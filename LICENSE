@@ -19,12 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-This license covers the MaeroOS kernel, userland, tools and documentation.
-It does not cover the third-party code vendored under third_party/ and
-ports/, which remains under its own terms (see the "Third-party code" table
-in README.md). The MaeroOS-specific backends inside ports/fbDOOM
-(i_input_maeros.c, i_sound_maeros.c and the modified fbdoom sources) are
-derivative works of the GPL v2 Doom source and are therefore GPL v2.
