@@ -36,7 +36,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | Native coreutils-style commands | `uname`, `whoami`, `hostname`, `free`, `df`, `uptime`, `which` | `make smoke-cmds` |
 | ext2 disk, login/passwd, init services, sessions | 108 assertions including `passwd: password updated for root` and `svc` state transitions | `make smoke-disk` |
 | TCP/IP over lwIP and RTL8139 | `MAEROS_HTTP_OK` fetched from a host HTTP server | `make smoke-net` |
-| Kernel firewall | rule drops the fetch, `/proc/firewall` shows a non-zero hit count, flush restores it | `make smoke-fw` |
+| Kernel firewall | after `fwctl enable` plus a drop rule the same fetch fails, `fwctl list` reports the firewall `enabled` with the `drop out tcp` rule, and `fwctl flush` restores the fetch | `make smoke-fw` |
 | Dynamic linker | `DYNPROBE_OK` from a PIE loaded through musl `ld.so` | `make smoke-dyn` |
 | External shared libraries and pthreads | `GREET_OK sum=42`, `ZLIB_OK ver=1.3`, `THREADS_OK count=200000`, `UNIX_SOCK_OK` | `make smoke-dynlib` |
 | X11 server | `XHANDSHAKE_OK`, `XDRAW_OK` (`w=320 h=200` from `GetGeometry`), `XEVENT_OK`, and `XREAL_PAINTED` from a client linked against the cross-built libX11 | `make smoke-x` |
@@ -102,8 +102,10 @@ What is proven by the automated QEMU tests in `tools/`:
 - `proc/pipe.c` pipes and FIFOs, `proc/shm.c` shared memory, `proc/signal.c` signal
   delivery with a `sigcontext`/`ucontext` frame laid out exactly as glibc expects, so a
   handler can read `uc_mcontext`.
-- `proc/elf.c` loads `ET_EXEC` and `ET_DYN`, records `PT_INTERP`, and hands control to the
-  interpreter with a full aux vector (`AT_PHDR`, `AT_BASE`, `AT_ENTRY`, `AT_RANDOM`).
+- `proc/elf.c` loads `ET_EXEC` and `ET_DYN` (the latter at a load bias) and records
+  `PT_INTERP` rather than rejecting it. `sys_exec` in `proc/syscall.c` is what acts on it:
+  it maps the interpreter at `0x40000000`, then enters it with a full aux vector
+  (`AT_PHDR`, `AT_BASE`, `AT_ENTRY`, `AT_PAGESZ`, `AT_RANDOM`).
 
 ### SMP
 
@@ -287,7 +289,7 @@ Everything goes to the serial console, so `make run` gives you the boot log and 
 
 The ten smoke targets each boot QEMU, drive the guest shell over the serial console and
 assert on the output. They are the project's regression suite; `tools/smoke.py` is the
-shortest one to read first.
+baseline the others build on, so it is the one to read first.
 
 ```sh
 make smoke          # boot, shell, procfs, PTYs, threads, shm, getrandom, ps
