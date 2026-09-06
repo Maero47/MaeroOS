@@ -371,6 +371,7 @@ Each of these keeps its own license. Nothing in this list has been relicensed.
 
 ## License
 
-No license has been chosen for MaeroOS itself yet, so there is no `LICENSE` file in this
-repository. The vendored and imported components listed above remain under their own
-licenses.
+MaeroOS (the kernel, userland, tools and documentation) is released under the MIT
+License, see [LICENSE](LICENSE). The vendored and imported components listed above
+remain under their own licenses; the MaeroOS backends inside `ports/fbDOOM` are
+derivative works of the GPL v2 Doom source and stay GPL v2.
