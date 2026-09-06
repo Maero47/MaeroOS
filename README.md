@@ -7,9 +7,9 @@ real Linux i386 ELF binaries (static and dynamically linked) alongside its own p
 
 ![The MaeroOS desktop](docs/screenshots/desktop.png)
 
-The desktop at 1280x800, showing the native Console, the maeroX X11 server window
-reporting `maeroX :0 - 0 clients, DISPLAY=:0`, and a System window with the current
-framebuffer mode.
+The desktop at 1280x800. `Console` and `System` are the desktop's own built-in windows,
+a fallback shell and an event log; `maeroX :0` is the X11 server running as an ordinary
+desktop application and reporting `0 clients, DISPLAY=:0`.
 
 ## Why it is unusual
 
@@ -21,8 +21,9 @@ framebuffer mode.
 - **SMP.** Application processors are booted through a real-mode trampoline and run
   threads under a recursive Big Kernel Lock with IPI-based TLB shootdown.
 - **The X11 wire protocol.** `maeroX` is a native MaeroOS GUI application that acts as
-  an X server on `/tmp/.X11-unix/X0`, and the genuine libX11/libxcb/Cairo/Pango/GTK3
-  stack has been cross-built and run against it.
+  an X server on `/tmp/.X11-unix/X0`, including enough of the RENDER extension for Cairo
+  to composite and for text to arrive as glyphs. The genuine libX11, libxcb, Cairo, Pango
+  and GTK3 stack has been cross-built and run against it.
 
 ## Project status
 
@@ -44,29 +45,24 @@ What is proven by the automated QEMU tests in `tools/`:
 ### What does not work
 
 - **Firefox 115.15.0esr does not reach first paint.** The prebuilt i686 ESR build loads
-  and `/disk/firefox/firefox-bin --version` prints `Mozilla Firefox 115.15.0esr`
-  (`Makefile:224`), but the browser stalls during startup before rendering a page. Much
-  of the Firefox-specific tracing left in `proc/syscall.c`, `proc/scheduler.c` and
-  `proc/usocket.c` exists to chase that stall. This is the current frontier of the
-  project, not a finished feature.
+  and `/disk/firefox/firefox-bin --version` prints `Mozilla Firefox 115.15.0esr` (the
+  `run-firefox` comment in the Makefile records this), but the browser stalls during
+  startup before rendering a page. Much of the Firefox-specific tracing left in
+  `proc/syscall.c`, `proc/scheduler.c` and `proc/usocket.c` exists to chase that stall.
+  This is the current frontier of the project, not a finished feature.
 - **More than 512 MiB of RAM hangs at boot.** The physical and virtual memory managers
   need work before the 1 to 2 GiB that Gecko wants is usable. See `README-BROWSER.md`.
 - **No W^X.** ELF segments are mapped writable; `proc/elf.c` does not yet enforce
   per-segment protection.
 - **inotify is deliberately absent.** Numbers 291, 292, 293 and 332 return `-ENOSYS`
-  on purpose so GLib falls back to its polling backend (`proc/syscall.c:6536`).
+  on purpose so GLib falls back to its polling backend (see the comment on those
+  cases in `proc/syscall.c`).
 - **No SMP scaling.** One Big Kernel Lock serialises all kernel execution
   (`arch/i686/cpu/bkl.c`).
 - **The host build is macOS-flavoured.** `make disk` calls Homebrew e2fsprogs at
   `/opt/homebrew/opt/e2fsprogs/sbin`, `make toybox` calls `gsed`, and `make start`
   auto-fits the guest resolution using `osascript`. These paths are hard-coded in the
   Makefile and in `tools/run-maeros.sh`.
-- **Known repository gap.** The bare filename patterns in `.gitignore` (added to exclude
-  built binaries in `testfiles/`) also match same-named source directories, so 67 of the
-  103 source directories referenced by `userspace/Makefile` are currently untracked and
-  will be missing from a fresh clone. `make userspace` therefore does not build from a
-  clone yet. The kernel tree (`arch/`, `drivers/`, `fs/`, `include/`, `kernel/`, `lib/`,
-  `mm/`, `net/`, `proc/`) is complete.
 
 ## What is in the box
 
@@ -133,7 +129,7 @@ lwIP 2.2.1 is vendored at `third_party/lwip` and driven by `net/lwip_glue.c` ove
 RTL8139 driver in `drivers/rtl8139.c`. DHCP runs at boot; `net/socket.c` implements the
 BSD socket calls both through `socketcall` (102) and the direct i386 numbers 359 to 373;
 `net/firewall.c` is a rule-based packet filter configured by `fwctl` and readable at
-`/proc/firewall`; a kernel thread `knetd` (`net/net.c:105`) keeps timers and TCP alive
+`/proc/firewall`; a kernel thread `knetd` (`net/net.c`) keeps timers and TCP alive
 without userspace polling.
 
 ### Drivers
@@ -145,27 +141,94 @@ keyboard and mouse (`keyboard.c`, `mouse.c`), CMOS RTC (`rtc.c`) and 16550 seria
 
 ### Userland
 
-`userspace/` holds its own freestanding libc (`libc/`, including `pthread.c`, `termios.c`,
-`socket.c` and a DNS resolver), `init` with `/etc/rc`, `/etc/inittab` sessions and
-`/etc/services` supervision, a shell, and the drawing stack `libdraw` / `libwm` /
-`libgui`. `userspace/Makefile` builds 100 binaries into `testfiles/`: coreutils-style
-commands, `login` / `passwd` / `doas` with PBKDF2-SHA256 password hashing, `svc`,
-`session`, `getty`, `fwctl`, `ifconfig`, `lspci`, `dmesg`, `ps`, `top`, and a set of
-`*probe` binaries that exist so the smoke tests can assert on their output.
+`userspace/` is 26,190 lines across 192 files, built with the same `i686-elf-gcc` and
+linked against its own freestanding libc (`userspace/libc/`: syscall stubs, stdio, stdlib,
+string, dirent, termios, sockets, a DNS resolver, pthreads and a toybox compatibility
+layer, entered from `crt0.asm`). `userspace/Makefile` produces 100 binaries into
+`testfiles/`.
+
+**init** (`userspace/init/init.c`) prefers a disk userland over the initrd, runs `/etc/rc`
+through the shell, then reads two tables: `/etc/inittab` for console sessions to respawn
+(up to 4) and `/etc/services` for `once` and `respawn` services (up to 8, each separately
+enabled or disabled). It opens a control FIFO at `/tmp/initctl`, writes
+`/tmp/services.status` and `/tmp/sessions.status` for `svc` and `session` to read back,
+and appends to `/var/log/init.log` when the disk root is writable. Respawn has a backoff:
+only an exit within 3 seconds counts as a rapid failure, each one adds 0.25 s of delay up
+to 1 s, and after 8 in a row the session is parked instead of restarted. When a
+framebuffer is present, init plays a startup chime through `wavplay` and runs the desktop
+as the unprivileged user.
+
+**The shell** (`userspace/shell/shell.c`, 1,528 lines) handles single and double quoting,
+`;`, `&&`, `||` and `&`, pipelines of up to 16 commands, redirections (`<`, `>`, `>>`,
+`2>`, `2>&1` and `<<` heredocs), `$VAR`, `$?`, `$$` and `$(...)` command substitution,
+shell variables with `export` and `unset`, `if`/`elif`/`else`/`fi`, `while`/`do`/`done`,
+`for x in ... do ... done`, and job control (`jobs`, `fg`, `bg`, `wait`, backed by
+`setpgid` and `tcsetpgrp`). Other built-ins are `cd`, `pwd`, `echo`, `read`, `trap`,
+`type`/`which`, `exit`, `true`, `false`, `clear` and `.`/`source`. It keeps arrow-key
+history, and `-c` runs a single command string, which is how init and the launchers call
+it.
+
+**Commands.** Coreutils-style tools (`ls`, `cat`, `cp`, `rm`, `grep`, `sed`, `awk`,
+`find`, `sort`, `diff`, `tar`, `xargs` and more), system tools (`ps`, `top`, `free`, `df`,
+`du`, `uptime`, `dmesg`, `lspci`, `ifconfig`, `fwctl`, `svc`, `session`), account tools
+(`login`, `passwd`, `doas`, `sudo`, `getty`, `id`, `whoami`) and the `*probe` binaries the
+smoke tests assert on. Passwords are PBKDF2-HMAC-SHA256 at 100,000 iterations, implemented
+in `userspace/auth/auth.c` and stored in `/etc/shadow`. Eighteen BusyBox applet names
+(`vi`, `less`, `ping`, `mount`, `gzip` and others) are installed into `/bin` as copies of
+a small `bbwrap` launcher.
 
 ### Desktop and window system
 
-`desktop` draws the taskbar and wallpaper and manages windows through `libwm`; `term`,
-`edit`, `calc`, `view`, `files`, `taskmgr`, `settings`, `store` and `browse` are native
-GUI applications built on `libgui`. `maerox` is the X11 server: it owns a desktop window,
-listens on the AF_UNIX socket `/tmp/.X11-unix/X0`, and answers the connection setup
-(one screen, a 24-bit TrueColor visual) plus `CreateWindow`, `CreateGC`, `MapWindow`,
-`PolyFillRectangle`, `PutImage` and `GetGeometry`, sending `Expose`, `ConfigureNotify`,
-`ButtonPress` and `ButtonRelease` back to clients.
+`desktop` (`userspace/desktop/desktop.c`, 4,889 lines) opens `/dev/fb0`,
+`/dev/input/event0` and `/dev/input/event1`, and composites the whole screen into a back
+buffer that it presents once per frame. It draws a PPM wallpaper (kept in a blurred copy
+for the window backdrop), desktop icons that launch on double-click, and a taskbar with a
+start menu that has a search filter and a right-click context menu. Windows have title
+bars with minimize, maximize and close, plus drag, edge resize, half-screen snapping, a
+show-desktop toggle, a minimize animation and a clock. The accent colour and wallpaper
+path are read from `/etc/desktop.conf`. Two windows belong to the desktop itself: `Console`,
+a fallback shell, and `System`, an event log. Themed icons come from `.mic` files generated
+by `tools/mkicons.py`, and text is drawn with antialiased fonts generated by
+`tools/mkfont.py`.
+
+Applications reach the compositor through `libwm` (`userspace/libwm/wm.c`): a line
+protocol written to the FIFO `/tmp/wmctl` (`app`, `title`, `geom`, `rect`, `text`, `icon`,
+`focus`, `surface`, `commit`), with events read back from `/tmp/wmevents`. `wm_surface`
+hands the desktop a shared-memory id, so a client renders into its own buffer and the
+desktop composites it; that is what the kernel's shm syscalls are for. `libgui` builds
+panels, labels, buttons, text inputs, checkboxes, scrollbars, list boxes and images on top
+of `libdraw` (rectangles, rounded frames, alpha blending, antialiased text, `.mic`
+images). `term`, `edit`, `calc`, `view`, `files`, `taskmgr`, `settings`, `store` and
+`browse` are written this way; `term` runs a real shell on a PTY and several instances can
+run side by side.
+
+`maerox` (`userspace/maerox/maerox.c`, 1,334 lines) is the X11 server. It takes a desktop
+slot like any other libgui application, listens on the AF_UNIX socket `/tmp/.X11-unix/X0`
+for up to 8 clients, and answers the connection setup with one screen, two pixmap formats
+and a single depth-24 TrueColor visual. The core request dispatch covers window and pixmap
+lifecycle (CreateWindow, ChangeWindowAttributes, ConfigureWindow, MapWindow, UnmapWindow,
+CreatePixmap, FreePixmap), drawing (CreateGC, ChangeGC, FreeGC, PolyFillRectangle,
+PolyRectangle, PutImage, GetImage, CopyArea, ClearArea) and the queries a real Xlib client
+blocks on (GetGeometry, GetWindowAttributes, QueryTree, InternAtom, GetAtomName,
+GetProperty, ChangeProperty, GetInputFocus, GetSelectionOwner, QueryPointer,
+GetKeyboardMapping, GetModifierMapping, QueryExtension). It sends `Expose`, `MapNotify`,
+`ConfigureNotify`, `ButtonPress` and `ButtonRelease` back to clients. `QueryExtension`
+reports RENDER as present, and the RENDER opcodes go far enough for Cairo and GTK to
+paint: QueryPictFormats, CreatePicture, Composite, FillRectangles, CreateSolidFill,
+CreateGlyphSet, AddGlyphs and CompositeGlyphs, so text arrives as real glyphs rather than
+bitmaps.
 
 `store` and `pkg` install packages from a repository built by `tools/mkrepo.py` out of
-`ports/packages/*/pkg.conf`; `make repo-serve` serves it over HTTP so the guest can fetch
-from `10.0.2.2:8000`.
+`ports/packages/*/pkg.conf`. `pkg update`, `list`, `install` and `remove` fetch
+`index.txt` and per-package ustar archives over HTTP into `/disk/apps/<name>/`, defaulting
+to the QEMU host at `10.0.2.2:8000` and overridable in `/disk/etc/pkg.conf`; `store` is
+the libgui front end that drives the `pkg` binary. `make repo-serve` serves the repository
+from the host.
+
+`ff` (`userspace/ff/ff.c`) is the one-command Firefox launcher: it starts a windowed
+maeroX in a desktop slot, creates a writable profile and home under `/tmp`, and execs
+Firefox with the `LD_LIBRARY_PATH`, `DISPLAY`, fontconfig and GTK icon-theme environment
+that build needs.
 
 ### Ports
 
@@ -299,7 +362,7 @@ For the longer story of how the browser stack was built up, phase by phase, see
 | links | 2.30 | `ports/links-2.30.tar.gz`, `ports/packages/links` | GPL v2 |
 | zlib, libpng, libjpeg | 1.3.1, 1.6.43, 9f | upstream tarballs in `ports/` | zlib, libpng and IJG terms |
 | libX11 / libxcb, GLib, Cairo, Pango, GTK3 | built by `ports/x11` and `ports/gtk` | not vendored | upstream terms |
-| Firefox ESR | 115.15.0 | fetched by `ports/firefox` | MPL 2.0 |
+| Firefox ESR | 115.15.0 | fetched by `ports/firefox` | upstream terms |
 | Doom shareware WAD | `doom1.wad` | `ports/doom1.wad` | id Software shareware terms |
 
 Each of these keeps its own license. Nothing in this list has been relicensed.
