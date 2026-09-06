@@ -1,0 +1,5 @@
+# MaeroOS early userspace startup script.
+echo [rc] early userspace
+mkdir /home
+mkdir /home/root
+printf booted > /home/root/boot-state

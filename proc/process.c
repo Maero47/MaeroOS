@@ -1,0 +1,463 @@
+#include "process.h"
+#include "scheduler.h"
+#include "elf.h"
+#include "../mm/heap.h"
+#include "../mm/vmm.h"
+#include "../mm/pmm.h"
+#include "../kernel/printk.h"
+#include "../arch/i686/cpu/tss.h"
+#include "../arch/i686/cpu/percpu.h"
+#include "../arch/i686/mm/paging.h"
+#include "../arch/i686/cpu/fpu.h"
+#include "../fs/vfs.h"
+#include <kernel/config.h>
+#include <stdint.h>
+#include <stddef.h>
+
+/* User virtual memory layout */
+#define USER_CODE_BASE  0x08048000U
+
+struct proc ptable[MAX_PROCS];
+/* current_proc is now a per-CPU macro (see process.h) — no global definition. */
+
+static int next_pid = 1;
+
+extern void trapret(void);  /* defined in isr.asm */
+
+void proc_init(void) {
+    for (int i = 0; i < MAX_PROCS; i++)
+        ptable[i].state = PROC_UNUSED;
+    printk("[PROC] Process table initialized (%d slots).\n", MAX_PROCS);
+}
+
+/* Diagnostic: dump every live process — pid, tgid, state, last syscall — so a
+ * stall (everyone SLEEPING on futex/poll) is visible from the serial log.
+ * States: 1=EMBRYO 2=RUNNABLE 3=RUNNING 4=SLEEPING 5=ZOMBIE 6=STOPPED. */
+/* Heuristic user-stack backtrace for a sleeping user thread.  Modern Firefox
+ * omits frame pointers, so instead of walking EBP we switch into the thread's
+ * address space and scan its stack for words that look like code return
+ * addresses (in the 0x10000000–0x60000000 mmap/exec range).  This reveals which
+ * subsystem the stuck main thread is parked in.  Safe: kernel higher-half is
+ * mapped in every pgdir, and we restore CR3 before returning. */
+static int str_has(const char *s, const char *sub);
+static void user_backtrace(struct proc *p) {
+    if (!p->tf || !p->pgdir_phys) return;
+    uint32_t saved;
+    __asm__ volatile("mov %%cr3,%0" : "=r"(saved));
+    __asm__ volatile("mov %0,%%cr3" :: "r"(p->pgdir_phys) : "memory");
+
+    printk("  bt p%d eip=%x chan=%x", p->pid,
+           (unsigned)p->tf->eip,
+           (unsigned)(uintptr_t)p->sleep_chan);
+    /* Dump the futex/lock structure the thread is parked on (owner tid etc.) */
+    uint32_t la = (uint32_t)(uintptr_t)p->sleep_chan;
+    if (la && la < 0xC0000000U && (*paging_get_pde(la) & 1) &&
+        (*paging_get_pte(la) & 1)) {
+        printk(" lock=[%x %x %x]",
+               (unsigned)*(volatile uint32_t *)(uintptr_t)la,
+               (unsigned)*(volatile uint32_t *)(uintptr_t)(la + 4),
+               (unsigned)*(volatile uint32_t *)(uintptr_t)(la + 8));
+    }
+    printk(" stk:");
+    uint32_t sp = p->tf->useresp & ~3U;
+    /* For the tgid leader (firefox main thread) dump MANY raw words so we can
+     * offline-resolve the call_once caller / the static-init function.  For
+     * worker threads keep the compact code-filtered scan. */
+    int leader = (p->pid == p->tgid);
+    int printed = 0, cap = leader ? 90 : 48;
+    for (uint32_t a = sp; a < sp + 8192 && printed < cap; a += 4) {
+        if (!(*paging_get_pde(a) & 1)) { a = (a & ~0x3FFFFFU) + 0x400000U - 4; continue; }
+        if (!(*paging_get_pte(a) & 1)) continue;
+        uint32_t v = *(volatile uint32_t *)(uintptr_t)a;
+        if (leader) { printk(" %x", (unsigned)v); printed++; }
+        else if (v >= 0x10000000U && v < 0x60000000U) { printk(" %x", (unsigned)v); printed++; }
+    }
+    printk("\n");
+    /* For the leader, also scan the stack region for printable ASCII runs — the
+     * child-process launch argv ("-contentproc", "tab"/"gpu"/"utility"/...) lives
+     * there and tells us exactly which process is being launched. */
+    if (leader) {
+        char run[40]; int rl = 0;
+        printk("  str:");
+        for (uint32_t a = sp; a < sp + 8192; a += 1) {
+            if (!(*paging_get_pde(a) & 1)) { a = (a & ~0x3FFFFFU) + 0x400000U - 1; rl = 0; continue; }
+            if (!(*paging_get_pte(a) & 1)) { rl = 0; continue; }
+            uint8_t ch = *(volatile uint8_t *)(uintptr_t)a;
+            if (ch >= 0x20 && ch < 0x7f) { if (rl < 39) run[rl++] = (char)ch; }
+            else { if (rl >= 5) { run[rl] = 0; printk(" |%s", run); } rl = 0; }
+        }
+        printk("\n");
+    }
+    __asm__ volatile("mov %0,%%cr3" :: "r"(saved) : "memory");
+}
+
+void proc_debug_snapshot(void) {
+    extern volatile uint32_t g_tlb_sends, g_tlb_timeouts, g_tlb_acks;
+    printk("[tlb] sends=%u acks=%u timeouts=%u\n",
+           (unsigned)g_tlb_sends, (unsigned)g_tlb_acks, (unsigned)g_tlb_timeouts);
+    printk("[snap]");
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *p = &ptable[i];
+        if (p->state == PROC_UNUSED) continue;
+        printk(" p%d/t%d:s%d#%d", p->pid, p->tgid, p->state, p->last_syscall);
+        printk("^%d", p->parent ? p->parent->pid : 0);   /* ppid */
+        if (p->state == PROC_SLEEPING && p->sleep_chan)
+            printk("@%x", (unsigned)(uintptr_t)p->sleep_chan);
+    }
+    printk("\n");
+    /* Backtrace only the firefox MAIN thread (leader).  The per-worker raw
+     * stack dumps were extremely noisy and are superseded by the call-filtered,
+     * offline-symbolizable [wbt] capture in the scheduler stall detector; keep
+     * just the leader dump here for a quick at-a-glance of the main thread. */
+    int ff_tgid = -1;
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (ptable[i].state != PROC_UNUSED && ptable[i].pid == ptable[i].tgid &&
+            str_has(ptable[i].name, "firefox")) { ff_tgid = ptable[i].tgid; break; }
+    if (ff_tgid >= 0)
+        for (int i = 0; i < MAX_PROCS; i++) {
+            struct proc *p = &ptable[i];
+            if (p->state == PROC_SLEEPING && p->tgid == ff_tgid &&
+                p->pid == p->tgid)          /* leader only */
+                user_backtrace(p);
+        }
+}
+
+static int str_has(const char *s, const char *sub) {
+    for (; *s; s++) {
+        const char *a = s, *b = sub;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (!*b) return 1;
+    }
+    return 0;
+}
+
+struct proc *allocproc(void) {
+    struct proc *p = NULL;
+    int live = 0;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        if (ptable[i].state == PROC_UNUSED) {
+            if (!p) p = &ptable[i];
+        } else {
+            live++;
+        }
+    }
+    if (!p) { printk("[proc] table FULL (%d/%d) — clone/fork fails\n",
+                     live, MAX_PROCS); return NULL; }
+    {   /* high-water-mark trace: how close does Firefox get to MAX_PROCS? */
+        static int peak = 0;
+        if (live + 1 > peak && live + 1 >= 40) {
+            peak = live + 1;
+            printk("[proc] live procs peak=%d/%d\n", peak, MAX_PROCS);
+        }
+    }
+
+    p->state          = PROC_EMBRYO;
+    p->pid            = next_pid++;
+    p->pgdir_phys     = 0;
+    p->parent         = NULL;
+    p->exit_status    = 0;
+    p->heap_end       = 0;
+    p->pending_sigs   = 0;
+    p->blocked_sigs   = 0;
+    p->sigframe_addr  = 0;
+    p->sleep_chan     = NULL;
+    p->wake_tick      = 0;
+    p->cwd[0]        = '/';
+    p->cwd[1]        = '\0';
+    p->mmap_next     = 0x40000000U;
+    p->umask         = 022;
+    p->uid = p->gid = p->euid = p->egid = 0;   /* root until setuid drops */
+    p->pgrp          = p->pid;
+    p->sid           = p->pid;
+    p->ctty          = NULL;
+    p->exe[0]        = '\0';
+    p->utime_ticks   = 0;
+    p->sched_count   = 0;
+    p->no_preempt    = 0;
+    p->tgid          = p->pid;
+    p->tls_base      = 0;
+    p->clear_child_tid = 0;
+    p->robust_list_head = 0;
+    p->vfork_parent  = NULL;
+    p->vfork_waiting = 0;
+    fpu_state_init(fpu_area(p));
+    __builtin_memset(p->sig_flags,    0, sizeof(p->sig_flags));
+    __builtin_memset(p->sig_handlers, 0, sizeof(p->sig_handlers));
+    /* Fresh private fd table (fork/initial keep it; thread clone replaces it
+     * with the shared group table — see sys_clone). */
+    fdtable_attach(p, fdtable_alloc());
+    if (!p->fdt) { p->state = PROC_UNUSED; return NULL; }
+    for (int i = 0; i < SHM_PROC_MAPS; i++)
+        p->shm_maps[i].id = -1;
+
+    /* Allocate kernel stack */
+    p->kstack = kmalloc(KSTACKSIZE);
+    if (!p->kstack) {
+        fdtable_put(p);
+        p->state = PROC_UNUSED;
+        return NULL;
+    }
+
+    /*
+     * Build the initial kernel stack for a new process:
+     *
+     * [kstack + KSTACKSIZE]  ← top
+     *   registers_t (trapframe)
+     *   return address → trapret
+     *   struct context { edi=0, esi=0, ebx=0, ebp=0, eip=forkret }
+     * [sp ← p->context]
+     */
+    uint8_t *sp = p->kstack + KSTACKSIZE;
+
+    /* Place trapframe */
+    sp -= sizeof(registers_t);
+    p->tf = (registers_t *)sp;
+
+    /* Return address from forkret → trapret */
+    sp -= sizeof(uint32_t);
+    *(uint32_t *)sp = (uint32_t)trapret;
+
+    /* Saved context */
+    sp -= sizeof(struct context);
+    p->context = (struct context *)sp;
+    __builtin_memset(p->context, 0, sizeof(struct context));
+    p->context->eip = (uint32_t)forkret;
+
+    return p;
+}
+
+/*
+ * forkret — called the first time a process is scheduled.
+ * Returns to trapret (via the return address on the stack),
+ * which executes iret into user mode using the trapframe.
+ */
+void forkret(void) {
+    /* First dispatch of a USER process: the scheduler swtch'd here holding the
+     * Big Kernel Lock; we are about to iret to user (via trapret), so release
+     * it.  (Kernel threads bypass forkret — they keep the BKL while running.) */
+    bkl_leave();
+}
+
+/*
+ * proc_create_kthread — create a kernel-mode thread that runs fn().
+ */
+struct proc *proc_create_kthread(void (*fn)(void), const char *name) {
+    struct proc *p = NULL;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        if (ptable[i].state == PROC_UNUSED) { p = &ptable[i]; break; }
+    }
+    if (!p) return NULL;
+
+    p->state       = PROC_EMBRYO;
+    p->pid         = next_pid++;
+    p->pgdir_phys  = 0;   /* kthreads use the kernel pgdir */
+    p->parent      = NULL;
+    p->exit_status = 0;
+    p->ctty        = NULL;
+    p->pgrp        = p->pid;
+    p->sid         = p->pid;
+
+    for (int i = 0; i < SHM_PROC_MAPS; i++)
+        p->shm_maps[i].id = -1;
+    p->utime_ticks = 0;
+    p->sched_count = 0;
+    p->no_preempt  = 0;
+    p->tgid        = p->pid;
+    p->tls_base    = 0;
+    p->clear_child_tid = 0;
+    fpu_state_init(fpu_area(p));
+
+    p->kstack = kmalloc(KSTACKSIZE);
+    if (!p->kstack) { p->state = PROC_UNUSED; return NULL; }
+
+    uint8_t *sp = p->kstack + KSTACKSIZE;
+    sp -= sizeof(uint32_t);
+    *(uint32_t *)sp = 0;   /* crash if fn() returns */
+
+    sp -= sizeof(struct context);
+    p->context = (struct context *)sp;
+    __builtin_memset(p->context, 0, sizeof(struct context));
+    p->context->eip = (uint32_t)(uintptr_t)fn;
+
+    int ni = 0;
+    while (name[ni] && ni < 15) { p->name[ni] = name[ni]; ni++; }
+    p->name[ni] = '\0';
+
+    p->tf         = NULL;
+    p->time_slice = 5;
+    p->sleep_chan = NULL;
+    p->wake_tick  = 0;
+    p->state      = PROC_RUNNABLE;
+    return p;
+}
+
+/*
+ * proc_create_userproc — create a ring-3 process with its own page directory.
+ *
+ * Each user process gets a fresh page directory (pgdir_create) with the
+ * kernel mappings copied.  The code and stack pages are mapped exclusively
+ * in that process's pgdir so different processes can have independent user
+ * address spaces.
+ */
+struct proc *proc_create_userproc(const uint8_t *code, uint32_t code_len,
+                                   const char *name) {
+    struct proc *p = allocproc();
+    if (!p) return NULL;
+
+    /* Create a private page directory for this process */
+    p->pgdir_phys = pgdir_create();
+    if (!p->pgdir_phys) {
+        kfree(p->kstack);
+        p->state = PROC_UNUSED;
+        return NULL;
+    }
+
+    /* Allocate code page, map it in the process pgdir, copy bytecode */
+    uint32_t code_phys = pmm_alloc_frame();
+    if (!code_phys) {
+        pgdir_free_user(p->pgdir_phys);
+        kfree(p->kstack);
+        p->state = PROC_UNUSED;
+        return NULL;
+    }
+    pgdir_map(p->pgdir_phys, USER_CODE_BASE, code_phys,
+              PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+    pmm_frame_incref(code_phys);
+
+    /* Copy bytecode into the frame via temp mapping */
+    uint8_t *cp = (uint8_t *)paging_temp_map(code_phys);
+    for (uint32_t i = 0; i < code_len; i++)
+        cp[i] = code[i];
+    paging_temp_unmap();
+
+    /* Allocate and map the user stack region. */
+    for (uint32_t va = USER_STACK_BASE; va < USER_STACK_TOP; va += PAGE_SIZE) {
+        uint32_t stack_phys = pmm_alloc_frame();
+        if (!stack_phys) {
+            pmm_frame_decref(code_phys);
+            pgdir_free_user(p->pgdir_phys);
+            kfree(p->kstack);
+            p->state = PROC_UNUSED;
+            return NULL;
+        }
+        pgdir_map(p->pgdir_phys, va, stack_phys,
+                  PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        pmm_frame_incref(stack_phys);
+    }
+
+    /* Fill the trapframe for ring-3 entry */
+    registers_t *tf = p->tf;
+    __builtin_memset(tf, 0, sizeof(*tf));
+
+    tf->ds  = 0x23;
+    tf->es  = 0x23;
+    tf->fs  = 0x23;
+    tf->gs  = 0x23;
+
+    tf->eip     = USER_CODE_BASE;
+    tf->cs      = 0x1B;
+    tf->eflags  = 0x202;   /* IF=1 + reserved bit 1 */
+    tf->useresp = USER_STACK_TOP;
+    tf->ss      = 0x23;
+
+    int ni = 0;
+    while (name[ni] && ni < 15) { p->name[ni] = name[ni]; ni++; }
+    p->name[ni] = '\0';
+
+    p->state = PROC_RUNNABLE;
+    printk("[PROC] Created user process '%s' pid=%d eip=0x%08x\n",
+           p->name, p->pid, (unsigned)USER_CODE_BASE);
+    return p;
+}
+
+/*
+ * proc_create_from_elf — create a user process by loading an ELF binary
+ * directly from a VFS node.  Used by kernel_main to launch /init.
+ */
+struct proc *proc_create_from_elf(vfs_node_t *node, const char *name) {
+    struct proc *p = allocproc();
+    if (!p) return NULL;
+
+    p->pgdir_phys = pgdir_create();
+    if (!p->pgdir_phys) {
+        kfree(p->kstack);
+        p->state = PROC_UNUSED;
+        return NULL;
+    }
+
+    uint32_t entry = 0, heap_end = 0;
+    if (elf_load(node, p->pgdir_phys, &entry, &heap_end) < 0) {
+        pgdir_free_user(p->pgdir_phys);
+        kfree(p->kstack);
+        p->state = PROC_UNUSED;
+        return NULL;
+    }
+    p->heap_end = heap_end;
+
+    /* Allocate and map the user stack region. */
+    uint32_t stack_top_phys = 0;
+    for (uint32_t va = USER_STACK_BASE; va < USER_STACK_TOP; va += PAGE_SIZE) {
+        uint32_t stack_phys = pmm_alloc_frame();
+        if (!stack_phys) {
+            pgdir_free_user(p->pgdir_phys);
+            kfree(p->kstack);
+            p->state = PROC_UNUSED;
+            return NULL;
+        }
+        pgdir_map(p->pgdir_phys, va, stack_phys,
+                  PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        pmm_frame_incref(stack_phys);
+        if (va == USER_STACK_TOP - PAGE_SIZE)
+            stack_top_phys = stack_phys;
+    }
+
+    /* Minimal Linux-layout entry frame: argc=0, argv NULL, envp NULL,
+     * AT_NULL auxv — 5 words at the stack top. */
+    uint32_t *frame = (uint32_t *)paging_temp_map(stack_top_phys);
+    frame[(PAGE_SIZE - 32) / 4 + 0] = 0;  /* argc = 0 */
+    frame[(PAGE_SIZE - 32) / 4 + 1] = 0;  /* argv NULL */
+    frame[(PAGE_SIZE - 32) / 4 + 2] = 0;  /* envp NULL */
+    frame[(PAGE_SIZE - 32) / 4 + 3] = 0;  /* AT_NULL type */
+    frame[(PAGE_SIZE - 32) / 4 + 4] = 0;  /* AT_NULL value */
+    paging_temp_unmap();
+
+    /* Fill trapframe */
+    registers_t *tf = p->tf;
+    __builtin_memset(tf, 0, sizeof(*tf));
+    tf->ds = tf->es = tf->fs = tf->gs = 0x23;
+    tf->eip     = entry;
+    tf->cs      = 0x1B;
+    tf->eflags  = 0x202;
+    tf->useresp = USER_STACK_TOP - 32;
+    tf->ss      = 0x23;
+
+    int ni = 0;
+    while (name[ni] && ni < 15) { p->name[ni] = name[ni]; ni++; }
+    p->name[ni] = '\0';
+
+    /* Set up stdin/stdout/stderr as /dev/tty if available */
+    {
+        vfs_node_t *tty = vfs_open("/dev/tty");
+        if (tty) {
+            p->ofile[0].type   = FD_FILE;
+            p->ofile[0].node   = tty;
+            p->ofile[0].offset = 0;
+            p->ofile[0].flags  = O_RDONLY;
+
+            p->ofile[1].type   = FD_FILE;
+            p->ofile[1].node   = tty;
+            p->ofile[1].offset = 0;
+            p->ofile[1].flags  = O_WRONLY;
+
+            p->ofile[2].type   = FD_FILE;
+            p->ofile[2].node   = tty;
+            p->ofile[2].offset = 0;
+            p->ofile[2].flags  = O_WRONLY;
+        }
+    }
+
+    p->state = PROC_RUNNABLE;
+    printk("[PROC] Created ELF process '%s' pid=%d entry=0x%08x\n",
+           p->name, p->pid, (unsigned)entry);
+    return p;
+}

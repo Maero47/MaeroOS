@@ -1,0 +1,2 @@
+# id action command
+tty0 respawn /disk/getty tty0

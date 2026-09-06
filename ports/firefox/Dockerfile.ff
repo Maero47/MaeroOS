@@ -1,0 +1,9 @@
+FROM maeros-gtkbuild3
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates build-essential clang llvm lld \
+    nodejs npm autoconf2.13 zip unzip libssl-dev \
+    python3-pip python3-venv pkg-config && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --default-toolchain 1.76.0 --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN rustup target add i686-unknown-linux-musl i686-unknown-linux-gnu

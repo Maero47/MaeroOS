@@ -1,0 +1,16 @@
+# Bochs config to boot MaeroOS (maeros.iso GRUB CD) with disk.img attached,
+# for the internal debugger's WRITE WATCHPOINT (which TCG-QEMU lacks).
+megs: 512
+romimage:    file=/opt/homebrew/Cellar/bochs/3.0/share/bochs/BIOS-bochs-latest
+vgaromimage: file=/opt/homebrew/Cellar/bochs/3.0/share/bochs/VGABIOS-lgpl-latest.bin
+cpu: model=corei7_haswell_4770, ips=80000000, reset_on_triple_fault=0
+ata0-master: type=disk, path="disk.img", mode=flat, cylinders=3072, heads=16, spt=16
+ata1-master: type=cdrom, path="maeros.iso", status=inserted
+boot: cdrom
+com1: enabled=1, mode=file, dev="/tmp/bochs_serial.log"
+magic_break: enabled=1
+display_library: nogui
+clock: sync=none, time0=local
+log: /tmp/bochs.log
+panic: action=report
+error: action=report

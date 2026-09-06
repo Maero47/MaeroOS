@@ -1,0 +1,5 @@
+FROM maeros-x11build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    meson ninja-build cmake gettext python3-pip libglib2.0-dev-bin && \
+    rm -rf /var/lib/apt/lists/* || apt-get install -y --no-install-recommends \
+    meson ninja-build cmake gettext && rm -rf /var/lib/apt/lists/*

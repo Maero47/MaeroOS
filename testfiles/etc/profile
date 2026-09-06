@@ -1,0 +1,5 @@
+# /etc/profile — system-wide shell startup script.
+# Sourced by interactive (login) shells at startup.
+export PAGER=cat
+export EDITOR=vi
+echo Welcome to MaeroOS

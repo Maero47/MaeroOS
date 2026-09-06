@@ -1,0 +1,1 @@
+MaeroOS M11: VFS and initrd are working.

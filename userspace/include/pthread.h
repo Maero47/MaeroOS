@@ -1,0 +1,27 @@
+#pragma once
+
+/*
+ * pthread-lite for MaeroOS.
+ *
+ * Threads are kernel tasks sharing the address space (clone + CLONE_VM);
+ * a pthread_t is the kernel tid and pthread_join is waitpid(tid).
+ * Mutexes are futex-backed.  Known limit: errno is process-global.
+ */
+
+typedef int pthread_t;
+
+typedef struct {
+    volatile int state;   /* 0 unlocked, 1 locked, 2 locked w/ waiters */
+} pthread_mutex_t;
+
+#define PTHREAD_MUTEX_INITIALIZER { 0 }
+
+int pthread_create(pthread_t *thread, const void *attr,
+                   void *(*fn)(void *), void *arg);
+int pthread_join(pthread_t thread, void **retval);
+pthread_t pthread_self(void);
+
+int pthread_mutex_init(pthread_mutex_t *m, const void *attr);
+int pthread_mutex_lock(pthread_mutex_t *m);
+int pthread_mutex_unlock(pthread_mutex_t *m);
+int pthread_mutex_destroy(pthread_mutex_t *m);

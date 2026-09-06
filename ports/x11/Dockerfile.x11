@@ -1,0 +1,4 @@
+FROM maeros-cross:latest
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget xz-utils python3 pkg-config autoconf automake libtool m4 \
+    bison gperf gcc g++ ca-certificates && rm -rf /var/lib/apt/lists/*

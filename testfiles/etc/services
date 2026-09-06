@@ -1,0 +1,4 @@
+# type name [enabled|disabled] command
+once bootstamp printf serviced > /home/root/service-state
+respawn heartbeat enabled /disk/respawnprobe
+respawn sleeper disabled /disk/sleep 60

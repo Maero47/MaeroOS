@@ -1,0 +1,20 @@
+# Disk-image ownership + permission manifest (Phase 24).
+# Applied by `make disk` via debugfs sif.  Paths are image-relative (the disk
+# is mounted at /disk, so "etc" here is /disk/etc at runtime).
+# mode values include type bits: 0100xxx = file, 040xxx = directory.
+#
+# path                  uid   gid   mode
+etc/shadow              0     0     0100600
+etc/passwd              0     0     0100644
+etc/group               0     0     0100644
+etc                     0     100   040775
+apps                    0     100   040775
+home                    0     0     040755
+home/user               1000  100   040755
+home/user/README.txt    1000  100   0100644
+etc/desktop.conf        1000  100   0100644
+etc/notes.txt           1000  100   0100644
+etc/doas.conf           0     0     0100644
+doas                    0     0     0104755
+passwd                  0     0     0104755
+ff                      1000  100   0100755

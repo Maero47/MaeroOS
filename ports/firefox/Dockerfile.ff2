@@ -1,0 +1,3 @@
+FROM maeros-ffbuild
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN cargo install cbindgen --version 0.26.0 --locked || cargo install cbindgen --version 0.24.5 --locked

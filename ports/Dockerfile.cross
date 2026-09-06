@@ -1,0 +1,9 @@
+# i686-linux-musl cross toolchain (toolchain tarball COPYed from host)
+FROM --platform=linux/amd64 debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    make git patch file ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY i686-linux-musl-cross.tgz /tmp/
+RUN tar xzf /tmp/i686-linux-musl-cross.tgz -C /opt && rm /tmp/i686-linux-musl-cross.tgz
+ENV PATH="/opt/i686-linux-musl-cross/bin:${PATH}"
+ENV CC=i686-linux-musl-gcc
+WORKDIR /build

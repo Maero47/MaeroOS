@@ -1,0 +1,5 @@
+name=links
+version=2.30
+exec=/disk/apps/links/links
+fullscreen=1
+args=-g -only-proxies 0 file:///disk/apps/links/home.html

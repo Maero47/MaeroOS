@@ -1,0 +1,14 @@
+user_pref("gfx.webrender.software", true);
+user_pref("gfx.webrender.software.opengl", false);
+user_pref("layers.acceleration.disabled", true);
+user_pref("layers.gpu-process.enabled", false);
+user_pref("media.gpu-process-decoder", false);
+user_pref("webgl.disabled", true);
+user_pref("gfx.x11-glx.disabled", true);
+user_pref("dom.ipc.processCount", 1);
+user_pref("browser.tabs.remote.autostart", false);
+user_pref("accessibility.force_disabled", 1);
+user_pref("toolkit.telemetry.enabled", false);
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.startup.homepage", "about:blank");
+user_pref("app.update.enabled", false);
