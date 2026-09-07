@@ -136,27 +136,33 @@ struct proc {
     /* Virtual memory */
     uint32_t         heap_end;    /* user heap break (managed by sys_brk) */
 
-    /* Signals */
+    /* Signals.  pending/blocked are per thread (Linux task->pending, ->blocked);
+     * the handler table is shared by the thread group (see struct sighand). */
     uint32_t         pending_sigs;          /* bitmask of pending signals */
     uint32_t         blocked_sigs;          /* bitmask of blocked signals */
-    sighandler_t     sig_handlers[NSIGS];   /* per-signal: SIG_DFL/SIG_IGN/fn */
-    uint32_t         sig_flags[NSIGS];      /* per-signal sa_flags (SA_RESTART etc.) */
+    struct sighand  *sighand;               /* shared under CLONE_SIGHAND */
     uint32_t         sigframe_addr;         /* user addr of saved trapframe for sigreturn */
+
+    /* Group exit (Linux signal_struct SIGNAL_GROUP_EXIT + group_exit_code),
+     * kept on the thread-group leader: set when exit_group() or a fatal signal
+     * ends the whole process, so the status waitpid() reports is the group's,
+     * not whatever SIGKILL later delivered to the leader itself. */
+    int              group_exit;
 
     /* Sleep channel (non-NULL when state == PROC_SLEEPING) */
     void            *sleep_chan;
-    uint32_t         wake_tick;   /* PIT tick deadline for timed sleeps */
-    uint32_t         sleep_tick;  /* PIT tick when this sleep began (stuck detect) */
+    uint32_t         wake_tick;   /* PIT tick deadline for timed sleeps; consumed
+                                   * (zeroed) by whichever path ends the sleep so a
+                                   * deadline never leaks into a later sleep */
+    uint8_t          sleep_timed_out; /* set by scheduler_tick when it ended the
+                                   * sleep by deadline; sleep_on() returns it */
+    uint32_t         sleep_tick;  /* PIT tick when this sleep began */
     uint32_t         sleep_seq;   /* monotonic enqueue order — FIFO wakeup (Linux futex plist) */
-    uint8_t          futex_cond;  /* sleeping in a CONDVAR futex wait (op=9) — the
-                                   * only waiters the BZ#25847 lost-wakeup safety
-                                   * net may spuriously wake (condvars always
-                                   * tolerate it; mutexes/raw futexes must not). */
-    uint8_t          futex_wait;  /* sleeping in ANY futex wait (op=0 or 9).  The
-                                   * aggressive multiprocess-deadlock recovery net
-                                   * may spuriously wake these; safe because every
-                                   * glibc futex (mutex/condvar/raw) re-checks its
-                                   * predicate on wake and re-sleeps if unmet. */
+    uint8_t          futex_wait;  /* 1: sleeping in a futex wait (futex_wake_n only
+                                   * matches these, so a wake_up() on a channel that
+                                   * happens to equal a user address cannot hit them);
+                                   * 2: that wait was ended by a FUTEX_WAKE, which
+                                   * sys_futex reports as 0 ahead of any signal */
     uint8_t          futex_shared; /* futex wait is process-SHARED (FUTEX_PRIVATE
                                     * bit clear).  Private futexes are keyed by
                                     * (tgid, uaddr); shared by physical page.  This
@@ -167,12 +173,6 @@ struct proc {
                                     * processes share virtual addresses). */
     uint32_t         futex_phys;   /* physical addr of the futex word (shared only),
                                     * resolved at WAIT time for cross-process match. */
-    uint8_t          wait_bt_n;   /* [wbt] user-stack backtrace captured at the
-                                   * moment this thread blocked (futex/poll):
-                                   * call-preceded return addresses inside
-                                   * libxul's text, for offline symbolization
-                                   * of the Firefox startup wedge. */
-    uint32_t         wait_bt[28];
 
     /* Current working directory (absolute path, always starts with '/') */
     char             cwd[256];
@@ -198,12 +198,25 @@ struct proc {
     int              no_preempt;
 
     /* Threads: thread-group id (== leader pid; getpid returns this) and
-     * the user TLS segment base loaded into the GDT on context switch. */
+     * the user TLS segment base loaded into the GDT on context switch.
+     * `parent` above always points at a thread-group LEADER (Linux real_parent
+     * is current->group_leader): children belong to the process, so any thread
+     * of the parent can wait for them, and CLONE_THREAD siblings inherit the
+     * leader's parent rather than being "children" of the creating thread. */
     int              tgid;
     uint32_t         tls_base;
     /* CLONE_CHILD_CLEARTID address: on thread exit the kernel writes 0 here
      * and futex-wakes it — this is how pthread_join() learns a thread ended. */
     uint32_t         clear_child_tid;
+    /* CLONE_CHILD_SETTID for a fork-style clone: the child's tid must be
+     * written into the CHILD's copy of the address space, so it is done by
+     * the child itself on first dispatch (forkret), like Linux schedule_tail. */
+    uint32_t         set_child_tid;
+    /* CLONE_VM without CLONE_THREAD (vfork, posix_spawn, Breakpad's dumper):
+     * the child is its own thread group but runs in the creator's address
+     * space, whose VMA list and mmap cursor live on that group's leader.
+     * mmap_owner() follows this pointer; cleared by exec (own pgdir). */
+    struct proc     *vm_owner;
 
     /* set_robust_list head: user pointer to this thread's list of held robust
      * mutexes.  On exit the kernel walks it, marks each owned futex
@@ -269,6 +282,20 @@ extern struct proc ptable[];
 
 /* Allocate an EMBRYO slot and set up its kernel stack */
 struct proc *allocproc(void);
+
+/* The thread-group leader of p (the proc whose pid == p->tgid); p itself if
+ * the leader slot is gone. */
+struct proc *proc_group_leader(struct proc *p);
+
+/* Free a ZOMBIE's kernel stack and page directory and return its slot (Linux
+ * release_task).  Called by waitpid for a reaped process, by the scheduler for
+ * an exited non-leader thread, and for orphans adopted by init. */
+void proc_release(struct proc *p);
+
+/* True if no thread of leader's group other than the leader itself is still
+ * alive (Linux thread_group_empty); exited threads awaiting release count as
+ * gone. */
+int proc_group_empty(struct proc *leader);
 
 /* Initialize the process subsystem */
 void proc_init(void);

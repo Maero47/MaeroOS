@@ -186,21 +186,6 @@ int usocket_read(usocket_t *s, void *buf, int len, int nonblock) {
         if (b->writer_closed) return 0;                /* EOF */
         if (nonblock) return -11;
         if (signal_interrupt_pending(current_proc)) return -4;
-        {   /* FLOW TRACE: a firefox thread about to BLOCK in read with an empty
-             * rx buffer — log which socket end so we can pair it with the [uflow]
-             * WR side and see if the writer ever targets this rx. */
-            extern volatile int g_ipc_launch_started;
-            static int sr = 0;
-            if (g_ipc_launch_started && sr < 200 && current_proc &&
-                current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-                current_proc->name[4]=='f') {
-                sr++;
-                printk("[uflow] RDBLK pid=%d t%d rx=%x tx=%x wclosed=%d\n",
-                       current_proc->pid, current_proc->tgid,
-                       (unsigned)(uintptr_t)s->rx, (unsigned)(uintptr_t)s->tx,
-                       b->writer_closed);
-            }
-        }
         sleep_on(b);
     }
     int take = len;
@@ -254,30 +239,6 @@ int usocket_write(usocket_t *s, const void *buf, int len, int nonblock) {
         b->total_in += (uint32_t)put;
         wake_up(b);                                    /* wake blocked readers */
         io_wake();
-    }
-    {   /* [swk] launch-phase diag: a 1-byte write to an AF_UNIX socketpair is a
-         * MessagePumpLibevent::ScheduleWork() wakeup kick.  Log it + the peer
-         * rx buffer count so we can see if the IO thread's epoll should fire. */
-        extern volatile int g_ipc_launch_started;
-        extern volatile unsigned g_ff_io_nudge;
-        if (g_ipc_launch_started && current_proc &&
-            current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-            current_proc->name[4]=='f') {
-            /* A firefox unix-socket write during launch = IPC traffic / dispatch;
-             * nudge so epoll-parked firefox IO threads self-heal immediately. */
-            g_ff_io_nudge++;
-            /* FLOW TRACE: who wrote how much to which socket-pair end.  Lets us
-             * see whether the content CHILD wrote its hello (and to which sock)
-             * and whether the parent ever wrote back — to locate the lost
-             * handshake message in the parent↔child exchange. */
-            static int sw = 0;
-            if (sw < 200) { sw++;
-                printk("[uflow] WR pid=%d t%d tx=%x rx=%x len=%d txcount=%d\n",
-                       current_proc->pid, current_proc->tgid,
-                       (unsigned)(uintptr_t)s->tx, (unsigned)(uintptr_t)s->rx,
-                       n, s->tx ? (int)s->tx->count : -1);
-            }
-        }
     }
     return n;
 }

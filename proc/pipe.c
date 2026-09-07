@@ -50,21 +50,6 @@ int pipe_read(pipe_buf_t *p, char *buf, int len, int nonblock) {
     return n;
 }
 
-/* Inject a single wakeup byte into a pipe from kernel context (no current_proc
- * write semantics).  Used by the epoll self-heal to wake a parked libevent IO
- * thread the SAME way MessagePumpLibevent::ScheduleWork would — by making its
- * self-pipe genuinely readable — so its OnWakeup read() returns a real byte
- * instead of blocking on an empty pipe.  Returns 1 if a byte was added. */
-int pipe_inject_byte(pipe_buf_t *p) {
-    if (!p || p->count >= PIPE_BUF_SIZE) return 0;
-    uint32_t tail = (p->head + p->count) % PIPE_BUF_SIZE;
-    p->data[tail] = 0;
-    p->count++;
-    wake_up(p);
-    io_wake();
-    return 1;
-}
-
 int pipe_write(pipe_buf_t *p, const char *buf, int len, int nonblock) {
     if (len <= 0) return 0;
     if (p->nreaders == 0) {
@@ -89,21 +74,6 @@ int pipe_write(pipe_buf_t *p, const char *buf, int len, int nonblock) {
         }
         wake_up(p);   /* wake any blocked readers */
         io_wake();
-    }
-    {   /* [pwk] launch-phase diag: a 1-byte pipe write is a
-         * MessagePumpLibevent::ScheduleWork() wakeup kick (the wakeup fd is a
-         * pipe).  Log it + the pipe's reader count so we can see whether the
-         * IO thread's epoll should fire. */
-        extern volatile int g_ipc_launch_started;
-        extern volatile unsigned g_ff_io_nudge;
-        if (g_ipc_launch_started && current_proc &&
-            current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-            current_proc->name[4]=='f') {
-            /* A firefox pipe write during the launch phase is a dispatch/IPC
-             * signal — bump the nudge counter so any firefox IO thread parked in
-             * epoll_wait self-heals IMMEDIATELY (event-driven, not every 150ms). */
-            g_ff_io_nudge++;
-        }
     }
     return n;
 }

@@ -22,10 +22,14 @@ void yield(void);
 void resched_on_return(void);
 
 /*
- * Sleep on a channel until wake_up(chan) is called.
- * Sets state = PROC_SLEEPING, saves context, returns when woken.
+ * Sleep on a channel until wake_up(chan) is called, a deliverable signal
+ * arrives, or the deadline the caller stored in current_proc->wake_tick passes.
+ * Sets state = PROC_SLEEPING, saves context, returns when woken.  Returns 1 if
+ * the sleep ended because the wake_tick deadline fired (the caller then reports
+ * a timeout, e.g. FUTEX_WAIT -> -ETIMEDOUT), 0 for any other wake.  wake_tick is
+ * always consumed: no stale deadline survives into a later untimed sleep.
  */
-void sleep_on(void *chan);
+int sleep_on(void *chan);
 
 /* Wake all processes sleeping on chan */
 void wake_up(void *chan);
