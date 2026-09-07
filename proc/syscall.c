@@ -1256,6 +1256,187 @@ static int sys_brk(registers_t *regs) {
 }
 
 /* ── sys_exec(const char *path, char **argv, char **envp) — EAX=11 ──────── */
+/* ── execve() argument collection ─────────────────────────────────────────────
+ * Linux copies argv/envp out of the OLD address space before the point of no
+ * return (fs/exec.c copy_strings) and bounds them two ways: MAX_ARG_STRLEN
+ * (32 pages) per string, and bprm_stack_limits() — a quarter of RLIMIT_STACK
+ * — for the whole block including the pointer arrays.  Past either it returns
+ * -E2BIG.  MaeroOS advertises an 8 MiB main-thread stack (paging.c grows it on
+ * fault), so the same quarter rule gives a 2 MiB ARG_MAX.
+ *
+ * The strings land in one growable kernel buffer and the vector holds byte
+ * OFFSETS into it, so growing the buffer never invalidates the vector. */
+#define EXEC_MAX_ARG_STRLEN  (32U * PAGE_SIZE)          /* Linux MAX_ARG_STRLEN */
+#define EXEC_STACK_LIMIT     (8U * 1024U * 1024U)       /* our RLIMIT_STACK */
+#define EXEC_ARG_MAX         (EXEC_STACK_LIMIT / 4U)    /* Linux bprm_stack_limits */
+#define EXEC_MAX_ARG_STRINGS 4096                       /* Linux MAX_ARG_STRINGS */
+
+struct exec_strings {
+    char     *buf;   uint32_t used, cap;    /* NUL-separated string bytes */
+    uint32_t *off;   uint32_t n,    ncap;   /* offset of each string in buf */
+};
+
+static void es_init(struct exec_strings *v) {
+    v->buf = NULL; v->used = v->cap = 0;
+    v->off = NULL; v->n = v->ncap = 0;
+}
+
+static void es_free(struct exec_strings *v) {
+    if (v->buf) kfree(v->buf);
+    if (v->off) kfree(v->off);
+    es_init(v);
+}
+
+/* Make room for `need` more string bytes.  Doubling, so a long argv is linear. */
+static int es_reserve(struct exec_strings *v, uint32_t need) {
+    if (v->used + need <= v->cap) return 0;
+    uint32_t cap = v->cap ? v->cap : 512;
+    while (cap < v->used + need) cap *= 2;
+    char *nb = (char *)kmalloc(cap);
+    if (!nb) return -12;
+    if (v->buf) { __builtin_memcpy(nb, v->buf, v->used); kfree(v->buf); }
+    v->buf = nb; v->cap = cap;
+    return 0;
+}
+
+/* Record `off` as the start of the next string. */
+static int es_index(struct exec_strings *v, uint32_t off) {
+    if (v->n >= EXEC_MAX_ARG_STRINGS) return -7;        /* -E2BIG */
+    if (v->n == v->ncap) {
+        uint32_t ncap = v->ncap ? v->ncap * 2 : 16;
+        uint32_t *no = (uint32_t *)kmalloc(ncap * sizeof(uint32_t));
+        if (!no) return -12;
+        if (v->off) {
+            __builtin_memcpy(no, v->off, v->n * sizeof(uint32_t));
+            kfree(v->off);
+        }
+        v->off = no; v->ncap = ncap;
+    }
+    v->off[v->n++] = off;
+    return 0;
+}
+
+/* Append a kernel string (len excludes the NUL). */
+static int es_push(struct exec_strings *v, const char *str, uint32_t len) {
+    if (es_reserve(v, len + 1) < 0) return -12;
+    uint32_t start = v->used;
+    __builtin_memcpy(v->buf + start, str, len);
+    v->buf[start + len] = '\0';
+    v->used = start + len + 1;
+    int rc = es_index(v, start);
+    if (rc < 0) v->used = start;
+    return rc;
+}
+
+/* Append a NUL-terminated USER string.  Copied in page-bounded chunks (a
+ * string may run right up to the end of a mapped page but never past it), not
+ * byte by byte — the strings Linux allows are up to 128 KiB. */
+static int es_push_user(struct exec_strings *v, const char *up) {
+    uint32_t start = v->used, got = 0;
+    for (;;) {
+        uint32_t chunk = PAGE_SIZE - (((uint32_t)(uintptr_t)up + got) & (PAGE_SIZE - 1));
+        v->used = start + got;
+        if (es_reserve(v, chunk) < 0) { v->used = start; return -12; }
+        if (copy_from_user(v->buf + start + got, up + got, chunk) < 0) {
+            v->used = start;
+            return -14;
+        }
+        for (uint32_t i = 0; i < chunk; i++)
+            if (v->buf[start + got + i] == '\0') {
+                v->used = start + got + i + 1;
+                int rc = es_index(v, start);
+                if (rc < 0) v->used = start;
+                return rc;
+            }
+        got += chunk;
+        if (got > EXEC_MAX_ARG_STRLEN) { v->used = start; return -7; }  /* -E2BIG */
+    }
+}
+
+/* Copy a whole NULL-terminated user vector (argv or envp). */
+static int es_push_user_vec(struct exec_strings *v, char **uvec) {
+    if (!uvec || !access_ok(uvec, sizeof(char *))) return 0;
+    for (uint32_t i = 0; ; i++) {
+        char *up = NULL;
+        if (copy_from_user(&up, &uvec[i], sizeof(up)) < 0) return -14;
+        if (!up) return 0;
+        int rc = es_push_user(v, up);
+        if (rc < 0) return rc;
+    }
+}
+
+/* Linux de_thread() (fs/exec.c): a thread that execve()s first kills every
+ * other thread of its group and waits for them to be gone; if the caller is
+ * not the group leader it then takes over the leader's identity (Linux
+ * exchange_tids() + release_task(leader)) so the new image runs single-
+ * threaded under the PROCESS's pid.  Called only past the point of no return.
+ * Returns with current_proc as the sole, leading thread of its group. */
+static void de_thread(void) {
+    struct proc *me   = current_proc;
+    int          tgid = me->tgid;
+    int          others = 0;
+
+    /* zap_other_threads(): SIGKILL every sibling. */
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (q == me || q->state == PROC_UNUSED || q->tgid != tgid) continue;
+        others = 1;
+        if (q->state != PROC_ZOMBIE) signal_send(q, SIGKILL);
+    }
+    if (!others) return;                       /* already the whole process */
+
+    /* Wait for them to die.  A killed sibling becomes a zombie and the
+     * scheduler releases it; the group LEADER's zombie stays for us to take
+     * over below, so it does not count as alive here. */
+    for (int guard = 0; guard < 200000; guard++) {
+        int alive = 0;
+        for (int i = 0; i < MAX_PROCS; i++) {
+            struct proc *q = &ptable[i];
+            if (q == me || q->state == PROC_UNUSED || q->tgid != tgid) continue;
+            if (q->state == PROC_ZOMBIE && q->pid == tgid) continue;   /* leader */
+            alive = 1;
+            break;
+        }
+        if (!alive) break;
+        yield();
+    }
+
+    /* A sibling dying from our SIGKILL runs the fatal-signal path, which ends
+     * the whole THREAD GROUP (proc_group_exit) — us included: it stamps a
+     * "killed by signal 9" status on the leader and queues SIGKILL on every
+     * other member.  Linux suppresses exactly that while an execve is taking
+     * the group over (signal_struct.group_exec_task).  Every sibling is gone
+     * by this point, so undo the collateral damage here: the process is not
+     * dying, it is being taken over. */
+    me->pending_sigs &= ~(1u << SIGKILL);
+    me->group_exit    = 0;
+    me->exit_status   = 0;
+
+    if (me->pid == tgid) return;               /* the caller IS the leader */
+
+    /* Take over the leader's pid: the process keeps the identity its parent
+     * knows and waits for, and the old leader's slot is freed. */
+    struct proc *leader = NULL;
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (&ptable[i] != me && ptable[i].state != PROC_UNUSED &&
+            ptable[i].pid == tgid) { leader = &ptable[i]; break; }
+    if (leader) {
+        me->parent     = leader->parent;
+        me->pgrp       = leader->pgrp;
+        me->sid        = leader->sid;
+        leader->group_exit = 0;
+        /* The process's children belong to the surviving thread now. */
+        for (int i = 0; i < MAX_PROCS; i++)
+            if (ptable[i].state != PROC_UNUSED && ptable[i].parent == leader)
+                ptable[i].parent = me;
+        if (leader->state == PROC_ZOMBIE)
+            proc_release(leader);
+        else
+            leader->tgid = leader->pid;        /* refused to die: detach it */
+    }
+    me->pid = tgid;
+}
+
 static int sys_exec(registers_t *regs) {
     const char *upath = (const char *)(uintptr_t)regs->ebx;
 
@@ -1268,70 +1449,30 @@ static int sys_exec(registers_t *regs) {
     if (r < 0) return r;
 
     /* Copy argv + envp strings from user space into kernel buffers (before CR3 swap) */
-#define EXEC_MAXARGS 64
-#define EXEC_ARGBUF  8192
 /* Load bases for position-independent objects: PIEs go low, the dynamic
  * linker (ld-musl) goes at the bottom of the mmap region (mmap_next is then
  * bumped above it so anonymous maps never clobber the interpreter image). */
 #define EXEC_PIE_BASE    0x10000000U
 #define EXEC_INTERP_BASE 0x40000000U
-    char *argbuf = (char *)kmalloc(EXEC_ARGBUF);
-    if (!argbuf) return -12;
-    const char *kargv[EXEC_MAXARGS + 1];
-    const char *kenvp[EXEC_MAXARGS + 1];
-    int  argc        = 0;
-    int  envc        = 0;
-    int  argbuf_used = 0;
-
-    /* Copy argv */
-    char **uargv = (char **)(uintptr_t)regs->ecx;
-    if (uargv && access_ok(uargv, sizeof(char *))) {
-        while (argc < EXEC_MAXARGS) {
-            char *uarg = NULL;
-            if (copy_from_user(&uarg, &uargv[argc], sizeof(uarg)) < 0) {
-                kfree(argbuf);
-                return -14;
-            }
-            if (!uarg) break;
-            if (!access_ok(uarg, 1)) break;
-            if (argbuf_used >= EXEC_ARGBUF - 1) break;
-            int n = copy_user_str(uarg, argbuf + argbuf_used,
-                                  EXEC_ARGBUF - argbuf_used - 1);
-            if (n < 0) break;
-            kargv[argc] = argbuf + argbuf_used;
-            argbuf_used += n + 1;
-            argc++;
-        }
-    }
-    kargv[argc] = NULL;
-
-    /* Copy envp */
-    char **uenvp = (char **)(uintptr_t)regs->edx;
-    if (uenvp && access_ok(uenvp, sizeof(char *))) {
-        while (envc < EXEC_MAXARGS) {
-            char *uenv = NULL;
-            if (copy_from_user(&uenv, &uenvp[envc], sizeof(uenv)) < 0) {
-                kfree(argbuf);
-                return -14;
-            }
-            if (!uenv) break;
-            if (!access_ok(uenv, 1)) break;
-            if (argbuf_used >= EXEC_ARGBUF - 1) break;
-            int n = copy_user_str(uenv, argbuf + argbuf_used,
-                                  EXEC_ARGBUF - argbuf_used - 1);
-            if (n < 0) break;
-            kenvp[envc] = argbuf + argbuf_used;
-            argbuf_used += n + 1;
-            envc++;
-        }
-    }
-    kenvp[envc] = NULL;
+    struct exec_strings av, ev;
+    es_init(&av);
+    es_init(&ev);
+    r = es_push_user_vec(&av, (char **)(uintptr_t)regs->ecx);
+    if (r == 0) r = es_push_user_vec(&ev, (char **)(uintptr_t)regs->edx);
+    if (r == 0 &&
+        av.used + ev.used + (av.n + ev.n + 2) * 4 > EXEC_ARG_MAX)
+        r = -7;                                   /* -E2BIG (bprm_stack_limits) */
+    if (r < 0) { es_free(&av); es_free(&ev); return r; }
+    int argc = (int)av.n;
+    int envc = (int)ev.n;
+#define EXEC_FAIL(err) do { es_free(&av); es_free(&ev); return (err); } while (0)
+#define KARGV(i) (av.buf + av.off[i])
+#define KENVP(i) (ev.buf + ev.off[i])
 
     vfs_node_t *node = vfs_open_at(path);
     if (!node) {
         printk("[execfail] '%s' pid=%d ENOENT (open failed)\n", path, current_proc->pid);
-        kfree(argbuf);
-        return -2;   /* -ENOENT */
+        EXEC_FAIL(-2);   /* -ENOENT */
     }
 
     /* Need execute permission on the binary. */
@@ -1340,8 +1481,7 @@ static int sys_exec(registers_t *regs) {
         printk("[execfail] '%s' pid=%d EACCES (uid=%d gid=%d mode=%o)\n",
                path, current_proc->pid, (int)current_proc->euid,
                (int)current_proc->egid, (unsigned)node->mask);
-        kfree(argbuf);
-        return -13;   /* -EACCES */
+        EXEC_FAIL(-13);   /* -EACCES */
     }
 
     /* set-user-ID bit: run with the file owner's effective uid (e.g. doas,
@@ -1374,68 +1514,29 @@ static int sys_exec(registers_t *regs) {
         interp_arg[ai] = '\0';
 
         if (ii > 0) {
-            /* Rebuild kargv: [interp, interp_arg?, script_path, orig_argv[1..]] */
-            char *argbuf2 = (char *)kmalloc(EXEC_ARGBUF);
-            if (!argbuf2) {
-                kfree(argbuf);
-                return -12;
-            }
-            const char *kargv2[EXEC_MAXARGS + 1];
-            int argc2 = 0, used2 = 0;
-
-            /* interp */
-            int n = ii + 1;
-            __builtin_memcpy(argbuf2 + used2, interp, n);
-            kargv2[argc2++] = argbuf2 + used2; used2 += n;
-
-            /* optional interp arg */
-            if (ai > 0 && argc2 < EXEC_MAXARGS) {
-                n = ai + 1;
-                __builtin_memcpy(argbuf2 + used2, interp_arg, n);
-                kargv2[argc2++] = argbuf2 + used2; used2 += n;
-            }
-
-            /* script path (argv[0] replacement) */
-            int plen = 0; while (path[plen]) plen++; plen++;
-            if (used2 + plen < EXEC_ARGBUF && argc2 < EXEC_MAXARGS) {
-                __builtin_memcpy(argbuf2 + used2, path, plen);
-                kargv2[argc2++] = argbuf2 + used2; used2 += plen;
-            }
-
-            /* original argv[1..] */
-            for (int i = 1; i < argc && argc2 < EXEC_MAXARGS; i++) {
-                int slen = 0; while (kargv[i][slen]) slen++; slen++;
-                if (used2 + slen >= EXEC_ARGBUF) break;
-                __builtin_memcpy(argbuf2 + used2, kargv[i], slen);
-                kargv2[argc2++] = argbuf2 + used2; used2 += slen;
-            }
-            kargv2[argc2] = NULL;
-
-            /* Copy argbuf2 into argbuf and fixup pointers */
-            __builtin_memcpy(argbuf, argbuf2, used2);
-            for (int i = 0; i < argc2; i++)
-                kargv[i] = argbuf + (kargv2[i] - argbuf2);
-            argc = argc2;
-            kargv[argc] = NULL;
-            argbuf_used = used2;
-            kfree(argbuf2);
+            /* Rebuild argv: [interp, interp_arg?, script_path, orig_argv[1..]] */
+            struct exec_strings nv;
+            es_init(&nv);
+            int rc = es_push(&nv, interp, (uint32_t)ii);
+            if (rc == 0 && ai > 0) rc = es_push(&nv, interp_arg, (uint32_t)ai);
+            if (rc == 0) rc = es_push(&nv, path, (uint32_t)__builtin_strlen(path));
+            for (int i = 1; rc == 0 && i < argc; i++)
+                rc = es_push(&nv, KARGV(i), (uint32_t)__builtin_strlen(KARGV(i)));
+            if (rc < 0) { es_free(&nv); EXEC_FAIL(rc); }
+            es_free(&av);
+            av   = nv;
+            argc = (int)av.n;
 
             /* Re-resolve to interpreter */
-            __builtin_memcpy(path, interp, ii + 1);
+            __builtin_memcpy(path, interp, (size_t)ii + 1);
             node = vfs_open_at(path);
-            if (!node) {
-                kfree(argbuf);
-                return -2;
-            }
+            if (!node) EXEC_FAIL(-2);
         }
     }
 
     /* Create new address space */
     uint32_t new_pgdir = pgdir_create();
-    if (!new_pgdir) {
-        kfree(argbuf);
-        return -12;
-    }
+    if (!new_pgdir) EXEC_FAIL(-12);
 
     /*
      * Load the main object.  A static ET_EXEC ignores the bias (fixed VAs);
@@ -1446,8 +1547,7 @@ static int sys_exec(registers_t *regs) {
     elf_info_t einfo;
     if (elf_load_bias(node, new_pgdir, EXEC_PIE_BASE, &einfo) < 0) {
         pgdir_free_user(new_pgdir);
-        kfree(argbuf);
-        return -8;  /* -ENOEXEC */
+        EXEC_FAIL(-8);  /* -ENOEXEC */
     }
     uint32_t prog_entry = einfo.entry;   /* main program entry (AT_ENTRY) */
     uint32_t entry      = einfo.entry;   /* address we actually iret to */
@@ -1483,14 +1583,12 @@ static int sys_exec(registers_t *regs) {
         if (!lnode) {
             printk("[ELF] interpreter '%s' not found\n", einfo.interp);
             pgdir_free_user(new_pgdir);
-            kfree(argbuf);
-            return -2;  /* -ENOENT */
+            EXEC_FAIL(-2);  /* -ENOENT */
         }
         elf_info_t linfo;
         if (elf_load_bias(lnode, new_pgdir, EXEC_INTERP_BASE, &linfo) < 0) {
             pgdir_free_user(new_pgdir);
-            kfree(argbuf);
-            return -8;
+            EXEC_FAIL(-8);
         }
         interp_base = linfo.load_bias;
         entry       = linfo.entry;          /* jump to the dynamic linker */
@@ -1498,65 +1596,70 @@ static int sys_exec(registers_t *regs) {
         if (linfo.heap_end > mmap_floor) mmap_floor = linfo.heap_end;
     }
 
-    /* Allocate and map the new user stack region. */
-    uint32_t stack_top_phys = 0;
-    for (uint32_t va = USER_STACK_BASE; va < USER_STACK_TOP; va += PAGE_SIZE) {
-        uint32_t stack_phys = pmm_alloc_frame();
-        if (!stack_phys) {
-            pgdir_free_user(new_pgdir);
-            kfree(argbuf);
-            return -12;
-        }
-        pmm_frame_incref(stack_phys);
-        pgdir_map(new_pgdir, va, stack_phys,
-                  PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-        if (va == USER_STACK_TOP - PAGE_SIZE)
-            stack_top_phys = stack_phys;
-    }
-
     /*
-     * Build the ABI stack frame via temp mapping.
+     * Build the initial-stack image in a kernel buffer first, then copy it
+     * into the new stack's frames.  Linux (fs/exec.c) puts the argv/envp
+     * strings at the very top of the stack and the argc/argv[]/envp[]/auxv
+     * frame just below them; the whole thing spans as many pages as it needs,
+     * which is what lets a 64 KiB argument or a 6 KiB environment through.
+     * Bytes below `str_off` are unused (the image is packed top-down).
      *
      * Layout (high address at top):
-     *   [envp strings, NUL-terminated, packed from top downward]
-     *   [argv strings, NUL-terminated, packed below envp strings]
-     *   [envp pointer array: envp[0]..envp[envc-1], NULL]
-     *   [argv pointer array: argv[0]..argv[argc-1], NULL]
-     *   [uint32_t envp* = &envp[0]] ← frame[3]
-     *   [uint32_t argv* = &argv[0]] ← frame[2]
-     *   [uint32_t argc             ]← frame[1]
-     *   [uint32_t retaddr = 0      ]← frame[0]  ← ESP points here
+     *   [envp strings, NUL-terminated, packed from the top downward]
+     *   [argv strings, NUL-terminated, packed below the envp strings]
+     *   [AT_RANDOM 16 bytes, AT_EXECFN path]
+     *   [argc, argv[0..argc-1], NULL, envp[0..envc-1], NULL, auxv, AT_NULL]
+     *                                                           ← ESP here
      */
-    uint8_t *kstack = (uint8_t *)paging_temp_map(stack_top_phys);
-    /* user-space base of stack page */
-    uint32_t ustack_base = USER_STACK_TOP - PAGE_SIZE;
+    uint32_t path_len = (uint32_t)__builtin_strlen(path);
+    uint32_t img_cap  = av.used + ev.used + 16 + path_len + 1 +
+                        ((uint32_t)argc + (uint32_t)envc + 4 + 2 * 20 + 2) * 4 +
+                        64;                        /* alignment slack */
+    img_cap = (img_cap + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
+    /* The image must stay inside the 8 MiB stack the kernel is prepared to
+     * grow; ARG_MAX already guarantees it, this is the belt-and-braces check. */
+    if (img_cap > EXEC_STACK_LIMIT - PAGE_SIZE) {
+        pgdir_free_user(new_pgdir);
+        EXEC_FAIL(-7);                             /* -E2BIG */
+    }
+    uint8_t *kstack = (uint8_t *)kmalloc(img_cap);
+    if (!kstack) {
+        pgdir_free_user(new_pgdir);
+        EXEC_FAIL(-12);
+    }
+    __builtin_memset(kstack, 0, img_cap);
+    /* kstack[i] will live at this user address: */
+    uint32_t ustack_base = USER_STACK_TOP - img_cap;
 
-    /* Pack strings from the top of the page downward: envp first, then argv */
-    uint32_t str_off = PAGE_SIZE;   /* offset into the page (from base) */
+    /* User addresses of each packed string (the frame's pointer arrays). */
+    uint32_t *uargv_ptrs = (uint32_t *)kmalloc(((uint32_t)argc + 1) * 4);
+    uint32_t *uenvp_ptrs = (uint32_t *)kmalloc(((uint32_t)envc + 1) * 4);
+    if (!uargv_ptrs || !uenvp_ptrs) {
+        if (uargv_ptrs) kfree(uargv_ptrs);
+        if (uenvp_ptrs) kfree(uenvp_ptrs);
+        kfree(kstack);
+        pgdir_free_user(new_pgdir);
+        EXEC_FAIL(-12);
+    }
+
+    /* Pack strings from the top of the image downward: envp first, then argv */
+    uint32_t str_off = img_cap;
 
     /* Pack envp strings */
-    uint32_t uenvp_ptrs[EXEC_MAXARGS + 1];
     for (int i = envc - 1; i >= 0; i--) {
-        uint32_t slen = 0;
-        while (kenvp[i][slen]) slen++;
-        slen++;  /* include NUL */
+        uint32_t slen = (uint32_t)__builtin_strlen(KENVP(i)) + 1;  /* with NUL */
         str_off -= slen;
-        __builtin_memcpy(kstack + str_off, kenvp[i], slen);
+        __builtin_memcpy(kstack + str_off, KENVP(i), slen);
         uenvp_ptrs[i] = ustack_base + str_off;
     }
-    uenvp_ptrs[envc] = 0;  /* NULL terminator */
 
     /* Pack argv strings */
-    uint32_t uargv_ptrs[EXEC_MAXARGS + 1];
     for (int i = argc - 1; i >= 0; i--) {
-        uint32_t slen = 0;
-        while (kargv[i][slen]) slen++;
-        slen++;  /* include NUL */
+        uint32_t slen = (uint32_t)__builtin_strlen(KARGV(i)) + 1;  /* with NUL */
         str_off -= slen;
-        __builtin_memcpy(kstack + str_off, kargv[i], slen);
+        __builtin_memcpy(kstack + str_off, KARGV(i), slen);
         uargv_ptrs[i] = ustack_base + str_off;
     }
-    uargv_ptrs[argc] = 0;  /* NULL terminator */
 
     /*
      * Linux i386 process-entry stack (what musl/glibc _start expects):
@@ -1570,7 +1673,8 @@ static int sys_exec(registers_t *regs) {
      * Our own crt0.asm reads the same layout (argv = esp+4).
      */
 
-    /* 16 random bytes for AT_RANDOM (stack canaries) */
+    /* 16 random bytes for AT_RANDOM (stack canaries).  ustack_base is page
+     * aligned, so aligning the offset aligns the user address too. */
     str_off -= 16;
     str_off &= ~3U;
     random_get_bytes(kstack + str_off, 16);
@@ -1579,11 +1683,9 @@ static int sys_exec(registers_t *regs) {
     /* A copy of the executable path for AT_EXECFN (glibc __progname, dl checks). */
     uint32_t at_execfn_uaddr = 0;
     {
-        int plen = 0;
-        while (path[plen] && plen < 255) plen++;
-        str_off -= (uint32_t)(plen + 1);
+        str_off -= path_len + 1;
         str_off &= ~3U;
-        __builtin_memcpy(kstack + str_off, path, (size_t)(plen + 1));
+        __builtin_memcpy(kstack + str_off, path, (size_t)path_len + 1);
         at_execfn_uaddr = ustack_base + str_off;
     }
 
@@ -1650,7 +1752,43 @@ static int sys_exec(registers_t *regs) {
     }
 
     uint32_t user_esp = ustack_base + str_off;
-    paging_temp_unmap();
+
+    /* Allocate and map the new user stack region, filling in the image as we
+     * go.  It is at least USER_STACK_PAGES long, and longer when the initial
+     * stack needs it; the fault handler grows it further (paging.c). */
+    {
+        uint32_t stack_base = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
+        if (ustack_base < stack_base) stack_base = ustack_base;
+        for (uint32_t va = stack_base; va < USER_STACK_TOP; va += PAGE_SIZE) {
+            uint32_t stack_phys = pmm_alloc_frame();
+            if (!stack_phys) {
+                kfree(uargv_ptrs);
+                kfree(uenvp_ptrs);
+                kfree(kstack);
+                pgdir_free_user(new_pgdir);
+                EXEC_FAIL(-12);
+            }
+            pmm_frame_incref(stack_phys);
+            preempt_disable();
+            uint8_t *kp = (uint8_t *)paging_temp_map(stack_phys);
+            __builtin_memset(kp, 0, PAGE_SIZE);
+            if (va + PAGE_SIZE > ustack_base) {     /* part of the image lands here */
+                uint32_t src = va - ustack_base;    /* va >= ustack_base always */
+                __builtin_memcpy(kp, kstack + src, PAGE_SIZE);
+            }
+            paging_temp_unmap();
+            preempt_enable();
+            pgdir_map(new_pgdir, va, stack_phys,
+                      PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        }
+    }
+    kfree(uargv_ptrs);
+    kfree(uenvp_ptrs);
+    kfree(kstack);
+
+    /* Point of no return (Linux begin_new_exec): every other thread of this
+     * process dies here and the caller becomes the group leader (audit C3). */
+    de_thread();
 
     /* Close any FD_CLOEXEC file descriptors (before CR3 swap) */
     for (int i = 0; i < MAX_FD; i++) {
@@ -1675,6 +1813,12 @@ static int sys_exec(registers_t *regs) {
     current_proc->egid       = new_egid;
     current_proc->tgid       = current_proc->pid;  /* exec → new thread-group leader */
     current_proc->vm_owner   = NULL;               /* own address space from here */
+    /* Linux begin_new_exec(): the new image inherits none of the old thread's
+     * per-thread user-memory hooks — they point into an address space that no
+     * longer exists, and honouring them at exit would scribble on the new one. */
+    current_proc->clear_child_tid  = 0;
+    current_proc->set_child_tid    = 0;
+    current_proc->robust_list_head = 0;
     vfork_wake_parent();         /* CLONE_VFORK: we have our own pgdir now */
 
     /* Store executable path for /proc/self/exe */
@@ -1697,12 +1841,12 @@ static int sys_exec(registers_t *regs) {
     }
 
     /* Capture argv/envp (NUL-separated, NUL-terminated) for /proc/self/cmdline
-     * and /proc/self/environ.  kargv/kenvp still point into argbuf (kernel heap,
-     * page-table independent) here, before kfree(argbuf). */
+     * and /proc/self/environ.  KARGV/KENVP still point into the kernel-heap
+     * collectors (page-table independent) here, before es_free(). */
     {
         uint32_t cl = 0;
-        for (int i = 0; i < argc && kargv[i]; i++) {
-            const char *s = kargv[i];
+        for (int i = 0; i < argc; i++) {
+            const char *s = KARGV(i);
             while (*s && cl < sizeof(current_proc->cmdline) - 1)
                 current_proc->cmdline[cl++] = *s++;
             if (cl < sizeof(current_proc->cmdline)) current_proc->cmdline[cl++] = '\0';
@@ -1710,8 +1854,8 @@ static int sys_exec(registers_t *regs) {
         current_proc->cmdline_len = cl;
 
         uint32_t el = 0;
-        for (int i = 0; i < envc && kenvp[i]; i++) {
-            const char *s = kenvp[i];
+        for (int i = 0; i < envc; i++) {
+            const char *s = KENVP(i);
             while (*s && el < sizeof(current_proc->environ) - 1)
                 current_proc->environ[el++] = *s++;
             if (el < sizeof(current_proc->environ)) current_proc->environ[el++] = '\0';
@@ -1762,7 +1906,7 @@ static int sys_exec(registers_t *regs) {
      * firefox-bin (the "profile cannot be loaded" modal implies it doesn't). */
     if (path[0] && dbg_str_has(path, "firefox")) {
         for (int ai = 0; ai < argc && ai < 20; ai++)
-            printk("[argv] pid=%d [%d]='%s'\n", current_proc->pid, ai, kargv[ai]);
+            printk("[argv] pid=%d [%d]='%s'\n", current_proc->pid, ai, KARGV(ai));
         /* [fdtab] For a CONTENT process (-contentproc), dump the inherited fd
          * table right after exec: which fd numbers survived, and their types.
          * Chromium remaps the prefMap/jsInit shared-memory memfds (FD_FILE=1) to
@@ -1770,7 +1914,7 @@ static int sys_exec(registers_t *regs) {
          * FD_NONE(0) instead, the remapping/inheritance is broken → mmap EBADF. */
         int is_content = 0;
         for (int ai = 1; ai < argc && ai < 4; ai++)
-            if (dbg_str_has(kargv[ai], "contentproc")) is_content = 1;
+            if (dbg_str_has(KARGV(ai), "contentproc")) is_content = 1;
         if (is_content) {
             for (int fd = 0; fd < MAX_FD; fd++) {
                 int ty = (int)current_proc->ofile[fd].type;
@@ -1785,7 +1929,11 @@ static int sys_exec(registers_t *regs) {
     }
     /* (watchpoint_arm exists for KVM/real-hw debugging of the GTK heap race;
      * QEMU TCG ignores guest DR registers so it's not armed here.) */
-    kfree(argbuf);
+    es_free(&av);
+    es_free(&ev);
+#undef KARGV
+#undef KENVP
+#undef EXEC_FAIL
     return 0;  /* trapret irets to entry */
 }
 
@@ -3115,11 +3263,19 @@ static struct shmap_entry *shmap_get(vfs_node_t *node) {
     return free_e;
 }
 
+/* memfd nodes store their data IN this registry (see shmem_read below), so
+ * there is no separate file body to seed a fresh frame from. */
+static uint32_t shmem_read(vfs_node_t *, uint32_t, uint32_t, uint8_t *);
+static int node_is_shmem(vfs_node_t *n) { return n && n->read_fn == shmem_read; }
+
 /* Get (allocating + initialising from file content on first touch) the shared
  * physical frame backing page `pg` of the file. */
 static uint32_t shmap_frame(struct shmap_entry *e, vfs_node_t *node, uint32_t pg) {
     if (pg >= e->npages) {
-        uint32_t newn = pg + 16;
+        /* Double, never grow by a constant: a 64 MiB memfd is 16384 pages and
+         * a +16 step would recopy the table on every page (O(n^2)). */
+        uint32_t newn = e->npages ? e->npages * 2 : 16;
+        if (newn < pg + 16) newn = pg + 16;
         uint32_t *nf = (uint32_t *)kmalloc(newn * sizeof(uint32_t));
         if (!nf) return 0;
         __builtin_memset(nf, 0, newn * sizeof(uint32_t));
@@ -3136,11 +3292,112 @@ static uint32_t shmap_frame(struct shmap_entry *e, vfs_node_t *node, uint32_t pg
     pmm_frame_incref(phys);                  /* registry holds one ref */
     uint8_t *kp = (uint8_t *)paging_temp_map(phys);
     __builtin_memset(kp, 0, PAGE_SIZE);
-    if (node->read_fn)                       /* preserve any pre-written content */
+    if (node->read_fn && !node_is_shmem(node))  /* preserve any pre-written content */
         vfs_read(node, pg * PAGE_SIZE, PAGE_SIZE, kp);
     paging_temp_unmap();
     e->frames[pg] = phys;
     return phys;
+}
+
+/* ── memfd (shmem) file backing ──────────────────────────────────────────────
+ * Linux: a memfd is a shmem inode whose page-cache pages ARE the pages a
+ * MAP_SHARED mapping maps (mm/memfd.c, mm/shmem.c).  read(2)/write(2) and
+ * stores through a mapping therefore hit the same frames, and the file costs
+ * one frame per touched page instead of a second contiguous copy of it.
+ * Installing these three operations on a memfd node makes the shmap registry
+ * above that file's only storage, which is what makes the two views coherent
+ * (audit M5).
+ *
+ * They use the SECOND temp-map slot: the page-population path holds slot 1
+ * across its fill, and a private mapping of a memfd page can reach vfs_read()
+ * from inside that. */
+
+/* Move `n` bytes between file page frame `phys` (at byte `in` within it) and
+ * the caller's buffer, through a small bounce buffer.  The caller's buffer is
+ * often a demand-paged USER page: faulting it in populates its frame through
+ * the same temp-map slots, so the slot must not be held across that touch. */
+static void shmem_bounce(uint32_t phys, uint32_t in, uint8_t *buf, uint32_t n,
+                         int to_frame) {
+    uint8_t tmp[256];
+    for (uint32_t done = 0; done < n; ) {
+        uint32_t k = n - done;
+        if (k > sizeof tmp) k = sizeof tmp;
+        if (to_frame) __builtin_memcpy(tmp, buf + done, k);
+        preempt_disable();
+        uint8_t *kp = (uint8_t *)paging_temp_map2(phys);
+        if (to_frame) __builtin_memcpy(kp + in + done, tmp, k);
+        else          __builtin_memcpy(tmp, kp + in + done, k);
+        paging_temp_unmap2();
+        preempt_enable();
+        if (!to_frame) __builtin_memcpy(buf + done, tmp, k);
+        done += k;
+    }
+}
+
+static uint32_t shmem_read(vfs_node_t *node, uint32_t off, uint32_t len,
+                           uint8_t *buf) {
+    if (off >= node->size) return 0;
+    if (len > node->size - off) len = node->size - off;
+    struct shmap_entry *e = shmap_lookup(node);
+    uint32_t done = 0;
+    while (done < len) {
+        uint32_t pos = off + done;
+        uint32_t in  = pos & (PAGE_SIZE - 1);
+        uint32_t n   = PAGE_SIZE - in;
+        if (n > len - done) n = len - done;
+        uint32_t phys = shmap_peek(e, pos / PAGE_SIZE);
+        if (phys) shmem_bounce(phys, in, buf + done, n, 0);
+        else      __builtin_memset(buf + done, 0, n);   /* unwritten page = hole */
+        done += n;
+    }
+    return done;
+}
+
+static uint32_t shmem_write(vfs_node_t *node, uint32_t off, uint32_t len,
+                            const uint8_t *buf) {
+    struct shmap_entry *e = shmap_get(node);
+    if (!e) return 0;
+    uint32_t done = 0;
+    while (done < len) {
+        uint32_t pos = off + done;
+        uint32_t in  = pos & (PAGE_SIZE - 1);
+        uint32_t n   = PAGE_SIZE - in;
+        if (n > len - done) n = len - done;
+        uint32_t phys = shmap_frame(e, node, pos / PAGE_SIZE);
+        if (!phys) break;                          /* out of frames */
+        shmem_bounce(phys, in, (uint8_t *)(uintptr_t)(buf + done), n, 1);
+        done += n;
+    }
+    if (off + done > node->size) node->size = off + done;
+    return done;
+}
+
+/* Linux shmem_setattr/shmem_truncate_range: growing is lazy (the new pages are
+ * holes that read as zero), shrinking drops the pages past the new end and
+ * zeroes the tail of the last partial one. */
+static int shmem_truncate(vfs_node_t *node, uint32_t new_size) {
+    struct shmap_entry *e = shmap_lookup(node);
+    if (e && e->frames && new_size < node->size) {
+        uint32_t tail = new_size & (PAGE_SIZE - 1);
+        if (tail) {
+            uint32_t phys = shmap_peek(e, new_size / PAGE_SIZE);
+            if (phys) {
+                preempt_disable();
+                uint8_t *kp = (uint8_t *)paging_temp_map2(phys);
+                __builtin_memset(kp + tail, 0, PAGE_SIZE - tail);
+                paging_temp_unmap2();
+                preempt_enable();
+            }
+        }
+        for (uint32_t pg = (new_size + PAGE_SIZE - 1) / PAGE_SIZE;
+             pg < e->npages; pg++)
+            if (e->frames[pg]) {
+                pmm_frame_decref(e->frames[pg]);   /* drop the registry ref */
+                e->frames[pg] = 0;
+            }
+    }
+    node->size = new_size;
+    return 0;
 }
 
 /* ── Page population ─────────────────────────────────────────────────────────
@@ -4115,13 +4372,9 @@ static int sys_umask(registers_t *regs) {
     return (int)old_mask;
 }
 
-/* ── sys_mknod(const char *path, mode_t mode, dev_t dev) — EAX=14 ────────── */
-static int sys_mknod(registers_t *regs) {
-    char path[256];
-    if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0) return -14;
-    uint32_t mode = regs->ecx;
-    /* dev = regs->edx (ignored for FIFOs) */
-
+/* Create a FIFO / character device / regular file node at an already-resolved
+ * absolute path.  Shared by mknod(14) and mknodat(297). */
+static int do_mknod(const char *path, uint32_t mode) {
     char dir_path[256], base[256];
     if (path_split(path, dir_path, base) < 0) return -22;
     if (base[0] == '\0') return -22;
@@ -4135,9 +4388,31 @@ static int sys_mknod(registers_t *regs) {
     if (fmt == 0x1000)       vfs_flag = VFS_FLAG_FIFO;    /* S_IFIFO  = 0010000 */
     else if (fmt == 0x2000)  vfs_flag = VFS_FLAG_CHARDEV; /* S_IFCHR  = 0020000 */
     else if (fmt == 0x8000)  vfs_flag = VFS_FLAG_FILE;    /* S_IFREG  = 0100000 */
+    else if (fmt == 0)       vfs_flag = VFS_FLAG_FILE;    /* mode 0 = regular file */
     else return -22;  /* -EINVAL: unsupported type */
 
     return dir->create_fn(dir, base, vfs_flag);
+}
+
+/* ── sys_mknod(const char *path, mode_t mode, dev_t dev) — EAX=14 ────────── */
+static int sys_mknod(registers_t *regs) {
+    char path[256], resolved[256];
+    if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0) return -14;
+    /* dev = regs->edx (ignored for FIFOs) */
+    int r = resolve_path_at_fd(AT_FDCWD, path, resolved, sizeof(resolved));
+    if (r < 0) return r;
+    return do_mknod(resolved, regs->ecx);
+}
+
+/* ── sys_mknodat(dirfd, path, mode, dev) — EAX=297 ───────────────────────────
+ * Linux implements mknod(2) as mknodat(AT_FDCWD, …) (fs/namei.c do_mknodat)
+ * and glibc's mkfifo()/mknod() issue this syscall directly. */
+static int sys_mknodat(registers_t *regs) {
+    char path[256], resolved[256];
+    if (copy_user_str((const char *)(uintptr_t)regs->ecx, path, 256) < 0) return -14;
+    int r = resolve_path_at_fd((int)regs->ebx, path, resolved, sizeof(resolved));
+    if (r < 0) return r;
+    return do_mknod(resolved, regs->edx);
 }
 
 /* ── sys_reboot(magic, magic2, cmd, arg) — EAX=88 ───────────────────────── */
@@ -4312,6 +4587,22 @@ static int sys_ftruncate(registers_t *regs) {
     proc_file_t *f = &current_proc->ofile[fd];
     if (f->type != FD_FILE || !f->node) return -9;
     return vfs_truncate(f->node, (uint32_t)regs->ecx);
+}
+
+/* ── sys_truncate64(path, length_lo, length_hi) — EAX=193 ───────────────────
+ * ── sys_ftruncate64(fd,  length_lo, length_hi) — EAX=194 ───────────────────
+ * Linux i386 carries a 64-bit-offset (f)truncate pair alongside the legacy
+ * 92/93; musl always issues these (src/unistd/{f,}truncate.c pass the length
+ * as the __SYSCALL_LL_O register pair ECX:EDX).  Our files are below 4 GiB, so
+ * a nonzero high word is -EFBIG, exactly what Linux reports past s_maxbytes. */
+static int sys_truncate64(registers_t *regs) {
+    if (regs->edx) return -27;                     /* -EFBIG */
+    return sys_truncate(regs);                     /* ECX already holds the low word */
+}
+
+static int sys_ftruncate64(registers_t *regs) {
+    if (regs->edx) return -27;                     /* -EFBIG */
+    return sys_ftruncate(regs);
 }
 
 /* ── sys_fallocate(fd, mode, offset, len) — EAX=324 ─────────────────────────
@@ -5043,6 +5334,32 @@ static int sys_unlink_kernel_path(const char *path) {
     return vfs_unlink(dir, base);
 }
 
+/* Remove an empty directory (Linux fs/namei.c do_rmdir): -ENOTDIR when the
+ * target is not a directory, -ENOTEMPTY while it still has entries. */
+static int sys_rmdir_kernel_path(const char *path) {
+    vfs_node_t *n = vfs_open(path);
+    if (!n) return -2;
+    if ((n->flags & 0x7U) != VFS_FLAG_DIR) return -20;   /* -ENOTDIR */
+    vfs_dirent_t de;
+    for (uint32_t i = 0; i < 65536 && vfs_readdir(n, i, &de) == 0; i++) {
+        if (de.name[0] == '.' &&
+            (de.name[1] == '\0' || (de.name[1] == '.' && de.name[2] == '\0')))
+            continue;                                    /* "." and ".." */
+        return -39;                                      /* -ENOTEMPTY */
+    }
+    return sys_unlink_kernel_path(path);
+}
+
+/* ── sys_rmdir(path) — EAX=40 ───────────────────────────────────────────── */
+static int sys_rmdir(registers_t *regs) {
+    char path[256], resolved[256];
+    if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, sizeof(path)) < 0)
+        return -14;
+    int r = resolve_path_at_fd(AT_FDCWD, path, resolved, sizeof(resolved));
+    if (r < 0) return r;
+    return sys_rmdir_kernel_path(resolved);
+}
+
 static int sys_mkdirat(registers_t *regs) {
     int dirfd = (int)regs->ebx;
     const char *upath = (const char *)(uintptr_t)regs->ecx;
@@ -5064,6 +5381,9 @@ static int sys_unlinkat(registers_t *regs) {
     if (r < 0) return r;
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
+    /* AT_REMOVEDIR turns unlinkat() into rmdir() (Linux do_unlinkat). */
+    if (flags & AT_REMOVEDIR)
+        return sys_rmdir_kernel_path(resolved);
     return sys_unlink_kernel_path(resolved);
 }
 
@@ -5369,7 +5689,21 @@ static int sys_memfd_create(registers_t *regs) {
     while (seq) { num[n++] = '0' + (seq % 10); seq /= 10; }
     while (n) path[p++] = num[--n];
     path[p] = '\0';
-    return sys_open_kernel_path(path, O_RDWR | O_CREAT | O_TRUNC);
+    int fd = sys_open_kernel_path(path, O_RDWR | O_CREAT | O_TRUNC);
+    if (fd < 0) return fd;
+    /* MFD_CLOEXEC = 0x0001 (Linux mm/memfd.c hands O_CLOEXEC to get_unused_fd). */
+    current_proc->ofile[fd].cloexec = (regs->ecx & 0x1) ? 1 : 0;
+    /* Back the file with the shared page registry rather than a contiguous
+     * tmpfs buffer, so the file's pages and every MAP_SHARED mapping of it are
+     * the same frames (Linux shmem — see shmem_read above). */
+    vfs_node_t *mn = current_proc->ofile[fd].node;
+    if (mn) {
+        mn->read_fn     = shmem_read;
+        mn->write_fn    = shmem_write;
+        mn->truncate_fn = shmem_truncate;
+        mn->size        = 0;
+    }
+    return fd;
 }
 
 /* Helper: find a process by pid in the global table. */
@@ -6209,18 +6543,29 @@ static int socket_arg_count(int call) {
     case 15: return 5; /* getsockopt */
     case 16: return 3; /* sendmsg(fd, msghdr*, flags) */
     case 17: return 3; /* recvmsg(fd, msghdr*, flags) */
+    case 18: return 4; /* accept4(fd, addr, addrlen, flags) */
     default: return -1;
     }
 }
 
 /* Core of the socket API, working on an already-fetched kernel args array.
  * Shared by socketcall(102) and the direct i386 socket syscalls (359-373). */
+#define SOCK_CLOEXEC_K   0x80000
+#define SOCK_NONBLOCK_K  0x800
 static int socketcall_core(int call, uint32_t *kargs) {
+    /* accept4(fd, addr, addrlen, flags) is socketcall index 18 (Linux
+     * SYS_ACCEPT4).  Its SOCK_CLOEXEC/SOCK_NONBLOCK apply to the NEW
+     * descriptor only (net/socket.c __sys_accept4), so carry them aside and
+     * run the ordinary accept path. */
+    int accept4_flags = 0;
+    if (call == 18) { accept4_flags = (int)kargs[3]; call = 5; }
+
     /* musl ORs SOCK_NONBLOCK (0x800) / SOCK_CLOEXEC (0x80000) into type */
     if (call == 1) { /* socket(domain, type, protocol) */
         int domain   = (int)kargs[0];
         int type     = (int)kargs[1] & 0xFF;
-        int nonblock = ((int)kargs[1] & 0x800) != 0;
+        int nonblock = ((int)kargs[1] & SOCK_NONBLOCK_K) != 0;
+        int cloexec  = ((int)kargs[1] & SOCK_CLOEXEC_K) != 0;
 
         if (domain == AF_UNIX_K) {           /* AF_UNIX local socket */
             usocket_t *us = usocket_create(type);
@@ -6231,6 +6576,7 @@ static int socketcall_core(int call, uint32_t *kargs) {
                     current_proc->ofile[fd].usock = us;
                     current_proc->ofile[fd].flags =
                         O_RDWR | (nonblock ? O_NONBLOCK : 0);
+                    current_proc->ofile[fd].cloexec = (uint8_t)cloexec;
                     return fd;
                 }
             }
@@ -6248,6 +6594,7 @@ static int socketcall_core(int call, uint32_t *kargs) {
                 current_proc->ofile[fd].socket = sock;
                 current_proc->ofile[fd].flags =
                     O_RDWR | (nonblock ? O_NONBLOCK : 0);
+                current_proc->ofile[fd].cloexec = (uint8_t)cloexec;
                 return fd;
             }
         }
@@ -6272,13 +6619,16 @@ static int socketcall_core(int call, uint32_t *kargs) {
             usocket_release(a); usocket_release(b);
             return -24;
         }
-        int nb = ((int)kargs[1] & 0x800) != 0;
+        int nb = ((int)kargs[1] & SOCK_NONBLOCK_K) != 0;
+        int ce = ((int)kargs[1] & SOCK_CLOEXEC_K) != 0;
         current_proc->ofile[fda].type = FD_USOCKET;
         current_proc->ofile[fda].usock = a;
         current_proc->ofile[fda].flags = O_RDWR | (nb ? O_NONBLOCK : 0);
+        current_proc->ofile[fda].cloexec = (uint8_t)ce;
         current_proc->ofile[fdb].type = FD_USOCKET;
         current_proc->ofile[fdb].usock = b;
         current_proc->ofile[fdb].flags = O_RDWR | (nb ? O_NONBLOCK : 0);
+        current_proc->ofile[fdb].cloexec = (uint8_t)ce;
         uint32_t sv[2] = { (uint32_t)fda, (uint32_t)fdb };
         if (copy_to_user(usv, sv, sizeof(sv)) < 0) return -14;
         return 0;
@@ -6326,7 +6676,10 @@ static int socketcall_core(int call, uint32_t *kargs) {
                 if (current_proc->ofile[nfd].type == FD_NONE) {
                     current_proc->ofile[nfd].type  = FD_USOCKET;
                     current_proc->ofile[nfd].usock = ns;
-                    current_proc->ofile[nfd].flags = O_RDWR;
+                    current_proc->ofile[nfd].flags = O_RDWR |
+                        ((accept4_flags & SOCK_NONBLOCK_K) ? O_NONBLOCK : 0);
+                    current_proc->ofile[nfd].cloexec =
+                        (accept4_flags & SOCK_CLOEXEC_K) ? 1 : 0;
                     return nfd;
                 }
             usocket_release(ns);
@@ -6634,7 +6987,7 @@ static int sys_socket_direct(registers_t *regs, int which) {
     case 361: return socketcall_core(2,  kargs);   /* bind */
     case 362: return socketcall_core(3,  kargs);   /* connect */
     case 363: return socketcall_core(4,  kargs);   /* listen */
-    case 364: return socketcall_core(5,  kargs);   /* accept4 → accept */
+    case 364: return socketcall_core(18, kargs);   /* accept4 (flags honoured) */
     case 365: return socketcall_core(15, kargs);   /* getsockopt */
     case 366: return socketcall_core(14, kargs);   /* setsockopt */
     case 367: return socketcall_core(6,  kargs);   /* getsockname */
@@ -6871,6 +7224,10 @@ void syscall_dispatch(registers_t *regs) {
         ret = 0;
         break;
 
+    case 40:  ret = sys_rmdir(regs);           break;  /* rmdir */
+    case 193: ret = sys_truncate64(regs);      break;  /* truncate64 */
+    case 194: ret = sys_ftruncate64(regs);     break;  /* ftruncate64 */
+    case 297: ret = sys_mknodat(regs);         break;  /* mknodat */
     case 296: ret = sys_mkdirat(regs);         break;
     case 300: ret = sys_fstatat64(regs);       break;
     case 301: ret = sys_unlinkat(regs);        break;

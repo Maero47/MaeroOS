@@ -47,7 +47,10 @@ static tmpfs_node_t *alloc_tmpfs_node(const char *name, uint32_t flags) {
      * creator's uid stamped by the open path. */
     tn->vnode.mask = (flags == VFS_FLAG_DIR) ? 0777 : 0666;
 
-    if (flags == VFS_FLAG_FILE || flags == VFS_FLAG_SYMLINK) {
+    if (flags != VFS_FLAG_DIR) {
+        /* Files, symlinks and the FIFO/device nodes mknod() creates: none of
+         * them are directories, so they must NOT carry directory operations
+         * (a FIFO with readdir/finddir would resolve as a directory). */
         tn->vnode.read_fn     = tmpfs_read;
         if (flags == VFS_FLAG_FILE) {
             tn->vnode.write_fn    = tmpfs_write;
