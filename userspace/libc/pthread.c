@@ -32,7 +32,17 @@ extern int __clone_thread(int flags, void *stack_top,
                           void (*fn)(void *), void *arg, int *tidptr);
 
 typedef struct {
-    volatile int tid;       /* set by the kernel at create, zeroed at exit */
+    /* CLONE_CHILD_CLEARTID word: the kernel writes the tid here at create and
+     * ZEROES it (plus a FUTEX_WAKE) when the thread exits.  It is the join
+     * futex, never an identity — see `id`. */
+    volatile int tid;
+    /* The tid as a stable join key.  pthread_join must still find the
+     * descriptor of a thread that has already exited (the common case), and by
+     * then the kernel has cleared `tid`; keying the lookup on that word made
+     * join return -1 without freeing the stack or the table slot, so both
+     * leaked and pthread_create failed for good after MAX_THREADS cycles.
+     * The kernel never touches this field. */
+    int          id;
     void *(*fn)(void *);
     void *arg;
     void *ret;
@@ -68,6 +78,7 @@ int pthread_create(pthread_t *thread, const void *attr,
     st->arg = arg;
     st->ret = 0;
     st->tid = 0;
+    st->id = 0;             /* set once the tid is known; 0 matches no thread */
     st->stack = block;
 
     pthread_mutex_lock(&threads_lock);
@@ -91,6 +102,7 @@ int pthread_create(pthread_t *thread, const void *attr,
         free(block);
         return -1;
     }
+    st->id = tid;           /* only the creator writes this; join reads it */
     if (thread) *thread = tid;
     return 0;
 }
@@ -101,14 +113,17 @@ int pthread_join(pthread_t thread, void **retval) {
 
     pthread_mutex_lock(&threads_lock);
     for (int i = 0; i < MAX_THREADS; i++)
-        if (threads[i] && threads[i]->tid == thread) { st = threads[i]; slot = i; break; }
+        if (threads[i] && threads[i]->id == thread) { st = threads[i]; slot = i; break; }
     pthread_mutex_unlock(&threads_lock);
     if (!st) return -1;
 
     /* CLONE_CHILD_CLEARTID: the kernel stores 0 in st->tid and wakes this
      * futex when the thread has exited (NPTL pthread_join does exactly this). */
-    while (st->tid != 0)
-        futex(&st->tid, FUTEX_WAIT, thread);
+    for (;;) {
+        int cur = st->tid;
+        if (cur == 0) break;
+        futex(&st->tid, FUTEX_WAIT, cur);
+    }
 
     if (retval) *retval = st->ret;
     pthread_mutex_lock(&threads_lock);

@@ -11,6 +11,7 @@
  *   2. shared memory is REALLY shared (no COW divergence)
  *   3. getpid() is the group id in every thread; gettid() differs
  *   4. set_thread_area TLS: each thread sees its own %gs-based slot
+ *   5. create/join recycles descriptors: more cycles than the table has slots
  */
 
 #define LOOPS 50000
@@ -49,6 +50,51 @@ static void *fdworker(void *arg) {
     while (!fd_go) { }                 /* user-mode spin: timer preempts us */
     int r = (int)write(fd_pub, "x", 1);
     fd_result = (r == 1) ? 0 : -1;
+    return 0;
+}
+
+/* More create/join cycles than libc has thread slots (MAX_THREADS is 64), so
+ * the table and the 256 KiB stack blocks must be recycled by pthread_join.
+ * They are not if join looks a thread up by its CLONE_CHILD_CLEARTID word: the
+ * kernel zeroes that word when the thread exits, so joining an already-finished
+ * thread — the ordinary case, and every case here — finds nothing, returns -1
+ * and frees neither the slot nor the stack.  pthread_create then fails for good
+ * once the table is full, which is what this loop catches. */
+#define JOIN_CYCLES 200
+
+static volatile int cycle_ran;
+
+static void *cycle_worker(void *arg) {
+    (void)arg;
+    cycle_ran++;
+    return (void *)0x5a5a;
+}
+
+static int join_cycles(void) {
+    for (int i = 0; i < JOIN_CYCLES; i++) {
+        pthread_t t;
+        void *ret = 0;
+        cycle_ran = 0;
+        if (pthread_create(&t, 0, cycle_worker, 0) != 0) {
+            printf("threadprobe: pthread_create failed on cycle %d of %d "
+                   "(thread slots or stacks leaked)\n", i + 1, JOIN_CYCLES);
+            return 1;
+        }
+        if (pthread_join(t, &ret) != 0) {
+            printf("threadprobe: pthread_join failed on cycle %d of %d\n",
+                   i + 1, JOIN_CYCLES);
+            return 1;
+        }
+        if (ret != (void *)0x5a5a) {
+            printf("threadprobe: cycle %d join returned %p, expected 0x5a5a\n",
+                   i + 1, ret);
+            return 1;
+        }
+        if (!cycle_ran) {
+            printf("threadprobe: cycle %d joined a thread that never ran\n", i + 1);
+            return 1;
+        }
+    }
     return 0;
 }
 
@@ -126,6 +172,10 @@ int main(void) {
         printf("threadprobe: tids not distinct (%d/%d)\n", t1_tid, t2_tid);
         return 1;
     }
+
+    if (join_cycles() != 0)
+        return 1;
+
     printf("threadprobe ok\n");
     return 0;
 }

@@ -10,7 +10,15 @@
 #define PAGE_ACCESSED   0x020
 #define PAGE_DIRTY      0x040
 #define PAGE_HUGE       0x080  /* PDE: 4 MiB page */
-#define PAGE_GLOBAL     0x100
+/* Bit 8 is the hardware Global bit, which the CPU only honours when CR4.PGE
+ * is set.  This kernel never enables PGE (fpu.c sets only OSFXSR/OSXMMEXCPT),
+ * so the bit is ignored by the MMU on every entry and is used as software
+ * storage: "write permission on this page was removed by mprotect()".  It
+ * survives fork's COW marking, so the copy-on-write handler can tell a page
+ * that is read-only because it is shared (break it) from one the process
+ * asked to be read-only (SIGSEGV).  Enabling CR4.PGE would require moving
+ * this flag. */
+#define PAGE_WRPROT     0x100
 #define PAGE_COW        0x200  /* AVL bit 9: copy-on-write */
 #define PAGE_SHARED     0x400  /* AVL bit 10: shared memory — never COW'd */
 #define PAGE_PROTNONE   0x800  /* AVL bit 11: PROT_NONE page — NOT present, but the

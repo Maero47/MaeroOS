@@ -1735,8 +1735,9 @@ static int sys_exec(registers_t *regs) {
         __builtin_memset(current_proc->sighand->flags, 0,
                          sizeof(current_proc->sighand->flags));
     }
-    current_proc->pending_sigs  = 0;
-    current_proc->sigframe_addr = 0;
+    current_proc->pending_sigs   = 0;
+    current_proc->sigframe_addr  = 0;
+    current_proc->restore_sigmask = 0;   /* no sigsuspend mask survives exec */
 
     /* Update trapframe to run new program */
     registers_t *tf = current_proc->tf;
@@ -2513,10 +2514,19 @@ static int sys_nanosleep(registers_t *regs) {
     uint32_t rs = 0, rn = 0;
     r = ksleep_until_mono(ds, dn, &rs, &rn);
     /* Linux writes the remainder only when interrupted (-EINTR). */
-    if (r == -4 && rem) {
-        struct ktimespec krem = { (int32_t)rs, (int32_t)rn };
-        cr = copy_to_user(rem, &krem, sizeof(krem));
-        if (cr < 0) return cr;
+    if (r == -4) {
+        if (rem) {
+            struct ktimespec krem = { (int32_t)rs, (int32_t)rn };
+            cr = copy_to_user(rem, &krem, sizeof(krem));
+            if (cr < 0) return cr;
+        }
+        /* -ERESTARTNOHAND, not -EINTR: the return-to-user path re-issues a -4
+         * with the ORIGINAL arguments when the handler has SA_RESTART, which
+         * for a sleep means sleeping the whole duration again and discarding
+         * the remainder just written.  Linux never restarts these calls once a
+         * handler has run (hrtimer_nanosleep returns ERESTART_RESTARTBLOCK,
+         * and a restart resumes the REMAINING time, never the original). */
+        return -ERESTARTNOHAND;
     }
     return r;
 }
@@ -3450,12 +3460,24 @@ static void pte_apply_prot(uint32_t va, uint32_t prot) {
     uint32_t *pte = paging_get_pte(va);
     uint32_t old = *pte;
     if (!pte_mapped(old) || !(old & PAGE_USER)) return;
-    uint32_t nw = old & ~(uint32_t)(PAGE_PRESENT | PAGE_WRITABLE | PAGE_PROTNONE);
+    uint32_t nw = old & ~(uint32_t)(PAGE_PRESENT | PAGE_WRITABLE | PAGE_PROTNONE |
+                                    PAGE_WRPROT);
     if (prot == 0) {
         nw |= PAGE_PROTNONE;
     } else {
         nw |= PAGE_PRESENT;
-        if ((prot & PROT_WRITE_K) && !(old & PAGE_COW)) nw |= PAGE_WRITABLE;
+        if (prot & PROT_WRITE_K) {
+            if (!(old & PAGE_COW)) nw |= PAGE_WRITABLE;
+        } else {
+            /* Record the denial on the page itself.  The VMA registry already
+             * carries the protection of everything it covers, but the ELF
+             * image (ld.so's PT_GNU_RELRO), the brk heap and the main stack are
+             * not in it, and for those the write fault has nothing else to
+             * consult: without this a COW break would hand write permission
+             * straight back and the two address spaces would diverge in
+             * silence where Linux raises SIGSEGV. */
+            nw |= PAGE_WRPROT;
+        }
     }
     if (nw != old) {
         *pte = nw;
@@ -5154,7 +5176,12 @@ static int do_clock_nanosleep(int clk, int flags, int64_t rsec, int64_t rnsec,
     if (r < 0) return r;
     if (expired) return 0;
     r = ksleep_until_mono(ds, dn, rem_sec, rem_nsec);
-    if (r == -4 && !(flags & TIMER_ABSTIME_K)) *write_rem = 1;
+    if (r == -4) {
+        if (!(flags & TIMER_ABSTIME_K)) *write_rem = 1;
+        /* See sys_nanosleep: -EINTR here would be restarted with the original
+         * request under an SA_RESTART handler. */
+        return -ERESTARTNOHAND;
+    }
     return r;
 }
 
@@ -5975,6 +6002,18 @@ static int sys_rt_sigsuspend(registers_t *regs) {
         current_proc->blocked_sigs = m;
     }
 
+    /* Linux set_restore_sigmask(): stash the caller's mask instead of putting
+     * it back here, and let the signal-return path reinstate it once it has
+     * decided what to deliver (kernel/signal.c sigsuspend + signal_delivered).
+     * Restoring it here would re-block the very signal this call is waiting
+     * for, so signal_return_to_user() would see nothing deliverable, take the
+     * `restartable` path for the -ERESTARTNOHAND below, and re-enter this
+     * syscall — which finds the signal pending under the temporary mask, does
+     * not sleep, and returns -ERESTARTNOHAND again: an unbreakable spin in
+     * which the handler never runs. */
+    current_proc->saved_sigmask   = old_mask;
+    current_proc->restore_sigmask = 1;
+
     /* Sleep until a DELIVERABLE signal wakes us (signal_send only wakes for
      * those); if one is already pending under the new mask, do not sleep.
      * Linux sigsuspend returns -ERESTARTNOHAND: EINTR once a handler has run,
@@ -5982,7 +6021,6 @@ static int sys_rt_sigsuspend(registers_t *regs) {
     if (!signal_interrupt_pending(current_proc))
         sleep_on((void *)&sys_rt_sigsuspend);
 
-    current_proc->blocked_sigs = old_mask;
     return -ERESTARTNOHAND;
 }
 

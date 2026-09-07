@@ -442,11 +442,18 @@ static void page_fault_handler(registers_t *regs) {
         uint32_t *pte = paging_get_pte(cr2);
         int vprot = vma_prot_lookup(cr2);
         if ((*pte & PAGE_PRESENT) && (*pte & PAGE_COW) &&
+            !(*pte & PAGE_WRPROT) &&
             (vprot < 0 || (vprot & 0x2))) {
             /* A COW page in a mapping WITHOUT PROT_WRITE (mprotect(PROT_READ)
              * after fork) is a real protection fault, not a COW break: the
              * vprot test above lets it fall through to SIGSEGV (Linux
-             * do_wp_page is only reached when the VMA allows writing). */
+             * do_wp_page is only reached when the VMA allows writing).
+             * PAGE_WRPROT is the same test for a page with no VMA at all (the
+             * ELF image, the brk heap, the main stack), where vprot is < 0 and
+             * would otherwise be read as "writes allowed".  It covers the
+             * copy path and the wp_page_reuse one below equally: a last
+             * reference is no reason to re-grant a write the process asked us
+             * to refuse. */
             uint32_t old_phys = *pte & ~0xFFFU;
 
             /* Last reference (the sharer exited, unmapped or DONTNEED'ed its

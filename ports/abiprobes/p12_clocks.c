@@ -140,5 +140,64 @@ int main(void)
     if (ts_s(&rem) < 1.0 || ts_s(&rem) > 1.95)
         probe_fail("remaining time after interrupt is %.3f s, expected ~1.9 s", ts_s(&rem));
 
+    /* T4, SA_RESTART variant.  Linux never restarts a sleep once a handler has
+     * run: hrtimer_nanosleep returns ERESTART_RESTARTBLOCK, which handle_signal
+     * turns into EINTR whatever SA_RESTART says (a restart would resume the
+     * REMAINING time through restart_block, never re-sleep the original
+     * request).  A kernel that maps its sleep's interrupted return onto the
+     * ordinary ERESTARTSYS code re-issues the call with the original duration
+     * under any SA_RESTART handler, so the sleep takes ~2 s + the delay
+     * instead of ~0.1 s and the remainder just written is thrown away.  An
+     * SA_RESTART SIGCHLD or SIGALRM handler is completely ordinary, so this is
+     * a routine over-sleep, not a corner case. */
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_usr1;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGUSR1, &sa, NULL);
+    got = 0;
+    pthread_create(&t, NULL, kicker, NULL);
+    req.tv_sec = 2; req.tv_nsec = 0;
+    rem.tv_sec = 0; rem.tv_nsec = 0;
+    t0 = now_ms();
+    r = nanosleep(&req, &rem);
+    e = errno;
+    dt = now_ms() - t0;
+    pthread_join(t, NULL);
+    probe_info("nanosleep(2 s) + SA_RESTART SIGUSR1 at 100 ms: r=%d errno=%s after "
+               "%.0f ms, rem %.3f s", r, r < 0 ? strerror(e) : "-", dt, ts_s(&rem));
+    if (r != -1 || e != EINTR)
+        probe_fail("SA_RESTART: interrupted nanosleep returned %d (%s) after %.0f ms, "
+                   "expected EINTR — the call was restarted", r,
+                   r < 0 ? strerror(e) : "-", dt);
+    if (dt > 1500)
+        probe_fail("SA_RESTART: nanosleep(2 s) interrupted at 100 ms took %.0f ms — "
+                   "it slept the original duration again", dt);
+    if (ts_s(&rem) < 1.0 || ts_s(&rem) > 1.95)
+        probe_fail("SA_RESTART: remaining time is %.3f s, expected ~1.9 s", ts_s(&rem));
+    if (!got)
+        probe_fail("SA_RESTART: the handler never ran");
+
+    /* The same for clock_nanosleep(267/407), which shares the implementation. */
+    got = 0;
+    pthread_create(&t, NULL, kicker, NULL);
+    req.tv_sec = 2; req.tv_nsec = 0;
+    rem.tv_sec = 0; rem.tv_nsec = 0;
+    t0 = now_ms();
+    r = clock_nanosleep(CLOCK_MONOTONIC, 0, &req, &rem);
+    dt = now_ms() - t0;
+    pthread_join(t, NULL);
+    probe_info("clock_nanosleep(2 s, relative) + SA_RESTART SIGUSR1 at 100 ms: r=%d "
+               "after %.0f ms, rem %.3f s", r, dt, ts_s(&rem));
+    if (r != EINTR)
+        probe_fail("SA_RESTART: clock_nanosleep returned %d (%s), expected EINTR",
+                   r, strerror(r));
+    if (dt > 1500)
+        probe_fail("SA_RESTART: clock_nanosleep(2 s) interrupted at 100 ms took "
+                   "%.0f ms — it slept the original duration again", dt);
+    if (ts_s(&rem) < 1.0 || ts_s(&rem) > 1.95)
+        probe_fail("SA_RESTART: clock_nanosleep remainder is %.3f s, expected ~1.9 s",
+                   ts_s(&rem));
+
     probe_pass();
 }

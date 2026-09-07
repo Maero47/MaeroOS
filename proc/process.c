@@ -160,6 +160,8 @@ struct proc *allocproc(void) {
     p->pending_sigs   = 0;
     p->blocked_sigs   = 0;
     p->sigframe_addr  = 0;
+    p->saved_sigmask  = 0;
+    p->restore_sigmask = 0;
     p->sleep_chan     = NULL;
     p->wake_tick      = 0;
     p->cwd[0]        = '/';

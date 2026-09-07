@@ -143,6 +143,16 @@ struct proc {
     struct sighand  *sighand;               /* shared under CLONE_SIGHAND */
     uint32_t         sigframe_addr;         /* user addr of saved trapframe for sigreturn */
 
+    /* sigsuspend's temporary mask (Linux saved_sigmask + TIF_RESTORE_SIGMASK).
+     * sigsuspend installs its mask and returns WITHOUT putting the caller's
+     * mask back, so the signal it is waiting for is still deliverable when the
+     * return-to-user path looks for one; that path puts `saved_sigmask` back
+     * once it has decided what to deliver.  Restoring the mask in the syscall
+     * itself makes the awaited signal blocked again, so nothing is deliverable,
+     * the -ERESTARTNOHAND return restarts the call, and the pair spins. */
+    uint32_t         saved_sigmask;
+    int              restore_sigmask;
+
     /* Group exit (Linux signal_struct SIGNAL_GROUP_EXIT + group_exit_code),
      * kept on the thread-group leader: set when exit_group() or a fatal signal
      * ends the whole process, so the status waitpid() reports is the group's,

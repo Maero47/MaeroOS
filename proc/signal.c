@@ -231,6 +231,16 @@ static void syscall_restart(registers_t *regs, int syscall_nr) {
     regs->eip -= 2;
 }
 
+/* Linux restore_saved_sigmask(): put back the mask sigsuspend stashed, once
+ * this path has decided what (if anything) is being delivered.  A no-op for
+ * every other syscall. */
+static void restore_saved_sigmask(void) {
+    if (current_proc && current_proc->restore_sigmask) {
+        current_proc->blocked_sigs    = current_proc->saved_sigmask;
+        current_proc->restore_sigmask = 0;
+    }
+}
+
 void signal_return_to_user(registers_t *regs, int syscall_nr) {
     if (!current_proc) return;
     /* Only deliver to user-mode frames */
@@ -243,8 +253,12 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
     if (!pending) {
         /* Woken by a signal that is no longer deliverable (or the syscall
          * returned an internal restart code with nothing pending): transparently
-         * restart it, exactly as Linux does when get_signal() finds nothing. */
+         * restart it, exactly as Linux does when get_signal() finds nothing.
+         * The restarted sigsuspend re-installs its temporary mask, so the
+         * stashed one is put back first (arch/x86 arch_do_signal_or_restart:
+         * restore_saved_sigmask() on the no-signal path). */
         if (restartable) syscall_restart(regs, syscall_nr);
+        restore_saved_sigmask();
         return;
     }
 
@@ -253,7 +267,7 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
     for (int i = 1; i < NSIGS; i++) {
         if (pending & (1u << i)) { sig = i; break; }
     }
-    if (!sig) return;
+    if (!sig) { restore_saved_sigmask(); return; }
 
     current_proc->pending_sigs &= ~(1u << sig);
 
@@ -269,6 +283,7 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
 
     if (handler == SIG_IGN) {
         if (restartable) syscall_restart(regs, syscall_nr);
+        restore_saved_sigmask();
         return;
     }
 
@@ -276,6 +291,7 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
         switch (sig_default_action(sig)) {
         case 1:
             if (restartable) syscall_restart(regs, syscall_nr);
+            restore_saved_sigmask();
             return;  /* default: ignore */
         case 2:
             /* Wake parent so waitpid(WUNTRACED) returns */
@@ -285,6 +301,7 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
              * The interrupted syscall is then restarted (no handler ran). */
             proc_stop_self();
             if (restartable) syscall_restart(regs, syscall_nr);
+            restore_saved_sigmask();
             return;
         default:
             /* Fatal signal with the default disposition: Linux get_signal()
@@ -454,6 +471,14 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
         tr[11]=marker; tr[12]=marker>>8; tr[13]=marker>>16; tr[14]=marker>>24;
         __builtin_memcpy((void *)tramp_addr, tr, 20);
     }
+
+    /* A handler frame is committed, so sigsuspend's job is done: put the
+     * caller's mask back (Linux does this in signal_delivered(), and restores
+     * it from the frame's uc_sigmask at sigreturn).  We reinstate it here
+     * rather than at sigreturn because this kernel does not alter the mask
+     * across handler entry at all (sa_mask and SA_NODEFER are unimplemented —
+     * audit item S6), so there is no per-frame mask to save and restore. */
+    restore_saved_sigmask();
 
     /* Redirect trapframe to the user handler */
     regs->eip     = (uint32_t)(uintptr_t)handler;
