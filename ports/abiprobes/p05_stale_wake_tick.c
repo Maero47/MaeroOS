@@ -28,6 +28,8 @@
 static volatile int in_futex, futex_returned;
 static volatile long futex_ret, futex_errno;
 static volatile double futex_ret_ms;
+static volatile long sleep_ret, sleep_errno;
+static volatile double sleep_ms_taken;
 static volatile sig_atomic_t got_usr1;
 static int word;
 static int pfd[2];
@@ -52,9 +54,12 @@ static void *worker(void *arg)
         r = poll(&p, 1, SLEEP_MS);
     }
     e = errno;
+    sleep_ret = r;
+    sleep_errno = e;
+    sleep_ms_taken = now_ms() - t0;
     probe_info("variant %c: timed %s returned %ld (errno %ld %s) after %.0f ms, handler ran: %d",
                variant ? 'B' : 'A', variant ? "poll" : "nanosleep", r, e,
-               r < 0 ? strerror((int)e) : "-", now_ms() - t0, (int)got_usr1);
+               r < 0 ? strerror((int)e) : "-", sleep_ms_taken, (int)got_usr1);
 
     __atomic_store_n(&word, 0, __ATOMIC_RELEASE);
     in_futex = 1;
@@ -75,7 +80,7 @@ static void run_variant(int variant)
     if (pthread_create(&t, NULL, worker, &variant) != 0)
         probe_fail("pthread_create: %s", strerror(errno));
     sleep_ms(100);
-    pthread_kill(t, SIGUSR1);
+    probe_kill_thread(t, SIGUSR1, "main");
 
     double t0 = now_ms();
     while (!in_futex) {
@@ -83,6 +88,22 @@ static void run_variant(int variant)
             probe_fail("variant %c: worker never reached the futex wait", variant ? 'B' : 'A');
         sleep_ms(5);
     }
+    /* The stale-deadline case only exists if the timed sleep was actually cut
+     * short by the handled signal.  Linux: EINTR at ~100 ms with the handler
+     * run.  Without that the probe would "pass" while testing nothing, so a
+     * missing interruption is reported as the failure it is. */
+    if (!got_usr1 || sleep_ret != -1 || sleep_errno != EINTR)
+        probe_fail("variant %c: the handled SIGUSR1 did not interrupt the %d ms %s "
+                   "(returned %ld, errno %ld, after %.0f ms, handler ran %d); Linux "
+                   "returns EINTR at ~100 ms, so the stale-deadline case cannot be set up",
+                   variant ? 'B' : 'A', SLEEP_MS, variant ? "poll" : "nanosleep",
+                   (long)sleep_ret, (long)sleep_errno, (double)sleep_ms_taken,
+                   (int)got_usr1);
+    if (sleep_ms_taken > SLEEP_MS / 2)
+        probe_fail("variant %c: the timed sleep ran %.0f ms of its %d ms before the "
+                   "signal cut it short; the deadline is no longer in the future",
+                   variant ? 'B' : 'A', (double)sleep_ms_taken, SLEEP_MS);
+
     double t1 = now_ms();
     while (now_ms() - t1 < WATCH_MS) {
         if (futex_returned)

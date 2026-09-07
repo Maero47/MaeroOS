@@ -30,7 +30,7 @@ static void *kicker(void *arg)
 {
     (void)arg;
     sleep_ms(100);
-    pthread_kill(main_thread, SIGUSR1);
+    probe_kill_thread(main_thread, SIGUSR1, "kicker");
     return NULL;
 }
 

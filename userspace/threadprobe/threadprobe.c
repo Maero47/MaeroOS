@@ -55,18 +55,24 @@ static void *fdworker(void *arg) {
 
 /* More create/join cycles than libc has thread slots (MAX_THREADS is 64), so
  * the table and the 256 KiB stack blocks must be recycled by pthread_join.
- * They are not if join looks a thread up by its CLONE_CHILD_CLEARTID word: the
- * kernel zeroes that word when the thread exits, so joining an already-finished
- * thread — the ordinary case, and every case here — finds nothing, returns -1
- * and frees neither the slot nor the stack.  pthread_create then fails for good
- * once the table is full, which is what this loop catches. */
-#define JOIN_CYCLES 200
+ *
+ * Each cycle joins a thread that has ALREADY FINISHED — the ordinary case, and
+ * the one that breaks if join looks a thread up by its CLONE_CHILD_CLEARTID
+ * word: the kernel zeroes that word when the thread exits, so the scan finds
+ * nothing, join returns -1, and neither the table slot nor the stack is freed.
+ * Joining a thread that is still running hides the bug (the word still holds
+ * the tid), so the loop waits for the worker to signal completion and then
+ * gives the kernel a moment to retire it before joining. */
+#define JOIN_CYCLES 100
+#define JOIN_EXIT_SETTLE_US 10000
 
 static volatile int cycle_ran;
+static volatile int cycle_done;
 
 static void *cycle_worker(void *arg) {
     (void)arg;
     cycle_ran++;
+    cycle_done = 1;         /* last thing before returning into the exit path */
     return (void *)0x5a5a;
 }
 
@@ -75,14 +81,17 @@ static int join_cycles(void) {
         pthread_t t;
         void *ret = 0;
         cycle_ran = 0;
+        cycle_done = 0;
         if (pthread_create(&t, 0, cycle_worker, 0) != 0) {
             printf("threadprobe: pthread_create failed on cycle %d of %d "
                    "(thread slots or stacks leaked)\n", i + 1, JOIN_CYCLES);
             return 1;
         }
+        while (!cycle_done) { }          /* the worker is done with its body */
+        usleep(JOIN_EXIT_SETTLE_US);     /* let the kernel retire the thread */
         if (pthread_join(t, &ret) != 0) {
-            printf("threadprobe: pthread_join failed on cycle %d of %d\n",
-                   i + 1, JOIN_CYCLES);
+            printf("threadprobe: pthread_join of the finished thread failed on "
+                   "cycle %d of %d (descriptor not found)\n", i + 1, JOIN_CYCLES);
             return 1;
         }
         if (ret != (void *)0x5a5a) {

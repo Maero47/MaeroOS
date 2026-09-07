@@ -172,6 +172,17 @@ static const char *probe_self_path(const char *argv0, char *buf, size_t len)
     return NULL;
 }
 
+/* pthread_kill returns the error number and does NOT set errno; reporting
+ * strerror(errno) after it hides a failure as "No error information".  Every
+ * probe that relies on a signal actually being sent goes through this. */
+static void probe_kill_thread(pthread_t, int, const char *) __attribute__((unused));
+static void probe_kill_thread(pthread_t t, int sig, const char *what)
+{
+    int rc = pthread_kill(t, sig);
+    if (rc != 0)
+        probe_fail("%s: pthread_kill(sig %d) failed: %s", what, sig, strerror(rc));
+}
+
 static inline long raw_gettid(void) __attribute__((unused));
 static inline long raw_gettid(void)
 {

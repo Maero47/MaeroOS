@@ -36,7 +36,7 @@ static void *kicker(void *arg)
 {
     struct kick *k = arg;
     sleep_ms(k->sig_ms);
-    pthread_kill(main_thread, SIGALRM);
+    probe_kill_thread(main_thread, SIGALRM, "kicker");
     if (k->write_ms > 0) {
         sleep_ms(k->write_ms - k->sig_ms);
         if (write(pfd[1], "x", 1) != 1)
