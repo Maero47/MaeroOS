@@ -3,7 +3,10 @@
 # Linux (Debian/Ubuntu).  After it finishes, `make`, `make initrd`, `make disk`,
 # `make iso`, `make smoke*` and `make run-firefox` work like they do on macOS.
 #
-#   tools/setup-linux.sh            # print apt list, build/fetch toolchains, verify
+#   tools/setup-linux.sh            # build/fetch toolchains and verify; picks the
+#                                   # no-sudo path when host packages are missing
+#   tools/setup-linux.sh --sudo     # force the apt path: print the package list
+#                                   # (installs nothing without --apt)
 #   tools/setup-linux.sh --apt      # also run `sudo apt-get install ...` first
 #   tools/setup-linux.sh --no-sudo  # no root at all: relocate the apt packages
 #                                   # into ~/opt/hostpkgs and use musl.cc's
@@ -12,9 +15,11 @@
 #   tools/setup-linux.sh --dry-run  # print the plan, download/build nothing
 #
 # What it does:
-#   1. prints the exact apt package list (installs it with --apt, via sudo).
+#   1. prints the exact apt package list (installs it with --apt, via sudo;
+#      --sudo prints it without installing anything).
 #      Without root (--no-sudo, or automatically when required host packages
-#      are missing and --apt was not given) it instead lets apt resolve and
+#      are missing and --apt was not given; the run says so and names --sudo)
+#      it instead lets apt resolve and
 #      download the missing packages (`apt-get -s install` + `apt-get download`,
 #      which checks every .deb against the signed archive index), unpacks them
 #      with dpkg-deb into $HOSTPKGS_DIR (default $HOME/opt/hostpkgs) and writes
@@ -24,7 +29,10 @@
 #      If the host has no C/C++ compiler either, musl.cc's self-contained
 #      x86_64-linux-musl-native toolchain is fetched into $OPT_DIR and exposed
 #      as `cc`/`c++` wrappers that link statically (its dynamic loader is not
-#      installed on the host);
+#      installed on the host).  Every generated wrapper hands off to a system
+#      tool of the same name as soon as one exists, and a later --sudo/--apt
+#      run deletes the wrappers that a real package has superseded, so nothing
+#      under $BIN_DIR permanently shadows an apt install;
 #   2. builds an i686-elf binutils + gcc (C only, --without-headers, + libgcc)
 #      into $PREFIX (default $HOME/opt/cross) with all cores, skipping what is
 #      already there.  Without root gmp/mpfr/mpc/isl are built in-tree via
@@ -35,6 +43,8 @@
 #   4. prints the `export PATH=...` line you need and checks every tool.
 #
 # Options:
+#   --sudo        force the apt path (print the package list; installs nothing
+#                 on its own).  Also prunes wrappers a system tool now supersedes
 #   --apt         run `sudo apt-get update && sudo apt-get install -y <list>`
 #   --optional    with --apt, also install the optional packages (docker.io,
 #                 gcc-multilib, gdb-multiarch)
@@ -66,6 +76,9 @@
 #                 you must supply the matching digest (or set MAEROS_SKIP_HASH=1
 #                 to accept an unverified download).
 #   MAEROS_SKIP_HASH=1  skip digest verification (not recommended)
+#   MAEROS_SYS_PATH     the directories a wrapper searches for the system tool
+#                       it stands in for, and that --sudo/--apt prune against
+#                       (default: the standard /usr/local/sbin:...:/bin set)
 
 set -eu
 
@@ -75,6 +88,9 @@ PREFIX="${PREFIX:-$HOME/opt/cross}"
 OPT_DIR="${OPT_DIR:-$HOME/opt}"
 BIN_DIR="${BIN_DIR:-$OPT_DIR/bin}"
 HOSTPKGS_DIR="${HOSTPKGS_DIR:-$OPT_DIR/hostpkgs}"
+# Where a package manager puts things.  Deliberately excludes $BIN_DIR, so a
+# wrapper can ask "is there a real system tool I should step aside for?".
+SYS_PATH="${MAEROS_SYS_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
 SRC_DIR="${SRC_DIR:-$PREFIX/src}"
 DEFAULT_BINUTILS_VER=2.44
 DEFAULT_GCC_VER=14.2.0
@@ -118,6 +134,8 @@ APT_OPTIONAL=0
 DO_CROSS=1
 DO_MUSL=1
 NOSUDO=auto         # auto | 0 | 1
+NOSUDO_EXPLICIT=""  # the flag that pinned it, for the contradiction check
+NOSUDO_AUTO=0       # 1: no-sudo was chosen by auto-detection, not by a flag
 USE_NATIVE=0        # 1: host compiler is the musl.cc native toolchain (cc/c++ wrappers)
 INTREE_PREREQS=0    # 1: gmp/mpfr/mpc/isl built inside the gcc tree
 
@@ -149,7 +167,11 @@ while [ $# -gt 0 ]; do
     case "$1" in
     --apt)      DO_APT=1 ;;
     --optional) APT_OPTIONAL=1 ;;
-    --no-sudo)  NOSUDO=1 ;;
+    --sudo|--system)
+                [ "$NOSUDO_EXPLICIT" = --no-sudo ] && { echo "setup-linux: --sudo and --no-sudo contradict each other" >&2; exit 2; }
+                NOSUDO=0; NOSUDO_EXPLICIT=--sudo ;;
+    --no-sudo)  [ "$NOSUDO_EXPLICIT" = --sudo ] && { echo "setup-linux: --sudo and --no-sudo contradict each other" >&2; exit 2; }
+                NOSUDO=1; NOSUDO_EXPLICIT=--no-sudo ;;
     --check)    MODE=check ;;
     --dry-run)  MODE=dry-run ;;
     --no-cross) DO_CROSS=0 ;;
@@ -173,11 +195,33 @@ die()  { printf 'setup-linux: error: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # The PATH the verification and the gcc build use: our prefixes first, and
-# the sbin dirs because Debian keeps mke2fs/debugfs there.
+# the sbin dirs because Debian keeps mke2fs/debugfs there.  Wrappers may come
+# first because each one steps aside for a system tool of the same name.
 BUILD_PATH="$BIN_DIR:$PREFIX/bin:$MUSL_DIR/bin:$PATH:/usr/sbin:/sbin"
-# The host's own PATH (no wrappers): what apt/no-sudo auto-detection looks at.
-HOST_PATH="$PATH:/usr/sbin:/sbin"
+# The host's own PATH: $PATH with this script's own directories removed, so
+# gap detection answers "what would the host have without us?" even when the
+# caller has already sourced maeros-env.sh.
+HOST_PATH=""
+sl_ifs=$IFS; IFS=:
+for sl_d in $PATH; do
+    case "$sl_d" in
+    "$BIN_DIR"|"$PREFIX/bin"|"$MUSL_DIR/bin"|"$NATIVE_DIR/bin"|"") continue ;;
+    esac
+    HOST_PATH="${HOST_PATH:+$HOST_PATH:}$sl_d"
+done
+IFS=$sl_ifs
+HOST_PATH="$HOST_PATH:/usr/sbin:/sbin"
 host_has() { PATH="$HOST_PATH" command -v "$1" >/dev/null 2>&1; }
+
+# system_tool NAME — echo the path of a real system NAME, or fail.  A grub-*
+# tool only counts when the system GRUB also has its BIOS modules: without
+# them it cannot build the ISO, so our relocated copy must stay in charge.
+system_tool() {
+    st=$(PATH="$SYS_PATH" command -v "$1" 2>/dev/null) || st=""
+    [ -n "$st" ] || return 1
+    case "$1" in grub-*) [ -d /usr/lib/grub/i386-pc ] || return 1 ;; esac
+    printf '%s' "$st"
+}
 
 # fetch URL DEST — resumable download with wget (or curl), atomic on success.
 fetch() {
@@ -391,11 +435,34 @@ nosudo_native() {
     fi
 }
 
+# handoff_lines NAME — the preamble every wrapper starts with: if a real
+# system NAME exists (it was installed after this wrapper was written, or the
+# wrapper was never needed), run that instead.  This is what keeps $BIN_DIR
+# from permanently shadowing a later `apt install`, whatever its position in
+# PATH.  The lookup uses $SYS_PATH, which never contains $BIN_DIR, and the
+# wrapper's own path is excluded in case $BIN_DIR is a system directory.
+handoff_lines() {
+    hname="$1"
+    hguard=""
+    case "$hname" in grub-*) hguard=" && [ -d /usr/lib/grub/i386-pc ]" ;; esac
+    say "# Prefer a system $hname over this wrapper if one is ever installed."
+    say "maeros_sys=\$(PATH=$SYS_PATH command -v $hname 2>/dev/null)"
+    say "if [ -n \"\$maeros_sys\" ] && [ \"\$maeros_sys\" != \"$BIN_DIR/$hname\" ]$hguard; then"
+    say "    exec \"\$maeros_sys\" \"\$@\""
+    say "fi"
+}
+
 # write_wrapper NAME PRELUDE EXTRA_ARGS — $BIN_DIR/NAME that execs the
 # relocated $HOSTPKGS_DIR binary of the same name, with LD_LIBRARY_PATH set
 # only when the binary needs libraries the host does not have.
 write_wrapper() {
     name="$1"; prelude="$2"; extra="$3"
+    # The host has a real one: leave it to PATH (demote_wrappers rewrites any
+    # wrapper an earlier run left behind).
+    if system_tool "$name" >/dev/null; then
+        SUPERSEDED="$SUPERSEDED $name"
+        return 0
+    fi
     real=""
     for d in usr/bin usr/sbin bin sbin; do
         [ -x "$HOSTPKGS_DIR/$d/$name" ] && { real="$HOSTPKGS_DIR/$d/$name"; break; }
@@ -408,6 +475,7 @@ write_wrapper() {
     {
         say "#!/bin/sh"
         say "# Generated by tools/setup-linux.sh (no-sudo mode): $name from $HOSTPKGS_DIR"
+        handoff_lines "$name"
         [ -n "$libs" ] && say "$libs"
         [ -n "$prelude" ] && say "$prelude"
         say "exec \"$real\" $extra\"\$@\""
@@ -421,6 +489,7 @@ nosudo_wrappers() {
     step "1c. wrapper scripts -> $BIN_DIR"
     mkdir -p "$BIN_DIR"
     WRAPPED=""
+    SUPERSEDED=""
     HOSTPKGS_LIBS=""
     for d in "$HOSTPKGS_DIR"/usr/lib/*-linux-gnu* "$HOSTPKGS_DIR"/lib/*-linux-gnu* "$HOSTPKGS_DIR/usr/lib" "$HOSTPKGS_DIR/lib"; do
         [ -d "$d" ] && HOSTPKGS_LIBS="${HOSTPKGS_LIBS:+$HOSTPKGS_LIBS:}$d"
@@ -462,32 +531,107 @@ export BISON_PKGDATADIR=\"$HOSTPKGS_DIR/usr/share/bison\""
     if [ "$USE_NATIVE" = 1 ]; then
         for pair in cc:gcc c++:g++; do
             wname=${pair%:*}; tool=${pair#*:}
-            cat >"$BIN_DIR/$wname.tmp" <<WRAP
+            if system_tool "$wname" >/dev/null; then
+                SUPERSEDED="$SUPERSEDED $wname"
+                continue
+            fi
+            { cat <<WRAP
 #!/bin/sh
 # Generated by tools/setup-linux.sh (no-sudo mode): host $wname is musl.cc's
 # x86_64-linux-musl-native $tool.  Its dynamic loader /lib/ld-musl-x86_64.so.1 is
 # not installed on this host, so executables are linked statically unless this
 # is a compile-only, preprocess-only or -shared invocation.
+WRAP
+              handoff_lines "$wname"
+              cat <<WRAP
 static=-static
 for a in "\$@"; do
     case "\$a" in -c|-S|-E|-M|-MM|-shared|-static|-r) static= ;; esac
 done
 exec "$NATIVE_DIR/bin/$tool" "\$@" \$static
 WRAP
+            } >"$BIN_DIR/$wname.tmp"
             chmod +x "$BIN_DIR/$wname.tmp"
             mv -f "$BIN_DIR/$wname.tmp" "$BIN_DIR/$wname"
             WRAPPED="$WRAPPED $wname"
         done
     fi
-    say "   wrote:$WRAPPED"
+    say "   wrote:${WRAPPED:- (nothing: the host provides all of them)}"
+    [ -n "$SUPERSEDED" ] && say "   not wrapped, the host has its own:$SUPERSEDED"
+    # No deleting here on purpose: $BIN_DIR may be in use by another build right
+    # now.  Superseded wrappers are rewritten as hand-offs instead, so they stop
+    # shadowing the system tool; removing the files is the explicit --sudo step.
+    demote_wrappers
+}
+
+# demote_wrappers — rewrite every wrapper the host has since gained a real tool
+# for into a pure hand-off, so nothing in $BIN_DIR shadows an installed
+# package.  The file is kept (another build may be running out of $BIN_DIR) and
+# rewritten in place only once; --sudo/--apt is what actually deletes it.
+demote_wrappers() {
+    [ -d "$BIN_DIR" ] || return 0
+    demoted=""
+    for w in "$BIN_DIR"/*; do
+        [ -f "$w" ] || continue
+        head -n 5 "$w" | grep -q 'Generated by tools/setup-linux.sh' || continue
+        n=${w##*/}
+        system_tool "$n" >/dev/null || continue
+        grep -q '^# hand-off only$' "$w" && continue
+        {
+            say "#!/bin/sh"
+            say "# Generated by tools/setup-linux.sh (no-sudo mode): the host has its own"
+            say "# $n, so this file only hands off to it.  --sudo (or --apt) deletes it."
+            say "# hand-off only"
+            handoff_lines "$n"
+            say "echo \"$n: no system $n on PATH; re-run tools/setup-linux.sh --no-sudo\" >&2"
+            say "exit 127"
+        } >"$w.tmp"
+        chmod +x "$w.tmp"
+        mv -f "$w.tmp" "$w"
+        demoted="$demoted $n"
+    done
+    [ -n "$demoted" ] && say "   superseded by system tools, now hand-off only:$demoted"
+    return 0
+}
+
+# prune_wrappers — delete wrappers this script generated that a real system
+# tool now supersedes (typically after an apt install).  Only files carrying
+# the generator marker are ever touched, and the wrappers that remain are the
+# ones the host still has no tool for.
+prune_wrappers() {
+    [ -d "$BIN_DIR" ] || return 0
+    pruned=""
+    for w in "$BIN_DIR"/*; do
+        [ -f "$w" ] || continue
+        head -n 4 "$w" | grep -q 'Generated by tools/setup-linux.sh' || continue
+        n=${w##*/}
+        sys=$(system_tool "$n") || continue
+        [ "$sys" != "$w" ] || continue
+        rm -f "$w"
+        pruned="$pruned $n"
+    done
+    [ -n "$pruned" ] && say "   superseded by system tools, removed from $BIN_DIR:$pruned"
+    return 0
 }
 
 # ── Verification ──────────────────────────────────────────────────────────────
 # check_tool NAME REQUIRED HINT
 MISSING_REQUIRED=0
+WRAPPER_TOOLS=""      # wrappers actually in use (the host has no such tool)
+WRAPPER_HANDOFF=""    # wrappers that step aside for an installed system tool
 check_tool() {
     name="$1"; required="$2"; hint="$3"
     if path=$(PATH="$BUILD_PATH" command -v "$name" 2>/dev/null); then
+        case "$path" in
+        "$BIN_DIR"/*)
+            if handoff=$(system_tool "$name"); then
+                WRAPPER_HANDOFF="$WRAPPER_HANDOFF $name"
+                path="$path -> $handoff"
+            else
+                WRAPPER_TOOLS="$WRAPPER_TOOLS $name"
+            fi
+            ;;
+        esac
         printf '  [ ok ]   %-24s %s\n' "$name" "$path"
     elif [ "$required" = 1 ]; then
         printf '  [MISSING] %-23s %s\n' "$name" "$hint"
@@ -498,6 +642,7 @@ check_tool() {
 }
 
 verify() {
+    WRAPPER_TOOLS=""; WRAPPER_HANDOFF=""
     step "Tool check (PATH includes $BIN_DIR, $PREFIX/bin and $MUSL_DIR/bin)"
     check_tool "$TARGET-gcc"     1 "built by this script into $PREFIX"
     check_tool "$TARGET-ar"      1 "built by this script into $PREFIX"
@@ -546,10 +691,26 @@ verify() {
             printf '  [ -- ]   %-24s optional: %s\n' "gcc -m32" "apt: gcc-multilib (build-glstubs.sh without Docker)"
         fi
     fi
+    if [ -n "$WRAPPER_TOOLS$WRAPPER_HANDOFF" ]; then
+        say ""
+        say "  Wrappers in $BIN_DIR (no-sudo mode):"
+        [ -n "$WRAPPER_TOOLS" ] && say "    in use, the host has no such tool:$WRAPPER_TOOLS"
+        if [ -n "$WRAPPER_HANDOFF" ]; then
+            say "    superseded, they exec the system tool shown above:$WRAPPER_HANDOFF"
+            say "    run --sudo (or --apt) to delete those from $BIN_DIR"
+        fi
+    fi
 }
 
+# $BIN_DIR belongs in PATH only while it actually holds wrappers: an empty
+# (or pruned-empty) directory must not be recommended to the user.
+wrappers_present() {
+    [ -d "$BIN_DIR" ] || return 1
+    for w in "$BIN_DIR"/*; do [ -f "$w" ] && return 0; done
+    return 1
+}
 env_path() {
-    if [ "$NOSUDO" = 1 ] || [ -d "$BIN_DIR" ]; then
+    if wrappers_present; then
         printf '%s' "$BIN_DIR:$PREFIX/bin:$MUSL_DIR/bin"
     else
         printf '%s' "$PREFIX/bin:$MUSL_DIR/bin"
@@ -564,19 +725,23 @@ print_path_line() {
 }
 
 # ── Decide sudo vs. no-sudo ───────────────────────────────────────────────────
+# host_gaps() answers what the host itself provides, ignoring anything this
+# script installed, so a repeat run reaches the same decision without needing
+# to remember it; nothing latches on $HOSTPKGS_DIR.
 GAPS=$(host_gaps)
 if [ "$NOSUDO" = auto ]; then
-    if [ -d "$HOSTPKGS_DIR/.done" ]; then
-        NOSUDO=1        # an earlier run relocated packages here: stay consistent
-    elif [ -n "$GAPS" ] && [ "$MODE" != check ]; then
+    if [ -n "$GAPS" ] && [ "$MODE" != check ]; then
         NOSUDO=1
+        NOSUDO_AUTO=1
     else
         NOSUDO=0
     fi
 fi
 if [ "$NOSUDO" = 1 ]; then
     INTREE_PREREQS=1
-    if native_ok || ! host_compiler_ok; then USE_NATIVE=1; fi
+    # The musl.cc host compiler is for hosts that have none of their own; an
+    # installed gcc/g++ takes precedence even if $NATIVE_DIR is still around.
+    host_compiler_ok || USE_NATIVE=1
 fi
 
 # ── Plan / check modes ────────────────────────────────────────────────────────
@@ -590,7 +755,12 @@ say "  mode      : $MODE"
 if [ "$NOSUDO" = 1 ]; then
     say "  root      : none (no-sudo): apt packages -> $HOSTPKGS_DIR, wrappers -> $BIN_DIR"
     [ "$USE_NATIVE" = 1 ] && say "  host cc   : musl.cc x86_64-linux-musl-native -> $NATIVE_DIR (static link)"
-    [ -n "$GAPS" ] && [ ! -d "$HOSTPKGS_DIR/.done" ] && say "  missing   : $GAPS (--apt would install them with sudo instead)"
+    [ -n "$GAPS" ] && say "  missing   : $GAPS"
+    if [ "$NOSUDO_AUTO" = 1 ]; then
+        say "  note      : no-sudo was chosen automatically because of those missing tools."
+        say "              --sudo prints the apt package list instead and installs nothing;"
+        say "              --apt installs it with sudo."
+    fi
 fi
 
 if [ "$MODE" = check ]; then
@@ -603,8 +773,16 @@ if [ "$MODE" = check ]; then
 fi
 
 if [ "$MODE" = dry-run ]; then
+    step "1. host packages"
     if [ "$NOSUDO" = 1 ]; then
-        step "1. host packages without root -> $HOSTPKGS_DIR"
+        say "   a real run takes the no-sudo path below; --sudo/--apt take this apt list:"
+    else
+        say "   a real run takes this apt list (--apt installs it):"
+    fi
+    say ""
+    apt_lines
+    if [ "$NOSUDO" = 1 ]; then
+        step "1b. selected: host packages without root -> $HOSTPKGS_DIR"
         if have apt-get; then
             list=$(hostpkgs_resolve)
             if [ -z "$list" ]; then say "   nothing to fetch: apt reports every package installed"; else
@@ -622,9 +800,12 @@ if [ "$MODE" = dry-run ]; then
             say "   host compiler: the host's own gcc/g++"
         fi
         say "   wrappers: $BIN_DIR/{$(printf '%s' "$NOSUDO_WRAP" | tr '\n' ' ' | tr -s ' ' ',')} (those present)$( [ "$USE_NATIVE" = 1 ] && printf ', cc, c++')"
+        say "             each one hands off to a system tool of the same name if one exists"
     else
-        step "1. apt packages"
-        apt_lines
+        say ""
+        say "   No-sudo fallback: tools/setup-linux.sh --no-sudo relocates the same"
+        say "   packages under $HOSTPKGS_DIR and needs no root at all."
+        wrappers_present && say "   $BIN_DIR holds wrappers from an earlier no-sudo run; a real run prunes the superseded ones."
     fi
     step "2. i686-elf cross toolchain -> $PREFIX"
     if [ "$DO_CROSS" = 0 ]; then say "   skipped (--no-cross)"; else
@@ -668,6 +849,11 @@ else
     else
         say ""
         say "(not installing: re-run with --apt to install them, or --no-sudo to relocate them under $HOSTPKGS_DIR)"
+    fi
+    if wrappers_present; then
+        step "1b. wrappers from an earlier no-sudo run -> $BIN_DIR"
+        prune_wrappers
+        wrappers_present || say "   none left; $BIN_DIR is dropped from the PATH line below"
     fi
 fi
 
