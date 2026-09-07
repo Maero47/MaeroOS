@@ -7,12 +7,14 @@ GTK_OK init, then attaches gdb with a CONDITIONAL write-watchpoint that only
 breaks when the slot becomes 0x80000000 (so it naturally fires in gtkprobe's
 context, ignoring other processes' identical virtual address).
 """
-import os, sys, time, subprocess, selectors
+import os, sys, time, subprocess, selectors, shutil
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PROMPT = "MaeroOS$ "
 A = 0x40073000
-GDB = "/opt/homebrew/bin/i386-elf-gdb"
+# First cross gdb on PATH (Linux: gdb-multiarch, macOS/Homebrew: i386-elf-gdb).
+GDB = (shutil.which("i686-elf-gdb") or shutil.which("i386-elf-gdb")
+       or shutil.which("gdb-multiarch") or "/opt/homebrew/bin/i386-elf-gdb")
 
 def main():
     subprocess.run(["make", "initrd", "disk"], cwd=ROOT, check=True,

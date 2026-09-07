@@ -71,8 +71,21 @@ $(LWIP_OBJS): CFLAGS := $(LWIP_CFLAGS)
 TARGET   := kernel.elf
 QEMU_ISO_PID := .qemu-iso.pid
 
-E2FSTOOLS := /opt/homebrew/opt/e2fsprogs/sbin
-GCC_INCLUDE := $(shell $(CC) -print-file-name=include)
+# Host tool discovery.  Everything here is deferred (plain `=`) or silenced so
+# that a missing tool fails when the recipe that needs it runs, not while Make
+# parses this file.  macOS/Homebrew paths are the fallback, Linux is the default.
+# find_tool: first of the given names on PATH, else the first name looked up in
+# the usual sbin/Homebrew directories, else the bare name (so the error message
+# at use time names the missing tool).
+TOOL_DIRS := /usr/sbin /sbin /opt/homebrew/opt/e2fsprogs/sbin /usr/local/opt/e2fsprogs/sbin
+find_tool = $(shell for t in $(1); do command -v "$$t" 2>/dev/null && exit 0; done; \
+	for d in $(TOOL_DIRS); do [ -x "$$d/$(firstword $(1))" ] && echo "$$d/$(firstword $(1))" && exit 0; done; \
+	echo $(firstword $(1)))
+MKE2FS  = $(call find_tool,mke2fs mkfs.ext2)
+DEBUGFS = $(call find_tool,debugfs)
+# toybox's build scripts need GNU sed: `gsed` on macOS, plain `sed` on Linux.
+SED     = $(shell command -v gsed 2>/dev/null || echo sed)
+GCC_INCLUDE := $(shell $(CC) -print-file-name=include 2>/dev/null)
 TOYBOX_DIR := third_party/toybox
 GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null)
 TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
@@ -110,7 +123,7 @@ toybox: userspace
 	rm -f $(TOYBOX_DIR)/toybox $(TOYBOX_DIR)/generated/unstripped/toybox
 	$(MAKE) -C $(TOYBOX_DIR) toybox \
 		KCONFIG_CONFIG=.config.maeros \
-		SED=gsed \
+		SED=$(SED) \
 		LDOPTIMIZE='-Wl,--gc-sections' \
 		CC=$(CC) \
 		HOSTCC=cc \
@@ -134,12 +147,14 @@ INITRD_EXCLUDE := --exclude=./cairoprobe --exclude=./pangoprobe \
 	--exclude=./firefox --exclude=./fflib \
 	--exclude=./usr/share/icons \
 	--exclude=./gtkprobe
+# COPYFILE_DISABLE=1 stops macOS tar from adding ._* AppleDouble entries; it is
+# an ordinary ignored environment variable for GNU tar on Linux.
 initrd: userspace toybox
 	COPYFILE_DISABLE=1 tar --format=ustar $(INITRD_EXCLUDE) -cf initrd.tar -C testfiles .
 	@echo "initrd.tar created."
 
 # Create an ext2 disk image populated from testfiles/.
-# Requires e2fsprogs (brew install e2fsprogs).
+# Requires e2fsprogs (apt install e2fsprogs / brew install e2fsprogs).
 #
 # DISK_SIZE_MB / DISK_PRUNE / DISK_IMG are overridable so the same recipe builds
 # both the lean default disk (used by smoke-disk / run-disk) and the large
@@ -153,22 +168,22 @@ DISK_PRUNE   ?= -path 'testfiles/firefox' -o -path 'testfiles/fflib'
 disk: userspace
 	@echo "[DISK]  Building ext2 disk image ($(DISK_SIZE_MB) MiB) -> $(DISK_IMG)..."
 	dd if=/dev/zero bs=1M count=$(DISK_SIZE_MB) 2>/dev/null | tr '\000' '\000' > $(DISK_IMG)
-	$(E2FSTOOLS)/mke2fs -t ext2 -b 1024 -F $(DISK_IMG) 2>/dev/null
+	$(MKE2FS) -t ext2 -b 1024 -F $(DISK_IMG) 2>/dev/null
 	@find testfiles \( $(DISK_PRUNE) \) -prune -o -type d -print | while read d; do \
 	    if [ "$$d" != "testfiles" ]; then \
 	        rel=$${d#testfiles/}; \
 	        echo "  [DISK]  mkdir /$$rel"; \
-	        $(E2FSTOOLS)/debugfs -w -R "mkdir /$$rel" $(DISK_IMG) || true; \
+	        $(DEBUGFS) -w -R "mkdir /$$rel" $(DISK_IMG) || true; \
 	    fi; \
 	done
 	@find testfiles \( $(DISK_PRUNE) \) -prune -o -type f -print | while read f; do \
 	    rel=$${f#testfiles/}; \
 	    echo "  [DISK]  $$f -> /$$rel"; \
-	    $(E2FSTOOLS)/debugfs -w \
+	    $(DEBUGFS) -w \
 	        -R "write $$f /$$rel" $(DISK_IMG) || true; \
 	    magic=$$(head -c4 "$$f" | od -An -tx1 | tr -d ' \n'); \
 	    if [ "$$magic" = "7f454c46" ]; then \
-	        $(E2FSTOOLS)/debugfs -w -R "sif /$$rel mode 0100755" $(DISK_IMG) \
+	        $(DEBUGFS) -w -R "sif /$$rel mode 0100755" $(DISK_IMG) \
 	            2>/dev/null || true; \
 	    fi; \
 	done
@@ -176,9 +191,9 @@ disk: userspace
 	    echo "[DISK]  Applying ownership/permission manifest..."; \
 	    grep -v '^#' tools/diskperms.txt | while read p u g m; do \
 	        [ -z "$$p" ] && continue; \
-	        $(E2FSTOOLS)/debugfs -w -R "sif /$$p uid $$u" $(DISK_IMG) 2>/dev/null || true; \
-	        $(E2FSTOOLS)/debugfs -w -R "sif /$$p gid $$g" $(DISK_IMG) 2>/dev/null || true; \
-	        $(E2FSTOOLS)/debugfs -w -R "sif /$$p mode $$m" $(DISK_IMG) 2>/dev/null || true; \
+	        $(DEBUGFS) -w -R "sif /$$p uid $$u" $(DISK_IMG) 2>/dev/null || true; \
+	        $(DEBUGFS) -w -R "sif /$$p gid $$g" $(DISK_IMG) 2>/dev/null || true; \
+	        $(DEBUGFS) -w -R "sif /$$p mode $$m" $(DISK_IMG) 2>/dev/null || true; \
 	    done; \
 	fi
 	@echo "[DISK]  Done: $(DISK_IMG)"
@@ -295,21 +310,19 @@ repo: $(wildcard ports/packages/*/*)
 	python3 tools/mkrepo.py
 
 repo-serve: repo
-	@lsof -ti tcp:8000 | xargs kill 2>/dev/null || true
+	@sh tools/run-maeros.sh --free-port 8000
 	@echo "Serving app repo at http://localhost:8000 (guest: 10.0.2.2:8000)"
 	cd repo && python3 -m http.server 8000
 
-# `make start` auto-fits the guest resolution to this Mac's screen and serves
-# the app repo.  Override the resolution with `make start RES=1280x720`.
+# `make start` auto-fits the guest resolution to the host screen (osascript on
+# macOS, xrandr/xdpyinfo on Linux) and serves the app repo.  Override the
+# resolution with `make start RES=1280x720`.
 start: disk iso repo
 	SERVE_REPO=1 sh tools/run-maeros.sh $(RES)
 
 # Just list the supported resolutions + the auto-pick for this screen.
 resolutions:
-	@sh tools/run-maeros.sh --list 2>/dev/null || \
-	 sh -c 'BOUNDS=$$(osascript -e "tell application \"Finder\" to get bounds of window of desktop"); \
-	        echo "Host screen points: $$BOUNDS"; \
-	        echo "Supported: 1920x1080 1680x1050 1600x900 1440x900 1366x768 1280x800 1280x720 1152x720 1024x768 800x600"'
+	@sh tools/run-maeros.sh --list
 
 run-iso: iso
 	@if [ -f "$(QEMU_ISO_PID)" ]; then \

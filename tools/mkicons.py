@@ -12,7 +12,8 @@ UI actually uses, at the sizes it draws.  Output goes to testfiles/icons/.
     u16 height
     width*height*4 bytes RGBA (straight alpha, top-to-bottom)
 
-Requires an SVG rasterizer: rsvg-convert (brew install librsvg) preferred,
+Requires an SVG rasterizer: rsvg-convert (apt install librsvg2-bin /
+brew install librsvg) preferred,
 else cairosvg.  Falls back gracefully (skips) so the build still works with
 the legacy hex-art icons if no rasterizer is present.
 """
@@ -99,7 +100,8 @@ def main():
         print(f"mkicons: theme not found at {THEME}; keeping hex-art icons.")
         return 0
     if not have_rsvg():
-        print("mkicons: rsvg-convert not found (brew install librsvg); "
+        print("mkicons: rsvg-convert not found (apt install librsvg2-bin / "
+              "brew install librsvg); "
               "keeping hex-art icons.")
         return 0
     os.makedirs(OUT, exist_ok=True)
