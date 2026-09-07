@@ -111,6 +111,15 @@ static void sv_unset(const char *name) {
 /* ── Global state ─────────────────────────────────────────────────────────── */
 static char **g_envp   = (char **)0;
 static int    g_status = 0;
+
+/* waitpid() status is Linux-encoded: exit code in bits 8..15, a terminating
+ * signal in bits 0..6, 0x7f in the low byte for a stopped child.  $? is the
+ * exit code, or 128 + signal for a signalled child, as in POSIX shells. */
+static int wait_status_to_exit(int st) {
+    if ((st & 0x7f) == 0)    return (st >> 8) & 0xff;
+    if ((st & 0xff) == 0x7f) return 128 + ((st >> 8) & 0xff);
+    return 128 + (st & 0x7f);
+}
 static int    shell_pgrp = 0;
 static int    job_pgrp = 0;
 
@@ -789,7 +798,7 @@ static int run_builtin(char *argv[], int argc) {
         int st=0;
         waitpid(pid, &st, 2); /* WUNTRACED=2 */
         shell_take_terminal();
-        g_status = st;
+        g_status = wait_status_to_exit(st);
         if ((st & 0xff) == 0x7f) {
             jobs_list[idx].stopped = 1; /* stopped again */
         } else {
@@ -1056,7 +1065,7 @@ static int run_pipeline(const char *cmdstr, int background) {
         }
         setpgid(pid, pid);
         job_take_terminal(pid);
-        int st=0; waitpid(pid,&st,2); g_status=st;
+        int st=0; waitpid(pid,&st,2); g_status=wait_status_to_exit(st);
         shell_take_terminal();
         if ((st & 0xff) == 0x7f && jobs_n < MAX_JOBS) {
             jobs_list[jobs_n].pid = pid;
@@ -1091,7 +1100,7 @@ static int run_pipeline(const char *cmdstr, int background) {
         for (int i=0;i<ncmds;i++)
             if (pids[i]>0) { int s; waitpid(pids[i],&s,2); st=s; }
         shell_take_terminal();
-        g_status=st;
+        g_status=wait_status_to_exit(st);
         if ((st & 0xff) == 0x7f && pgid > 0 && jobs_n < MAX_JOBS) {
             jobs_list[jobs_n].pid = pgid;
             jobs_list[jobs_n].stopped = 1;
