@@ -35,7 +35,7 @@ The runtime layout mirrors what the launchers (`userspace/ff/ff.c`,
 * `LD_LIBRARY_PATH=/lib:/disk/lib:/disk/firefox` — glibc in `/lib`, the GTK
   stack next to `firefox-bin`.
 * `GDK_PIXBUF_MODULE_FILE=/disk/firefox/pixbuf-loaders/loaders.cache` — the
-  cache is generated with the suite's own `gdk-pixbuf-query-loaders` (run on
+  cache is produced by the suite's own `gdk-pixbuf-query-loaders` (run on
   the host through the fetched `ld-linux.so.2`) and rewritten to `/disk/...`
   paths.  PNG and JPEG are built into gdk-pixbuf 2.42; the module set is the
   Debian default minus `tiff` (drags in libtiff plus seven codecs) and `svg`
