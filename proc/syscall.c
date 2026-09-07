@@ -16,6 +16,7 @@
 #include "../drivers/keyboard.h"
 #include "../kernel/random.h"
 #include "../arch/i686/cpu/pit.h"
+#include "../arch/i686/cpu/tsc.h"
 #include "../arch/i686/cpu/gdt.h"
 #include "../arch/i686/cpu/fpu.h"
 #include "../arch/i686/cpu/cpuid.h"
@@ -115,6 +116,9 @@ struct ktimespec { int32_t tv_sec; int32_t tv_nsec; };
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
 
+int vma_prot_lookup(uint32_t addr);   /* defined with the VMA registry below */
+static int vma_range_free(uint32_t va, uint32_t length);
+
 int access_ok(const void *ptr, size_t len) {
     uintptr_t addr = (uintptr_t)ptr;
     uintptr_t end = addr + len;
@@ -129,11 +133,15 @@ int access_ok(const void *ptr, size_t len) {
 
     for (;;) {
         uint32_t *pde = paging_get_pde((uint32_t)page);
-        if (!(*pde & PAGE_PRESENT))
-            return 0;
-        uint32_t pte = *paging_get_pte((uint32_t)page);
-        if (!(pte & PAGE_PRESENT) || !(pte & PAGE_USER))
-            return 0;
+        uint32_t pte = (*pde & PAGE_PRESENT) ? *paging_get_pte((uint32_t)page) : 0;
+        if (!(pte & PAGE_PRESENT) || !(pte & PAGE_USER)) {
+            /* Not populated: fine if a VMA with access covers it — the copy
+             * demand-faults it in (Linux access_ok only checks the range; the
+             * fault path does the rest).  A PROT_NONE page or PROT_NONE VMA is
+             * not accessible. */
+            if (pte & PAGE_PROTNONE) return 0;
+            if (vma_prot_lookup((uint32_t)page) <= 0) return 0;
+        }
         if (page == last)
             break;
         page += PAGE_SIZE;
@@ -744,14 +752,19 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
 
         for (int pte_idx = 0; pte_idx < 1024; pte_idx++) {
             uint32_t pte = parent_pt[pte_idx];
-            if (!(pte & PAGE_PRESENT)) {
+            /* PAGE_PROTNONE entries own a frame too (mprotect(PROT_NONE)). */
+            if (!(pte & (PAGE_PRESENT | PAGE_PROTNONE))) {
                 child_pt[pte_idx] = 0;
                 continue;
             }
 
             uint32_t frame_phys = pte & ~0xFFFU;
 
-            if ((pte & PAGE_WRITABLE) && !(pte & PAGE_SHARED)) {
+            /* Every private page becomes COW, writable or not: a read-only
+             * private page may be made writable later by mprotect(), and the
+             * COW bit is what keeps that write from leaking into the sharer
+             * (Linux copy_present_pte marks the whole private range). */
+            if (!(pte & PAGE_SHARED)) {
                 /* Make COW: strip write bit, add COW flag in both.  NB: do NOT
                  * per-page invlpg here — for a large address space (Firefox's
                  * ~150 MB) that is tens of thousands of invlpgs, making fork slow
@@ -1205,6 +1218,11 @@ static int sys_brk(registers_t *regs) {
         /* Grow heap: map pages from old_brk up to new_brk */
         uint32_t va = old_brk & ~(PAGE_SIZE - 1);
         uint32_t end = (new_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        /* Linux do_brk_flags: the break may not run into a mapping. */
+        {
+            uint32_t chk = (old_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+            if (end > chk && !vma_range_free(chk, end - chk)) return -12;
+        }
         for (; va < end; va += PAGE_SIZE) {
             /* Skip pages already mapped (old_brk might not be page-aligned) */
             if (va < old_brk && (*paging_get_pde(va) & PAGE_PRESENT) &&
@@ -2206,18 +2224,206 @@ static int sys_fcntl(registers_t *regs) {
     return -22;  /* EINVAL */
 }
 
+/* ── Clocks ──────────────────────────────────────────────────────────────────
+ * clock_gettime ids (uapi/linux/time.h).  MONOTONIC, MONOTONIC_RAW, BOOTTIME
+ * and MONOTONIC_COARSE are uptime; REALTIME, REALTIME_COARSE and TAI are the
+ * RTC epoch sampled at boot plus uptime (nothing steps the clock); the CPU-time
+ * clocks are the scheduler's per-thread tick accounting.  The fine clocks are
+ * TSC-interpolated between 100 Hz ticks (arch/i686/cpu/tsc.c), so their
+ * resolution is 1 ns like Linux reports; the *_COARSE clocks are the tick. */
+#define CLK_REALTIME_K          0
+#define CLK_MONOTONIC_K         1
+#define CLK_PROCESS_CPUTIME_K   2
+#define CLK_THREAD_CPUTIME_K    3
+#define CLK_MONOTONIC_RAW_K     4
+#define CLK_REALTIME_COARSE_K   5
+#define CLK_MONOTONIC_COARSE_K  6
+#define CLK_BOOTTIME_K          7
+#define CLK_REALTIME_ALARM_K    8
+#define CLK_BOOTTIME_ALARM_K    9
+#define CLK_TAI_K               11
+
+/* CPU time of one thread or of a whole thread group, in ticks. */
+static uint32_t cputime_ticks(int tgid, int tid) {
+    uint32_t t = 0;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *p = &ptable[i];
+        if (p->state == PROC_UNUSED) continue;
+        if (tid ? (p->pid == tid) : (p->tgid == tgid)) t += p->utime_ticks;
+    }
+    return t;
+}
+
+/* Read clock `clk` into (sec, nsec).  Returns 0 or -EINVAL for unknown ids. */
+static int kclock_get(int clk, int64_t *sec, uint32_t *nsec) {
+    uint32_t ms, mns;
+    switch (clk) {
+    case CLK_MONOTONIC_K: case CLK_MONOTONIC_RAW_K: case CLK_BOOTTIME_K:
+    case CLK_BOOTTIME_ALARM_K:
+        clock_mono(&ms, &mns);
+        *sec = ms; *nsec = mns;
+        return 0;
+    case CLK_MONOTONIC_COARSE_K: {
+        uint32_t t = pit_ticks();
+        *sec = t / TICK_HZ; *nsec = (t % TICK_HZ) * TICK_NS;
+        return 0;
+    }
+    case CLK_REALTIME_K: case CLK_REALTIME_ALARM_K: case CLK_TAI_K:
+        clock_mono(&ms, &mns);
+        *sec = (int64_t)rtc_boot_epoch() + ms; *nsec = mns;
+        return 0;
+    case CLK_REALTIME_COARSE_K: {
+        uint32_t t = pit_ticks();
+        *sec = (int64_t)rtc_boot_epoch() + t / TICK_HZ; *nsec = (t % TICK_HZ) * TICK_NS;
+        return 0;
+    }
+    case CLK_PROCESS_CPUTIME_K: case CLK_THREAD_CPUTIME_K: {
+        uint32_t t = current_proc
+                   ? cputime_ticks(current_proc->tgid,
+                                   clk == CLK_THREAD_CPUTIME_K ? current_proc->pid : 0)
+                   : 0;
+        *sec = t / TICK_HZ; *nsec = (t % TICK_HZ) * TICK_NS;
+        return 0;
+    }
+    default:
+        break;
+    }
+    if (clk < 0) {
+        /* Dynamic CPU clocks (clock_getcpuclockid / pthread_getcpuclockid):
+         * id = ~(pid << 3) | type, bit 2 selects a thread (CPUCLOCK_PERTHREAD). */
+        int pid  = ~(clk >> 3);
+        int type = clk & 7;
+        if ((type & 3) == 3) return -22;
+        if (pid == 0 && current_proc) pid = (type & 4) ? current_proc->pid : current_proc->tgid;
+        uint32_t t = (type & 4) ? cputime_ticks(0, pid) : cputime_ticks(pid, 0);
+        int found = 0;
+        for (int i = 0; i < MAX_PROCS && !found; i++)
+            if (ptable[i].state != PROC_UNUSED &&
+                ((type & 4) ? ptable[i].pid == pid : ptable[i].tgid == pid)) found = 1;
+        if (!found) return -22;
+        *sec = t / TICK_HZ; *nsec = (t % TICK_HZ) * TICK_NS;
+        return 0;
+    }
+    return -22;
+}
+
+/* Resolution of clock `clk` in ns, or -EINVAL. */
+static int kclock_res(int clk, uint32_t *nsec) {
+    switch (clk) {
+    case CLK_REALTIME_COARSE_K: case CLK_MONOTONIC_COARSE_K:
+        *nsec = TICK_NS;                 /* the tick (Linux: jiffy) */
+        return 0;
+    case CLK_REALTIME_K: case CLK_MONOTONIC_K: case CLK_MONOTONIC_RAW_K:
+    case CLK_BOOTTIME_K: case CLK_REALTIME_ALARM_K: case CLK_BOOTTIME_ALARM_K:
+    case CLK_TAI_K: case CLK_PROCESS_CPUTIME_K: case CLK_THREAD_CPUTIME_K:
+        *nsec = clock_tsc_calibrated() ? 1 : TICK_NS;
+        return 0;
+    default:
+        if (clk < 0) { *nsec = 1; return 0; }
+        return -22;
+    }
+}
+
+/* Sleep until the MONOTONIC instant (dsec, dnsec) since boot.  Returns 0 once
+ * the deadline has passed, or -EINTR when a signal that will be delivered is
+ * pending, with the remaining time in (*rsec, *rnsec) (Linux hrtimer_nanosleep:
+ * the remainder is what nanosleep(2) reports and what a restart would sleep).
+ * The scheduler wakes us at the first tick at or after the deadline, so we can
+ * never return early; spurious wakeups simply re-arm. */
+static int ksleep_until_mono(uint32_t dsec, uint32_t dnsec, uint32_t *rsec, uint32_t *rnsec) {
+    for (;;) {
+        uint32_t s, ns;
+        clock_mono(&s, &ns);
+        if (s > dsec || (s == dsec && ns >= dnsec)) {
+            if (rsec) { *rsec = 0; *rnsec = 0; }
+            return 0;
+        }
+        if (signal_interrupt_pending(current_proc)) {
+            if (rsec) {
+                uint32_t rs = dsec - s, rn;
+                if (dnsec >= ns) rn = dnsec - ns; else { rs--; rn = dnsec + 1000000000U - ns; }
+                *rsec = rs; *rnsec = rn;
+            }
+            return -4;                       /* -EINTR */
+        }
+        uint32_t wt = clock_mono_to_tick(dsec, dnsec);
+        if ((int32_t)(wt - pit_ticks()) <= 0) wt = pit_ticks() + 1;
+        if (!wt) wt = 1;                     /* 0 means "no deadline" */
+        current_proc->wake_tick = wt;
+        sleep_on((void *)&ksleep_until_mono);
+    }
+}
+
+/* Validate a timespec (Linux timespec64_valid): nsec in [0, 1e9). */
+static int ts_valid(int64_t sec, int64_t nsec) {
+    return sec >= 0 && nsec >= 0 && nsec < 1000000000LL;
+}
+
+/* Turn a clock_nanosleep request into a MONOTONIC deadline.  Returns 0, or a
+ * negative errno (unsupported clock, bad flags).  *expired is set when the
+ * absolute deadline is already in the past. */
+#define TIMER_ABSTIME_K 1
+static int knanosleep_deadline(int clk, int flags, int64_t rsec, int64_t rnsec,
+                               uint32_t *dsec, uint32_t *dnsec, int *expired) {
+    if (flags & ~TIMER_ABSTIME_K) return -22;
+    switch (clk) {
+    case CLK_REALTIME_K: case CLK_MONOTONIC_K: case CLK_BOOTTIME_K:
+    case CLK_PROCESS_CPUTIME_K:           /* accepted by Linux; we sleep on wall time */
+        break;
+    case CLK_REALTIME_COARSE_K: case CLK_MONOTONIC_COARSE_K: case CLK_MONOTONIC_RAW_K:
+    case CLK_THREAD_CPUTIME_K:
+        return -95;                       /* -EOPNOTSUPP (Linux: ENOTSUP) */
+    default:
+        return -22;
+    }
+    if (rnsec < 0 || rnsec >= 1000000000LL) return -22;
+    uint32_t ms, mns;
+    clock_mono(&ms, &mns);
+    *expired = 0;
+    if (flags & TIMER_ABSTIME_K) {
+        int64_t asec = rsec;
+        if (clk == CLK_REALTIME_K) asec -= (int64_t)rtc_boot_epoch();   /* wall → uptime */
+        if (asec < 0 || (asec == 0 && rnsec == 0) || asec < (int64_t)ms ||
+            (asec == (int64_t)ms && (uint32_t)rnsec <= mns)) { *expired = 1; return 0; }
+        if (asec > (int64_t)ms + 20000000LL) asec = (int64_t)ms + 20000000LL;  /* ~231 days: keep tick math in range */
+        *dsec = (uint32_t)asec; *dnsec = (uint32_t)rnsec;
+        return 0;
+    }
+    if (rsec < 0) return -22;
+    if (rsec == 0 && rnsec == 0) { *expired = 1; return 0; }
+    if (rsec > 20000000LL) rsec = 20000000LL;
+    uint32_t ds = ms + (uint32_t)rsec, dn = mns + (uint32_t)rnsec;
+    if (dn >= 1000000000U) { dn -= 1000000000U; ds++; }
+    *dsec = ds; *dnsec = dn;
+    return 0;
+}
+
 /* ── sys_gettimeofday(timeval *tv, timezone *tz) — EAX=78 ───────────────── */
 static int sys_gettimeofday(registers_t *regs) {
     struct ktimeval *tv = (struct ktimeval *)(uintptr_t)regs->ebx;
     if (tv) {
         struct ktimeval ktv;
-        uint32_t t = pit_ticks();   /* 100 Hz ticks since boot */
-        ktv.tv_sec  = rtc_boot_epoch() + t / 100;   /* wall-clock seconds */
-        ktv.tv_usec = (t % 100) * 10000;
+        int64_t sec; uint32_t nsec;
+        kclock_get(CLK_REALTIME_K, &sec, &nsec);
+        ktv.tv_sec  = (int32_t)sec;
+        ktv.tv_usec = (int32_t)(nsec / 1000U);
         int cr = copy_to_user(tv, &ktv, sizeof(ktv));
         if (cr < 0) return cr;
     }
     return 0;
+}
+
+/* ── sys_time(time_t *t) — EAX=13 ───────────────────────────────────────── */
+static int sys_time(registers_t *regs) {
+    int32_t *ut = (int32_t *)(uintptr_t)regs->ebx;
+    int64_t sec; uint32_t nsec;
+    kclock_get(CLK_REALTIME_K, &sec, &nsec);
+    int32_t s32 = (int32_t)sec;
+    if (ut) {
+        int cr = copy_to_user(ut, &s32, sizeof(s32));
+        if (cr < 0) return cr;
+    }
+    return s32;
 }
 
 /* ── sys_stat(path, stat*) — EAX=106 ────────────────────────────────────── */
@@ -2295,39 +2501,24 @@ static int sys_nanosleep(registers_t *regs) {
     struct ktimespec *req = (struct ktimespec *)(uintptr_t)regs->ebx;
     struct ktimespec *rem = (struct ktimespec *)(uintptr_t)regs->ecx;
     if (!req) return -14;
-
-    /* Bounce the request into kernel memory before reading any field. */
     struct ktimespec kreq;
     int cr = copy_from_user(&kreq, req, sizeof(kreq));
     if (cr < 0) return cr;
-    if (kreq.tv_sec < 0 || kreq.tv_nsec < 0 || kreq.tv_nsec >= 1000000000)
-        return -22;
+    if (!ts_valid(kreq.tv_sec, kreq.tv_nsec)) return -22;
 
-    /* Zero the remaining time */
-    if (rem) {
-        struct ktimespec krem = { 0, 0 };
+    uint32_t ds, dn; int expired;
+    int r = knanosleep_deadline(CLK_MONOTONIC_K, 0, kreq.tv_sec, kreq.tv_nsec, &ds, &dn, &expired);
+    if (r < 0) return r;
+    if (expired) return 0;
+    uint32_t rs = 0, rn = 0;
+    r = ksleep_until_mono(ds, dn, &rs, &rn);
+    /* Linux writes the remainder only when interrupted (-EINTR). */
+    if (r == -4 && rem) {
+        struct ktimespec krem = { (int32_t)rs, (int32_t)rn };
         cr = copy_to_user(rem, &krem, sizeof(krem));
         if (cr < 0) return cr;
     }
-    if (kreq.tv_sec == 0 && kreq.tv_nsec == 0) return 0;
-
-    uint32_t ticks = (uint32_t)kreq.tv_sec * 100U;
-    ticks += ((uint32_t)kreq.tv_nsec + 9999999U) / 10000000U;
-    if (!ticks) ticks = 1;
-    uint32_t start = pit_ticks();
-    current_proc->wake_tick = start + ticks;
-    int timed_out = sleep_on((void *)&sys_nanosleep);
-    if (timed_out) return 0;
-    /* Woken early by a signal (Linux hrtimer_nanosleep -> -ERESTART_RESTARTBLOCK:
-     * EINTR to a handler, with the unslept time in *rem; restarted otherwise). */
-    if (rem) {
-        uint32_t used = pit_ticks() - start;
-        uint32_t left = used < ticks ? ticks - used : 0;
-        struct ktimespec krem = { (int32_t)(left / 100U), (int32_t)((left % 100U) * 10000000U) };
-        cr = copy_to_user(rem, &krem, sizeof(krem));
-        if (cr < 0) return cr;
-    }
-    return -ERESTARTNOHAND;
+    return r;
 }
 
 /* ── sys_getdents(fd, buf, count) — EAX=141 ─────────────────────────────── */
@@ -2469,15 +2660,59 @@ static struct proc *mmap_owner(void) {
  * allocated (zeroed) on first fault.  The VMA list belongs to the address space
  * (the tgid leader); all VMA ops run with interrupts off because threads share
  * the list and a fault can occur on any thread. */
+/* ── Virtual memory areas ────────────────────────────────────────────────────
+ * Every mmap()ed region of an address space is recorded in a VMA, kept sorted
+ * by address and owned by the thread-group leader (Linux: mm_struct's VMA
+ * tree).  The registry is authoritative for a mapping's existence and its
+ * protection; the page tables only cache what has been populated.  It drives
+ *   - the free-space search, so munmap()ed ranges are reused (mm/mmap.c,
+ *     vm_unmapped_area) and a long-lived process can mmap/munmap forever;
+ *   - protection of pages that fault in later, and the SIGSEGV decision for
+ *     PROT_NONE ranges (mm/memory.c, access_error);
+ *   - re-population after MADV_DONTNEED (a zero page, or the file contents
+ *     again for a private file mapping);
+ *   - /proc/self/maps.
+ * Pages are populated eagerly at mmap time for small mappings and on first
+ * touch for large ones; both paths go through vma_populate_page(). */
+
 struct vma {
     uint32_t start;       /* page-aligned, inclusive */
     uint32_t end;         /* page-aligned, exclusive */
     uint32_t prot;        /* raw mmap PROT bits: 1=R 2=W 4=X; 0 = PROT_NONE */
+    uint32_t flags;       /* VMA_F_* */
     vfs_node_t *file;     /* NULL = anonymous (zero-fill); else file-backed   */
     uint32_t file_off;    /* byte offset in `file` corresponding to `start`   */
     uint32_t file_size;   /* file size snapshot (bytes past it are BSS-zero)  */
-    struct vma *next;
+    struct vma *next;     /* next by ascending start */
 };
+
+/* PTEs of this VMA carry PAGE_SHARED (MAP_SHARED file/anon, /dev/fb0): they
+ * are shared with children instead of COW'd, and MADV_DONTNEED leaves them
+ * alone because there is no per-VMA re-population path for shared frames. */
+#define VMA_F_SHARED   0x1U
+
+#define PROT_READ_K    0x1
+#define PROT_WRITE_K   0x2
+#define PROT_EXEC_K    0x4
+
+#define MAP_SHARED_K            0x01
+#define MAP_PRIVATE_K           0x02
+#define MAP_FIXED_K             0x10
+#define MAP_ANONYMOUS_K         0x20
+#define MAP_FIXED_NOREPLACE_K   0x100000
+
+/* Free-space search window.  The floor keeps mmap() above the ELF images and
+ * the brk heap (the interpreter is loaded at 0x40000000 and is skipped by the
+ * present-page scan); the top stays out of the main thread's 8 MiB stack
+ * growth window (Linux: mmap_base sits below the stack plus stack_guard_gap;
+ * audit M14). */
+#define MMAP_FLOOR   0x40000000U
+#define MMAP_TOP     ((uint32_t)USER_STACK_TOP - (8U << 20))
+
+/* Small mappings are populated at mmap time; large ones fault in lazily (8 MiB
+ * thread stacks and multi-hundred-MiB libraries mostly go untouched). */
+#define VMA_DEMAND_MIN       (4U * 1024U * 1024U)
+#define VMA_FILE_DEMAND_MIN  (1U * 1024U * 1024U)
 
 static inline uint32_t vma_irq_save(void) {
     uint32_t f; __asm__ volatile("pushf; pop %0; cli" : "=r"(f) :: "memory"); return f;
@@ -2486,50 +2721,109 @@ static inline void vma_irq_restore(uint32_t f) {
     if (f & 0x200) __asm__ volatile("sti" ::: "memory");
 }
 
-/* Insert a VMA for [start,end) with the given prot into the owner's list. */
-static int vma_add(uint32_t start, uint32_t end, uint32_t prot) {
-    struct proc *o = mmap_owner();
-    if (!o || end <= start) return -1;
-    struct vma *v = (struct vma *)kmalloc(sizeof(struct vma));
-    if (!v) return -1;
-    v->start = start; v->end = end; v->prot = prot;
-    v->file = NULL; v->file_off = 0; v->file_size = 0;
-    uint32_t irq = vma_irq_save();
-    v->next = o->vmas;
-    o->vmas = v;
-    vma_irq_restore(irq);
-    return 0;
+/* A PTE that owns a frame: present, or PROT_NONE'd (not present, PAGE_PROTNONE
+ * marker, frame kept so the data survives an mprotect(PROT_NONE)/mprotect(RW)
+ * round trip exactly like Linux's _PAGE_PROTNONE). */
+static inline int pte_mapped(uint32_t pte) {
+    return (pte & (PAGE_PRESENT | PAGE_PROTNONE)) != 0;
 }
 
-/* Insert a FILE-BACKED demand-paged VMA: pages fault in from `file` (private,
- * copy-on-fault).  Holds a reference on the node so it survives the fd close
- * that ld.so does right after mmap.  Bytes past file_size read as zero (BSS). */
-static int vma_add_file(uint32_t start, uint32_t end, uint32_t prot,
-                        vfs_node_t *file, uint32_t file_off) {
-    struct proc *o = mmap_owner();
-    if (!o || end <= start || !file) return -1;
-    struct vma *v = (struct vma *)kmalloc(sizeof(struct vma));
-    if (!v) return -1;
-    v->start = start; v->end = end; v->prot = prot;
-    v->file = file; v->file_off = file_off; v->file_size = file->size;
-    vfs_retain(file);                    /* keep node alive past fd close */
-    uint32_t irq = vma_irq_save();
-    v->next = o->vmas;
-    o->vmas = v;
-    vma_irq_restore(irq);
-    return 0;
+/* PTE flag bits for a freshly populated page of a mapping with `prot`. */
+static uint32_t pte_flags_for(uint32_t prot, uint32_t shared) {
+    uint32_t f = PAGE_USER | (shared ? PAGE_SHARED : 0);
+    if (prot == 0) return f | PAGE_PROTNONE;          /* inaccessible, frame kept */
+    f |= PAGE_PRESENT;
+    if (prot & PROT_WRITE_K) f |= PAGE_WRITABLE;
+    return f;
 }
 
-/* Find the VMA containing `addr` (page-aligned lookups), or NULL. */
+static struct vma *vma_alloc(uint32_t start, uint32_t end, uint32_t prot,
+                             uint32_t flags, vfs_node_t *file, uint32_t file_off) {
+    struct vma *v = (struct vma *)kmalloc(sizeof(struct vma));
+    if (!v) return NULL;
+    v->start = start; v->end = end; v->prot = prot; v->flags = flags;
+    v->file = file; v->file_off = file ? file_off : 0;
+    v->file_size = file ? file->size : 0;
+    v->next = NULL;
+    if (file) vfs_retain(file);          /* keep node alive past fd close */
+    return v;
+}
+
+static void vma_free_one(struct vma *v) {
+    if (v->file) vfs_close(v->file);     /* release node ref */
+    kfree(v);
+}
+
+/* Two anonymous VMAs with identical attributes that touch can be one VMA
+ * (Linux vma_merge).  Keeps the list short under allocators that map many
+ * adjacent chunks. */
+static int vma_can_merge(const struct vma *a, const struct vma *b) {
+    return a->end == b->start && !a->file && !b->file &&
+           a->prot == b->prot && a->flags == b->flags;
+}
+
+/* Insert v into the owner's sorted list, merging with its neighbours.  Returns
+ * the node that now covers v's range (v itself, or the neighbour it was merged
+ * into — v is freed in that case). */
+static struct vma *vma_insert(struct proc *o, struct vma *v) {
+    uint32_t irq = vma_irq_save();
+    struct vma **pp = &o->vmas;
+    struct vma *prev = NULL;
+    while (*pp && (*pp)->start < v->start) { prev = *pp; pp = &(*pp)->next; }
+    v->next = *pp;
+    *pp = v;
+    if (v->end > o->mmap_next) o->mmap_next = v->end;   /* high-water mark */
+    /* merge with the successor */
+    struct vma *n = v->next;
+    if (n && vma_can_merge(v, n)) { v->end = n->end; v->next = n->next; kfree(n); }
+    /* merge with the predecessor */
+    if (prev && vma_can_merge(prev, v)) {
+        prev->end = v->end; prev->next = v->next; kfree(v); v = prev;
+    }
+    vma_irq_restore(irq);
+    return v;
+}
+
+/* Merge every pair of adjacent mergeable VMAs (after mprotect re-unified the
+ * protection of neighbouring pieces, e.g. a JIT toggling W^X on one region). */
+static void vma_merge_all(struct proc *o) {
+    uint32_t irq = vma_irq_save();
+    for (struct vma *v = o->vmas; v && v->next; ) {
+        struct vma *n = v->next;
+        if (vma_can_merge(v, n)) { v->end = n->end; v->next = n->next; kfree(n); }
+        else v = n;
+    }
+    vma_irq_restore(irq);
+}
+
+/* Record a VMA for [start,end).  Returns the VMA covering it (possibly a
+ * merged neighbour spanning more than [start,end)) or NULL. */
+static struct vma *vma_add(uint32_t start, uint32_t end, uint32_t prot,
+                           uint32_t flags, vfs_node_t *file, uint32_t file_off) {
+    struct proc *o = mmap_owner();
+    if (!o || end <= start) return NULL;
+    struct vma *v = vma_alloc(start, end, prot, flags, file, file_off);
+    if (!v) return NULL;
+    return vma_insert(o, v);
+}
+
+/* Find the VMA containing `addr`, or NULL. */
 static struct vma *vma_find(uint32_t addr) {
     struct proc *o = mmap_owner();
     if (!o) return NULL;
-    for (struct vma *v = o->vmas; v; v = v->next)
-        if (addr >= v->start && addr < v->end) return v;
+    for (struct vma *v = o->vmas; v && v->start <= addr; v = v->next)
+        if (addr < v->end) return v;
     return NULL;
 }
 
-/* Expose the anonymous VMA list to procfs (struct vma is private here). */
+/* Protection of the VMA covering addr, or -1 if no VMA covers it.  Used by
+ * the page-fault handler to refuse a COW break in a read-only mapping. */
+int vma_prot_lookup(uint32_t addr) {
+    struct vma *v = vma_find(addr & ~0xFFFU);
+    return v ? (int)v->prot : -1;
+}
+
+/* Expose the VMA list to procfs (struct vma is private here). */
 int proc_vma_iter(struct proc *p, int idx,
                   uint32_t *start, uint32_t *end, uint32_t *prot) {
     if (!p) return -1;
@@ -2545,31 +2839,85 @@ int proc_vma_iter(struct proc *p, int idx,
     return -1;
 }
 
-/* True if NOTHING occupies [va, va+length): no present page table entry AND no
- * demand-paged VMA overlaps.  Used to decide whether a non-MAP_FIXED mmap HINT
- * address is safe to honor — blindly honoring a colliding hint overlays a live
- * mapping (a thread stack/TLS, another allocator arena) and corrupts it. */
-static int mmap_range_free(uint32_t va, uint32_t length) {
-    uint32_t end = va + length;
-    if (end < va) return 0;
-    /* Any present page in the range → occupied (skip whole absent PDEs fast). */
-    for (uint32_t a = va; a < end; ) {
-        if (!(*paging_get_pde(a) & PAGE_PRESENT)) {
-            a = (a & ~0x3FFFFFU) + 0x400000U;        /* next 4 MiB PDE region */
-            continue;
+/* Same, plus the sharing flag and the backing file's name for /proc/pid/maps. */
+int proc_vma_iter_ex(struct proc *p, int idx, uint32_t *start, uint32_t *end,
+                     uint32_t *prot, int *shared, const char **name) {
+    if (!p) return -1;
+    int i = 0;
+    for (struct vma *v = p->vmas; v; v = v->next, i++) {
+        if (i == idx) {
+            if (start)  *start  = v->start;
+            if (end)    *end    = v->end;
+            if (prot)   *prot   = v->prot;
+            if (shared) *shared = (v->flags & VMA_F_SHARED) ? 1 : 0;
+            if (name)   *name   = v->file ? v->file->name : "";
+            return 0;
         }
-        if (*paging_get_pte(a) & PAGE_PRESENT) return 0;
-        a += PAGE_SIZE;
     }
-    /* Any demand-paged VMA overlapping the range → reserved. */
-    struct proc *o = mmap_owner();
-    if (o)
-        for (struct vma *v = o->vmas; v; v = v->next)
-            if (v->start < end && va < v->end) return 0;
-    return 1;
+    return -1;
 }
 
-/* Remove (and trim/split) any VMA coverage of [start,end) from the owner. */
+/* Address of the first page in [start,end) whose PTE owns a frame, or 0. */
+static uint32_t first_mapped_page(uint32_t start, uint32_t end) {
+    for (uint32_t a = start; a < end; ) {
+        if (!(*paging_get_pde(a) & PAGE_PRESENT)) {
+            uint32_t n = (a & ~0x3FFFFFU) + 0x400000U;   /* next 4 MiB PDE */
+            if (n <= a) break;                            /* wrapped */
+            a = n;
+            continue;
+        }
+        if (pte_mapped(*paging_get_pte(a))) return a ? a : 1;
+        a += PAGE_SIZE;
+    }
+    return 0;
+}
+
+/* True if NOTHING occupies [va, va+length): no VMA overlaps and no page table
+ * entry owns a frame (the latter also covers regions that are not VMAs: the
+ * ELF image, the brk heap, SysV-style shm attachments, the stack). */
+static int vma_range_free(uint32_t va, uint32_t length) {
+    uint32_t end = va + length;
+    if (end < va) return 0;
+    struct proc *o = mmap_owner();
+    if (o)
+        for (struct vma *v = o->vmas; v && v->start < end; v = v->next)
+            if (va < v->end) return 0;
+    return first_mapped_page(va, end) == 0;
+}
+
+/* First-fit search for a free range of `length` bytes whose start is a
+ * multiple of `align` inside [MMAP_FLOOR, MMAP_TOP).  Gaps between VMAs are
+ * verified against the page tables so non-VMA occupants are skipped too.
+ * Returns 0 when nothing fits (-ENOMEM).  Linux searches top-down from
+ * mmap_base; bottom-up first-fit gives the same reuse guarantee and keeps
+ * the layout this kernel's users already expect (libraries low, stacks high). */
+static uint32_t vma_gap_find(uint32_t length, uint32_t align) {
+    struct proc *o = mmap_owner();
+    if (!o || !length) return 0;
+    if (align < PAGE_SIZE) align = PAGE_SIZE;
+    uint32_t cur = MMAP_FLOOR;
+    for (int guard = 0; guard < 100000; guard++) {
+        /* find the first gap at or after cur that fits */
+        uint32_t cand = 0;
+        uint32_t lo = cur;
+        struct vma *v = o->vmas;
+        for (;;) {
+            uint32_t a = (lo + align - 1) & ~(align - 1);
+            if (a < lo || a + length < a || a + length > MMAP_TOP) return 0;
+            while (v && v->end <= lo) v = v->next;
+            if (!v || a + length <= v->start) { cand = a; break; }
+            lo = v->end;
+        }
+        /* the gap is VMA-free; make sure no stray page table entry lives there */
+        uint32_t occ = first_mapped_page(cand, cand + length);
+        if (!occ) return cand;
+        cur = occ + PAGE_SIZE;
+    }
+    return 0;
+}
+
+/* Remove (and trim/split) any VMA coverage of [start,end) from the owner.
+ * Order is preserved; a split keeps the right piece right after the left. */
 static void vma_remove_range(uint32_t start, uint32_t end) {
     struct proc *o = mmap_owner();
     if (!o || end <= start) return;
@@ -2577,24 +2925,21 @@ static void vma_remove_range(uint32_t start, uint32_t end) {
     struct vma **pp = &o->vmas;
     while (*pp) {
         struct vma *v = *pp;
-        if (v->end <= start || v->start >= end) { pp = &v->next; continue; }
+        if (v->start >= end) break;                         /* sorted: done */
+        if (v->end <= start) { pp = &v->next; continue; }
         /* overlap */
-        if (v->start >= start && v->end <= end) {       /* fully covered: drop */
+        if (v->start >= start && v->end <= end) {           /* fully covered: drop */
             *pp = v->next;
             vma_irq_restore(irq);
-            if (v->file) vfs_close(v->file);            /* release node ref */
-            kfree(v);
+            vma_free_one(v);
             irq = vma_irq_save();
             continue;
         }
-        if (v->start < start && v->end > end) {         /* split into two */
-            struct vma *right = (struct vma *)kmalloc(sizeof(struct vma));
+        if (v->start < start && v->end > end) {             /* split into two */
+            struct vma *right = vma_alloc(end, v->end, v->prot, v->flags, v->file,
+                                          v->file ? v->file_off + (end - v->start) : 0);
             if (right) {
-                right->start = end; right->end = v->end; right->prot = v->prot;
-                right->file = v->file;
-                right->file_off = v->file ? v->file_off + (end - v->start) : 0;
                 right->file_size = v->file_size;
-                if (right->file) vfs_retain(right->file);  /* second ref to node */
                 right->next = v->next;
                 v->next = right;
             }
@@ -2602,8 +2947,8 @@ static void vma_remove_range(uint32_t start, uint32_t end) {
             pp = &v->next;
             continue;
         }
-        if (v->start < start) { v->end = start; }       /* trim right edge */
-        else {                                          /* trim left edge */
+        if (v->start < start) { v->end = start; }           /* trim right edge */
+        else {                                              /* trim left edge */
             if (v->file) v->file_off += end - v->start;
             v->start = end;
         }
@@ -2612,38 +2957,43 @@ static void vma_remove_range(uint32_t start, uint32_t end) {
     vma_irq_restore(irq);
 }
 
-/* Update prot of VMA coverage over [start,end) (splitting as needed). */
+/* Update prot of VMA coverage over [start,end), splitting as needed while
+ * keeping the list sorted (Linux mprotect_fixup / split_vma). */
 static void vma_protect_range(uint32_t start, uint32_t end, uint32_t prot) {
     struct proc *o = mmap_owner();
     if (!o || end <= start) return;
     uint32_t irq = vma_irq_save();
-    for (struct vma *v = o->vmas; v; v = v->next) {
-        if (v->end <= start || v->start >= end) continue;
-        if (v->start >= start && v->end <= end) { v->prot = prot; continue; }
-        /* Partial overlap: carve out the covered middle into its own VMA. */
+    for (struct vma *v = o->vmas; v && v->start < end; v = v->next) {
+        if (v->end <= start || v->prot == prot) continue;
         uint32_t cs = v->start > start ? v->start : start;
         uint32_t ce = v->end   < end   ? v->end   : end;
-        struct vma *mid = (struct vma *)kmalloc(sizeof(struct vma));
-        if (!mid) { v->prot = prot; continue; }   /* fallback: prot whole VMA */
-        mid->start = cs; mid->end = ce; mid->prot = prot; mid->next = v->next;
-        mid->file = v->file;
-        mid->file_off = v->file ? v->file_off + (cs - v->start) : 0;
-        mid->file_size = v->file_size;
-        if (mid->file) vfs_retain(mid->file);
-        if (v->start < cs && v->end > ce) {       /* middle: need a right piece too */
-            struct vma *right = (struct vma *)kmalloc(sizeof(struct vma));
-            if (right) { right->start = ce; right->end = v->end; right->prot = v->prot;
-                         right->file = v->file;
-                         right->file_off = v->file ? v->file_off + (ce - v->start) : 0;
-                         right->file_size = v->file_size;
-                         if (right->file) vfs_retain(right->file);
-                         right->next = mid->next; mid->next = right; }
+        if (v->start < cs) {
+            /* keep [v->start,cs) as v; carve [cs,v->end) as mid and continue
+             * with mid so the tail split below applies to it */
+            struct vma *mid = vma_alloc(cs, v->end, v->prot, v->flags, v->file,
+                                        v->file ? v->file_off + (cs - v->start) : 0);
+            if (!mid) { v->prot = prot; continue; }   /* fallback: prot whole VMA */
+            mid->file_size = v->file_size;
+            mid->next = v->next;
+            v->next = mid;
+            v->end = cs;
+            v = mid;
         }
-        v->next = mid;
-        if (v->start < cs) { v->end = cs; }
-        else { if (v->file) v->file_off += ce - v->start; v->start = ce; }
+        /* v starts at cs; if it runs past ce split the tail off with the old prot */
+        if (ce < v->end) {
+            struct vma *right = vma_alloc(ce, v->end, v->prot, v->flags, v->file,
+                                          v->file ? v->file_off + (ce - v->start) : 0);
+            if (right) {
+                right->file_size = v->file_size;
+                right->next = v->next;
+                v->next = right;
+                v->end = ce;
+            }
+        }
+        v->prot = prot;
     }
     vma_irq_restore(irq);
+    vma_merge_all(o);
 }
 
 /* Free all VMAs of a process (exec / last-thread exit). */
@@ -2653,86 +3003,32 @@ void vma_clear(struct proc *p) {
     struct vma *v = p->vmas;
     p->vmas = NULL;
     vma_irq_restore(irq);
-    while (v) { struct vma *n = v->next;
-        if (v->file) vfs_close(v->file);   /* drop the demand-page node ref */
-        kfree(v); v = n; }
+    while (v) { struct vma *n = v->next; vma_free_one(v); v = n; }
 }
 
-/* Copy parent's VMA list to child (fork). */
+/* Copy parent's VMA list to child (fork), preserving order. */
 void vma_clone(struct proc *parent, struct proc *child) {
     child->vmas = NULL;
     if (!parent) return;
-    /* Demand-paged VMAs live on the thread-group LEADER (mmap_owner), not on a
-     * non-leader worker thread.  When a worker forks (e.g. Firefox's content-
-     * process launch happens on the "IPC Launch" thread, not the main thread),
-     * copy the LEADER's VMA list — otherwise the child has no demand-paged
-     * coverage and SIGSEGVs on the first libxul / thread-stack page it touches. */
+    /* VMAs live on the thread-group LEADER (mmap_owner), not on a non-leader
+     * worker thread.  When a worker forks (e.g. Firefox's content-process
+     * launch happens on the "IPC Launch" thread, not the main thread), copy the
+     * LEADER's list — otherwise the child has no coverage and SIGSEGVs on the
+     * first libxul / thread-stack page it touches. */
     struct proc *owner = parent;
     if (parent->tgid != parent->pid)
         for (int i = 0; i < MAX_PROCS; i++)
             if (ptable[i].state != PROC_UNUSED && ptable[i].pid == parent->tgid) {
                 owner = &ptable[i]; break;
             }
+    struct vma **tail = &child->vmas;
     for (struct vma *v = owner->vmas; v; v = v->next) {
-        struct vma *nv = (struct vma *)kmalloc(sizeof(struct vma));
+        struct vma *nv = vma_alloc(v->start, v->end, v->prot, v->flags, v->file, v->file_off);
         if (!nv) return;
-        nv->start = v->start; nv->end = v->end; nv->prot = v->prot;
-        nv->file = v->file; nv->file_off = v->file_off; nv->file_size = v->file_size;
-        if (nv->file) vfs_retain(nv->file);   /* child shares the backing file */
-        nv->next = child->vmas;
-        child->vmas = nv;
+        nv->file_size = v->file_size;
+        *tail = nv;
+        tail = &nv->next;
     }
-}
-
-/* Page-fault populate: map a zeroed frame for a faulting anonymous VMA page.
- * Returns 1 if handled, 0 if the address isn't a populatable VMA page. */
-int vma_handle_fault(uint32_t addr) {
-    addr &= ~0xFFFU;
-    struct vma *v = vma_find(addr);
-    if (!v) return 0;
-    if (v->prot == 0) return 0;                 /* PROT_NONE guard → SIGSEGV */
-    /* already present? (another thread populated it) */
-    if ((*paging_get_pde(addr) & PAGE_PRESENT) &&
-        (*paging_get_pte(addr) & PAGE_PRESENT)) return 1;
-    uint32_t phys = pmm_alloc_frame();
-    if (!phys) return 0;                         /* OOM → let it SIGSEGV */
-    pmm_frame_incref(phys);
-
-    /* FILL-BEFORE-MAP (SMP correctness).  Fill the new frame through a PRIVATE
-     * temporary kernel mapping, and only AFTER it is complete map it at the user
-     * VA.  The previous code did the opposite — paging_map(addr, …PRESENT…) and
-     * then memset + vfs_read THROUGH addr — which races a sibling thread sharing
-     * this address space on another CPU: the page is published PRESENT (so the
-     * sibling's MMU can walk to it) while the frame is still zeroed / only
-     * half-read from the file, so the sibling reads garbage.  That is the
-     * residual -smp 2 wild-pointer / SIGILL corruption in the file-backed
-     * library region (it cannot happen on -smp 1: no parallel reader).  Filling
-     * first means the page is only ever visible fully-formed.  preempt_disable
-     * keeps the shared temp-map slot ours across the BKL-held, non-sleeping
-     * vfs_read (no other CPU runs kernel code under the BKL; no local preemption
-     * can steal the slot). */
-    preempt_disable();
-    uint8_t *kva = (uint8_t *)paging_temp_map(phys);
-    __builtin_memset(kva, 0, PAGE_SIZE);
-    if (v->file) {
-        /* File-backed (MAP_PRIVATE): copy this page's worth of file data over
-         * the zeroed frame.  Bytes past file_size stay zero (BSS tail / SIGBUS
-         * region we treat as zero).  The frame is private, so later writes are
-         * naturally copy-on-fault and never reach the file. */
-        uint32_t foff = v->file_off + (addr - v->start);
-        if (foff < v->file_size) {
-            uint32_t want = PAGE_SIZE;
-            if (want > v->file_size - foff) want = v->file_size - foff;
-            vfs_read(v->file, foff, want, kva);
-        }
-    }
-    paging_temp_unmap();
-    preempt_enable();
-
-    uint32_t flags = PAGE_PRESENT | PAGE_USER;
-    if (v->prot & 2) flags |= PAGE_WRITABLE;     /* PROT_WRITE, else read-only */
-    paging_map(addr, phys, flags);               /* publish: present + complete */
-    return 1;
 }
 
 /* ── Shared file mappings (MAP_SHARED) ───────────────────────────────────────
@@ -2847,36 +3143,116 @@ static uint32_t shmap_frame(struct shmap_entry *e, vfs_node_t *node, uint32_t pg
     return phys;
 }
 
-/* Flush-before-free for mmap page REPLACEMENT (MAP_FIXED overlays, e.g. ld.so
- * mapping each library LOAD segment over a reserved span).  Remapping an already-
- * present user page leaves a sibling thread on another CPU with a stale TLB entry
- * pointing at the OLD frame; if we free that frame inside the loop it can be
- * reused before the sibling flushes → it reads/writes the reclaimed frame =
- * wild-pointer / code corruption (the residual -smp 2 crashes were here, in the
- * 0x46–0x4a library region).  So stash old frames and release them only AFTER a
- * tlb_shootdown().  BKL-serialized + non-preemptive → a single static batch is
- * safe (one CPU in mmap at a time). */
-static uint32_t g_mmap_oldframes[512];
-static int      g_mmap_oldn;
-static void mmap_stash_old(uint32_t phys) {
-    if (g_mmap_oldn >= 512) {                 /* batch full: flush, drain, reset */
-        tlb_shootdown();
-        while (g_mmap_oldn) pmm_frame_decref(g_mmap_oldframes[--g_mmap_oldn]);
+/* ── Page population ─────────────────────────────────────────────────────────
+ * Map one page of a PRIVATE VMA: a zeroed frame, filled from the backing file
+ * (or from the file's shared frames if it also has MAP_SHARED mappers, so a
+ * private read-only view of a memfd sees the data written through the shared
+ * view).  Returns 1 if the page is mapped afterwards, 0 on OOM.
+ *
+ * FILL-BEFORE-MAP (SMP correctness): fill the new frame through a PRIVATE
+ * temporary kernel mapping and only AFTER it is complete map it at the user VA.
+ * Publishing the PTE first and filling through the user address races a sibling
+ * thread on another CPU (it can read a half-filled page).  preempt_disable keeps
+ * the shared temp-map slot ours across the BKL-held, non-sleeping vfs_read. */
+static int vma_populate_page(struct vma *v, uint32_t addr) {
+    addr &= ~0xFFFU;
+    if ((*paging_get_pde(addr) & PAGE_PRESENT) &&
+        pte_mapped(*paging_get_pte(addr))) return 1;     /* already there */
+    uint32_t phys = pmm_alloc_frame();
+    if (!phys) return 0;
+    pmm_frame_incref(phys);
+
+    preempt_disable();
+    uint8_t *kva = (uint8_t *)paging_temp_map(phys);
+    __builtin_memset(kva, 0, PAGE_SIZE);
+    if (v->file) {
+        uint32_t foff = v->file_off + (addr - v->start);
+        struct shmap_entry *se = shmap_lookup(v->file);
+        uint32_t sf = se ? shmap_peek(se, foff / PAGE_SIZE) : 0;
+        if (sf) {
+            /* copy from the shared frame (temp slot 2), not the stale tmpfs buffer */
+            const uint8_t *src = (const uint8_t *)paging_temp_map2(sf);
+            __builtin_memcpy(kva, src, PAGE_SIZE);
+            paging_temp_unmap2();
+        } else if (foff < v->file_size) {
+            uint32_t want = PAGE_SIZE;
+            if (want > v->file_size - foff) want = v->file_size - foff;
+            vfs_read(v->file, foff, want, kva);
+        }
     }
-    g_mmap_oldframes[g_mmap_oldn++] = phys;
+    paging_temp_unmap();
+    preempt_enable();
+
+    paging_map(addr, phys, pte_flags_for(v->prot, 0));     /* publish: complete */
+    return 1;
 }
-static void mmap_free_stashed(void) {         /* call before every return */
-    if (!g_mmap_oldn) return;                 /* nothing remapped → no shootdown */
-    tlb_shootdown();                          /* sibling CPUs flush stale remaps */
-    while (g_mmap_oldn) pmm_frame_decref(g_mmap_oldframes[--g_mmap_oldn]);
+
+/* Page-fault populate.  Returns 1 if handled, 0 if the address isn't a
+ * populatable VMA page (PROT_NONE, shared mapping, no VMA, OOM → SIGSEGV). */
+int vma_handle_fault(uint32_t addr) {
+    addr &= ~0xFFFU;
+    struct vma *v = vma_find(addr);
+    if (!v) return 0;
+    if (v->prot == 0) return 0;                 /* PROT_NONE guard → SIGSEGV */
+    if (v->flags & VMA_F_SHARED) return 0;      /* shared frames are eager-only */
+    return vma_populate_page(v, addr);
+}
+
+/* Populate [start,end) of a private VMA now (small mappings).  1 on success. */
+static int vma_populate_range(struct vma *v, uint32_t start, uint32_t end) {
+    if (v->prot == 0) return 1;                 /* nothing to map for PROT_NONE */
+    for (uint32_t a = start; a < end; a += PAGE_SIZE)
+        if (!vma_populate_page(v, a)) return 0;
+    return 1;
+}
+
+/* Unmap every populated page in [start,end) and release the frames.
+ *
+ * FLUSH-BEFORE-FREE (Linux mmu_gather rule): clear the PTEs first, then
+ * tlb_shootdown(), and only AFTER the shootdown release the frames.  Freeing a
+ * frame before the shootdown is a use-after-free: a sibling thread on another
+ * CPU may still hold a stale TLB entry for the page and would read/write the
+ * frame after it has been reclaimed and handed to another allocation.  Batched
+ * so an arbitrarily large range uses bounded stack. */
+static void unmap_pages(uint32_t start, uint32_t end) {
+    uint32_t batch[256];
+    int nb = 0;
+    for (uint32_t va = start; va < end; ) {
+        if (!(*paging_get_pde(va) & PAGE_PRESENT)) {
+            uint32_t n = (va & ~0x3FFFFFU) + 0x400000U;
+            if (n <= va) break;
+            va = n;
+            continue;
+        }
+        uint32_t *pte = paging_get_pte(va);
+        if (pte_mapped(*pte)) {
+            batch[nb++] = *pte & ~0xFFFU;       /* remember frame; free AFTER flush */
+            *pte = 0;
+            tlb_flush_single(va);
+            if (nb == 256) {
+                tlb_shootdown();                /* no CPU keeps a stale entry now */
+                for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
+                nb = 0;
+            }
+        }
+        va += PAGE_SIZE;
+    }
+    tlb_shootdown();                            /* flush the remainder before freeing */
+    for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
+}
+
+/* Tear down whatever occupies [start,end): VMAs and pages.  MAP_FIXED overlay
+ * and munmap share this (Linux do_munmap). */
+static void unmap_range(uint32_t start, uint32_t end) {
+    vma_remove_range(start, end);
+    unmap_pages(start, end);
 }
 
 /* ── sys_mmap2(addr,len,prot,flags,fd,pgoffset) — EAX=192 ──────────────── */
 static int sys_mmap2(registers_t *regs) {
-    g_mmap_oldn = 0;   /* fresh batch (drop any leaked stash from a prior error) */
     uint32_t addr   = regs->ebx;
     uint32_t length = regs->ecx;
-    /* prot = regs->edx, flags = regs->esi, fd = regs->edi (via pusha) */
+    uint32_t prot   = regs->edx & 0x7;           /* PROT_SEM/GROWS* ignored */
     int flags  = (int)regs->esi;
     int fd     = (int)regs->edi;
     /* mmap2's 6th arg (offset in PAGES) is passed in EBP on i386, which the
@@ -2884,265 +3260,152 @@ static int sys_mmap2(registers_t *regs) {
      * library's data segment, which sits at a nonzero file offset. */
     uint32_t pgoff = regs->ebp;
 
-
     if (length == 0) return -22;
-
+    if (length > 0xC0000000U) return -12;
     length = (length + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
 
-    /* Choose the target VA.
-     *
-     * `addr` is honored as a MANDATORY placement only for MAP_FIXED (0x10) —
-     * that's how ld.so maps each library LOAD segment over a reserved span.
-     * For a non-fixed HINT, the address is advisory: honor it only if the range
-     * is entirely free, otherwise fall through to the cursor.  Blindly honoring
-     * a colliding hint (mozjemalloc/glibc pass them constantly) overlays a live
-     * mapping with fresh zeroed frames — corrupting a thread's TLS/stack or
-     * another arena, which presented as intermittent TLS-zero / 0xe5-poison
-     * crashes deep in Firefox.  For a non-fixed mapping we atomically reserve
-     * from the shared cursor so concurrent threads never get the same address. */
-#define MAP_FIXED_K  0x10
     struct proc *owner = mmap_owner();
-    uint32_t va;
-    int reserved = 0;
-    uint32_t hint = addr & ~(uint32_t)(PAGE_SIZE - 1);
-    if (hint && hint < USER_STACK_BASE && (flags & MAP_FIXED_K)) {
-        va = hint;                                   /* MAP_FIXED: overlay */
-    } else if (hint && hint >= owner->mmap_next && hint < USER_STACK_BASE &&
-               hint + length > hint && hint + length <= USER_STACK_BASE &&
-               mmap_range_free(hint, length)) {
-        /* Honor a non-FIXED hint ONLY if it is at/above the monotonic cursor,
-         * then advance the cursor past it.  A hint BELOW the cursor (e.g.
-         * mozjemalloc/SpiderMonkey requesting a low address) must NOT be
-         * honored: a large allocation there can overlay loaded libraries (ld.so
-         * at 0x40000000) or GC chunks the cursor already handed out, which the
-         * present-page scan can miss once those were freed → the GC's chunk
-         * pointer math then addresses another live region → corruption.  The
-         * hint is advisory, so falling through to the aligned cursor is valid
-         * and keeps every anonymous mapping in a single monotonic, non-
-         * overlapping order — matching how Linux's layout keeps these apart. */
-        __asm__ volatile("cli");
-        va = hint;
-        if (hint + length > owner->mmap_next) owner->mmap_next = hint + length;
-        __asm__ volatile("sti");
-    } else {
-        __asm__ volatile("cli");
-        va = owner->mmap_next;
-        /* Align large anonymous mappings (≥1 MiB) to a 1 MiB boundary.
-         * SpiderMonkey's GC allocates 1 MiB chunks and locates a cell's chunk
-         * header by masking the pointer to 1 MiB (ptr & ~(ChunkSize-1)); it
-         * relies on the OS page allocator returning suitably-aligned chunks.
-         * Our plain bump cursor is only 4 KiB-aligned, so chunks landed at
-         * non-1 MiB addresses → the GC's chunk/arena pointer math addressed the
-         * wrong metadata → memory corruption deep in the JS engine (parser
-         * canary smashes, JIT wild jumps).  Real Linux's mmap layout happens to
-         * satisfy this; match it for large anon maps. */
-        if ((flags & 0x20) && length >= 0x100000U) {
-            uint32_t aligned = (va + 0xFFFFFU) & ~0xFFFFFU;
-            if (aligned >= va && aligned + length <= USER_STACK_BASE)
-                va = aligned;
-        }
-        if (va + length >= va && va + length <= USER_STACK_BASE)
-            owner->mmap_next = va + length;       /* reserve now */
-        __asm__ volatile("sti");
-        reserved = 1;
+    if (!owner) return -12;
+    int anon    = (flags & MAP_ANONYMOUS_K) != 0;
+    int shared  = (flags & MAP_SHARED_K) != 0;
+    int fixed   = (flags & (MAP_FIXED_K | MAP_FIXED_NOREPLACE_K)) != 0;
+
+    /* File-backed: validate the descriptor first (EBADF before any layout work). */
+    vfs_node_t *fnode = NULL;
+    if (!anon) {
+        if (fd < 0 || fd >= MAX_FD || current_proc->ofile[fd].type != FD_FILE ||
+            !current_proc->ofile[fd].node)
+            return -9;
+        fnode = current_proc->ofile[fd].node;
     }
 
-    if (va + length < va || va + length > USER_STACK_BASE) return -12;
+    /* ── Choose the target VA ──
+     * MAP_FIXED places exactly at `addr`, replacing whatever is there (ld.so
+     * maps each library LOAD segment over a reserved span; mozjemalloc commits/
+     * decommits with MAP_FIXED).  MAP_FIXED_NOREPLACE (Linux 4.17+) places at
+     * `addr` only if the range is free and fails with EEXIST otherwise.  A plain
+     * hint is honoured if that range is entirely free, else ignored (Linux
+     * get_unmapped_area).  Everything else goes through the first-fit gap
+     * search, which reuses munmap()ed space. */
+    uint32_t va;
+    if (fixed) {
+        if (addr & (PAGE_SIZE - 1)) return -22;
+        if (addr + length < addr || addr + length > (uint32_t)USER_STACK_BASE) return -12;
+        va = addr;
+        if (flags & MAP_FIXED_NOREPLACE_K) {
+            if (!vma_range_free(va, length)) return -17;   /* -EEXIST */
+        } else {
+            unmap_range(va, va + length);                 /* replace */
+        }
+    } else {
+        uint32_t hint = addr & ~(uint32_t)(PAGE_SIZE - 1);
+        if (hint && hint >= MMAP_FLOOR && hint + length > hint &&
+            hint + length <= MMAP_TOP && vma_range_free(hint, length)) {
+            va = hint;
+        } else {
+            /* Align large anonymous mappings (≥1 MiB) to a 1 MiB boundary.
+             * SpiderMonkey's GC allocates 1 MiB chunks and locates a cell's
+             * chunk header by masking the pointer to 1 MiB; it relies on the OS
+             * page allocator returning suitably-aligned chunks (real Linux's
+             * layout happens to satisfy this). */
+            uint32_t align = (anon && length >= 0x100000U) ? 0x100000U : PAGE_SIZE;
+            va = vma_gap_find(length, align);
+            if (!va && align != PAGE_SIZE) va = vma_gap_find(length, PAGE_SIZE);
+            if (!va) return -12;
+        }
+    }
+    uint32_t end = va + length;
 
     /* ── /dev/fb0: map the real framebuffer (DOOM, links -g) ── */
-    if (!(flags & 0x20) && fd >= 0 && fd < MAX_FD &&
-        current_proc->ofile[fd].type == FD_FILE &&
-        current_proc->ofile[fd].node &&
-        __builtin_strcmp(current_proc->ofile[fd].node->name, "fb0") == 0) {
+    if (fnode && __builtin_strcmp(fnode->name, "fb0") == 0) {
         uint32_t fb_phys = framebuffer_phys();
         uint32_t fb_len = framebuffer_size();
         if (!fb_phys) return -19;
         if (length > ((fb_len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1)))
             length = (fb_len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
+        end = va + length;
+        if (!vma_add(va, end, prot, VMA_F_SHARED, NULL, 0)) return -12;
         for (uint32_t i = 0; i < length; i += PAGE_SIZE)
             paging_map(va + i, fb_phys + i,
                        PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER |
-                       PAGE_SHARED | (1U << 4));   /* SHARED: no COW on fork */
-        mmap_free_stashed();
-        (void)reserved;
+                       PAGE_SHARED | (1U << 4));   /* SHARED: no COW on fork; PCD */
         return (int)va;
     }
 
-    /* ── MAP_SHARED (0x01) on a real file: share physical frames ──
+    /* ── MAP_SHARED on a real file: share physical frames ──
      * memfd/tmpfs shared memory — all mappers of the same node see the same
      * frames (Firefox IPC / SharedStringMap depend on this).  Mapped writable
      * iff PROT_WRITE; PAGE_SHARED so fork shares rather than COWs. */
-    if ((flags & 0x01) && !(flags & 0x20) && fd >= 0 && fd < MAX_FD &&
-        current_proc->ofile[fd].type == FD_FILE &&
-        current_proc->ofile[fd].node) {
-        vfs_node_t *node = current_proc->ofile[fd].node;
-        uint32_t prot = regs->edx;
-            struct shmap_entry *e = shmap_get(node);
+    if (shared && fnode) {
+        struct shmap_entry *e = shmap_get(fnode);
         if (!e) return -12;
-        vma_remove_range(va, va + length);
+        struct vma *v = vma_add(va, end, prot, VMA_F_SHARED, NULL, 0);
+        if (!v) return -12;
         for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
-            uint32_t pg = pgoff + i / PAGE_SIZE;
-            uint32_t phys = shmap_frame(e, node, pg);
-            if (!phys) return -12;
-            uint32_t *pte = paging_get_pte(va + i);
-            if ((*paging_get_pde(va + i) & PAGE_PRESENT) && (*pte & PAGE_PRESENT)) {
-                uint32_t old = *pte & ~0xFFFU;
-                paging_unmap(va + i);
-                mmap_stash_old(old);   /* free AFTER shootdown (flush-before-free) */
-            }
+            uint32_t phys = shmap_frame(e, fnode, pgoff + i / PAGE_SIZE);
+            if (!phys) { unmap_range(va, end); return -12; }
             pmm_frame_incref(phys);          /* this mapping's ref */
-            uint32_t pflags = PAGE_PRESENT | PAGE_USER | PAGE_SHARED;
-            if (prot & 2) pflags |= PAGE_WRITABLE;   /* PROT_WRITE */
-            paging_map(va + i, phys, pflags);
+            paging_map(va + i, phys, pte_flags_for(prot, 1));
         }
-        mmap_free_stashed();
-        (void)reserved;
         return (int)va;
     }
 
-    /* ── Large anonymous mapping: DEMAND-PAGED ──
-     * Record a VMA and return; pages fault in (zeroed) on first touch.  Only
-     * LARGE anonymous regions (>= 1 MiB) are lazy — the big win is 8 MiB thread
-     * stacks (mostly untouched).  Smaller anonymous mmaps (glibc malloc arenas,
-     * dlopen scratch buffers) stay EAGER: some glibc paths are sensitive to lazy
-     * population and demand-paging them broke dlopen(libxul).  MAP_FIXED overlay
-     * coverage is torn down first. */
-#define VMA_DEMAND_MIN (4U * 1024U * 1024U)   /* only big (≥4 MiB) regions: thread stacks */
-    if ((flags & 0x20) && length >= VMA_DEMAND_MIN) {
-        uint32_t prot = regs->edx;
-        vma_remove_range(va, va + length);
+    /* ── MAP_SHARED | MAP_ANONYMOUS: zero-filled frames shared across fork ──
+     * Linux backs these with shmem (shmem_zero_setup): the pages are one copy
+     * that parent and child both see.  PAGE_SHARED makes fork share the frame
+     * instead of COW'ing it; the frames are populated now because a shared
+     * page has no per-process re-population path. */
+    if (shared && anon) {
+        struct vma *v = vma_add(va, end, prot, VMA_F_SHARED, NULL, 0);
+        if (!v) return -12;
         for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
-            uint32_t *pte = paging_get_pte(va + i);
-            if ((*paging_get_pde(va + i) & PAGE_PRESENT) && (*pte & PAGE_PRESENT)) {
-                uint32_t old = *pte & ~0xFFFU;
-                paging_unmap(va + i);
-                mmap_stash_old(old);   /* free AFTER shootdown (flush-before-free) */
-            }
+            uint32_t phys = pmm_alloc_frame();
+            if (!phys) { unmap_range(va, end); return -12; }
+            pmm_frame_incref(phys);
+            preempt_disable();
+            __builtin_memset(paging_temp_map(phys), 0, PAGE_SIZE);
+            paging_temp_unmap();
+            preempt_enable();
+            paging_map(va + i, phys, pte_flags_for(prot, 1));
         }
-        if (vma_add(va, va + length, prot) < 0) return -12;
-        mmap_free_stashed();
-        (void)reserved;
         return (int)va;
     }
 
-    /* ── Large MAP_PRIVATE file-backed: DEMAND-PAGE ──
-     * Eagerly copying a big library (libxul.so is ~175 MiB) reads the whole
-     * file through the slow ATA-PIO path at map time even though startup only
-     * touches a fraction of it — minutes of latency.  Instead record a
-     * file-backed VMA and fault pages in from the file on first touch (the
-     * standard Linux behaviour).  Only LARGE (≥1 MiB) private mappings of a
-     * plain file with NO shared-frame (shmap) entry qualify — small dlopen
-     * scratch mappings and shared/tmpfs files keep the eager path, which some
-     * glibc/IPC paths depend on. */
-#define VMA_FILE_DEMAND_MIN (1U * 1024U * 1024U)
-    if (!(flags & 0x20) && !(flags & 0x01) && length >= VMA_FILE_DEMAND_MIN &&
-        fd >= 0 && fd < MAX_FD && current_proc->ofile[fd].type == FD_FILE &&
-        current_proc->ofile[fd].node &&
-        !shmap_lookup(current_proc->ofile[fd].node)) {
-        vfs_node_t *fnode = current_proc->ofile[fd].node;
-        uint32_t prot = regs->edx;
-        vma_remove_range(va, va + length);
-        for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
-            uint32_t *pte = paging_get_pte(va + i);
-            if ((*paging_get_pde(va + i) & PAGE_PRESENT) && (*pte & PAGE_PRESENT)) {
-                uint32_t old = *pte & ~0xFFFU;
-                paging_unmap(va + i);
-                mmap_stash_old(old);   /* free AFTER shootdown (flush-before-free) */
-            }
-        }
-        if (vma_add_file(va, va + length, prot, fnode, pgoff * PAGE_SIZE) < 0)
+    /* ── MAP_PRIVATE anonymous ──
+     * Record the VMA; prot is honoured for every page (Linux: PROT_NONE ranges
+     * are reservations that fault on any access, read-only ranges fault on
+     * write).  Large regions fault in lazily; small ones are populated now. */
+    if (anon) {
+        struct vma *v = vma_add(va, end, prot, 0, NULL, 0);
+        if (!v) return -12;
+        if (length < VMA_DEMAND_MIN && !vma_populate_range(v, va, end)) {
+            unmap_range(va, end);
             return -12;
+        }
+        return (int)va;
+    }
+
+    /* ── MAP_PRIVATE file-backed ──
+     * Pages fault in from the file (copy-on-fault: the frame is private, so
+     * writes never reach the file).  Eagerly copying a big library (libxul.so
+     * is ~175 MiB) would read the whole file through the slow ATA-PIO path even
+     * though startup touches a fraction of it, so large mappings are lazy. */
+    {
+        struct vma *v = vma_add(va, end, prot, 0, fnode, pgoff * PAGE_SIZE);
+        if (!v) return -12;
         if (fnode->size > 100u * 1024u * 1024u && pgoff == 0) {
-            static int logged_big2 = 0;
-            if (!logged_big2) { logged_big2 = 1;
-                printk("[gdbaid] big mmap base=0x%08x size=%u fd=%d pid=%d (demand)\n",
+            static int logged_big = 0;
+            if (!logged_big) { logged_big = 1;
+                printk("[gdbaid] big mmap base=0x%08x size=%u fd=%d pid=%d\n",
                        (unsigned)va, (unsigned)fnode->size, fd, current_proc->pid);
             }
         }
-        mmap_free_stashed();
-        (void)reserved;
+        if (length < VMA_FILE_DEMAND_MIN && !vma_populate_range(v, va, end)) {
+            unmap_range(va, end);
+            return -12;
+        }
         return (int)va;
     }
-
-    /* MAP_PRIVATE file-backed (copy contents at map time).
-     * For MAP_FIXED overlays (ld.so reserves a library's span, then maps each
-     * LOAD segment over it) the target page may already be mapped — release
-     * the old frame first so we don't leak it.  Also drop any anonymous VMA
-     * covering this range (the file mapping replaces the reservation). */
-    vma_remove_range(va, va + length);
-    for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
-        uint32_t *pte = paging_get_pte(va + i);
-        if ((*paging_get_pde(va + i) & PAGE_PRESENT) && (*pte & PAGE_PRESENT)) {
-            uint32_t old = *pte & ~0xFFFU;
-            paging_unmap(va + i);
-            pmm_frame_decref(old);
-        }
-        uint32_t phys = pmm_alloc_frame();
-        if (!phys) return -12;
-        pmm_frame_incref(phys);
-        paging_map(va + i, phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-        __builtin_memset((void *)(va + i), 0, PAGE_SIZE);
-    }
-
-    if (!(flags & 0x20)) {            /* file-backed: copy in the contents */
-        if (fd < 0 || fd >= MAX_FD ||
-            current_proc->ofile[fd].type != FD_FILE) {
-            /* [shmmap] Firefox's compositor shared memory (shared_memory_posix.cc)
-             * mmaps a memfd/shm fd MAP_SHARED and gets EBADF here → NULL buffer →
-             * ImageBridgeChild::InitSameProcess NULL-deref crash.  Log the fd + its
-             * ACTUAL type so we can see why it's not FD_FILE (closed? wrong type?
-             * memfd not registered?). */
-            if (current_proc &&
-                current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-                current_proc->name[4]=='f') {
-                static int sm = 0;
-                if (sm < 40) { sm++;
-                    int ty = (fd >= 0 && fd < MAX_FD) ?
-                             (int)current_proc->ofile[fd].type : -1;
-                    printk("[shmmap] EBADF mmap fd=%d type=%d flags=%x len=%x pid=%d\n",
-                           fd, ty, (unsigned)flags, (unsigned)length,
-                           current_proc->pid); }
-            }
-            return -9;
-        }
-        {
-            vfs_node_t *fnode = current_proc->ofile[fd].node;
-            struct shmap_entry *se = shmap_lookup(fnode);
-            uint32_t off = pgoff * PAGE_SIZE;
-            uint32_t want = length;
-            if (se) {
-                /* This file has shared (MAP_SHARED) frames — a MAP_PRIVATE/RO
-                 * mapping must see the SAME data (Firefox writes via a MAP_SHARED
-                 * mapping then reads it back via a MAP_PRIVATE/RO one).  Copy each
-                 * page from the shared frame, not the stale tmpfs data buffer. */
-                for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
-                    uint32_t sf = shmap_peek(se, pgoff + i / PAGE_SIZE);
-                    if (sf) {
-                        const uint8_t *kp = (const uint8_t *)paging_temp_map(sf);
-                        __builtin_memcpy((void *)(va + i), kp, PAGE_SIZE);
-                        paging_temp_unmap();
-                    }
-                }
-            } else if (off < fnode->size) {
-                if (want > fnode->size - off) want = fnode->size - off;
-                vfs_read(fnode, off, want, (uint8_t *)va);
-            }
-            /* [gdbaid] one-shot: report libxul.so's load base (the ~150MB file
-             * mapping) so a remote debugger can compute symbol VAs. */
-            if (fnode->size > 100u * 1024u * 1024u && off == 0) {
-                static int logged_big = 0;
-                if (!logged_big) { logged_big = 1;
-                    printk("[gdbaid] big mmap base=0x%08x size=%u fd=%d pid=%d\n",
-                           (unsigned)va, (unsigned)fnode->size, fd, current_proc->pid);
-                }
-            }
-        }
-    }
-
-    mmap_free_stashed();   /* shootdown + free replaced frames (flush-before-free) */
-    (void)reserved;   /* region was reserved up front from the shared cursor */
-
-    return (int)va;
 }
 
 /* ── sys_mmap(struct mmap_arg*) — EAX=90 (old i386 variant) ─────────────── */
@@ -3159,76 +3422,363 @@ static int sys_mmap_old(registers_t *regs) {
         fake.edi = a.fd;
         /* byte offset → page offset (mmap2 semantics); must be aligned */
         if (a.offset & (PAGE_SIZE - 1)) return -22;
+        fake.ebp = a.offset / PAGE_SIZE;
         return sys_mmap2(&fake);
     }
 }
 
 /* ── sys_munmap(addr, len) — EAX=91 ─────────────────────────────────────── */
 static int sys_munmap(registers_t *regs) {
-    uint32_t addr = regs->ebx & ~(uint32_t)(PAGE_SIZE - 1);
-    uint32_t len  = (regs->ecx + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
-
-    vma_remove_range(addr, addr + len);   /* drop lazy (unfaulted) coverage */
-
-    /* FLUSH-BEFORE-FREE (Linux mmu_gather rule): clear the PTEs first, then
-     * tlb_shootdown(), and only AFTER the shootdown release the frames.  Freeing
-     * a frame inside the loop (before the shootdown) is a use-after-free: a
-     * sibling thread on another CPU may still hold a stale TLB entry for the page
-     * and would read/write the frame after it has been reclaimed and handed to
-     * another allocation → memory corruption (wild pointers / clobbered code).
-     * Batch the collected frames so an arbitrarily large munmap uses bounded
-     * stack: drain (shootdown + decref) each full batch and once at the end. */
-    uint32_t batch[256];
-    int nb = 0;
-    for (uint32_t va = addr; va < addr + len; va += PAGE_SIZE) {
-        if (!(*paging_get_pde(va) & PAGE_PRESENT)) continue;
-        uint32_t *pte = paging_get_pte(va);
-        if (!(*pte & PAGE_PRESENT)) continue;
-        batch[nb++] = *pte & ~0xFFFU;       /* remember frame; free AFTER flush */
-        paging_unmap(va);                   /* clear PTE + local invlpg */
-        if (nb == 256) {
-            tlb_shootdown();                /* no CPU keeps a stale entry now */
-            for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
-            nb = 0;
-        }
-    }
-    tlb_shootdown();                        /* flush the remainder before freeing */
-    for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
+    uint32_t addr = regs->ebx;
+    uint32_t len  = regs->ecx;
+    if (addr & (PAGE_SIZE - 1)) return -22;          /* Linux: EINVAL */
+    if (len == 0) return -22;
+    len = (len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
+    if (addr + len < addr || addr + len > 0xC0000000U) return -22;
+    /* Unmapping a range with no mapping is not an error (Linux). */
+    unmap_range(addr, addr + len);
     return 0;
+}
+
+/* Apply `prot` to the page table entry of one populated user page.  Linux
+ * change_protection(): PROT_NONE turns the entry into a not-present
+ * _PAGE_PROTNONE entry that keeps its frame; PROT_WRITE is granted only to
+ * pages that are not copy-on-write — a COW page stays read-only and the write
+ * fault copies it (or reuses it when it is the last reference). */
+static void pte_apply_prot(uint32_t va, uint32_t prot) {
+    if (!(*paging_get_pde(va) & PAGE_PRESENT)) return;      /* not populated */
+    uint32_t *pte = paging_get_pte(va);
+    uint32_t old = *pte;
+    if (!pte_mapped(old) || !(old & PAGE_USER)) return;
+    uint32_t nw = old & ~(uint32_t)(PAGE_PRESENT | PAGE_WRITABLE | PAGE_PROTNONE);
+    if (prot == 0) {
+        nw |= PAGE_PROTNONE;
+    } else {
+        nw |= PAGE_PRESENT;
+        if ((prot & PROT_WRITE_K) && !(old & PAGE_COW)) nw |= PAGE_WRITABLE;
+    }
+    if (nw != old) {
+        *pte = nw;
+        tlb_flush_single(va);
+    }
 }
 
 /* ── sys_mprotect(addr, len, prot) — EAX=125 ────────────────────────────── */
 static int sys_mprotect(registers_t *regs) {
     uint32_t addr = regs->ebx;
     uint32_t len  = regs->ecx;
-    int prot = (int)regs->edx;
+    uint32_t prot = regs->edx;
 
     if (addr & (PAGE_SIZE - 1)) return -22;
     if (len == 0) return 0;
-    if (prot & ~0x7) return -22;
+    if (prot & ~(0x7U | 0x01000000U | 0x02000000U)) return -22;   /* GROWSDOWN/UP tolerated */
+    prot &= 0x7U;
     uint32_t end = addr + ((len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1));
     if (end < addr || end > 0xC0000000U) return -22;
 
-    /* Record the new prot on any demand-paged VMA covering this range, so pages
-     * that fault in LATER get the right permissions.  Pages not yet present are
-     * fine — with demand paging they simply aren't mapped yet (a hard -ENOMEM
-     * here would break glibc's pthread guard-page mprotect on a lazy stack). */
-    vma_protect_range(addr, end, (uint32_t)(prot & 0x7));
+    /* Record the new prot on the VMAs covering this range, so pages that fault
+     * in LATER get the right permissions.  Gaps are tolerated (Linux returns
+     * ENOMEM): ld.so's RELRO mprotect targets the executable image, which is
+     * not a VMA here, and glibc treats that failure as fatal. */
+    vma_protect_range(addr, end, prot);
 
-    for (uint32_t va = addr; va < end; va += PAGE_SIZE) {
-        uint32_t *pde = paging_get_pde(va);
-        if (!(*pde & PAGE_PRESENT)) continue;            /* not yet faulted in */
-        uint32_t *pte = paging_get_pte(va);
-        if (!(*pte & PAGE_PRESENT) || !(*pte & PAGE_USER)) continue;
-        if (prot & 0x2)
-            *pte |= PAGE_WRITABLE;
-        else
-            *pte &= ~(uint32_t)PAGE_WRITABLE;
-        tlb_flush_single(va);
+    for (uint32_t va = addr; va < end; ) {
+        if (!(*paging_get_pde(va) & PAGE_PRESENT)) {
+            uint32_t n = (va & ~0x3FFFFFU) + 0x400000U;
+            if (n <= va) break;
+            va = n;
+            continue;
+        }
+        pte_apply_prot(va, prot);
+        va += PAGE_SIZE;
     }
     /* SMP: permission reductions must be seen by sibling threads on other CPUs
      * before they next touch the page (W^X / JIT correctness). */
     tlb_shootdown();
+    return 0;
+}
+
+/* ── sys_madvise(addr, len, advice) — EAX=219 ────────────────────────────── */
+#define MADV_DONTNEED_K 4
+#define MADV_FREE_K     8
+static int sys_madvise(registers_t *regs) {
+    uint32_t addr = regs->ebx;
+    uint32_t len  = regs->ecx;
+    int advice = (int)regs->edx;
+    if (addr & (PAGE_SIZE - 1)) return -22;
+    if (advice < 0 || advice > 25) return -22;
+    if (len == 0) return 0;
+    uint32_t end = (addr + len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
+    if (end < addr || end > 0xC0000000U) return -22;
+
+    /* Linux returns ENOMEM if the range has any unmapped gap.  We approximate:
+     * an entirely unmapped range is -ENOMEM, a partially mapped one is advised. */
+    if (vma_range_free(addr, end - addr)) return -12;
+
+    if (advice != MADV_DONTNEED_K) return 0;    /* MADV_FREE and hints: no-op.
+                                                 * MADV_FREE is lazy on Linux: the
+                                                 * data persists until reclaim,
+                                                 * and we never reclaim. */
+
+    /* MADV_DONTNEED zaps the range (mm/madvise.c zap_page_range_single): the
+     * next touch of a private page gives a fresh zero page (or the file page
+     * again); the other side of a COW share keeps its copy because we only
+     * drop THIS address space's reference.  Pages we cannot re-populate stay
+     * mapped: shared frames (no per-VMA population path), and pages outside
+     * any VMA (brk heap, stack) which are zeroed in place instead — for a COW
+     * page in place means a private zero frame, so the sharer is untouched. */
+    uint32_t batch[256];
+    int nb = 0;
+    for (uint32_t va = addr; va < end; ) {
+        if (!(*paging_get_pde(va) & PAGE_PRESENT)) {
+            uint32_t n = (va & ~0x3FFFFFU) + 0x400000U;
+            if (n <= va) break;
+            va = n;
+            continue;
+        }
+        uint32_t *pte = paging_get_pte(va);
+        uint32_t old = *pte;
+        if (pte_mapped(old) && (old & PAGE_USER) && !(old & PAGE_SHARED)) {
+            uint32_t frame = old & ~0xFFFU;
+            if (vma_find(va)) {
+                batch[nb++] = frame;             /* free AFTER the shootdown */
+                *pte = 0;
+                tlb_flush_single(va);
+                if (nb == 256) {
+                    tlb_shootdown();
+                    for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
+                    nb = 0;
+                }
+            } else if (old & PAGE_PRESENT) {
+                if (pmm_frame_refcount(frame) > 1) {
+                    /* COW-shared: give this side a private zero frame */
+                    uint32_t nf = pmm_alloc_frame();
+                    if (nf) {
+                        pmm_frame_incref(nf);
+                        preempt_disable();
+                        __builtin_memset(paging_temp_map(nf), 0, PAGE_SIZE);
+                        paging_temp_unmap();
+                        preempt_enable();
+                        *pte = nf | (old & 0xFFFU & ~(uint32_t)PAGE_COW) | PAGE_WRITABLE;
+                        tlb_flush_single(va);
+                        batch[nb++] = frame;
+                        if (nb == 256) {
+                            tlb_shootdown();
+                            for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
+                            nb = 0;
+                        }
+                    }
+                } else {
+                    preempt_disable();
+                    __builtin_memset(paging_temp_map(frame), 0, PAGE_SIZE);
+                    paging_temp_unmap();
+                    preempt_enable();
+                }
+            }
+        }
+        va += PAGE_SIZE;
+    }
+    tlb_shootdown();
+    for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
+    return 0;
+}
+
+/* ── sys_mincore(addr, len, vec) — EAX=218 ──────────────────────────────── */
+static int sys_mincore(registers_t *regs) {
+    uint32_t addr = regs->ebx;
+    uint32_t len  = regs->ecx;
+    uint8_t *vec  = (uint8_t *)(uintptr_t)regs->edx;
+    if (addr & (PAGE_SIZE - 1)) return -22;
+    uint32_t end = (addr + len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
+    if (end < addr || end > 0xC0000000U) return -12;
+    uint32_t npages = (end - addr) / PAGE_SIZE;
+    if (!access_ok(vec, npages)) return -14;
+    uint8_t buf[256];
+    uint32_t done = 0;
+    while (done < npages) {
+        uint32_t n = npages - done;
+        if (n > sizeof(buf)) n = sizeof(buf);
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t va = addr + (done + i) * PAGE_SIZE;
+            int mapped = (*paging_get_pde(va) & PAGE_PRESENT) &&
+                         pte_mapped(*paging_get_pte(va));
+            /* Linux: ENOMEM if a page is in no mapping at all. */
+            if (!mapped && !vma_find(va)) return -12;
+            buf[i] = mapped ? 1 : 0;              /* resident */
+        }
+        if (copy_to_user(vec + done, buf, n) < 0) return -14;
+        done += n;
+    }
+    return 0;
+}
+
+/* ── sys_mremap(old_addr, old_size, new_size, flags, new_addr) — EAX=163 ──
+ * Linux mm/mremap.c: shrink in place, grow in place when the space after the
+ * mapping is free, otherwise (MREMAP_MAYMOVE) move the page table entries to
+ * a new range — no data is copied.  glibc/musl realloc() and JS ArrayBuffer
+ * growth use this for large blocks. */
+#define MREMAP_MAYMOVE_K   1
+#define MREMAP_FIXED_K     2
+#define MREMAP_DONTUNMAP_K 4
+
+/* Attributes of the last VMA piece of the old range, captured before any list
+ * surgery (the extension of a grown mapping continues them). */
+struct mremap_tail { uint32_t prot, flags, off, fsize; vfs_node_t *file; };
+
+/* Move the page table entries of [old,old+len) to new (both page aligned,
+ * non-overlapping) and the VMA coverage with them.  The pieces are snapshotted
+ * first because inserting at the destination may merge with (and free) nodes
+ * of the source range. */
+#define MREMAP_MAX_PIECES 32
+static int mremap_move(uint32_t old, uint32_t len, uint32_t new) {
+    struct proc *o = mmap_owner();
+    if (!o) return -12;
+    struct { uint32_t s, e, prot, flags, off, fsize; vfs_node_t *file; } pcs[MREMAP_MAX_PIECES];
+    int np = 0;
+    for (struct vma *v = o->vmas; v && v->start < old + len; v = v->next) {
+        if (v->end <= old) continue;
+        if (np == MREMAP_MAX_PIECES) {
+            while (np) { np--; if (pcs[np].file) vfs_close(pcs[np].file); }
+            return -12;
+        }
+        uint32_t cs = v->start > old ? v->start : old;
+        uint32_t ce = v->end < old + len ? v->end : old + len;
+        pcs[np].s = new + (cs - old); pcs[np].e = new + (ce - old);
+        pcs[np].prot = v->prot; pcs[np].flags = v->flags; pcs[np].fsize = v->file_size;
+        pcs[np].file = v->file; pcs[np].off = v->file ? v->file_off + (cs - v->start) : 0;
+        if (v->file) vfs_retain(v->file);         /* survive the removal below */
+        np++;
+    }
+    vma_remove_range(old, old + len);
+    for (uint32_t off = 0; off < len; off += PAGE_SIZE) {
+        uint32_t va = old + off;
+        if (!(*paging_get_pde(va) & PAGE_PRESENT)) continue;
+        uint32_t *pte = paging_get_pte(va);
+        uint32_t e = *pte;
+        if (!pte_mapped(e)) continue;
+        *pte = 0;
+        tlb_flush_single(va);
+        paging_map(new + off, e & ~0xFFFU, e & 0xFFFU);   /* same frame, same flags */
+    }
+    tlb_shootdown();
+    for (int i = 0; i < np; i++) {
+        struct vma *nv = vma_alloc(pcs[i].s, pcs[i].e, pcs[i].prot, pcs[i].flags,
+                                   pcs[i].file, pcs[i].off);
+        if (nv) { nv->file_size = pcs[i].fsize; vma_insert(o, nv); }
+        if (pcs[i].file) vfs_close(pcs[i].file);
+    }
+    return 0;
+}
+
+/* Add the extension [s,e) of a grown mapping, continuing the tail piece. */
+static int mremap_extend(uint32_t s, uint32_t e, const struct mremap_tail *t) {
+    if ((t->flags & VMA_F_SHARED) && !t->file) return -12;   /* shared anon: no lazy path */
+    struct proc *o = mmap_owner();
+    struct vma *nv = o ? vma_alloc(s, e, t->prot, t->flags, t->file, t->off) : NULL;
+    if (!nv) return -12;
+    nv->file_size = t->fsize;
+    vma_insert(o, nv);
+    return 0;
+}
+
+static int sys_mremap(registers_t *regs) {
+    uint32_t old_addr = regs->ebx;
+    uint32_t old_size = regs->ecx;
+    uint32_t new_size = regs->edx;
+    uint32_t flags    = regs->esi;
+    uint32_t new_addr = regs->edi;
+
+    if (old_addr & (PAGE_SIZE - 1)) return -22;
+    if (flags & ~(uint32_t)(MREMAP_MAYMOVE_K | MREMAP_FIXED_K)) return -22;
+    if ((flags & MREMAP_FIXED_K) && !(flags & MREMAP_MAYMOVE_K)) return -22;
+    if (new_size == 0) return -22;
+    old_size = (old_size + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
+    new_size = (new_size + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
+    if (old_addr + old_size < old_addr || old_addr + old_size > 0xC0000000U) return -22;
+    if (old_size == 0) return -22;               /* shared-dup form not supported */
+
+    /* The old range must be fully covered by mappings (Linux: EFAULT otherwise). */
+    for (uint32_t a = old_addr; a < old_addr + old_size; ) {
+        struct vma *c = vma_find(a);
+        if (!c) return -14;
+        a = c->end;
+    }
+    struct mremap_tail t;
+    {
+        struct vma *last = vma_find(old_addr + old_size - PAGE_SIZE);
+        uint32_t tail = old_addr + old_size;
+        t.prot = last->prot; t.flags = last->flags; t.fsize = last->file_size;
+        t.file = last->file; t.off = last->file ? last->file_off + (tail - last->start) : 0;
+        if (t.file) vfs_retain(t.file);         /* outlives the list surgery below */
+    }
+    int ret;
+
+    if (flags & MREMAP_FIXED_K) {
+        if ((new_addr & (PAGE_SIZE - 1)) || new_addr + new_size < new_addr ||
+            new_addr + new_size > (uint32_t)USER_STACK_BASE ||
+            (new_addr < old_addr + old_size && old_addr < new_addr + new_size)) {
+            ret = -22;
+            goto out;
+        }
+        unmap_range(new_addr, new_addr + new_size);
+        uint32_t mv = old_size < new_size ? old_size : new_size;
+        ret = mremap_move(old_addr, mv, new_addr);
+        if (ret < 0) goto out;
+        if (mv < old_size) unmap_range(old_addr + mv, old_addr + old_size);
+        if (new_size > mv) {
+            ret = mremap_extend(new_addr + mv, new_addr + new_size, &t);
+            if (ret < 0) goto out;
+        }
+        ret = (int)new_addr;
+        goto out;
+    }
+
+    if (new_size <= old_size) {                  /* shrink (or same size) in place */
+        if (new_size < old_size) unmap_range(old_addr + new_size, old_addr + old_size);
+        ret = (int)old_addr;
+        goto out;
+    }
+
+    /* grow: in place if the space right after is free */
+    {
+        uint32_t grow = new_size - old_size;
+        uint32_t tail = old_addr + old_size;
+        if (tail + grow > tail && tail + grow <= MMAP_TOP && vma_range_free(tail, grow) &&
+            !((t.flags & VMA_F_SHARED) && !t.file)) {
+            ret = mremap_extend(tail, tail + grow, &t);
+            if (ret == 0) ret = (int)old_addr;
+            goto out;
+        }
+    }
+    if (!(flags & MREMAP_MAYMOVE_K)) { ret = -12; goto out; }
+    if ((t.flags & VMA_F_SHARED) && !t.file) { ret = -12; goto out; }   /* shared anon: cannot grow */
+
+    {
+        uint32_t dest = vma_gap_find(new_size, new_size >= 0x100000U ? 0x100000U : PAGE_SIZE);
+        if (!dest) dest = vma_gap_find(new_size, PAGE_SIZE);
+        if (!dest) { ret = -12; goto out; }
+        ret = mremap_move(old_addr, old_size, dest);
+        if (ret < 0) goto out;
+        ret = mremap_extend(dest + old_size, dest + new_size, &t);
+        if (ret < 0) { unmap_range(dest, dest + new_size); goto out; }
+        ret = (int)dest;
+    }
+out:
+    if (t.file) vfs_close(t.file);
+    return ret;
+}
+
+/* msync (144) and mlock/munlock/mlockall/munlockall (150-153): there is no
+ * writeback (tmpfs/memfd frames ARE the file) and no swap, so every page is
+ * always "locked" and "synced".  Accept and return 0 like Linux would after
+ * doing the work. */
+static int sys_msync(registers_t *regs) {
+    uint32_t addr = regs->ebx;
+    if (addr & (PAGE_SIZE - 1)) return -22;
+    return 0;
+}
+static int sys_mlock_noop(registers_t *regs) {
+    (void)regs;
     return 0;
 }
 
@@ -3331,16 +3881,11 @@ static int sys_set_tid_address(registers_t *regs) {
 static int sys_clock_gettime(registers_t *regs) {
     int clk = (int)regs->ebx;
     struct ktimespec *ts = (struct ktimespec *)(uintptr_t)regs->ecx;
+    int64_t sec; uint32_t nsec;
+    int r = kclock_get(clk, &sec, &nsec);
+    if (r < 0) return r;
     if (ts) {
-        struct ktimespec kts;
-        uint32_t t = pit_ticks();
-        if (clk == 1 || clk == 4) {        /* MONOTONIC / MONOTONIC_RAW */
-            kts.tv_sec  = (int32_t)(t / 100);
-            kts.tv_nsec = (int32_t)((t % 100) * 10000000L);
-        } else {                           /* REALTIME and the rest */
-            kts.tv_sec  = (int32_t)(rtc_boot_epoch() + t / 100);
-            kts.tv_nsec = (int32_t)((t % 100) * 10000000L);
-        }
+        struct ktimespec kts = { (int32_t)sec, (int32_t)nsec };
         int cr = copy_to_user(ts, &kts, sizeof(kts));
         if (cr < 0) return cr;
     }
@@ -3348,16 +3893,14 @@ static int sys_clock_gettime(registers_t *regs) {
 }
 
 /* ── sys_clock_gettime64(clockid, timespec64*) — EAX=403 ────────────────── */
-/* time64 variant: struct timespec { int64_t tv_sec; int32_t tv_nsec; pad }. */
+/* time64 variant: struct __kernel_timespec { int64_t tv_sec; int64_t tv_nsec; }. */
 static int sys_clock_gettime64(registers_t *regs) {
     int clk = (int)regs->ebx;
     void *uts = (void *)(uintptr_t)regs->ecx;
+    int64_t sec; uint32_t nsec;
+    int r = kclock_get(clk, &sec, &nsec);
+    if (r < 0) return r;
     if (uts) {
-        uint32_t t = pit_ticks();
-        int64_t sec;
-        int32_t nsec = (int32_t)((t % 100) * 10000000L);
-        if (clk == 1 || clk == 4) sec = (int64_t)(t / 100);
-        else                      sec = (int64_t)rtc_boot_epoch() + (int64_t)(t / 100);
         struct { int64_t s; int64_t ns; } kt = { sec, (int64_t)nsec };
         int cr = copy_to_user(uts, &kt, sizeof(kt));
         if (cr < 0) return cr;
@@ -4598,12 +5141,57 @@ static int sys_renameat(registers_t *regs) {
     return sys_rename_kernel_path(oldres, newres);
 }
 
-/* ── sys_clock_nanosleep(clkid, flags, rqtp, rmtp) — EAX=253 ─────────────── */
+/* ── sys_clock_nanosleep(clkid, flags, rqtp, rmtp) — EAX=267 / 407 ────────
+ * TIMER_ABSTIME sleeps until an absolute instant of the given clock (used by
+ * std::this_thread::sleep_until, Rust thread::sleep_until, pthread timed
+ * waits); a relative request is nanosleep on that clock.  On EINTR the
+ * remainder is written for relative sleeps only (Linux common_nsleep). */
+static int do_clock_nanosleep(int clk, int flags, int64_t rsec, int64_t rnsec,
+                              uint32_t *rem_sec, uint32_t *rem_nsec, int *write_rem) {
+    uint32_t ds, dn; int expired;
+    *write_rem = 0;
+    int r = knanosleep_deadline(clk, flags, rsec, rnsec, &ds, &dn, &expired);
+    if (r < 0) return r;
+    if (expired) return 0;
+    r = ksleep_until_mono(ds, dn, rem_sec, rem_nsec);
+    if (r == -4 && !(flags & TIMER_ABSTIME_K)) *write_rem = 1;
+    return r;
+}
+
 static int sys_clock_nanosleep(registers_t *regs) {
-    registers_t fake = *regs;
-    fake.ebx = regs->edx;  /* timespec *req */
-    fake.ecx = regs->esi;  /* timespec *rem */
-    return sys_nanosleep(&fake);
+    int clk = (int)regs->ebx, flags = (int)regs->ecx;
+    struct ktimespec *req = (struct ktimespec *)(uintptr_t)regs->edx;
+    struct ktimespec *rem = (struct ktimespec *)(uintptr_t)regs->esi;
+    if (!req) return -14;
+    struct ktimespec kreq;
+    int cr = copy_from_user(&kreq, req, sizeof(kreq));
+    if (cr < 0) return cr;
+    uint32_t rs = 0, rn = 0; int wr;
+    int r = do_clock_nanosleep(clk, flags, kreq.tv_sec, kreq.tv_nsec, &rs, &rn, &wr);
+    if (wr && rem) {
+        struct ktimespec krem = { (int32_t)rs, (int32_t)rn };
+        cr = copy_to_user(rem, &krem, sizeof(krem));
+        if (cr < 0) return cr;
+    }
+    return r;
+}
+
+static int sys_clock_nanosleep_time64(registers_t *regs) {
+    int clk = (int)regs->ebx, flags = (int)regs->ecx;
+    void *req = (void *)(uintptr_t)regs->edx;
+    void *rem = (void *)(uintptr_t)regs->esi;
+    if (!req) return -14;
+    struct { int64_t s; int64_t ns; } kreq;
+    int cr = copy_from_user(&kreq, req, sizeof(kreq));
+    if (cr < 0) return cr;
+    uint32_t rs = 0, rn = 0; int wr;
+    int r = do_clock_nanosleep(clk, flags, kreq.s, kreq.ns, &rs, &rn, &wr);
+    if (wr && rem) {
+        struct { int64_t s; int64_t ns; } krem = { (int64_t)rs, (int64_t)rn };
+        cr = copy_to_user(rem, &krem, sizeof(krem));
+        if (cr < 0) return cr;
+    }
+    return r;
 }
 
 /* ── sys_getresuid32 / sys_getresgid32 — EAX=209/211 ────────────────────────
@@ -4697,21 +5285,25 @@ static int sys_sched_setattr(registers_t *regs) {
     return 0;                              /* accept SCHED_NORMAL/BATCH/IDLE, ignore */
 }
 
-/* ── sys_clock_getres(clkid, timespec*) — EAX=266 ───────────────────────────
- * Report the PIT tick period (10 ms).  Firefox calls this to learn the timer
- * granularity; a bogus stub left it reading uninitialised memory. */
+/* ── sys_clock_getres(clkid, timespec*) — EAX=266 / 406 ──────────────────── */
 static int sys_clock_getres(registers_t *regs) {
+    uint32_t ns;
+    int r = kclock_res((int)regs->ebx, &ns);
+    if (r < 0) return r;
     void *uts = (void *)(uintptr_t)regs->ecx;
-    if (uts && access_ok(uts, 8)) {
-        struct { int32_t sec; int32_t nsec; } ts = { 0, 10000000 };
+    if (uts) {
+        struct { int32_t sec; int32_t nsec; } ts = { 0, (int32_t)ns };
         if (copy_to_user(uts, &ts, sizeof(ts)) < 0) return -14;
     }
     return 0;
 }
 static int sys_clock_getres_time64(registers_t *regs) {
+    uint32_t ns;
+    int r = kclock_res((int)regs->ebx, &ns);
+    if (r < 0) return r;
     void *uts = (void *)(uintptr_t)regs->ecx;
-    if (uts && access_ok(uts, 12)) {
-        struct { int64_t sec; int64_t nsec; } ts = { 0, 10000000 };
+    if (uts) {
+        struct { int64_t sec; int64_t nsec; } ts = { 0, (int64_t)ns };
         if (copy_to_user(uts, &ts, sizeof(ts)) < 0) return -14;
     }
     return 0;
@@ -4811,62 +5403,6 @@ static int sys_getpgid(registers_t *regs) {
     struct proc *p = (pid == 0) ? current_proc : proc_find_by_pid(pid);
     if (!p) return -3;   /* -ESRCH */
     return p->pgrp;
-}
-
-/* ── sys_madvise(addr, len, advice) — EAX=219 ──────────────────────────────
- * MADV_DONTNEED(4)/MADV_FREE(8) must actually drop the page contents: the next
- * access to anonymous memory must read back ZERO.  mozjemalloc (Firefox's
- * allocator) poisons freed memory with 0xe5, then MADV_DONTNEED's the chunk and
- * later REUSES the same virtual range expecting zeroed pages — if we no-op the
- * advice, the recycled pages still hold the 0xe5 poison, so mozjemalloc reads a
- * "freed" object back as live garbage → the intermittent use-after-free crash.
- * Zero every PRESENT page in the range (absent/demand-paged pages already read
- * as zero, so skip them).  Other advice is accepted as a hint (no-op). */
-#define MADV_DONTNEED_K 4
-#define MADV_FREE_K     8
-static int sys_madvise(registers_t *regs) {
-    uint32_t addr = regs->ebx & ~(uint32_t)(PAGE_SIZE - 1);
-    uint32_t len  = regs->ecx;
-    int advice = (int)regs->edx;
-    if (advice < 0 || advice > 16) return -22;
-    if (len == 0) return 0;
-    uint32_t end = (regs->ebx + len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
-    if (end < addr || end > 0xC0000000U) return -22;
-
-    /* Linux returns ENOMEM if the range has any unmapped gap.  We approximate:
-     * the range must be covered by present pages or a demand-paged VMA.  (Real
-     * callers — mozjemalloc — only advise their own committed chunks, so this
-     * stays correct for them while satisfying the unmapped-range test.) */
-    if (!mmap_range_free(addr, end - addr)) {
-        /* not free → at least partly mapped; fall through to apply advice */
-    } else {
-        return -12;   /* entirely unmapped → -ENOMEM */
-    }
-
-    /* MADV_DONTNEED is defined to give a ZERO page on next access, so zero the
-     * present pages.  MADV_FREE is LAZY: the data must PERSIST until the kernel
-     * reclaims under memory pressure (which our simple kernel never does), so
-     * treat it as a no-op — eagerly zeroing it destroys data mozjemalloc still
-     * considers live. */
-    if (advice == MADV_DONTNEED_K) {
-        for (uint32_t va = addr; va < end; ) {
-            if (!(*paging_get_pde(va) & PAGE_PRESENT)) {
-                va = (va & ~0x3FFFFFU) + 0x400000U;     /* skip absent 4 MiB PDE */
-                continue;
-            }
-            uint32_t *pte = paging_get_pte(va);
-            if ((*pte & PAGE_PRESENT) && (*pte & PAGE_USER) && (*pte & PAGE_WRITABLE))
-                __builtin_memset((void *)(uintptr_t)va, 0, PAGE_SIZE);
-            va += PAGE_SIZE;
-        }
-    }
-    return 0;
-}
-
-/* ── sys_mincore(addr, len, vec) — EAX=218 (stub) ───────────────────────── */
-static int sys_mincore(registers_t *regs) {
-    (void)regs;
-    return -12;  /* -ENOMEM stub */
 }
 
 /* Thread-directed signal (Linux do_tkill -> do_send_specific): queued on
@@ -6242,7 +6778,7 @@ void syscall_dispatch(registers_t *regs) {
     case 224: ret = sys_gettid(regs);          break;
     case 243: ret = sys_set_thread_area(regs); break;
     case 252: sys_exit_group(regs);            break;  /* noreturn */
-    case 253: ret = sys_clock_nanosleep(regs); break;
+    case 267: ret = sys_clock_nanosleep(regs); break;  /* clock_nanosleep */
     case 209: ret = sys_getresuid32(regs);     break;  /* getresuid32 */
     case 211: ret = sys_getresgid32(regs);     break;  /* getresgid32 */
     case 225: ret = 0;                         break;  /* readahead: no-op */
@@ -6270,7 +6806,7 @@ void syscall_dispatch(registers_t *regs) {
     case 355: ret = sys_getrandom(regs);       break;
     case 383: ret = sys_statx(regs);           break;  /* statx (fontconfig) */
     case 403: ret = sys_clock_gettime64(regs); break;  /* clock_gettime64 */
-    case 407: ret = sys_clock_nanosleep(regs); break;  /* clock_nanosleep_time64 */
+    case 407: ret = sys_clock_nanosleep_time64(regs); break;
     case 422: ret = sys_futex(regs, 1);        break;  /* futex_time64 (64-bit ts) */
     /* chmod/chown stubs */
     case 15:  ret = sys_chmod(regs);           break;
@@ -6281,7 +6817,7 @@ void syscall_dispatch(registers_t *regs) {
     case 240: ret = sys_futex(regs, 0);        break;  /* futex (32-bit ts) */
     case 116: ret = sys_sysinfo(regs);         break;
     case 90:  ret = sys_mmap_old(regs);        break;
-    case 163: ret = -12;                       break;  /* mremap: ENOMEM */
+    case 163: ret = sys_mremap(regs);          break;
     case 191: ret = sys_ugetrlimit(regs);      break;  /* ugetrlimit */
     case 199: ret = sys_getuid(regs);          break;  /* getuid32 */
     case 200: ret = sys_getgid(regs);          break;  /* getgid32 */
@@ -6294,6 +6830,10 @@ void syscall_dispatch(registers_t *regs) {
     case 143: ret = sys_flock(regs);           break;
     case 145: ret = sys_readv(regs);           break;
     case 218: ret = sys_mincore(regs);         break;
+    case 144: ret = sys_msync(regs);           break;
+    case 150: case 151: case 152: case 153:
+              ret = sys_mlock_noop(regs);      break;  /* mlock/munlock/mlockall/munlockall */
+    case 13:  ret = sys_time(regs);            break;
     case 219: ret = sys_madvise(regs);         break;
     case 270: ret = sys_tgkill(regs);          break;
     case 238: ret = sys_tkill(regs);           break;

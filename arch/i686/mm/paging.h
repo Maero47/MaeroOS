@@ -13,6 +13,10 @@
 #define PAGE_GLOBAL     0x100
 #define PAGE_COW        0x200  /* AVL bit 9: copy-on-write */
 #define PAGE_SHARED     0x400  /* AVL bit 10: shared memory — never COW'd */
+#define PAGE_PROTNONE   0x800  /* AVL bit 11: PROT_NONE page — NOT present, but the
+                                * entry still owns its frame so the data survives
+                                * mprotect(PROT_NONE) → mprotect(RW) (Linux
+                                * _PAGE_PROTNONE).  Any access faults. */
 
 /* Recursive page table addresses (PDE[1023] = page directory itself) */
 #define PAGE_TABLES_BASE  0xFFC00000U  /* Start of all page tables (virtual) */

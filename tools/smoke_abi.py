@@ -55,11 +55,8 @@ PROBES = {
 # Delete an entry when the corresponding kernel change lands (the run then
 # reports XPASS until you do).
 XFAIL = {
-    "p06_mmap_prot_madvise":   "M1, M6, M4: prot not enforced, DONTNEED skips COW",
     "p07_ftruncate64":         "syscalls 194/193/297/40 missing",
     "p10_unix_socket":         "U2-U5: SCM_RIGHTS position, recvmsg 0, flags, POLLHUP",
-    "p11_addr_space_reuse":    "M3: mmap cursor never reused",
-    "p12_clocks":              "T1, T2, T4: tick clocks, wrong ids, clock_nanosleep",
     "p14_exec_arg_size":       "C4: 4 KiB arg page, EXEC_MAXARGS 64",
     "p15_socket_cloexec":      "C5: SOCK_CLOEXEC ignored",
     "p16_memfd_cloexec_size":  "C5, M5: MFD_CLOEXEC ignored, write not reflected",

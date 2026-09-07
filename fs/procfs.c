@@ -277,7 +277,7 @@ static void maps_line(char *b, uint32_t *pos, uint32_t cap,
     perms[0] = (prot & 1) ? 'r' : '-';
     perms[1] = (prot & 2) ? 'w' : '-';
     perms[2] = (prot & 4) ? 'x' : '-';
-    perms[3] = 'p';
+    perms[3] = (prot & 8) ? 's' : 'p';   /* bit 3: MAP_SHARED mapping */
     perms[4] = '\0';
     pappend_hex(b, pos, cap, start, 8);
     pappend(b, pos, cap, "-");
@@ -292,7 +292,7 @@ static void maps_line(char *b, uint32_t *pos, uint32_t cap,
 static uint32_t procfs_maps_read(vfs_node_t *n, uint32_t off, uint32_t len,
                                   uint8_t *buf) {
     (void)n;
-    static char content[8192];
+    static char content[32768];   /* the VMA registry lists every mapping now */
     static uint32_t content_len = 0;
 
     if (off == 0) {
@@ -307,11 +307,14 @@ static uint32_t procfs_maps_read(vfs_node_t *n, uint32_t off, uint32_t len,
             if (p->heap_end > p->brk_base)
                 maps_line(content, &pos, sizeof(content),
                           p->brk_base, p->heap_end, 1 | 2, "[heap]");
-            /* Anonymous / demand-paged VMAs (thread stacks, large mmaps). */
-            uint32_t vs, ve, vp;
-            for (int i = 0; proc_vma_iter(p, i, &vs, &ve, &vp) == 0; i++) {
+            /* Every mmap()ed region, in address order, from the VMA registry
+             * (anonymous, file-backed, shared); the backing file's name for
+             * file mappings, 's' for MAP_SHARED. */
+            uint32_t vs, ve, vp; int vsh; const char *vname;
+            for (int i = 0; proc_vma_iter_ex(p, i, &vs, &ve, &vp, &vsh, &vname) == 0; i++) {
                 if (pos > sizeof(content) - 128) break;  /* leave room for [stack] */
-                maps_line(content, &pos, sizeof(content), vs, ve, vp, "");
+                maps_line(content, &pos, sizeof(content), vs, ve,
+                          vp | (vsh ? 8 : 0), vname);
             }
         }
         /* The main-thread stack — the line glibc/SpiderMonkey read for stack

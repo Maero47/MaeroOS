@@ -323,3 +323,7 @@ struct proc *proc_create_from_elf(struct vfs_node *node, const char *name);
  * for the idx-th VMA, or -1 when idx is past the end. */
 int proc_vma_iter(struct proc *p, int idx,
                   uint32_t *start, uint32_t *end, uint32_t *prot);
+/* Same, plus whether the mapping is MAP_SHARED and the backing file's name
+ * ("" for anonymous). */
+int proc_vma_iter_ex(struct proc *p, int idx, uint32_t *start, uint32_t *end,
+                     uint32_t *prot, int *shared, const char **name);
