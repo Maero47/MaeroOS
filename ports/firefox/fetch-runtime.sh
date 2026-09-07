@@ -14,11 +14,21 @@
 #   testfiles/lib/                glibc runtime (ld-linux.so.2, libc.so.6, ...)
 #                                 + libgcc_s / libstdc++ from the same suite
 #
-# Everything is fetched by URL: the Firefox tarball from ftp.mozilla.org
-# (verified against Mozilla's SHA256SUMS) and Debian packages from
-# deb.debian.org, resolved through the suite's Packages.xz index (verified
-# against the SHA256 recorded there).  .debs are unpacked with dpkg-deb -x;
-# no apt, no dpkg -i, no root, no Docker.
+# Everything is fetched by URL over https: the Firefox tarball from
+# ftp.mozilla.org and Debian packages from deb.debian.org, resolved through
+# the suite's Packages.xz index.  .debs are unpacked with dpkg-deb -x; no
+# apt, no dpkg -i, no root, no Docker.
+#
+# Trust model (see ports/firefox/README.md):
+#   * The Firefox tarball must match the sha256 pinned in this script
+#     (FF_SHA256).  For another FF_VERSION pass FF_SHA256 too; without it the
+#     script falls back to Mozilla's SHA256SUMS over https and says so.
+#   * The Debian index is anchored in the suite's InRelease file: its
+#     signature is verified with gpgv against the Debian archive keyring when
+#     both are present on the host (else a warning), the Packages.xz sha256
+#     must match the one InRelease records (fetched via by-hash), and every
+#     .deb must match the sha256 recorded in Packages.xz.
+#   * Mirrors must be https unless ALLOW_INSECURE_MIRROR=1.
 #
 # Downloads are cached under ports/firefox/prebuilt/ and the script is
 # idempotent: re-running it re-uses every cached download and stamps.
@@ -28,8 +38,12 @@
 #                           (default trixie: glibc 2.41 fixes the condvar
 #                           lost-wakeup bug BZ#25847 that bookworm's 2.36 has)
 #   FF_VERSION=115.15.0esr  Firefox release to fetch
+#   FF_SHA256=<hex>         expected sha256 of the tarball (pinned for the default)
 #   DEBIAN_MIRROR=...       default https://deb.debian.org/debian
-#   REFRESH_INDEX=1         re-download the Packages.xz index
+#   DEBIAN_KEYRING=<file>   gpg keyring holding the Debian archive signing keys
+#                           (default: the usual debian-archive-keyring paths)
+#   ALLOW_INSECURE_MIRROR=1 permit http:// in DEBIAN_MIRROR / MOZ_BASE
+#   REFRESH_INDEX=1         re-download InRelease and the Packages.xz index
 #   SKIP_CHECK=1            skip the final closure check
 #   NO_I386_EXEC=1          pretend the host cannot run i386 binaries (exercises
 #                           the loaders.cache.template fallback)
@@ -44,13 +58,17 @@ MOZ_BASE=${MOZ_BASE:-https://ftp.mozilla.org/pub/firefox/releases}
 ARCH=i386
 FF_ARCH=linux-i686
 FF_LOCALE=en-US
+# sha256 of firefox-115.15.0esr.tar.bz2 (linux-i686, en-US) from Mozilla's
+# SHA256SUMS, recorded here so a substituted mirror cannot swap the binary.
+FF_SHA256_PINNED_VERSION=115.15.0esr
+FF_SHA256_PINNED=9a8b03f993049e75418e4753aedfe661016557c708cd6099eb2949b306d6f695
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 CACHE="$HERE/prebuilt"
 SUITEDIR="$CACHE/$SUITE"
 DEBS="$SUITEDIR/debs"
-UNPACK="$SUITEDIR/root"          # dpkg-deb -x target (merged for all packages)
+UNPACK="$SUITEDIR/pkgs"          # dpkg-deb -x target, one subdirectory per package
 POOL="$SUITEDIR/pool"            # flat soname -> real file
 FFDIR="$ROOT/testfiles/firefox"
 LIBDIR="$ROOT/testfiles/lib"
@@ -90,6 +108,13 @@ need xz
 need bzip2
 need sha256sum
 need awk
+
+for u in "$DEBIAN_MIRROR" "$MOZ_BASE"; do
+    case "$u" in
+        https://*) ;;
+        *) [ "${ALLOW_INSECURE_MIRROR:-0}" = 1 ] || die "refusing non-https URL '$u' (set ALLOW_INSECURE_MIRROR=1 to override)" ;;
+    esac
+done
 
 download() {  # download URL DEST
     [ -s "$2" ] && return 0
@@ -132,15 +157,33 @@ FF_URL="$MOZ_BASE/$FF_VERSION/$FF_ARCH/$FF_LOCALE/$FF_TARBALL"
 FF_SUMS="$CACHE/SHA256SUMS-$FF_VERSION"
 FF_STAMP="$FFDIR/.fetch-runtime.firefox"
 
-download "$MOZ_BASE/$FF_VERSION/SHA256SUMS" "$FF_SUMS"
 download "$FF_URL" "$CACHE/$FF_TARBALL"
-expected=$(awk -v f="$FF_ARCH/$FF_LOCALE/$FF_TARBALL" '$2==f {print $1}' "$FF_SUMS")
-[ -n "$expected" ] || die "$FF_TARBALL not listed in Mozilla's SHA256SUMS"
+if [ -n "${FF_SHA256:-}" ]; then
+    expected=$FF_SHA256; source="FF_SHA256 from the environment"
+elif [ "$FF_VERSION" = "$FF_SHA256_PINNED_VERSION" ]; then
+    expected=$FF_SHA256_PINNED; source="the sha256 pinned in fetch-runtime.sh"
+else
+    warn "no pinned sha256 for Firefox $FF_VERSION; trusting Mozilla's SHA256SUMS over https (pass FF_SHA256=... to pin it)"
+    download "$MOZ_BASE/$FF_VERSION/SHA256SUMS" "$FF_SUMS"
+    expected=$(awk -v f="$FF_ARCH/$FF_LOCALE/$FF_TARBALL" '$2==f {print $1}' "$FF_SUMS")
+    [ -n "$expected" ] || die "$FF_TARBALL not listed in Mozilla's SHA256SUMS"
+    source="Mozilla's SHA256SUMS (unpinned)"
+fi
 sha256_check "$CACHE/$FF_TARBALL" "$expected" || {
     rm -f "$CACHE/$FF_TARBALL"
-    die "$FF_TARBALL failed SHA256 verification (deleted; re-run to fetch again)"
+    die "$FF_TARBALL does not match $source (deleted; re-run to fetch again)"
 }
-log "firefox tarball $FF_TARBALL verified (sha256 $expected)"
+log "firefox tarball $FF_TARBALL verified against $source (sha256 $expected)"
+
+# File list of the tarball (relative to the tree): it tells a later step which
+# files in testfiles/firefox are Firefox's own and which were placed by us or
+# by an earlier, differently built tree.
+FF_LIST="$CACHE/$FF_TARBALL.list"
+if [ ! -s "$FF_LIST" ]; then
+    tar -tjf "$CACHE/$FF_TARBALL" | sed -e 's|^[^/]*/||' -e '/^$/d' -e 's|/$||' | sort -u > "$FF_LIST.part"
+    mv "$FF_LIST.part" "$FF_LIST"
+fi
+in_tarball() { grep -qxF "$1" "$FF_LIST"; }
 
 if [ "$(cat "$FF_STAMP" 2>/dev/null)" = "$FF_VERSION" ] && [ -f "$FFDIR/firefox-bin" ] && [ -f "$FFDIR/libxul.so" ]; then
     log "firefox $FF_VERSION already extracted in ${FFDIR#"$ROOT"/}"
@@ -164,8 +207,52 @@ log "dependentlibs.list ($(wc -l < "$FFDIR/dependentlibs.list") entries) and app
 # ---------------------------------------------------------------------------
 INDEX_XZ="$SUITEDIR/Packages.xz"
 INDEX="$SUITEDIR/Packages.tsv"      # package \t version \t filename \t sha256
-[ "${REFRESH_INDEX:-0}" = 1 ] && rm -f "$INDEX_XZ" "$INDEX"
-download "$DEBIAN_MIRROR/dists/$SUITE/main/binary-$ARCH/Packages.xz" "$INDEX_XZ"
+INRELEASE="$SUITEDIR/InRelease"
+INDEX_PATH="main/binary-$ARCH/Packages.xz"
+[ "${REFRESH_INDEX:-0}" = 1 ] && rm -f "$INDEX_XZ" "$INDEX" "$INRELEASE"
+[ -s "$INDEX_XZ" ] || rm -f "$INRELEASE" "$INDEX"     # keep InRelease and index paired
+download "$DEBIAN_MIRROR/dists/$SUITE/InRelease" "$INRELEASE"
+
+# Signature: gpgv + a Debian archive keyring, if the host has them.
+keyring=""
+if [ -n "${DEBIAN_KEYRING:-}" ]; then
+    # An explicitly requested keyring is mandatory: never fall back silently.
+    [ -r "$DEBIAN_KEYRING" ] || die "DEBIAN_KEYRING=$DEBIAN_KEYRING is not readable"
+    command -v gpgv >/dev/null 2>&1 || die "DEBIAN_KEYRING is set but gpgv is not installed"
+    keyring=$DEBIAN_KEYRING
+else
+    for k in /usr/share/keyrings/debian-archive-keyring.gpg /etc/apt/trusted.gpg.d/debian-archive-keyring.gpg \
+             /usr/share/keyrings/debian-archive-keyring.pgp; do
+        [ -r "$k" ] && { keyring=$k; break; }
+    done
+fi
+if [ -n "$keyring" ] && command -v gpgv >/dev/null 2>&1; then
+    gpgv --keyring "$keyring" "$INRELEASE" >/dev/null 2>&1 \
+        || { rm -f "$INRELEASE"; die "InRelease for $SUITE has no valid signature under $keyring (deleted; re-run)"; }
+    log "InRelease signature verified with gpgv against $keyring"
+else
+    if [ -z "$keyring" ]; then why="no Debian archive keyring found (install debian-archive-keyring or set DEBIAN_KEYRING=)"
+    else why="gpgv not found"; fi
+    warn "InRelease signature NOT verified: $why; trusting https to $DEBIAN_MIRROR for the index"
+fi
+grep -q '^Codename: '"$SUITE"'$\|^Suite: '"$SUITE"'$' "$INRELEASE" || die "InRelease does not describe suite $SUITE"
+
+# sha256 of Packages.xz as recorded in the (signed) InRelease; fetch exactly
+# that object through by-hash so a mirror mid-update cannot hand us a stale one.
+index_sha=$(awk -v f="$INDEX_PATH" '/^SHA256:/ {in_sha=1; next} /^[A-Za-z]/ {in_sha=0} in_sha && $3==f {print $1; exit}' "$INRELEASE")
+[ -n "$index_sha" ] || die "InRelease has no SHA256 entry for $INDEX_PATH"
+if [ -s "$INDEX_XZ" ] && ! sha256_check "$INDEX_XZ" "$index_sha"; then
+    log "cached Packages.xz no longer matches InRelease; refetching"
+    rm -f "$INDEX_XZ" "$INDEX"
+fi
+if [ ! -s "$INDEX_XZ" ]; then
+    curl -fsSL --retry 3 -o "$INDEX_XZ.part" "$DEBIAN_MIRROR/dists/$SUITE/main/binary-$ARCH/by-hash/SHA256/$index_sha" \
+        || curl -fsSL --retry 3 -o "$INDEX_XZ.part" "$DEBIAN_MIRROR/dists/$SUITE/$INDEX_PATH" \
+        || { rm -f "$INDEX_XZ.part"; die "download failed: $INDEX_PATH"; }
+    mv "$INDEX_XZ.part" "$INDEX_XZ"
+fi
+sha256_check "$INDEX_XZ" "$index_sha" || { rm -f "$INDEX_XZ" "$INRELEASE"; die "Packages.xz does not match the sha256 in InRelease (deleted; re-run)"; }
+log "Packages.xz ($SUITE/$INDEX_PATH) matches InRelease (sha256 $index_sha)"
 if [ ! -s "$INDEX" ]; then
     log "indexing $SUITE/main/binary-$ARCH"
     xz -dc "$INDEX_XZ" | awk -v RS= -F'\n' '
@@ -206,16 +293,23 @@ fetch_pkg() {  # fetch_pkg PKG : download, verify, dpkg-deb -x (stamped)
     deb="$DEBS/$(basename "$file")"
     download "$DEBIAN_MIRROR/$file" "$deb"
     sha256_check "$deb" "$sum" || { rm -f "$deb"; die "$(basename "$deb") failed SHA256 verification (deleted; re-run)"; }
-    stamp="$UNPACK/.unpacked/$pkg"
-    if [ "$(cat "$stamp" 2>/dev/null)" != "$ver" ]; then
+    # One directory per package; a version change replaces it wholesale so no
+    # file from the previous version can survive next to the new one.
+    pdir="$UNPACK/$pkg"
+    if [ "$(cat "$pdir/.version" 2>/dev/null)" != "$ver" ]; then
+        [ -d "$pdir" ] && log "replacing $pkg $(cat "$pdir/.version" 2>/dev/null) -> $ver"
+        rm -rf "$pdir"; mkdir -p "$pdir"
         log "unpacking $pkg $ver"
-        dpkg-deb -x "$deb" "$UNPACK"
-        mkdir -p "$UNPACK/.unpacked"
-        printf '%s\n' "$ver" > "$stamp"
+        dpkg-deb -x "$deb" "$pdir"
+        printf '%s\n' "$ver" > "$pdir/.version"
     fi
     printf '%s %s\n' "$pkg" "$ver" >> "$SUITEDIR/installed.txt"
 }
 
+if [ -d "$SUITEDIR/root" ]; then
+    log "removing ${SUITEDIR#"$ROOT"/}/root (merged unpack directory from an earlier layout)"
+    rm -rf "$SUITEDIR/root"
+fi
 : > "$SUITEDIR/installed.txt"
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$PKGLIST" | while IFS= read -r entry; do
     entry=$(printf '%s' "$entry" | tr -d '[:space:]')
@@ -224,21 +318,23 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$PKGLIST" | while IFS= read -r entry; d
 done
 log "$(wc -l < "$SUITEDIR/installed.txt") packages from Debian $SUITE/$ARCH unpacked under ${UNPACK#"$ROOT"/}"
 
-# Library directories inside the unpacked tree (bookworm .debs still ship
-# glibc under /lib, trixie is fully merged-/usr).
-LIBSRC="$UNPACK/usr/lib/$ARCH-linux-gnu $UNPACK/lib/$ARCH-linux-gnu $UNPACK/usr/lib $UNPACK/lib"
-
-# Flat pool: every ELF shared object, named by its DT_SONAME (basename if none).
+# Flat pool: every ELF shared object from the packages unpacked in THIS run
+# (in list order), named by its DT_SONAME (basename if none).  Library
+# directories differ per suite: bookworm .debs still ship glibc under /lib,
+# trixie is fully merged-/usr.
 rm -rf "$POOL"; mkdir -p "$POOL"
-for d in $LIBSRC; do
-    [ -d "$d" ] || continue
-    find "$d" -maxdepth 1 -type f \( -name '*.so' -o -name '*.so.*' \) | while IFS= read -r f; do
-        is_elf "$f" || continue
-        so=$(soname_of "$f"); [ -n "$so" ] || so=$(basename "$f")
-        [ -e "$POOL/$so" ] || cp "$f" "$POOL/$so"
+while read -r pkg _ver; do
+    for d in "$UNPACK/$pkg/usr/lib/$ARCH-linux-gnu" "$UNPACK/$pkg/lib/$ARCH-linux-gnu" "$UNPACK/$pkg/usr/lib" "$UNPACK/$pkg/lib"; do
+        [ -d "$d" ] || continue
+        find "$d" -maxdepth 1 -type f \( -name '*.so' -o -name '*.so.*' \) | sort | while IFS= read -r f; do
+            is_elf "$f" || continue
+            so=$(soname_of "$f"); [ -n "$so" ] || so=$(basename "$f")
+            if [ -e "$POOL/$so" ]; then warn "pool: $so from $pkg shadows an earlier copy; keeping the first"; continue; fi
+            cp "$f" "$POOL/$so"
+        done
     done
-done
-log "pool holds $(find "$POOL" -type f | wc -l) shared objects"
+done < "$SUITEDIR/installed.txt"
+log "pool holds $(find "$POOL" -type f | wc -l) shared objects from $(wc -l < "$SUITEDIR/installed.txt") packages"
 
 # ---------------------------------------------------------------------------
 # 4. glibc -> testfiles/lib
@@ -260,13 +356,33 @@ EOT
 log "glibc $glibc_ver (Debian $SUITE) installed into ${LIBDIR#"$ROOT"/}"
 
 # ---------------------------------------------------------------------------
-# 5. Remove what a previous run placed in testfiles/firefox (suite switches)
+# 5. Reset testfiles/firefox to "Firefox tarball only"
 # ---------------------------------------------------------------------------
+# Remove what a previous run placed there (manifest), then every shared
+# object that is not part of the tarball - e.g. a GTK stack left behind by an
+# earlier, differently assembled tree.  Only the Debian pool may satisfy a
+# soname from here on, so a stale library can never shadow a fresh one.
+nprev=0
 if [ -f "$MANIFEST" ]; then
-    while IFS= read -r rel; do rm -f "$FFDIR/$rel"; done < "$MANIFEST"
+    while IFS= read -r rel; do [ -e "$FFDIR/$rel" ] && { rm -f "$FFDIR/$rel"; nprev=$((nprev + 1)); }; done < "$MANIFEST"
+    [ $nprev -gt 0 ] && log "removed $nprev files installed by the previous run (manifest)"
 fi
 : > "$MANIFEST"
 mkdir -p "$FFDIR/pixbuf-loaders"
+nstale=0
+find "$FFDIR" -maxdepth 2 -type f \( -name '*.so' -o -name '*.so.*' \) | sort | while IFS= read -r f; do
+    rel=${f#"$FFDIR"/}
+    in_tarball "$rel" && continue
+    is_elf "$f" || continue
+    rm -f "$f"
+    printf '%s\n' "$rel"
+done > "$FFDIR/.fetch-runtime.stale"
+nstale=$(wc -l < "$FFDIR/.fetch-runtime.stale")
+if [ "$nstale" -gt 0 ]; then
+    log "removed $nstale shared objects that are neither from the Firefox tarball nor from this script's previous run:"
+    sed 's/^/    /' "$FFDIR/.fetch-runtime.stale"
+fi
+rm -f "$FFDIR/.fetch-runtime.stale"
 install_ff() {  # install_ff SRC RELNAME
     cp "$1" "$FFDIR/$2.tmp" && mv "$FFDIR/$2.tmp" "$FFDIR/$2"
     printf '%s\n' "$2" >> "$MANIFEST"
@@ -275,7 +391,7 @@ install_ff() {  # install_ff SRC RELNAME
 # ---------------------------------------------------------------------------
 # 6. gdk-pixbuf loader modules
 # ---------------------------------------------------------------------------
-loaderdir=$(find "$UNPACK/usr/lib/$ARCH-linux-gnu/gdk-pixbuf-2.0" -maxdepth 2 -type d -name loaders | head -n 1)
+loaderdir=$(find "$UNPACK" -type d -path "*/gdk-pixbuf-2.0/*/loaders" 2>/dev/null | head -n 1)
 [ -n "$loaderdir" ] || die "gdk-pixbuf loaders directory not found in the unpacked packages"
 nload=0
 for f in "$loaderdir"/libpixbufloader-*.so; do
@@ -336,10 +452,12 @@ while [ -s "$queue" ]; do
     printf '%s\n' "$so" >> "$seen"
     if [ -f "$LIBDIR/$so" ]; then
         continue                                     # satisfied by /lib
-    elif [ -f "$FFDIR/$so" ]; then
-        src="$FFDIR/$so"                             # Firefox's own or a stub
+    elif in_tarball "$so" && [ -f "$FFDIR/$so" ]; then
+        src="$FFDIR/$so"                             # Firefox's own library
     elif [ -f "$POOL/$so" ]; then
         install_ff "$POOL/$so" "$so"; src="$FFDIR/$so"; ncopied=$((ncopied + 1))
+    elif grep -qx "$so" "$MANIFEST" && [ -f "$FFDIR/$so" ]; then
+        src="$FFDIR/$so"                             # a stub installed above
     else
         printf '%s\n' "$so" >> "$missing"; continue
     fi
@@ -354,7 +472,7 @@ log "$ncopied Debian shared objects copied into ${FFDIR#"$ROOT"/} ($(wc -l < "$s
 # 9. loaders.cache with the on-disk paths
 # ---------------------------------------------------------------------------
 CACHEFILE="$FFDIR/pixbuf-loaders/loaders.cache"
-query=$(find "$UNPACK/usr/lib/$ARCH-linux-gnu/gdk-pixbuf-2.0" "$UNPACK/usr/bin" -type f -name gdk-pixbuf-query-loaders 2>/dev/null | head -n 1)
+query=$(find "$UNPACK" -type f -name gdk-pixbuf-query-loaders 2>/dev/null | head -n 1)
 if [ -n "$query" ] && host_runs_i386; then
     log "generating loaders.cache with the suite's gdk-pixbuf-query-loaders"
     GDK_PIXBUF_MODULEDIR="$FFDIR/pixbuf-loaders" \
@@ -387,7 +505,7 @@ if [ ! -f "$FONTDIR/DejaVuSans.ttf" ]; then
     log "DejaVuSans.ttf missing; fetching fonts-dejavu-core"
     fetch_pkg fonts-dejavu-core
     mkdir -p "$FONTDIR"
-    cp "$(find "$UNPACK/usr/share/fonts" -name DejaVuSans.ttf | head -n 1)" "$FONTDIR/DejaVuSans.ttf"
+    cp "$(find "$UNPACK/fonts-dejavu-core" -name DejaVuSans.ttf | head -n 1)" "$FONTDIR/DejaVuSans.ttf"
 fi
 
 # ---------------------------------------------------------------------------

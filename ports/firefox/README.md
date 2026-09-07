@@ -61,8 +61,45 @@ listed package ships but nothing links (e.g. `libbrotlienc`, `libexpatw`,
 `libgcrypt` on trixie) is pruned.  A soname that no listed package provides
 aborts the run with its name, so extending the list is a one-line change.
 
-Every `.deb` is checked against the SHA256 in the suite's `Packages.xz`
-index and the Firefox tarball against Mozilla's `SHA256SUMS`.
+## Trust model
+
+What the script verifies, and what it merely relies on:
+
+* **Firefox tarball**: must match the sha256 pinned in `fetch-runtime.sh`
+  (`FF_SHA256_PINNED`, taken from Mozilla's `SHA256SUMS` for 115.15.0esr).
+  A swapped mirror or a tampered download fails hard. For another
+  `FF_VERSION` pass `FF_SHA256=<hex>` as well; without it the script falls
+  back to Mozilla's `SHA256SUMS` fetched over https and warns that the hash
+  is unpinned (that only detects corruption, not substitution).
+* **Debian index**: the suite's `InRelease` file is the anchor. Its OpenPGP
+  signature is verified with `gpgv` against the Debian archive keyring when
+  both exist on the host (`/usr/share/keyrings/debian-archive-keyring.gpg`,
+  or `DEBIAN_KEYRING=<file>`; the `debian-archive-keyring` package provides
+  it). Without them the script prints a warning and the index is trusted on
+  the strength of https to the mirror alone. In both cases `Packages.xz` is
+  fetched through `by-hash/SHA256/<sum>` using the sum recorded in
+  `InRelease` and must match it, and every `.deb` must match the sha256
+  recorded in `Packages.xz`. So with a keyring the chain is
+  signature → InRelease → Packages.xz → .deb; without one it is
+  https → InRelease → Packages.xz → .deb.
+* **Transport**: `DEBIAN_MIRROR` and `MOZ_BASE` must be https. Set
+  `ALLOW_INSECURE_MIRROR=1` to use a plain-http mirror (e.g. a local cache);
+  the hash chain above still applies.
+* Not verified: Mozilla's `SHA256SUMS.asc` (only relevant in the unpinned
+  fallback), and the contents of the Debian packages beyond their recorded
+  hashes.
+
+## Idempotence
+
+Re-running is safe and cheap. Downloads are cached; each package unpacks
+into its own directory under `prebuilt/<suite>/pkgs/<package>/`, replaced
+wholesale when its version changes, so no file from an older version can
+shadow a newer one in the pool. Before assembling, the script deletes what
+its previous run installed (recorded in `.fetch-runtime.manifest`) and then
+every shared object in `testfiles/firefox/` that is not part of the Firefox
+tarball, logging each removal. That means a tree left behind by an earlier,
+differently assembled build is reset to "tarball only" and rebuilt from the
+chosen suite; a stale library can never win over the pool copy.
 
 ## Verification
 
