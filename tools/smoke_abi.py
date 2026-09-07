@@ -55,25 +55,15 @@ PROBES = {
 # Delete an entry when the corresponding kernel change lands (the run then
 # reports XPASS until you do).
 XFAIL = {
-    "p01_fatal_signal_scope":  "RC1, S2: fatal signal kills one thread",
-    "p02_spawn_exit_group":    "RC2, C1: CLONE_VM child shares the tgid",
-    "p03_sigchld_thread":      "RC3, S3, S4, S11, C2: per-thread handlers/SIGCHLD/waitpid",
-    "p04_spurious_futex":      "RC4, F3, F11, S1, S8: nets and signal wakes",
-    "p05_stale_wake_tick":     "F4: stale wake_tick",
     "p06_mmap_prot_madvise":   "M1, M6, M4: prot not enforced, DONTNEED skips COW",
     "p07_ftruncate64":         "syscalls 194/193/297/40 missing",
-    "p08_select_timeout":      "E2: select ignores the timeout",
-    "p09_poll_eintr_restart":  "E1, S5: poll not interruptible, SA_RESTART -> ENOSYS",
     "p10_unix_socket":         "U2-U5: SCM_RIGHTS position, recvmsg 0, flags, POLLHUP",
     "p11_addr_space_reuse":    "M3: mmap cursor never reused",
     "p12_clocks":              "T1, T2, T4: tick clocks, wrong ids, clock_nanosleep",
-    "p13_futex_timeout":       "F2: timeout returns 0",
     "p14_exec_arg_size":       "C4: 4 KiB arg page, EXEC_MAXARGS 64",
     "p15_socket_cloexec":      "C5: SOCK_CLOEXEC ignored",
     "p16_memfd_cloexec_size":  "C5, M5: MFD_CLOEXEC ignored, write not reflected",
-    "p17_signal_busy_thread":  "S2, S4: no delivery to a CPU-bound thread",
     "p19_siginfo":             "S6: si_addr/si_code, sa_mask, sigaltstack",
-    "p20_shared_futex":        "F5, F6: shared futex on a non-present page",
 }
 
 

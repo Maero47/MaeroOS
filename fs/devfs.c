@@ -440,10 +440,9 @@ static uint32_t pty_buf_write(pty_pair_t *p, int to_slave,
 static void pty_send_pgrp_signal(pty_pair_t *p, int sig) {
     int pg = p->fg_pgrp;
     if (!pg && current_proc) pg = current_proc->pgrp;
-    for (int i = 0; i < MAX_PROCS; i++) {
-        if (ptable[i].state != PROC_UNUSED && ptable[i].pgrp == pg)
-            signal_send(&ptable[i], sig);
-    }
+    /* One signal per process in the group, delivered to a thread that does
+     * not block it (Linux kill_pgrp), not one per thread. */
+    signal_send_pgrp(pg, sig);
 }
 
 static int pty_background_current(pty_pair_t *p) {

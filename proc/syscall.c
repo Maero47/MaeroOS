@@ -205,7 +205,7 @@ int user_fault_signal(registers_t *regs, int sig) {
            (unsigned)(regs->cs & 0xFFFF), sig);
     if (regs->eip == current_proc->last_fault_eip) {
         if (++current_proc->fault_repeat >= 3)
-            proc_exit(128 + sig);            /* does not return */
+            proc_group_exit(sig);            /* does not return */
     } else {
         current_proc->last_fault_eip = regs->eip;
         current_proc->fault_repeat   = 0;
@@ -508,11 +508,6 @@ static int eventfd_write(struct eventfd_obj *e, const char *buf, int len, int no
     e->count += add;
     wake_up(e);                                     /* wake blocked readers */
     io_wake();                                      /* wake pollers (now readable) */
-    /* NB: deliberately do NOT bump g_ff_io_nudge here — eventfd writes (GLib
-     * wakeups, vsync ~60Hz, timers) are far too frequent and make the IO threads
-     * spin on the self-heal, starving the single CPU (observed: stall at the
-     * first nsWindow::Create).  Pipe + unix-socket writes are the right dispatch
-     * signal; they got the browser chrome laid out (553x108 window mapped). */
     return 8;
 }
 
@@ -604,11 +599,26 @@ void fdtable_put(struct proc *p) {
  */
 
 /* ── sys_exit(int status) — EAX=1 ─────────────────────────────────────── */
+/* exit() ends the CALLING THREAD only (Linux do_exit; glibc's pthread_exit
+ * path).  The status is wait-encoded here as (code & 0xff) << 8, the form
+ * WIFEXITED/WEXITSTATUS expect; a death by signal stores the bare signal
+ * number instead (kernel/exit.c: tsk->exit_code = code, do_group_exit(sig)). */
 static void sys_exit(registers_t *regs) {
     printk("[SYSCALL] sys_exit(%d) from pid %d\n",
            (int)regs->ebx, current_proc ? current_proc->pid : -1);
-    proc_exit((int)regs->ebx);   /* noreturn */
+    proc_exit(((int)regs->ebx & 0xff) << 8);   /* noreturn */
 }
+
+/* Linux clone(2) flag bits (uapi/linux/sched.h); used by do_fork and sys_clone. */
+#define CLONE_VM             0x00000100
+#define CLONE_FILES          0x00000400
+#define CLONE_SIGHAND        0x00000800
+#define CLONE_VFORK          0x00004000
+#define CLONE_THREAD         0x00010000
+#define CLONE_PARENT_SETTID  0x00100000
+#define CLONE_CHILD_CLEARTID 0x00200000
+#define CLONE_SETTLS         0x00080000
+#define CLONE_CHILD_SETTID   0x01000000
 
 /* Core fork.  child_stack==0 → child shares the parent's stack pointer (classic
  * fork).  child_stack!=0 → child runs on that user stack instead (clone without
@@ -617,7 +627,8 @@ static void sys_exit(registers_t *regs) {
  * Honouring child_stack here is essential: otherwise the child runs the glibc
  * clone trampoline on the parent's stack, pops garbage as its entry fn, and
  * jumps into the weeds. */
-static int do_fork(registers_t *regs, uint32_t child_stack) {
+static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags,
+                   uint32_t uptid, uint32_t uctid) {
     (void)regs;
     struct proc *parent = current_proc;
     if (!parent) return -1;
@@ -630,14 +641,20 @@ static int do_fork(registers_t *regs, uint32_t child_stack) {
     __builtin_memcpy(child->tf, parent->tf, sizeof(registers_t));
     child->tf->eax = 0;
 
-    child->parent = parent;
+    /* The child belongs to the forking PROCESS, not to the forking thread
+     * (Linux copy_process: p->real_parent = current->group_leader), so any
+     * thread of the parent may wait for it and its SIGCHLD goes to the process. */
+    child->parent = proc_group_leader(parent);
     __builtin_memcpy(child->name, parent->name, sizeof(parent->name));
 
-    /* Inherit signal handlers and flags; clear pending signals in child */
-    __builtin_memcpy(child->sig_handlers, parent->sig_handlers,
-                     sizeof(parent->sig_handlers));
-    __builtin_memcpy(child->sig_flags, parent->sig_flags,
-                     sizeof(parent->sig_flags));
+    /* Inherit a private COPY of the handler table (Linux copy_sighand without
+     * CLONE_SIGHAND); clear pending signals in child, keep the blocked mask. */
+    if (parent->sighand) {
+        __builtin_memcpy(child->sighand->handlers, parent->sighand->handlers,
+                         sizeof(child->sighand->handlers));
+        __builtin_memcpy(child->sighand->flags, parent->sighand->flags,
+                         sizeof(child->sighand->flags));
+    }
     child->pending_sigs  = 0;
     child->blocked_sigs  = parent->blocked_sigs;
     child->sigframe_addr = 0;
@@ -669,6 +686,17 @@ static int do_fork(registers_t *regs, uint32_t child_stack) {
     child->ctty      = parent->ctty;
     if (child->ctty)
         vfs_retain(child->ctty);
+
+    /* CLONE_PARENT_SETTID / CLONE_CHILD_SETTID / CLONE_CHILD_CLEARTID apply to
+     * fork-style clones too (kernel/fork.c copy_process: parent_tidptr is
+     * written by the parent, set_child_tid by the child in schedule_tail,
+     * clear_child_tid at exit).  glibc's fork passes &THREAD_SELF->tid as
+     * ctid so the child's descriptor holds ITS pid, not the parent's. */
+    if ((clone_flags & CLONE_PARENT_SETTID) && uptid &&
+        access_ok((void *)(uintptr_t)uptid, 4))
+        *(uint32_t *)(uintptr_t)uptid = (uint32_t)child->pid;
+    child->set_child_tid   = (clone_flags & CLONE_CHILD_SETTID)   ? uctid : 0;
+    child->clear_child_tid = (clone_flags & CLONE_CHILD_CLEARTID) ? uctid : 0;
 
     vma_clone(parent, child);     /* fork: child gets its own copy of the VMAs */
 
@@ -791,25 +819,12 @@ static int do_fork(registers_t *regs, uint32_t child_stack) {
     printk("[SYSCALL] %s: parent pid=%d child pid=%d%s\n",
            child_stack ? "clone(fork)" : "sys_fork",
            parent->pid, child->pid, child_stack ? " (child stack)" : "");
-    /* [fk] a firefox thread just fork()ed a full child (content process launch).
-     * Remember it so we can trace whether it BLOCKS (futex WAIT) or NOTIFIES
-     * (futex WAKE) afterward — i.e. does it reach Monitor.Notify to set the
-     * WaitForProcessHandle predicate?  Skip the Breakpad crash-dumper clone
-     * (child_stack != 0 = CLONE_VM w/ stack); we want the real content fork. */
-    extern volatile int g_ipc_launch_started;
-    if (g_ipc_launch_started && !child_stack && parent &&
-        parent->name[0]=='f' && parent->name[1]=='i' && parent->name[4]=='f') {
-        extern volatile int g_forker_tid;
-        g_forker_tid = parent->pid;
-        printk("[fk] forker set: firefox tid=%d forked content pid=%d\n",
-               parent->pid, child->pid);
-    }
     return child->pid;  /* parent gets child's PID */
 }
 
 /* ── sys_fork() — EAX=2 ────────────────────────────────────────────────── */
 static int sys_fork(registers_t *regs) {
-    return do_fork(regs, 0);
+    return do_fork(regs, 0, 0, 0, 0);
 }
 
 /* ── sys_read(int fd, void *buf, size_t count) — EAX=3 ───────────────────── */
@@ -925,6 +940,15 @@ static int sys_write(registers_t *regs) {
 #define WNOHANG    1
 #define WUNTRACED  2
 
+/* Linux kernel/exit.c do_wait()/wait_consider_task(): the wait set is the
+ * children of the calling PROCESS (real_parent == our group leader), so any
+ * thread of a multithreaded parent can reap a child forked by another thread.
+ * Only thread-group LEADERS are wait targets: CLONE_THREAD siblings are
+ * released as soon as they exit and never reported.  A leader that is a zombie
+ * is reported only once its whole group is gone (delay_group_leader), so the
+ * process is collected exactly once and with the group's exit status.  Waiting
+ * is interruptible: a deliverable signal returns -EINTR (restarted under
+ * SA_RESTART), which is what lets a SIGKILL end a parent parked here. */
 static int sys_waitpid(registers_t *regs) {
     int     req_pid    = (int)regs->ebx;
     int    *status_ptr = (int *)(uintptr_t)regs->ecx;
@@ -933,35 +957,33 @@ static int sys_waitpid(registers_t *regs) {
     if (status_ptr && !access_ok(status_ptr, sizeof(int)))
         return -14;  /* -EFAULT */
 
+    struct proc *me = proc_group_leader(current_proc);
+    int my_tgid = current_proc->tgid;
+
     for (;;) {
         int found_child = 0;
 
         for (int i = 0; i < MAX_PROCS; i++) {
             struct proc *p = &ptable[i];
             if (p->state == PROC_UNUSED) continue;
-            if (p->parent != current_proc) continue;
-            if (req_pid != -1 && p->pid != req_pid) continue;
+            if (!p->parent || p->parent->tgid != my_tgid) continue;
+            if (p->pid != p->tgid) continue;               /* threads: never */
+            if (req_pid > 0 && p->pid != req_pid) continue;
+            if (req_pid == 0 && p->pgrp != current_proc->pgrp) continue;
+            if (req_pid < -1 && p->pgrp != -req_pid) continue;
             found_child = 1;
 
             if (p->state == PROC_ZOMBIE) {
+                if (!proc_group_empty(p)) continue;        /* siblings still exiting */
                 int child_pid = p->pid;
                 if (status_ptr) {
                     int status = p->exit_status;
                     int cr = copy_to_user(status_ptr, &status, sizeof(status));
                     if (cr < 0) return cr;
                 }
-
-                /* Free child's resources (shared pgdirs only when the
-                 * last thread of the group is reaped). */
-                if (p->pgdir_phys && !pgdir_release(p->pgdir_phys))
-                    pgdir_free_user(p->pgdir_phys);
-                kfree(p->kstack);
-                p->kstack     = NULL;
-                p->pgdir_phys = 0;
-                p->state      = PROC_UNUSED;
-
-                printk("[SYSCALL] sys_waitpid: collected child pid=%d status=%d\n",
+                printk("[SYSCALL] sys_waitpid: collected child pid=%d status=0x%x\n",
                        child_pid, p->exit_status);
+                proc_release(p);
                 return child_pid;
             }
 
@@ -982,20 +1004,12 @@ static int sys_waitpid(registers_t *regs) {
         if (options & WNOHANG)
             return 0;
 
-        /* No zombie yet — sleep until a child exits (proc_exit wakes us) */
-        {   /* DEBUG: who is blocking in waitpid and on which child? */
-            static int wlog = 0;
-            if (wlog < 40) {
-                wlog++;
-                int kids = 0, kpid = -1;
-                for (int j = 0; j < MAX_PROCS; j++)
-                    if (ptable[j].state != PROC_UNUSED &&
-                        ptable[j].parent == current_proc) { kids++; kpid = ptable[j].pid; }
-                printk("[wpid] pid=%d(%s) req=%d kids=%d eg.child=%d sleeping\n",
-                       current_proc->pid, current_proc->name, req_pid, kids, kpid);
-            }
-        }
-        sleep_on(current_proc);
+        if (signal_interrupt_pending(current_proc))
+            return -4;   /* -EINTR (Linux -ERESTARTSYS) */
+
+        /* No zombie yet — sleep until a child exits.  The channel is our group
+         * leader: proc_exit wakes the parent PROCESS, whichever thread waits. */
+        sleep_on(me);
     }
 }
 
@@ -1012,13 +1026,11 @@ void reap_orphan_zombies(void) {
     if (!init) return;
     for (int i = 0; i < MAX_PROCS; i++) {
         struct proc *p = &ptable[i];
+        if (p == current_proc) continue;     /* never reap the caller mid-exit:
+                                              * its own kstack is still in use */
         if (p->state != PROC_ZOMBIE || p->parent != init) continue;
-        if (p->pgdir_phys && !pgdir_release(p->pgdir_phys))
-            pgdir_free_user(p->pgdir_phys);
-        if (p->kstack) kfree(p->kstack);
-        p->kstack     = NULL;
-        p->pgdir_phys = 0;
-        p->state      = PROC_UNUSED;
+        if (p->pid != p->tgid || !proc_group_empty(p)) continue;
+        proc_release(p);
     }
 }
 
@@ -1644,6 +1656,7 @@ static int sys_exec(registers_t *regs) {
     current_proc->euid       = new_euid;   /* honour any set-uid/gid bit */
     current_proc->egid       = new_egid;
     current_proc->tgid       = current_proc->pid;  /* exec → new thread-group leader */
+    current_proc->vm_owner   = NULL;               /* own address space from here */
     vfork_wake_parent();         /* CLONE_VFORK: we have our own pgdir now */
 
     /* Store executable path for /proc/self/exe */
@@ -1688,11 +1701,22 @@ static int sys_exec(registers_t *regs) {
         current_proc->environ_len = el;
     }
 
-    /* Reset signal handlers to SIG_DFL (exec clears them) */
-    __builtin_memset(current_proc->sig_handlers, 0,
-                     sizeof(current_proc->sig_handlers));
-    __builtin_memset(current_proc->sig_flags, 0,
-                     sizeof(current_proc->sig_flags));
+    /* Reset caught signals to SIG_DFL (fs/exec.c flush_signal_handlers).  If
+     * the table is still shared with other threads, unshare it first (Linux
+     * unshare_sighand) so their dispositions are untouched. */
+    if (current_proc->sighand && current_proc->sighand->refcount > 1) {
+        struct sighand *fresh = sighand_alloc();
+        if (fresh) {
+            sighand_put(current_proc->sighand);
+            current_proc->sighand = fresh;
+        }
+    }
+    if (current_proc->sighand) {
+        __builtin_memset(current_proc->sighand->handlers, 0,
+                         sizeof(current_proc->sighand->handlers));
+        __builtin_memset(current_proc->sighand->flags, 0,
+                         sizeof(current_proc->sighand->flags));
+    }
     current_proc->pending_sigs  = 0;
     current_proc->sigframe_addr = 0;
 
@@ -1754,44 +1778,38 @@ static int sys_kill(registers_t *regs) {
 
     if (sig < 0 || sig >= NSIGS) return -22;  /* -EINVAL */
 
-    /* pid=0 -> current process group; pid<0 -> process group -pid */
+    /* pid=0 -> current process group; pid<0 -> process group -pid.  One
+     * signal per PROCESS (Linux __kill_pgrp_info -> group_send_sig_info for
+     * each process in the group), delivered to a thread that does not block it. */
     if (pid == 0) {
         int pg = current_proc ? current_proc->pgrp : 0;
-        for (int i = 0; i < MAX_PROCS; i++)
-            if (ptable[i].state != PROC_UNUSED && ptable[i].pgrp == pg)
-                signal_send(&ptable[i], sig);
+        if (sig) signal_send_pgrp(pg, sig);
         return 0;
     }
     if (pid < 0) {
-        int pg = -pid;
-        int sent = 0;
-        for (int i = 0; i < MAX_PROCS; i++) {
-            if (ptable[i].state != PROC_UNUSED && ptable[i].pgrp == pg) {
-                signal_send(&ptable[i], sig);
-                sent = 1;
-            }
-        }
+        int sent = sig ? signal_send_pgrp(-pid, sig) : 1;
         return sent ? 0 : -3;
     }
 
+    /* kill(pid): pid may name any thread of a process (Linux kill_pid_info
+     * uses the thread group of the task with that pid).  The signal is
+     * process-directed: complete_signal() picks one thread that does not block
+     * it; a fatal default disposition then ends the whole group at delivery. */
     for (int i = 0; i < MAX_PROCS; i++) {
         if (ptable[i].pid == pid && ptable[i].state != PROC_UNUSED) {
-            /* SIGKILL terminates the whole thread group AND the entire process
-             * subtree (POSIX exit semantics + tree cleanup).  Signal every
-             * thread of the target's tgid, then every descendant process — the
-             * child processes Firefox forks (content/socket/GPU, separate tgids)
-             * don't reliably notice the parent's death and would otherwise leak,
-             * exhausting the process table across watchdog restarts.  Marking is
-             * done before any victim runs (signal_send only sets a pending bit),
-             * so parent links are still intact for the walk. */
+            if (sig == 0) return 0;               /* existence check */
             if (sig == SIGKILL) {
+                /* Kill the thread group AND the entire process subtree.  The
+                 * subtree part is not Linux behaviour (Linux kills only the
+                 * group); it is kept deliberately so a watchdog killing a
+                 * misbehaving multiprocess application does not leak its
+                 * forked children into the 128-slot process table.  Marking is
+                 * done before any victim runs (signal_send only sets a pending
+                 * bit), so parent links are still intact for the walk. */
                 int tg = ptable[i].tgid;
                 for (int j = 0; j < MAX_PROCS; j++)
                     if (ptable[j].state != PROC_UNUSED && ptable[j].tgid == tg)
                         signal_send(&ptable[j], sig);
-                /* Iteratively mark descendants: a proc dies if its parent is
-                 * already marked-for-kill (pending SIGKILL).  Repeat until no
-                 * new victims (handles arbitrary tree depth; O(n^2), n<=64). */
                 int changed = 1;
                 while (changed) {
                     changed = 0;
@@ -1806,7 +1824,7 @@ static int sys_kill(registers_t *regs) {
                     }
                 }
             } else {
-                signal_send(&ptable[i], sig);
+                signal_send_group(&ptable[i], sig);
             }
             return 0;
         }
@@ -1822,8 +1840,8 @@ static int sys_signal(registers_t *regs) {
     if (signum < 1 || signum >= NSIGS) return -22;  /* -EINVAL */
     if (signum == SIGKILL || signum == SIGSTOP) return -22;
 
-    sighandler_t old = current_proc->sig_handlers[signum];
-    current_proc->sig_handlers[signum] = handler;
+    sighandler_t old = current_proc->sighand->handlers[signum];
+    current_proc->sighand->handlers[signum] = handler;
     return (int)(uintptr_t)old;
 }
 
@@ -1832,7 +1850,7 @@ static void sys_sigreturn(registers_t *regs) {
     /* The per-frame trampoline passed the restore address in ecx and a type
      * marker in edx (nesting-safe; honours handler ucontext modifications). */
     if (sigreturn_restore(regs, regs->ecx, regs->edx) < 0)
-        proc_exit(128 + SIGSEGV);   /* spurious/invalid sigreturn */
+        proc_group_exit(SIGSEGV);   /* spurious/invalid sigreturn */
     current_proc->sigframe_addr = 0;
 }
 
@@ -2296,9 +2314,20 @@ static int sys_nanosleep(registers_t *regs) {
     uint32_t ticks = (uint32_t)kreq.tv_sec * 100U;
     ticks += ((uint32_t)kreq.tv_nsec + 9999999U) / 10000000U;
     if (!ticks) ticks = 1;
-    current_proc->wake_tick = pit_ticks() + ticks;
-    sleep_on((void *)&sys_nanosleep);
-    return 0;
+    uint32_t start = pit_ticks();
+    current_proc->wake_tick = start + ticks;
+    int timed_out = sleep_on((void *)&sys_nanosleep);
+    if (timed_out) return 0;
+    /* Woken early by a signal (Linux hrtimer_nanosleep -> -ERESTART_RESTARTBLOCK:
+     * EINTR to a handler, with the unslept time in *rem; restarted otherwise). */
+    if (rem) {
+        uint32_t used = pit_ticks() - start;
+        uint32_t left = used < ticks ? ticks - used : 0;
+        struct ktimespec krem = { (int32_t)(left / 100U), (int32_t)((left % 100U) * 10000000U) };
+        cr = copy_to_user(rem, &krem, sizeof(krem));
+        if (cr < 0) return cr;
+    }
+    return -ERESTARTNOHAND;
 }
 
 /* ── sys_getdents(fd, buf, count) — EAX=141 ─────────────────────────────── */
@@ -2421,11 +2450,12 @@ static int sys_getcwd(registers_t *regs) {
 static struct proc *mmap_owner(void) {
     if (!current_proc) return NULL;
     struct proc *p = current_proc;
-    /* A CLONE_VFORK child shares the PARENT's address space (and thus its
-     * demand-paged VMA list + mmap cursor) but has its own tgid — route it to
-     * the parent so faults on the shared address space resolve, and so its
-     * stack mmaps don't get a private (empty) VMA list. */
-    if (p->vfork_parent) p = p->vfork_parent;
+    /* A CLONE_VM child that is NOT a thread (vfork, posix_spawn, a Breakpad
+     * dumper clone) shares its creator's address space (and thus the
+     * demand-paged VMA list + mmap cursor) while being its own thread group —
+     * route it to the owning group so faults on the shared address space
+     * resolve, and so its stack mmaps don't get a private (empty) VMA list. */
+    if (p->vm_owner) p = p->vm_owner;
     if (p->tgid == p->pid) return p;
     for (int i = 0; i < MAX_PROCS; i++)
         if (ptable[i].state != PROC_UNUSED &&
@@ -2439,39 +2469,6 @@ static struct proc *mmap_owner(void) {
  * allocated (zeroed) on first fault.  The VMA list belongs to the address space
  * (the tgid leader); all VMA ops run with interrupts off because threads share
  * the list and a fault can occur on any thread. */
-volatile int g_ipc_launch_started = 0;   /* [lt] launcher-trace arm flag */
-/* Last PIT tick at which a FUTEX_WAKE actually woke a waiter (woke>0) — i.e. a
- * real condvar/mutex handoff.  The scheduler uses this to detect a condvar STALL
- * (waiters parked but no successful handoff) and apply the BZ#25847 lost-wakeup
- * safety net (POSIX permits spurious condvar wakeups). */
-volatile uint32_t g_futex_progress_tick = 0;
-/* Event-driven epoll self-heal: bumped on every firefox pipe/usocket write
- * during the launch phase (a dispatch/IPC signal).  A firefox IO thread parked
- * in epoll_wait records this at entry and, if it changes while waiting, self-heals
- * IMMEDIATELY — so cross-thread dispatches (whose ScheduleWork pipe-write Gecko
- * fails to issue on our scheduler) wake the IO thread with ~no latency, instead
- * of relying on the 150ms timed fallback that's too slow for the multi-round-trip
- * parent↔socket-process handshake. */
-volatile unsigned g_ff_io_nudge = 0;
-volatile int g_ipc_launch_tid = 0;       /* pid of the "IPC Launch" nsThread */
-volatile uint32_t g_ipclaunch_waitaddr = 0;  /* last futex addr IPC Launch parked on */
-/* [wfph] the condvar address the firefox MAIN thread (WaitForProcessHandle) has
- * been parked on for a long time; set by the scheduler stall detector.  sys_futex
- * WAKE logs when a wake targets it — decisive test of whether the launch-complete
- * cond_signal is EVER sent (→ glibc lost it, BZ#25847, glibc 2.41 fix) vs never
- * sent (→ launcher never Notifies, a different bug). */
-volatile uint32_t g_wfph_watch_addr = 0;
-volatile int      g_wfph_watch_tgid = 0;  /* address space (tgid) of the watched
-                                           * WaitForProcessHandle condvar — futex
-                                           * addrs are per-AS, so only wakes from
-                                           * THIS tgid touch the real condvar. */
-volatile int      g_forker_tid = 0;       /* [fk] firefox thread that most recently
-                                           * fork()ed a content process (clone w/o
-                                           * CLONE_VM, ret>0); trace its futex ops
-                                           * to see if it BLOCKS (WAIT) or NOTIFIES
-                                           * (WAKE) after the fork = does it reach
-                                           * SetProcessState + Monitor.Notify? */
-
 struct vma {
     uint32_t start;       /* page-aligned, inclusive */
     uint32_t end;         /* page-aligned, exclusive */
@@ -3095,7 +3092,7 @@ static int sys_mmap2(registers_t *regs) {
              * ImageBridgeChild::InitSameProcess NULL-deref crash.  Log the fd + its
              * ACTUAL type so we can see why it's not FD_FILE (closed? wrong type?
              * memfd not registered?). */
-            if (g_ipc_launch_started && current_proc &&
+            if (current_proc &&
                 current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
                 current_proc->name[4]=='f') {
                 static int sm = 0;
@@ -3295,18 +3292,12 @@ static int sys_gettid(registers_t *regs) {
 }
 
 /* ── sys_exit_group(status) — EAX=252 ───────────────────────────────────── */
+/* Linux do_group_exit(): the exit code is fixed for the whole group first, then
+ * every other thread is SIGKILLed and the caller exits.  waitpid reports the
+ * leader once the last thread is gone, with THIS status (not the SIGKILL the
+ * siblings, or the leader itself, died of). */
 static void sys_exit_group(registers_t *regs) {
-    /* Kill every other thread in this thread group, then exit ourselves. */
-    if (current_proc) {
-        for (int i = 0; i < MAX_PROCS; i++) {
-            struct proc *p = &ptable[i];
-            if (p == current_proc || p->state == PROC_UNUSED) continue;
-            if (p->state == PROC_ZOMBIE) continue;
-            if (p->tgid == current_proc->tgid)
-                signal_send(p, SIGKILL);
-        }
-    }
-    sys_exit(regs);
+    proc_group_exit(((int)regs->ebx & 0xff) << 8);
 }
 
 /* ── sys_set_thread_area(user_desc*) — EAX=243 ──────────────────────────── */
@@ -3437,15 +3428,6 @@ static int sys_rt_sigaction(registers_t *regs) {
     const uint32_t *act  = (const uint32_t *)(uintptr_t)regs->ecx;
     uint32_t       *oact = (uint32_t *)(uintptr_t)regs->edx;
 
-    if (current_proc && current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-        current_proc->name[4]=='f') {
-        static int rs = 0;
-        if (rs < 30) { rs++;
-            printk("[rtsig] tid=%d sig=%d act=%x oact=%x ssz=%x (KILL=%d STOP=%d)\n",
-                   current_proc->pid, sig, (unsigned)regs->ecx, (unsigned)regs->edx,
-                   (unsigned)regs->esi, SIGKILL, SIGSTOP);
-        }
-    }
     if (sig < 1 || sig > 64) return -22;
     if (sig == SIGKILL || sig == SIGSTOP) return -22;
 
@@ -3463,8 +3445,12 @@ static int sys_rt_sigaction(registers_t *regs) {
         return 0;
     }
 
-    sighandler_t old_handler = current_proc->sig_handlers[sig];
-    uint32_t     old_flags   = current_proc->sig_flags[sig];
+    /* The table is shared by the thread group (CLONE_SIGHAND): a change made
+     * by any thread is immediately in force for all of them (Linux
+     * do_sigaction writes the shared sighand_struct under siglock). */
+    struct sighand *sh = current_proc->sighand;
+    sighandler_t old_handler = sh->handlers[sig];
+    uint32_t     old_flags   = sh->flags[sig];
 
     if (oact) {
         uint32_t koact[8];
@@ -3478,20 +3464,34 @@ static int sys_rt_sigaction(registers_t *regs) {
         uint32_t kact[8];
         int cr = copy_from_user(kact, act, sizeof(kact));
         if (cr < 0) return cr;
-        current_proc->sig_handlers[sig] = (sighandler_t)(uintptr_t)kact[0];
-        current_proc->sig_flags[sig]    = kact[1];  /* sa_flags (SA_RESTART etc.) */
+        sh->handlers[sig] = (sighandler_t)(uintptr_t)kact[0];
+        sh->flags[sig]    = kact[1];  /* sa_flags (SA_RESTART etc.) */
+        /* Linux do_sigaction: setting SIG_IGN (or SIG_DFL for a default-ignored
+         * signal) discards matching signals already pending on every thread. */
+        sighandler_t nh = sh->handlers[sig];
+        if (nh == SIG_IGN || (nh == SIG_DFL && (sig == SIGCHLD || sig == SIGCONT)))
+            for (int i = 0; i < MAX_PROCS; i++)
+                if (ptable[i].state != PROC_UNUSED && ptable[i].sighand == sh)
+                    ptable[i].pending_sigs &= ~(1u << sig);
     }
     return 0;
 }
 
 /* ── sys_rt_sigprocmask(how, set, oset, sigsetsize) — EAX=175 ────────────── */
+/* The user sigset_t numbers bit (sig - 1) for signal sig (Linux sigmask(sig) =
+ * 1UL << ((sig) - 1), include/linux/signal.h), whereas the kernel's pending_sigs
+ * and blocked_sigs use bit sig.  Convert at the boundary; only the first word
+ * (signals 1..32) is honoured. */
+static uint32_t sigset_from_user(uint32_t uset) { return uset << 1; }
+static uint32_t sigset_to_user(uint32_t kset)   { return kset >> 1; }
+
 static int sys_rt_sigprocmask(registers_t *regs) {
     int       how  = (int)regs->ebx;
     uint32_t *nset = (uint32_t *)(uintptr_t)regs->ecx;
     uint32_t *oset = (uint32_t *)(uintptr_t)regs->edx;
 
     if (oset) {
-        uint32_t old = current_proc->blocked_sigs;
+        uint32_t old = sigset_to_user(current_proc->blocked_sigs);
         int cr = copy_to_user(oset, &old, sizeof(old));
         if (cr < 0) return cr;
     }
@@ -3500,6 +3500,7 @@ static int sys_rt_sigprocmask(registers_t *regs) {
         uint32_t set = 0;
         int cr = copy_from_user(&set, nset, sizeof(set));
         if (cr < 0) return cr;
+        set = sigset_from_user(set);
         /* SIGKILL and SIGSTOP cannot be blocked */
         set &= ~((1u << SIGKILL) | (1u << SIGSTOP));
         switch (how) {
@@ -3546,7 +3547,8 @@ static int sys_dup(registers_t *regs) {
 /* ── sys_getppid() — EAX=64 ─────────────────────────────────────────────── */
 static int sys_getppid(registers_t *regs) {
     (void)regs;
-    return (current_proc && current_proc->parent) ? current_proc->parent->pid : 1;
+    /* parent is always a group leader, so its pid is the parent's tgid. */
+    return (current_proc && current_proc->parent) ? current_proc->parent->tgid : 1;
 }
 
 /* ── sys_setsid() — EAX=66 ───────────────────────────────────────────────── */
@@ -3828,13 +3830,15 @@ static int fd_write_ready(int fd) {
 }
 
 /* ── sys_select(n, readfds, writefds, exceptfds, timeout) — EAX=82 ────────── */
-static int sys_select(registers_t *regs) {
-    int       n        = (int)regs->ebx;
-    uint32_t *readfds  = (uint32_t *)(uintptr_t)regs->ecx;
-    uint32_t *writefds = (uint32_t *)(uintptr_t)regs->edx;
-    /* exceptfds ignored; fd_sets span MAX_FD bits (2 words at 64) */
+/* Common body of select(2)/_newselect and pselect6.  toms < 0 blocks without
+ * a deadline; 0 polls once; > 0 is the timeout in ms (fs/select.c
+ * core_sys_select -> do_select with a schedule_hrtimeout deadline).  Returns
+ * 0 when the deadline passes with nothing ready and -ERESTARTNOHAND when a
+ * signal interrupts the wait (EINTR once its handler has run; man 7 signal
+ * lists select among the calls that are never restarted by SA_RESTART). */
+static int do_select(int n, uint32_t *readfds, uint32_t *writefds,
+                     uint32_t *exceptfds, int toms) {
 #define SELECT_WORDS ((MAX_FD + 31) / 32)
-
     if (n <= 0) return 0;
     if (n > MAX_FD) n = MAX_FD;
 
@@ -3849,18 +3853,14 @@ static int sys_select(registers_t *regs) {
         if (cr < 0) return cr;
     }
 
-    /* Check if timeout is zero (non-blocking) */
-    struct { long tv_sec; long tv_usec; } *tv =
-        (void *)(uintptr_t)regs->edi;
-    int nonblock = 0;
-    if (tv) {
-        struct { long tv_sec; long tv_usec; } ktv;
-        int cr = copy_from_user(&ktv, tv, sizeof(ktv));
-        if (cr < 0) return cr;
-        nonblock = (ktv.tv_sec == 0 && ktv.tv_usec == 0);
+    uint32_t start = pit_ticks();
+    uint32_t timeout_ticks = 0;
+    if (toms > 0) {
+        timeout_ticks = ((uint32_t)toms + 9U) / 10U;
+        if (!timeout_ticks) timeout_ticks = 1;
     }
 
-    for (int attempt = 0; ; attempt++) {
+    for (;;) {
         uint32_t rd_out[SELECT_WORDS] = {0}, wr_out[SELECT_WORDS] = {0};
         int ready = 0;
         for (int fd = 0; fd < n; fd++) {
@@ -3868,7 +3868,9 @@ static int sys_select(registers_t *regs) {
             if (rd_in[w] & b) { if (fd_read_ready(fd))  { rd_out[w] |= b; ready++; } }
             if (wr_in[w] & b) { if (fd_write_ready(fd)) { wr_out[w] |= b; ready++; } }
         }
-        if (ready > 0 || nonblock || attempt >= 600) {
+        int expired = (toms == 0) ||
+                      (toms > 0 && (uint32_t)(pit_ticks() - start) >= timeout_ticks);
+        if (ready > 0 || expired) {
             if (readfds) {
                 int cr = copy_to_user(readfds, rd_out, words * 4);
                 if (cr < 0) return cr;
@@ -3877,10 +3879,74 @@ static int sys_select(registers_t *regs) {
                 int cr = copy_to_user(writefds, wr_out, words * 4);
                 if (cr < 0) return cr;
             }
+            if (exceptfds) {        /* exceptional conditions are not tracked */
+                uint32_t ex_out[SELECT_WORDS] = {0};
+                int cr = copy_to_user(exceptfds, ex_out, words * 4);
+                if (cr < 0) return cr;
+            }
             return ready;
         }
-        io_wait_sleep(5);   /* woken early by any I/O activity */
+        if (signal_interrupt_pending(current_proc))
+            return -ERESTARTNOHAND;
+        uint32_t cap = 50;
+        if (toms > 0) {
+            uint32_t left = timeout_ticks - (uint32_t)(pit_ticks() - start);
+            if (left < cap) cap = left ? left : 1;
+        }
+        io_wait_sleep(cap);   /* woken early by any I/O activity or a signal */
+        if (signal_interrupt_pending(current_proc))
+            return -ERESTARTNOHAND;
     }
+}
+
+/* select(n, in, out, ex, struct timeval *) — EAX=82 (old, via struct) and 142
+ * (_newselect).  Linux updates the timeval with the time left (unless
+ * STICKY_TIMEOUTS); a NULL timeval blocks indefinitely. */
+static int sys_select(registers_t *regs) {
+    int       n        = (int)regs->ebx;
+    uint32_t *readfds  = (uint32_t *)(uintptr_t)regs->ecx;
+    uint32_t *writefds = (uint32_t *)(uintptr_t)regs->edx;
+    uint32_t *exceptfds = (uint32_t *)(uintptr_t)regs->esi;
+    struct { int32_t tv_sec; int32_t tv_usec; } *tv = (void *)(uintptr_t)regs->edi;
+    int toms = -1;
+    if (tv) {
+        struct { int32_t tv_sec; int32_t tv_usec; } ktv;
+        int cr = copy_from_user(&ktv, tv, sizeof(ktv));
+        if (cr < 0) return cr;
+        if (ktv.tv_sec < 0 || ktv.tv_usec < 0) return -22;
+        if (ktv.tv_sec > 2000000) toms = 0x7fffffff;
+        else toms = ktv.tv_sec * 1000 + ktv.tv_usec / 1000;
+    }
+    uint32_t start = pit_ticks();
+    int ret = do_select(n, readfds, writefds, exceptfds, toms);
+    if (tv && toms >= 0) {
+        uint32_t used_ms = (pit_ticks() - start) * 10U;
+        uint32_t left_ms = used_ms < (uint32_t)toms ? (uint32_t)toms - used_ms : 0;
+        struct { int32_t tv_sec; int32_t tv_usec; } krem =
+            { (int32_t)(left_ms / 1000U), (int32_t)((left_ms % 1000U) * 1000U) };
+        copy_to_user(tv, &krem, sizeof(krem));
+    }
+    return ret;
+}
+
+/* pselect6(n, in, out, ex, struct timespec *, sigmask*) — EAX=308.  The
+ * timeout is a TIMESPEC (nanoseconds, not microseconds) and is not updated;
+ * the temporary sigmask is not applied (S6, out of scope here). */
+static int sys_pselect6(registers_t *regs) {
+    int       n        = (int)regs->ebx;
+    uint32_t *readfds  = (uint32_t *)(uintptr_t)regs->ecx;
+    uint32_t *writefds = (uint32_t *)(uintptr_t)regs->edx;
+    uint32_t *exceptfds = (uint32_t *)(uintptr_t)regs->esi;
+    uint32_t  tsp      = regs->edi;
+    int toms = -1;
+    if (tsp) {
+        struct { int32_t s, ns; } ts;
+        if (copy_from_user(&ts, (void *)(uintptr_t)tsp, sizeof(ts)) < 0) return -14;
+        if (ts.s < 0 || ts.ns < 0) return -22;
+        if (ts.s > 2000000) toms = 0x7fffffff;
+        else toms = ts.s * 1000 + ts.ns / 1000000;
+    }
+    return do_select(n, readfds, writefds, exceptfds, toms);
 }
 
 /* ── sys_poll(fds, nfds, timeout) — EAX=168 ────────────────────────────────── */
@@ -3898,88 +3964,6 @@ static int sys_select(registers_t *regs) {
 static void io_wait_sleep(uint32_t max_ticks) {
     current_proc->wake_tick = pit_ticks() + max_ticks;
     sleep_on(&io_activity);
-}
-
-/* ── [wbt] wedge-backtrace capture ──────────────────────────────────────────
- * At the moment a firefox thread blocks (futex wait / infinite poll), scan ITS
- * OWN user stack for return addresses inside libxul's text mapping and stash
- * them in the PCB.  The scheduler's stall detector dumps the stashed captures
- * ([wbt] lines) for offline symbolization against the exact Mozilla .sym file.
- * The call-preceded filter — the bytes immediately before the candidate must
- * decode as a CALL (E8 rel32 or FF /2 forms) — is what removes the noise that
- * made raw stack-scan dumps unusable.  libxul loads at 0x43300000 (no ASLR,
- * deterministic — see [gdbaid]); size 175628760. */
-#define LIBXUL_TEXT_LO 0x43300000U
-#define LIBXUL_TEXT_HI (0x43300000U + 175628760U)
-static void fx_capture_wait_bt(registers_t *regs) {
-    if (!g_ipc_launch_started || !current_proc) return;
-    if (!(current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-          current_proc->name[4]=='f')) return;
-    current_proc->wait_bt_n = 0;
-    uint32_t sp = regs->useresp;
-    if (sp < 0x1000 || sp >= 0xC0000000U) return;
-    int n = 0;
-    for (uint32_t off = 0; off < 16384 && n < 28; off += 4) {
-        uint32_t v = 0;
-        if (copy_from_user(&v, (const void *)(uintptr_t)(sp + off), 4) < 0)
-            break;                              /* ran off the mapped stack */
-        if (v < LIBXUL_TEXT_LO + 8 || v >= LIBXUL_TEXT_HI) continue;
-        uint8_t cb[8];
-        if (copy_from_user(cb, (const void *)(uintptr_t)(v - 8), 8) < 0)
-            continue;
-        if (!(cb[3] == 0xE8 ||                  /* call rel32   (v-5) */
-              cb[6] == 0xFF ||                  /* call reg     (v-2) */
-              cb[5] == 0xFF ||                  /* call [r+d8]  (v-3) */
-              cb[2] == 0xFF ||                  /* call [r+d32] (v-6) */
-              cb[1] == 0xFF))                   /* call [sib+d32] (v-7) */
-            continue;
-        current_proc->wait_bt[n++] = v;
-    }
-    current_proc->wait_bt_n = (uint8_t)n;
-
-    /* [wburl] LEADER only: find the modal's document URL.  nsCString stores its
-     * text on the HEAP with only a {char* data; u32 len; u32 flags} on the stack,
-     * so scan each stack WORD as a candidate heap pointer, dereference it, and if
-     * the pointed-to bytes begin with a chrome/about/resource/jar URL scheme,
-     * print it.  Reveals exactly which dialog OpenWindowInternal opens — no
-     * MOZ_LOG needed. */
-    if (current_proc->pid == current_proc->tgid) {
-        int printed = 0;
-        for (uint32_t off = 0; off < 16384 && printed < 16; off += 4) {
-            uint32_t ptr = 0;
-            if (copy_from_user(&ptr, (const void *)(uintptr_t)(sp + off), 4) < 0)
-                continue;
-            /* Firefox heap lives roughly in [0x08000000, 0x60000000). */
-            if (ptr < 0x08000000U || ptr >= 0x60000000U) continue;
-            char s[72];
-            if (copy_from_user(s, (const void *)(uintptr_t)ptr, sizeof(s) - 1) < 0)
-                continue;
-            s[sizeof(s) - 1] = '\0';
-            int sl = 0, letters = 0, spaces = 0;
-            while (sl < 71 && s[sl] >= 0x20 && s[sl] < 0x7f) {
-                if ((s[sl]|0x20) >= 'a' && (s[sl]|0x20) <= 'z') letters++;
-                if (s[sl] == ' ') spaces++;
-                sl++;
-            }
-            s[sl] = '\0';
-            int is_url = (sl >= 9 &&
-                ((s[0]=='c'&&s[1]=='h'&&s[2]=='r'&&s[3]=='o'&&s[4]=='m'&&s[5]=='e'&&s[6]==':') ||
-                 (s[0]=='r'&&s[1]=='e'&&s[2]=='s'&&s[3]=='o'&&s[4]=='u'&&s[5]=='r'&&s[6]=='c') ||
-                 (s[0]=='j'&&s[1]=='a'&&s[2]=='r'&&s[3]==':')));
-            /* A prompt MESSAGE/title: a natural-language run (>=16 chars, mostly
-             * letters, has spaces) — reveals what alert/confirm is blocking. */
-            int is_msg = (sl >= 16 && letters * 2 >= sl && spaces >= 2);
-            /* Also surface any profile-path string Firefox holds, to see whether
-             * it actually resolved -profile /tmp/ffp or resolved to something
-             * else (the "profile cannot be loaded" modal implies a bad path). */
-            int is_prof = (sl >= 4 && (dbg_str_has(s, "ffp") || dbg_str_has(s, ".mozilla") ||
-                           dbg_str_has(s, "/tmp/") || dbg_str_has(s, "rofile")));
-            if (is_url || is_msg || is_prof) {
-                printk("[wburl] %s\n", s);
-                printed++;
-            }
-        }
-    }
 }
 
 /* [lockop] log a profile-relevant filesystem op + its result, gated to firefox
@@ -4037,7 +4021,6 @@ static int sys_poll(registers_t *regs) {
 
     uint32_t start = pit_ticks();
     uint32_t timeout_ticks = 0;
-    int bt_captured = 0;    /* [wbt] snapshot at most once per poll call */
     if (toms > 0) {
         timeout_ticks = ((uint32_t)toms + 9U) / 10U;
         if (!timeout_ticks) timeout_ticks = 1;
@@ -4124,10 +4107,14 @@ static int sys_poll(registers_t *regs) {
                            rxc, wrc, (unsigned)rxp, (unsigned)txp, (unsigned)nfds, toms);
                 }
             }
-            /* [wbt] long/infinite poll block: snapshot once per poll call. */
-            if (toms < 0 && !bt_captured) {
-                bt_captured = 1;
-                fx_capture_wait_bt(regs);
+            /* A deliverable signal interrupts the wait (fs/select.c
+             * do_sys_poll returns -ERESTARTNOHAND: EINTR once the handler has
+             * run, a transparent restart if none did; SA_RESTART never applies
+             * to poll).  Check before AND after sleeping so a signal that
+             * arrived while we scanned the fds is not slept through. */
+            if (signal_interrupt_pending(current_proc)) {
+                kfree(kfds);
+                return -ERESTARTNOHAND;
             }
             /* Sleep until I/O activity (or the poll timeout). */
             uint32_t cap = 50;
@@ -4136,13 +4123,9 @@ static int sys_poll(registers_t *regs) {
                 if (left < cap) cap = left ? left : 1;
             }
             io_wait_sleep(cap);
-            /* SIGKILL must abort the wait (uncatchable): without this the loop
-             * re-checks + re-sleeps forever and the thread never returns to
-             * user mode to die — so kill(pid,SIGKILL) of a poll()-blocked
-             * process (e.g. the ff watchdog killing a stalled Firefox) hangs. */
-            if (current_proc->pending_sigs & (1u << SIGKILL)) {
+            if (signal_interrupt_pending(current_proc)) {
                 kfree(kfds);
-                return -4;  /* -EINTR → returns to user → SIGKILL delivered */
+                return -ERESTARTNOHAND;
             }
         }
     }
@@ -4282,8 +4265,6 @@ static int sys_epoll_wait(registers_t *regs) {
     uint32_t timeout_ticks = 0;
     if (toms > 0) { timeout_ticks = ((uint32_t)toms + 9U) / 10U; if (!timeout_ticks) timeout_ticks = 1; }
 
-    extern volatile unsigned g_ff_io_nudge;
-    unsigned nudge_at_entry = g_ff_io_nudge;
 
     for (;;) {
         int n = 0;
@@ -4303,111 +4284,18 @@ static int sys_epoll_wait(registers_t *regs) {
                 n++;
             }
         }
-        {   /* [epw] launch-phase diag: does the firefox IO thread's epoll_wait
-             * ever return events (i.e. does the ScheduleWork socketpair wakeup
-             * get delivered)?  Log returns with n>0 and the registered fds. */
-            extern volatile int g_ipc_launch_started;
-            if (g_ipc_launch_started && n > 0 && current_proc &&
-                current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-                current_proc->name[4]=='f') {
-                static int ew = 0;
-                if (ew < 60) { ew++;
-                    printk("[epw] pid=%d epoll_wait -> %d events\n",
-                           current_proc->pid, n);
-                }
-            }
-        }
         if (n > 0 || toms == 0) return n;
         if (toms > 0 && (uint32_t)(pit_ticks() - start) >= timeout_ticks) return 0;
-        /* Launch-phase epoll self-heal v2: the 'IPC I/O Parent' thread parks in
-         * event_base_loop(EVLOOP_ONCE), which only returns when a REAL event
-         * fires.  Its libevent wakeup is a 1-byte write to a self-pipe via
-         * MessagePumpLibevent::ScheduleWork — which doesn't reach it on our
-         * single-CPU scheduler, so the dispatched Launch task in its
-         * incoming_queue_ is never run.  Returning 0 (v1) was useless: EVLOOP_ONCE
-         * ignores it and re-polls.  Instead, REPORT a registered pipe-read fd as
-         * EPOLLIN (a real event) so libevent's OnWakeup fires, event_base_loop
-         * returns, and the pump runs DoWork() → drains incoming_queue_ → runs
-         * Launch.  Gated to firefox + launch phase; fires after ~150 ms idle. */
-        {
-            extern volatile int g_ipc_launch_started;
-            /* Fire the self-heal the instant a dispatch happened (g_ff_io_nudge
-             * changed since we entered — event-driven, minimal latency) OR after
-             * a 150ms timed fallback.  Immediate firing is what got Firefox's
-             * browser chrome to lay out; a 20ms rate-limit regressed it.  Spin is
-             * bounded because we only count pipe + unix-socket writes (real
-             * dispatch/IPC signals), not the high-rate eventfd/vsync wakeups. */
-            /* 2026-07-04: DISABLED.  The self-heal reports EMPTY *blocking* pipes
-             * as EPOLLIN; libevent then invokes that fd's callback, whose read()
-             * blocks in pipe_read on a pipe nobody ever writes → the IPC I/O
-             * thread is STRANDED out of its epoll loop and the launch-completion
-             * continuation (→ mProcessState=PROCESS_CREATED + Monitor.Notify)
-             * never runs (observed directly: 120s hang with 'IPC I/O Parent'
-             * s4#3 in sys_read while the main thread waited forever).  The heal
-             * was load-bearing ONLY pre-SMP/pre-futex-scoping, when mis-routed
-             * wakes and single-CPU serialization needed emergent kicks.  Native
-             * wakeups are complete now: pipe/usocket writes do wake_up(buf) +
-             * io_wake(), and epoll re-scans immediately.  Flip to 1 to restore. */
-            #define FF_EPOLL_SELF_HEAL 0
-            int nudged = (g_ff_io_nudge != nudge_at_entry);
-            if (FF_EPOLL_SELF_HEAL && g_ipc_launch_started && current_proc &&
-                current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-                current_proc->name[4]=='f' &&
-                (nudged || (uint32_t)(pit_ticks() - start) >= 15)) {
-                /* Report a registered pipe-read fd as EPOLLIN so libevent's
-                 * OnWakeup fires and the pump runs DoWork() → drains
-                 * incoming_queue_.  NB (2026-06-25): an "inject a real wakeup byte
-                 * into the libevent self-pipe" variant was tried (more correct —
-                 * it makes the IO threads park in epoll_wait instead of risking a
-                 * blocking OnWakeup read), but it regressed the empirical
-                 * progress (0/2 runs reached 553x108 vs this version's ~30-50%),
-                 * so this proven spurious-report form is kept.  See
-                 * firefox-paint-blocker memory for the full handshake analysis. */
-                for (int i = 0; i < EPOLL_MAX_ITEMS && n < maxevents; i++) {
-                    int wfd = ep->items[i].fd;
-                    if (wfd < 0 || wfd >= MAX_FD) continue;
-                    if (current_proc->ofile[wfd].type != FD_PIPE_R) continue;
-                    if (!(ep->items[i].events & EPOLLIN_K)) continue;
-                    /* Report EVERY registered pipe-read fd, even empty/blocking
-                     * ones.  This is deliberately NOT narrowed — FOUR "cleaner"
-                     * variants were tried (2026-06-25) and every one REGRESSED:
-                     * (1) only count>0, (2) inject a byte into the self-pipe only,
-                     * (3) only non-blocking pipes, (4) broad report + force the
-                     * reported fd O_NONBLOCK.  The broad blocking report is
-                     * load-bearing in an emergent way (the blocking read appears
-                     * to genuinely wait for a peer write that wake_up(pipe)
-                     * delivers).  See firefox-paint-blocker memory before retrying. */
-                    struct { uint32_t events; uint8_t data[8]; }
-                        __attribute__((packed)) out;
-                    out.events = EPOLLIN_K;
-                    __builtin_memcpy(out.data, ep->items[i].data, 8);
-                    if (copy_to_user((uint8_t *)uevents + (size_t)n * 12, &out, 12) < 0)
-                        return -14;
-                    n++;
-                }
-                if (n > 0) {
-                    static int sh = 0;
-                    if (sh < 8) { sh++;
-                        printk("[ephe2] pid=%d report %d pipe EPOLLIN (spurious)\n",
-                               current_proc->pid, n); }
-                    return n;
-                }
-            }
-        }
+        /* Interruptible like poll (fs/eventpoll.c ep_poll: -EINTR when a
+         * signal is pending, no SA_RESTART restart). */
+        if (signal_interrupt_pending(current_proc)) return -ERESTARTNOHAND;
         uint32_t cap = 50;
         if (toms > 0) {
             uint32_t left = timeout_ticks - (uint32_t)(pit_ticks() - start);
             if (left < cap) cap = left ? left : 1;
         }
         io_wait_sleep(cap);
-        /* SIGKILL must abort the wait (uncatchable), exactly like sys_poll and
-         * sys_futex: without this a thread parked in an infinite-timeout
-         * epoll_wait NEVER re-enters signal delivery and survives the watchdog's
-         * SIGKILL of its thread group — each killed Firefox attempt leaked its
-         * epoll-parked IO threads (observed: orphaned s4#256 threads reparented
-         * to init), exhausting the 64-slot ptable across watchdog retries. */
-        if (current_proc->pending_sigs & (1u << SIGKILL))
-            return -4;  /* -EINTR */
+        if (signal_interrupt_pending(current_proc)) return -ERESTARTNOHAND;
     }
 }
 
@@ -4508,15 +4396,6 @@ static int sys_prctl(registers_t *regs) {
         if (copy_from_user(nm, (void *)(uintptr_t)regs->ecx, 16) == 0) {
             nm[16] = 0;
             printk("[tname] tid=%d name='%s'\n", current_proc->pid, nm);
-            extern volatile int g_ipc_launch_tid;
-            extern volatile int g_ipc_launch_started;
-            if (nm[0]=='I'&&nm[1]=='P'&&nm[2]=='C'&&nm[4]=='L') { /* "IPC Launch" */
-                g_ipc_launch_tid = current_proc->pid;
-                g_ipc_launch_started = 1;   /* arm diags early — the IPC Launch
-                                             * thread is created at the START of
-                                             * the launch, before the Launch
-                                             * dispatch's ScheduleWork pipe write */
-            }
         }
     }
     return 0;
@@ -4990,29 +4869,35 @@ static int sys_mincore(registers_t *regs) {
     return -12;  /* -ENOMEM stub */
 }
 
-/* ── sys_tgkill(tgid, tid, sig) — EAX=270 ───────────────────────────────── */
-static int sys_tgkill(registers_t *regs) {
-    /* In single-threaded model tgid==pid; delegate to kill */
-    int tgid = (int)regs->ebx;
-    int tid  = (int)regs->ecx;
-    int sig  = (int)regs->edx;
-    /* Target the specific thread (tid) when present — glibc's per-thread
-     * signalling (e.g. setxid) addresses an individual tid, not the leader. */
+/* Thread-directed signal (Linux do_tkill -> do_send_specific): queued on
+ * exactly the thread `tid`, which must belong to thread group `tgid` (or any
+ * group when tgid is -1, i.e. tkill).  Whether it is fatal for the whole group
+ * is decided at delivery: a SIG_DFL fatal signal ends the group; a handled one
+ * runs the handler on this thread; a blocked one stays pending on it. */
+static int do_tkill(int tgid, int tid, int sig) {
+    if (sig < 0 || sig >= NSIGS) return -22;
+    if (tid <= 0) return -22;
     for (int i = 0; i < MAX_PROCS; i++) {
-        if (ptable[i].state == PROC_UNUSED) continue;
-        if (ptable[i].pid == tid && ptable[i].tgid == tgid) {
-            signal_send(&ptable[i], sig);
-            return 0;
-        }
-    }
-    /* Fall back to the group leader if no exact tid match. */
-    for (int i = 0; i < MAX_PROCS; i++) {
-        if (ptable[i].pid == tgid && ptable[i].state != PROC_UNUSED) {
-            signal_send(&ptable[i], sig);
-            return 0;
-        }
+        struct proc *p = &ptable[i];
+        if (p->state == PROC_UNUSED || p->state == PROC_ZOMBIE) continue;
+        if (p->pid != tid) continue;
+        if (tgid > 0 && p->tgid != tgid) return -3;   /* -ESRCH */
+        if (sig) signal_send(p, sig);
+        return 0;
     }
     return -3;  /* -ESRCH */
+}
+
+/* ── sys_tgkill(tgid, tid, sig) — EAX=270 ───────────────────────────────── */
+static int sys_tgkill(registers_t *regs) {
+    int tgid = (int)regs->ebx;
+    if (tgid <= 0) return -22;
+    return do_tkill(tgid, (int)regs->ecx, (int)regs->edx);
+}
+
+/* ── sys_tkill(tid, sig) — EAX=238 (musl raise()/pthread_kill use this) ──── */
+static int sys_tkill(registers_t *regs) {
+    return do_tkill(-1, (int)regs->ebx, (int)regs->ecx);
 }
 
 /* ── sys_pipe2(fds[2], flags) — EAX=331 ─────────────────────────────────── */
@@ -5168,6 +5053,7 @@ static int futex_wake_n(uint32_t uaddr, int is_private, uint32_t phys,
             struct proc *p = &ptable[i];
             if (FUTEX_MATCH(p)) {
                 p->sleep_chan = (void *)0; p->wake_tick = 0;
+                p->futex_wait = 2;         /* woken by a FUTEX_WAKE */
                 p->state = PROC_RUNNABLE; woken++;
             }
         }
@@ -5181,6 +5067,7 @@ static int futex_wake_n(uint32_t uaddr, int is_private, uint32_t phys,
             }
             if (!best) break;
             best->sleep_chan = (void *)0; best->wake_tick = 0;
+            best->futex_wait = 2;          /* woken by a FUTEX_WAKE */
             best->state = PROC_RUNNABLE; woken++;
         }
     }
@@ -5190,10 +5077,6 @@ static int futex_wake_n(uint32_t uaddr, int is_private, uint32_t phys,
 }
 
 /* ── sys_futex(uaddr, op, val, timeout, uaddr2, val3) — EAX=240 ─────────── */
-/*
- * Only FUTEX_WAIT(0), FUTEX_WAKE(1), and their _PRIVATE variants (|128) are
- * needed for musl's mutex/condvar.  Everything else returns -ENOSYS.
- */
 static int sys_futex(registers_t *regs, int time64) {
     uint32_t *uaddr = (uint32_t *)(uintptr_t)regs->ebx;
     int       raw_op = (int)regs->ecx;
@@ -5211,15 +5094,6 @@ static int sys_futex(registers_t *regs, int time64) {
      * its timeout makes a thread that's waiting "up to N ms for the next frame"
      * sleep FOREVER (the compositor/refresh-driver hang).  Convert the timeout
      * to a relative tick deadline (wake_tick) so scheduler_tick wakes us. */
-    /* [fk] trace the content-fork thread's futex WAITs after it forks — does it
-     * block, and on what?  (Compact, capped.) */
-    if (g_forker_tid && current_proc && current_proc->pid == g_forker_tid &&
-        (op == 0 || op == 9)) {
-        static int fkw = 0;
-        if (fkw < 40) { fkw++;
-            printk("[fk] tid=%d WAIT %x op=%d\n", current_proc->pid,
-                   (unsigned)(uintptr_t)uaddr, op); }
-    }
     if (op == 0 || op == 9) {  /* FUTEX_WAIT / FUTEX_WAIT_BITSET */
         uint32_t cur = 0;
         int cr = copy_from_user(&cur, uaddr, sizeof(cur));
@@ -5258,31 +5132,6 @@ static int sys_futex(registers_t *regs, int time64) {
             if (!ticks) ticks = 1;
             current_proc->wake_tick = now + ticks;
         }
-        {
-            static int fw = 0;
-            uint32_t a = (uint32_t)(uintptr_t)uaddr;
-            /* Broadened: log ALL firefox futex WAITs (any address) during the IPC
-             * launch window, so content-CHILD futexes on the stack (0x5bxxxxxx)
-             * are captured too — needed to find which WAIT addr never gets a WAKE
-             * (lost signal vs signaler-never-runs). */
-            if (fw < 400 && current_proc && g_ipc_launch_started &&
-                current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-                current_proc->name[4]=='f') {
-                fw++; printk("[fxw] pid=%d t%d WAIT %x val=%x op=%d\n",
-                             current_proc->pid, current_proc->tgid,
-                             (unsigned)a, (unsigned)val, op);
-            }
-        }
-        if (g_ipc_launch_tid && current_proc->pid == g_ipc_launch_tid) {
-            g_ipclaunch_waitaddr = (uint32_t)(uintptr_t)uaddr;
-            static int il = 0;
-            if (il < 40) { il++; printk("[ilfx] WAIT %x val=%x op=%d\n",
-                                        (unsigned)(uintptr_t)uaddr, (unsigned)val, op); }
-        }
-        /* op 9 (WAIT_BITSET) is what glibc 2.36's condvar uses (both timed and
-         * untimed via FUTEX_BITSET_MATCH_ANY); op 0 is mutex/raw-futex.  Only
-         * condvar waiters may be spuriously woken by the lost-wakeup safety net. */
-        current_proc->futex_cond = (op == 9);
         current_proc->futex_wait = 1;
         /* Address-space-scoped futex key (mirrors Linux get_futex_key): private
          * futexes match by (tgid, uaddr); shared by physical page.  A shared futex
@@ -5295,36 +5144,19 @@ static int sys_futex(registers_t *regs, int time64) {
             current_proc->futex_shared = (!is_private && fphys) ? 1 : 0;
             current_proc->futex_phys   = fphys;
         }
-        fx_capture_wait_bt(regs);   /* [wbt] snapshot where this thread parks */
-        /* [wfph] record the WaitForProcessHandle condvar address (STICKY, precise):
-         * only when the MAIN thread's captured backtrace contains WaitForProcessHandle
-         * (libxul base 0x43300000 + 0x1596184 = 0x48c9d184, ±0x40).  Once set, do
-         * NOT overwrite — so the WAKE path decisively shows whether THIS specific
-         * condvar is ever signaled (launcher Notify reached kernel) vs never. */
-        if (op == 9 && current_proc->pid == current_proc->tgid &&
-            g_ipc_launch_started && g_wfph_watch_addr == 0 &&
-            current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-            current_proc->name[4]=='f') {
-            for (int k = 0; k < current_proc->wait_bt_n; k++) {
-                int32_t dd = (int32_t)(current_proc->wait_bt[k] - 0x48c9d184u);
-                if (dd > -0x40 && dd < 0x40) {
-                    g_wfph_watch_addr = (uint32_t)(uintptr_t)uaddr;
-                    g_wfph_watch_tgid = current_proc->tgid;
-                    printk("[wfph] WATCH set addr=%x tgid=%d (WaitForProcessHandle)\n",
-                           (unsigned)(uintptr_t)uaddr, current_proc->tgid);
-                    break;
-                }
-            }
-        }
-        sleep_on((void *)uaddr);
-        current_proc->futex_cond = 0;
+        int timed_out = sleep_on((void *)uaddr);
+        int woken = (current_proc->futex_wait == 2);
         current_proc->futex_wait = 0;
-        current_proc->wake_tick = 0;
-        /* SIGKILL must abort (uncatchable) so a futex-blocked thread returns to
-         * user mode and dies — else kill() of a thread parked here hangs. */
-        if (current_proc->pending_sigs & (1u << SIGKILL))
-            return -4;  /* -EINTR */
-        return 0;   /* glibc re-checks predicate+clock; returns ETIMEDOUT itself */
+        /* Linux kernel/futex/waitwake.c futex_wait(): a wake by FUTEX_WAKE
+         * returns 0 (checked first: "If we were woken (and unqueued), we
+         * succeeded"); deadline expiry returns -ETIMEDOUT; a signal returns
+         * -ERESTARTSYS (EINTR to the caller unless SA_RESTART re-issues the
+         * call).  Nothing else ends the wait, so glibc never sees a bare 0
+         * without a real wake. */
+        if (woken) return 0;
+        if (timed_out) return -110;                        /* -ETIMEDOUT */
+        if (signal_interrupt_pending(current_proc)) return -4;  /* -EINTR */
+        return 0;
     }
     if (op == 1 || op == 10) {  /* FUTEX_WAKE / FUTEX_WAKE_BITSET */
         if ((int)val <= 0) return 0;
@@ -5334,60 +5166,6 @@ static int sys_futex(registers_t *regs, int time64) {
             int woke = futex_wake_n((uint32_t)(uintptr_t)uaddr,
                                     is_private || !wphys, wphys,
                                     current_proc->tgid, (int)val);
-            if (woke > 0) g_futex_progress_tick = pit_ticks();  /* real handoff */
-            /* [fk] the content-fork thread issuing a WAKE = it reached a Notify
-             * (Monitor.Notify → sets/signals the WaitForProcessHandle predicate).
-             * If we see the forker WAKE but the main thread stays parked → the
-             * WAKE isn't reaching the right waiter (kernel routing).  If the
-             * forker NEVER WAKEs (only WAITs / exits) → it never Notifies. */
-            if (g_forker_tid && current_proc && current_proc->pid == g_forker_tid) {
-                static int fkk = 0;
-                if (fkk < 40) { fkk++;
-                    printk("[fk] tid=%d WAKE %x val=%d woke=%d\n",
-                           current_proc->pid, (unsigned)(uintptr_t)uaddr,
-                           (int)val, woke); }
-            }
-            /* [wfph] decisive: did ANY wake target the stuck WaitForProcessHandle
-             * condvar (±64B)?  If yes → the launch-complete cond_signal IS sent
-             * (glibc lost it = BZ#25847 = glibc 2.41 fixes it).  If we NEVER see a
-             * wake here while the main thread stays parked → the launcher never
-             * Notifies (a different, non-glibc bug). */
-            if (g_wfph_watch_addr && current_proc &&
-                current_proc->tgid == g_wfph_watch_tgid) {  /* SAME address space
-                * as the watched condvar — the ONLY wakes that touch the real
-                * WaitForProcessHandle condvar (futex addrs are per-AS). */
-                uint32_t a = (uint32_t)(uintptr_t)uaddr;
-                int32_t d = (int32_t)(a - g_wfph_watch_addr);
-                if (d > -64 && d < 64) {
-                    static int wf = 0;
-                    if (wf < 30) { wf++;
-                        printk("[wfph] FFWAKE %x (watch%+d) by pid=%d t%d val=%d woke=%d\n",
-                               (unsigned)a, (int)d, current_proc->pid,
-                               current_proc->tgid, (int)val, woke); }
-                }
-            }
-            if (g_ipclaunch_waitaddr) {
-                uint32_t a = (uint32_t)(uintptr_t)uaddr;
-                int32_t d = (int32_t)(a - g_ipclaunch_waitaddr);
-                if (d > -64 && d < 64) {     /* same condvar struct (within ±64B) */
-                    static int ilw = 0;
-                    if (ilw < 40) { ilw++;
-                        printk("[ilfx] WAKE %x (waitaddr%+d) by tid=%d woke=%d\n",
-                               (unsigned)a, (int)d, current_proc->pid, woke); }
-                }
-            }
-            static int fk = 0;
-            uint32_t a = (uint32_t)(uintptr_t)uaddr;
-            /* Broadened to match [fxw]: log ALL firefox futex WAKEs (any address)
-             * during the launch window so we can match WAIT addrs↔WAKE addrs and
-             * find the content-child WAIT that never gets a WAKE. */
-            if (fk < 400 && current_proc && g_ipc_launch_started &&
-                current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-                current_proc->name[4]=='f') {
-                fk++; printk("[fxk] pid=%d t%d WAKE %x val=%x woke=%d\n",
-                             current_proc->pid, current_proc->tgid,
-                             (unsigned)a, (unsigned)val, woke);
-            }
             return woke;
         }
     }
@@ -5410,7 +5188,6 @@ static int sys_futex(registers_t *regs, int time64) {
                        : futex_resolve_phys((uint32_t)(uintptr_t)uaddr);
         int woke = futex_wake_n((uint32_t)(uintptr_t)uaddr, is_private || !rphys,
                                 rphys, current_proc->tgid, (int)n);
-        if (woke > 0) g_futex_progress_tick = pit_ticks();
         return woke;
     }
     if (op == 5) {  /* FUTEX_WAKE_OP — wake both futexes conservatively */
@@ -5658,39 +5435,47 @@ static int sys_rt_sigsuspend(registers_t *regs) {
         uint32_t raw = 0;
         int cr = copy_from_user(&raw, mask, sizeof(raw));
         if (cr < 0) return cr;
-        uint32_t m = raw & ~((1u << SIGKILL) | (1u << SIGSTOP));
+        uint32_t m = sigset_from_user(raw) & ~((1u << SIGKILL) | (1u << SIGSTOP));
         current_proc->blocked_sigs = m;
     }
 
-    /* Sleep until a signal wakes us (signal_send clears sleep_chan) */
-    sleep_on((void *)&sys_rt_sigsuspend);
+    /* Sleep until a DELIVERABLE signal wakes us (signal_send only wakes for
+     * those); if one is already pending under the new mask, do not sleep.
+     * Linux sigsuspend returns -ERESTARTNOHAND: EINTR once a handler has run,
+     * a transparent restart if the signal turned out to do nothing. */
+    if (!signal_interrupt_pending(current_proc))
+        sleep_on((void *)&sys_rt_sigsuspend);
 
     current_proc->blocked_sigs = old_mask;
-    return -4;  /* -EINTR — always */
+    return -ERESTARTNOHAND;
 }
 
 /* ── sys_clone(flags, child_stack, ...) — EAX=120 ──────────────────────── */
-/*
- * musl calls clone() even for fork().  We only support fork-like clone
- * (no CLONE_VM — no shared address space).  If CLONE_VM is requested,
- * return -ENOSYS; otherwise treat it as fork.
- */
 /* Linux i386 clone(flags, stack, ptid, newtls, ctid) — args in EBX,ECX,EDX,ESI,EDI. */
-#define CLONE_VM             0x00000100
-#define CLONE_FILES          0x00000400
-#define CLONE_VFORK          0x00004000
-#define CLONE_THREAD         0x00010000
-#define CLONE_PARENT_SETTID  0x00100000
-#define CLONE_CHILD_CLEARTID 0x00200000
-#define CLONE_SETTLS         0x00080000
-#define CLONE_CHILD_SETTID   0x01000000
 
+/*
+ * Thread-group model (kernel/fork.c copy_process):
+ *   - no CLONE_VM            : fork.  COW copy of the address space, own group.
+ *   - CLONE_VM, no THREAD    : own thread group (tgid = pid, own signal state,
+ *                              parent = creating process) that RUNS IN THE
+ *                              CREATOR'S ADDRESS SPACE: glibc posix_spawn
+ *                              (CLONE_VM|CLONE_VFORK), vfork, Breakpad.  An
+ *                              exit_group() there ends only the child.
+ *   - CLONE_THREAD           : a thread of the creator's group (tgid inherited,
+ *                              parent inherited from the group).  Requires
+ *                              CLONE_SIGHAND, which requires CLONE_VM.
+ * The handler table is shared under CLONE_SIGHAND and copied otherwise; the fd
+ * table is shared under CLONE_FILES and copied otherwise.
+ */
 static int sys_clone(registers_t *regs) {
-    int flags = (int)regs->ebx;
+    uint32_t flags       = regs->ebx;
     uint32_t child_stack = regs->ecx;
     uint32_t uptid       = regs->edx;   /* CLONE_PARENT_SETTID target */
     uint32_t newtls      = regs->esi;   /* CLONE_SETTLS: struct user_desc* */
     uint32_t uctid       = regs->edi;   /* CLONE_CHILD_(SET|CLEAR)TID target */
+
+    if ((flags & CLONE_THREAD) && !(flags & CLONE_SIGHAND)) return -22;
+    if ((flags & CLONE_SIGHAND) && !(flags & CLONE_VM)) return -22;
 
     if (!(flags & CLONE_VM)) {
         /* No CLONE_VM → COW copy of the address space (like fork).  But if the
@@ -5698,16 +5483,9 @@ static int sys_clone(registers_t *regs) {
          * frozen snapshot onto a fresh stack and runs an entry fn), the child
          * must run on THAT stack, not the parent's — else its clone trampoline
          * pops garbage and jumps into the weeds. */
-        return do_fork(regs, child_stack);
+        return do_fork(regs, child_stack, flags, uptid, uctid);
     }
 
-    /*
-     * Thread create: share the address space.  The child gets its own proc
-     * slot, kernel stack, and trapframe; pgdir_phys is the parent's (with a
-     * share count so reaping only frees it when the last user is gone).
-     * Threads keep the leader's tgid: getpid() reports the group, gettid()
-     * the thread.  pthread_join is waitpid(tid) in this kernel.
-     */
     struct proc *parent = current_proc;
     struct proc *child;
 
@@ -5727,15 +5505,21 @@ static int sys_clone(registers_t *regs) {
     child->tf->eax = 0;                 /* clone returns 0 in the child */
     child->tf->useresp = child_stack;
 
-    child->parent = parent;
     __builtin_memcpy(child->name, parent->name, sizeof(parent->name));
-    __builtin_memcpy(child->sig_handlers, parent->sig_handlers,
-                     sizeof(parent->sig_handlers));
-    __builtin_memcpy(child->sig_flags, parent->sig_flags,
-                     sizeof(parent->sig_flags));
     child->pending_sigs  = 0;
     child->blocked_sigs  = parent->blocked_sigs;
     child->sigframe_addr = 0;
+    if (flags & CLONE_SIGHAND) {
+        /* One handler table for the group (Linux copy_sighand: refcount++). */
+        sighand_put(child->sighand);
+        child->sighand = parent->sighand;
+        child->sighand->refcount++;
+    } else if (parent->sighand) {
+        __builtin_memcpy(child->sighand->handlers, parent->sighand->handlers,
+                         sizeof(child->sighand->handlers));
+        __builtin_memcpy(child->sighand->flags, parent->sighand->flags,
+                         sizeof(child->sighand->flags));
+    }
     __builtin_memcpy(child->cwd, parent->cwd, sizeof(parent->cwd));
     child->heap_end  = parent->heap_end;
     child->umask     = parent->umask;
@@ -5750,11 +5534,21 @@ static int sys_clone(registers_t *regs) {
 
     child->pgdir_phys = parent->pgdir_phys;
     pgdir_retain(child->pgdir_phys);
-    /* Threads share the parent's thread group.  (A vfork'd process also lands
-     * here, but it EXECs immediately and sys_exec resets its tgid to its own
-     * pid — so glxtest's exit_group() no longer kills Firefox.  We can't key on
-     * CLONE_THREAD here: our native libc's threads don't set it.) */
-    child->tgid     = parent->tgid;
+
+    if (flags & CLONE_THREAD) {
+        /* Same group as the creator; the group's parent is the parent of every
+         * thread (copy_process: p->real_parent = current->real_parent), so a
+         * thread's exit is never a "child exit" for the creating thread. */
+        child->tgid   = parent->tgid;
+        child->parent = parent->parent;
+    } else {
+        /* Own group in a shared address space.  Its parent is the creating
+         * PROCESS; its VMA list and mmap cursor stay with the address-space
+         * owner (the creator's group leader), which mmap_owner() follows. */
+        child->tgid     = child->pid;
+        child->parent   = proc_group_leader(parent);
+        child->vm_owner = mmap_owner();
+    }
 
     /* CLONE_SETTLS: each thread gets its OWN TLS base (the thread pointer that
      * %gs:0 resolves to).  Read it from the user_desc the caller passed; the
@@ -5785,7 +5579,7 @@ static int sys_clone(registers_t *regs) {
         child->fdt->refcount++;
         child->ofile = child->fdt->f;
     } else {
-        /* Private copy (CLONE_VM without CLONE_FILES — rare). */
+        /* Private copy (CLONE_VM without CLONE_FILES: posix_spawn, vfork). */
         for (int i = 0; i < MAX_FD; i++) {
             child->ofile[i] = parent->ofile[i];
             fd_retain(&parent->ofile[i]);
@@ -5795,17 +5589,17 @@ static int sys_clone(registers_t *regs) {
 
     /* CLONE_VFORK: the child shares our address space; block until it execs
      * (which gives it a fresh pgdir, un-sharing) or exits.  Without this the
-     * child runs concurrently in the shared address space and races us. */
+     * child runs concurrently in the shared address space and races us.  The
+     * wait is killable only (kernel/fork.c wait_for_vfork_done: TASK_KILLABLE),
+     * other signals are delivered once the child has gone its own way. */
     if (flags & CLONE_VFORK) {
-        printk("[launch] VFORK parent pid=%d (%s) -> child pid=%d, waiting for exec/exit\n",
-               parent->pid, parent->name, child->pid);
         child->vfork_parent = parent;
         parent->vfork_waiting = 1;
         child->state = PROC_RUNNABLE;
-        while (parent->vfork_waiting)
+        while (parent->vfork_waiting) {
+            if (parent->pending_sigs & (1u << SIGKILL)) break;
             sleep_on((void *)&parent->vfork_waiting);
-        printk("[launch] VFORK parent pid=%d resumed (child %d exec'd or exited)\n",
-               parent->pid, child->pid);
+        }
         return child->pid;
     }
 
@@ -5927,13 +5721,6 @@ static int socketcall_core(int call, uint32_t *kargs) {
 
     if (call == 8) { /* socketpair(domain, type, protocol, sv[2]) */
         int domain = (int)kargs[0];
-        if (current_proc && current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-            current_proc->name[4]=='f') {
-            printk("[ipc] pid=%d socketpair domain=%d type=%d\n",
-                   current_proc->pid, domain, (int)kargs[1]);
-            extern volatile int g_ipc_launch_started;
-            g_ipc_launch_started = 1;            /* arm the launcher syscall trace */
-        }
         if (domain != AF_UNIX_K) return -95;     /* only AF_UNIX pairs */
         uint32_t *usv = (uint32_t *)(uintptr_t)kargs[3];
         if (!access_ok(usv, 2 * sizeof(uint32_t))) return -14;
@@ -6401,8 +6188,7 @@ void syscall_dispatch(registers_t *regs) {
     case 78:  ret = sys_gettimeofday(regs);    break;
     case 82:  ret = sys_select(regs);          break;
     case 142: ret = sys_select(regs);          break;  /* _newselect */
-    case 308: ret = sys_select(regs);          break;  /* pselect6 (musl);
-        timeout is a timespec but only zero-checked; sigmask ignored */
+    case 308: ret = sys_pselect6(regs);        break;  /* pselect6 */
     case 83:  ret = sys_symlink(regs);         break;
     case 85:  ret = sys_readlink(regs);        break;
     case 88:  ret = sys_reboot(regs);          break;
@@ -6510,6 +6296,7 @@ void syscall_dispatch(registers_t *regs) {
     case 218: ret = sys_mincore(regs);         break;
     case 219: ret = sys_madvise(regs);         break;
     case 270: ret = sys_tgkill(regs);          break;
+    case 238: ret = sys_tkill(regs);           break;
     case 331: ret = sys_pipe2(regs);           break;
     case 102: ret = sys_socketcall(regs);      break;
     /* Direct i386 socket syscalls (modern musl uses these, not socketcall). */
@@ -6600,37 +6387,6 @@ void syscall_dispatch(registers_t *regs) {
         }
     }
 
-    /* [lt] launcher syscall trace: after Firefox creates the IPC channel
-     * socketpair, log every syscall from a NON-main firefox thread so we can see
-     * exactly where the IPC child launch stalls before reaching fork. */
-    if (g_ipc_launch_started && current_proc && current_proc->pid != current_proc->tgid &&
-        current_proc->name[0]=='f' && current_proc->name[1]=='i' && current_proc->name[4]=='f') {
-        /* Trace EVERY syscall from the "IPC Launch" thread specifically — it
-         * runs DoSetup/DoLaunch (fork+exec).  If it stalls before fork, the last
-         * syscall here is where.  futex(240)/futex_time64(403) idle-waits are
-         * skipped to cut noise. */
-        if (g_ipc_launch_tid && current_proc->pid == g_ipc_launch_tid &&
-            num != 240 && num != 403) {
-            static int lt2 = 0;
-            if (lt2 < 400) { lt2++;
-                printk("[ipclaunch] sys=%u ret=%d ebx=%x ecx=%x\n",
-                       (unsigned)num, ret, (unsigned)regs->ebx, (unsigned)regs->ecx);
-            }
-        }
-        /* [postfork] Any firefox thread that forked a child (clone/fork returned a
-         * positive pid) then blocks — trace its subsequent blocking reads/polls so
-         * we can see the post-fork sync-pipe wait that gates mProcessState (the
-         * WaitForProcessHandle predicate).  num 120=clone 2=fork; 3=read 168=poll
-         * 142=select 145=readv. */
-        if ((num == 3 || num == 168 || num == 142 || num == 145) && (int)ret < 0) {
-            static int pf = 0;
-            if (pf < 60) { pf++;
-                printk("[postfork] pid=%d sys=%u ret=%d fd=%x\n",
-                       current_proc->pid, (unsigned)num, ret, (unsigned)regs->ebx);
-            }
-        }
-    }
-
     /* [einval-trace] catch any EINVAL returned to a firefox thread (the glxtest
      * "poll failed: Invalid argument" culprit). */
     if (ret == -22 && current_proc && current_proc->name[0]=='f' &&
@@ -6643,8 +6399,10 @@ void syscall_dispatch(registers_t *regs) {
         }
     }
 
-    /* Deliver any pending signals before returning to user mode */
-    signal_deliver_pending(regs);
+    /* Deliver any pending signals before returning to user mode; an
+     * interrupted blocking call is restarted or fails with EINTR here (the
+     * syscall number lets the restart re-issue it). */
+    signal_return_to_user(regs, (int)num);
 
     /* Linux-style wakeup preemption: if this syscall woke another thread, yield
      * at the return-to-user boundary so the woken thread runs promptly (closes

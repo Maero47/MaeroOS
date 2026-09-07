@@ -177,16 +177,23 @@ struct proc *allocproc(void) {
     p->tgid          = p->pid;
     p->tls_base      = 0;
     p->clear_child_tid = 0;
+    p->set_child_tid = 0;
+    p->vm_owner      = NULL;
     p->robust_list_head = 0;
     p->vfork_parent  = NULL;
     p->vfork_waiting = 0;
+    p->group_exit    = 0;
+    p->sleep_timed_out = 0;
+    p->futex_wait    = 0;
     fpu_state_init(fpu_area(p));
-    __builtin_memset(p->sig_flags,    0, sizeof(p->sig_flags));
-    __builtin_memset(p->sig_handlers, 0, sizeof(p->sig_handlers));
+    /* Fresh private handler table (fork copies the parent's into it; a
+     * CLONE_SIGHAND thread drops it for the shared one — see sys_clone). */
+    p->sighand = sighand_alloc();
+    if (!p->sighand) { p->state = PROC_UNUSED; return NULL; }
     /* Fresh private fd table (fork/initial keep it; thread clone replaces it
      * with the shared group table — see sys_clone). */
     fdtable_attach(p, fdtable_alloc());
-    if (!p->fdt) { p->state = PROC_UNUSED; return NULL; }
+    if (!p->fdt) { sighand_put(p->sighand); p->sighand = NULL; p->state = PROC_UNUSED; return NULL; }
     for (int i = 0; i < SHM_PROC_MAPS; i++)
         p->shm_maps[i].id = -1;
 
@@ -194,6 +201,7 @@ struct proc *allocproc(void) {
     p->kstack = kmalloc(KSTACKSIZE);
     if (!p->kstack) {
         fdtable_put(p);
+        sighand_put(p->sighand); p->sighand = NULL;
         p->state = PROC_UNUSED;
         return NULL;
     }
@@ -232,10 +240,51 @@ struct proc *allocproc(void) {
  * which executes iret into user mode using the trapframe.
  */
 void forkret(void) {
+    /* CLONE_CHILD_SETTID for a fork-style clone (Linux schedule_tail ->
+     * put_user(task_pid_vnr(current), current->set_child_tid)): the tid word
+     * must land in the CHILD's address space, which is only current now that
+     * the child runs with its own page directory.  A COW fault here is taken
+     * in kernel mode and resolved by the page-fault handler. */
+    if (current_proc && current_proc->set_child_tid) {
+        extern int copy_to_user(void *dst, const void *src, size_t len);
+        uint32_t tid = (uint32_t)current_proc->pid;
+        copy_to_user((void *)(uintptr_t)current_proc->set_child_tid, &tid, sizeof(tid));
+        current_proc->set_child_tid = 0;
+    }
     /* First dispatch of a USER process: the scheduler swtch'd here holding the
      * Big Kernel Lock; we are about to iret to user (via trapret), so release
      * it.  (Kernel threads bypass forkret — they keep the BKL while running.) */
     bkl_leave();
+}
+
+struct proc *proc_group_leader(struct proc *p) {
+    if (!p || p->pid == p->tgid) return p;
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (ptable[i].state != PROC_UNUSED && ptable[i].pid == p->tgid)
+            return &ptable[i];
+    return p;
+}
+
+int proc_group_empty(struct proc *leader) {
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (q == leader || q->state == PROC_UNUSED) continue;
+        if (q->tgid != leader->tgid) continue;
+        if (q->state == PROC_ZOMBIE && q->pid != q->tgid) continue;  /* released soon */
+        return 0;
+    }
+    return 1;
+}
+
+void proc_release(struct proc *p) {
+    if (!p || p->state != PROC_ZOMBIE) return;
+    if (p->pgdir_phys && !pgdir_release(p->pgdir_phys))
+        pgdir_free_user(p->pgdir_phys);
+    if (p->kstack) kfree(p->kstack);
+    p->kstack     = NULL;
+    p->pgdir_phys = 0;
+    p->parent     = NULL;
+    p->state      = PROC_UNUSED;
 }
 
 /*
@@ -265,10 +314,19 @@ struct proc *proc_create_kthread(void (*fn)(void), const char *name) {
     p->tgid        = p->pid;
     p->tls_base    = 0;
     p->clear_child_tid = 0;
+    p->set_child_tid = 0;
+    p->vm_owner    = NULL;
+    p->group_exit  = 0;
+    p->pending_sigs = 0;
+    p->blocked_sigs = 0;
     fpu_state_init(fpu_area(p));
+    /* Kernel threads never take signals, but common paths (e.g. the network
+     * stack's blocking waits) consult the handler table of current_proc. */
+    p->sighand = sighand_alloc();
+    if (!p->sighand) { p->state = PROC_UNUSED; return NULL; }
 
     p->kstack = kmalloc(KSTACKSIZE);
-    if (!p->kstack) { p->state = PROC_UNUSED; return NULL; }
+    if (!p->kstack) { sighand_put(p->sighand); p->sighand = NULL; p->state = PROC_UNUSED; return NULL; }
 
     uint8_t *sp = p->kstack + KSTACKSIZE;
     sp -= sizeof(uint32_t);

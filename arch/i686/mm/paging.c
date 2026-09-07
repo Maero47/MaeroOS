@@ -655,14 +655,17 @@ static void page_fault_handler(registers_t *regs) {
                 printk("[SIG] pid=%d SIGSEGV loop eip=%08x addr=%08x ret=%08x — killed\n",
                        current_proc->pid, (unsigned)regs->eip, (unsigned)cr2,
                        (unsigned)retaddr);
-                proc_exit(128 + SIGSEGV);   /* does not return */
+                proc_group_exit(SIGSEGV);   /* does not return */
             }
         } else {
             current_proc->last_fault_eip = regs->eip;
             current_proc->fault_repeat   = 0;
         }
+        /* Synchronous fault: thread-directed SIGSEGV.  With SIG_DFL the whole
+         * thread group exits (Linux force_sig_fault -> get_signal ->
+         * do_group_exit), not just the faulting thread. */
         signal_send(current_proc, SIGSEGV);
-        signal_deliver_pending(regs);  /* → handler, or proc_exit if SIG_DFL */
+        signal_deliver_pending(regs);  /* → handler, or group exit if SIG_DFL */
         return;
     }
 

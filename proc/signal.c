@@ -51,18 +51,132 @@ struct k_ucontext {
     uint8_t  __pad[64];
 } __attribute__((packed));
 
-void signal_send(struct proc *p, int sig) {
-    if (!p || sig < 1 || sig >= NSIGS) return;
-    p->pending_sigs |= (1u << sig);
-    /* Wake sleeping processes so they can handle the signal */
+#include "../mm/heap.h"
+
+/* ── Shared signal-handler table ─────────────────────────────────────────── */
+
+struct sighand *sighand_alloc(void) {
+    struct sighand *sh = (struct sighand *)kmalloc(sizeof(*sh));
+    if (!sh) return (struct sighand *)0;
+    __builtin_memset(sh, 0, sizeof(*sh));
+    sh->refcount = 1;
+    return sh;
+}
+
+struct sighand *sighand_copy(struct sighand *src) {
+    struct sighand *sh = sighand_alloc();
+    if (!sh) return sh;
+    if (src) {
+        __builtin_memcpy(sh->handlers, src->handlers, sizeof(sh->handlers));
+        __builtin_memcpy(sh->flags,    src->flags,    sizeof(sh->flags));
+    }
+    return sh;
+}
+
+void sighand_put(struct sighand *sh) {
+    if (!sh) return;
+    if (--sh->refcount > 0) return;
+    kfree(sh);
+}
+
+/* ── Sending ─────────────────────────────────────────────────────────────── */
+
+/* Default action of sig when its handler is SIG_DFL: 1 = ignore, 2 = stop,
+ * 3 = terminate (Linux sig_kernel_ignore / sig_kernel_stop / the rest). */
+static int sig_default_action(int sig) {
+    switch (sig) {
+    case SIGCHLD: case SIGCONT: case 23 /* SIGURG */: case 28 /* SIGWINCH */:
+        return 1;
+    case SIGSTOP: case SIGTSTP: case SIGTTIN: case SIGTTOU:
+        return 2;
+    default:
+        return 3;
+    }
+}
+
+/* Linux sig_ignored(): a signal whose disposition is SIG_IGN, or SIG_DFL with
+ * a default action of "ignore", is discarded at send time — unless it is
+ * blocked, in which case it stays pending so that a later sigaction() +
+ * unblock can still see it.  SIGKILL/SIGSTOP are never ignorable. */
+static int sig_ignored(struct proc *p, int sig) {
+    if (sig == SIGKILL || sig == SIGSTOP) return 0;
+    if (p->blocked_sigs & (1u << sig)) return 0;
+    sighandler_t h = p->sighand ? p->sighand->handlers[sig] : SIG_DFL;
+    if (h == SIG_IGN) return 1;
+    if (h == SIG_DFL && sig_default_action(sig) == 1) return 1;
+    return 0;
+}
+
+/* Would sig, if pending on p, make p do something on its next return to user
+ * mode?  Blocked signals do not; ignored ones were never queued.  Used to
+ * decide whether queuing it must wake a sleeping p (Linux signal_wake_up is
+ * called only from complete_signal, i.e. for a deliverable signal). */
+static int sig_wakes(struct proc *p, int sig) {
+    if (sig == SIGKILL || sig == SIGSTOP) return 1;
+    if (p->blocked_sigs & (1u << sig)) return 0;
+    return !sig_ignored(p, sig);
+}
+
+/* Make a sleeping thread run so that it notices its new pending signal.  The
+ * timed-wait deadline is consumed here (like every other wake path): the
+ * interrupted call reports -EINTR/restart, never a timeout, and the deadline
+ * must not fire into whatever the thread sleeps on next. */
+static void sig_wake_sleeper(struct proc *p, int sig) {
     if (p->state == PROC_SLEEPING) {
         p->sleep_chan = (void *)0;
-        p->state     = PROC_RUNNABLE;
+        p->wake_tick  = 0;
+        p->state      = PROC_RUNNABLE;
+    } else if (p->state == PROC_STOPPED && sig == SIGKILL) {
+        p->state      = PROC_RUNNABLE;   /* a stopped task can still be killed */
     }
-    /* SIGCONT resumes a stopped process */
-    if (sig == SIGCONT && p->state == PROC_STOPPED) {
+}
+
+void signal_send(struct proc *p, int sig) {
+    if (!p || sig < 1 || sig >= NSIGS) return;
+    if (p->state == PROC_UNUSED || p->state == PROC_ZOMBIE) return;
+    /* SIGCONT resumes a stopped process even when it is ignored (Linux
+     * prepare_signal: SIGCONT always wakes the group out of a stop). */
+    if (sig == SIGCONT && p->state == PROC_STOPPED)
         p->state = PROC_RUNNABLE;
+    if (sig_ignored(p, sig)) return;
+    p->pending_sigs |= (1u << sig);
+    if (sig_wakes(p, sig))
+        sig_wake_sleeper(p, sig);
+}
+
+void signal_send_group(struct proc *p, int sig) {
+    if (!p || sig < 1 || sig >= NSIGS) return;
+    int tg = p->tgid;
+    struct proc *leader = (struct proc *)0, *open_thread = (struct proc *)0,
+                *any = (struct proc *)0;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (q->state == PROC_UNUSED || q->state == PROC_ZOMBIE) continue;
+        if (q->tgid != tg) continue;
+        if (q->pid == q->tgid) leader = q;
+        if (!any) any = q;
+        if (!(q->blocked_sigs & (1u << sig))) {
+            /* Prefer the leader when it can take the signal, else the first
+             * thread that does not block it (Linux complete_signal: the main
+             * thread first, then wants_signal() over the others). */
+            if (q == leader) { open_thread = q; break; }
+            if (!open_thread) open_thread = q;
+        }
     }
+    struct proc *target = open_thread ? open_thread : (leader ? leader : any);
+    if (target) signal_send(target, sig);
+}
+
+int signal_send_pgrp(int pg, int sig) {
+    int sent = 0;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (q->state == PROC_UNUSED || q->state == PROC_ZOMBIE) continue;
+        if (q->pgrp != pg || q->pid != q->tgid) continue;   /* one per process */
+        signal_send_group(q, sig);
+        sent++;
+    }
+    return sent;
 }
 
 int signal_interrupt_pending(struct proc *p) {
@@ -71,21 +185,68 @@ int signal_interrupt_pending(struct proc *p) {
     if (!pending) return 0;
     for (int i = 1; i < NSIGS; i++) {
         if (!(pending & (1u << i))) continue;
-        sighandler_t h = p->sig_handlers[i];
+        sighandler_t h = p->sighand ? p->sighand->handlers[i] : SIG_DFL;
         if (h == SIG_IGN) continue;
-        if (h == SIG_DFL && (i == SIGCHLD || i == SIGCONT)) continue;
+        if (h == SIG_DFL && sig_default_action(i) == 1) continue;
         return 1;
     }
     return 0;
 }
 
-void signal_deliver_pending(registers_t *regs) {
+/* ── Group exit ──────────────────────────────────────────────────────────── */
+
+/* Linux do_group_exit() / zap_other_threads(): record the group's exit status
+ * on the leader once (the first exiting thread wins, later SIGKILL deaths of
+ * siblings must not overwrite it) and queue SIGKILL on every other live thread
+ * of the group.  Sleeping siblings are woken by signal_send and die when their
+ * interrupted syscall returns; CPU-bound siblings die on their next timer
+ * interrupt (irq_handler delivers signals on return to ring 3). */
+static void thread_group_kill(int status) {
+    struct proc *me = current_proc;
+    struct proc *leader = proc_group_leader(me);
+    if (leader && !leader->group_exit) {
+        leader->group_exit  = 1;
+        leader->exit_status = status;
+    }
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (q == me || q->state == PROC_UNUSED || q->state == PROC_ZOMBIE) continue;
+        if (q->tgid != me->tgid) continue;
+        signal_send(q, SIGKILL);
+    }
+}
+
+void proc_group_exit(int status) {
+    thread_group_kill(status);
+    proc_exit(status);
+}
+
+/* ── Delivery ────────────────────────────────────────────────────────────── */
+
+/* Re-execute the interrupted syscall: back eip up over the 2-byte `int 0x80`
+ * and restore the syscall number that the return value overwrote in eax
+ * (Linux arch/x86/kernel/signal.c: regs->ax = regs->orig_ax; regs->ip -= 2). */
+static void syscall_restart(registers_t *regs, int syscall_nr) {
+    regs->eax  = (uint32_t)syscall_nr;
+    regs->eip -= 2;
+}
+
+void signal_return_to_user(registers_t *regs, int syscall_nr) {
     if (!current_proc) return;
     /* Only deliver to user-mode frames */
     if ((regs->cs & 3) != 3) return;
 
+    int32_t  ret = (int32_t)regs->eax;
+    int restartable = syscall_nr >= 0 && (ret == -4 || ret == -ERESTARTNOHAND);
+
     uint32_t pending = current_proc->pending_sigs & ~current_proc->blocked_sigs;
-    if (!pending) return;
+    if (!pending) {
+        /* Woken by a signal that is no longer deliverable (or the syscall
+         * returned an internal restart code with nothing pending): transparently
+         * restart it, exactly as Linux does when get_signal() finds nothing. */
+        if (restartable) syscall_restart(regs, syscall_nr);
+        return;
+    }
 
     /* Find lowest-numbered pending signal */
     int sig = 0;
@@ -96,34 +257,43 @@ void signal_deliver_pending(registers_t *regs) {
 
     current_proc->pending_sigs &= ~(1u << sig);
 
+    struct sighand *sh = current_proc->sighand;
+    sighandler_t handler = sh ? sh->handlers[sig] : SIG_DFL;
+    uint32_t     sflags  = sh ? sh->flags[sig]    : 0;
+
     /* SIGKILL can never be caught or ignored */
     if (sig == SIGKILL) {
-        printk("[SIG] pid=%d killed by SIGKILL\n", current_proc->pid);
-        proc_exit(128 + sig);
+        handler = SIG_DFL;
+        sflags  = 0;
     }
 
-    sighandler_t handler = current_proc->sig_handlers[sig];
-
-    if (handler == SIG_IGN) return;
+    if (handler == SIG_IGN) {
+        if (restartable) syscall_restart(regs, syscall_nr);
+        return;
+    }
 
     if (handler == SIG_DFL) {
-        switch (sig) {
-        case SIGCHLD:
-        case SIGCONT:
+        switch (sig_default_action(sig)) {
+        case 1:
+            if (restartable) syscall_restart(regs, syscall_nr);
             return;  /* default: ignore */
-        case SIGSTOP:
-        case SIGTSTP:
-        case SIGTTIN:
-        case SIGTTOU:
+        case 2:
             /* Wake parent so waitpid(WUNTRACED) returns */
             if (current_proc->parent)
                 wake_up(current_proc->parent);
-            /* Stop and yield — won't return until SIGCONT makes us RUNNABLE */
+            /* Stop and yield — won't return until SIGCONT makes us RUNNABLE.
+             * The interrupted syscall is then restarted (no handler ran). */
             proc_stop_self();
+            if (restartable) syscall_restart(regs, syscall_nr);
             return;
         default:
-            printk("[SIG] pid=%d killed by signal %d\n", current_proc->pid, sig);
-            proc_exit(128 + sig);
+            /* Fatal signal with the default disposition: Linux get_signal()
+             * calls do_group_exit(signr), so the WHOLE thread group dies with
+             * this signal as its wait status (kernel/signal.c complete_signal
+             * + zap_other_threads), not just the thread it was queued on. */
+            printk("[SIG] pid=%d tgid=%d killed by signal %d\n",
+                   current_proc->pid, current_proc->tgid, sig);
+            proc_group_exit(sig & 0x7f);
         }
     }
 
@@ -179,13 +349,19 @@ void signal_deliver_pending(registers_t *regs) {
     uint32_t uctx_addr = 0;   /* set in the SA_SIGINFO branch below */
 
     /*
-     * SA_RESTART: if this signal interrupted a blocking syscall (eax==-EINTR),
-     * save eip-2 so that sigreturn resumes at the int $0x80 instruction.
+     * A handler is about to run.  If it interrupted a blocking syscall, decide
+     * what that syscall returns once the handler completes (Linux
+     * handle_signal(): -ERESTARTNOHAND always becomes -EINTR; -ERESTARTSYS
+     * becomes -EINTR unless SA_RESTART, in which case the call is re-executed
+     * with its original number).  The decision is applied to the SAVED frame,
+     * which sigreturn restores after the handler returns.
      */
     registers_t saved_regs = *regs;
-    if ((current_proc->sig_flags[sig] & SA_RESTART) &&
-        (int32_t)regs->eax == -4 /* -EINTR */) {
-        saved_regs.eip -= 2;
+    if (restartable) {
+        if (ret == -4 && (sflags & SA_RESTART))
+            syscall_restart(&saved_regs, syscall_nr);
+        else
+            saved_regs.eax = (uint32_t)-4;   /* -EINTR */
     }
 
     /* Save (possibly modified) trapframe */
@@ -195,7 +371,7 @@ void signal_deliver_pending(registers_t *regs) {
     __builtin_memcpy((void *)sp, &saved_regs, sizeof(registers_t));
     current_proc->sigframe_addr = saved_addr;
 
-    if (current_proc->sig_flags[sig] & SA_SIGINFO) {
+    if (sflags & SA_SIGINFO) {
         /* Build a real ucontext_t on the user stack so SA_SIGINFO handlers that
          * read the faulting register state (Breakpad, WasmTrapHandler, …) work
          * instead of dereferencing a NULL ucontext and crashing. */
@@ -267,7 +443,7 @@ void signal_deliver_pending(registers_t *regs) {
      * sigreturn correct under NESTED signals (a fault inside a handler). */
     {
         uint32_t restore_addr, marker;
-        if (current_proc->sig_flags[sig] & SA_SIGINFO) { restore_addr = uctx_addr; marker = 1; }
+        if (sflags & SA_SIGINFO) { restore_addr = uctx_addr; marker = 1; }
         else                                           { restore_addr = saved_addr; marker = 0; }
         uint8_t tr[20] = { 0xB8, 0x77,0,0,0,    /* mov  eax, 0x77 (sigreturn) */
                            0xB9, 0,0,0,0,       /* mov  ecx, restore_addr     */
@@ -286,7 +462,7 @@ void signal_deliver_pending(registers_t *regs) {
 
 fatal:
     printk("[SIG] pid=%d: stack overflow in signal delivery\n", current_proc->pid);
-    proc_exit(128 + SIGSEGV);
+    proc_group_exit(SIGSEGV);
 }
 
 /* Restore a trapframe at sigreturn.  `addr`/`marker` come from the per-frame
