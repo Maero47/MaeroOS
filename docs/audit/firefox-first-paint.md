@@ -624,6 +624,13 @@ Small C programs, statically linked against the glibc in `testfiles/lib`, run
 from the shell in QEMU. Each prints `PASS`/`FAIL` and the observed value; the
 expected Linux result is stated so the same binary can be checked on the host.
 
+Implemented in `ports/abiprobes/` (one `pNN_*.c` per probe, static musl
+binaries in `testfiles/abiprobes/`), run by `make smoke-abi` through
+`tools/smoke_abi.py`; `ports/abiprobes/README.md` has the probe-to-file table,
+the expected-fail list and two deviations from the text below (P9: Linux does
+not restart `poll` under `SA_RESTART`, the restart check uses `read`; P17 also
+covers process-directed `kill`).
+
 **P1 fatal-signal-scope (RC1, S2).** Thread B does `raise(SIGSEGV)` (or writes
 to address 0) 100 ms after start; main thread sleeps 2 s and then prints
 `FAIL still alive`. Linux: the process dies with SIGSEGV before printing.
