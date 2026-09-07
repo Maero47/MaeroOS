@@ -167,6 +167,11 @@ took ~4 years to first-paint a modern web engine — with a team.
 
 ## Practical notes
 
+- The Firefox runtime tree (`testfiles/firefox/`, gitignored) and the glibc
+  in `testfiles/lib/` are rebuilt from public sources by
+  `sh ports/firefox/fetch-runtime.sh` (official Firefox 115 ESR tarball plus
+  Debian i386 packages, no Docker/root); `ports/firefox/check-runtime.sh`
+  proves the tree is closed under dynamic linking.  See `ports/firefox/README.md`.
 - Cross builds: `ports/Dockerfile.cross` (linux/amd64 + musl.cc i686).
   The toolchain tarball is vendored at `ports/i686-linux-musl-cross.tgz`.
 - Most ports build `-static -no-pie`; **as of Phase 30 the kernel also runs
