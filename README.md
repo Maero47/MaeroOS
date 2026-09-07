@@ -275,7 +275,10 @@ export PATH="$HOME/opt/cross/bin:$HOME/opt/i686-linux-musl-cross/bin:$PATH"
 ```
 
 `PREFIX=`, `OPT_DIR=`, `BINUTILS_VER=` and `GCC_VER=` override the defaults; the script
-is idempotent and skips anything already built. Running Docker (`docker.io`) and
+is idempotent and skips anything already built. Downloads come from `ftp.gnu.org` and
+`musl.cc` over TLS and are checked against pinned digests before anything is extracted;
+a different GCC or binutils version needs its digest in `GCC_SHA256=` / `BINUTILS_SHA256=`
+(or `MAEROS_SKIP_HASH=1`). Running Docker (`docker.io`) and
 `gcc-multilib` are optional and only matter for rebuilding `ports/`. `make start`
 uses the `gtk` or `sdl` QEMU display and `pipewire`, `pa` or `alsa` audio, whichever
 the installed QEMU supports, and sizes the guest to the primary monitor reported by

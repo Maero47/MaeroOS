@@ -35,9 +35,15 @@
 #   SRC_DIR       tarballs + build dirs          (default $PREFIX/src)
 #   BINUTILS_VER  binutils release               (default 2.44)
 #   GCC_VER       gcc release                    (default 14.2.0)
-#   GNU_MIRROR    base URL for GNU tarballs      (default https://ftpmirror.gnu.org)
+#   GNU_MIRROR    base URL for GNU tarballs      (default https://ftp.gnu.org/gnu, TLS)
 #   MUSL_URL      musl.cc tarball URL
 #   JOBS          same as --jobs
+#   BINUTILS_SHA256, GCC_SHA256, MUSL_SHA512
+#                 expected digests of the downloads.  The defaults are pinned
+#                 for the default versions; if you change BINUTILS_VER/GCC_VER
+#                 you must supply the matching digest (or set MAEROS_SKIP_HASH=1
+#                 to accept an unverified download).
+#   MAEROS_SKIP_HASH=1  skip digest verification (not recommended)
 
 set -eu
 
@@ -46,10 +52,32 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PREFIX="${PREFIX:-$HOME/opt/cross}"
 OPT_DIR="${OPT_DIR:-$HOME/opt}"
 SRC_DIR="${SRC_DIR:-$PREFIX/src}"
-BINUTILS_VER="${BINUTILS_VER:-2.44}"
-GCC_VER="${GCC_VER:-14.2.0}"
-GNU_MIRROR="${GNU_MIRROR:-https://ftpmirror.gnu.org}"
+DEFAULT_BINUTILS_VER=2.44
+DEFAULT_GCC_VER=14.2.0
+BINUTILS_VER="${BINUTILS_VER:-$DEFAULT_BINUTILS_VER}"
+GCC_VER="${GCC_VER:-$DEFAULT_GCC_VER}"
+# ftp.gnu.org serves over TLS; ftpmirror.gnu.org may redirect to plain HTTP.
+GNU_MIRROR="${GNU_MIRROR:-https://ftp.gnu.org/gnu}"
 MUSL_URL="${MUSL_URL:-https://musl.cc/i686-linux-musl-cross.tgz}"
+
+# Pinned digests of the artifacts the default configuration downloads.
+# binutils/gcc: sha256 of the .tar.xz fetched from https://ftp.gnu.org/gnu
+# (gcc's matches https://gcc.gnu.org/pub/gcc/releases/gcc-14.2.0/sha512.sum).
+# musl: the entry from https://musl.cc/SHA512SUMS.  musl.cc republishes that
+# tarball when it rebuilds, so a mismatch there means "check SHA512SUMS and
+# update MUSL_SHA512", not necessarily tampering.
+if [ "$BINUTILS_VER" = "$DEFAULT_BINUTILS_VER" ]; then
+    BINUTILS_SHA256="${BINUTILS_SHA256:-ce2017e059d63e67ddb9240e9d4ec49c2893605035cd60e92ad53177f4377237}"
+else
+    BINUTILS_SHA256="${BINUTILS_SHA256:-}"
+fi
+if [ "$GCC_VER" = "$DEFAULT_GCC_VER" ]; then
+    GCC_SHA256="${GCC_SHA256:-a7b39bc69cbf9e25826c5a60ab26477001f7c08d85cec04bc0e29cabed6f3cc9}"
+else
+    GCC_SHA256="${GCC_SHA256:-}"
+fi
+MUSL_SHA512="${MUSL_SHA512:-5047afc68170a2910895db2dfa448227e71a984bfa2130a1bc946fd1015d722b80b15e4abf90c64300815aa84fe781cc8b8a72f10174f9dce96169e035911880}"
+MAEROS_SKIP_HASH="${MAEROS_SKIP_HASH:-0}"
 MUSL_TGZ="$REPO_ROOT/ports/i686-linux-musl-cross.tgz"
 MUSL_DIR="$OPT_DIR/i686-linux-musl-cross"
 TARGET=i686-elf
@@ -105,13 +133,41 @@ fetch() {
     mkdir -p "$(dirname "$dest")"
     say "   fetching $url"
     if have wget; then
-        wget -q --show-progress -c -O "$dest.part" "$url" || { rm -f "$dest.part"; die "download failed: $url"; }
+        # A bar on a terminal, one dot per MiB when logging to a file/pipe.
+        if [ -t 1 ]; then progress=bar:force:noscroll; else progress=dot:mega; fi
+        wget -q --show-progress --progress="$progress" -c -O "$dest.part" "$url" || { rm -f "$dest.part"; die "download failed: $url"; }
     elif have curl; then
         curl -fL -C - -o "$dest.part" "$url" || { rm -f "$dest.part"; die "download failed: $url"; }
     else
         die "need wget or curl to download $url"
     fi
     mv "$dest.part" "$dest"
+}
+
+# verify_hash FILE ALGO EXPECTED VAR — compare the sha256/sha512 of FILE with
+# EXPECTED.  Fails closed: a mismatch moves the file aside as FILE.bad and
+# stops; an empty EXPECTED (version changed without a digest) also stops.
+# MAEROS_SKIP_HASH=1 turns both into a warning.  VAR names the override.
+verify_hash() {
+    file="$1"; algo="$2"; expected="$3"; var="$4"
+    if [ "$MAEROS_SKIP_HASH" = 1 ]; then
+        say "   WARNING: MAEROS_SKIP_HASH=1, not verifying $file"
+        return 0
+    fi
+    [ -n "$expected" ] || die "no pinned $algo digest for $file
+  set $var=<digest> (or MAEROS_SKIP_HASH=1 to accept an unverified download)"
+    have "${algo}sum" || die "${algo}sum not found (coreutils); cannot verify $file"
+    actual=$("${algo}sum" "$file" | cut -d' ' -f1)
+    if [ "$actual" != "$expected" ]; then
+        mv -f "$file" "$file.bad"
+        die "$algo mismatch for $file (moved to $file.bad)
+  expected $expected
+  actual   $actual
+  The download is not the pinned artifact.  Check the upstream checksum
+  (GNU: .sig next to the tarball; musl: https://musl.cc/SHA512SUMS) and set
+  $var= accordingly, or MAEROS_SKIP_HASH=1 to accept it anyway."
+    fi
+    say "   $algo OK: $file"
 }
 
 # run_logged LOG CMD... — run a build command with output in LOG; on failure
@@ -245,13 +301,16 @@ if [ "$MODE" = dry-run ]; then
     step "2. i686-elf cross toolchain -> $PREFIX"
     if [ "$DO_CROSS" = 0 ]; then say "   skipped (--no-cross)"; else
         if cross_binutils_ok; then say "   binutils: already installed, skip"; else
-            say "   binutils $BINUTILS_VER: fetch $GNU_MIRROR/binutils/binutils-$BINUTILS_VER.tar.xz, build in $SRC_DIR/build-binutils, install"; fi
+            say "   binutils $BINUTILS_VER: fetch $GNU_MIRROR/binutils/binutils-$BINUTILS_VER.tar.xz, build in $SRC_DIR/build-binutils, install"
+            say "     sha256 ${BINUTILS_SHA256:-<none: set BINUTILS_SHA256 or MAEROS_SKIP_HASH=1>}"; fi
         if cross_gcc_ok; then say "   gcc: already installed, skip"; else
-            say "   gcc $GCC_VER: fetch $GNU_MIRROR/gcc/gcc-$GCC_VER/gcc-$GCC_VER.tar.xz, build all-gcc all-target-libgcc in $SRC_DIR/build-gcc, install"; fi
+            say "   gcc $GCC_VER: fetch $GNU_MIRROR/gcc/gcc-$GCC_VER/gcc-$GCC_VER.tar.xz, build all-gcc all-target-libgcc in $SRC_DIR/build-gcc, install"
+            say "     sha256 ${GCC_SHA256:-<none: set GCC_SHA256 or MAEROS_SKIP_HASH=1>}"; fi
     fi
     step "3. musl.cc toolchain -> $MUSL_TGZ, $MUSL_DIR"
     if [ "$DO_MUSL" = 0 ]; then say "   skipped (--no-musl)"; else
         if [ -f "$MUSL_TGZ" ]; then say "   tarball present, skip download"; else say "   fetch $MUSL_URL"; fi
+        say "     sha512 $MUSL_SHA512"
         if musl_ok; then say "   already extracted, skip"; else say "   extract into $OPT_DIR"; fi
     fi
     step "4. verify"
@@ -298,6 +357,7 @@ if [ "$DO_CROSS" = 1 ]; then
         say "   binutils $BINUTILS_VER"
         tarball="$SRC_DIR/binutils-$BINUTILS_VER.tar.xz"
         fetch "$GNU_MIRROR/binutils/binutils-$BINUTILS_VER.tar.xz" "$tarball"
+        verify_hash "$tarball" sha256 "$BINUTILS_SHA256" BINUTILS_SHA256
         xz -t "$tarball" || { rm -f "$tarball"; die "corrupt download $tarball (removed; re-run)"; }
         [ -d "$SRC_DIR/binutils-$BINUTILS_VER" ] || run_logged "$SRC_DIR/binutils-extract.log" tar -xJf "$tarball" -C "$SRC_DIR"
         rm -rf "$SRC_DIR/build-binutils"
@@ -318,6 +378,7 @@ if [ "$DO_CROSS" = 1 ]; then
         say "   gcc $GCC_VER (C only, --without-headers, + libgcc)"
         tarball="$SRC_DIR/gcc-$GCC_VER.tar.xz"
         fetch "$GNU_MIRROR/gcc/gcc-$GCC_VER/gcc-$GCC_VER.tar.xz" "$tarball"
+        verify_hash "$tarball" sha256 "$GCC_SHA256" GCC_SHA256
         xz -t "$tarball" || { rm -f "$tarball"; die "corrupt download $tarball (removed; re-run)"; }
         [ -d "$SRC_DIR/gcc-$GCC_VER" ] || run_logged "$SRC_DIR/gcc-extract.log" tar -xJf "$tarball" -C "$SRC_DIR"
         rm -rf "$SRC_DIR/build-gcc"
@@ -342,10 +403,11 @@ if [ "$DO_MUSL" = 1 ]; then
     else
         fetch "$MUSL_URL" "$MUSL_TGZ"
     fi
-    gzip -t "$MUSL_TGZ" 2>/dev/null || { rm -f "$MUSL_TGZ"; die "corrupt download $MUSL_TGZ (removed; re-run)"; }
     if musl_ok; then
         say "   $MUSL_DIR present, skipping extract"
     else
+        verify_hash "$MUSL_TGZ" sha512 "$MUSL_SHA512" MUSL_SHA512
+        gzip -t "$MUSL_TGZ" 2>/dev/null || { rm -f "$MUSL_TGZ"; die "corrupt download $MUSL_TGZ (removed; re-run)"; }
         mkdir -p "$OPT_DIR"
         run_logged "$OPT_DIR/musl-extract.log" tar -xzf "$MUSL_TGZ" -C "$OPT_DIR"
         musl_ok || die "extracting $MUSL_TGZ did not produce $MUSL_DIR/bin/i686-linux-musl-gcc"
