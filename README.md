@@ -265,20 +265,44 @@ directory), so a missing tool fails when its target runs, not when Make parses t
 `tools/setup-linux.sh` bootstraps a fresh Ubuntu box. It prints the apt package list,
 builds an `i686-elf` binutils + GCC (C only, with libgcc) into `~/opt/cross`, downloads
 the musl.cc `i686-linux-musl` toolchain into `ports/` and `~/opt`, and checks every
-tool. The only step that needs root is the apt install.
+tool. The only step that needs root is the apt install, and even that is optional.
 
 ```sh
 tools/setup-linux.sh --dry-run   # show what it would do
 tools/setup-linux.sh --apt       # apt install (sudo), build and fetch toolchains, verify
+tools/setup-linux.sh --no-sudo   # no root at all, see below
 tools/setup-linux.sh --check     # just report present/missing tools
-export PATH="$HOME/opt/cross/bin:$HOME/opt/i686-linux-musl-cross/bin:$PATH"
+export PATH="$HOME/opt/bin:$HOME/opt/cross/bin:$HOME/opt/i686-linux-musl-cross/bin:$PATH"
 ```
 
-`PREFIX=`, `OPT_DIR=`, `BINUTILS_VER=` and `GCC_VER=` override the defaults; the script
-is idempotent and skips anything already built. Downloads come from `ftp.gnu.org` and
-`musl.cc` over TLS and are checked against pinned digests before anything is extracted;
-a different GCC or binutils version needs its digest in `GCC_SHA256=` / `BINUTILS_SHA256=`
-(or `MAEROS_SKIP_HASH=1`). Running Docker (`docker.io`) and
+**Without root.** `--no-sudo` (chosen automatically when `make`, `nasm`, QEMU, the GRUB
+BIOS modules or a compiler are missing and `--apt` was not given) never calls `sudo`.
+It asks apt which of `make nasm bison flex m4 texinfo qemu-system-x86 qemu-system-gui
+grub-pc-bin mtools xorriso e2fsprogs xz-utils zstd shellcheck` (plus dependencies) are
+not installed, downloads exactly those with `apt-get download`, which checks each `.deb`
+against the signed archive index, unpacks them with `dpkg-deb -x` into `~/opt/hostpkgs`,
+and writes wrapper scripts into `~/opt/bin` that add what the relocated binaries need:
+the library path, `-L` firmware directories and `QEMU_MODULE_DIR` for QEMU,
+`-d ~/opt/hostpkgs/usr/lib/grub/i386-pc` for `grub-mkrescue`, `M4=` for bison and flex,
+`PERL5LIB` for `makeinfo`. If the host has no C/C++ compiler, the self-contained musl.cc
+`x86_64-linux-musl-native` toolchain is fetched into `~/opt` and exposed as `cc`/`c++`
+wrappers that link statically (its dynamic loader is not installed on the host); the
+`i686-elf` binutils and GCC are then built with it, with gmp/mpfr/mpc/isl in-tree via
+gcc's `contrib/download_prerequisites` and without LTO/plugin support, since a static
+`ld` cannot load plugins. Only `~/opt/bin` is added to `PATH`; nothing outside `~/opt`
+and `ports/` is written. `make toybox` uses that `cc` as `HOSTCC`. The run is idempotent
+and resumable: unpacked packages, extracted tarballs and finished toolchains are skipped
+on the next run.
+
+`make initrd` also builds toybox from `third_party/toybox/.config.maeros`, the applet set
+that compiles and links against the MaeroOS libc (about 100 applets; the rest need
+headers or syscalls the libc does not provide yet).
+
+`PREFIX=`, `OPT_DIR=`, `BIN_DIR=`, `HOSTPKGS_DIR=`, `BINUTILS_VER=` and `GCC_VER=`
+override the defaults; the script is idempotent and skips anything already built.
+Downloads come from `ftp.gnu.org` and `musl.cc` over TLS and are checked against pinned
+digests before anything is extracted; a different GCC or binutils version needs its
+digest in `GCC_SHA256=` / `BINUTILS_SHA256=` (or `MAEROS_SKIP_HASH=1`). Running Docker (`docker.io`) and
 `gcc-multilib` are optional and only matter for rebuilding `ports/`. `make start`
 uses the `gtk` or `sdl` QEMU display and `pipewire`, `pa` or `alsa` audio, whichever
 the installed QEMU supports, and sizes the guest to the primary monitor reported by
