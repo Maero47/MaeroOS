@@ -97,7 +97,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk abiprobes smoke-abi repo repo-serve start resolutions icons
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk abiprobes smoke-abi smoke-firefox repo repo-serve start resolutions icons
 
 all: $(TARGET)
 
@@ -205,8 +205,16 @@ disk: userspace
 
 # Large disk WITH the Firefox + glibc library trees (175 MiB libxul etc.).
 # Used to run the prebuilt Firefox ESR; see `make run-firefox`.
-disk-ff:
+# The Firefox runtime tree is gitignored; rebuild it from public sources when
+# it is missing (ports/firefox/fetch-runtime.sh, cached under ports/firefox/prebuilt).
+testfiles/firefox/firefox-bin:
+	sh ports/firefox/fetch-runtime.sh
+
+disk-ff: testfiles/firefox/firefox-bin
 	$(MAKE) disk DISK_SIZE_MB=1024 DISK_IMG=disk-ff.img DISK_PRUNE="-path testfiles/nonexistent"
+
+# -accel kvm when this user can open /dev/kvm (native speed, real CPU), else TCG.
+QEMU_ACCEL := $(shell test -r /dev/kvm -a -w /dev/kvm && echo "-accel kvm" || echo "-accel tcg")
 
 # Run in QEMU — uses built-in multiboot loader (no ISO required)
 run: $(TARGET) initrd
@@ -243,11 +251,16 @@ run-disk: $(TARGET) initrd disk
 # Boot with the Firefox disk attached (2 GiB RAM).  At the shell, run:
 #   /disk/firefox/firefox-bin --version      (proven: prints "Mozilla Firefox 115.15.0esr")
 # LD_LIBRARY_PATH and DISPLAY are pre-set by login for the GTK/X stack.
-run-firefox: $(TARGET) initrd disk-ff
+# Firefox needs the desktop, and the desktop needs a framebuffer, which only
+# the GRUB ISO path provides (gfxpayload).  The -kernel path boots without
+# /dev/fb0, so init never starts the graphical session and ff cannot run.
+# With /disk/ffauto on the disk the desktop launches ff by itself.
+run-firefox: $(TARGET) iso disk-ff
 	qemu-system-i386 \
-		-kernel $(TARGET) \
-		-initrd initrd.tar \
+		-cdrom maeros.iso \
 		-drive file=disk-ff.img,format=raw,if=ide \
+		$(QEMU_ACCEL) \
+		-vga std \
 		-serial stdio \
 		-m 2048M \
 		-no-reboot \
@@ -292,6 +305,14 @@ abiprobes:
 
 smoke-abi: $(TARGET) abiprobes initrd
 	python3 tools/smoke_abi.py
+
+# Does Firefox 115 paint a window on the desktop?  Boots the ISO with the
+# Firefox disk headless (KVM when available), lets the desktop launch ff, and
+# judges PASS/FAIL from the serial console.  Artifacts (serial log, screendump,
+# summary) land in build/ff-smoke/<timestamp>-<accel>-smpN/.  Options pass
+# through SMOKE_FF_ARGS, e.g. make smoke-firefox SMOKE_FF_ARGS="--smp 2 --accel tcg".
+smoke-firefox: $(TARGET) iso disk-ff
+	python3 tools/smoke_firefox.py $(SMOKE_FF_ARGS)
 
 # Run with full interrupt + CPU-reset logging
 debug: $(TARGET)

@@ -152,3 +152,6 @@ testfiles/awk
 
 # Upstream fbDOOM clone metadata kept aside (rename back to .git to use it)
 ports/fbDOOM/.git-upstream/
+
+# ── smoke-firefox artifacts (serial logs, screendumps, summaries) ──────────
+/build/ff-smoke/
