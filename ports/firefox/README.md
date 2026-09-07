@@ -82,9 +82,15 @@ What the script verifies, and what it merely relies on:
   recorded in `Packages.xz`. So with a keyring the chain is
   signature → InRelease → Packages.xz → .deb; without one it is
   https → InRelease → Packages.xz → .deb.
-* **Transport**: `DEBIAN_MIRROR` and `MOZ_BASE` must be https. Set
-  `ALLOW_INSECURE_MIRROR=1` to use a plain-http mirror (e.g. a local cache);
-  the hash chain above still applies.
+* **Transport**: `DEBIAN_MIRROR` and `MOZ_BASE` must be https, and every
+  download is pinned to https for redirects too (`curl --proto '=https'
+  --proto-redir '=https'`). Curl's default redirect protocol set includes
+  plain http, so without `--proto-redir` an https mirror answering
+  `302 Location: http://...` would be followed silently; that matters most
+  for `InRelease`, which is the only trust anchor on a host without a Debian
+  keyring. Set `ALLOW_INSECURE_MIRROR=1` to allow plain http both as a mirror
+  URL and as a redirect target (e.g. for a local cache); the run then warns,
+  and the hash chain above is what still protects the contents.
 * Not verified: Mozilla's `SHA256SUMS.asc` (only relevant in the unpinned
   fallback), and the contents of the Debian packages beyond their recorded
   hashes.

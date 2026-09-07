@@ -28,7 +28,8 @@
 #     both are present on the host (else a warning), the Packages.xz sha256
 #     must match the one InRelease records (fetched via by-hash), and every
 #     .deb must match the sha256 recorded in Packages.xz.
-#   * Mirrors must be https unless ALLOW_INSECURE_MIRROR=1.
+#   * Mirrors must be https, and every download refuses to follow a redirect
+#     off https, unless ALLOW_INSECURE_MIRROR=1.
 #
 # Downloads are cached under ports/firefox/prebuilt/ and the script is
 # idempotent: re-running it re-uses every cached download and stamps.
@@ -42,7 +43,8 @@
 #   DEBIAN_MIRROR=...       default https://deb.debian.org/debian
 #   DEBIAN_KEYRING=<file>   gpg keyring holding the Debian archive signing keys
 #                           (default: the usual debian-archive-keyring paths)
-#   ALLOW_INSECURE_MIRROR=1 permit http:// in DEBIAN_MIRROR / MOZ_BASE
+#   ALLOW_INSECURE_MIRROR=1 permit http:// in DEBIAN_MIRROR / MOZ_BASE and in
+#                           redirect targets
 #   REFRESH_INDEX=1         re-download InRelease and the Packages.xz index
 #   SKIP_CHECK=1            skip the final closure check
 #   NO_I386_EXEC=1          pretend the host cannot run i386 binaries (exercises
@@ -101,7 +103,7 @@ warn() { printf '[fetch-runtime] WARNING: %s\n' "$*" >&2; }
 die()  { printf '[fetch-runtime] ERROR: %s\n' "$*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "required tool '$1' not found${2:+ ($2)}"; }
-need curl "or set FETCH=wget below"
+need curl "the only downloader used here"
 need dpkg-deb "package dpkg on Debian/Ubuntu, dpkg on Fedora/Arch/Homebrew"
 need readelf "package binutils"
 need xz
@@ -109,17 +111,40 @@ need bzip2
 need sha256sum
 need awk
 
+# Transport policy.  Two things have to hold, and they are separate checks:
+#   * the configured mirror URLs must be https (the loop below), and
+#   * curl must not be talked into plain http by a redirect.  curl's default
+#     redirect protocol set INCLUDES http, so an https mirror answering 302
+#     Location: http://... would otherwise be followed silently.  --proto
+#     restricts the initial request and --proto-redir every redirect target,
+#     so both the InRelease trust anchor and the unpinned SHA256SUMS fallback
+#     stay on TLS all the way.
+# ALLOW_INSECURE_MIRROR=1 relaxes both (for a local/plain-http package cache);
+# the sha256 chain in this script is what still protects the contents then.
 for u in "$DEBIAN_MIRROR" "$MOZ_BASE"; do
     case "$u" in
         https://*) ;;
         *) [ "${ALLOW_INSECURE_MIRROR:-0}" = 1 ] || die "refusing non-https URL '$u' (set ALLOW_INSECURE_MIRROR=1 to override)" ;;
     esac
 done
+if [ "${ALLOW_INSECURE_MIRROR:-0}" = 1 ]; then
+    CURL_PROTO="--proto =https,http --proto-redir =https,http"
+    warn "ALLOW_INSECURE_MIRROR=1: plain http is permitted for downloads and redirects"
+else
+    CURL_PROTO="--proto =https --proto-redir =https"
+fi
+
+# Every download in this script goes through here, so the protocol policy
+# cannot be bypassed by forgetting a flag at one call site.
+curl_get() {  # curl_get DEST URL
+    # shellcheck disable=SC2086  # CURL_PROTO is a deliberate multi-word option list
+    curl -fsSL $CURL_PROTO --retry 3 -o "$1" "$2"
+}
 
 download() {  # download URL DEST
     [ -s "$2" ] && return 0
     log "fetching $(basename "$2")"
-    curl -fsSL --retry 3 -o "$2.part" "$1" || { rm -f "$2.part"; die "download failed: $1"; }
+    curl_get "$2.part" "$1" || { rm -f "$2.part"; die "download failed: $1 (if the mirror redirects to plain http, see ALLOW_INSECURE_MIRROR)"; }
     mv "$2.part" "$2"
 }
 
@@ -246,9 +271,9 @@ if [ -s "$INDEX_XZ" ] && ! sha256_check "$INDEX_XZ" "$index_sha"; then
     rm -f "$INDEX_XZ" "$INDEX"
 fi
 if [ ! -s "$INDEX_XZ" ]; then
-    curl -fsSL --retry 3 -o "$INDEX_XZ.part" "$DEBIAN_MIRROR/dists/$SUITE/main/binary-$ARCH/by-hash/SHA256/$index_sha" \
-        || curl -fsSL --retry 3 -o "$INDEX_XZ.part" "$DEBIAN_MIRROR/dists/$SUITE/$INDEX_PATH" \
-        || { rm -f "$INDEX_XZ.part"; die "download failed: $INDEX_PATH"; }
+    curl_get "$INDEX_XZ.part" "$DEBIAN_MIRROR/dists/$SUITE/main/binary-$ARCH/by-hash/SHA256/$index_sha" \
+        || curl_get "$INDEX_XZ.part" "$DEBIAN_MIRROR/dists/$SUITE/$INDEX_PATH" \
+        || { rm -f "$INDEX_XZ.part"; die "download failed: $INDEX_PATH (if the mirror redirects to plain http, see ALLOW_INSECURE_MIRROR)"; }
     mv "$INDEX_XZ.part" "$INDEX_XZ"
 fi
 sha256_check "$INDEX_XZ" "$index_sha" || { rm -f "$INDEX_XZ" "$INRELEASE"; die "Packages.xz does not match the sha256 in InRelease (deleted; re-run)"; }
