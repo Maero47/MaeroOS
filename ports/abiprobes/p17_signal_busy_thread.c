@@ -65,8 +65,7 @@ static void one_case(int process_directed)
         if (kill(getpid(), SIGTERM) != 0)
             probe_fail("kill: %s", strerror(errno));
     } else {
-        if (pthread_kill(t, SIGTERM) != 0)
-            probe_fail("pthread_kill: %s", strerror(errno));
+        probe_kill_thread(t, SIGTERM, what);
     }
     while (!got && now_ms() - t0 < 3000)
         sleep_ms(1);

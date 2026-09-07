@@ -37,11 +37,15 @@ static long verify(const unsigned char *p, size_t len, uint32_t seed)
 
 int main(int argc, char **argv)
 {
-    probe_watchdog(240);
     size_t mib = 700;
     if (argc > 1)
         mib = (size_t)strtoul(argv[1], NULL, 10);
     size_t len = mib << 20;
+    /* Touching the whole allocation is the slow part, so the watchdog scales
+     * with the size: 700 MiB -> 470 s, 1400 MiB -> 820 s.  tools/smoke_abi.py
+     * mirrors this expression in p18_watchdog() and sets its own timeout
+     * above it; keep the two in step (the driver checks them). */
+    probe_watchdog(120 + (long)mib / 2);
 
     double t0 = now_ms();
     unsigned char *big = calloc(1, len);

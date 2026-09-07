@@ -12,9 +12,15 @@
  * signal (proc/signal.c:54-61, S1) and the futex then returns 0 (F3).
  *
  * Six threads park in a raw FUTEX_WAIT (private, expected value 0) on
- * separate words with no waker for 5 s; thread 0 additionally receives an
- * ignored SIGUSR1 and a blocked SIGUSR2 every 500 ms.  Every return before
- * the final wake is counted.  Linux: 0 returns.
+ * separate words with no waker for 5 s.  Waiter 0 is additionally sent a
+ * SIGUSR1 that it blocks, and waiter 1 a SIGUSR2 that the process ignores;
+ * neither may wake its waiter.  Every return before the final wake is
+ * counted.  Linux: 0 returns.
+ *
+ * A seventh CONTROL waiter is sent the same SIGUSR1 unblocked, with a handler
+ * installed: Linux wakes it with EINTR.  Without that control a kernel that
+ * cannot deliver signals to a parked thread at all would report "0 spurious
+ * returns" and pass while never exercising the blocked/ignored case.
  *
  * S8: a FUTEX_WAKE/FUTEX_WAIT ping-pong between two threads measures the
  * wake-to-run round trip; the average must be well below a 10 ms tick.
@@ -23,7 +29,8 @@
 #include "probe.h"
 #include <linux/futex.h>
 
-#define NW 6
+#define NW 6          /* waiters that must never return early */
+#define CTRL NW       /* control waiter: a handled, unblocked signal must reach it */
 #define PARK_MS 5000
 
 struct waiter {
@@ -32,7 +39,10 @@ struct waiter {
     int spurious, eintr, other, other_errno;
     pthread_t t;
 };
-static struct waiter W[NW];
+static struct waiter W[NW + 1];
+
+static volatile sig_atomic_t usr1_handled;
+static void on_usr1(int sig) { (void)sig; usr1_handled++; }
 
 static long futex(int *uaddr, int op, int val, const struct kernel_old_timespec *ts)
 {
@@ -42,12 +52,11 @@ static long futex(int *uaddr, int op, int val, const struct kernel_old_timespec 
 static void *waiter_fn(void *arg)
 {
     struct waiter *w = arg;
-    if (w == &W[0]) {
-        sigset_t s;
-        sigemptyset(&s);
-        sigaddset(&s, SIGUSR2);
-        pthread_sigmask(SIG_BLOCK, &s, NULL);
-    }
+    sigset_t s;
+    sigemptyset(&s);
+    sigaddset(&s, SIGUSR1);
+    /* Waiter 0 blocks the handled SIGUSR1; the control waiter must not. */
+    pthread_sigmask(w == &W[0] ? SIG_BLOCK : SIG_UNBLOCK, &s, NULL);
     while (__atomic_load_n(&w->word, __ATOMIC_ACQUIRE) == 0) {
         long r = futex(&w->word, FUTEX_WAIT_PRIVATE, 0, NULL);
         if (r == 0) {
@@ -85,9 +94,14 @@ static void *pong_fn(void *arg)
 int main(void)
 {
     probe_watchdog(60);
-    signal(SIGUSR1, SIG_IGN);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_usr1;            /* handled: blocked in W[0], live in CTRL */
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR1, &sa, NULL);
+    signal(SIGUSR2, SIG_IGN);           /* ignored process-wide */
 
-    for (int i = 0; i < NW; i++)
+    for (int i = 0; i <= CTRL; i++)
         if (pthread_create(&W[i].t, NULL, waiter_fn, &W[i]) != 0)
             probe_fail("pthread_create: %s", strerror(errno));
     sleep_ms(300);
@@ -96,16 +110,30 @@ int main(void)
     int kicks = 0;
     while (now_ms() - t0 < PARK_MS) {
         sleep_ms(500);
-        pthread_kill(W[0].t, SIGUSR1);   /* ignored */
-        pthread_kill(W[0].t, SIGUSR2);   /* blocked in that thread */
+        probe_kill_thread(W[0].t, SIGUSR1, "blocked-signal waiter");
+        probe_kill_thread(W[1].t, SIGUSR2, "ignored-signal waiter");
+        probe_kill_thread(W[CTRL].t, SIGUSR1, "control waiter");
         kicks++;
     }
-    for (int i = 0; i < NW; i++) {
+    for (int i = 0; i <= CTRL; i++) {
         __atomic_store_n(&W[i].word, 1, __ATOMIC_RELEASE);
         futex(&W[i].word, FUTEX_WAKE_PRIVATE, 1, NULL);
     }
-    for (int i = 0; i < NW; i++)
+    for (int i = 0; i <= CTRL; i++)
         pthread_join(W[i].t, NULL);
+
+    /* Control first: if signals never reach a parked waiter, the counts below
+     * prove nothing about blocked and ignored signals. */
+    probe_info("control waiter: %d EINTR, %d spurious, %d other returns; "
+               "handler ran %d times", W[CTRL].eintr, W[CTRL].spurious,
+               W[CTRL].other, (int)usr1_handled);
+    if (W[CTRL].eintr < 1)
+        probe_fail("a handled, unblocked SIGUSR1 sent %d times never returned EINTR from "
+                   "a parked FUTEX_WAIT (%d spurious, %d other, handler ran %d): signals "
+                   "do not reach parked waiters, so the blocked/ignored cases below are "
+                   "untested", kicks, W[CTRL].spurious, W[CTRL].other, (int)usr1_handled);
+    if (usr1_handled < 1)
+        probe_fail("the SIGUSR1 handler never ran although %d were sent", kicks);
 
     int spurious = 0, eintr = 0, other = 0, oerr = 0;
     for (int i = 0; i < NW; i++) {
@@ -115,15 +143,18 @@ int main(void)
         if (W[i].other)
             oerr = W[i].other_errno;
     }
-    probe_info("%d waiters parked %d ms, %d ignored+blocked signal pairs sent: "
+    probe_info("%d waiters parked %d ms, %d blocked and %d ignored signals delivered: "
                "%d spurious, %d EINTR, %d other returns",
-               NW, PARK_MS, kicks, spurious, eintr, other);
+               NW, PARK_MS, kicks, kicks, spurious, eintr, other);
     if (other)
         probe_fail("FUTEX_WAIT failed with errno %d (%s)", oerr, strerror(oerr));
     if (spurious)
         probe_fail("%d FUTEX_WAIT return(s) without wake, timeout or signal", spurious);
     if (eintr)
         probe_fail("%d EINTR return(s) for signals that were ignored or blocked", eintr);
+    if (usr1_handled > kicks)
+        probe_fail("the SIGUSR1 handler ran %d times for %d signals: it also ran in the "
+                   "thread that blocks SIGUSR1", (int)usr1_handled, kicks);
 
     /* S8 */
     pthread_t pt;

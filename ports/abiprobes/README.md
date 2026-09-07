@@ -86,15 +86,38 @@ On MaeroOS under QEMU:
     python3 tools/smoke_abi.py --mem 2048M  # the audit's second P18 case
     python3 tools/smoke_abi.py --only p05,p13
 
-`tools/smoke_abi.py` runs each probe from the shell over the serial console,
-reads the verdict line and prints a summary `N pass, M xfail, K unexpected,
-X xpass, S skip`.  Probes that the audit expects to fail on the current kernel
-are listed in `XFAIL` inside the script, so the target is green today; when a
-kernel fix flips one to PASS it is reported as XPASS and its entry must be
-removed to make it required (`--strict` turns XPASS into a failure).  Only
-P18 is expected to pass on the current kernel.
+P18 sizes its allocation from the QEMU memory (`mem - 324 MiB`, clamped to
+64..1400), so `-m 1024M` runs the audit's 700 MiB case and `-m 2048M` a
+genuinely larger 1400 MiB one.
 
-Each probe has an internal watchdog (60 s, 240 s for P18) that prints a FAIL
-line and exits, so a hung syscall still returns the shell prompt.  P16 and
-P18 accept a size in MiB as `argv[1]`; the driver scales P18 to the QEMU
-memory.
+`tools/smoke_abi.py` runs each probe from the shell over the serial console,
+reads the verdict line and prints a summary `N pass, M xfail, K unexpected
+fail, X xpass, S skip, H hang, R not run, V no verdict`.  Probes that the
+audit expects to fail on the current kernel are listed in `XFAIL` inside the
+script, so the target is green today; when a kernel fix flips one to PASS it
+is reported as XPASS and its entry must be removed to make it required
+(`--strict` turns XPASS into a failure).  P18 and P20 pass on the current
+kernel and are required; the other eighteen are listed in `XFAIL`.
+
+An `XFAIL` entry is satisfied only by a probe that ran and printed
+`FAIL <name>: ...`.  A probe that printed no verdict line, that wedged the
+guest shell, or that never ran is a hard failure whether or not it is listed:
+those mean the harness itself is broken (binaries missing from the initrd,
+exec failure, a crash before any output, a kernel wedge) and would otherwise
+be indistinguishable from the expected ABI failures.  After a wedge the driver
+kills QEMU, reboots and continues with the remaining probes.
+
+Each probe arms an internal watchdog thread that prints a `FAIL` line and
+exits, so a hung syscall still returns the shell prompt instead of wedging
+the guest:
+
+| Probes | Watchdog | Driver timeout |
+|---|---|---|
+| P1-P10, P12-P15, P17, P19, P20 | 60 s | 90 s |
+| P11, P16 | 120 s | 150 s |
+| P18 | `120 + MiB/2` s (470 s at 700 MiB) | watchdog + 30 s |
+
+The driver derives its per-probe timeout as watchdog + 30 s, so the watchdog
+always fires first, and it verifies the watchdog values in this table against
+the `probe_watchdog()` calls in the sources before every run (a mismatch
+aborts the run). P16 and P18 accept a size in MiB as `argv[1]`.

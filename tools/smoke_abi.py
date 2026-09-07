@@ -8,14 +8,25 @@ same binaries print PASS on a Linux host; that is the behaviour asserted here.
 
 Probes the audit expects to FAIL on the current kernel are listed in XFAIL
 with the finding ids they cover.  A kernel fix that makes one of them pass
-shows up as XPASS: remove the entry so the probe becomes required.  The run
-is green when there is no unexpected FAIL (and, with --strict, no XPASS).
+shows up as XPASS: remove the entry so the probe becomes required.
+
+Only a probe that actually ran and printed `FAIL <name>: ...` can satisfy an
+XFAIL entry.  A probe that produced no verdict line, that wedged the guest
+shell, or that never ran is a hard failure whether or not it is in XFAIL:
+those are harness faults (missing binaries, exec failure, a crash before any
+output, a kernel wedge), and swallowing them would hide a run in which
+nothing was actually tested.  Each is counted separately in the summary.
+
+When a probe wedges the shell the driver kills QEMU, reboots and continues
+with the remaining probes, so one wedge does not turn the rest of the run
+into NOTRUN.
 
 Usage: tools/smoke_abi.py [--mem 1024M] [--only p05,p13] [--strict]
                           [--timeout SECS] [--qemu qemu-system-i386]
 """
 import argparse
 import os
+import re
 import selectors
 import subprocess
 import sys
@@ -24,31 +35,41 @@ import time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PROBE_DIR = os.path.join(ROOT, "testfiles", "abiprobes")
+SRC_DIR = os.path.join(ROOT, "ports", "abiprobes")
 GUEST_DIR = "/abiprobes"
 PROMPT = "MaeroOS$ "
+BOOT_TIMEOUT = 75
 
-# name -> (per-probe timeout in seconds, extra arguments)
+# Seconds allowed on top of a probe's own watchdog before the driver gives up
+# on the shell prompt.  The probe's watchdog always fires first and prints a
+# FAIL line, so a stuck syscall is reported as a verdict rather than a wedge.
+GRACE = 30
+
+# name -> (watchdog seconds, extra guest arguments).  "watchdog" must equal the
+# probe_watchdog(...) argument in ports/abiprobes/<name>.c; check_watchdogs()
+# enforces that before the run.  None means the probe computes its watchdog
+# from its arguments (p18); see p18_watchdog() below.
 PROBES = {
-    "p01_fatal_signal_scope":  (90, ""),
-    "p02_spawn_exit_group":    (90, ""),
-    "p03_sigchld_thread":      (90, ""),
-    "p04_spurious_futex":      (90, ""),
-    "p05_stale_wake_tick":     (90, ""),
-    "p06_mmap_prot_madvise":   (90, ""),
-    "p07_ftruncate64":         (90, ""),
-    "p08_select_timeout":      (90, ""),
-    "p09_poll_eintr_restart":  (90, ""),
-    "p10_unix_socket":         (90, ""),
-    "p11_addr_space_reuse":    (150, ""),
-    "p12_clocks":              (90, ""),
-    "p13_futex_timeout":       (90, ""),
-    "p14_exec_arg_size":       (90, ""),
-    "p15_socket_cloexec":      (90, ""),
-    "p16_memfd_cloexec_size":  (150, ""),
-    "p17_signal_busy_thread":  (90, ""),
-    "p18_high_memory":         (300, "{p18_mib}"),
-    "p19_siginfo":             (90, ""),
-    "p20_shared_futex":        (90, ""),
+    "p01_fatal_signal_scope":  (60, ""),
+    "p02_spawn_exit_group":    (60, ""),
+    "p03_sigchld_thread":      (60, ""),
+    "p04_spurious_futex":      (60, ""),
+    "p05_stale_wake_tick":     (60, ""),
+    "p06_mmap_prot_madvise":   (60, ""),
+    "p07_ftruncate64":         (60, ""),
+    "p08_select_timeout":      (60, ""),
+    "p09_poll_eintr_restart":  (60, ""),
+    "p10_unix_socket":         (60, ""),
+    "p11_addr_space_reuse":    (120, ""),
+    "p12_clocks":              (60, ""),
+    "p13_futex_timeout":       (60, ""),
+    "p14_exec_arg_size":       (60, ""),
+    "p15_socket_cloexec":      (60, ""),
+    "p16_memfd_cloexec_size":  (120, ""),
+    "p17_signal_busy_thread":  (60, ""),
+    "p18_high_memory":         (None, "{p18_mib}"),
+    "p19_siginfo":             (60, ""),
+    "p20_shared_futex":        (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.
@@ -58,8 +79,8 @@ XFAIL = {
     "p01_fatal_signal_scope":  "RC1, S2: fatal signal kills one thread",
     "p02_spawn_exit_group":    "RC2, C1: CLONE_VM child shares the tgid",
     "p03_sigchld_thread":      "RC3, S3, S4, S11, C2: per-thread handlers/SIGCHLD/waitpid",
-    "p04_spurious_futex":      "RC4, F3, F11, S1, S8: nets and signal wakes",
-    "p05_stale_wake_tick":     "F4: stale wake_tick",
+    "p04_spurious_futex":      "RC4, F3, F11, S1, S8: nets and signal wakes; blocked first by tkill (238) missing, which is what musl's pthread_kill uses",
+    "p05_stale_wake_tick":     "F4: stale wake_tick; blocked first by tkill (238) missing",
     "p06_mmap_prot_madvise":   "M1, M6, M4: prot not enforced, DONTNEED skips COW",
     "p07_ftruncate64":         "syscalls 194/193/297/40 missing",
     "p08_select_timeout":      "E2: select ignores the timeout",
@@ -73,8 +94,56 @@ XFAIL = {
     "p16_memfd_cloexec_size":  "C5, M5: MFD_CLOEXEC ignored, write not reflected",
     "p17_signal_busy_thread":  "S2, S4: no delivery to a CPU-bound thread",
     "p19_siginfo":             "S6: si_addr/si_code, sa_mask, sigaltstack",
-    "p20_shared_futex":        "F5, F6: shared futex on a non-present page",
+    # p20_shared_futex is NOT listed: F5/F6 are marked conditional in the audit
+    # and the shared-futex cases were observed to work on this kernel, so the
+    # probe is required to keep passing.
 }
+
+
+def p18_watchdog(mib):
+    """Mirror of the probe_watchdog() expression in p18_high_memory.c."""
+    return 120 + mib // 2
+
+
+def watchdog_secs(name, p18_mib):
+    wd = PROBES[name][0]
+    return p18_watchdog(p18_mib) if wd is None else wd
+
+
+def check_watchdogs(selected, p18_mib):
+    """Every probe must fire its own watchdog before the driver's timeout.
+
+    The driver's timeout is watchdog + GRACE by construction, so all that is
+    left to verify is that the table matches the compiled-in value.  Reading
+    the sources keeps the two from drifting apart silently.
+    """
+    problems = []
+    for name in selected:
+        src = os.path.join(SRC_DIR, name + ".c")
+        if not os.path.exists(src):
+            continue
+        with open(src) as fh:
+            m = re.search(r"probe_watchdog\(([^;]*)\)\s*;", fh.read())
+        if not m:
+            problems.append(f"{name}: no probe_watchdog() call in {name}.c")
+            continue
+        expr = m.group(1).strip()
+        table = PROBES[name][0]
+        if expr.isdigit():
+            if table is None:
+                problems.append(f"{name}: source has a constant watchdog {expr}, "
+                                f"table says dynamic")
+            elif int(expr) != table:
+                problems.append(f"{name}: source watchdog {expr} s, table {table} s")
+        else:
+            if table is not None:
+                problems.append(f"{name}: source watchdog is '{expr}' (dynamic), "
+                                f"table says {table} s")
+            elif "120 + (long)mib / 2" not in expr:
+                problems.append(f"{name}: dynamic watchdog '{expr}' does not match "
+                                f"p18_watchdog() in this driver")
+    if problems:
+        raise SystemExit("watchdog/timeout mismatch:\n  " + "\n  ".join(problems))
 
 
 def wait_for(proc, sel, needle, log, timeout, start=0):
@@ -99,6 +168,37 @@ def send(proc, text):
     proc.stdin.flush()
 
 
+def kill_qemu(proc):
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def boot(args):
+    """Start QEMU and wait for the shell prompt.  Returns (proc, sel, log)."""
+    proc = subprocess.Popen(
+        [args.qemu, "-kernel", "kernel.elf", "-initrd", "initrd.tar",
+         "-serial", "stdio", "-display", "none", "-m", args.mem,
+         "-no-reboot", "-no-shutdown"],
+        cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, bufsize=0,
+    )
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+    log = []
+    try:
+        if not wait_for(proc, sel, PROMPT, log, timeout=BOOT_TIMEOUT):
+            raise TimeoutError(f"no shell prompt within {BOOT_TIMEOUT} s")
+    except Exception:
+        kill_qemu(proc)
+        raise
+    return proc, sel, log
+
+
 def parse_mem_mib(mem):
     mem = mem.strip().upper()
     if mem.endswith("G"):
@@ -121,7 +221,9 @@ def verdict(body, name):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mem", default="1024M", help="QEMU memory (default 1024M; audit P18 also asks for 2048M)")
+    ap.add_argument("--mem", default="1024M",
+                    help="QEMU memory (default 1024M; the audit also asks for 2048M, "
+                         "which scales P18's allocation up with it)")
     ap.add_argument("--only", default="", help="comma-separated probe prefixes, e.g. p05,p13")
     ap.add_argument("--strict", action="store_true", help="treat XPASS as a failure")
     ap.add_argument("--timeout", type=int, default=0, help="override every per-probe timeout")
@@ -129,8 +231,12 @@ def main():
     args = ap.parse_args()
 
     mem_mib = parse_mem_mib(args.mem)
-    # P18 touches this much in one calloc; leave room for kernel + initrd.
-    p18_mib = max(64, min(700, mem_mib - 324))
+    # P18 calloc()s and touches this much in one go.  Leave the kernel, the
+    # initrd and the guest page tables room, and stay inside what a 32-bit
+    # user address space can hold: -m 1024M gives the audit's 700 MiB and
+    # -m 2048M a genuinely larger 1400 MiB run.
+    p18_mib = max(64, min(1400, mem_mib - 324))
+    args.p18_mib = p18_mib
 
     selected = list(PROBES)
     if args.only:
@@ -143,74 +249,91 @@ def main():
     if missing:
         raise SystemExit("probe binaries missing (run `make abiprobes`): " + ", ".join(missing))
 
-    proc = subprocess.Popen(
-        [args.qemu, "-kernel", "kernel.elf", "-initrd", "initrd.tar",
-         "-serial", "stdio", "-display", "none", "-m", args.mem,
-         "-no-reboot", "-no-shutdown"],
-        cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, bufsize=0,
-    )
-    sel = selectors.DefaultSelector()
-    sel.register(proc.stdout, selectors.EVENT_READ)
-    log = []
-    results = {}   # name -> (tag, line)
-    try:
-        if not wait_for(proc, sel, PROMPT, log, timeout=75):
-            raise TimeoutError("no shell prompt after boot")
+    check_watchdogs(selected, p18_mib)
 
-        for name in selected:
-            tmo, extra = PROBES[name]
-            if args.timeout:
-                tmo = args.timeout
-            cmd = f"{GUEST_DIR}/{name} {extra.format(p18_mib=p18_mib)}".rstrip()
+    results = {}   # name -> (tag, line, wedged)
+    proc = sel = log = None
+    try:
+        proc, sel, log = boot(args)
+        for i, name in enumerate(selected):
+            if proc is None:                      # previous probe wedged the guest
+                print("\n[SMOKE-ABI] rebooting after the wedge")
+                try:
+                    proc, sel, log = boot(args)
+                except Exception as exc:
+                    for rest in selected[i:]:
+                        results[rest] = ("NOTRUN", f"NOTRUN {rest}: reboot failed ({exc})", False)
+                    break
+            wd = watchdog_secs(name, p18_mib)
+            tmo = args.timeout or wd + GRACE
+            extra = PROBES[name][1].format(p18_mib=p18_mib)
+            cmd = f"{GUEST_DIR}/{name} {extra}".rstrip()
             before = len("".join(log))
-            print(f"\n[SMOKE-ABI] running {cmd}")
+            print(f"\n[SMOKE-ABI] running {cmd} (watchdog {wd} s, timeout {tmo} s)")
             send(proc, cmd + "\n")
             got_prompt = wait_for(proc, sel, PROMPT, log, timeout=tmo, start=before)
             body = "".join(log)[before:]
             v = verdict(body, name)
-            if not got_prompt:
-                results[name] = ("HANG", f"HANG {name}: no prompt after {tmo} s")
-                print(f"\n[SMOKE-ABI] {name} hung the shell; stopping the run")
-                for rest in selected[selected.index(name) + 1:]:
-                    results[rest] = ("NOTRUN", f"NOTRUN {rest}: shell hung earlier")
-                break
-            if v is None:
-                v = ("FAIL", f"FAIL {name}: no verdict line (crashed?)")
-            results[name] = v
+            if got_prompt:
+                if v is None:
+                    results[name] = ("NOVERDICT", f"NOVERDICT {name}: ran but printed no "
+                                                  f"PASS/FAIL/SKIP line", False)
+                else:
+                    results[name] = (v[0], v[1], False)
+            else:
+                detail = f" (last line: {v[1]})" if v else " and printed no verdict line"
+                results[name] = ("HANG", f"HANG {name}: no shell prompt after {tmo} s"
+                                         f"{detail}", True)
+                print(f"\n[SMOKE-ABI] {name} wedged the shell; killing QEMU")
+                kill_qemu(proc)
+                proc = None
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        kill_qemu(proc)
 
-    npass = nxfail = nxpass = nskip = nfail = 0
+    return summarise(selected, results, args)
+
+
+def summarise(selected, results, args):
+    """Print the per-probe verdicts and the summary; return the exit code.
+
+    Only a FAIL from a probe that ran satisfies an XFAIL entry.  HANG, NOTRUN
+    and NOVERDICT are harness faults and always fail the run.
+    """
+    counts = dict(npass=0, nxfail=0, nxpass=0, nskip=0, nfail=0,
+                  nhang=0, nnotrun=0, nnoverdict=0)
     print("\n[SMOKE-ABI] results:")
     for name in selected:
-        tag, line = results.get(name, ("NOTRUN", f"NOTRUN {name}"))
+        tag, line, _ = results.get(name, ("NOTRUN", f"NOTRUN {name}: never started", False))
         expected_fail = name in XFAIL
-        if tag == "PASS" and not expected_fail:
-            status = "pass"
-            npass += 1
-        elif tag == "PASS" and expected_fail:
-            status = "XPASS (remove from XFAIL: " + XFAIL[name] + ")"
-            nxpass += 1
+        if tag == "HANG":
+            # A wedge is a harness fault even for an expected failure: the guest
+            # had to be rebooted and the probe never returned a clean verdict.
+            status, key = "HANG", "nhang"
+        elif tag == "NOTRUN":
+            status, key = "NOTRUN", "nnotrun"
+        elif tag == "NOVERDICT":
+            status, key = "NO VERDICT", "nnoverdict"
         elif tag == "SKIP":
-            status = "skip"
-            nskip += 1
-        elif tag in ("FAIL", "HANG", "NOTRUN") and expected_fail:
-            status = "xfail (" + XFAIL[name] + ")"
-            nxfail += 1
+            status, key = "skip", "nskip"
+        elif tag == "PASS":
+            if expected_fail:
+                status, key = "XPASS (remove from XFAIL: " + XFAIL[name] + ")", "nxpass"
+            else:
+                status, key = "pass", "npass"
+        elif expected_fail:
+            status, key = "xfail (" + XFAIL[name] + ")", "nxfail"
         else:
-            status = "UNEXPECTED " + tag
-            nfail += 1
+            status, key = "UNEXPECTED FAIL", "nfail"
+        counts[key] += 1
         print(f"  {status:<12} {line}")
 
-    print(f"\n[SMOKE-ABI] {npass} pass, {nxfail} xfail, {nfail} unexpected, "
-          f"{nxpass} xpass, {nskip} skip (mem {args.mem}, p18 {p18_mib} MiB)")
-    if nfail or (args.strict and nxpass):
+    print(f"\n[SMOKE-ABI] {counts['npass']} pass, {counts['nxfail']} xfail, "
+          f"{counts['nfail']} unexpected fail, {counts['nxpass']} xpass, "
+          f"{counts['nskip']} skip, {counts['nhang']} hang, "
+          f"{counts['nnotrun']} not run, {counts['nnoverdict']} no verdict "
+          f"(mem {args.mem}, p18 {args.p18_mib} MiB)")
+    hard = counts["nfail"] + counts["nhang"] + counts["nnotrun"] + counts["nnoverdict"]
+    if hard or (args.strict and counts["nxpass"]):
         print("[SMOKE-ABI] failed")
         return 1
     print("[SMOKE-ABI] passed")
