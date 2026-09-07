@@ -24,6 +24,26 @@ and each carries a probe program (section 8) that proves or disproves it in QEMU
 
 ## 1. Executive summary
 
+> **Errata after measurement (2026-09-08).** The section 8 probes have since
+> been implemented as `ports/abiprobes/` on branch `yonet/abi-probes`, and the
+> first `make smoke-abi` baseline against this unmodified kernel (2026-09-07)
+> does not confirm all of this document:
+>
+> - **p01, p02, p03, p06-p17 and p19 failed as predicted**, so RC1, RC2, RC3
+>   and findings S2-S6, C1-C5, E1, E2, U2-U5, M1, M3, M4, M6, T1, T2, T4, F2
+>   and the missing syscalls stand as written. p18 passed, also as predicted
+>   (M10).
+> - **p04, p05 and p20 passed on the unmodified kernel**, so **F3, F4, F5 and
+>   F6 did not reproduce as written**. They remain code-reading conclusions
+>   with no observed failure behind them. Do not spend a kernel change on them
+>   until a probe reproduces them; the discrepancy itself is the open question
+>   (section 9). RC4 item 3 and probe P5 have been rewritten — the `poll()`
+>   path they described in the first revision does not exist, see F4 and E1 —
+>   and the four rows are marked in section 3.1.
+>
+> Nothing else here has been executed; every unmarked row is still a
+> code-reading conclusion.
+
 The futex compare-and-sleep itself is not the problem. Every trap into the
 kernel takes the big kernel lock (`arch/i686/cpu/isr.asm:169-176`,
 `arch/i686/cpu/bkl.c:18-40`) and the lock is held across `swtch()` until the
@@ -119,7 +139,7 @@ The five most likely root causes, ranked:
   wakes the creating thread with a spurious `SIGCHLD` (`proc/signal.c:58-61`),
   which is one of the spurious futex returns in RC4.
 
-### RC4. Kernel-injected spurious wake-ups plus wake-to-run latency widen glibc 2.36's condvar steal window (confidence: high that it widens the window, medium that it is the WaitForProcessHandle trigger)
+### RC4. Kernel-injected spurious wake-ups plus wake-to-run latency widen glibc 2.36's condvar steal window (confidence: medium for the mechanism, low that it is the WaitForProcessHandle trigger — see the errata: the two sources a standalone probe can reach did not reproduce)
 
 - glibc 2.36 `__pthread_cond_wait_common`: after the futex returns, the waiter
   drops its group reference (`nptl/pthread_cond_wait.c:521`), reloads
@@ -134,31 +154,57 @@ The five most likely root causes, ranked:
   Linux that is nanoseconds and the futex only returns for a real wake, a
   timeout or a signal (`kernel/futex/waitwake.c:719-738`, spurious wake-ups
   retry inside the kernel). On MaeroOS the window is stretched by:
-  1. the "gentle net" that marks every condvar waiter parked for 150 ms
-     runnable whenever four or more exist (`proc/scheduler.c:142-180`), and the
-     "aggressive net" that does the same to mutex waiters during the whole
-     launch phase (`proc/scheduler.c:200-251`); `g_ipc_launch_started` is set by
-     the first `socketpair()` and never cleared (`proc/syscall.c:5930-5936`,
-     `:4513-4516`);
-  2. `signal_send` waking any sleeper for any signal, including the per-thread
-     `SIGCHLD` of RC3 and ignored signals (`proc/signal.c:54-61`);
-  3. a stale `wake_tick`: `signal_send` does not clear it, `sleep_on` does not
-     reset it (`proc/scheduler.c:292-301`), so a thread woken by a signal out of
-     `poll()` and then blocking in an untimed `FUTEX_WAIT` is woken again when
-     the old deadline passes (`proc/scheduler.c:116-121`);
-  4. `sys_futex` returning 0 for a timeout (`proc/syscall.c:5327`) instead of
-     `-ETIMEDOUT`, which makes glibc's timed waits take the "spurious" path once
-     per timeout;
-  5. wake-to-run latency: a woken thread waits for the next pass of an O(n)
-     scheduler loop, with 20 ms quanta and no wake-up preemption outside the
-     launch phase (`proc/scheduler.c:32`, `:413-424`), and an idle CPU sleeps in
-     `hlt` until the next 10 ms tick (`proc/scheduler.c:88-105`).
+  1. *(unmeasured)* the "gentle net" that marks every condvar waiter parked
+     for 150 ms runnable whenever four or more exist (`proc/scheduler.c:142-180`),
+     and the "aggressive net" that does the same to mutex waiters during the
+     whole launch phase (`proc/scheduler.c:200-251`); `g_ipc_launch_started` is
+     set by the first `socketpair()` and never cleared (`proc/syscall.c:5930-5936`,
+     `:4513-4516`). No standalone probe can arm either net: the flag is set only
+     for a process whose name begins `firef` (`proc/syscall.c:5930-5932`) and the
+     gentle net counts only `futex_cond` waiters, i.e. op 9 (`proc/scheduler.c:155-157`,
+     `proc/syscall.c:5285`), while p04 parks in op 0. Only a Firefox run can
+     confirm or refute this item.
+  2. *(not reproduced: p04 passed)* `signal_send` waking any sleeper for any
+     signal, including the per-thread `SIGCHLD` of RC3 and ignored signals
+     (`proc/signal.c:54-61`). The code has no filter, yet the probe that sends an
+     ignored `SIGUSR1` and a blocked `SIGUSR2` to a parked waiter saw no futex
+     return; see section 9.
+  3. *(not reproduced: p05 passed)* a stale `wake_tick`: `signal_send` does not
+     clear it and `sleep_on` does not reset it (`proc/signal.c:54-61`,
+     `proc/scheduler.c:292-301`), so a deadline armed by one syscall can survive
+     into the next blocking one. The only path that can leak a deadline is
+     `nanosleep`/`clock_nanosleep`, which arms `wake_tick` and then returns 0 on
+     a signal wake without clearing it (`proc/syscall.c:2296-2301`, `:4723-4728`);
+     a following untimed `FUTEX_WAIT` leaves `wake_tick` alone (it is armed only
+     when a timeout is supplied, `proc/syscall.c:5229-5260`, and cleared only
+     after the sleep at `:5322`), so the old deadline fires into it
+     (`proc/scheduler.c:116-121`). It is **not** reachable through `poll()`, as
+     the first revision of this document claimed: `sys_poll` re-arms `wake_tick`
+     to at most 50 ticks on every pass (`proc/syscall.c:3898-3901`, `:4133-4138`),
+     never to the caller's deadline, it does not return on a handled signal at all
+     (E1), and `scheduler_tick` zeroes `wake_tick` when a timeout fires
+     (`proc/scheduler.c:118`).
+  4. *(confirmed: p13 failed)* `sys_futex` returning 0 for a timeout
+     (`proc/syscall.c:5327`) instead of `-ETIMEDOUT`, which makes glibc's timed
+     waits take the "spurious" path once per timeout;
+  5. *(partly measured)* wake-to-run latency: a woken thread waits for the next
+     pass of an O(n) scheduler loop, with 20 ms quanta and no wake-up preemption
+     outside the launch phase (`proc/scheduler.c:32`, `:413-424`), and an idle CPU
+     sleeps in `hlt` until the next 10 ms tick (`proc/scheduler.c:88-105`). p04's
+     wake ping-pong stayed under a tick, so the round trip is not pathological at
+     rest; the launch-phase yield gate (`proc/scheduler.c:417-422`) is still
+     untested.
 - Answer to the brief's question: BZ#25847 is not reproducible with a correct
   glibc (2.41 has no steal path), and it is rare on Linux because the window is
   tiny. MaeroOS does not violate futex semantics here (spurious `FUTEX_WAIT`
-  returns are permitted), but it manufactures the timing that the 2.36 bug
-  needs, and the nets that were added to recover lost wake-ups are themselves
-  the largest source of the spurious returns that feed the bug.
+  returns are permitted). Whether it *manufactures* the timing the 2.36 bug
+  needs is now only partly supported: of the five sources above, one is
+  confirmed (item 4), two did not reproduce (items 2 and 3), one cannot be
+  reached outside a Firefox run (item 1, the nets) and one measured clean at
+  rest (item 5). The nets remain the most likely remaining contributor because
+  they are the only source that fires without any syscall from the waiter, but
+  that has not been measured and must be, before RC4 justifies a kernel change
+  beyond item 4.
 
 ### RC5. Thread-exit and crash paths leave IPC endpoints and locks alive (confidence: medium)
 
@@ -250,10 +296,10 @@ to section 8.
 |---|---|---|---|---|---|---|
 | F1 | Compare-and-sleep is serialized by the BKL held from trap entry to the next iret (`isr.asm:169-176`, `bkl.c:18-40`); `sleep_on` sets `SLEEPING` before `cli`/`swtch` (`scheduler.c:292-301`). No lost wake vs. another CPU. | Same guarantee via hash-bucket lock (`waitwake.c:701-738`). | none | none | - | P4 |
 | F2 | Timeout expiry returns 0 (`syscall.c:5327`), not `-ETIMEDOUT`; glibc retries once and gets `-ETIMEDOUT` on the second call because the deadline is then in the past (`:5256`). | `-ETIMEDOUT` (`waitwake.c:729-730`). | degrades (extra syscall per timed wait; feeds RC4 item 4) | Track the tick-wake reason: set a `timed_out` flag in `scheduler_tick` when it fires `wake_tick`; return `-ETIMEDOUT` when set and no wake happened. | S | P13 |
-| F3 | Wake by `signal_send` returns 0 (`:5325-5327` only special-cases SIGKILL). | `-ERESTARTSYS` → `-EINTR` to user unless restarted (`waitwake.c:735-738`). | degrades (spurious 0 return; RC4 item 2) | Return `-EINTR` when `signal_interrupt_pending()`; do not wake for blocked/ignored signals (see S1). | S | P4 |
-| F4 | Stale `wake_tick` is applied to a later untimed wait (`signal.c:58-61` leaves `wake_tick`; `scheduler.c:292-301` does not reset it; `syscall.c:5322` clears it only after the futex wait). | Timeout is per call. | degrades (RC4 item 3) | Clear `wake_tick` in `signal_send` and at the top of `sleep_on`. | S | P5 |
-| F5 | Futex word read via `copy_from_user` which returns `-EFAULT` when the page is merely not present (`:5206`, `:5225`; `access_ok` walks PTEs, `syscall.c:118-143`). | `get_user` faults the page in; `-EFAULT` only for unmapped memory. | conditional (glibc calls `futex_fatal_error` on `EFAULT`, `nptl/futex-internal.c:118-125`); only reachable for a shared futex on an untouched memfd page | Let `copy_from_user` call `vma_handle_fault` on `-EFAULT`, or touch the page first. | S | P20 |
-| F6 | Shared futex whose page is not present in the waker falls back to the private key (`:5332-5336`), so it cannot wake a cross-process waiter registered by physical page. | Key is always the (inode, page) pair. | conditional (only for `PTHREAD_PROCESS_SHARED` in shm; not seen on the launch path) | Resolve through the VMA/shmap registry, not the PTE. | S | P20 |
+| F3 | Wake by `signal_send` returns 0 (`:5325-5327` only special-cases SIGKILL). | `-ERESTARTSYS` → `-EINTR` to user unless restarted (`waitwake.c:735-738`). | **not reproduced** (p04 passed, errata); by code reading: degrades, RC4 item 2 | Return `-EINTR` when `signal_interrupt_pending()`; do not wake for blocked/ignored signals (see S1). Explain the p04 result before changing anything. | S | P4 |
+| F4 | A deadline armed by `nanosleep`/`clock_nanosleep` (`syscall.c:2296-2301`, `:4723-4728`) survives a signal wake — `signal.c:58-61` leaves `wake_tick`, `scheduler.c:292-301` does not reset it — and can fire inside a later untimed `FUTEX_WAIT`, which arms `wake_tick` only when a timeout is given and clears it only after the sleep (`syscall.c:5229-5260`, `:5322`). Not reachable through `poll`/`select`/`epoll_wait`: `io_wait_sleep` re-arms `wake_tick` to ≤ 50 ticks per pass (`syscall.c:3898-3901`) and those loops do not return on a handled signal (E1), and `scheduler_tick` zeroes it on timeout (`scheduler.c:118`). | Timeout is per call. | **not reproduced** (p05 passed, both variants, errata); by code reading: degrades, RC4 item 3 | Clear `wake_tick` in `signal_send` and at the top of `sleep_on`. Cheap and correct either way, but establish the probe first. | S | P5 |
+| F5 | Futex word read via `copy_from_user` which returns `-EFAULT` when the page is merely not present (`:5206`, `:5225`; `access_ok` walks PTEs, `syscall.c:118-143`). | `get_user` faults the page in; `-EFAULT` only for unmapped memory. | **not reproduced** (p20 passed, errata); by code reading: conditional (glibc calls `futex_fatal_error` on `EFAULT`, `nptl/futex-internal.c:118-125`), only reachable for a shared futex on an untouched memfd page | Let `copy_from_user` call `vma_handle_fault` on `-EFAULT`, or touch the page first. | S | P20 |
+| F6 | Shared futex whose page is not present in the waker falls back to the private key (`:5332-5336`), so it cannot wake a cross-process waiter registered by physical page. | Key is always the (inode, page) pair. | **not reproduced** (p20 passed, errata); by code reading: conditional (only for `PTHREAD_PROCESS_SHARED` in shm; not seen on the launch path) | Resolve through the VMA/shmap registry, not the PTE. | S | P20 |
 | F7 | `FUTEX_REQUEUE`/`CMP_REQUEUE` wake `val + val2` waiters instead of moving them (`:5394-5415`); `val3` mismatch does return `-EAGAIN` (`:5404`). | Requeue; return woken (+ requeued for CMP_REQUEUE). | cosmetic for glibc ≥ 2.25 (new condvar does not requeue); wrong for anything that does | Implement real requeue by rewriting `sleep_chan` of the selected waiters. | M | - |
 | F8 | `FUTEX_WAKE_OP` wakes both addresses and never performs the atomic op on `uaddr2` (`:5416-5428`). | Performs op, wakes conditionally. | cosmetic today (glibc 2.36 uses it only in the old condvar) but incorrect | Implement the op encoding. | S | - |
 | F9 | `val3` bitset ignored for WAIT_BITSET/WAKE_BITSET. | Mask match. | cosmetic (glibc passes MATCH_ANY) | Store/compare bitset. | S | - |
@@ -370,14 +416,14 @@ Wiring mistakes found while diffing: 159 (`sched_get_priority_max`) is wired to 
 | 117 | `ipc` | degrades | glibc 2.36 on i386 routes `shmget`/`shmat`/`semop` through `ipc(117)` unless built for ≥ 5.1 kernels (Debian: 3.2 baseline). libxcb's MIT-SHM (`XShm`) and GTK's `gdk_x11` shm images need it if maeroX advertises MIT-SHM; Firefox's `nsShmImage` checks `XShmQueryExtension` first. Return `-ENOSYS` deliberately (already the default) so the X client path stays on `PutImage`. |
 | 160 | `sched_get_priority_min` | degrades | see 159. |
 | 177 | `rt_sigtimedwait` | degrades | glibc `sigtimedwait`/`sigwait`; GLib's `g_unix_signal` does not need it; glibc's `timer_create(SIGEV_THREAD)` helper thread does. |
-| 190 | `vfork` | degrades | glibc `vfork()` (NSPR does not use it; some GLib/GTK helpers do). Implement as `clone(CLONE_VM|CLONE_VFORK)` with its own tgid (C1). |
+| 190 | `vfork` | degrades | glibc `vfork()` (NSPR does not use it; some GLib/GTK helpers do). Implement as `clone(CLONE_VM\|CLONE_VFORK)` with its own tgid (C1). |
 | 193 | `truncate64` | degrades | same as 194 for `truncate()`. |
 | 205 | `getgroups32` | degrades | glibc `getgroups`; `nsLocalFile`/GIO permission checks call it. Return 0 groups. |
 | 320 | `utimensat` | degrades | glibc `utimensat`/`futimens`/`utimes` → 412 then 320; sqlite and `nsLocalFile::SetLastModifiedTime` call it; return 0. |
 | 412 | `utimensat_time64` | degrades | see 320. |
 | 421 | `rt_sigtimedwait_time64` | degrades | see 177. |
 | 0 | `restart_syscall` | cosmetic | only used by the kernel itself for restarted `nanosleep`/`poll`. |
-| 8 | `creat` | cosmetic | glibc `creat` → `open(O_CREAT|O_WRONLY|O_TRUNC)`; 8 is legacy. |
+| 8 | `creat` | cosmetic | glibc `creat` → `open(O_CREAT\|O_WRONLY\|O_TRUNC)`; 8 is legacy. |
 | 13 | `time` | cosmetic | glibc `time()` uses `clock_gettime`. |
 | 27 | `alarm` | cosmetic | glibc `alarm` → `setitimer`. |
 | 29 | `pause` | cosmetic | glibc uses `ppoll`/`rt_sigsuspend`. |
@@ -501,10 +547,15 @@ failures instead of parked threads.
    as a tgid; `SIGCHLD` only for process exit and only to the parent process;
    `waitpid` by parent tgid; `kill(tgid)` picks a thread not blocking the
    signal. Probe P3.
-4. **Stop injecting spurious wake-ups** (S1, F3, F4, F2): `signal_send` wakes
-   only for deliverable signals; clear `wake_tick` in `signal_send` and at the
-   top of `sleep_on`; `sys_futex` returns `-ETIMEDOUT` on tick expiry and
-   `-EINTR` on signal wake. Probes P4, P5, P13.
+4. **Stop injecting spurious wake-ups** (F2 confirmed; S1, F3, F4 not
+   reproduced — see the errata, so this item shrank): `sys_futex` returns
+   `-ETIMEDOUT` on tick expiry (F2, the only part p13 proves is needed). The
+   rest — `signal_send` waking only for deliverable signals, clearing
+   `wake_tick` in `signal_send` and at the top of `sleep_on`, `-EINTR` on a
+   signal wake — is still correct-by-inspection and cheap, but P4 and P5
+   already pass, so it fixes nothing observable; do it as cleanup alongside
+   item 3, not as a bug fix, and keep the probes as regression tests.
+   Probes P4, P5, P13.
 5. **Remove the Firefox-specific nets and traces** (section 6) once 1-4 are
    in, and verify with P4 that no `FUTEX_WAIT` returns without a wake, a timeout
    or a signal.
@@ -620,9 +671,17 @@ which thread happens to crash or lose a wake-up first:
 
 ## 8. Probe programs
 
-Small C programs, statically linked against the glibc in `testfiles/lib`, run
-from the shell in QEMU. Each prints `PASS`/`FAIL` and the observed value; the
-expected Linux result is stated so the same binary can be checked on the host.
+Small C programs, run from the shell in QEMU. Each prints `PASS`/`FAIL` and the
+observed value; the expected Linux result is stated so the same binary can be
+checked on an x86_64 Linux host.
+
+These are implemented as `ports/abiprobes/p01..p20` on branch
+`yonet/abi-probes` (static musl i386 binaries, driver `tools/smoke_abi.py`,
+target `make smoke-abi`). The specifications below are the audit's original
+intent; where the implementation deviates deliberately, its source comment says
+so, and the baseline results are in the errata at the top of section 1. Three
+probes (P4, P5, P20) passed on the unmodified kernel and their entries record
+that.
 
 **P1 fatal-signal-scope (RC1, S2).** Thread B does `raise(SIGSEGV)` (or writes
 to address 0) 100 ms after start; main thread sleeps 2 s and then prints
@@ -641,17 +700,43 @@ immediately; main `waitpid(child, 0)` and checks the handler ran. Linux: handler
 runs in some thread, `waitpid` succeeds. Also check `gettid()` in the forked
 child equals `getpid()` (C2) and that a `pthread_exit` in T sends no `SIGCHLD`.
 
-**P4 spurious-futex (RC4, F1, F3, F11, S1).** Six threads park in
+**P4 spurious-futex (RC4, F1, F3, F11, S1, S8).** Six threads park in
 `pthread_cond_wait` on separate condvars with no signaller for 10 s; count
 returns of the raw `futex(FUTEX_WAIT)` (use `syscall()` directly on a private
 word, expected value 0). Linux: 0 returns. Also send `SIGUSR1` (`SIG_IGN`) and a
 blocked `SIGUSR2` to a waiter: Linux still 0 returns. Measure wake-to-run
 latency with `clock_gettime` around a signal/wait ping-pong (S8).
 
-**P5 stale-wake-tick (F4).** Thread T: `poll(pipe, 5000 ms)`; main sends
-`SIGUSR1` (handled) after 100 ms, T's `poll` returns `EINTR`; T then does an
-untimed `FUTEX_WAIT` on a word nobody wakes for 10 s. Linux: never returns.
-MaeroOS: returns at about 5 s.
+*Result: PASSED on the unmodified kernel (2026-09-07).* No spurious return, no
+`EINTR` for the ignored and blocked signals, and a sub-tick ping-pong. This
+contradicts F3 and S1 as written and is unexplained (section 9). Note what the
+probe cannot cover: it parks in op 0 on a process not named `firef*`, so
+neither scheduler net (F11) nor the launch-phase yield (S8) can arm — covering
+those needs a Firefox run, not a probe.
+
+**P5 stale-wake-tick (F4, with T4 as the trigger).** Thread T calls
+`nanosleep(3 s)`; main sends a handled `SIGUSR1` after 100 ms, which returns T's
+`nanosleep` early (T4) while leaving `wake_tick` armed at the original deadline;
+T then does an untimed `FUTEX_WAIT` on a word nobody wakes for 5 s. Linux: the
+futex never returns, because a timeout belongs to the syscall that armed it
+(`kernel/futex/waitwake.c:719-738`). MaeroOS, by code reading: the leftover
+deadline fires inside the futex wait (`proc/scheduler.c:116-121`).
+
+The `poll(pipe, 3 s)` variant of the same shape is the audit's original
+scenario and is worth keeping, but it can only test anything **once E1 is
+fixed**: today `sys_poll` neither returns on a handled signal nor lets the
+caller's deadline reach `wake_tick` (F4, E1), so the variant passes for reasons
+unrelated to F4.
+
+*Result: PASSED on the unmodified kernel (2026-09-07), both variants.*
+Implemented as `ports/abiprobes/p05_stale_wake_tick.c` (branch
+`yonet/abi-probes`), which already runs the `nanosleep` variant first for
+exactly this reason. Before treating F4 as refuted, check the probe's own info
+line: it prints how long the timed sleep actually took and whether the handler
+ran, so a run in which the signal arrived before T reached `nanosleep` (the
+sleep then completes normally and `scheduler_tick` zeroes `wake_tick` at
+`proc/scheduler.c:118`) is distinguishable from a run that armed the condition
+and still saw no early return. Only the latter refutes F4.
 
 **P6 mmap-prot and madvise (M1, M6).** `mmap(64 KiB, PROT_NONE)`, install a
 `SIGSEGV` handler, read the page: Linux faults, MaeroOS reads 0. Then
@@ -718,10 +803,30 @@ halt the machine).
 the wait; B writes 1 and `FUTEX_WAKE`s: Linux wakes A; MaeroOS `EFAULT` in A or
 a lost wake.
 
+*Result: PASSED on the unmodified kernel (2026-09-07).* F5 and F6 did not
+reproduce; the likely reason is that the eager `MAP_SHARED` path populates every
+PTE at mmap time (`proc/syscall.c:2986-3000`), so the waiter's page is present
+and both the `copy_from_user` and the physical-key lookup succeed. That would
+make F5/F6 reachable only for a mapping that is *not* eagerly populated, which
+on this kernel means none. Confirm that reading before deleting the rows.
+
 ---
 
 ## 9. Unverified points and suggestions
 
+- **The p04/p05/p20 discrepancy is the top open question.** Three probes pass
+  on code paths that, read statically, should fail them: `signal_send` has no
+  deliverability filter (`proc/signal.c:54-61`) yet an ignored signal did not
+  wake a futex waiter; `sys_nanosleep` leaks its deadline
+  (`proc/syscall.c:2296-2301`) yet no untimed futex wait fired early; the shared
+  futex key resolves through a PTE (`proc/syscall.c:5132-5139`) yet a
+  cross-process wake arrived. Until that is explained, F3, F4, F5 and F6 are
+  not evidence for anything, and neither is the part of RC4 built on them. The
+  cheapest next step is to re-run the three probes with the kernel's existing
+  tracing (`[fxw]`/`[fxk]` in `sys_futex`) enabled for the probe's process name,
+  or to add a one-line `printk` in `signal_send` when it wakes a sleeper, and
+  see which of the two — the wake not happening, or the wake not being observed
+  as a futex return — is the case.
 - **Shipped binaries not inspected.** Whether any other library on the disk
   image (`libgio`, `libgtk`, NSPR) calls `posix_spawn`/`vfork` on the startup
   path was inferred from source (GLib `gspawn.c:2200`, Firefox `GfxInfo.cpp:602`).
