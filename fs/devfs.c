@@ -694,7 +694,14 @@ static void pty_master_retain(vfs_node_t *n) {
 
 static void pty_slave_retain(vfs_node_t *n) {
     pty_pair_t *p = (pty_pair_t *)n->private;
-    if (p && p->used) p->slave_refs++;
+    if (!p || !p->used) return;
+    /* The first holder of the slave is what clears the hangup the master sees,
+     * not the lookup that found the node: ptsdir_finddir() used to clear it,
+     * so a bare stat("/dev/pts/N") on a slave nobody had open made the master's
+     * read/poll wait instead of reporting hangup, with no holder left to set it
+     * back.  pty_slave_close() sets it again when the last holder goes. */
+    if (p->slave_refs == 0) p->slave_closed = 0;
+    p->slave_refs++;
 }
 
 static void pty_master_close(vfs_node_t *n) {
@@ -721,6 +728,16 @@ static void pty_slave_close(vfs_node_t *n) {
     pty_maybe_free(p);
 }
 
+/* Allocate a master/slave pair and return the master node.
+ *
+ * INVARIANT: this reserves one of the MAX_PTYS slots, so it must only ever run
+ * on behalf of a descriptor that is definitely about to hold it.  It is
+ * therefore reached only through dev_ptmx.open_fn (see vfs.h), never from
+ * devdir_finddir(): a lookup that does not become an open — stat(), access(),
+ * execve(), or an open() that fails its permission check or runs out of
+ * descriptors — must reserve nothing.  It used to be called from the lookup,
+ * and because pty_maybe_free() is only reachable from the close paths, eight
+ * stat("/dev/ptmx") calls exhausted the table for the life of the boot. */
 static vfs_node_t *pty_alloc_master(void) {
     for (int i = 0; i < MAX_PTYS; i++) {
         pty_pair_t *p = &ptys[i];
@@ -728,11 +745,11 @@ static vfs_node_t *pty_alloc_master(void) {
         memset(p, 0, sizeof(*p));
         p->used = 1;
         p->id = i;
-        /* The descriptor that this lookup is feeding takes the reference
-         * itself, in the open path (vfs_retain -> pty_master_retain), the same
-         * way every other filesystem's nodes are referenced.  Pre-taking it
-         * here as well double-counted once open() started retaining, and the
-         * pair was never freed: ptytest ran out of PTYs at round 7. */
+        /* The descriptor that this open is feeding takes the reference itself
+         * (vfs_retain -> pty_master_retain), the same way every other
+         * filesystem's nodes are referenced.  Pre-taking it here as well
+         * double-counted once open() started retaining, and the pair was never
+         * freed: ptytest ran out of PTYs at round 7. */
         p->master_refs = 0;
         p->slave_closed = 1;
         p->termios = tty_termios;
@@ -768,6 +785,13 @@ static vfs_node_t *pty_alloc_master(void) {
     return NULL;
 }
 
+/* dev_ptmx.open_fn — /dev/ptmx is a cloning device: the descriptor gets a fresh
+ * master, the lookup does not.  See the open_fn comment in fs/vfs.h. */
+static vfs_node_t *ptmx_open(vfs_node_t *n) {
+    (void)n;
+    return pty_alloc_master();
+}
+
 /* ── Directory operations ─────────────────────────────────────────────────── */
 
 static vfs_node_t *devdir_finddir(vfs_node_t *node, const char *name) {
@@ -775,7 +799,7 @@ static vfs_node_t *devdir_finddir(vfs_node_t *node, const char *name) {
     if (strcmp(name, "null")    == 0) return &dev_null;
     if (strcmp(name, "zero")    == 0) return &dev_zero;
     if (strcmp(name, "tty")     == 0) return &dev_tty;
-    if (strcmp(name, "ptmx")    == 0) return pty_alloc_master();
+    if (strcmp(name, "ptmx")    == 0) return &dev_ptmx;   /* open_fn clones */
     if (strcmp(name, "pts")     == 0) return &dev_pts_dir;
     if (strcmp(name, "urandom") == 0) return &dev_urandom;
     if (strcmp(name, "dsp") == 0) return &dev_dsp;
@@ -818,8 +842,11 @@ static vfs_node_t *ptsdir_finddir(vfs_node_t *node, const char *name) {
     if (!name || !name[0] || name[1]) return NULL;
     int id = name[0] - '0';
     if (id < 0 || id >= MAX_PTYS || !ptys[id].used) return NULL;
-    /* No slave_refs++ here either — see pty_alloc_master(); the opener retains. */
-    ptys[id].slave_closed = 0;
+    /* A lookup changes nothing: it neither takes a reference (the opener does,
+     * via vfs_retain -> pty_slave_retain) nor clears the master's hangup (the
+     * first holder does, in pty_slave_retain).  Clearing slave_closed here made
+     * a bare stat("/dev/pts/N") on an unopened slave silently stop the master
+     * from reporting hangup, with nothing left to set it back. */
     return &ptys[id].slave;
 }
 
@@ -1008,6 +1035,7 @@ vfs_node_t *devfs_mount(void) {
     strncpy(dev_ptmx.name, "ptmx", 255);
     dev_ptmx.flags = VFS_FLAG_CHARDEV;
     dev_ptmx.inode = 20;
+    dev_ptmx.open_fn = ptmx_open;
 
     /* /dev/pts */
     memset(&dev_pts_dir, 0, sizeof(dev_pts_dir));

@@ -41,6 +41,7 @@ regression tests for the fixes in audit section 5.
 | P22 | `p22_mprotect_cow.c`        | review round 1, finding 3 (M1) | 9 |
 | P23 | `p23_exec_dethread.c`       | C3 | 10 |
 | P24 | `p24_unlink_open.c`         | tmpfs node lifetime (unlink while open) | — |
+| P25 | `p25_ptmx_lookup.c`         | fix round 1: PTY leaked by a lookup | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the
@@ -107,6 +108,15 @@ this kernel's first-fit heap a freed node keeps its contents until something
 happens to reuse that exact block, which a single process cannot force
 reliably, so the probe passed even before the fix.  The empirical evidence for
 the fix is the `make smoke-firefox` pass rate.
+
+P25 is not from the audit either: a lookup of `/dev/ptmx` used to allocate the
+master/slave pair, so `stat()`, `access()` and `execve()` each consumed one of
+the eight and nothing ever gave it back.  It asserts that a lookup is free —
+`stat`/`lstat`/`access` in bulk, then an open that must still succeed — and
+that a `stat()` of an unopened slave does not change what the master's
+`poll`/`read` report.  It compares the master before and after rather than
+asserting an absolute hangup behaviour, because Linux (blocks until the slave
+has been opened once) and MaeroOS (reports EOF) legitimately differ there.
 
 `tools/smoke_abi.py` runs each probe from the shell over the serial console,
 reads the verdict line and prints a summary `N pass, M xfail, K unexpected

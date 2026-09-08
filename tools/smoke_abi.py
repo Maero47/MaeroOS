@@ -74,6 +74,7 @@ PROBES = {
     "p22_mprotect_cow":        (60, ""),
     "p23_exec_dethread":       (90, ""),
     "p24_unlink_open":         (60, ""),
+    "p25_ptmx_lookup":         (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

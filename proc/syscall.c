@@ -1131,6 +1131,17 @@ static int sys_open_kernel_path(const char *path, int flags) {
     /* Find a free file descriptor slot */
     for (int i = 0; i < MAX_FD; i++) {
         if (current_proc->ofile[i].type == FD_NONE) {
+            /* Cloning device (/dev/ptmx): the descriptor holds a fresh node,
+             * not the one the lookup returned.  This runs here, after the
+             * permission check and after the slot is known to exist, so the
+             * only lookups that reserve a pty are the ones that become an open
+             * — a stat(), an access() or a failed open() reserves nothing.
+             * See the open_fn comment in fs/vfs.h. */
+            if (node->open_fn) {
+                vfs_node_t *clone = node->open_fn(node);
+                if (!clone) return -2;   /* -ENOENT: no capacity left */
+                node = clone;
+            }
             /* The descriptor is a long-lived reference to the node, so it takes
              * one: fd_release() drops it again, and fd_retain() adds one per
              * dup/fork.  Without this a tmpfs file unlinked while open was freed
