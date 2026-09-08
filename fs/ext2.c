@@ -119,29 +119,34 @@ static int g_mounted = 0;
  * three indirect blocks and four data blocks, so the metadata was evicted by
  * the data of the very fault that needed it and re-read from disk every time.
  *
- * Set-associative (bucket = block number mod EXT2_CACHE_BUCKETS, LRU within the
- * bucket), so a large cache costs no more per lookup than the old linear scan
- * over 8 slots.  Slot buffers are allocated on first use and the total is
- * capped at a share of the free physical memory measured when the filesystem is
- * mounted, so the cache is large on the 2 GiB machine that runs the browser and
- * stays small on a 128 MiB one.  Once the budget is reached a claim recycles a
- * slot that already owns a buffer instead of allocating another. */
+ * Set-associative (bucket = block number masked to the set count, LRU within the
+ * set), so a large cache costs no more per lookup than the old linear scan over
+ * 8 slots.  Sized at mount from a share of the free physical memory, so it is
+ * large on the 2 GiB machine that runs the browser and small on a 128 MiB one.
+ *
+ * The block buffers come out of ONE slab allocation rather than one kmalloc per
+ * slot.  kmalloc is a first-fit walk of a single free list (mm/heap.c), and the
+ * filesystem and the page-fault path both allocate on every call, so putting
+ * tens of thousands of 1 KiB blocks on that list makes every later allocation
+ * walk past them: measured, a 32 MiB cache built from per-slot allocations
+ * quadrupled page-fault time (5.6 s -> 20.5 s over a Firefox startup) and lost
+ * far more than the extra cache hits gained.  One slab costs one list entry. */
 /* Most blocks that a run of consecutive file blocks can carry in one ATA
  * transaction.  128 KiB is 256 sectors, past what one command can express;
  * 64 blocks keeps a transaction's interrupts-off window near 100 us. */
 #define EXT2_READ_CLUSTER  64
 
-#define EXT2_CACHE_BUCKETS 8192                 /* power of two */
-#define EXT2_CACHE_WAYS    4
-#define EXT2_CACHE_SLOTS   (EXT2_CACHE_BUCKETS * EXT2_CACHE_WAYS)
+#define EXT2_CACHE_MAX_SETS 4096                /* power of two */
+#define EXT2_CACHE_WAYS     4
+#define EXT2_CACHE_SLOTS    (EXT2_CACHE_MAX_SETS * EXT2_CACHE_WAYS)
 
 /* Share of free physical memory the cache may hold, and a floor so that a tiny
  * machine still gets a useful one. */
 #define EXT2_CACHE_MEM_SHARE  8                 /* one eighth of free RAM */
-#define EXT2_CACHE_MIN_BYTES  (256u * 1024u)
+#define EXT2_CACHE_MIN_SETS   8
 
-static uint32_t g_cache_budget;                 /* bytes the cache may allocate */
-static uint32_t g_cache_bytes;                  /* bytes it has allocated       */
+static uint8_t  *g_cache_slab;                  /* one allocation for all slots */
+static uint32_t  g_cache_setmask;               /* sets in use, minus one       */
 
 typedef struct {
     uint32_t blk;
@@ -155,7 +160,7 @@ static uint32_t g_cache_age = 1;
 static int g_cache_ready = 0;
 
 static inline ext2_cache_entry_t *ext2_cache_set(uint32_t blk) {
-    return &g_cache[(blk & (EXT2_CACHE_BUCKETS - 1)) * EXT2_CACHE_WAYS];
+    return &g_cache[(blk & g_cache_setmask) * EXT2_CACHE_WAYS];
 }
 
 /* The slot holding `blk`, or NULL. */
@@ -169,31 +174,17 @@ static ext2_cache_entry_t *ext2_cache_find(uint32_t blk) {
 /* A slot in blk's set to (re)use: its own slot, then a free one, then the LRU.
  * Returns NULL if the buffer could not be allocated (the cache then just
  * misses, which is correct, only slower). */
+/* The slot in blk's set to (re)use: its own, then a free one, then the LRU.
+ * Every slot already owns its slab buffer, so this cannot fail. */
 static ext2_cache_entry_t *ext2_cache_claim(uint32_t blk) {
     ext2_cache_entry_t *set = ext2_cache_set(blk);
-    ext2_cache_entry_t *empty = (ext2_cache_entry_t *)0;   /* no buffer yet */
-    ext2_cache_entry_t *lru   = (ext2_cache_entry_t *)0;   /* LRU that has one */
+    ext2_cache_entry_t *lru = &set[0];
     for (int i = 0; i < EXT2_CACHE_WAYS; i++) {
         if (set[i].valid && set[i].blk == blk) return &set[i];   /* already ours */
-        if (set[i].data) {
-            if (!lru || set[i].age < lru->age) lru = &set[i];
-        } else if (!empty) {
-            empty = &set[i];
-        }
+        if (!set[i].valid) return &set[i];
+        if (set[i].age < lru->age) lru = &set[i];
     }
-    /* Take an empty slot while there is budget to back it; past the budget,
-     * recycle a slot that already owns a buffer rather than growing. */
-    int can_grow = empty && g_cache_bytes + g_state.block_size <= g_cache_budget;
-    ext2_cache_entry_t *slot = can_grow ? empty : (lru ? lru : empty);
-    if (!slot) return (ext2_cache_entry_t *)0;
-    if (!slot->data) {
-        if (g_cache_bytes + g_state.block_size > g_cache_budget)
-            return (ext2_cache_entry_t *)0;
-        slot->data = (uint8_t *)kmalloc(g_state.block_size);
-        if (!slot->data) { slot->valid = 0; return (ext2_cache_entry_t *)0; }
-        g_cache_bytes += g_state.block_size;
-    }
-    return slot;
+    return lru;
 }
 
 /* Per-node private data */
@@ -274,17 +265,41 @@ static void ext2_cache_init(void) {
         g_cache[i].blk = 0;
         g_cache[i].age = 0;
         g_cache[i].valid = 0;
-        /* Buffers are allocated on demand in ext2_cache_claim(); a remount
-         * keeps the ones already allocated, and g_cache_bytes still counts
-         * them, so the budget is not double-spent. */
+        g_cache[i].data = (uint8_t *)0;
     }
-    uint64_t share = ((uint64_t)pmm_free_frames() * PAGE_SIZE) / EXT2_CACHE_MEM_SHARE;
-    uint64_t cap   = (uint64_t)EXT2_CACHE_SLOTS * g_state.block_size;
-    if (share > cap) share = cap;
-    if (share < EXT2_CACHE_MIN_BYTES) share = EXT2_CACHE_MIN_BYTES;
-    g_cache_budget = (uint32_t)share;
-    printk("[EXT2] block cache up to %u KiB (%u slots of %u B)\n",
-           (unsigned)(g_cache_budget / 1024u), (unsigned)EXT2_CACHE_SLOTS,
+
+    /* How many sets can we afford?  A share of free memory, capped by the slot
+     * array, floored so a small machine still caches something.  Sets are a
+     * power of two so the bucket index is a mask. */
+    /* Frames * (PAGE_SIZE / SHARE) rather than (frames * PAGE_SIZE) / SHARE:
+     * the kernel links no libgcc 64-bit division helpers, and the share divides
+     * the page size exactly. */
+    uint32_t share = pmm_free_frames() * (PAGE_SIZE / EXT2_CACHE_MEM_SHARE);
+    uint32_t want  = share / (g_state.block_size * EXT2_CACHE_WAYS);
+    uint32_t sets  = EXT2_CACHE_MIN_SETS;
+    while (sets * 2u <= want && sets * 2u <= EXT2_CACHE_MAX_SETS) sets *= 2u;
+
+    /* One slab for every buffer.  If it will not fit, halve and retry rather
+     * than fall back to per-slot allocations, which would flood the heap's
+     * free list (see the note above). */
+    while (sets >= EXT2_CACHE_MIN_SETS) {
+        uint32_t bytes = sets * EXT2_CACHE_WAYS * g_state.block_size;
+        g_cache_slab = (uint8_t *)kmalloc(bytes);
+        if (g_cache_slab) break;
+        sets /= 2u;
+    }
+    if (!g_cache_slab) {
+        printk("[EXT2] block cache unavailable (no memory)\n");
+        g_cache_ready = 0;
+        return;
+    }
+
+    g_cache_setmask = sets - 1u;
+    for (uint32_t i = 0; i < sets * EXT2_CACHE_WAYS; i++)
+        g_cache[i].data = g_cache_slab + (size_t)i * g_state.block_size;
+    printk("[EXT2] block cache %u KiB (%u sets x %u ways of %u B)\n",
+           (unsigned)(sets * EXT2_CACHE_WAYS * g_state.block_size / 1024u),
+           (unsigned)sets, (unsigned)EXT2_CACHE_WAYS,
            (unsigned)g_state.block_size);
     g_cache_ready = 1;
 }
@@ -345,7 +360,7 @@ static int ext2_read_block(uint32_t blk, void *buf) {
 static void ext2_cache_insert(uint32_t blk, const void *buf) {
     if (!g_cache_ready) return;
     ext2_cache_entry_t *slot = ext2_cache_claim(blk);
-    if (!slot) return;
+    if (!slot || !slot->data) return;
     memcpy(slot->data, buf, g_state.block_size);
     slot->blk = blk;
     slot->age = g_cache_age++;
