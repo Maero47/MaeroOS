@@ -62,6 +62,7 @@ void isr_handler(registers_t *regs) {
     /* Syscall (int 0x80) */
     if (regs->int_no == 128) {
         kprof_count(KPE_SYSCALL);
+        kprof_syscall_enter(regs->eax);
         syscall_dispatch(regs);
         kprof_switch(kp_old);
         return;

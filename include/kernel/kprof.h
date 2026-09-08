@@ -29,7 +29,8 @@
 #define KPB_PGFAULT   4   /* #PF handler (minus any nested ATA)               */
 #define KPB_ATA       5   /* ATA PIO transfers (interrupts off)               */
 #define KPB_EXC       6   /* other CPU exceptions                             */
-#define KPB_FIXED     7
+#define KPB_FB        7   /* memcpy into the framebuffer (uncached MMIO)      */
+#define KPB_FIXED     8
 #define KPB_SYSBASE   KPB_FIXED
 #define KPROF_NSYS    448              /* Linux i386 table + our 500-505      */
 #define KPROF_NBUCKET (KPB_SYSBASE + KPROF_NSYS)
@@ -40,7 +41,7 @@ enum {
     KPE_PF_COW, KPE_PF_ANON, KPE_PF_FILE, KPE_PF_STACK, KPE_PF_OTHER,
     KPE_ATA_RD, KPE_ATA_RD_SECT, KPE_ATA_WR, KPE_ATA_WR_SECT,
     KPE_EXT2_BLK, KPE_EXT2_HIT, KPE_EXT2_MISS,
-    KPE_WAKE, KPE_RESCHED,
+    KPE_WAKE, KPE_RESCHED, KPE_FB_KB,
     KPE_MAX
 };
 
@@ -53,6 +54,10 @@ static inline int kprof_sys_bucket(uint32_t nr) {
 
 void kprof_count(int ev);
 void kprof_add(int ev, uint32_t n);
+
+/* One entry into syscall `nr` from user mode.  Separate from the bucket
+ * switches, which also fire when a parked thread is re-dispatched. */
+void kprof_syscall_enter(uint32_t nr);
 
 /* Blocked (not runnable) wall time, attributed to the syscall that blocked.
  * The token is the caller's, so concurrent sleepers do not share state. */

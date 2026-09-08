@@ -6968,6 +6968,9 @@ void syscall_dispatch(registers_t *regs) {
     int ret = -38;   /* -ENOSYS */
 
     if (current_proc) current_proc->last_syscall = (int)num;
+    /* kprof's periodic dump.  Here rather than in the timer tick so the printk
+     * runs with interrupts enabled and does not cost the tick counter time. */
+    kprof_tick();
 
     switch (num) {
     case 1:   sys_exit(regs);                  break;  /* noreturn */

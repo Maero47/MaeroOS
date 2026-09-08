@@ -5,6 +5,7 @@
 #include <kernel/config.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <kernel/kprof.h>
 
 #define FB_VIRT_BASE 0xE0000000U
 
@@ -107,7 +108,13 @@ uint32_t framebuffer_read(uint32_t off, uint32_t len, uint8_t *buf) {
 uint32_t framebuffer_write(uint32_t off, uint32_t len, const uint8_t *buf) {
     if (!fb.ready || !buf || off >= fb.size) return 0;
     if (len > fb.size - off) len = fb.size - off;
+    /* The framebuffer is device memory, so this copy runs at MMIO speed, not
+     * RAM speed; kprof gives it its own bucket because at a full-screen blit
+     * per frame it is one of the two largest costs of a Firefox startup. */
+    kprof_add(KPE_FB_KB, len >> 10);
+    int kp_old = kprof_switch(KPB_FB);
     memcpy((void *)(uintptr_t)(fb.virt + off), buf, len);
+    kprof_switch(kp_old);
     return len;
 }
 

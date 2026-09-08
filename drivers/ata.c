@@ -49,9 +49,19 @@ static inline void ata_irq_restore(uint32_t f) {
 
 static int drive_present = 0;
 
-/* Read alternate status 4 times (~400 ns delay) */
+/* Read alternate status 4 times (~400 ns delay).  Required after a write to the
+ * command or drive-select register, before the status register is meaningful. */
 static void ata_delay(void) {
     inb(ATA_ALT); inb(ATA_ALT); inb(ATA_ALT); inb(ATA_ALT);
+}
+
+/* The same settle between the sectors of one multi-sector transfer, where the
+ * drive has just gone busy on its own: a single alternate-status read is what
+ * the interface needs there.  Each of these reads is a port access, and under
+ * KVM every port access is a VM exit into QEMU (~2 us), so the other three were
+ * pure cost on every 512 bytes the guest reads. */
+static inline void ata_settle(void) {
+    inb(ATA_ALT);
 }
 
 /* Wait until BSY clears; return -1 on error/timeout */
@@ -154,7 +164,7 @@ int ata_read(uint32_t lba, uint8_t count, void *buf) {
         if (ata_wait_drq() < 0) { ata_irq_restore(irq); kprof_switch(kp_old); return -1; }
         insw(ATA_DATA, ptr, 256);  /* 256 words = 512 bytes */
         ptr += 256;
-        ata_delay();
+        ata_settle();
     }
     ata_irq_restore(irq);
     kprof_switch(kp_old);
@@ -186,7 +196,7 @@ int ata_write(uint32_t lba, uint8_t count, const void *buf) {
         if (ata_wait_drq() < 0) { ata_irq_restore(irq); kprof_switch(kp_old); return -1; }
         outsw(ATA_DATA, ptr, 256);
         ptr += 256;
-        ata_delay();
+        ata_settle();
     }
 
     /* Flush write cache */

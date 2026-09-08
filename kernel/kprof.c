@@ -12,6 +12,7 @@
 static uint64_t g_cyc[KPROF_NBUCKET];
 static uint32_t g_cnt[KPROF_NBUCKET];      /* entries into each bucket */
 static uint64_t g_ev[KPE_MAX];
+static uint32_t g_syscnt[KPROF_NSYS];      /* true invocations, per syscall   */
 static uint64_t g_sleep_cyc[KPROF_NSYS];   /* blocked wall time per syscall  */
 static uint32_t g_sleep_cnt[KPROF_NSYS];
 
@@ -45,6 +46,9 @@ int kprof_switch(int bucket) {
 }
 
 void kprof_count(int ev) { g_ev[ev]++; }
+void kprof_syscall_enter(uint32_t nr) {
+    g_syscnt[nr < KPROF_NSYS ? nr : KPROF_NSYS - 1]++;
+}
 void kprof_add(int ev, uint32_t n) { g_ev[ev] += n; }
 
 /* Blocked time.  sleep_on() records the TSC before switching away and charges
@@ -82,7 +86,9 @@ void kprof_reset(void) {
     __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
     for (int i = 0; i < KPROF_NBUCKET; i++) { g_cyc[i] = 0; g_cnt[i] = 0; }
     for (int i = 0; i < KPE_MAX; i++) g_ev[i] = 0;
-    for (int i = 0; i < KPROF_NSYS; i++) { g_sleep_cyc[i] = 0; g_sleep_cnt[i] = 0; }
+    for (int i = 0; i < KPROF_NSYS; i++) {
+        g_sleep_cyc[i] = 0; g_sleep_cnt[i] = 0; g_syscnt[i] = 0;
+    }
     g_base = g_last = rdtsc64();
     g_on = 1;
     if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
@@ -102,10 +108,10 @@ void kprof_dump(const char *tag) {
     printk("[kprof] --- %s  t=%u.%02us  elapsed=%ums accounted=%ums\n",
            tag, (unsigned)(pit_ticks() / 100U), (unsigned)(pit_ticks() % 100U),
            cyc_ms(elapsed), cyc_ms(sum));
-    printk("[kprof] user=%u idle=%u sched=%u irq=%u pgfault=%u ata=%u exc=%u sys=%u (ms)\n",
+    printk("[kprof] user=%u idle=%u sched=%u irq=%u pgfault=%u ata=%u fb=%u exc=%u sys=%u (ms)\n",
            cyc_ms(g_cyc[KPB_USER]), cyc_ms(g_cyc[KPB_IDLE]), cyc_ms(g_cyc[KPB_SCHED]),
            cyc_ms(g_cyc[KPB_IRQ]), cyc_ms(g_cyc[KPB_PGFAULT]), cyc_ms(g_cyc[KPB_ATA]),
-           cyc_ms(g_cyc[KPB_EXC]), cyc_ms(sysc));
+           cyc_ms(g_cyc[KPB_FB]), cyc_ms(g_cyc[KPB_EXC]), cyc_ms(sysc));
     printk("[kprof] ev sysc=%u ctxsw=%u pf(cow=%u anon=%u file=%u stk=%u oth=%u)\n",
            (unsigned)g_ev[KPE_SYSCALL], (unsigned)g_ev[KPE_CTXSW],
            (unsigned)g_ev[KPE_PF_COW], (unsigned)g_ev[KPE_PF_ANON],
@@ -117,6 +123,7 @@ void kprof_dump(const char *tag) {
            (unsigned)g_ev[KPE_EXT2_BLK], (unsigned)g_ev[KPE_EXT2_HIT],
            (unsigned)g_ev[KPE_EXT2_MISS], (unsigned)g_ev[KPE_WAKE],
            (unsigned)g_ev[KPE_RESCHED]);
+    printk("[kprof] ev fb_kb=%u\n", (unsigned)g_ev[KPE_FB_KB]);
 
     /* Top syscalls by kernel CPU time, then by blocked wall time. */
     for (int pass = 0; pass < 2; pass++) {
@@ -141,7 +148,7 @@ void kprof_dump(const char *tag) {
             int i = (int)shown[k];
             printk(" %u:%ums/%u", (unsigned)i,
                    cyc_ms(pass ? g_sleep_cyc[i] : g_cyc[KPB_SYSBASE + i]),
-                   (unsigned)(pass ? g_sleep_cnt[i] : g_cnt[KPB_SYSBASE + i]));
+                   (unsigned)(pass ? g_sleep_cnt[i] : g_syscnt[i]));
         }
         printk("\n");
     }

@@ -127,8 +127,6 @@ void scheduler_tick(int user_mode) {
         }
     }
 
-    kprof_tick();
-
     if (!current_proc) return;
     current_proc->utime_ticks++;
     /* Never preempt kernel-mode execution (see pit_handler) or a held
