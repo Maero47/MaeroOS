@@ -773,7 +773,21 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
                 uint32_t *np = (uint32_t *)malloc((size_t)nw * nh * 4);
                 if (np) {
                     for (int i = 0; i < nw * nh; i++) np[i] = 0x00202830;
-                    if (w->px) free(w->px);
+                    /* Carry the overlapping region across.  X leaves a resized
+                     * window's contents undefined and we do send an Expose, but
+                     * Firefox composites damage rather than redrawing on a bare
+                     * Expose, so throwing the pixels away left the browser
+                     * permanently blank whenever a ConfigureWindow arrived after
+                     * the last PutImage — a run could report a real paint
+                     * (putimg=25) and still show an empty window. */
+                    if (w->px) {
+                        int cw = w->w < nw ? w->w : nw;
+                        int ch = w->h < nh ? w->h : nh;
+                        for (int y = 0; y < ch; y++)
+                            memcpy(np + (size_t)y * nw, w->px + (size_t)y * w->w,
+                                   (size_t)cw * 4);
+                        free(w->px);
+                    }
                     w->px = np; w->w = nw; w->h = nh;
                 }
             }
