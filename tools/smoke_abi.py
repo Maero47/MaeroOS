@@ -49,6 +49,7 @@ PROBES = {
     "p18_high_memory":         (300, "{p18_mib}"),
     "p19_siginfo":             (90, ""),
     "p20_shared_futex":        (90, ""),
+    "p21_unlink_open":         (90, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

@@ -15,6 +15,15 @@
 
 typedef struct tmpfs_node {
     vfs_node_t          vnode;      /* MUST be first — callers cast to vfs_node_t* */
+    /* Reference count.  One reference belongs to the link in the parent
+     * directory; every long-lived holder of the node (an open file descriptor,
+     * a file-backed VMA, the shared-mapping registry) takes another through
+     * vfs_retain() and drops it through vfs_close().  The node is freed only
+     * when the count reaches zero, so unlink() on a file that is still open
+     * detaches the name and leaves the data readable through the descriptor —
+     * the Unix semantics every program relies on, and which the kernel used to
+     * violate by kfree()ing the node inside tmpfs_unlink(). */
+    int                 refs;
     /* file backing */
     uint8_t            *data;       /* NULL for dirs */
     uint32_t            capacity;   /* allocated bytes */
@@ -32,6 +41,8 @@ static vfs_node_t *      tmpfs_finddir (vfs_node_t *, const char *);
 static int               tmpfs_create  (vfs_node_t *, const char *, uint32_t);
 static int               tmpfs_unlink  (vfs_node_t *, const char *);
 static int               tmpfs_symlink (vfs_node_t *, const char *, const char *);
+static void              tmpfs_retain  (vfs_node_t *);
+static void              tmpfs_release (vfs_node_t *);
 
 /* ── Node factory ─────────────────────────────────────────────────────────── */
 
@@ -43,6 +54,9 @@ static tmpfs_node_t *alloc_tmpfs_node(const char *name, uint32_t flags) {
     strncpy(tn->vnode.name, name, 255);
     tn->vnode.name[255] = '\0';
     tn->vnode.flags = flags;
+    tn->refs = 1;                    /* the link in the parent directory */
+    tn->vnode.retain_fn = tmpfs_retain;
+    tn->vnode.close_fn  = tmpfs_release;
     /* /tmp is world-writable (like Unix 01777); created files get the
      * creator's uid stamped by the open path. */
     tn->vnode.mask = (flags == VFS_FLAG_DIR) ? 0777 : 0666;
@@ -61,6 +75,24 @@ static tmpfs_node_t *alloc_tmpfs_node(const char *name, uint32_t flags) {
         tn->vnode.symlink_fn = tmpfs_symlink;
     }
     return tn;
+}
+
+/* ── Reference counting ───────────────────────────────────────────────────── */
+
+static void tmpfs_retain(vfs_node_t *node) {
+    if (node) ((tmpfs_node_t *)node)->refs++;
+}
+
+/* Drop one reference; free the node once nothing holds it any more.  A
+ * directory is never freed while it still has children: dropping the parent's
+ * reference to a non-empty directory would strand them, and unlink() already
+ * refuses to remove a non-empty directory. */
+static void tmpfs_release(vfs_node_t *node) {
+    if (!node) return;
+    tmpfs_node_t *tn = (tmpfs_node_t *)node;
+    if (--tn->refs > 0) return;
+    if (tn->data) { kfree(tn->data); tn->data = NULL; }
+    kfree(tn);
 }
 
 /* ── File operations ──────────────────────────────────────────────────────── */
@@ -188,14 +220,17 @@ static int tmpfs_unlink(vfs_node_t *dir_node, const char *name) {
     for (tmpfs_node_t *c = dir->first_child; c;
          c = (tmpfs_node_t *)c->vnode.next) {
         if (strcmp(c->vnode.name, name) == 0) {
-            /* Unlink from list */
+            /* A directory must be empty before its name can go away. */
+            if ((c->vnode.flags & VFS_FLAG_DIR) && c->first_child)
+                return -39;                  /* -ENOTEMPTY */
+            /* Detach from the list, then drop the directory's reference.  The
+             * node survives if a descriptor or a mapping still holds one. */
             if (prev)
                 prev->vnode.next = c->vnode.next;
             else
                 dir->first_child = (tmpfs_node_t *)c->vnode.next;
-            /* Free file data if applicable */
-            if (c->data) kfree(c->data);
-            kfree(c);
+            c->vnode.next = NULL;
+            tmpfs_release(&c->vnode);
             return 0;
         }
         prev = c;

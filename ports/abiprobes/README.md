@@ -37,6 +37,7 @@ regression tests for the fixes in audit section 5.
 | P18 | `p18_high_memory.c`         | M10 (M8 timing printed) | 13 |
 | P19 | `p19_siginfo.c`             | S6 | 14 |
 | P20 | `p20_shared_futex.c`        | F5, F6 | 14 |
+| P21 | `p21_unlink_open.c`         | tmpfs node lifetime (unlink while open) | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the
@@ -85,6 +86,15 @@ On MaeroOS under QEMU:
     make smoke-abi                          # boots with -m 1024M
     python3 tools/smoke_abi.py --mem 2048M  # the audit's second P18 case
     python3 tools/smoke_abi.py --only p05,p13
+
+P21 is not from the audit: it was added after an intermittent kernel panic in
+`fdtable_put` was traced to `tmpfs_unlink()` freeing a node that a descriptor
+still referenced.  It asserts the ordinary Unix contract that unlinking a file
+removes only its name.  Note that it checks *semantics*, not the crash: under
+this kernel's first-fit heap a freed node keeps its contents until something
+happens to reuse that exact block, which a single process cannot force
+reliably, so the probe passed even before the fix.  The empirical evidence for
+the fix is the `make smoke-firefox` pass rate.
 
 `tools/smoke_abi.py` runs each probe from the shell over the serial console,
 reads the verdict line and prints a summary `N pass, M xfail, K unexpected,

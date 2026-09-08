@@ -540,8 +540,10 @@ static int sys_eventfd(unsigned int initval, int flags) {
 
 void fd_retain(proc_file_t *f) {
     if (f->type == FD_FILE)    vfs_retain(f->node);
-    if (f->type == FD_PIPE_R)  f->pipe->nreaders++;
-    if (f->type == FD_PIPE_W)  f->pipe->nwriters++;
+    /* A named pipe's descriptor also holds the FIFO's vfs node; an anonymous
+     * pipe leaves node NULL and vfs_retain/vfs_close ignore it. */
+    if (f->type == FD_PIPE_R)  { f->pipe->nreaders++; vfs_retain(f->node); }
+    if (f->type == FD_PIPE_W)  { f->pipe->nwriters++; vfs_retain(f->node); }
     if (f->type == FD_SOCKET)  net_socket_retain(f->socket);
     if (f->type == FD_USOCKET) usocket_retain(f->usock);
     if (f->type == FD_EPOLL)   epoll_retain(f->epoll);
@@ -550,8 +552,8 @@ void fd_retain(proc_file_t *f) {
 
 void fd_release(proc_file_t *f) {
     if (f->type == FD_FILE)    vfs_close(f->node);
-    if (f->type == FD_PIPE_R)  pipe_close_read(f->pipe);
-    if (f->type == FD_PIPE_W)  pipe_close_write(f->pipe);
+    if (f->type == FD_PIPE_R)  { pipe_close_read(f->pipe);  vfs_close(f->node); }
+    if (f->type == FD_PIPE_W)  { pipe_close_write(f->pipe); vfs_close(f->node); }
     if (f->type == FD_SOCKET)  net_socket_release(f->socket);
     if (f->type == FD_USOCKET) usocket_release(f->usock);
     if (f->type == FD_EPOLL)   epoll_release(f->epoll);
@@ -1109,6 +1111,7 @@ static int sys_open_kernel_path(const char *path, int flags) {
                     current_proc->ofile[i].type = FD_PIPE_R;
                     pb->nreaders++;
                 }
+                vfs_retain(node);              /* see the FD_FILE case below */
                 current_proc->ofile[i].pipe    = pb;
                 current_proc->ofile[i].node    = node;
                 current_proc->ofile[i].flags   = flags;  /* incl. O_NONBLOCK */
@@ -1128,6 +1131,12 @@ static int sys_open_kernel_path(const char *path, int flags) {
     /* Find a free file descriptor slot */
     for (int i = 0; i < MAX_FD; i++) {
         if (current_proc->ofile[i].type == FD_NONE) {
+            /* The descriptor is a long-lived reference to the node, so it takes
+             * one: fd_release() drops it again, and fd_retain() adds one per
+             * dup/fork.  Without this a tmpfs file unlinked while open was freed
+             * under the descriptor and the next close jumped through a recycled
+             * function pointer. */
+            vfs_retain(node);
             current_proc->ofile[i].type    = FD_FILE;
             current_proc->ofile[i].node    = node;
             current_proc->ofile[i].offset  = (flags & O_APPEND) ? node->size : 0;
@@ -3094,10 +3103,16 @@ static int shmap_try_reclaim(struct shmap_entry *e) {
     for (uint32_t p = 0; p < e->npages; p++)
         if (e->frames && e->frames[p]) pmm_frame_decref(e->frames[p]);
     if (e->frames) kfree(e->frames);
-    e->frames = NULL; e->npages = 0; e->node = NULL;
+    e->frames = NULL; e->npages = 0;
+    vfs_close(e->node);                 /* drop the registry's reference */
+    e->node = NULL;
     return 1;
 }
 
+/* The registry keys on the node pointer and outlives every mapping of it, so it
+ * must hold a reference of its own: otherwise the node could be freed, its
+ * address reused by a different file, and the stale key would match the wrong
+ * one.  shmap_try_reclaim() drops the reference when it retires an entry. */
 static struct shmap_entry *shmap_get(vfs_node_t *node) {
     struct shmap_entry *free_e = NULL;
     for (int i = 0; i < SHMAP_MAX; i++) {
@@ -3109,6 +3124,7 @@ static struct shmap_entry *shmap_get(vfs_node_t *node) {
             if (shmaps[i].node && shmap_try_reclaim(&shmaps[i])) { free_e = &shmaps[i]; break; }
         if (!free_e) return NULL;
     }
+    vfs_retain(node);                   /* the registry's own reference */
     free_e->node   = node;
     free_e->frames = NULL;
     free_e->npages = 0;
