@@ -5874,22 +5874,32 @@ static int sys_rename_kernel_path(const char *oldpath, const char *newpath) {
     vfs_node_t *dst_dir = vfs_open_parent_at(newpath, new_dir);
     if (!src_dir || !dst_dir) return -2;
 
-    /* Find the source node */
+    /* Find the source node.  Only its flags survive the unlink/create below:
+     * a vfs_node is not reference counted, and tmpfs_unlink() kfree()s the node
+     * it removes, so a pointer obtained before a directory is mutated must not
+     * be dereferenced after it.  Re-resolve instead. */
     vfs_node_t *src = vfs_finddir(src_dir, old_base);
     if (!src) return -2;
+    uint32_t src_flags = src->flags;
 
     /* If the target already exists, unlink it */
     vfs_unlink(dst_dir, new_base);
 
     /* Copy data into a new node then unlink the old */
     if (!dst_dir->create_fn) return -1;
-    if (dst_dir->create_fn(dst_dir, new_base, src->flags) < 0) return -1;
+    if (dst_dir->create_fn(dst_dir, new_base, src_flags) < 0) return -1;
     vfs_node_t *dst = vfs_finddir(dst_dir, new_base);
     if (!dst) return -1;
+    src = vfs_finddir(src_dir, old_base);      /* may have moved/been freed */
+    if (!src) return -2;
 
     if (!(src->flags & VFS_FLAG_DIR) && src->size > 0 && src->read_fn && dst->write_fn) {
-        /* Copy file contents in 4KiB chunks */
-        uint8_t tmp_buf[4096];
+        /* Copy file contents in 4 KiB chunks.  The buffer is heap-allocated, not
+         * a local: with it on the stack this function's frame was 5164 bytes,
+         * and a syscall that recurses into the filesystem (and can take an IRQ
+         * on the way) has no business eating a sixth of a KSTACKSIZE stack. */
+        uint8_t *tmp_buf = (uint8_t *)kmalloc(4096);
+        if (!tmp_buf) return -12;                  /* -ENOMEM */
         uint32_t copied = 0;
         while (copied < src->size) {
             uint32_t chunk = src->size - copied;
@@ -5899,6 +5909,7 @@ static int sys_rename_kernel_path(const char *oldpath, const char *newpath) {
             vfs_write(dst, copied, got, tmp_buf);
             copied += got;
         }
+        kfree(tmp_buf);
         if (dst->truncate_fn) dst->truncate_fn(dst, src->size);
     }
 
