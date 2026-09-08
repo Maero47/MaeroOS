@@ -1265,7 +1265,15 @@ static int sys_brk(registers_t *regs) {
  * fault), so the same quarter rule gives a 2 MiB ARG_MAX.
  *
  * The strings land in one growable kernel buffer and the vector holds byte
- * OFFSETS into it, so growing the buffer never invalidates the vector. */
+ * OFFSETS into it, so growing the buffer never invalidates the vector.
+ *
+ * The ARG_MAX bound is charged INCREMENTALLY, before each chunk is reserved or
+ * copied, exactly as Linux checks bprm_stack_limits() inside copy_strings().
+ * Checking only after both vectors are copied is not a bound at all: 4096 argv
+ * pointers aimed at one 128 KiB user string cost the attacker 128 KiB and would
+ * drive this buffer to ~540 MiB, and kmalloc does not fail gracefully — a heap
+ * that outgrows HEAP_MAX halts the machine (mm/heap.c heap_expand).  An
+ * unprivileged execve must never be able to reach that. */
 #define EXEC_MAX_ARG_STRLEN  (32U * PAGE_SIZE)          /* Linux MAX_ARG_STRLEN */
 #define EXEC_STACK_LIMIT     (8U * 1024U * 1024U)       /* our RLIMIT_STACK */
 #define EXEC_ARG_MAX         (EXEC_STACK_LIMIT / 4U)    /* Linux bprm_stack_limits */
@@ -1274,24 +1282,37 @@ static int sys_brk(registers_t *regs) {
 struct exec_strings {
     char     *buf;   uint32_t used, cap;    /* NUL-separated string bytes */
     uint32_t *off;   uint32_t n,    ncap;   /* offset of each string in buf */
+    uint32_t *total;  /* running argv+envp charge, SHARED by the two vectors */
 };
 
-static void es_init(struct exec_strings *v) {
+static void es_init(struct exec_strings *v, uint32_t *total) {
     v->buf = NULL; v->used = v->cap = 0;
     v->off = NULL; v->n = v->ncap = 0;
+    v->total = total;
 }
 
 static void es_free(struct exec_strings *v) {
+    uint32_t *total = v->total;
     if (v->buf) kfree(v->buf);
     if (v->off) kfree(v->off);
-    es_init(v);
+    es_init(v, total);
 }
 
-/* Make room for `need` more string bytes.  Doubling, so a long argv is linear. */
+/* Charge `bytes` against the shared argv+envp budget before anything is
+ * allocated for them.  -E2BIG once the block would exceed ARG_MAX. */
+static int es_charge(struct exec_strings *v, uint32_t bytes) {
+    if (bytes > EXEC_ARG_MAX - *v->total) return -7;    /* -E2BIG */
+    *v->total += bytes;
+    return 0;
+}
+
+/* Make room for `need` more string bytes.  Doubling, so a long argv is linear;
+ * clamped to the budget so the buffer itself can never exceed ARG_MAX. */
 static int es_reserve(struct exec_strings *v, uint32_t need) {
     if (v->used + need <= v->cap) return 0;
     uint32_t cap = v->cap ? v->cap : 512;
     while (cap < v->used + need) cap *= 2;
+    if (cap > EXEC_ARG_MAX) cap = v->used + need;
     char *nb = (char *)kmalloc(cap);
     if (!nb) return -12;
     if (v->buf) { __builtin_memcpy(nb, v->buf, v->used); kfree(v->buf); }
@@ -1299,9 +1320,11 @@ static int es_reserve(struct exec_strings *v, uint32_t need) {
     return 0;
 }
 
-/* Record `off` as the start of the next string. */
+/* Record `off` as the start of the next string, charging its slot in the
+ * pointer array the block will need on the new stack. */
 static int es_index(struct exec_strings *v, uint32_t off) {
     if (v->n >= EXEC_MAX_ARG_STRINGS) return -7;        /* -E2BIG */
+    if (es_charge(v, 4) < 0) return -7;                 /* -E2BIG */
     if (v->n == v->ncap) {
         uint32_t ncap = v->ncap ? v->ncap * 2 : 16;
         uint32_t *no = (uint32_t *)kmalloc(ncap * sizeof(uint32_t));
@@ -1318,6 +1341,7 @@ static int es_index(struct exec_strings *v, uint32_t off) {
 
 /* Append a kernel string (len excludes the NUL). */
 static int es_push(struct exec_strings *v, const char *str, uint32_t len) {
+    if (es_charge(v, len + 1) < 0) return -7;           /* -E2BIG */
     if (es_reserve(v, len + 1) < 0) return -12;
     uint32_t start = v->used;
     __builtin_memcpy(v->buf + start, str, len);
@@ -1335,6 +1359,9 @@ static int es_push_user(struct exec_strings *v, const char *up) {
     uint32_t start = v->used, got = 0;
     for (;;) {
         uint32_t chunk = PAGE_SIZE - (((uint32_t)(uintptr_t)up + got) & (PAGE_SIZE - 1));
+        /* Charge FIRST: the budget has to stop us before the allocation, not
+         * after the whole vector has been copied. */
+        if (es_charge(v, chunk) < 0) { v->used = start; return -7; }    /* -E2BIG */
         v->used = start + got;
         if (es_reserve(v, chunk) < 0) { v->used = start; return -12; }
         if (copy_from_user(v->buf + start + got, up + got, chunk) < 0) {
@@ -1343,6 +1370,7 @@ static int es_push_user(struct exec_strings *v, const char *up) {
         }
         for (uint32_t i = 0; i < chunk; i++)
             if (v->buf[start + got + i] == '\0') {
+                *v->total -= chunk - (i + 1);   /* refund the unused tail */
                 v->used = start + got + i + 1;
                 int rc = es_index(v, start);
                 if (rc < 0) v->used = start;
@@ -1455,13 +1483,17 @@ static int sys_exec(registers_t *regs) {
 #define EXEC_PIE_BASE    0x10000000U
 #define EXEC_INTERP_BASE 0x40000000U
     struct exec_strings av, ev;
-    es_init(&av);
-    es_init(&ev);
+    /* One budget for both vectors, pre-charged with the two NULL terminators
+     * their pointer arrays need.  es_charge() spends it as the strings are
+     * copied, so an oversized argv is refused before the memory is taken. */
+    uint32_t arg_budget = 8;
+    /* Function scope, not block scope: the shebang rebuild below hands its
+     * vector to `av`, which keeps pointing at this counter afterwards. */
+    uint32_t shebang_budget = 8;
+    es_init(&av, &arg_budget);
+    es_init(&ev, &arg_budget);
     r = es_push_user_vec(&av, (char **)(uintptr_t)regs->ecx);
     if (r == 0) r = es_push_user_vec(&ev, (char **)(uintptr_t)regs->edx);
-    if (r == 0 &&
-        av.used + ev.used + (av.n + ev.n + 2) * 4 > EXEC_ARG_MAX)
-        r = -7;                                   /* -E2BIG (bprm_stack_limits) */
     if (r < 0) { es_free(&av); es_free(&ev); return r; }
     int argc = (int)av.n;
     int envc = (int)ev.n;
@@ -1516,7 +1548,7 @@ static int sys_exec(registers_t *regs) {
         if (ii > 0) {
             /* Rebuild argv: [interp, interp_arg?, script_path, orig_argv[1..]] */
             struct exec_strings nv;
-            es_init(&nv);
+            es_init(&nv, &shebang_budget);
             int rc = es_push(&nv, interp, (uint32_t)ii);
             if (rc == 0 && ai > 0) rc = es_push(&nv, interp_arg, (uint32_t)ai);
             if (rc == 0) rc = es_push(&nv, path, (uint32_t)__builtin_strlen(path));

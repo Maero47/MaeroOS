@@ -13,6 +13,15 @@
  *
  * The probe re-executes itself with --helper-args; the helper prints argc,
  * the environment count and the longest env/arg lengths to a pipe.
+ *
+ * It also asserts the REFUSAL side, which is what keeps the kernel alive: the
+ * total is bounded while the strings are being copied, not after.  A vector of
+ * thousands of pointers all aimed at ONE large string costs the caller almost
+ * nothing and must still be rejected with E2BIG rather than consuming kernel
+ * memory proportional to argc x strlen.  Linux checks bprm_stack_limits()
+ * inside copy_strings() for exactly this reason.  Every refusal is issued from
+ * the probe's own process: execve returning an error must leave the caller
+ * running, and the kernel must still be able to exec afterwards.
  */
 #define PROBE_NAME "p14_exec_arg_size"
 #include "probe.h"
@@ -133,6 +142,74 @@ int main(int argc, char **argv)
     char *av2[] = { self, "--helper-args", bigarg, NULL };
     char *ev2[] = { bigenv, NULL };
     run_exec(self, av2, ev2, 3, 1, 32768, 65536, "64 KiB arg + 32 KiB env");
+
+    /* Case 3: one string past MAX_ARG_STRLEN (32 pages). */
+    {
+        size_t big = 200 * 1024;
+        char *huge = malloc(big + 1);
+        if (!huge)
+            probe_skip("cannot allocate %zu KiB", big >> 10);
+        memset(huge, 'a', big);
+        huge[big] = 0;
+        char *hav[] = { self, "--helper-args", huge, NULL };
+        char *hev[] = { NULL };
+        errno = 0;
+        execve(self, hav, hev);
+        if (errno != E2BIG)
+            probe_fail("execve with a %zu KiB argument failed with %s, expected E2BIG",
+                       big >> 10, strerror(errno));
+        free(huge);
+        probe_info("a single %zu KiB argument is refused with E2BIG", big >> 10);
+    }
+
+    /* Case 4: MAX_ARG_STRINGS pointers to ONE 128 KiB string.  The caller only
+     * supplies 128 KiB; a kernel that sizes its copy buffer by argc x strlen
+     * would try to allocate hundreds of MiB here. */
+    size_t rep = 128 * 1024;
+    char *repeated = malloc(rep + 1);
+    if (!repeated)
+        probe_skip("cannot allocate %zu KiB", rep >> 10);
+    memset(repeated, 'b', rep);
+    repeated[rep] = 0;
+    {
+        static char *flood[4098];
+        flood[0] = self;
+        flood[1] = (char *)"--helper-args";
+        for (int i = 2; i < 4096; i++)
+            flood[i] = repeated;
+        flood[4096] = NULL;
+        char *nev[] = { NULL };
+        errno = 0;
+        execve(self, flood, nev);
+        if (errno != E2BIG)
+            probe_fail("execve with 4096 argv pointers to one %zu KiB string failed "
+                       "with %s, expected E2BIG", rep >> 10, strerror(errno));
+        probe_info("4096 argv pointers to one %zu KiB string are refused with E2BIG",
+                   rep >> 10);
+    }
+
+    /* Case 5: the same flood in the ENVIRONMENT, behind a small argv.  argv
+     * alone is legal, so this only fails if argv and envp are charged against
+     * ONE running total while they are copied. */
+    {
+        static char *floodenv[4098];
+        for (int i = 0; i < 4096; i++)
+            floodenv[i] = repeated;
+        floodenv[4096] = NULL;
+        char *sav[] = { self, "--helper-args", NULL };
+        errno = 0;
+        execve(self, sav, floodenv);
+        if (errno != E2BIG)
+            probe_fail("execve with 4096 envp pointers to one %zu KiB string failed "
+                       "with %s, expected E2BIG", rep >> 10, strerror(errno));
+        probe_info("4096 envp pointers to one %zu KiB string are refused with E2BIG",
+                   rep >> 10);
+    }
+    free(repeated);
+
+    /* The four refusals must have left this process, and the kernel, healthy:
+     * an ordinary execve still has to work. */
+    run_exec(self, av2, ev2, 3, 1, 32768, 65536, "exec still works after E2BIG");
 
     probe_pass();
 }
