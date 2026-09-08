@@ -58,6 +58,18 @@ typedef struct {
     int      pic_solid;    /* 1 = 1x1 solid colour source (colour in fg) */
     /* glyphset (XRender text): A8 coverage bitmaps keyed by glyph id */
     void    *gset;         /* glyphset_t* for R_GLYPHSET */
+    /* Creation order, used as the stacking order when compositing.  The slot
+     * index cannot serve: res_new() reuses the first free slot, and pixmaps and
+     * GCs are created and freed constantly, so a window created later can land
+     * in a lower slot than one created earlier. */
+    unsigned create_seq;
+    /* Set the first time anything is drawn into this window.  A mapped window
+     * that has never been drawn into must not be composited: X gives such a
+     * window no contents of its own (GTK creates the MozContainer that Firefox
+     * renders into with no background so the parent shows through), and
+     * painting maeroX's placeholder colour over the parent hid the browser
+     * chrome that had been drawn into the toplevel underneath. */
+    int      painted;
 } xres_t;
 
 /* XRender glyph storage: each glyph is an A8 coverage bitmap + metrics. */
@@ -99,6 +111,7 @@ static int       dumps_done;
 static int       listen_fd = -1;
 static xclient_t clients[MAX_XCLIENTS];
 static int       dirty = 1;
+static unsigned  res_seq;      /* monotonic; stamped on every window created */
 
 /* ── A0 diagnostic trace ─────────────────────────────────────────────────────
  * Firefox's X requests are the key to why nothing paints, but maeroX's stdout
@@ -124,6 +137,20 @@ static void xt_dump_hist(void) {
     for (int i = 0; i < 256; i++)
         if (op_hist[i]) xt("op%d=%u ", i, op_hist[i]);
     xt("| putimg=%u copy=%u render=%u\n", putimage_n, copyarea_n, render_n);
+    /* Why is a painted toplevel not on screen?  composite_windows() only draws
+     * a window that is mapped, has a backing buffer and lands inside the
+     * surface, so print exactly those facts for every window big enough to be
+     * a toplevel. */
+    for (int ci = 0; ci < MAX_XCLIENTS; ci++) {
+        if (!clients[ci].used) continue;
+        for (int i = 0; i < clients[ci].nres; i++) {
+            xres_t *w = &clients[ci].res[i];
+            if (w->kind != R_WINDOW || w->w < 400) continue;
+            xt("XT win c%d slot%d xid=0x%x %dx%d @%d,%d mapped=%d px=%d max=%d seq=%u\n",
+               ci, i, (unsigned)w->xid, w->w, w->h, w->x, w->y,
+               w->mapped, w->px ? 1 : 0, w->maximized, w->create_seq);
+        }
+    }
     xt("XT lastops: ");
     int n = op_ring_n < 32 ? (int)op_ring_n : 32;
     int base = op_ring_n < 32 ? 0 : (int)(op_ring_n & 31);
@@ -412,6 +439,7 @@ static void send_pointer(xclient_t *c, xres_t *w, int type, int detail,
 /* ── drawing into a drawable's backing buffer ────────────────────────────── */
 static void fill_rect(xres_t *d, int x, int y, int w, int h, uint32_t color) {
     if (!d || !d->px) return;
+    d->painted = 1;
     for (int yy = y; yy < y + h; yy++) {
         if (yy < 0 || yy >= d->h) continue;
         for (int xx = x; xx < x + w; xx++) {
@@ -475,6 +503,7 @@ static xglyph_t *glyph_find(glyphset_t *gs, uint32_t id) {
 /* Blit one A8 glyph (coverage) in colour `col` onto drawable dd at pen (px,py). */
 static void glyph_blit(xres_t *dd, xglyph_t *g, int px, int py, uint32_t col) {
     if (!g || !g->bits || !dd || !dd->px) return;
+    dd->painted = 1;
     int ox = px - g->x, oy = py - g->y;
     uint32_t cr = (col >> 16) & 0xff, cg = (col >> 8) & 0xff, cb = col & 0xff;
     for (int yy = 0; yy < g->h; yy++) {
@@ -548,6 +577,7 @@ static void dispatch_render(xclient_t *c, const uint8_t *q, int qlen) {
         if (!dstp || dstp->kind != R_PICTURE) break;
         xres_t *dd = res_find(c, dstp->pic_drawable);
         if (!dd || !dd->px) break;
+        dd->painted = 1;
         int    solid = (srcp && srcp->kind == R_PICTURE && srcp->pic_solid);
         uint32_t sc  = solid ? srcp->fg : 0;
         xres_t *sd   = (!solid && srcp && srcp->kind == R_PICTURE)
@@ -584,6 +614,7 @@ static void dispatch_render(xclient_t *c, const uint8_t *q, int qlen) {
         if (!dstp || dstp->kind != R_PICTURE) break;
         xres_t *dd = res_find(c, dstp->pic_drawable);
         if (!dd || !dd->px) break;
+        dd->painted = 1;
         int nr = (qlen - 20) / 8;
         for (int i = 0; i < nr; i++) {
             const uint8_t *rr = q + 20 + i * 8;
@@ -664,6 +695,7 @@ static void dispatch_render(xclient_t *c, const uint8_t *q, int qlen) {
         if (!dstp || dstp->kind != R_PICTURE) break;
         xres_t *dd = res_find(c, dstp->pic_drawable);
         if (!dd || !dd->px) break;
+        dd->painted = 1;
         uint32_t col = (srcp && srcp->kind == R_PICTURE && srcp->pic_solid)
                      ? srcp->fg : 0xFF000000;          /* default opaque black */
         int penx = 0, peny = 0, off = 28;              /* glyph-element list */
@@ -717,6 +749,7 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
         uint32_t wid = r32(q + 4);
         xres_t *w = res_new(c, wid, R_WINDOW);
         if (!w) return;
+        w->create_seq = ++res_seq;
         w->x = rs16(q + 12); w->y = rs16(q + 14);
         w->w = (int)r16(q + 16); w->h = (int)r16(q + 18);
         if (w->w < 1) w->w = 1; if (w->h < 1) w->h = 1;
@@ -856,6 +889,7 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
         if (copyarea_n <= 8) xt("XT CopyArea src=0x%x dst=0x%x\n",
                                 (unsigned)r32(q + 4), (unsigned)r32(q + 8));
         if (src && src->px && dst && dst->px) {
+            dst->painted = 1;
             int sx = rs16(q + 16), sy = rs16(q + 18);
             int dx = rs16(q + 20), dy = rs16(q + 22);
             int w  = (int)r16(q + 24), h = (int)r16(q + 26);
@@ -937,6 +971,7 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
             if (mfd >= 0) close(mfd);
         }
         if (d && d->px && (depth == 24 || depth == 32)) {
+            d->painted = 1;
             int stride = ((iw * 4 + 3) & ~3);          /* scanline pad 32 */
             const uint8_t *img = q + 24;
             for (int yy = 0; yy < ih; yy++) {
@@ -1255,21 +1290,44 @@ static void frame_dump(void) {
 }
 
 /* ── compositing ─────────────────────────────────────────────────────────── */
+/* Draw the mapped windows in CREATION order, oldest first, so a window created
+ * later covers one created earlier.  maeroX does not track the window
+ * hierarchy, and Firefox's toplevel (which it leaves blank) and the MozContainer
+ * it actually renders into are both full-screen, so whichever is drawn last
+ * decides what the user sees.  Iterating the resource array drew them in slot
+ * order, and because res_new() reuses freed pixmap/GC slots the container could
+ * land below the toplevel: the browser then painted normally (putimg=24) while
+ * the screen showed the toplevel's empty background.  That was a coin flip -
+ * 10 of 20 runs. */
+typedef struct { xres_t *w; unsigned seq; } zorder_t;
+
 static void composite_windows(draw_surface_t *s) {
+    zorder_t order[MAX_XCLIENTS * MAX_RES];
+    int n = 0;
     for (int ci = 0; ci < MAX_XCLIENTS; ci++) {
         if (!clients[ci].used) continue;
         xclient_t *c = &clients[ci];
-        for (int i = 0; i < c->nres; i++) {
+        for (int i = 0; i < c->nres && n < (int)(sizeof(order) / sizeof(order[0])); i++) {
             xres_t *w = &c->res[i];
-            if (w->kind != R_WINDOW || !w->mapped || !w->px) continue;
-            for (int yy = 0; yy < w->h; yy++) {
-                int ty = w->y + yy;
-                if (ty < 0 || ty >= s->h) continue;
-                for (int xx = 0; xx < w->w; xx++) {
-                    int tx = w->x + xx;
-                    if (tx < 0 || tx >= s->w) continue;
-                    s->px[(size_t)ty * s->w + tx] = w->px[(size_t)yy * w->w + xx];
-                }
+            if (w->kind != R_WINDOW || !w->mapped || !w->px || !w->painted) continue;
+            order[n].w = w; order[n].seq = w->create_seq; n++;
+        }
+    }
+    for (int i = 1; i < n; i++) {            /* insertion sort: n is tiny */
+        zorder_t t = order[i];
+        int j = i - 1;
+        while (j >= 0 && order[j].seq > t.seq) { order[j + 1] = order[j]; j--; }
+        order[j + 1] = t;
+    }
+    for (int k = 0; k < n; k++) {
+        xres_t *w = order[k].w;
+        for (int yy = 0; yy < w->h; yy++) {
+            int ty = w->y + yy;
+            if (ty < 0 || ty >= s->h) continue;
+            for (int xx = 0; xx < w->w; xx++) {
+                int tx = w->x + xx;
+                if (tx < 0 || tx >= s->w) continue;
+                s->px[(size_t)ty * s->w + tx] = w->px[(size_t)yy * w->w + xx];
             }
         }
     }
