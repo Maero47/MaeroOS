@@ -1,5 +1,6 @@
 #include "ata.h"
 #include "../kernel/printk.h"
+#include <kernel/kprof.h>
 #include <io.h>
 #include <stdint.h>
 
@@ -131,6 +132,9 @@ int ata_present(void) {
 int ata_read(uint32_t lba, uint8_t count, void *buf) {
     if (!drive_present) return -1;
 
+    kprof_count(KPE_ATA_RD);
+    kprof_add(KPE_ATA_RD_SECT, count ? count : 256);
+    int kp_old = kprof_switch(KPB_ATA);
     uint32_t irq = ata_irq_save();   /* serialize the whole PIO transaction */
     ata_wait_bsy();
 
@@ -147,18 +151,22 @@ int ata_read(uint32_t lba, uint8_t count, void *buf) {
     uint16_t *ptr = (uint16_t *)buf;
 
     for (int s = 0; s < nsect; s++) {
-        if (ata_wait_drq() < 0) { ata_irq_restore(irq); return -1; }
+        if (ata_wait_drq() < 0) { ata_irq_restore(irq); kprof_switch(kp_old); return -1; }
         insw(ATA_DATA, ptr, 256);  /* 256 words = 512 bytes */
         ptr += 256;
         ata_delay();
     }
     ata_irq_restore(irq);
+    kprof_switch(kp_old);
     return 0;
 }
 
 int ata_write(uint32_t lba, uint8_t count, const void *buf) {
     if (!drive_present) return -1;
 
+    kprof_count(KPE_ATA_WR);
+    kprof_add(KPE_ATA_WR_SECT, count ? count : 256);
+    int kp_old = kprof_switch(KPB_ATA);
     uint32_t irq = ata_irq_save();   /* serialize the whole PIO transaction */
     ata_wait_bsy();
 
@@ -175,7 +183,7 @@ int ata_write(uint32_t lba, uint8_t count, const void *buf) {
     const uint16_t *ptr = (const uint16_t *)buf;
 
     for (int s = 0; s < nsect; s++) {
-        if (ata_wait_drq() < 0) { ata_irq_restore(irq); return -1; }
+        if (ata_wait_drq() < 0) { ata_irq_restore(irq); kprof_switch(kp_old); return -1; }
         outsw(ATA_DATA, ptr, 256);
         ptr += 256;
         ata_delay();
@@ -185,6 +193,7 @@ int ata_write(uint32_t lba, uint8_t count, const void *buf) {
     outb(ATA_CMD, ATA_CMD_FLUSH);
     ata_wait_bsy();
     ata_irq_restore(irq);
+    kprof_switch(kp_old);
 
     return 0;
 }

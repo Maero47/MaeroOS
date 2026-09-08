@@ -8,6 +8,7 @@
 #include "../proc/scheduler.h"
 #include <stdint.h>
 #include <stddef.h>
+#include <kernel/kprof.h>
 
 /* ── ext2 on-disk structures ──────────────────────────────────────────────── */
 
@@ -208,6 +209,7 @@ static int ext2_read_block(uint32_t blk, void *buf) {
      * data → spurious ENOENT on a file that exists (the intermittent
      * "/disk/shell not found" boot flake and flaky smoke-disk).  Serialize the
      * whole cache access (the raw ATA read already runs with IRQs off). */
+    kprof_count(KPE_EXT2_BLK);
     preempt_disable();
     if (g_cache_ready) {
         for (uint32_t i = 0; i < EXT2_CACHE_SLOTS; i++) {
@@ -215,11 +217,13 @@ static int ext2_read_block(uint32_t blk, void *buf) {
                 memcpy(buf, g_cache[i].data, g_state.block_size);
                 g_cache[i].age = g_cache_age++;
                 preempt_enable();
+                kprof_count(KPE_EXT2_HIT);
                 return 0;
             }
         }
     }
 
+    kprof_count(KPE_EXT2_MISS);
     if (ext2_raw_read_block(blk, buf) < 0) {
         preempt_enable();
         return -1;

@@ -18,6 +18,7 @@ extern void vma_clear(struct proc *p);   /* free demand-paged VMAs (syscall.c) *
 #include "../mm/heap.h"
 #include "../kernel/printk.h"
 #include <kernel/config.h>
+#include <kernel/kprof.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -47,15 +48,6 @@ void scheduler_start(void) {
             if (p->state != PROC_RUNNABLE) continue;
 
             ran = 1;
-            /* DEBUG (SMP S4): prove each CPU actually dispatches work. */
-            {
-                static int seen[8];
-                int c = (int)this_cpu_id();
-                if (c > 0 && c < 8 && !seen[c]) {
-                    seen[c] = 1;
-                    printk("[SMP]  CPU %d dispatched pid=%d (AP scheduling live)\n", c, p->pid);
-                }
-            }
             current_proc   = p;
             p->state       = PROC_RUNNING;
             p->time_slice  = DEFAULT_TIMESLICE;
@@ -72,7 +64,11 @@ void scheduler_start(void) {
                 __asm__ volatile("mov %0, %%cr3" :: "r"(p->pgdir_phys) : "memory");
 
             fpu_restore(fpu_area(p));
+            kprof_count(KPE_CTXSW);
+            kprof_switch(p->kprof_bucket);   /* charge the dispatch to KPB_SCHED */
             swtch(&scheduler_ctx, p->context);
+            /* Back in the scheduler: the outgoing thread already parked its own
+             * bucket and left KPB_SCHED current (see kprof_park below). */
             fpu_save(fpu_area(p));
 
             __asm__ volatile("mov %0, %%cr3" :: "r"(kernel_pgdir_phys) : "memory");
@@ -93,6 +89,7 @@ void scheduler_start(void) {
          * run kernel code; re-acquire on wake before re-scanning the shared
          * ptable. */
         if (!ran) {
+            int kp_old = kprof_switch(KPB_IDLE);
             bkl_release();
             if (this_cpu_id() == 0) {
                 /* BSP: woken by the PIT/keyboard/IRQ (all routed here via the
@@ -109,6 +106,7 @@ void scheduler_start(void) {
                 }
             }
             bkl_acquire();
+            kprof_switch(kp_old);
         }
     }
 }
@@ -128,6 +126,8 @@ void scheduler_tick(int user_mode) {
             p->state = PROC_RUNNABLE;
         }
     }
+
+    kprof_tick();
 
     if (!current_proc) return;
     current_proc->utime_ticks++;
@@ -153,9 +153,18 @@ void preempt_enable(void) {
         current_proc->no_preempt--;
 }
 
+/* Park the running thread's kprof bucket in the thread and hand the cycles
+ * over to the scheduler, so kernel time is charged to whoever is really on the
+ * CPU (see include/kernel/kprof.h). */
+static inline void kprof_park(void) {
+    if (current_proc) current_proc->kprof_bucket = kprof_switch(KPB_SCHED);
+    else kprof_switch(KPB_SCHED);
+}
+
 void yield(void) {
     if (!current_proc) return;
     current_proc->state = PROC_RUNNABLE;
+    kprof_park();
     __asm__ volatile("cli");
     swtch(&current_proc->context, scheduler_ctx);
     __asm__ volatile("sti");
@@ -174,9 +183,13 @@ int sleep_on(void *chan) {
     current_proc->sleep_seq  = ++g_sleep_seq;
     current_proc->sleep_timed_out = 0;
     current_proc->state     = PROC_SLEEPING;
+    int slp_sys = current_proc->last_syscall;
+    uint64_t slp_t0 = kprof_sleep_begin();
+    kprof_park();
     __asm__ volatile("cli");
     swtch(&current_proc->context, scheduler_ctx);
     __asm__ volatile("sti");
+    kprof_sleep_end(slp_t0, slp_sys);
     /* Every wake path clears wake_tick, but make it unconditional here so a
      * deadline set for THIS sleep can never fire into a later untimed sleep
      * (Linux timeouts are per call: a stale one is simply not a thing). */
@@ -189,6 +202,7 @@ int sleep_on(void *chan) {
 void proc_stop_self(void) {
     if (!current_proc) return;
     current_proc->state = PROC_STOPPED;
+    kprof_park();
     __asm__ volatile("cli");
     swtch(&current_proc->context, scheduler_ctx);
     __asm__ volatile("sti");
@@ -257,7 +271,7 @@ int wake_up_n(void *chan, int n) {
             woken++;
         }
     }
-    if (woken > 0) g_resched_pending = 1;
+    if (woken > 0) { g_resched_pending = 1; kprof_add(KPE_WAKE, (uint32_t)woken); }
     return woken;
 }
 
@@ -299,6 +313,7 @@ void resched_on_return(void) {
     if (!current_proc || current_proc->no_preempt) return;
     if (!g_resched_pending) return;
     g_resched_pending = 0;
+    kprof_count(KPE_RESCHED);
     yield();
 }
 
@@ -469,6 +484,7 @@ void proc_exit(int status) {
         }
     }
 
+    kprof_park();
     swtch(&current_proc->context, scheduler_ctx);
     for (;;) __asm__ volatile("hlt");
 }

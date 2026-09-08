@@ -30,106 +30,7 @@ void proc_init(void) {
     printk("[PROC] Process table initialized (%d slots).\n", MAX_PROCS);
 }
 
-/* Diagnostic: dump every live process — pid, tgid, state, last syscall — so a
- * stall (everyone SLEEPING on futex/poll) is visible from the serial log.
- * States: 1=EMBRYO 2=RUNNABLE 3=RUNNING 4=SLEEPING 5=ZOMBIE 6=STOPPED. */
-/* Heuristic user-stack backtrace for a sleeping user thread.  Modern Firefox
- * omits frame pointers, so instead of walking EBP we switch into the thread's
- * address space and scan its stack for words that look like code return
- * addresses (in the 0x10000000–0x60000000 mmap/exec range).  This reveals which
- * subsystem the stuck main thread is parked in.  Safe: kernel higher-half is
- * mapped in every pgdir, and we restore CR3 before returning. */
-static int str_has(const char *s, const char *sub);
-static void user_backtrace(struct proc *p) {
-    if (!p->tf || !p->pgdir_phys) return;
-    uint32_t saved;
-    __asm__ volatile("mov %%cr3,%0" : "=r"(saved));
-    __asm__ volatile("mov %0,%%cr3" :: "r"(p->pgdir_phys) : "memory");
 
-    printk("  bt p%d eip=%x chan=%x", p->pid,
-           (unsigned)p->tf->eip,
-           (unsigned)(uintptr_t)p->sleep_chan);
-    /* Dump the futex/lock structure the thread is parked on (owner tid etc.) */
-    uint32_t la = (uint32_t)(uintptr_t)p->sleep_chan;
-    if (la && la < 0xC0000000U && (*paging_get_pde(la) & 1) &&
-        (*paging_get_pte(la) & 1)) {
-        printk(" lock=[%x %x %x]",
-               (unsigned)*(volatile uint32_t *)(uintptr_t)la,
-               (unsigned)*(volatile uint32_t *)(uintptr_t)(la + 4),
-               (unsigned)*(volatile uint32_t *)(uintptr_t)(la + 8));
-    }
-    printk(" stk:");
-    uint32_t sp = p->tf->useresp & ~3U;
-    /* For the tgid leader (firefox main thread) dump MANY raw words so we can
-     * offline-resolve the call_once caller / the static-init function.  For
-     * worker threads keep the compact code-filtered scan. */
-    int leader = (p->pid == p->tgid);
-    int printed = 0, cap = leader ? 90 : 48;
-    for (uint32_t a = sp; a < sp + 8192 && printed < cap; a += 4) {
-        if (!(*paging_get_pde(a) & 1)) { a = (a & ~0x3FFFFFU) + 0x400000U - 4; continue; }
-        if (!(*paging_get_pte(a) & 1)) continue;
-        uint32_t v = *(volatile uint32_t *)(uintptr_t)a;
-        if (leader) { printk(" %x", (unsigned)v); printed++; }
-        else if (v >= 0x10000000U && v < 0x60000000U) { printk(" %x", (unsigned)v); printed++; }
-    }
-    printk("\n");
-    /* For the leader, also scan the stack region for printable ASCII runs — the
-     * child-process launch argv ("-contentproc", "tab"/"gpu"/"utility"/...) lives
-     * there and tells us exactly which process is being launched. */
-    if (leader) {
-        char run[40]; int rl = 0;
-        printk("  str:");
-        for (uint32_t a = sp; a < sp + 8192; a += 1) {
-            if (!(*paging_get_pde(a) & 1)) { a = (a & ~0x3FFFFFU) + 0x400000U - 1; rl = 0; continue; }
-            if (!(*paging_get_pte(a) & 1)) { rl = 0; continue; }
-            uint8_t ch = *(volatile uint8_t *)(uintptr_t)a;
-            if (ch >= 0x20 && ch < 0x7f) { if (rl < 39) run[rl++] = (char)ch; }
-            else { if (rl >= 5) { run[rl] = 0; printk(" |%s", run); } rl = 0; }
-        }
-        printk("\n");
-    }
-    __asm__ volatile("mov %0,%%cr3" :: "r"(saved) : "memory");
-}
-
-void proc_debug_snapshot(void) {
-    extern volatile uint32_t g_tlb_sends, g_tlb_timeouts, g_tlb_acks;
-    printk("[tlb] sends=%u acks=%u timeouts=%u\n",
-           (unsigned)g_tlb_sends, (unsigned)g_tlb_acks, (unsigned)g_tlb_timeouts);
-    printk("[snap]");
-    for (int i = 0; i < MAX_PROCS; i++) {
-        struct proc *p = &ptable[i];
-        if (p->state == PROC_UNUSED) continue;
-        printk(" p%d/t%d:s%d#%d", p->pid, p->tgid, p->state, p->last_syscall);
-        printk("^%d", p->parent ? p->parent->pid : 0);   /* ppid */
-        if (p->state == PROC_SLEEPING && p->sleep_chan)
-            printk("@%x", (unsigned)(uintptr_t)p->sleep_chan);
-    }
-    printk("\n");
-    /* Backtrace only the firefox MAIN thread (leader).  The per-worker raw
-     * stack dumps were extremely noisy and are superseded by the call-filtered,
-     * offline-symbolizable [wbt] capture in the scheduler stall detector; keep
-     * just the leader dump here for a quick at-a-glance of the main thread. */
-    int ff_tgid = -1;
-    for (int i = 0; i < MAX_PROCS; i++)
-        if (ptable[i].state != PROC_UNUSED && ptable[i].pid == ptable[i].tgid &&
-            str_has(ptable[i].name, "firefox")) { ff_tgid = ptable[i].tgid; break; }
-    if (ff_tgid >= 0)
-        for (int i = 0; i < MAX_PROCS; i++) {
-            struct proc *p = &ptable[i];
-            if (p->state == PROC_SLEEPING && p->tgid == ff_tgid &&
-                p->pid == p->tgid)          /* leader only */
-                user_backtrace(p);
-        }
-}
-
-static int str_has(const char *s, const char *sub) {
-    for (; *s; s++) {
-        const char *a = s, *b = sub;
-        while (*a && *b && *a == *b) { a++; b++; }
-        if (!*b) return 1;
-    }
-    return 0;
-}
 
 struct proc *allocproc(void) {
     struct proc *p = NULL;
@@ -143,13 +44,6 @@ struct proc *allocproc(void) {
     }
     if (!p) { printk("[proc] table FULL (%d/%d) — clone/fork fails\n",
                      live, MAX_PROCS); return NULL; }
-    {   /* high-water-mark trace: how close does Firefox get to MAX_PROCS? */
-        static int peak = 0;
-        if (live + 1 > peak && live + 1 >= 40) {
-            peak = live + 1;
-            printk("[proc] live procs peak=%d/%d\n", peak, MAX_PROCS);
-        }
-    }
 
     p->state          = PROC_EMBRYO;
     p->pid            = next_pid++;

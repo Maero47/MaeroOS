@@ -19,6 +19,13 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 
+/* Ask the kernel to dump its cycle-accounting counters (kprof, syscall 503) at
+ * the instant the paint marker appears, so the profile covers exactly the
+ * startup being measured rather than the nearest periodic dump. */
+static void kprof_mark(void) {
+    __asm__ volatile("int $0x80" :: "a"(503) : "memory");
+}
+
 static char *const ff_envp[] = {
     "PATH=/disk:/disk/bin:/:/bin",
     /* HOME must be WRITABLE: nsToolkitProfileService creates/writes
@@ -318,7 +325,7 @@ int main(void) {
         int max_iters = PAINT_TIMEOUT_S * 20;
         for (int t = 0; t < max_iters && time((time_t *)0) < deadline; t++) {
             if (waitpid(fpid, &status, 1 /* WNOHANG */) == fpid) { exited = 1; break; }
-            if (access("/tmp/ff_painted", F_OK) == 0) { painted = 1; break; }
+            if (access("/tmp/ff_painted", F_OK) == 0) { kprof_mark(); painted = 1; break; }
             usleep(100000);   /* 100 ms */
         }
 

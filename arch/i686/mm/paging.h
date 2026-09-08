@@ -90,4 +90,3 @@ int pgdir_release(uint32_t pgdir_phys);
 
 /* Debug: arm a 4-byte hardware write-watchpoint (DR0/#DB) on a linear address
  * for one pid, reporting the instruction that writes `target_value` there. */
-void watchpoint_arm(uint32_t addr, int pid, uint32_t target_value);

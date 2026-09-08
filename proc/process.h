@@ -75,7 +75,6 @@ int usocket_send_fds(struct usocket *s, proc_file_t *files, int n);
 int usocket_recv_fds(struct usocket *s, proc_file_t *out, int max);
 
 /* Diagnostic: print a one-line state snapshot of every live process. */
-void proc_debug_snapshot(void);
 
 /* ── Context switch ─────────────────────────────────────────────────────── */
 
@@ -126,6 +125,8 @@ struct proc {
     int              exit_status;
     int              time_slice;
     int              last_syscall;            /* diagnostic: last syscall number */
+    int              kprof_bucket;            /* kprof: bucket in effect when this
+                                               * thread last switched away */
     char             name[16];
 
     /* File descriptor table — shared (refcounted) among threads of the group,

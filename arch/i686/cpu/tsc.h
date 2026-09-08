@@ -29,3 +29,6 @@ uint32_t clock_mono_to_tick(uint32_t sec, uint32_t nsec);
 /* Non-zero once the TSC rate has been measured (a few ticks after boot);
  * before that clock_mono() has plain 10 ms resolution. */
 int clock_tsc_calibrated(void);
+
+/* Cycles per 10 ms tick as measured by the calibration; 0 before it completes. */
+uint32_t tsc_cycles_per_tick(void);

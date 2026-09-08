@@ -1,6 +1,7 @@
 #include "isr.h"
 #include <registers.h>
 #include <stddef.h>
+#include <kernel/kprof.h>
 
 /* Forward declaration — defined in kernel/panic.c */
 extern void panic(const char *msg, registers_t *regs) __attribute__((noreturn));
@@ -51,15 +52,25 @@ static const char *exception_names[] = {
  * Called from isr_common_stub in isr.asm.
  */
 void isr_handler(registers_t *regs) {
+    /* kprof: charge this trap's cycles to its own bucket (per syscall for
+     * int 0x80), and restore the interrupted thread's bucket on the way out.
+     * `old` lives on this thread's kernel stack, so it survives a context
+     * switch inside the trap and is restored for the right thread. */
+    int kp_old = kprof_switch(regs->int_no == 128 ? kprof_sys_bucket(regs->eax)
+                              : regs->int_no == 14 ? KPB_PGFAULT : KPB_EXC);
+
     /* Syscall (int 0x80) */
     if (regs->int_no == 128) {
+        kprof_count(KPE_SYSCALL);
         syscall_dispatch(regs);
+        kprof_switch(kp_old);
         return;
     }
 
     /* Dispatch to a registered handler if present (e.g. #PF → page_fault_handler) */
     if (regs->int_no < 32 && exception_handlers[regs->int_no]) {
         exception_handlers[regs->int_no](regs);
+        kprof_switch(kp_old);
         return;
     }
 
@@ -75,8 +86,10 @@ void isr_handler(registers_t *regs) {
             case 17:                   sig = _SIGBUS;  break; /* alignment check */
             default:                   sig = _SIGSEGV; break; /* #GP, #SS, #NP … */
         }
-        if (user_fault_signal(regs, sig))
+        if (user_fault_signal(regs, sig)) {
+            kprof_switch(kp_old);
             return;
+        }
     }
 
     /* Kernel-mode (or pre-process) unhandled exception → fatal */

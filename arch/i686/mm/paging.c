@@ -9,6 +9,7 @@
 #include "../cpu/gdt.h"
 #include <kernel/config.h>
 #include <stdint.h>
+#include <kernel/kprof.h>
 
 extern void panic(const char *msg, registers_t *regs) __attribute__((noreturn));
 extern int vma_handle_fault(uint32_t addr);   /* demand-paged anonymous VMAs */
@@ -50,8 +51,6 @@ uint32_t kernel_pgdir_phys;
 #define KPGDIR ((uint32_t *)PAGE_DIR_VIRT)
 
 static void page_fault_handler(registers_t *regs);
-static void debug_watch_handler(registers_t *regs);
-void watchpoint_arm(uint32_t addr, int pid, uint32_t target_value);
 static void map_higher_half_physical_memory(void);
 
 void *paging_temp_map(uint32_t phys);
@@ -113,7 +112,6 @@ void paging_init(void) {
 
     /* Register the page fault handler + the debug (#DB) watchpoint handler */
     isr_install_handler(14, page_fault_handler);
-    isr_install_handler(1, debug_watch_handler);
 
     map_higher_half_physical_memory();
 
@@ -365,67 +363,7 @@ void pgdir_free_user(uint32_t pgdir_phys) {
 
 /* ─── Page fault handler ─────────────────────────────────────────────────── */
 
-/* Read a 4-byte word from the faulting process's user space, present-checked so
- * a wild pointer in a crashed thread can't fault us in ring 0.  The fault keeps
- * the process's CR3 loaded, so user VAs resolve directly.  Returns 0 if the
- * address is out of range or unmapped. */
-static uint32_t user_read_word(uint32_t va) {
-    if (va < 0x08000000U || va >= 0xC0000000U) return 0;
-    if (!(*paging_get_pde(va) & PAGE_PRESENT)) return 0;
-    if (!(*paging_get_pte(va) & PAGE_PRESENT)) return 0;
-    return *(uint32_t *)(uintptr_t)va;
-}
 
-/* ── Hardware watchpoint (DR0/#DB) ───────────────────────────────────────────
- * Catch the exact instruction that writes the corrupting value into a watched
- * user heap address.  DR0 holds the linear address; DR7 enables a 4-byte WRITE
- * breakpoint; #DB (vector 1) traps AFTER the write so we can read the value.
- * Only meaningful for one process (the watched pid), since the linear address
- * exists in every address space. */
-static uint32_t wp_addr;     /* watched linear address (0 = disabled) */
-static int      wp_pid;      /* only report writes by this pid */
-static uint32_t wp_target;   /* the corrupting value we're hunting */
-
-void watchpoint_arm(uint32_t addr, int pid, uint32_t target_value) {
-    wp_addr = addr; wp_pid = pid; wp_target = target_value;
-    __asm__ volatile("mov %0, %%dr0" :: "r"(addr));
-    /* DR7: L0=1 (bit0), R/W0=01 write (bits16-17), LEN0=11 4-byte (bits18-19) */
-    uint32_t dr7 = (1U << 0) | (1U << 16) | (3U << 18);
-    __asm__ volatile("mov %0, %%dr7" :: "r"(dr7));
-    __asm__ volatile("mov %0, %%dr6" :: "r"(0U));   /* clear status */
-    printk("[wp] armed DR0=%08x pid=%d hunting val=%08x\n",
-           (unsigned)addr, pid, (unsigned)target_value);
-}
-
-static unsigned wp_hits;
-static void debug_watch_handler(registers_t *regs) {
-    uint32_t dr6;
-    __asm__ volatile("mov %%dr6, %0" : "=r"(dr6));
-    __asm__ volatile("mov %0, %%dr6" :: "r"(0U));      /* clear status */
-    if (!(dr6 & 1) || !wp_addr) return;                /* not our DR0 hit */
-    if (!current_proc || current_proc->pid != wp_pid) return;
-    if (++wp_hits <= 3 || (wp_hits % 2000) == 0)
-        printk("[wp] hit #%u eip=%08x cur=%08x\n", wp_hits, (unsigned)regs->eip,
-               (unsigned)((*paging_get_pde(wp_addr) & PAGE_PRESENT) &&
-                          (*paging_get_pte(wp_addr) & PAGE_PRESENT)
-                          ? *(volatile uint32_t *)(uintptr_t)wp_addr : 0xDEADU));
-    uint32_t val = 0;
-    if ((*paging_get_pde(wp_addr) & PAGE_PRESENT) &&
-        (*paging_get_pte(wp_addr) & PAGE_PRESENT))
-        val = *(volatile uint32_t *)(uintptr_t)wp_addr;
-    /* Report the write that lands the corrupting value (and disarm to stop). */
-    if (val == wp_target) {
-        printk("[wp] HIT! eip=%08x wrote %08x to %08x (ring %s)\n",
-               (unsigned)regs->eip, (unsigned)val, (unsigned)wp_addr,
-               (regs->cs & 3) ? "user" : "KERNEL");
-        printk("[wp]  eax=%08x ebx=%08x ecx=%08x edx=%08x esi=%08x edi=%08x ebp=%08x\n",
-               (unsigned)regs->eax, (unsigned)regs->ebx, (unsigned)regs->ecx,
-               (unsigned)regs->edx, (unsigned)regs->esi, (unsigned)regs->edi,
-               (unsigned)regs->ebp);
-        wp_addr = 0;                                   /* disarm */
-        __asm__ volatile("mov %0, %%dr7" :: "r"(0U));
-    }
-}
 
 static void page_fault_handler(registers_t *regs) {
     uint32_t cr2;
@@ -460,6 +398,7 @@ static void page_fault_handler(registers_t *regs) {
              * side): no copy needed, just make the page writable again (Linux
              * wp_page_reuse). */
             if (pmm_frame_refcount(old_phys) == 1) {
+                kprof_count(KPE_PF_COW);
                 /* Grants write while keeping the entry's other bits, which is
                  * only correct because the test above has already excluded
                  * PAGE_WRPROT pages; do not relax that guard without changing
@@ -470,6 +409,7 @@ static void page_fault_handler(registers_t *regs) {
                 return;
             }
 
+            kprof_count(KPE_PF_COW);
             uint32_t new_phys = pmm_alloc_frame();
             if (!new_phys)
                 panic("COW fault: out of physical memory", regs);
@@ -551,6 +491,7 @@ static void page_fault_handler(registers_t *regs) {
             uint32_t page = cr2 & ~0xFFFU;
             uint32_t phys = pmm_alloc_frame();
             if (phys) {
+                kprof_count(KPE_PF_STACK);
                 pmm_frame_incref(phys);
                 paging_map(page, phys,
                            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
@@ -584,37 +525,6 @@ static void page_fault_handler(registers_t *regs) {
            (unsigned)regs->eax, (unsigned)regs->ebx, (unsigned)regs->ecx,
            (unsigned)regs->edx, (unsigned)regs->esi, (unsigned)regs->edi,
            (unsigned)regs->ebp, (unsigned)regs->useresp);
-    /* Aliasing check: is the physical frame holding the corrupt value (at edi)
-     * mapped at MORE THAN ONE user virtual address?  If so, a write through the
-     * alias VA corrupted edi's frame (a frame-aliasing kernel bug) — which a VA
-     * watchpoint could never catch.  Scan all user PTEs for the same frame. */
-    if (current_proc && regs->edi >= 0x08000000U && regs->edi < 0xC0000000U) {
-        uint32_t want_va = regs->edi & ~0xFFFU;
-        uint32_t want_ph = 0;
-        if ((*paging_get_pde(want_va) & PAGE_PRESENT) &&
-            (*paging_get_pte(want_va) & PAGE_PRESENT))
-            want_ph = *paging_get_pte(want_va) & ~0xFFFU;
-        if (want_ph) {
-            int aliases = 0;
-            for (uint32_t pde = 0; pde < 768 && aliases < 6; pde++) {
-                if (!(*paging_get_pde(pde << 22) & PAGE_PRESENT)) continue;
-                uint32_t *pt = (uint32_t *)(PAGE_TABLES_BASE + pde * PAGE_SIZE);
-                for (uint32_t pti = 0; pti < 1024 && aliases < 6; pti++) {
-                    if (!(pt[pti] & PAGE_PRESENT)) continue;
-                    if ((pt[pti] & ~0xFFFU) != want_ph) continue;
-                    uint32_t va = (pde << 22) | (pti << 12);
-                    if (va == want_va) continue;
-                    printk("  [ALIAS] frame %08x (of edi %08x) ALSO mapped at %08x pte=%08x\n",
-                           (unsigned)want_ph, (unsigned)want_va, (unsigned)va,
-                           (unsigned)pt[pti]);
-                    aliases++;
-                }
-            }
-            if (!aliases)
-                printk("  [ALIAS] frame %08x of edi is mapped at exactly one VA (no aliasing)\n",
-                       (unsigned)want_ph);
-        }
-    }
     if (current_proc && cr2 < 0xC0000000U) {
         /* Is the faulting address inside a known demand-paged VMA?  If yes, the
          * region was mmap'd but our handler failed to back it (kernel bug); if
@@ -631,45 +541,8 @@ static void page_fault_handler(registers_t *regs) {
                    (unsigned)current_proc->mmap_next, (unsigned)current_proc->brk_base,
                    (unsigned)current_proc->heap_end, (unsigned)current_proc->image_start,
                    (unsigned)current_proc->image_end);
-        /* Dump memory around the registers that point into mapped user memory —
-         * one of them holds the corrupted heap location feeding the bad pointer.
-         * Print 0x20 bytes around edi/esi/edx if present (read-checked). */
-        uint32_t probes[3] = { regs->edi, regs->esi, regs->edx };
-        const char *pn[3] = { "edi", "esi", "edx" };
-        for (int pi = 0; pi < 3; pi++) {
-            uint32_t a = probes[pi] & ~0xFU;
-            if (a < 0x1000 || a >= 0xC0000000U) continue;
-            if (!(*paging_get_pde(a) & PAGE_PRESENT) ||
-                !(*paging_get_pte(a) & PAGE_PRESENT)) continue;
-            const uint32_t *m = (const uint32_t *)a;
-            printk("  mem@%s=%08x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-                   pn[pi], (unsigned)a, (unsigned)m[0], (unsigned)m[1],
-                   (unsigned)m[2], (unsigned)m[3], (unsigned)m[4], (unsigned)m[5],
-                   (unsigned)m[6], (unsigned)m[7]);
-        }
     }
 
-    /* User-stack backtrace: the page fault keeps the faulting process's CR3, so
-     * its user pages are directly readable here (present-checked).  Walk the EBP
-     * chain printing each frame's return address — symbolize offline with
-     * tools/ffsym.sh against the fixed library load bases.  Only for faults that
-     * involve a user context. */
-    if (current_proc && cr2 < 0xC0000000U) {
-        uint32_t bp = regs->ebp;
-        printk("[bt] eip=%08x esp=%08x tgid=%d gs=%04x tls_base=%08x\n",
-               (unsigned)regs->eip, (unsigned)regs->useresp,
-               current_proc->tgid,
-               (unsigned)(regs->gs & 0xFFFF),
-               (unsigned)current_proc->tls_base);
-        for (int n = 0; n < 12 && bp >= 0x08000000U && bp < 0xC0000000U; n++) {
-            uint32_t ret = user_read_word(bp + 4);
-            uint32_t nbp = user_read_word(bp);
-            if (ret == 0) break;
-            printk("[bt] #%d ebp=%08x ret=%08x\n", n, (unsigned)bp, (unsigned)ret);
-            if (nbp <= bp) break;          /* stacks grow down; chain must ascend */
-            bp = nbp;
-        }
-    }
 
     /* User-mode fault: send SIGSEGV and let the process die gracefully.
      *
