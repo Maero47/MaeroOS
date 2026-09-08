@@ -1,4 +1,5 @@
 #include "pit.h"
+#include "tsc.h"
 #include "irq.h"
 #include "../include/io.h"
 #include "../include/registers.h"
@@ -13,6 +14,7 @@
 static volatile uint32_t ticks = 0;
 
 static void pit_handler(void *regs) {
+    tsc_tick_sample();   /* record the TSC at this tick edge (fine clock) */
     ticks++;
     random_mix_u32(ticks);
     /*

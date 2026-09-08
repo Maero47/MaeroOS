@@ -12,6 +12,7 @@
 
 extern void panic(const char *msg, registers_t *regs) __attribute__((noreturn));
 extern int vma_handle_fault(uint32_t addr);   /* demand-paged anonymous VMAs */
+extern int vma_prot_lookup(uint32_t addr);    /* mmap prot of the VMA at addr, -1 if none */
 
 /*
  * paging.c — x86 two-level page table management.
@@ -345,7 +346,8 @@ void pgdir_free_user(uint32_t pgdir_phys) {
         /* Access page table entries via recursive mapping */
         uint32_t *pt = (uint32_t *)(PAGE_TABLES_BASE + (uint32_t)i * PAGE_SIZE);
         for (int j = 0; j < 1024; j++) {
-            if (!(pt[j] & PAGE_PRESENT)) continue;
+            /* PAGE_PROTNONE entries are not present but still own a frame. */
+            if (!(pt[j] & (PAGE_PRESENT | PAGE_PROTNONE))) continue;
             uint32_t frame_phys = pt[j] & ~0xFFFU;
             pmm_frame_decref(frame_phys);
         }
@@ -438,8 +440,36 @@ static void page_fault_handler(registers_t *regs) {
     if ((err & 0x3U) == 0x3U &&
         (*paging_get_pde(cr2) & PAGE_PRESENT)) {
         uint32_t *pte = paging_get_pte(cr2);
-        if ((*pte & PAGE_PRESENT) && (*pte & PAGE_COW)) {
+        int vprot = vma_prot_lookup(cr2);
+        if ((*pte & PAGE_PRESENT) && (*pte & PAGE_COW) &&
+            !(*pte & PAGE_WRPROT) &&
+            (vprot < 0 || (vprot & 0x2))) {
+            /* A COW page in a mapping WITHOUT PROT_WRITE (mprotect(PROT_READ)
+             * after fork) is a real protection fault, not a COW break: the
+             * vprot test above lets it fall through to SIGSEGV (Linux
+             * do_wp_page is only reached when the VMA allows writing).
+             * PAGE_WRPROT is the same test for a page with no VMA at all (the
+             * ELF image, the brk heap, the main stack), where vprot is < 0 and
+             * would otherwise be read as "writes allowed".  It covers the
+             * copy path and the wp_page_reuse one below equally: a last
+             * reference is no reason to re-grant a write the process asked us
+             * to refuse. */
             uint32_t old_phys = *pte & ~0xFFFU;
+
+            /* Last reference (the sharer exited, unmapped or DONTNEED'ed its
+             * side): no copy needed, just make the page writable again (Linux
+             * wp_page_reuse). */
+            if (pmm_frame_refcount(old_phys) == 1) {
+                /* Grants write while keeping the entry's other bits, which is
+                 * only correct because the test above has already excluded
+                 * PAGE_WRPROT pages; do not relax that guard without changing
+                 * this line too. */
+                *pte = (*pte & ~(uint32_t)PAGE_COW) | PAGE_WRITABLE;
+                tlb_flush_single(cr2 & ~0xFFFU);
+                tlb_shootdown();
+                return;
+            }
+
             uint32_t new_phys = pmm_alloc_frame();
             if (!new_phys)
                 panic("COW fault: out of physical memory", regs);
@@ -490,12 +520,20 @@ static void page_fault_handler(registers_t *regs) {
         }
     }
 
-    /* Demand-paged anonymous VMA: a not-present fault may be the first touch of
-     * a lazily-allocated mmap region (e.g. a thread stack).  This fires for BOTH
+    /* A not-present entry carrying PAGE_PROTNONE is a page the process made
+     * inaccessible with mprotect(PROT_NONE) (or mapped PROT_NONE): it owns a
+     * frame and must NOT be demand-populated or treated as stack growth — the
+     * access is a genuine SIGSEGV (Linux: pte_protnone → access_error). */
+    int protnone = !(err & 0x1U) && cr2 < 0xC0000000U &&
+                   (*paging_get_pde(cr2) & PAGE_PRESENT) &&
+                   (*paging_get_pte(cr2) & PAGE_PROTNONE);
+
+    /* Demand-paged VMA: a not-present fault may be the first touch of a
+     * lazily-allocated mmap region (e.g. a thread stack).  This fires for BOTH
      * user-mode faults AND kernel-mode faults — the kernel writes to user mmap
      * buffers during syscalls (copy_to_user, a read() into a fresh buffer), and
      * those faults occur at CPL=0 on a user address.  Populate + retry. */
-    if (!(err & 0x1U) && cr2 < 0xC0000000U && current_proc &&
+    if (!(err & 0x1U) && !protnone && cr2 < 0xC0000000U && current_proc &&
         vma_handle_fault(cr2)) {
         return;
     }
@@ -508,7 +546,7 @@ static void page_fault_handler(registers_t *regs) {
      * narrow: only the stack region, never the mmap/heap area lower down.) */
     {
         uint32_t stack_grow_floor = (uint32_t)USER_STACK_TOP - (8U * 1024 * 1024);
-        if (!(err & 0x1U) && current_proc &&
+        if (!(err & 0x1U) && !protnone && current_proc &&
             cr2 >= stack_grow_floor && cr2 < (uint32_t)USER_STACK_BASE) {
             uint32_t page = cr2 & ~0xFFFU;
             uint32_t phys = pmm_alloc_frame();
@@ -655,14 +693,17 @@ static void page_fault_handler(registers_t *regs) {
                 printk("[SIG] pid=%d SIGSEGV loop eip=%08x addr=%08x ret=%08x — killed\n",
                        current_proc->pid, (unsigned)regs->eip, (unsigned)cr2,
                        (unsigned)retaddr);
-                proc_exit(128 + SIGSEGV);   /* does not return */
+                proc_group_exit(SIGSEGV);   /* does not return */
             }
         } else {
             current_proc->last_fault_eip = regs->eip;
             current_proc->fault_repeat   = 0;
         }
+        /* Synchronous fault: thread-directed SIGSEGV.  With SIG_DFL the whole
+         * thread group exits (Linux force_sig_fault -> get_signal ->
+         * do_group_exit), not just the faulting thread. */
         signal_send(current_proc, SIGSEGV);
-        signal_deliver_pending(regs);  /* → handler, or proc_exit if SIG_DFL */
+        signal_deliver_pending(regs);  /* → handler, or group exit if SIG_DFL */
         return;
     }
 

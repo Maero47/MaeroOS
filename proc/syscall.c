@@ -16,6 +16,7 @@
 #include "../drivers/keyboard.h"
 #include "../kernel/random.h"
 #include "../arch/i686/cpu/pit.h"
+#include "../arch/i686/cpu/tsc.h"
 #include "../arch/i686/cpu/gdt.h"
 #include "../arch/i686/cpu/fpu.h"
 #include "../arch/i686/cpu/cpuid.h"
@@ -115,6 +116,9 @@ struct ktimespec { int32_t tv_sec; int32_t tv_nsec; };
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
 
+int vma_prot_lookup(uint32_t addr);   /* defined with the VMA registry below */
+static int vma_range_free(uint32_t va, uint32_t length);
+
 int access_ok(const void *ptr, size_t len) {
     uintptr_t addr = (uintptr_t)ptr;
     uintptr_t end = addr + len;
@@ -129,11 +133,15 @@ int access_ok(const void *ptr, size_t len) {
 
     for (;;) {
         uint32_t *pde = paging_get_pde((uint32_t)page);
-        if (!(*pde & PAGE_PRESENT))
-            return 0;
-        uint32_t pte = *paging_get_pte((uint32_t)page);
-        if (!(pte & PAGE_PRESENT) || !(pte & PAGE_USER))
-            return 0;
+        uint32_t pte = (*pde & PAGE_PRESENT) ? *paging_get_pte((uint32_t)page) : 0;
+        if (!(pte & PAGE_PRESENT) || !(pte & PAGE_USER)) {
+            /* Not populated: fine if a VMA with access covers it — the copy
+             * demand-faults it in (Linux access_ok only checks the range; the
+             * fault path does the rest).  A PROT_NONE page or PROT_NONE VMA is
+             * not accessible. */
+            if (pte & PAGE_PROTNONE) return 0;
+            if (vma_prot_lookup((uint32_t)page) <= 0) return 0;
+        }
         if (page == last)
             break;
         page += PAGE_SIZE;
@@ -205,7 +213,7 @@ int user_fault_signal(registers_t *regs, int sig) {
            (unsigned)(regs->cs & 0xFFFF), sig);
     if (regs->eip == current_proc->last_fault_eip) {
         if (++current_proc->fault_repeat >= 3)
-            proc_exit(128 + sig);            /* does not return */
+            proc_group_exit(sig);            /* does not return */
     } else {
         current_proc->last_fault_eip = regs->eip;
         current_proc->fault_repeat   = 0;
@@ -508,11 +516,6 @@ static int eventfd_write(struct eventfd_obj *e, const char *buf, int len, int no
     e->count += add;
     wake_up(e);                                     /* wake blocked readers */
     io_wake();                                      /* wake pollers (now readable) */
-    /* NB: deliberately do NOT bump g_ff_io_nudge here — eventfd writes (GLib
-     * wakeups, vsync ~60Hz, timers) are far too frequent and make the IO threads
-     * spin on the self-heal, starving the single CPU (observed: stall at the
-     * first nsWindow::Create).  Pipe + unix-socket writes are the right dispatch
-     * signal; they got the browser chrome laid out (553x108 window mapped). */
     return 8;
 }
 
@@ -537,8 +540,10 @@ static int sys_eventfd(unsigned int initval, int flags) {
 
 void fd_retain(proc_file_t *f) {
     if (f->type == FD_FILE)    vfs_retain(f->node);
-    if (f->type == FD_PIPE_R)  f->pipe->nreaders++;
-    if (f->type == FD_PIPE_W)  f->pipe->nwriters++;
+    /* A named pipe's descriptor also holds the FIFO's vfs node; an anonymous
+     * pipe leaves node NULL and vfs_retain/vfs_close ignore it. */
+    if (f->type == FD_PIPE_R)  { f->pipe->nreaders++; vfs_retain(f->node); }
+    if (f->type == FD_PIPE_W)  { f->pipe->nwriters++; vfs_retain(f->node); }
     if (f->type == FD_SOCKET)  net_socket_retain(f->socket);
     if (f->type == FD_USOCKET) usocket_retain(f->usock);
     if (f->type == FD_EPOLL)   epoll_retain(f->epoll);
@@ -547,8 +552,8 @@ void fd_retain(proc_file_t *f) {
 
 void fd_release(proc_file_t *f) {
     if (f->type == FD_FILE)    vfs_close(f->node);
-    if (f->type == FD_PIPE_R)  pipe_close_read(f->pipe);
-    if (f->type == FD_PIPE_W)  pipe_close_write(f->pipe);
+    if (f->type == FD_PIPE_R)  { pipe_close_read(f->pipe);  vfs_close(f->node); }
+    if (f->type == FD_PIPE_W)  { pipe_close_write(f->pipe); vfs_close(f->node); }
     if (f->type == FD_SOCKET)  net_socket_release(f->socket);
     if (f->type == FD_USOCKET) usocket_release(f->usock);
     if (f->type == FD_EPOLL)   epoll_release(f->epoll);
@@ -604,11 +609,26 @@ void fdtable_put(struct proc *p) {
  */
 
 /* ── sys_exit(int status) — EAX=1 ─────────────────────────────────────── */
+/* exit() ends the CALLING THREAD only (Linux do_exit; glibc's pthread_exit
+ * path).  The status is wait-encoded here as (code & 0xff) << 8, the form
+ * WIFEXITED/WEXITSTATUS expect; a death by signal stores the bare signal
+ * number instead (kernel/exit.c: tsk->exit_code = code, do_group_exit(sig)). */
 static void sys_exit(registers_t *regs) {
     printk("[SYSCALL] sys_exit(%d) from pid %d\n",
            (int)regs->ebx, current_proc ? current_proc->pid : -1);
-    proc_exit((int)regs->ebx);   /* noreturn */
+    proc_exit(((int)regs->ebx & 0xff) << 8);   /* noreturn */
 }
+
+/* Linux clone(2) flag bits (uapi/linux/sched.h); used by do_fork and sys_clone. */
+#define CLONE_VM             0x00000100
+#define CLONE_FILES          0x00000400
+#define CLONE_SIGHAND        0x00000800
+#define CLONE_VFORK          0x00004000
+#define CLONE_THREAD         0x00010000
+#define CLONE_PARENT_SETTID  0x00100000
+#define CLONE_CHILD_CLEARTID 0x00200000
+#define CLONE_SETTLS         0x00080000
+#define CLONE_CHILD_SETTID   0x01000000
 
 /* Core fork.  child_stack==0 → child shares the parent's stack pointer (classic
  * fork).  child_stack!=0 → child runs on that user stack instead (clone without
@@ -617,7 +637,8 @@ static void sys_exit(registers_t *regs) {
  * Honouring child_stack here is essential: otherwise the child runs the glibc
  * clone trampoline on the parent's stack, pops garbage as its entry fn, and
  * jumps into the weeds. */
-static int do_fork(registers_t *regs, uint32_t child_stack) {
+static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags,
+                   uint32_t uptid, uint32_t uctid) {
     (void)regs;
     struct proc *parent = current_proc;
     if (!parent) return -1;
@@ -630,14 +651,20 @@ static int do_fork(registers_t *regs, uint32_t child_stack) {
     __builtin_memcpy(child->tf, parent->tf, sizeof(registers_t));
     child->tf->eax = 0;
 
-    child->parent = parent;
+    /* The child belongs to the forking PROCESS, not to the forking thread
+     * (Linux copy_process: p->real_parent = current->group_leader), so any
+     * thread of the parent may wait for it and its SIGCHLD goes to the process. */
+    child->parent = proc_group_leader(parent);
     __builtin_memcpy(child->name, parent->name, sizeof(parent->name));
 
-    /* Inherit signal handlers and flags; clear pending signals in child */
-    __builtin_memcpy(child->sig_handlers, parent->sig_handlers,
-                     sizeof(parent->sig_handlers));
-    __builtin_memcpy(child->sig_flags, parent->sig_flags,
-                     sizeof(parent->sig_flags));
+    /* Inherit a private COPY of the handler table (Linux copy_sighand without
+     * CLONE_SIGHAND); clear pending signals in child, keep the blocked mask. */
+    if (parent->sighand) {
+        __builtin_memcpy(child->sighand->handlers, parent->sighand->handlers,
+                         sizeof(child->sighand->handlers));
+        __builtin_memcpy(child->sighand->flags, parent->sighand->flags,
+                         sizeof(child->sighand->flags));
+    }
     child->pending_sigs  = 0;
     child->blocked_sigs  = parent->blocked_sigs;
     child->sigframe_addr = 0;
@@ -669,6 +696,17 @@ static int do_fork(registers_t *regs, uint32_t child_stack) {
     child->ctty      = parent->ctty;
     if (child->ctty)
         vfs_retain(child->ctty);
+
+    /* CLONE_PARENT_SETTID / CLONE_CHILD_SETTID / CLONE_CHILD_CLEARTID apply to
+     * fork-style clones too (kernel/fork.c copy_process: parent_tidptr is
+     * written by the parent, set_child_tid by the child in schedule_tail,
+     * clear_child_tid at exit).  glibc's fork passes &THREAD_SELF->tid as
+     * ctid so the child's descriptor holds ITS pid, not the parent's. */
+    if ((clone_flags & CLONE_PARENT_SETTID) && uptid &&
+        access_ok((void *)(uintptr_t)uptid, 4))
+        *(uint32_t *)(uintptr_t)uptid = (uint32_t)child->pid;
+    child->set_child_tid   = (clone_flags & CLONE_CHILD_SETTID)   ? uctid : 0;
+    child->clear_child_tid = (clone_flags & CLONE_CHILD_CLEARTID) ? uctid : 0;
 
     vma_clone(parent, child);     /* fork: child gets its own copy of the VMAs */
 
@@ -716,14 +754,19 @@ static int do_fork(registers_t *regs, uint32_t child_stack) {
 
         for (int pte_idx = 0; pte_idx < 1024; pte_idx++) {
             uint32_t pte = parent_pt[pte_idx];
-            if (!(pte & PAGE_PRESENT)) {
+            /* PAGE_PROTNONE entries own a frame too (mprotect(PROT_NONE)). */
+            if (!(pte & (PAGE_PRESENT | PAGE_PROTNONE))) {
                 child_pt[pte_idx] = 0;
                 continue;
             }
 
             uint32_t frame_phys = pte & ~0xFFFU;
 
-            if ((pte & PAGE_WRITABLE) && !(pte & PAGE_SHARED)) {
+            /* Every private page becomes COW, writable or not: a read-only
+             * private page may be made writable later by mprotect(), and the
+             * COW bit is what keeps that write from leaking into the sharer
+             * (Linux copy_present_pte marks the whole private range). */
+            if (!(pte & PAGE_SHARED)) {
                 /* Make COW: strip write bit, add COW flag in both.  NB: do NOT
                  * per-page invlpg here — for a large address space (Firefox's
                  * ~150 MB) that is tens of thousands of invlpgs, making fork slow
@@ -791,25 +834,12 @@ static int do_fork(registers_t *regs, uint32_t child_stack) {
     printk("[SYSCALL] %s: parent pid=%d child pid=%d%s\n",
            child_stack ? "clone(fork)" : "sys_fork",
            parent->pid, child->pid, child_stack ? " (child stack)" : "");
-    /* [fk] a firefox thread just fork()ed a full child (content process launch).
-     * Remember it so we can trace whether it BLOCKS (futex WAIT) or NOTIFIES
-     * (futex WAKE) afterward — i.e. does it reach Monitor.Notify to set the
-     * WaitForProcessHandle predicate?  Skip the Breakpad crash-dumper clone
-     * (child_stack != 0 = CLONE_VM w/ stack); we want the real content fork. */
-    extern volatile int g_ipc_launch_started;
-    if (g_ipc_launch_started && !child_stack && parent &&
-        parent->name[0]=='f' && parent->name[1]=='i' && parent->name[4]=='f') {
-        extern volatile int g_forker_tid;
-        g_forker_tid = parent->pid;
-        printk("[fk] forker set: firefox tid=%d forked content pid=%d\n",
-               parent->pid, child->pid);
-    }
     return child->pid;  /* parent gets child's PID */
 }
 
 /* ── sys_fork() — EAX=2 ────────────────────────────────────────────────── */
 static int sys_fork(registers_t *regs) {
-    return do_fork(regs, 0);
+    return do_fork(regs, 0, 0, 0, 0);
 }
 
 /* ── sys_read(int fd, void *buf, size_t count) — EAX=3 ───────────────────── */
@@ -925,6 +955,15 @@ static int sys_write(registers_t *regs) {
 #define WNOHANG    1
 #define WUNTRACED  2
 
+/* Linux kernel/exit.c do_wait()/wait_consider_task(): the wait set is the
+ * children of the calling PROCESS (real_parent == our group leader), so any
+ * thread of a multithreaded parent can reap a child forked by another thread.
+ * Only thread-group LEADERS are wait targets: CLONE_THREAD siblings are
+ * released as soon as they exit and never reported.  A leader that is a zombie
+ * is reported only once its whole group is gone (delay_group_leader), so the
+ * process is collected exactly once and with the group's exit status.  Waiting
+ * is interruptible: a deliverable signal returns -EINTR (restarted under
+ * SA_RESTART), which is what lets a SIGKILL end a parent parked here. */
 static int sys_waitpid(registers_t *regs) {
     int     req_pid    = (int)regs->ebx;
     int    *status_ptr = (int *)(uintptr_t)regs->ecx;
@@ -933,35 +972,33 @@ static int sys_waitpid(registers_t *regs) {
     if (status_ptr && !access_ok(status_ptr, sizeof(int)))
         return -14;  /* -EFAULT */
 
+    struct proc *me = proc_group_leader(current_proc);
+    int my_tgid = current_proc->tgid;
+
     for (;;) {
         int found_child = 0;
 
         for (int i = 0; i < MAX_PROCS; i++) {
             struct proc *p = &ptable[i];
             if (p->state == PROC_UNUSED) continue;
-            if (p->parent != current_proc) continue;
-            if (req_pid != -1 && p->pid != req_pid) continue;
+            if (!p->parent || p->parent->tgid != my_tgid) continue;
+            if (p->pid != p->tgid) continue;               /* threads: never */
+            if (req_pid > 0 && p->pid != req_pid) continue;
+            if (req_pid == 0 && p->pgrp != current_proc->pgrp) continue;
+            if (req_pid < -1 && p->pgrp != -req_pid) continue;
             found_child = 1;
 
             if (p->state == PROC_ZOMBIE) {
+                if (!proc_group_empty(p)) continue;        /* siblings still exiting */
                 int child_pid = p->pid;
                 if (status_ptr) {
                     int status = p->exit_status;
                     int cr = copy_to_user(status_ptr, &status, sizeof(status));
                     if (cr < 0) return cr;
                 }
-
-                /* Free child's resources (shared pgdirs only when the
-                 * last thread of the group is reaped). */
-                if (p->pgdir_phys && !pgdir_release(p->pgdir_phys))
-                    pgdir_free_user(p->pgdir_phys);
-                kfree(p->kstack);
-                p->kstack     = NULL;
-                p->pgdir_phys = 0;
-                p->state      = PROC_UNUSED;
-
-                printk("[SYSCALL] sys_waitpid: collected child pid=%d status=%d\n",
+                printk("[SYSCALL] sys_waitpid: collected child pid=%d status=0x%x\n",
                        child_pid, p->exit_status);
+                proc_release(p);
                 return child_pid;
             }
 
@@ -982,20 +1019,12 @@ static int sys_waitpid(registers_t *regs) {
         if (options & WNOHANG)
             return 0;
 
-        /* No zombie yet — sleep until a child exits (proc_exit wakes us) */
-        {   /* DEBUG: who is blocking in waitpid and on which child? */
-            static int wlog = 0;
-            if (wlog < 40) {
-                wlog++;
-                int kids = 0, kpid = -1;
-                for (int j = 0; j < MAX_PROCS; j++)
-                    if (ptable[j].state != PROC_UNUSED &&
-                        ptable[j].parent == current_proc) { kids++; kpid = ptable[j].pid; }
-                printk("[wpid] pid=%d(%s) req=%d kids=%d eg.child=%d sleeping\n",
-                       current_proc->pid, current_proc->name, req_pid, kids, kpid);
-            }
-        }
-        sleep_on(current_proc);
+        if (signal_interrupt_pending(current_proc))
+            return -4;   /* -EINTR (Linux -ERESTARTSYS) */
+
+        /* No zombie yet — sleep until a child exits.  The channel is our group
+         * leader: proc_exit wakes the parent PROCESS, whichever thread waits. */
+        sleep_on(me);
     }
 }
 
@@ -1012,13 +1041,11 @@ void reap_orphan_zombies(void) {
     if (!init) return;
     for (int i = 0; i < MAX_PROCS; i++) {
         struct proc *p = &ptable[i];
+        if (p == current_proc) continue;     /* never reap the caller mid-exit:
+                                              * its own kstack is still in use */
         if (p->state != PROC_ZOMBIE || p->parent != init) continue;
-        if (p->pgdir_phys && !pgdir_release(p->pgdir_phys))
-            pgdir_free_user(p->pgdir_phys);
-        if (p->kstack) kfree(p->kstack);
-        p->kstack     = NULL;
-        p->pgdir_phys = 0;
-        p->state      = PROC_UNUSED;
+        if (p->pid != p->tgid || !proc_group_empty(p)) continue;
+        proc_release(p);
     }
 }
 
@@ -1084,6 +1111,7 @@ static int sys_open_kernel_path(const char *path, int flags) {
                     current_proc->ofile[i].type = FD_PIPE_R;
                     pb->nreaders++;
                 }
+                vfs_retain(node);              /* see the FD_FILE case below */
                 current_proc->ofile[i].pipe    = pb;
                 current_proc->ofile[i].node    = node;
                 current_proc->ofile[i].flags   = flags;  /* incl. O_NONBLOCK */
@@ -1103,6 +1131,23 @@ static int sys_open_kernel_path(const char *path, int flags) {
     /* Find a free file descriptor slot */
     for (int i = 0; i < MAX_FD; i++) {
         if (current_proc->ofile[i].type == FD_NONE) {
+            /* Cloning device (/dev/ptmx): the descriptor holds a fresh node,
+             * not the one the lookup returned.  This runs here, after the
+             * permission check and after the slot is known to exist, so the
+             * only lookups that reserve a pty are the ones that become an open
+             * — a stat(), an access() or a failed open() reserves nothing.
+             * See the open_fn comment in fs/vfs.h. */
+            if (node->open_fn) {
+                vfs_node_t *clone = node->open_fn(node);
+                if (!clone) return -2;   /* -ENOENT: no capacity left */
+                node = clone;
+            }
+            /* The descriptor is a long-lived reference to the node, so it takes
+             * one: fd_release() drops it again, and fd_retain() adds one per
+             * dup/fork.  Without this a tmpfs file unlinked while open was freed
+             * under the descriptor and the next close jumped through a recycled
+             * function pointer. */
+            vfs_retain(node);
             current_proc->ofile[i].type    = FD_FILE;
             current_proc->ofile[i].node    = node;
             current_proc->ofile[i].offset  = (flags & O_APPEND) ? node->size : 0;
@@ -1193,6 +1238,11 @@ static int sys_brk(registers_t *regs) {
         /* Grow heap: map pages from old_brk up to new_brk */
         uint32_t va = old_brk & ~(PAGE_SIZE - 1);
         uint32_t end = (new_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        /* Linux do_brk_flags: the break may not run into a mapping. */
+        {
+            uint32_t chk = (old_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+            if (end > chk && !vma_range_free(chk, end - chk)) return -12;
+        }
         for (; va < end; va += PAGE_SIZE) {
             /* Skip pages already mapped (old_brk might not be page-aligned) */
             if (va < old_brk && (*paging_get_pde(va) & PAGE_PRESENT) &&
@@ -1226,6 +1276,215 @@ static int sys_brk(registers_t *regs) {
 }
 
 /* ── sys_exec(const char *path, char **argv, char **envp) — EAX=11 ──────── */
+/* ── execve() argument collection ─────────────────────────────────────────────
+ * Linux copies argv/envp out of the OLD address space before the point of no
+ * return (fs/exec.c copy_strings) and bounds them two ways: MAX_ARG_STRLEN
+ * (32 pages) per string, and bprm_stack_limits() — a quarter of RLIMIT_STACK
+ * — for the whole block including the pointer arrays.  Past either it returns
+ * -E2BIG.  MaeroOS advertises an 8 MiB main-thread stack (paging.c grows it on
+ * fault), so the same quarter rule gives a 2 MiB ARG_MAX.
+ *
+ * The strings land in one growable kernel buffer and the vector holds byte
+ * OFFSETS into it, so growing the buffer never invalidates the vector.
+ *
+ * The ARG_MAX bound is charged INCREMENTALLY, before each chunk is reserved or
+ * copied, exactly as Linux checks bprm_stack_limits() inside copy_strings().
+ * Checking only after both vectors are copied is not a bound at all: 4096 argv
+ * pointers aimed at one 128 KiB user string cost the attacker 128 KiB and would
+ * drive this buffer to ~540 MiB, and kmalloc does not fail gracefully — a heap
+ * that outgrows HEAP_MAX halts the machine (mm/heap.c heap_expand).  An
+ * unprivileged execve must never be able to reach that. */
+#define EXEC_MAX_ARG_STRLEN  (32U * PAGE_SIZE)          /* Linux MAX_ARG_STRLEN */
+#define EXEC_STACK_LIMIT     (8U * 1024U * 1024U)       /* our RLIMIT_STACK */
+#define EXEC_ARG_MAX         (EXEC_STACK_LIMIT / 4U)    /* Linux bprm_stack_limits */
+#define EXEC_MAX_ARG_STRINGS 4096                       /* Linux MAX_ARG_STRINGS */
+
+struct exec_strings {
+    char     *buf;   uint32_t used, cap;    /* NUL-separated string bytes */
+    uint32_t *off;   uint32_t n,    ncap;   /* offset of each string in buf */
+    uint32_t *total;  /* running argv+envp charge, SHARED by the two vectors */
+};
+
+static void es_init(struct exec_strings *v, uint32_t *total) {
+    v->buf = NULL; v->used = v->cap = 0;
+    v->off = NULL; v->n = v->ncap = 0;
+    v->total = total;
+}
+
+static void es_free(struct exec_strings *v) {
+    uint32_t *total = v->total;
+    if (v->buf) kfree(v->buf);
+    if (v->off) kfree(v->off);
+    es_init(v, total);
+}
+
+/* Charge `bytes` against the shared argv+envp budget before anything is
+ * allocated for them.  -E2BIG once the block would exceed ARG_MAX. */
+static int es_charge(struct exec_strings *v, uint32_t bytes) {
+    if (bytes > EXEC_ARG_MAX - *v->total) return -7;    /* -E2BIG */
+    *v->total += bytes;
+    return 0;
+}
+
+/* Make room for `need` more string bytes.  Doubling, so a long argv is linear;
+ * clamped to the budget so the buffer itself can never exceed ARG_MAX. */
+static int es_reserve(struct exec_strings *v, uint32_t need) {
+    if (v->used + need <= v->cap) return 0;
+    uint32_t cap = v->cap ? v->cap : 512;
+    while (cap < v->used + need) cap *= 2;
+    if (cap > EXEC_ARG_MAX) cap = v->used + need;
+    char *nb = (char *)kmalloc(cap);
+    if (!nb) return -12;
+    if (v->buf) { __builtin_memcpy(nb, v->buf, v->used); kfree(v->buf); }
+    v->buf = nb; v->cap = cap;
+    return 0;
+}
+
+/* Record `off` as the start of the next string, charging its slot in the
+ * pointer array the block will need on the new stack. */
+static int es_index(struct exec_strings *v, uint32_t off) {
+    if (v->n >= EXEC_MAX_ARG_STRINGS) return -7;        /* -E2BIG */
+    if (es_charge(v, 4) < 0) return -7;                 /* -E2BIG */
+    if (v->n == v->ncap) {
+        uint32_t ncap = v->ncap ? v->ncap * 2 : 16;
+        uint32_t *no = (uint32_t *)kmalloc(ncap * sizeof(uint32_t));
+        if (!no) return -12;
+        if (v->off) {
+            __builtin_memcpy(no, v->off, v->n * sizeof(uint32_t));
+            kfree(v->off);
+        }
+        v->off = no; v->ncap = ncap;
+    }
+    v->off[v->n++] = off;
+    return 0;
+}
+
+/* Append a kernel string (len excludes the NUL). */
+static int es_push(struct exec_strings *v, const char *str, uint32_t len) {
+    if (es_charge(v, len + 1) < 0) return -7;           /* -E2BIG */
+    if (es_reserve(v, len + 1) < 0) return -12;
+    uint32_t start = v->used;
+    __builtin_memcpy(v->buf + start, str, len);
+    v->buf[start + len] = '\0';
+    v->used = start + len + 1;
+    int rc = es_index(v, start);
+    if (rc < 0) v->used = start;
+    return rc;
+}
+
+/* Append a NUL-terminated USER string.  Copied in page-bounded chunks (a
+ * string may run right up to the end of a mapped page but never past it), not
+ * byte by byte — the strings Linux allows are up to 128 KiB. */
+static int es_push_user(struct exec_strings *v, const char *up) {
+    uint32_t start = v->used, got = 0;
+    for (;;) {
+        uint32_t chunk = PAGE_SIZE - (((uint32_t)(uintptr_t)up + got) & (PAGE_SIZE - 1));
+        /* Charge FIRST: the budget has to stop us before the allocation, not
+         * after the whole vector has been copied. */
+        if (es_charge(v, chunk) < 0) { v->used = start; return -7; }    /* -E2BIG */
+        v->used = start + got;
+        if (es_reserve(v, chunk) < 0) { v->used = start; return -12; }
+        if (copy_from_user(v->buf + start + got, up + got, chunk) < 0) {
+            v->used = start;
+            return -14;
+        }
+        for (uint32_t i = 0; i < chunk; i++)
+            if (v->buf[start + got + i] == '\0') {
+                *v->total -= chunk - (i + 1);   /* refund the unused tail */
+                v->used = start + got + i + 1;
+                int rc = es_index(v, start);
+                if (rc < 0) v->used = start;
+                return rc;
+            }
+        got += chunk;
+        if (got > EXEC_MAX_ARG_STRLEN) { v->used = start; return -7; }  /* -E2BIG */
+    }
+}
+
+/* Copy a whole NULL-terminated user vector (argv or envp). */
+static int es_push_user_vec(struct exec_strings *v, char **uvec) {
+    if (!uvec || !access_ok(uvec, sizeof(char *))) return 0;
+    for (uint32_t i = 0; ; i++) {
+        char *up = NULL;
+        if (copy_from_user(&up, &uvec[i], sizeof(up)) < 0) return -14;
+        if (!up) return 0;
+        int rc = es_push_user(v, up);
+        if (rc < 0) return rc;
+    }
+}
+
+/* Linux de_thread() (fs/exec.c): a thread that execve()s first kills every
+ * other thread of its group and waits for them to be gone; if the caller is
+ * not the group leader it then takes over the leader's identity (Linux
+ * exchange_tids() + release_task(leader)) so the new image runs single-
+ * threaded under the PROCESS's pid.  Called only past the point of no return.
+ * Returns with current_proc as the sole, leading thread of its group. */
+static void de_thread(void) {
+    struct proc *me   = current_proc;
+    int          tgid = me->tgid;
+    int          others = 0;
+
+    /* zap_other_threads(): SIGKILL every sibling. */
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (q == me || q->state == PROC_UNUSED || q->tgid != tgid) continue;
+        others = 1;
+        if (q->state != PROC_ZOMBIE) signal_send(q, SIGKILL);
+    }
+    if (!others) return;                       /* already the whole process */
+
+    /* Wait for them to die.  A killed sibling becomes a zombie and the
+     * scheduler releases it; the group LEADER's zombie stays for us to take
+     * over below, so it does not count as alive here. */
+    for (int guard = 0; guard < 200000; guard++) {
+        int alive = 0;
+        for (int i = 0; i < MAX_PROCS; i++) {
+            struct proc *q = &ptable[i];
+            if (q == me || q->state == PROC_UNUSED || q->tgid != tgid) continue;
+            if (q->state == PROC_ZOMBIE && q->pid == tgid) continue;   /* leader */
+            alive = 1;
+            break;
+        }
+        if (!alive) break;
+        yield();
+    }
+
+    /* A sibling dying from our SIGKILL runs the fatal-signal path, which ends
+     * the whole THREAD GROUP (proc_group_exit) — us included: it stamps a
+     * "killed by signal 9" status on the leader and queues SIGKILL on every
+     * other member.  Linux suppresses exactly that while an execve is taking
+     * the group over (signal_struct.group_exec_task).  Every sibling is gone
+     * by this point, so undo the collateral damage here: the process is not
+     * dying, it is being taken over. */
+    me->pending_sigs &= ~(1u << SIGKILL);
+    me->group_exit    = 0;
+    me->exit_status   = 0;
+
+    if (me->pid == tgid) return;               /* the caller IS the leader */
+
+    /* Take over the leader's pid: the process keeps the identity its parent
+     * knows and waits for, and the old leader's slot is freed. */
+    struct proc *leader = NULL;
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (&ptable[i] != me && ptable[i].state != PROC_UNUSED &&
+            ptable[i].pid == tgid) { leader = &ptable[i]; break; }
+    if (leader) {
+        me->parent     = leader->parent;
+        me->pgrp       = leader->pgrp;
+        me->sid        = leader->sid;
+        leader->group_exit = 0;
+        /* The process's children belong to the surviving thread now. */
+        for (int i = 0; i < MAX_PROCS; i++)
+            if (ptable[i].state != PROC_UNUSED && ptable[i].parent == leader)
+                ptable[i].parent = me;
+        if (leader->state == PROC_ZOMBIE)
+            proc_release(leader);
+        else
+            leader->tgid = leader->pid;        /* refused to die: detach it */
+    }
+    me->pid = tgid;
+}
+
 static int sys_exec(registers_t *regs) {
     const char *upath = (const char *)(uintptr_t)regs->ebx;
 
@@ -1238,70 +1497,34 @@ static int sys_exec(registers_t *regs) {
     if (r < 0) return r;
 
     /* Copy argv + envp strings from user space into kernel buffers (before CR3 swap) */
-#define EXEC_MAXARGS 64
-#define EXEC_ARGBUF  8192
 /* Load bases for position-independent objects: PIEs go low, the dynamic
  * linker (ld-musl) goes at the bottom of the mmap region (mmap_next is then
  * bumped above it so anonymous maps never clobber the interpreter image). */
 #define EXEC_PIE_BASE    0x10000000U
 #define EXEC_INTERP_BASE 0x40000000U
-    char *argbuf = (char *)kmalloc(EXEC_ARGBUF);
-    if (!argbuf) return -12;
-    const char *kargv[EXEC_MAXARGS + 1];
-    const char *kenvp[EXEC_MAXARGS + 1];
-    int  argc        = 0;
-    int  envc        = 0;
-    int  argbuf_used = 0;
-
-    /* Copy argv */
-    char **uargv = (char **)(uintptr_t)regs->ecx;
-    if (uargv && access_ok(uargv, sizeof(char *))) {
-        while (argc < EXEC_MAXARGS) {
-            char *uarg = NULL;
-            if (copy_from_user(&uarg, &uargv[argc], sizeof(uarg)) < 0) {
-                kfree(argbuf);
-                return -14;
-            }
-            if (!uarg) break;
-            if (!access_ok(uarg, 1)) break;
-            if (argbuf_used >= EXEC_ARGBUF - 1) break;
-            int n = copy_user_str(uarg, argbuf + argbuf_used,
-                                  EXEC_ARGBUF - argbuf_used - 1);
-            if (n < 0) break;
-            kargv[argc] = argbuf + argbuf_used;
-            argbuf_used += n + 1;
-            argc++;
-        }
-    }
-    kargv[argc] = NULL;
-
-    /* Copy envp */
-    char **uenvp = (char **)(uintptr_t)regs->edx;
-    if (uenvp && access_ok(uenvp, sizeof(char *))) {
-        while (envc < EXEC_MAXARGS) {
-            char *uenv = NULL;
-            if (copy_from_user(&uenv, &uenvp[envc], sizeof(uenv)) < 0) {
-                kfree(argbuf);
-                return -14;
-            }
-            if (!uenv) break;
-            if (!access_ok(uenv, 1)) break;
-            if (argbuf_used >= EXEC_ARGBUF - 1) break;
-            int n = copy_user_str(uenv, argbuf + argbuf_used,
-                                  EXEC_ARGBUF - argbuf_used - 1);
-            if (n < 0) break;
-            kenvp[envc] = argbuf + argbuf_used;
-            argbuf_used += n + 1;
-            envc++;
-        }
-    }
-    kenvp[envc] = NULL;
+    struct exec_strings av, ev;
+    /* One budget for both vectors, pre-charged with the two NULL terminators
+     * their pointer arrays need.  es_charge() spends it as the strings are
+     * copied, so an oversized argv is refused before the memory is taken. */
+    uint32_t arg_budget = 8;
+    /* Function scope, not block scope: the shebang rebuild below hands its
+     * vector to `av`, which keeps pointing at this counter afterwards. */
+    uint32_t shebang_budget = 8;
+    es_init(&av, &arg_budget);
+    es_init(&ev, &arg_budget);
+    r = es_push_user_vec(&av, (char **)(uintptr_t)regs->ecx);
+    if (r == 0) r = es_push_user_vec(&ev, (char **)(uintptr_t)regs->edx);
+    if (r < 0) { es_free(&av); es_free(&ev); return r; }
+    int argc = (int)av.n;
+    int envc = (int)ev.n;
+#define EXEC_FAIL(err) do { es_free(&av); es_free(&ev); return (err); } while (0)
+#define KARGV(i) (av.buf + av.off[i])
+#define KENVP(i) (ev.buf + ev.off[i])
 
     vfs_node_t *node = vfs_open_at(path);
     if (!node) {
         printk("[execfail] '%s' pid=%d ENOENT (open failed)\n", path, current_proc->pid);
-        kfree(argbuf);
-        return -2;   /* -ENOENT */
+        EXEC_FAIL(-2);   /* -ENOENT */
     }
 
     /* Need execute permission on the binary. */
@@ -1310,8 +1533,7 @@ static int sys_exec(registers_t *regs) {
         printk("[execfail] '%s' pid=%d EACCES (uid=%d gid=%d mode=%o)\n",
                path, current_proc->pid, (int)current_proc->euid,
                (int)current_proc->egid, (unsigned)node->mask);
-        kfree(argbuf);
-        return -13;   /* -EACCES */
+        EXEC_FAIL(-13);   /* -EACCES */
     }
 
     /* set-user-ID bit: run with the file owner's effective uid (e.g. doas,
@@ -1344,68 +1566,29 @@ static int sys_exec(registers_t *regs) {
         interp_arg[ai] = '\0';
 
         if (ii > 0) {
-            /* Rebuild kargv: [interp, interp_arg?, script_path, orig_argv[1..]] */
-            char *argbuf2 = (char *)kmalloc(EXEC_ARGBUF);
-            if (!argbuf2) {
-                kfree(argbuf);
-                return -12;
-            }
-            const char *kargv2[EXEC_MAXARGS + 1];
-            int argc2 = 0, used2 = 0;
-
-            /* interp */
-            int n = ii + 1;
-            __builtin_memcpy(argbuf2 + used2, interp, n);
-            kargv2[argc2++] = argbuf2 + used2; used2 += n;
-
-            /* optional interp arg */
-            if (ai > 0 && argc2 < EXEC_MAXARGS) {
-                n = ai + 1;
-                __builtin_memcpy(argbuf2 + used2, interp_arg, n);
-                kargv2[argc2++] = argbuf2 + used2; used2 += n;
-            }
-
-            /* script path (argv[0] replacement) */
-            int plen = 0; while (path[plen]) plen++; plen++;
-            if (used2 + plen < EXEC_ARGBUF && argc2 < EXEC_MAXARGS) {
-                __builtin_memcpy(argbuf2 + used2, path, plen);
-                kargv2[argc2++] = argbuf2 + used2; used2 += plen;
-            }
-
-            /* original argv[1..] */
-            for (int i = 1; i < argc && argc2 < EXEC_MAXARGS; i++) {
-                int slen = 0; while (kargv[i][slen]) slen++; slen++;
-                if (used2 + slen >= EXEC_ARGBUF) break;
-                __builtin_memcpy(argbuf2 + used2, kargv[i], slen);
-                kargv2[argc2++] = argbuf2 + used2; used2 += slen;
-            }
-            kargv2[argc2] = NULL;
-
-            /* Copy argbuf2 into argbuf and fixup pointers */
-            __builtin_memcpy(argbuf, argbuf2, used2);
-            for (int i = 0; i < argc2; i++)
-                kargv[i] = argbuf + (kargv2[i] - argbuf2);
-            argc = argc2;
-            kargv[argc] = NULL;
-            argbuf_used = used2;
-            kfree(argbuf2);
+            /* Rebuild argv: [interp, interp_arg?, script_path, orig_argv[1..]] */
+            struct exec_strings nv;
+            es_init(&nv, &shebang_budget);
+            int rc = es_push(&nv, interp, (uint32_t)ii);
+            if (rc == 0 && ai > 0) rc = es_push(&nv, interp_arg, (uint32_t)ai);
+            if (rc == 0) rc = es_push(&nv, path, (uint32_t)__builtin_strlen(path));
+            for (int i = 1; rc == 0 && i < argc; i++)
+                rc = es_push(&nv, KARGV(i), (uint32_t)__builtin_strlen(KARGV(i)));
+            if (rc < 0) { es_free(&nv); EXEC_FAIL(rc); }
+            es_free(&av);
+            av   = nv;
+            argc = (int)av.n;
 
             /* Re-resolve to interpreter */
-            __builtin_memcpy(path, interp, ii + 1);
+            __builtin_memcpy(path, interp, (size_t)ii + 1);
             node = vfs_open_at(path);
-            if (!node) {
-                kfree(argbuf);
-                return -2;
-            }
+            if (!node) EXEC_FAIL(-2);
         }
     }
 
     /* Create new address space */
     uint32_t new_pgdir = pgdir_create();
-    if (!new_pgdir) {
-        kfree(argbuf);
-        return -12;
-    }
+    if (!new_pgdir) EXEC_FAIL(-12);
 
     /*
      * Load the main object.  A static ET_EXEC ignores the bias (fixed VAs);
@@ -1416,8 +1599,7 @@ static int sys_exec(registers_t *regs) {
     elf_info_t einfo;
     if (elf_load_bias(node, new_pgdir, EXEC_PIE_BASE, &einfo) < 0) {
         pgdir_free_user(new_pgdir);
-        kfree(argbuf);
-        return -8;  /* -ENOEXEC */
+        EXEC_FAIL(-8);  /* -ENOEXEC */
     }
     uint32_t prog_entry = einfo.entry;   /* main program entry (AT_ENTRY) */
     uint32_t entry      = einfo.entry;   /* address we actually iret to */
@@ -1453,14 +1635,12 @@ static int sys_exec(registers_t *regs) {
         if (!lnode) {
             printk("[ELF] interpreter '%s' not found\n", einfo.interp);
             pgdir_free_user(new_pgdir);
-            kfree(argbuf);
-            return -2;  /* -ENOENT */
+            EXEC_FAIL(-2);  /* -ENOENT */
         }
         elf_info_t linfo;
         if (elf_load_bias(lnode, new_pgdir, EXEC_INTERP_BASE, &linfo) < 0) {
             pgdir_free_user(new_pgdir);
-            kfree(argbuf);
-            return -8;
+            EXEC_FAIL(-8);
         }
         interp_base = linfo.load_bias;
         entry       = linfo.entry;          /* jump to the dynamic linker */
@@ -1468,65 +1648,70 @@ static int sys_exec(registers_t *regs) {
         if (linfo.heap_end > mmap_floor) mmap_floor = linfo.heap_end;
     }
 
-    /* Allocate and map the new user stack region. */
-    uint32_t stack_top_phys = 0;
-    for (uint32_t va = USER_STACK_BASE; va < USER_STACK_TOP; va += PAGE_SIZE) {
-        uint32_t stack_phys = pmm_alloc_frame();
-        if (!stack_phys) {
-            pgdir_free_user(new_pgdir);
-            kfree(argbuf);
-            return -12;
-        }
-        pmm_frame_incref(stack_phys);
-        pgdir_map(new_pgdir, va, stack_phys,
-                  PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-        if (va == USER_STACK_TOP - PAGE_SIZE)
-            stack_top_phys = stack_phys;
-    }
-
     /*
-     * Build the ABI stack frame via temp mapping.
+     * Build the initial-stack image in a kernel buffer first, then copy it
+     * into the new stack's frames.  Linux (fs/exec.c) puts the argv/envp
+     * strings at the very top of the stack and the argc/argv[]/envp[]/auxv
+     * frame just below them; the whole thing spans as many pages as it needs,
+     * which is what lets a 64 KiB argument or a 6 KiB environment through.
+     * Bytes below `str_off` are unused (the image is packed top-down).
      *
      * Layout (high address at top):
-     *   [envp strings, NUL-terminated, packed from top downward]
-     *   [argv strings, NUL-terminated, packed below envp strings]
-     *   [envp pointer array: envp[0]..envp[envc-1], NULL]
-     *   [argv pointer array: argv[0]..argv[argc-1], NULL]
-     *   [uint32_t envp* = &envp[0]] ← frame[3]
-     *   [uint32_t argv* = &argv[0]] ← frame[2]
-     *   [uint32_t argc             ]← frame[1]
-     *   [uint32_t retaddr = 0      ]← frame[0]  ← ESP points here
+     *   [envp strings, NUL-terminated, packed from the top downward]
+     *   [argv strings, NUL-terminated, packed below the envp strings]
+     *   [AT_RANDOM 16 bytes, AT_EXECFN path]
+     *   [argc, argv[0..argc-1], NULL, envp[0..envc-1], NULL, auxv, AT_NULL]
+     *                                                           ← ESP here
      */
-    uint8_t *kstack = (uint8_t *)paging_temp_map(stack_top_phys);
-    /* user-space base of stack page */
-    uint32_t ustack_base = USER_STACK_TOP - PAGE_SIZE;
+    uint32_t path_len = (uint32_t)__builtin_strlen(path);
+    uint32_t img_cap  = av.used + ev.used + 16 + path_len + 1 +
+                        ((uint32_t)argc + (uint32_t)envc + 4 + 2 * 20 + 2) * 4 +
+                        64;                        /* alignment slack */
+    img_cap = (img_cap + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
+    /* The image must stay inside the 8 MiB stack the kernel is prepared to
+     * grow; ARG_MAX already guarantees it, this is the belt-and-braces check. */
+    if (img_cap > EXEC_STACK_LIMIT - PAGE_SIZE) {
+        pgdir_free_user(new_pgdir);
+        EXEC_FAIL(-7);                             /* -E2BIG */
+    }
+    uint8_t *kstack = (uint8_t *)kmalloc(img_cap);
+    if (!kstack) {
+        pgdir_free_user(new_pgdir);
+        EXEC_FAIL(-12);
+    }
+    __builtin_memset(kstack, 0, img_cap);
+    /* kstack[i] will live at this user address: */
+    uint32_t ustack_base = USER_STACK_TOP - img_cap;
 
-    /* Pack strings from the top of the page downward: envp first, then argv */
-    uint32_t str_off = PAGE_SIZE;   /* offset into the page (from base) */
+    /* User addresses of each packed string (the frame's pointer arrays). */
+    uint32_t *uargv_ptrs = (uint32_t *)kmalloc(((uint32_t)argc + 1) * 4);
+    uint32_t *uenvp_ptrs = (uint32_t *)kmalloc(((uint32_t)envc + 1) * 4);
+    if (!uargv_ptrs || !uenvp_ptrs) {
+        if (uargv_ptrs) kfree(uargv_ptrs);
+        if (uenvp_ptrs) kfree(uenvp_ptrs);
+        kfree(kstack);
+        pgdir_free_user(new_pgdir);
+        EXEC_FAIL(-12);
+    }
+
+    /* Pack strings from the top of the image downward: envp first, then argv */
+    uint32_t str_off = img_cap;
 
     /* Pack envp strings */
-    uint32_t uenvp_ptrs[EXEC_MAXARGS + 1];
     for (int i = envc - 1; i >= 0; i--) {
-        uint32_t slen = 0;
-        while (kenvp[i][slen]) slen++;
-        slen++;  /* include NUL */
+        uint32_t slen = (uint32_t)__builtin_strlen(KENVP(i)) + 1;  /* with NUL */
         str_off -= slen;
-        __builtin_memcpy(kstack + str_off, kenvp[i], slen);
+        __builtin_memcpy(kstack + str_off, KENVP(i), slen);
         uenvp_ptrs[i] = ustack_base + str_off;
     }
-    uenvp_ptrs[envc] = 0;  /* NULL terminator */
 
     /* Pack argv strings */
-    uint32_t uargv_ptrs[EXEC_MAXARGS + 1];
     for (int i = argc - 1; i >= 0; i--) {
-        uint32_t slen = 0;
-        while (kargv[i][slen]) slen++;
-        slen++;  /* include NUL */
+        uint32_t slen = (uint32_t)__builtin_strlen(KARGV(i)) + 1;  /* with NUL */
         str_off -= slen;
-        __builtin_memcpy(kstack + str_off, kargv[i], slen);
+        __builtin_memcpy(kstack + str_off, KARGV(i), slen);
         uargv_ptrs[i] = ustack_base + str_off;
     }
-    uargv_ptrs[argc] = 0;  /* NULL terminator */
 
     /*
      * Linux i386 process-entry stack (what musl/glibc _start expects):
@@ -1540,7 +1725,8 @@ static int sys_exec(registers_t *regs) {
      * Our own crt0.asm reads the same layout (argv = esp+4).
      */
 
-    /* 16 random bytes for AT_RANDOM (stack canaries) */
+    /* 16 random bytes for AT_RANDOM (stack canaries).  ustack_base is page
+     * aligned, so aligning the offset aligns the user address too. */
     str_off -= 16;
     str_off &= ~3U;
     random_get_bytes(kstack + str_off, 16);
@@ -1549,11 +1735,9 @@ static int sys_exec(registers_t *regs) {
     /* A copy of the executable path for AT_EXECFN (glibc __progname, dl checks). */
     uint32_t at_execfn_uaddr = 0;
     {
-        int plen = 0;
-        while (path[plen] && plen < 255) plen++;
-        str_off -= (uint32_t)(plen + 1);
+        str_off -= path_len + 1;
         str_off &= ~3U;
-        __builtin_memcpy(kstack + str_off, path, (size_t)(plen + 1));
+        __builtin_memcpy(kstack + str_off, path, (size_t)path_len + 1);
         at_execfn_uaddr = ustack_base + str_off;
     }
 
@@ -1620,7 +1804,43 @@ static int sys_exec(registers_t *regs) {
     }
 
     uint32_t user_esp = ustack_base + str_off;
-    paging_temp_unmap();
+
+    /* Allocate and map the new user stack region, filling in the image as we
+     * go.  It is at least USER_STACK_PAGES long, and longer when the initial
+     * stack needs it; the fault handler grows it further (paging.c). */
+    {
+        uint32_t stack_base = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
+        if (ustack_base < stack_base) stack_base = ustack_base;
+        for (uint32_t va = stack_base; va < USER_STACK_TOP; va += PAGE_SIZE) {
+            uint32_t stack_phys = pmm_alloc_frame();
+            if (!stack_phys) {
+                kfree(uargv_ptrs);
+                kfree(uenvp_ptrs);
+                kfree(kstack);
+                pgdir_free_user(new_pgdir);
+                EXEC_FAIL(-12);
+            }
+            pmm_frame_incref(stack_phys);
+            preempt_disable();
+            uint8_t *kp = (uint8_t *)paging_temp_map(stack_phys);
+            __builtin_memset(kp, 0, PAGE_SIZE);
+            if (va + PAGE_SIZE > ustack_base) {     /* part of the image lands here */
+                uint32_t src = va - ustack_base;    /* va >= ustack_base always */
+                __builtin_memcpy(kp, kstack + src, PAGE_SIZE);
+            }
+            paging_temp_unmap();
+            preempt_enable();
+            pgdir_map(new_pgdir, va, stack_phys,
+                      PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        }
+    }
+    kfree(uargv_ptrs);
+    kfree(uenvp_ptrs);
+    kfree(kstack);
+
+    /* Point of no return (Linux begin_new_exec): every other thread of this
+     * process dies here and the caller becomes the group leader (audit C3). */
+    de_thread();
 
     /* Close any FD_CLOEXEC file descriptors (before CR3 swap) */
     for (int i = 0; i < MAX_FD; i++) {
@@ -1644,6 +1864,13 @@ static int sys_exec(registers_t *regs) {
     current_proc->euid       = new_euid;   /* honour any set-uid/gid bit */
     current_proc->egid       = new_egid;
     current_proc->tgid       = current_proc->pid;  /* exec → new thread-group leader */
+    current_proc->vm_owner   = NULL;               /* own address space from here */
+    /* Linux begin_new_exec(): the new image inherits none of the old thread's
+     * per-thread user-memory hooks — they point into an address space that no
+     * longer exists, and honouring them at exit would scribble on the new one. */
+    current_proc->clear_child_tid  = 0;
+    current_proc->set_child_tid    = 0;
+    current_proc->robust_list_head = 0;
     vfork_wake_parent();         /* CLONE_VFORK: we have our own pgdir now */
 
     /* Store executable path for /proc/self/exe */
@@ -1666,12 +1893,12 @@ static int sys_exec(registers_t *regs) {
     }
 
     /* Capture argv/envp (NUL-separated, NUL-terminated) for /proc/self/cmdline
-     * and /proc/self/environ.  kargv/kenvp still point into argbuf (kernel heap,
-     * page-table independent) here, before kfree(argbuf). */
+     * and /proc/self/environ.  KARGV/KENVP still point into the kernel-heap
+     * collectors (page-table independent) here, before es_free(). */
     {
         uint32_t cl = 0;
-        for (int i = 0; i < argc && kargv[i]; i++) {
-            const char *s = kargv[i];
+        for (int i = 0; i < argc; i++) {
+            const char *s = KARGV(i);
             while (*s && cl < sizeof(current_proc->cmdline) - 1)
                 current_proc->cmdline[cl++] = *s++;
             if (cl < sizeof(current_proc->cmdline)) current_proc->cmdline[cl++] = '\0';
@@ -1679,8 +1906,8 @@ static int sys_exec(registers_t *regs) {
         current_proc->cmdline_len = cl;
 
         uint32_t el = 0;
-        for (int i = 0; i < envc && kenvp[i]; i++) {
-            const char *s = kenvp[i];
+        for (int i = 0; i < envc; i++) {
+            const char *s = KENVP(i);
             while (*s && el < sizeof(current_proc->environ) - 1)
                 current_proc->environ[el++] = *s++;
             if (el < sizeof(current_proc->environ)) current_proc->environ[el++] = '\0';
@@ -1688,13 +1915,25 @@ static int sys_exec(registers_t *regs) {
         current_proc->environ_len = el;
     }
 
-    /* Reset signal handlers to SIG_DFL (exec clears them) */
-    __builtin_memset(current_proc->sig_handlers, 0,
-                     sizeof(current_proc->sig_handlers));
-    __builtin_memset(current_proc->sig_flags, 0,
-                     sizeof(current_proc->sig_flags));
-    current_proc->pending_sigs  = 0;
-    current_proc->sigframe_addr = 0;
+    /* Reset caught signals to SIG_DFL (fs/exec.c flush_signal_handlers).  If
+     * the table is still shared with other threads, unshare it first (Linux
+     * unshare_sighand) so their dispositions are untouched. */
+    if (current_proc->sighand && current_proc->sighand->refcount > 1) {
+        struct sighand *fresh = sighand_alloc();
+        if (fresh) {
+            sighand_put(current_proc->sighand);
+            current_proc->sighand = fresh;
+        }
+    }
+    if (current_proc->sighand) {
+        __builtin_memset(current_proc->sighand->handlers, 0,
+                         sizeof(current_proc->sighand->handlers));
+        __builtin_memset(current_proc->sighand->flags, 0,
+                         sizeof(current_proc->sighand->flags));
+    }
+    current_proc->pending_sigs   = 0;
+    current_proc->sigframe_addr  = 0;
+    current_proc->restore_sigmask = 0;   /* no sigsuspend mask survives exec */
 
     /* Update trapframe to run new program */
     registers_t *tf = current_proc->tf;
@@ -1720,7 +1959,7 @@ static int sys_exec(registers_t *regs) {
      * firefox-bin (the "profile cannot be loaded" modal implies it doesn't). */
     if (path[0] && dbg_str_has(path, "firefox")) {
         for (int ai = 0; ai < argc && ai < 20; ai++)
-            printk("[argv] pid=%d [%d]='%s'\n", current_proc->pid, ai, kargv[ai]);
+            printk("[argv] pid=%d [%d]='%s'\n", current_proc->pid, ai, KARGV(ai));
         /* [fdtab] For a CONTENT process (-contentproc), dump the inherited fd
          * table right after exec: which fd numbers survived, and their types.
          * Chromium remaps the prefMap/jsInit shared-memory memfds (FD_FILE=1) to
@@ -1728,7 +1967,7 @@ static int sys_exec(registers_t *regs) {
          * FD_NONE(0) instead, the remapping/inheritance is broken → mmap EBADF. */
         int is_content = 0;
         for (int ai = 1; ai < argc && ai < 4; ai++)
-            if (dbg_str_has(kargv[ai], "contentproc")) is_content = 1;
+            if (dbg_str_has(KARGV(ai), "contentproc")) is_content = 1;
         if (is_content) {
             for (int fd = 0; fd < MAX_FD; fd++) {
                 int ty = (int)current_proc->ofile[fd].type;
@@ -1743,7 +1982,11 @@ static int sys_exec(registers_t *regs) {
     }
     /* (watchpoint_arm exists for KVM/real-hw debugging of the GTK heap race;
      * QEMU TCG ignores guest DR registers so it's not armed here.) */
-    kfree(argbuf);
+    es_free(&av);
+    es_free(&ev);
+#undef KARGV
+#undef KENVP
+#undef EXEC_FAIL
     return 0;  /* trapret irets to entry */
 }
 
@@ -1754,44 +1997,38 @@ static int sys_kill(registers_t *regs) {
 
     if (sig < 0 || sig >= NSIGS) return -22;  /* -EINVAL */
 
-    /* pid=0 -> current process group; pid<0 -> process group -pid */
+    /* pid=0 -> current process group; pid<0 -> process group -pid.  One
+     * signal per PROCESS (Linux __kill_pgrp_info -> group_send_sig_info for
+     * each process in the group), delivered to a thread that does not block it. */
     if (pid == 0) {
         int pg = current_proc ? current_proc->pgrp : 0;
-        for (int i = 0; i < MAX_PROCS; i++)
-            if (ptable[i].state != PROC_UNUSED && ptable[i].pgrp == pg)
-                signal_send(&ptable[i], sig);
+        if (sig) signal_send_pgrp(pg, sig);
         return 0;
     }
     if (pid < 0) {
-        int pg = -pid;
-        int sent = 0;
-        for (int i = 0; i < MAX_PROCS; i++) {
-            if (ptable[i].state != PROC_UNUSED && ptable[i].pgrp == pg) {
-                signal_send(&ptable[i], sig);
-                sent = 1;
-            }
-        }
+        int sent = sig ? signal_send_pgrp(-pid, sig) : 1;
         return sent ? 0 : -3;
     }
 
+    /* kill(pid): pid may name any thread of a process (Linux kill_pid_info
+     * uses the thread group of the task with that pid).  The signal is
+     * process-directed: complete_signal() picks one thread that does not block
+     * it; a fatal default disposition then ends the whole group at delivery. */
     for (int i = 0; i < MAX_PROCS; i++) {
         if (ptable[i].pid == pid && ptable[i].state != PROC_UNUSED) {
-            /* SIGKILL terminates the whole thread group AND the entire process
-             * subtree (POSIX exit semantics + tree cleanup).  Signal every
-             * thread of the target's tgid, then every descendant process — the
-             * child processes Firefox forks (content/socket/GPU, separate tgids)
-             * don't reliably notice the parent's death and would otherwise leak,
-             * exhausting the process table across watchdog restarts.  Marking is
-             * done before any victim runs (signal_send only sets a pending bit),
-             * so parent links are still intact for the walk. */
+            if (sig == 0) return 0;               /* existence check */
             if (sig == SIGKILL) {
+                /* Kill the thread group AND the entire process subtree.  The
+                 * subtree part is not Linux behaviour (Linux kills only the
+                 * group); it is kept deliberately so a watchdog killing a
+                 * misbehaving multiprocess application does not leak its
+                 * forked children into the 128-slot process table.  Marking is
+                 * done before any victim runs (signal_send only sets a pending
+                 * bit), so parent links are still intact for the walk. */
                 int tg = ptable[i].tgid;
                 for (int j = 0; j < MAX_PROCS; j++)
                     if (ptable[j].state != PROC_UNUSED && ptable[j].tgid == tg)
                         signal_send(&ptable[j], sig);
-                /* Iteratively mark descendants: a proc dies if its parent is
-                 * already marked-for-kill (pending SIGKILL).  Repeat until no
-                 * new victims (handles arbitrary tree depth; O(n^2), n<=64). */
                 int changed = 1;
                 while (changed) {
                     changed = 0;
@@ -1806,7 +2043,7 @@ static int sys_kill(registers_t *regs) {
                     }
                 }
             } else {
-                signal_send(&ptable[i], sig);
+                signal_send_group(&ptable[i], sig);
             }
             return 0;
         }
@@ -1822,8 +2059,8 @@ static int sys_signal(registers_t *regs) {
     if (signum < 1 || signum >= NSIGS) return -22;  /* -EINVAL */
     if (signum == SIGKILL || signum == SIGSTOP) return -22;
 
-    sighandler_t old = current_proc->sig_handlers[signum];
-    current_proc->sig_handlers[signum] = handler;
+    sighandler_t old = current_proc->sighand->handlers[signum];
+    current_proc->sighand->handlers[signum] = handler;
     return (int)(uintptr_t)old;
 }
 
@@ -1832,7 +2069,7 @@ static void sys_sigreturn(registers_t *regs) {
     /* The per-frame trampoline passed the restore address in ecx and a type
      * marker in edx (nesting-safe; honours handler ucontext modifications). */
     if (sigreturn_restore(regs, regs->ecx, regs->edx) < 0)
-        proc_exit(128 + SIGSEGV);   /* spurious/invalid sigreturn */
+        proc_group_exit(SIGSEGV);   /* spurious/invalid sigreturn */
     current_proc->sigframe_addr = 0;
 }
 
@@ -2188,18 +2425,260 @@ static int sys_fcntl(registers_t *regs) {
     return -22;  /* EINVAL */
 }
 
+/* ── Clocks ──────────────────────────────────────────────────────────────────
+ * clock_gettime ids (uapi/linux/time.h).  MONOTONIC, MONOTONIC_RAW, BOOTTIME
+ * and MONOTONIC_COARSE are uptime; REALTIME, REALTIME_COARSE and TAI are the
+ * RTC epoch sampled at boot plus uptime (nothing steps the clock); the CPU-time
+ * clocks are the scheduler's per-thread tick accounting.  The fine clocks are
+ * TSC-interpolated between 100 Hz ticks (arch/i686/cpu/tsc.c), so their
+ * resolution is 1 ns like Linux reports; the *_COARSE clocks are the tick. */
+#define CLK_REALTIME_K          0
+#define CLK_MONOTONIC_K         1
+#define CLK_PROCESS_CPUTIME_K   2
+#define CLK_THREAD_CPUTIME_K    3
+#define CLK_MONOTONIC_RAW_K     4
+#define CLK_REALTIME_COARSE_K   5
+#define CLK_MONOTONIC_COARSE_K  6
+#define CLK_BOOTTIME_K          7
+#define CLK_REALTIME_ALARM_K    8
+#define CLK_BOOTTIME_ALARM_K    9
+#define CLK_TAI_K               11
+
+/* CPU time of one thread or of a whole thread group, in ticks. */
+static uint32_t cputime_ticks(int tgid, int tid) {
+    uint32_t t = 0;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *p = &ptable[i];
+        if (p->state == PROC_UNUSED) continue;
+        if (tid ? (p->pid == tid) : (p->tgid == tgid)) t += p->utime_ticks;
+    }
+    return t;
+}
+
+/* Read clock `clk` into (sec, nsec).  Returns 0 or -EINVAL for unknown ids. */
+static int kclock_get(int clk, int64_t *sec, uint32_t *nsec) {
+    uint32_t ms, mns;
+    switch (clk) {
+    case CLK_MONOTONIC_K: case CLK_MONOTONIC_RAW_K: case CLK_BOOTTIME_K:
+    case CLK_BOOTTIME_ALARM_K:
+        clock_mono(&ms, &mns);
+        *sec = ms; *nsec = mns;
+        return 0;
+    case CLK_MONOTONIC_COARSE_K: {
+        uint32_t t = pit_ticks();
+        *sec = t / TICK_HZ; *nsec = (t % TICK_HZ) * TICK_NS;
+        return 0;
+    }
+    case CLK_REALTIME_K: case CLK_REALTIME_ALARM_K: case CLK_TAI_K:
+        clock_mono(&ms, &mns);
+        *sec = (int64_t)rtc_boot_epoch() + ms; *nsec = mns;
+        return 0;
+    case CLK_REALTIME_COARSE_K: {
+        uint32_t t = pit_ticks();
+        *sec = (int64_t)rtc_boot_epoch() + t / TICK_HZ; *nsec = (t % TICK_HZ) * TICK_NS;
+        return 0;
+    }
+    case CLK_PROCESS_CPUTIME_K: case CLK_THREAD_CPUTIME_K: {
+        uint32_t t = current_proc
+                   ? cputime_ticks(current_proc->tgid,
+                                   clk == CLK_THREAD_CPUTIME_K ? current_proc->pid : 0)
+                   : 0;
+        *sec = t / TICK_HZ; *nsec = (t % TICK_HZ) * TICK_NS;
+        return 0;
+    }
+    default:
+        break;
+    }
+    if (clk < 0) {
+        /* Dynamic CPU clocks (clock_getcpuclockid / pthread_getcpuclockid):
+         * id = ~(pid << 3) | type, bit 2 selects a thread (CPUCLOCK_PERTHREAD). */
+        int pid  = ~(clk >> 3);
+        int type = clk & 7;
+        if ((type & 3) == 3) return -22;
+        if (pid == 0 && current_proc) pid = (type & 4) ? current_proc->pid : current_proc->tgid;
+        uint32_t t = (type & 4) ? cputime_ticks(0, pid) : cputime_ticks(pid, 0);
+        int found = 0;
+        for (int i = 0; i < MAX_PROCS && !found; i++)
+            if (ptable[i].state != PROC_UNUSED &&
+                ((type & 4) ? ptable[i].pid == pid : ptable[i].tgid == pid)) found = 1;
+        if (!found) return -22;
+        *sec = t / TICK_HZ; *nsec = (t % TICK_HZ) * TICK_NS;
+        return 0;
+    }
+    return -22;
+}
+
+/* Resolution of clock `clk` in ns, or -EINVAL. */
+static int kclock_res(int clk, uint32_t *nsec) {
+    switch (clk) {
+    case CLK_REALTIME_COARSE_K: case CLK_MONOTONIC_COARSE_K:
+        *nsec = TICK_NS;                 /* the tick (Linux: jiffy) */
+        return 0;
+    case CLK_REALTIME_K: case CLK_MONOTONIC_K: case CLK_MONOTONIC_RAW_K:
+    case CLK_BOOTTIME_K: case CLK_REALTIME_ALARM_K: case CLK_BOOTTIME_ALARM_K:
+    case CLK_TAI_K: case CLK_PROCESS_CPUTIME_K: case CLK_THREAD_CPUTIME_K:
+        *nsec = clock_tsc_calibrated() ? 1 : TICK_NS;
+        return 0;
+    default:
+        if (clk < 0) { *nsec = 1; return 0; }
+        return -22;
+    }
+}
+
+/* Sleep until the MONOTONIC instant (dsec, dnsec) since boot.  Returns 0 once
+ * the deadline has passed, or -EINTR when a signal that will be delivered is
+ * pending, with the remaining time in (*rsec, *rnsec) (Linux hrtimer_nanosleep:
+ * the remainder is what nanosleep(2) reports and what a restart would sleep).
+ * The scheduler wakes us at the first tick at or after the deadline, so we can
+ * never return early; spurious wakeups simply re-arm. */
+static int ksleep_until_mono(uint32_t dsec, uint32_t dnsec, uint32_t *rsec, uint32_t *rnsec) {
+    for (;;) {
+        uint32_t s, ns;
+        clock_mono(&s, &ns);
+        if (s > dsec || (s == dsec && ns >= dnsec)) {
+            if (rsec) { *rsec = 0; *rnsec = 0; }
+            return 0;
+        }
+        if (signal_interrupt_pending(current_proc)) {
+            if (rsec) {
+                uint32_t rs = dsec - s, rn;
+                if (dnsec >= ns) rn = dnsec - ns; else { rs--; rn = dnsec + 1000000000U - ns; }
+                *rsec = rs; *rnsec = rn;
+            }
+            return -4;                       /* -EINTR */
+        }
+        uint32_t wt = clock_mono_to_tick(dsec, dnsec);
+        if ((int32_t)(wt - pit_ticks()) <= 0) wt = pit_ticks() + 1;
+        if (!wt) wt = 1;                     /* 0 means "no deadline" */
+        current_proc->wake_tick = wt;
+        sleep_on((void *)&ksleep_until_mono);
+    }
+}
+
+/* ── Timeout deadlines (select / poll / epoll_wait / futex) ──────────────────
+ * Linux never lets a timeout-based wait return EARLY: poll_select_set_timeout()
+ * and schedule_hrtimeout_range() round the requested interval UP, so the
+ * elapsed time the caller measures is always >= what it asked for.
+ *
+ * A tick counter alone cannot promise that.  pit_ticks() is sampled at an
+ * arbitrary point INSIDE the current 10 ms tick, so "N ticks have gone by"
+ * means anywhere from (N-1)*10 ms to N*10 ms of real time — a 100 ms select
+ * armed for 10 ticks could return after 91 ms, which is what p08 caught.
+ *
+ * So a deadline is kept as an ABSOLUTE instant on the fine-grained monotonic
+ * clock — the same clock clock_gettime() reports, so the caller's own
+ * measurement agrees with ours — and the scheduler's wake tick is derived with
+ * clock_mono_to_tick(), the first tick at or after that instant. */
+struct kdeadline { uint32_t sec, nsec; };
+
+/* Deadline `sec` seconds + `nsec` nanoseconds from now. */
+static void deadline_set(struct kdeadline *d, uint32_t sec, uint32_t nsec) {
+    uint32_t s, ns;
+    clock_mono(&s, &ns);
+    s  += sec + nsec / 1000000000U;
+    ns += nsec % 1000000000U;
+    if (ns >= 1000000000U) { ns -= 1000000000U; s++; }
+    d->sec = s; d->nsec = ns;
+}
+
+/* Deadline `ms` milliseconds from now. */
+static void deadline_set_ms(struct kdeadline *d, uint32_t ms) {
+    deadline_set(d, ms / 1000U, (ms % 1000U) * 1000000U);
+}
+
+/* Non-zero once the monotonic clock has reached the deadline. */
+static int deadline_expired(const struct kdeadline *d) {
+    uint32_t s, ns;
+    clock_mono(&s, &ns);
+    return s > d->sec || (s == d->sec && ns >= d->nsec);
+}
+
+/* The tick this sleeper must be woken at so it cannot wake before `d`. */
+static uint32_t deadline_wake_tick(const struct kdeadline *d) {
+    uint32_t wt = clock_mono_to_tick(d->sec, d->nsec);
+    uint32_t now = pit_ticks();
+    if ((int32_t)(wt - now) <= 0) wt = now + 1;   /* never in the past */
+    return wt ? wt : 1;                            /* 0 means "no deadline" */
+}
+
+/* Ticks to sleep before the next readiness re-check: at most `cap`, and never
+ * past the deadline's wake tick. */
+static uint32_t deadline_sleep_ticks(const struct kdeadline *d, uint32_t cap) {
+    uint32_t left = deadline_wake_tick(d) - pit_ticks();
+    if ((int32_t)left <= 0) return 1;
+    return left < cap ? left : cap;
+}
+
+/* Validate a timespec (Linux timespec64_valid): nsec in [0, 1e9). */
+static int ts_valid(int64_t sec, int64_t nsec) {
+    return sec >= 0 && nsec >= 0 && nsec < 1000000000LL;
+}
+
+/* Turn a clock_nanosleep request into a MONOTONIC deadline.  Returns 0, or a
+ * negative errno (unsupported clock, bad flags).  *expired is set when the
+ * absolute deadline is already in the past. */
+#define TIMER_ABSTIME_K 1
+static int knanosleep_deadline(int clk, int flags, int64_t rsec, int64_t rnsec,
+                               uint32_t *dsec, uint32_t *dnsec, int *expired) {
+    if (flags & ~TIMER_ABSTIME_K) return -22;
+    switch (clk) {
+    case CLK_REALTIME_K: case CLK_MONOTONIC_K: case CLK_BOOTTIME_K:
+    case CLK_PROCESS_CPUTIME_K:           /* accepted by Linux; we sleep on wall time */
+        break;
+    case CLK_REALTIME_COARSE_K: case CLK_MONOTONIC_COARSE_K: case CLK_MONOTONIC_RAW_K:
+    case CLK_THREAD_CPUTIME_K:
+        return -95;                       /* -EOPNOTSUPP (Linux: ENOTSUP) */
+    default:
+        return -22;
+    }
+    if (rnsec < 0 || rnsec >= 1000000000LL) return -22;
+    uint32_t ms, mns;
+    clock_mono(&ms, &mns);
+    *expired = 0;
+    if (flags & TIMER_ABSTIME_K) {
+        int64_t asec = rsec;
+        if (clk == CLK_REALTIME_K) asec -= (int64_t)rtc_boot_epoch();   /* wall → uptime */
+        if (asec < 0 || (asec == 0 && rnsec == 0) || asec < (int64_t)ms ||
+            (asec == (int64_t)ms && (uint32_t)rnsec <= mns)) { *expired = 1; return 0; }
+        if (asec > (int64_t)ms + 20000000LL) asec = (int64_t)ms + 20000000LL;  /* ~231 days: keep tick math in range */
+        *dsec = (uint32_t)asec; *dnsec = (uint32_t)rnsec;
+        return 0;
+    }
+    if (rsec < 0) return -22;
+    if (rsec == 0 && rnsec == 0) { *expired = 1; return 0; }
+    if (rsec > 20000000LL) rsec = 20000000LL;
+    uint32_t ds = ms + (uint32_t)rsec, dn = mns + (uint32_t)rnsec;
+    if (dn >= 1000000000U) { dn -= 1000000000U; ds++; }
+    *dsec = ds; *dnsec = dn;
+    return 0;
+}
+
 /* ── sys_gettimeofday(timeval *tv, timezone *tz) — EAX=78 ───────────────── */
 static int sys_gettimeofday(registers_t *regs) {
     struct ktimeval *tv = (struct ktimeval *)(uintptr_t)regs->ebx;
     if (tv) {
         struct ktimeval ktv;
-        uint32_t t = pit_ticks();   /* 100 Hz ticks since boot */
-        ktv.tv_sec  = rtc_boot_epoch() + t / 100;   /* wall-clock seconds */
-        ktv.tv_usec = (t % 100) * 10000;
+        int64_t sec; uint32_t nsec;
+        kclock_get(CLK_REALTIME_K, &sec, &nsec);
+        ktv.tv_sec  = (int32_t)sec;
+        ktv.tv_usec = (int32_t)(nsec / 1000U);
         int cr = copy_to_user(tv, &ktv, sizeof(ktv));
         if (cr < 0) return cr;
     }
     return 0;
+}
+
+/* ── sys_time(time_t *t) — EAX=13 ───────────────────────────────────────── */
+static int sys_time(registers_t *regs) {
+    int32_t *ut = (int32_t *)(uintptr_t)regs->ebx;
+    int64_t sec; uint32_t nsec;
+    kclock_get(CLK_REALTIME_K, &sec, &nsec);
+    int32_t s32 = (int32_t)sec;
+    if (ut) {
+        int cr = copy_to_user(ut, &s32, sizeof(s32));
+        if (cr < 0) return cr;
+    }
+    return s32;
 }
 
 /* ── sys_stat(path, stat*) — EAX=106 ────────────────────────────────────── */
@@ -2277,28 +2756,33 @@ static int sys_nanosleep(registers_t *regs) {
     struct ktimespec *req = (struct ktimespec *)(uintptr_t)regs->ebx;
     struct ktimespec *rem = (struct ktimespec *)(uintptr_t)regs->ecx;
     if (!req) return -14;
-
-    /* Bounce the request into kernel memory before reading any field. */
     struct ktimespec kreq;
     int cr = copy_from_user(&kreq, req, sizeof(kreq));
     if (cr < 0) return cr;
-    if (kreq.tv_sec < 0 || kreq.tv_nsec < 0 || kreq.tv_nsec >= 1000000000)
-        return -22;
+    if (!ts_valid(kreq.tv_sec, kreq.tv_nsec)) return -22;
 
-    /* Zero the remaining time */
-    if (rem) {
-        struct ktimespec krem = { 0, 0 };
-        cr = copy_to_user(rem, &krem, sizeof(krem));
-        if (cr < 0) return cr;
+    uint32_t ds, dn; int expired;
+    int r = knanosleep_deadline(CLK_MONOTONIC_K, 0, kreq.tv_sec, kreq.tv_nsec, &ds, &dn, &expired);
+    if (r < 0) return r;
+    if (expired) return 0;
+    uint32_t rs = 0, rn = 0;
+    r = ksleep_until_mono(ds, dn, &rs, &rn);
+    /* Linux writes the remainder only when interrupted (-EINTR). */
+    if (r == -4) {
+        if (rem) {
+            struct ktimespec krem = { (int32_t)rs, (int32_t)rn };
+            cr = copy_to_user(rem, &krem, sizeof(krem));
+            if (cr < 0) return cr;
+        }
+        /* -ERESTARTNOHAND, not -EINTR: the return-to-user path re-issues a -4
+         * with the ORIGINAL arguments when the handler has SA_RESTART, which
+         * for a sleep means sleeping the whole duration again and discarding
+         * the remainder just written.  Linux never restarts these calls once a
+         * handler has run (hrtimer_nanosleep returns ERESTART_RESTARTBLOCK,
+         * and a restart resumes the REMAINING time, never the original). */
+        return -ERESTARTNOHAND;
     }
-    if (kreq.tv_sec == 0 && kreq.tv_nsec == 0) return 0;
-
-    uint32_t ticks = (uint32_t)kreq.tv_sec * 100U;
-    ticks += ((uint32_t)kreq.tv_nsec + 9999999U) / 10000000U;
-    if (!ticks) ticks = 1;
-    current_proc->wake_tick = pit_ticks() + ticks;
-    sleep_on((void *)&sys_nanosleep);
-    return 0;
+    return r;
 }
 
 /* ── sys_getdents(fd, buf, count) — EAX=141 ─────────────────────────────── */
@@ -2421,11 +2905,12 @@ static int sys_getcwd(registers_t *regs) {
 static struct proc *mmap_owner(void) {
     if (!current_proc) return NULL;
     struct proc *p = current_proc;
-    /* A CLONE_VFORK child shares the PARENT's address space (and thus its
-     * demand-paged VMA list + mmap cursor) but has its own tgid — route it to
-     * the parent so faults on the shared address space resolve, and so its
-     * stack mmaps don't get a private (empty) VMA list. */
-    if (p->vfork_parent) p = p->vfork_parent;
+    /* A CLONE_VM child that is NOT a thread (vfork, posix_spawn, a Breakpad
+     * dumper clone) shares its creator's address space (and thus the
+     * demand-paged VMA list + mmap cursor) while being its own thread group —
+     * route it to the owning group so faults on the shared address space
+     * resolve, and so its stack mmaps don't get a private (empty) VMA list. */
+    if (p->vm_owner) p = p->vm_owner;
     if (p->tgid == p->pid) return p;
     for (int i = 0; i < MAX_PROCS; i++)
         if (ptable[i].state != PROC_UNUSED &&
@@ -2439,48 +2924,59 @@ static struct proc *mmap_owner(void) {
  * allocated (zeroed) on first fault.  The VMA list belongs to the address space
  * (the tgid leader); all VMA ops run with interrupts off because threads share
  * the list and a fault can occur on any thread. */
-volatile int g_ipc_launch_started = 0;   /* [lt] launcher-trace arm flag */
-/* Last PIT tick at which a FUTEX_WAKE actually woke a waiter (woke>0) — i.e. a
- * real condvar/mutex handoff.  The scheduler uses this to detect a condvar STALL
- * (waiters parked but no successful handoff) and apply the BZ#25847 lost-wakeup
- * safety net (POSIX permits spurious condvar wakeups). */
-volatile uint32_t g_futex_progress_tick = 0;
-/* Event-driven epoll self-heal: bumped on every firefox pipe/usocket write
- * during the launch phase (a dispatch/IPC signal).  A firefox IO thread parked
- * in epoll_wait records this at entry and, if it changes while waiting, self-heals
- * IMMEDIATELY — so cross-thread dispatches (whose ScheduleWork pipe-write Gecko
- * fails to issue on our scheduler) wake the IO thread with ~no latency, instead
- * of relying on the 150ms timed fallback that's too slow for the multi-round-trip
- * parent↔socket-process handshake. */
-volatile unsigned g_ff_io_nudge = 0;
-volatile int g_ipc_launch_tid = 0;       /* pid of the "IPC Launch" nsThread */
-volatile uint32_t g_ipclaunch_waitaddr = 0;  /* last futex addr IPC Launch parked on */
-/* [wfph] the condvar address the firefox MAIN thread (WaitForProcessHandle) has
- * been parked on for a long time; set by the scheduler stall detector.  sys_futex
- * WAKE logs when a wake targets it — decisive test of whether the launch-complete
- * cond_signal is EVER sent (→ glibc lost it, BZ#25847, glibc 2.41 fix) vs never
- * sent (→ launcher never Notifies, a different bug). */
-volatile uint32_t g_wfph_watch_addr = 0;
-volatile int      g_wfph_watch_tgid = 0;  /* address space (tgid) of the watched
-                                           * WaitForProcessHandle condvar — futex
-                                           * addrs are per-AS, so only wakes from
-                                           * THIS tgid touch the real condvar. */
-volatile int      g_forker_tid = 0;       /* [fk] firefox thread that most recently
-                                           * fork()ed a content process (clone w/o
-                                           * CLONE_VM, ret>0); trace its futex ops
-                                           * to see if it BLOCKS (WAIT) or NOTIFIES
-                                           * (WAKE) after the fork = does it reach
-                                           * SetProcessState + Monitor.Notify? */
+/* ── Virtual memory areas ────────────────────────────────────────────────────
+ * Every mmap()ed region of an address space is recorded in a VMA, kept sorted
+ * by address and owned by the thread-group leader (Linux: mm_struct's VMA
+ * tree).  The registry is authoritative for a mapping's existence and its
+ * protection; the page tables only cache what has been populated.  It drives
+ *   - the free-space search, so munmap()ed ranges are reused (mm/mmap.c,
+ *     vm_unmapped_area) and a long-lived process can mmap/munmap forever;
+ *   - protection of pages that fault in later, and the SIGSEGV decision for
+ *     PROT_NONE ranges (mm/memory.c, access_error);
+ *   - re-population after MADV_DONTNEED (a zero page, or the file contents
+ *     again for a private file mapping);
+ *   - /proc/self/maps.
+ * Pages are populated eagerly at mmap time for small mappings and on first
+ * touch for large ones; both paths go through vma_populate_page(). */
 
 struct vma {
     uint32_t start;       /* page-aligned, inclusive */
     uint32_t end;         /* page-aligned, exclusive */
     uint32_t prot;        /* raw mmap PROT bits: 1=R 2=W 4=X; 0 = PROT_NONE */
+    uint32_t flags;       /* VMA_F_* */
     vfs_node_t *file;     /* NULL = anonymous (zero-fill); else file-backed   */
     uint32_t file_off;    /* byte offset in `file` corresponding to `start`   */
     uint32_t file_size;   /* file size snapshot (bytes past it are BSS-zero)  */
-    struct vma *next;
+    struct vma *next;     /* next by ascending start */
 };
+
+/* PTEs of this VMA carry PAGE_SHARED (MAP_SHARED file/anon, /dev/fb0): they
+ * are shared with children instead of COW'd, and MADV_DONTNEED leaves them
+ * alone because there is no per-VMA re-population path for shared frames. */
+#define VMA_F_SHARED   0x1U
+
+#define PROT_READ_K    0x1
+#define PROT_WRITE_K   0x2
+#define PROT_EXEC_K    0x4
+
+#define MAP_SHARED_K            0x01
+#define MAP_PRIVATE_K           0x02
+#define MAP_FIXED_K             0x10
+#define MAP_ANONYMOUS_K         0x20
+#define MAP_FIXED_NOREPLACE_K   0x100000
+
+/* Free-space search window.  The floor keeps mmap() above the ELF images and
+ * the brk heap (the interpreter is loaded at 0x40000000 and is skipped by the
+ * present-page scan); the top stays out of the main thread's 8 MiB stack
+ * growth window (Linux: mmap_base sits below the stack plus stack_guard_gap;
+ * audit M14). */
+#define MMAP_FLOOR   0x40000000U
+#define MMAP_TOP     ((uint32_t)USER_STACK_TOP - (8U << 20))
+
+/* Small mappings are populated at mmap time; large ones fault in lazily (8 MiB
+ * thread stacks and multi-hundred-MiB libraries mostly go untouched). */
+#define VMA_DEMAND_MIN       (4U * 1024U * 1024U)
+#define VMA_FILE_DEMAND_MIN  (1U * 1024U * 1024U)
 
 static inline uint32_t vma_irq_save(void) {
     uint32_t f; __asm__ volatile("pushf; pop %0; cli" : "=r"(f) :: "memory"); return f;
@@ -2489,50 +2985,109 @@ static inline void vma_irq_restore(uint32_t f) {
     if (f & 0x200) __asm__ volatile("sti" ::: "memory");
 }
 
-/* Insert a VMA for [start,end) with the given prot into the owner's list. */
-static int vma_add(uint32_t start, uint32_t end, uint32_t prot) {
-    struct proc *o = mmap_owner();
-    if (!o || end <= start) return -1;
-    struct vma *v = (struct vma *)kmalloc(sizeof(struct vma));
-    if (!v) return -1;
-    v->start = start; v->end = end; v->prot = prot;
-    v->file = NULL; v->file_off = 0; v->file_size = 0;
-    uint32_t irq = vma_irq_save();
-    v->next = o->vmas;
-    o->vmas = v;
-    vma_irq_restore(irq);
-    return 0;
+/* A PTE that owns a frame: present, or PROT_NONE'd (not present, PAGE_PROTNONE
+ * marker, frame kept so the data survives an mprotect(PROT_NONE)/mprotect(RW)
+ * round trip exactly like Linux's _PAGE_PROTNONE). */
+static inline int pte_mapped(uint32_t pte) {
+    return (pte & (PAGE_PRESENT | PAGE_PROTNONE)) != 0;
 }
 
-/* Insert a FILE-BACKED demand-paged VMA: pages fault in from `file` (private,
- * copy-on-fault).  Holds a reference on the node so it survives the fd close
- * that ld.so does right after mmap.  Bytes past file_size read as zero (BSS). */
-static int vma_add_file(uint32_t start, uint32_t end, uint32_t prot,
-                        vfs_node_t *file, uint32_t file_off) {
-    struct proc *o = mmap_owner();
-    if (!o || end <= start || !file) return -1;
-    struct vma *v = (struct vma *)kmalloc(sizeof(struct vma));
-    if (!v) return -1;
-    v->start = start; v->end = end; v->prot = prot;
-    v->file = file; v->file_off = file_off; v->file_size = file->size;
-    vfs_retain(file);                    /* keep node alive past fd close */
-    uint32_t irq = vma_irq_save();
-    v->next = o->vmas;
-    o->vmas = v;
-    vma_irq_restore(irq);
-    return 0;
+/* PTE flag bits for a freshly populated page of a mapping with `prot`. */
+static uint32_t pte_flags_for(uint32_t prot, uint32_t shared) {
+    uint32_t f = PAGE_USER | (shared ? PAGE_SHARED : 0);
+    if (prot == 0) return f | PAGE_PROTNONE;          /* inaccessible, frame kept */
+    f |= PAGE_PRESENT;
+    if (prot & PROT_WRITE_K) f |= PAGE_WRITABLE;
+    return f;
 }
 
-/* Find the VMA containing `addr` (page-aligned lookups), or NULL. */
+static struct vma *vma_alloc(uint32_t start, uint32_t end, uint32_t prot,
+                             uint32_t flags, vfs_node_t *file, uint32_t file_off) {
+    struct vma *v = (struct vma *)kmalloc(sizeof(struct vma));
+    if (!v) return NULL;
+    v->start = start; v->end = end; v->prot = prot; v->flags = flags;
+    v->file = file; v->file_off = file ? file_off : 0;
+    v->file_size = file ? file->size : 0;
+    v->next = NULL;
+    if (file) vfs_retain(file);          /* keep node alive past fd close */
+    return v;
+}
+
+static void vma_free_one(struct vma *v) {
+    if (v->file) vfs_close(v->file);     /* release node ref */
+    kfree(v);
+}
+
+/* Two anonymous VMAs with identical attributes that touch can be one VMA
+ * (Linux vma_merge).  Keeps the list short under allocators that map many
+ * adjacent chunks. */
+static int vma_can_merge(const struct vma *a, const struct vma *b) {
+    return a->end == b->start && !a->file && !b->file &&
+           a->prot == b->prot && a->flags == b->flags;
+}
+
+/* Insert v into the owner's sorted list, merging with its neighbours.  Returns
+ * the node that now covers v's range (v itself, or the neighbour it was merged
+ * into — v is freed in that case). */
+static struct vma *vma_insert(struct proc *o, struct vma *v) {
+    uint32_t irq = vma_irq_save();
+    struct vma **pp = &o->vmas;
+    struct vma *prev = NULL;
+    while (*pp && (*pp)->start < v->start) { prev = *pp; pp = &(*pp)->next; }
+    v->next = *pp;
+    *pp = v;
+    if (v->end > o->mmap_next) o->mmap_next = v->end;   /* high-water mark */
+    /* merge with the successor */
+    struct vma *n = v->next;
+    if (n && vma_can_merge(v, n)) { v->end = n->end; v->next = n->next; kfree(n); }
+    /* merge with the predecessor */
+    if (prev && vma_can_merge(prev, v)) {
+        prev->end = v->end; prev->next = v->next; kfree(v); v = prev;
+    }
+    vma_irq_restore(irq);
+    return v;
+}
+
+/* Merge every pair of adjacent mergeable VMAs (after mprotect re-unified the
+ * protection of neighbouring pieces, e.g. a JIT toggling W^X on one region). */
+static void vma_merge_all(struct proc *o) {
+    uint32_t irq = vma_irq_save();
+    for (struct vma *v = o->vmas; v && v->next; ) {
+        struct vma *n = v->next;
+        if (vma_can_merge(v, n)) { v->end = n->end; v->next = n->next; kfree(n); }
+        else v = n;
+    }
+    vma_irq_restore(irq);
+}
+
+/* Record a VMA for [start,end).  Returns the VMA covering it (possibly a
+ * merged neighbour spanning more than [start,end)) or NULL. */
+static struct vma *vma_add(uint32_t start, uint32_t end, uint32_t prot,
+                           uint32_t flags, vfs_node_t *file, uint32_t file_off) {
+    struct proc *o = mmap_owner();
+    if (!o || end <= start) return NULL;
+    struct vma *v = vma_alloc(start, end, prot, flags, file, file_off);
+    if (!v) return NULL;
+    return vma_insert(o, v);
+}
+
+/* Find the VMA containing `addr`, or NULL. */
 static struct vma *vma_find(uint32_t addr) {
     struct proc *o = mmap_owner();
     if (!o) return NULL;
-    for (struct vma *v = o->vmas; v; v = v->next)
-        if (addr >= v->start && addr < v->end) return v;
+    for (struct vma *v = o->vmas; v && v->start <= addr; v = v->next)
+        if (addr < v->end) return v;
     return NULL;
 }
 
-/* Expose the anonymous VMA list to procfs (struct vma is private here). */
+/* Protection of the VMA covering addr, or -1 if no VMA covers it.  Used by
+ * the page-fault handler to refuse a COW break in a read-only mapping. */
+int vma_prot_lookup(uint32_t addr) {
+    struct vma *v = vma_find(addr & ~0xFFFU);
+    return v ? (int)v->prot : -1;
+}
+
+/* Expose the VMA list to procfs (struct vma is private here). */
 int proc_vma_iter(struct proc *p, int idx,
                   uint32_t *start, uint32_t *end, uint32_t *prot) {
     if (!p) return -1;
@@ -2548,31 +3103,85 @@ int proc_vma_iter(struct proc *p, int idx,
     return -1;
 }
 
-/* True if NOTHING occupies [va, va+length): no present page table entry AND no
- * demand-paged VMA overlaps.  Used to decide whether a non-MAP_FIXED mmap HINT
- * address is safe to honor — blindly honoring a colliding hint overlays a live
- * mapping (a thread stack/TLS, another allocator arena) and corrupts it. */
-static int mmap_range_free(uint32_t va, uint32_t length) {
-    uint32_t end = va + length;
-    if (end < va) return 0;
-    /* Any present page in the range → occupied (skip whole absent PDEs fast). */
-    for (uint32_t a = va; a < end; ) {
-        if (!(*paging_get_pde(a) & PAGE_PRESENT)) {
-            a = (a & ~0x3FFFFFU) + 0x400000U;        /* next 4 MiB PDE region */
-            continue;
+/* Same, plus the sharing flag and the backing file's name for /proc/pid/maps. */
+int proc_vma_iter_ex(struct proc *p, int idx, uint32_t *start, uint32_t *end,
+                     uint32_t *prot, int *shared, const char **name) {
+    if (!p) return -1;
+    int i = 0;
+    for (struct vma *v = p->vmas; v; v = v->next, i++) {
+        if (i == idx) {
+            if (start)  *start  = v->start;
+            if (end)    *end    = v->end;
+            if (prot)   *prot   = v->prot;
+            if (shared) *shared = (v->flags & VMA_F_SHARED) ? 1 : 0;
+            if (name)   *name   = v->file ? v->file->name : "";
+            return 0;
         }
-        if (*paging_get_pte(a) & PAGE_PRESENT) return 0;
-        a += PAGE_SIZE;
     }
-    /* Any demand-paged VMA overlapping the range → reserved. */
-    struct proc *o = mmap_owner();
-    if (o)
-        for (struct vma *v = o->vmas; v; v = v->next)
-            if (v->start < end && va < v->end) return 0;
-    return 1;
+    return -1;
 }
 
-/* Remove (and trim/split) any VMA coverage of [start,end) from the owner. */
+/* Address of the first page in [start,end) whose PTE owns a frame, or 0. */
+static uint32_t first_mapped_page(uint32_t start, uint32_t end) {
+    for (uint32_t a = start; a < end; ) {
+        if (!(*paging_get_pde(a) & PAGE_PRESENT)) {
+            uint32_t n = (a & ~0x3FFFFFU) + 0x400000U;   /* next 4 MiB PDE */
+            if (n <= a) break;                            /* wrapped */
+            a = n;
+            continue;
+        }
+        if (pte_mapped(*paging_get_pte(a))) return a ? a : 1;
+        a += PAGE_SIZE;
+    }
+    return 0;
+}
+
+/* True if NOTHING occupies [va, va+length): no VMA overlaps and no page table
+ * entry owns a frame (the latter also covers regions that are not VMAs: the
+ * ELF image, the brk heap, SysV-style shm attachments, the stack). */
+static int vma_range_free(uint32_t va, uint32_t length) {
+    uint32_t end = va + length;
+    if (end < va) return 0;
+    struct proc *o = mmap_owner();
+    if (o)
+        for (struct vma *v = o->vmas; v && v->start < end; v = v->next)
+            if (va < v->end) return 0;
+    return first_mapped_page(va, end) == 0;
+}
+
+/* First-fit search for a free range of `length` bytes whose start is a
+ * multiple of `align` inside [MMAP_FLOOR, MMAP_TOP).  Gaps between VMAs are
+ * verified against the page tables so non-VMA occupants are skipped too.
+ * Returns 0 when nothing fits (-ENOMEM).  Linux searches top-down from
+ * mmap_base; bottom-up first-fit gives the same reuse guarantee and keeps
+ * the layout this kernel's users already expect (libraries low, stacks high). */
+static uint32_t vma_gap_find(uint32_t length, uint32_t align) {
+    struct proc *o = mmap_owner();
+    if (!o || !length) return 0;
+    if (align < PAGE_SIZE) align = PAGE_SIZE;
+    uint32_t cur = MMAP_FLOOR;
+    for (int guard = 0; guard < 100000; guard++) {
+        /* find the first gap at or after cur that fits */
+        uint32_t cand = 0;
+        uint32_t lo = cur;
+        struct vma *v = o->vmas;
+        for (;;) {
+            uint32_t a = (lo + align - 1) & ~(align - 1);
+            if (a < lo || a + length < a || a + length > MMAP_TOP) return 0;
+            while (v && v->end <= lo) v = v->next;
+            if (!v || a + length <= v->start) { cand = a; break; }
+            lo = v->end;
+        }
+        /* the gap is VMA-free; make sure no stray page table entry lives there */
+        uint32_t occ = first_mapped_page(cand, cand + length);
+        if (!occ) return cand;
+        cur = occ + PAGE_SIZE;
+    }
+    return 0;
+}
+
+/* Remove (and trim/split) any VMA coverage of [start,end) from the owner.
+ * Order is preserved; a split keeps the right piece right after the left. */
 static void vma_remove_range(uint32_t start, uint32_t end) {
     struct proc *o = mmap_owner();
     if (!o || end <= start) return;
@@ -2580,24 +3189,21 @@ static void vma_remove_range(uint32_t start, uint32_t end) {
     struct vma **pp = &o->vmas;
     while (*pp) {
         struct vma *v = *pp;
-        if (v->end <= start || v->start >= end) { pp = &v->next; continue; }
+        if (v->start >= end) break;                         /* sorted: done */
+        if (v->end <= start) { pp = &v->next; continue; }
         /* overlap */
-        if (v->start >= start && v->end <= end) {       /* fully covered: drop */
+        if (v->start >= start && v->end <= end) {           /* fully covered: drop */
             *pp = v->next;
             vma_irq_restore(irq);
-            if (v->file) vfs_close(v->file);            /* release node ref */
-            kfree(v);
+            vma_free_one(v);
             irq = vma_irq_save();
             continue;
         }
-        if (v->start < start && v->end > end) {         /* split into two */
-            struct vma *right = (struct vma *)kmalloc(sizeof(struct vma));
+        if (v->start < start && v->end > end) {             /* split into two */
+            struct vma *right = vma_alloc(end, v->end, v->prot, v->flags, v->file,
+                                          v->file ? v->file_off + (end - v->start) : 0);
             if (right) {
-                right->start = end; right->end = v->end; right->prot = v->prot;
-                right->file = v->file;
-                right->file_off = v->file ? v->file_off + (end - v->start) : 0;
                 right->file_size = v->file_size;
-                if (right->file) vfs_retain(right->file);  /* second ref to node */
                 right->next = v->next;
                 v->next = right;
             }
@@ -2605,8 +3211,8 @@ static void vma_remove_range(uint32_t start, uint32_t end) {
             pp = &v->next;
             continue;
         }
-        if (v->start < start) { v->end = start; }       /* trim right edge */
-        else {                                          /* trim left edge */
+        if (v->start < start) { v->end = start; }           /* trim right edge */
+        else {                                              /* trim left edge */
             if (v->file) v->file_off += end - v->start;
             v->start = end;
         }
@@ -2615,38 +3221,43 @@ static void vma_remove_range(uint32_t start, uint32_t end) {
     vma_irq_restore(irq);
 }
 
-/* Update prot of VMA coverage over [start,end) (splitting as needed). */
+/* Update prot of VMA coverage over [start,end), splitting as needed while
+ * keeping the list sorted (Linux mprotect_fixup / split_vma). */
 static void vma_protect_range(uint32_t start, uint32_t end, uint32_t prot) {
     struct proc *o = mmap_owner();
     if (!o || end <= start) return;
     uint32_t irq = vma_irq_save();
-    for (struct vma *v = o->vmas; v; v = v->next) {
-        if (v->end <= start || v->start >= end) continue;
-        if (v->start >= start && v->end <= end) { v->prot = prot; continue; }
-        /* Partial overlap: carve out the covered middle into its own VMA. */
+    for (struct vma *v = o->vmas; v && v->start < end; v = v->next) {
+        if (v->end <= start || v->prot == prot) continue;
         uint32_t cs = v->start > start ? v->start : start;
         uint32_t ce = v->end   < end   ? v->end   : end;
-        struct vma *mid = (struct vma *)kmalloc(sizeof(struct vma));
-        if (!mid) { v->prot = prot; continue; }   /* fallback: prot whole VMA */
-        mid->start = cs; mid->end = ce; mid->prot = prot; mid->next = v->next;
-        mid->file = v->file;
-        mid->file_off = v->file ? v->file_off + (cs - v->start) : 0;
-        mid->file_size = v->file_size;
-        if (mid->file) vfs_retain(mid->file);
-        if (v->start < cs && v->end > ce) {       /* middle: need a right piece too */
-            struct vma *right = (struct vma *)kmalloc(sizeof(struct vma));
-            if (right) { right->start = ce; right->end = v->end; right->prot = v->prot;
-                         right->file = v->file;
-                         right->file_off = v->file ? v->file_off + (ce - v->start) : 0;
-                         right->file_size = v->file_size;
-                         if (right->file) vfs_retain(right->file);
-                         right->next = mid->next; mid->next = right; }
+        if (v->start < cs) {
+            /* keep [v->start,cs) as v; carve [cs,v->end) as mid and continue
+             * with mid so the tail split below applies to it */
+            struct vma *mid = vma_alloc(cs, v->end, v->prot, v->flags, v->file,
+                                        v->file ? v->file_off + (cs - v->start) : 0);
+            if (!mid) { v->prot = prot; continue; }   /* fallback: prot whole VMA */
+            mid->file_size = v->file_size;
+            mid->next = v->next;
+            v->next = mid;
+            v->end = cs;
+            v = mid;
         }
-        v->next = mid;
-        if (v->start < cs) { v->end = cs; }
-        else { if (v->file) v->file_off += ce - v->start; v->start = ce; }
+        /* v starts at cs; if it runs past ce split the tail off with the old prot */
+        if (ce < v->end) {
+            struct vma *right = vma_alloc(ce, v->end, v->prot, v->flags, v->file,
+                                          v->file ? v->file_off + (ce - v->start) : 0);
+            if (right) {
+                right->file_size = v->file_size;
+                right->next = v->next;
+                v->next = right;
+                v->end = ce;
+            }
+        }
+        v->prot = prot;
     }
     vma_irq_restore(irq);
+    vma_merge_all(o);
 }
 
 /* Free all VMAs of a process (exec / last-thread exit). */
@@ -2656,86 +3267,32 @@ void vma_clear(struct proc *p) {
     struct vma *v = p->vmas;
     p->vmas = NULL;
     vma_irq_restore(irq);
-    while (v) { struct vma *n = v->next;
-        if (v->file) vfs_close(v->file);   /* drop the demand-page node ref */
-        kfree(v); v = n; }
+    while (v) { struct vma *n = v->next; vma_free_one(v); v = n; }
 }
 
-/* Copy parent's VMA list to child (fork). */
+/* Copy parent's VMA list to child (fork), preserving order. */
 void vma_clone(struct proc *parent, struct proc *child) {
     child->vmas = NULL;
     if (!parent) return;
-    /* Demand-paged VMAs live on the thread-group LEADER (mmap_owner), not on a
-     * non-leader worker thread.  When a worker forks (e.g. Firefox's content-
-     * process launch happens on the "IPC Launch" thread, not the main thread),
-     * copy the LEADER's VMA list — otherwise the child has no demand-paged
-     * coverage and SIGSEGVs on the first libxul / thread-stack page it touches. */
+    /* VMAs live on the thread-group LEADER (mmap_owner), not on a non-leader
+     * worker thread.  When a worker forks (e.g. Firefox's content-process
+     * launch happens on the "IPC Launch" thread, not the main thread), copy the
+     * LEADER's list — otherwise the child has no coverage and SIGSEGVs on the
+     * first libxul / thread-stack page it touches. */
     struct proc *owner = parent;
     if (parent->tgid != parent->pid)
         for (int i = 0; i < MAX_PROCS; i++)
             if (ptable[i].state != PROC_UNUSED && ptable[i].pid == parent->tgid) {
                 owner = &ptable[i]; break;
             }
+    struct vma **tail = &child->vmas;
     for (struct vma *v = owner->vmas; v; v = v->next) {
-        struct vma *nv = (struct vma *)kmalloc(sizeof(struct vma));
+        struct vma *nv = vma_alloc(v->start, v->end, v->prot, v->flags, v->file, v->file_off);
         if (!nv) return;
-        nv->start = v->start; nv->end = v->end; nv->prot = v->prot;
-        nv->file = v->file; nv->file_off = v->file_off; nv->file_size = v->file_size;
-        if (nv->file) vfs_retain(nv->file);   /* child shares the backing file */
-        nv->next = child->vmas;
-        child->vmas = nv;
+        nv->file_size = v->file_size;
+        *tail = nv;
+        tail = &nv->next;
     }
-}
-
-/* Page-fault populate: map a zeroed frame for a faulting anonymous VMA page.
- * Returns 1 if handled, 0 if the address isn't a populatable VMA page. */
-int vma_handle_fault(uint32_t addr) {
-    addr &= ~0xFFFU;
-    struct vma *v = vma_find(addr);
-    if (!v) return 0;
-    if (v->prot == 0) return 0;                 /* PROT_NONE guard → SIGSEGV */
-    /* already present? (another thread populated it) */
-    if ((*paging_get_pde(addr) & PAGE_PRESENT) &&
-        (*paging_get_pte(addr) & PAGE_PRESENT)) return 1;
-    uint32_t phys = pmm_alloc_frame();
-    if (!phys) return 0;                         /* OOM → let it SIGSEGV */
-    pmm_frame_incref(phys);
-
-    /* FILL-BEFORE-MAP (SMP correctness).  Fill the new frame through a PRIVATE
-     * temporary kernel mapping, and only AFTER it is complete map it at the user
-     * VA.  The previous code did the opposite — paging_map(addr, …PRESENT…) and
-     * then memset + vfs_read THROUGH addr — which races a sibling thread sharing
-     * this address space on another CPU: the page is published PRESENT (so the
-     * sibling's MMU can walk to it) while the frame is still zeroed / only
-     * half-read from the file, so the sibling reads garbage.  That is the
-     * residual -smp 2 wild-pointer / SIGILL corruption in the file-backed
-     * library region (it cannot happen on -smp 1: no parallel reader).  Filling
-     * first means the page is only ever visible fully-formed.  preempt_disable
-     * keeps the shared temp-map slot ours across the BKL-held, non-sleeping
-     * vfs_read (no other CPU runs kernel code under the BKL; no local preemption
-     * can steal the slot). */
-    preempt_disable();
-    uint8_t *kva = (uint8_t *)paging_temp_map(phys);
-    __builtin_memset(kva, 0, PAGE_SIZE);
-    if (v->file) {
-        /* File-backed (MAP_PRIVATE): copy this page's worth of file data over
-         * the zeroed frame.  Bytes past file_size stay zero (BSS tail / SIGBUS
-         * region we treat as zero).  The frame is private, so later writes are
-         * naturally copy-on-fault and never reach the file. */
-        uint32_t foff = v->file_off + (addr - v->start);
-        if (foff < v->file_size) {
-            uint32_t want = PAGE_SIZE;
-            if (want > v->file_size - foff) want = v->file_size - foff;
-            vfs_read(v->file, foff, want, kva);
-        }
-    }
-    paging_temp_unmap();
-    preempt_enable();
-
-    uint32_t flags = PAGE_PRESENT | PAGE_USER;
-    if (v->prot & 2) flags |= PAGE_WRITABLE;     /* PROT_WRITE, else read-only */
-    paging_map(addr, phys, flags);               /* publish: present + complete */
-    return 1;
 }
 
 /* ── Shared file mappings (MAP_SHARED) ───────────────────────────────────────
@@ -2801,10 +3358,16 @@ static int shmap_try_reclaim(struct shmap_entry *e) {
     for (uint32_t p = 0; p < e->npages; p++)
         if (e->frames && e->frames[p]) pmm_frame_decref(e->frames[p]);
     if (e->frames) kfree(e->frames);
-    e->frames = NULL; e->npages = 0; e->node = NULL;
+    e->frames = NULL; e->npages = 0;
+    vfs_close(e->node);                 /* drop the registry's reference */
+    e->node = NULL;
     return 1;
 }
 
+/* The registry keys on the node pointer and outlives every mapping of it, so it
+ * must hold a reference of its own: otherwise the node could be freed, its
+ * address reused by a different file, and the stale key would match the wrong
+ * one.  shmap_try_reclaim() drops the reference when it retires an entry. */
 static struct shmap_entry *shmap_get(vfs_node_t *node) {
     struct shmap_entry *free_e = NULL;
     for (int i = 0; i < SHMAP_MAX; i++) {
@@ -2816,17 +3379,26 @@ static struct shmap_entry *shmap_get(vfs_node_t *node) {
             if (shmaps[i].node && shmap_try_reclaim(&shmaps[i])) { free_e = &shmaps[i]; break; }
         if (!free_e) return NULL;
     }
+    vfs_retain(node);                   /* the registry's own reference */
     free_e->node   = node;
     free_e->frames = NULL;
     free_e->npages = 0;
     return free_e;
 }
 
+/* memfd nodes store their data IN this registry (see shmem_read below), so
+ * there is no separate file body to seed a fresh frame from. */
+static uint32_t shmem_read(vfs_node_t *, uint32_t, uint32_t, uint8_t *);
+static int node_is_shmem(vfs_node_t *n) { return n && n->read_fn == shmem_read; }
+
 /* Get (allocating + initialising from file content on first touch) the shared
  * physical frame backing page `pg` of the file. */
 static uint32_t shmap_frame(struct shmap_entry *e, vfs_node_t *node, uint32_t pg) {
     if (pg >= e->npages) {
-        uint32_t newn = pg + 16;
+        /* Double, never grow by a constant: a 64 MiB memfd is 16384 pages and
+         * a +16 step would recopy the table on every page (O(n^2)). */
+        uint32_t newn = e->npages ? e->npages * 2 : 16;
+        if (newn < pg + 16) newn = pg + 16;
         uint32_t *nf = (uint32_t *)kmalloc(newn * sizeof(uint32_t));
         if (!nf) return 0;
         __builtin_memset(nf, 0, newn * sizeof(uint32_t));
@@ -2843,43 +3415,224 @@ static uint32_t shmap_frame(struct shmap_entry *e, vfs_node_t *node, uint32_t pg
     pmm_frame_incref(phys);                  /* registry holds one ref */
     uint8_t *kp = (uint8_t *)paging_temp_map(phys);
     __builtin_memset(kp, 0, PAGE_SIZE);
-    if (node->read_fn)                       /* preserve any pre-written content */
+    if (node->read_fn && !node_is_shmem(node))  /* preserve any pre-written content */
         vfs_read(node, pg * PAGE_SIZE, PAGE_SIZE, kp);
     paging_temp_unmap();
     e->frames[pg] = phys;
     return phys;
 }
 
-/* Flush-before-free for mmap page REPLACEMENT (MAP_FIXED overlays, e.g. ld.so
- * mapping each library LOAD segment over a reserved span).  Remapping an already-
- * present user page leaves a sibling thread on another CPU with a stale TLB entry
- * pointing at the OLD frame; if we free that frame inside the loop it can be
- * reused before the sibling flushes → it reads/writes the reclaimed frame =
- * wild-pointer / code corruption (the residual -smp 2 crashes were here, in the
- * 0x46–0x4a library region).  So stash old frames and release them only AFTER a
- * tlb_shootdown().  BKL-serialized + non-preemptive → a single static batch is
- * safe (one CPU in mmap at a time). */
-static uint32_t g_mmap_oldframes[512];
-static int      g_mmap_oldn;
-static void mmap_stash_old(uint32_t phys) {
-    if (g_mmap_oldn >= 512) {                 /* batch full: flush, drain, reset */
-        tlb_shootdown();
-        while (g_mmap_oldn) pmm_frame_decref(g_mmap_oldframes[--g_mmap_oldn]);
+/* ── memfd (shmem) file backing ──────────────────────────────────────────────
+ * Linux: a memfd is a shmem inode whose page-cache pages ARE the pages a
+ * MAP_SHARED mapping maps (mm/memfd.c, mm/shmem.c).  read(2)/write(2) and
+ * stores through a mapping therefore hit the same frames, and the file costs
+ * one frame per touched page instead of a second contiguous copy of it.
+ * Installing these three operations on a memfd node makes the shmap registry
+ * above that file's only storage, which is what makes the two views coherent
+ * (audit M5).
+ *
+ * They use the SECOND temp-map slot: the page-population path holds slot 1
+ * across its fill, and a private mapping of a memfd page can reach vfs_read()
+ * from inside that. */
+
+/* Move `n` bytes between file page frame `phys` (at byte `in` within it) and
+ * the caller's buffer, through a small bounce buffer.  The caller's buffer is
+ * often a demand-paged USER page: faulting it in populates its frame through
+ * the same temp-map slots, so the slot must not be held across that touch. */
+static void shmem_bounce(uint32_t phys, uint32_t in, uint8_t *buf, uint32_t n,
+                         int to_frame) {
+    uint8_t tmp[256];
+    for (uint32_t done = 0; done < n; ) {
+        uint32_t k = n - done;
+        if (k > sizeof tmp) k = sizeof tmp;
+        if (to_frame) __builtin_memcpy(tmp, buf + done, k);
+        preempt_disable();
+        uint8_t *kp = (uint8_t *)paging_temp_map2(phys);
+        if (to_frame) __builtin_memcpy(kp + in + done, tmp, k);
+        else          __builtin_memcpy(tmp, kp + in + done, k);
+        paging_temp_unmap2();
+        preempt_enable();
+        if (!to_frame) __builtin_memcpy(buf + done, tmp, k);
+        done += k;
     }
-    g_mmap_oldframes[g_mmap_oldn++] = phys;
 }
-static void mmap_free_stashed(void) {         /* call before every return */
-    if (!g_mmap_oldn) return;                 /* nothing remapped → no shootdown */
-    tlb_shootdown();                          /* sibling CPUs flush stale remaps */
-    while (g_mmap_oldn) pmm_frame_decref(g_mmap_oldframes[--g_mmap_oldn]);
+
+static uint32_t shmem_read(vfs_node_t *node, uint32_t off, uint32_t len,
+                           uint8_t *buf) {
+    if (off >= node->size) return 0;
+    if (len > node->size - off) len = node->size - off;
+    struct shmap_entry *e = shmap_lookup(node);
+    uint32_t done = 0;
+    while (done < len) {
+        uint32_t pos = off + done;
+        uint32_t in  = pos & (PAGE_SIZE - 1);
+        uint32_t n   = PAGE_SIZE - in;
+        if (n > len - done) n = len - done;
+        uint32_t phys = shmap_peek(e, pos / PAGE_SIZE);
+        if (phys) shmem_bounce(phys, in, buf + done, n, 0);
+        else      __builtin_memset(buf + done, 0, n);   /* unwritten page = hole */
+        done += n;
+    }
+    return done;
+}
+
+static uint32_t shmem_write(vfs_node_t *node, uint32_t off, uint32_t len,
+                            const uint8_t *buf) {
+    struct shmap_entry *e = shmap_get(node);
+    if (!e) return 0;
+    uint32_t done = 0;
+    while (done < len) {
+        uint32_t pos = off + done;
+        uint32_t in  = pos & (PAGE_SIZE - 1);
+        uint32_t n   = PAGE_SIZE - in;
+        if (n > len - done) n = len - done;
+        uint32_t phys = shmap_frame(e, node, pos / PAGE_SIZE);
+        if (!phys) break;                          /* out of frames */
+        shmem_bounce(phys, in, (uint8_t *)(uintptr_t)(buf + done), n, 1);
+        done += n;
+    }
+    if (off + done > node->size) node->size = off + done;
+    return done;
+}
+
+/* Linux shmem_setattr/shmem_truncate_range: growing is lazy (the new pages are
+ * holes that read as zero), shrinking drops the pages past the new end and
+ * zeroes the tail of the last partial one. */
+static int shmem_truncate(vfs_node_t *node, uint32_t new_size) {
+    struct shmap_entry *e = shmap_lookup(node);
+    if (e && e->frames && new_size < node->size) {
+        uint32_t tail = new_size & (PAGE_SIZE - 1);
+        if (tail) {
+            uint32_t phys = shmap_peek(e, new_size / PAGE_SIZE);
+            if (phys) {
+                preempt_disable();
+                uint8_t *kp = (uint8_t *)paging_temp_map2(phys);
+                __builtin_memset(kp + tail, 0, PAGE_SIZE - tail);
+                paging_temp_unmap2();
+                preempt_enable();
+            }
+        }
+        for (uint32_t pg = (new_size + PAGE_SIZE - 1) / PAGE_SIZE;
+             pg < e->npages; pg++)
+            if (e->frames[pg]) {
+                pmm_frame_decref(e->frames[pg]);   /* drop the registry ref */
+                e->frames[pg] = 0;
+            }
+    }
+    node->size = new_size;
+    return 0;
+}
+
+/* ── Page population ─────────────────────────────────────────────────────────
+ * Map one page of a PRIVATE VMA: a zeroed frame, filled from the backing file
+ * (or from the file's shared frames if it also has MAP_SHARED mappers, so a
+ * private read-only view of a memfd sees the data written through the shared
+ * view).  Returns 1 if the page is mapped afterwards, 0 on OOM.
+ *
+ * FILL-BEFORE-MAP (SMP correctness): fill the new frame through a PRIVATE
+ * temporary kernel mapping and only AFTER it is complete map it at the user VA.
+ * Publishing the PTE first and filling through the user address races a sibling
+ * thread on another CPU (it can read a half-filled page).  preempt_disable keeps
+ * the shared temp-map slot ours across the BKL-held, non-sleeping vfs_read. */
+static int vma_populate_page(struct vma *v, uint32_t addr) {
+    addr &= ~0xFFFU;
+    if ((*paging_get_pde(addr) & PAGE_PRESENT) &&
+        pte_mapped(*paging_get_pte(addr))) return 1;     /* already there */
+    uint32_t phys = pmm_alloc_frame();
+    if (!phys) return 0;
+    pmm_frame_incref(phys);
+
+    preempt_disable();
+    uint8_t *kva = (uint8_t *)paging_temp_map(phys);
+    __builtin_memset(kva, 0, PAGE_SIZE);
+    if (v->file) {
+        uint32_t foff = v->file_off + (addr - v->start);
+        struct shmap_entry *se = shmap_lookup(v->file);
+        uint32_t sf = se ? shmap_peek(se, foff / PAGE_SIZE) : 0;
+        if (sf) {
+            /* copy from the shared frame (temp slot 2), not the stale tmpfs buffer */
+            const uint8_t *src = (const uint8_t *)paging_temp_map2(sf);
+            __builtin_memcpy(kva, src, PAGE_SIZE);
+            paging_temp_unmap2();
+        } else if (foff < v->file_size) {
+            uint32_t want = PAGE_SIZE;
+            if (want > v->file_size - foff) want = v->file_size - foff;
+            vfs_read(v->file, foff, want, kva);
+        }
+    }
+    paging_temp_unmap();
+    preempt_enable();
+
+    paging_map(addr, phys, pte_flags_for(v->prot, 0));     /* publish: complete */
+    return 1;
+}
+
+/* Page-fault populate.  Returns 1 if handled, 0 if the address isn't a
+ * populatable VMA page (PROT_NONE, shared mapping, no VMA, OOM → SIGSEGV). */
+int vma_handle_fault(uint32_t addr) {
+    addr &= ~0xFFFU;
+    struct vma *v = vma_find(addr);
+    if (!v) return 0;
+    if (v->prot == 0) return 0;                 /* PROT_NONE guard → SIGSEGV */
+    if (v->flags & VMA_F_SHARED) return 0;      /* shared frames are eager-only */
+    return vma_populate_page(v, addr);
+}
+
+/* Populate [start,end) of a private VMA now (small mappings).  1 on success. */
+static int vma_populate_range(struct vma *v, uint32_t start, uint32_t end) {
+    if (v->prot == 0) return 1;                 /* nothing to map for PROT_NONE */
+    for (uint32_t a = start; a < end; a += PAGE_SIZE)
+        if (!vma_populate_page(v, a)) return 0;
+    return 1;
+}
+
+/* Unmap every populated page in [start,end) and release the frames.
+ *
+ * FLUSH-BEFORE-FREE (Linux mmu_gather rule): clear the PTEs first, then
+ * tlb_shootdown(), and only AFTER the shootdown release the frames.  Freeing a
+ * frame before the shootdown is a use-after-free: a sibling thread on another
+ * CPU may still hold a stale TLB entry for the page and would read/write the
+ * frame after it has been reclaimed and handed to another allocation.  Batched
+ * so an arbitrarily large range uses bounded stack. */
+static void unmap_pages(uint32_t start, uint32_t end) {
+    uint32_t batch[256];
+    int nb = 0;
+    for (uint32_t va = start; va < end; ) {
+        if (!(*paging_get_pde(va) & PAGE_PRESENT)) {
+            uint32_t n = (va & ~0x3FFFFFU) + 0x400000U;
+            if (n <= va) break;
+            va = n;
+            continue;
+        }
+        uint32_t *pte = paging_get_pte(va);
+        if (pte_mapped(*pte)) {
+            batch[nb++] = *pte & ~0xFFFU;       /* remember frame; free AFTER flush */
+            *pte = 0;
+            tlb_flush_single(va);
+            if (nb == 256) {
+                tlb_shootdown();                /* no CPU keeps a stale entry now */
+                for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
+                nb = 0;
+            }
+        }
+        va += PAGE_SIZE;
+    }
+    tlb_shootdown();                            /* flush the remainder before freeing */
+    for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
+}
+
+/* Tear down whatever occupies [start,end): VMAs and pages.  MAP_FIXED overlay
+ * and munmap share this (Linux do_munmap). */
+static void unmap_range(uint32_t start, uint32_t end) {
+    vma_remove_range(start, end);
+    unmap_pages(start, end);
 }
 
 /* ── sys_mmap2(addr,len,prot,flags,fd,pgoffset) — EAX=192 ──────────────── */
 static int sys_mmap2(registers_t *regs) {
-    g_mmap_oldn = 0;   /* fresh batch (drop any leaked stash from a prior error) */
     uint32_t addr   = regs->ebx;
     uint32_t length = regs->ecx;
-    /* prot = regs->edx, flags = regs->esi, fd = regs->edi (via pusha) */
+    uint32_t prot   = regs->edx & 0x7;           /* PROT_SEM/GROWS* ignored */
     int flags  = (int)regs->esi;
     int fd     = (int)regs->edi;
     /* mmap2's 6th arg (offset in PAGES) is passed in EBP on i386, which the
@@ -2887,265 +3640,152 @@ static int sys_mmap2(registers_t *regs) {
      * library's data segment, which sits at a nonzero file offset. */
     uint32_t pgoff = regs->ebp;
 
-
     if (length == 0) return -22;
-
+    if (length > 0xC0000000U) return -12;
     length = (length + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
 
-    /* Choose the target VA.
-     *
-     * `addr` is honored as a MANDATORY placement only for MAP_FIXED (0x10) —
-     * that's how ld.so maps each library LOAD segment over a reserved span.
-     * For a non-fixed HINT, the address is advisory: honor it only if the range
-     * is entirely free, otherwise fall through to the cursor.  Blindly honoring
-     * a colliding hint (mozjemalloc/glibc pass them constantly) overlays a live
-     * mapping with fresh zeroed frames — corrupting a thread's TLS/stack or
-     * another arena, which presented as intermittent TLS-zero / 0xe5-poison
-     * crashes deep in Firefox.  For a non-fixed mapping we atomically reserve
-     * from the shared cursor so concurrent threads never get the same address. */
-#define MAP_FIXED_K  0x10
     struct proc *owner = mmap_owner();
-    uint32_t va;
-    int reserved = 0;
-    uint32_t hint = addr & ~(uint32_t)(PAGE_SIZE - 1);
-    if (hint && hint < USER_STACK_BASE && (flags & MAP_FIXED_K)) {
-        va = hint;                                   /* MAP_FIXED: overlay */
-    } else if (hint && hint >= owner->mmap_next && hint < USER_STACK_BASE &&
-               hint + length > hint && hint + length <= USER_STACK_BASE &&
-               mmap_range_free(hint, length)) {
-        /* Honor a non-FIXED hint ONLY if it is at/above the monotonic cursor,
-         * then advance the cursor past it.  A hint BELOW the cursor (e.g.
-         * mozjemalloc/SpiderMonkey requesting a low address) must NOT be
-         * honored: a large allocation there can overlay loaded libraries (ld.so
-         * at 0x40000000) or GC chunks the cursor already handed out, which the
-         * present-page scan can miss once those were freed → the GC's chunk
-         * pointer math then addresses another live region → corruption.  The
-         * hint is advisory, so falling through to the aligned cursor is valid
-         * and keeps every anonymous mapping in a single monotonic, non-
-         * overlapping order — matching how Linux's layout keeps these apart. */
-        __asm__ volatile("cli");
-        va = hint;
-        if (hint + length > owner->mmap_next) owner->mmap_next = hint + length;
-        __asm__ volatile("sti");
-    } else {
-        __asm__ volatile("cli");
-        va = owner->mmap_next;
-        /* Align large anonymous mappings (≥1 MiB) to a 1 MiB boundary.
-         * SpiderMonkey's GC allocates 1 MiB chunks and locates a cell's chunk
-         * header by masking the pointer to 1 MiB (ptr & ~(ChunkSize-1)); it
-         * relies on the OS page allocator returning suitably-aligned chunks.
-         * Our plain bump cursor is only 4 KiB-aligned, so chunks landed at
-         * non-1 MiB addresses → the GC's chunk/arena pointer math addressed the
-         * wrong metadata → memory corruption deep in the JS engine (parser
-         * canary smashes, JIT wild jumps).  Real Linux's mmap layout happens to
-         * satisfy this; match it for large anon maps. */
-        if ((flags & 0x20) && length >= 0x100000U) {
-            uint32_t aligned = (va + 0xFFFFFU) & ~0xFFFFFU;
-            if (aligned >= va && aligned + length <= USER_STACK_BASE)
-                va = aligned;
-        }
-        if (va + length >= va && va + length <= USER_STACK_BASE)
-            owner->mmap_next = va + length;       /* reserve now */
-        __asm__ volatile("sti");
-        reserved = 1;
+    if (!owner) return -12;
+    int anon    = (flags & MAP_ANONYMOUS_K) != 0;
+    int shared  = (flags & MAP_SHARED_K) != 0;
+    int fixed   = (flags & (MAP_FIXED_K | MAP_FIXED_NOREPLACE_K)) != 0;
+
+    /* File-backed: validate the descriptor first (EBADF before any layout work). */
+    vfs_node_t *fnode = NULL;
+    if (!anon) {
+        if (fd < 0 || fd >= MAX_FD || current_proc->ofile[fd].type != FD_FILE ||
+            !current_proc->ofile[fd].node)
+            return -9;
+        fnode = current_proc->ofile[fd].node;
     }
 
-    if (va + length < va || va + length > USER_STACK_BASE) return -12;
+    /* ── Choose the target VA ──
+     * MAP_FIXED places exactly at `addr`, replacing whatever is there (ld.so
+     * maps each library LOAD segment over a reserved span; mozjemalloc commits/
+     * decommits with MAP_FIXED).  MAP_FIXED_NOREPLACE (Linux 4.17+) places at
+     * `addr` only if the range is free and fails with EEXIST otherwise.  A plain
+     * hint is honoured if that range is entirely free, else ignored (Linux
+     * get_unmapped_area).  Everything else goes through the first-fit gap
+     * search, which reuses munmap()ed space. */
+    uint32_t va;
+    if (fixed) {
+        if (addr & (PAGE_SIZE - 1)) return -22;
+        if (addr + length < addr || addr + length > (uint32_t)USER_STACK_BASE) return -12;
+        va = addr;
+        if (flags & MAP_FIXED_NOREPLACE_K) {
+            if (!vma_range_free(va, length)) return -17;   /* -EEXIST */
+        } else {
+            unmap_range(va, va + length);                 /* replace */
+        }
+    } else {
+        uint32_t hint = addr & ~(uint32_t)(PAGE_SIZE - 1);
+        if (hint && hint >= MMAP_FLOOR && hint + length > hint &&
+            hint + length <= MMAP_TOP && vma_range_free(hint, length)) {
+            va = hint;
+        } else {
+            /* Align large anonymous mappings (≥1 MiB) to a 1 MiB boundary.
+             * SpiderMonkey's GC allocates 1 MiB chunks and locates a cell's
+             * chunk header by masking the pointer to 1 MiB; it relies on the OS
+             * page allocator returning suitably-aligned chunks (real Linux's
+             * layout happens to satisfy this). */
+            uint32_t align = (anon && length >= 0x100000U) ? 0x100000U : PAGE_SIZE;
+            va = vma_gap_find(length, align);
+            if (!va && align != PAGE_SIZE) va = vma_gap_find(length, PAGE_SIZE);
+            if (!va) return -12;
+        }
+    }
+    uint32_t end = va + length;
 
     /* ── /dev/fb0: map the real framebuffer (DOOM, links -g) ── */
-    if (!(flags & 0x20) && fd >= 0 && fd < MAX_FD &&
-        current_proc->ofile[fd].type == FD_FILE &&
-        current_proc->ofile[fd].node &&
-        __builtin_strcmp(current_proc->ofile[fd].node->name, "fb0") == 0) {
+    if (fnode && __builtin_strcmp(fnode->name, "fb0") == 0) {
         uint32_t fb_phys = framebuffer_phys();
         uint32_t fb_len = framebuffer_size();
         if (!fb_phys) return -19;
         if (length > ((fb_len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1)))
             length = (fb_len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
+        end = va + length;
+        if (!vma_add(va, end, prot, VMA_F_SHARED, NULL, 0)) return -12;
         for (uint32_t i = 0; i < length; i += PAGE_SIZE)
             paging_map(va + i, fb_phys + i,
                        PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER |
-                       PAGE_SHARED | (1U << 4));   /* SHARED: no COW on fork */
-        mmap_free_stashed();
-        (void)reserved;
+                       PAGE_SHARED | (1U << 4));   /* SHARED: no COW on fork; PCD */
         return (int)va;
     }
 
-    /* ── MAP_SHARED (0x01) on a real file: share physical frames ──
+    /* ── MAP_SHARED on a real file: share physical frames ──
      * memfd/tmpfs shared memory — all mappers of the same node see the same
      * frames (Firefox IPC / SharedStringMap depend on this).  Mapped writable
      * iff PROT_WRITE; PAGE_SHARED so fork shares rather than COWs. */
-    if ((flags & 0x01) && !(flags & 0x20) && fd >= 0 && fd < MAX_FD &&
-        current_proc->ofile[fd].type == FD_FILE &&
-        current_proc->ofile[fd].node) {
-        vfs_node_t *node = current_proc->ofile[fd].node;
-        uint32_t prot = regs->edx;
-            struct shmap_entry *e = shmap_get(node);
+    if (shared && fnode) {
+        struct shmap_entry *e = shmap_get(fnode);
         if (!e) return -12;
-        vma_remove_range(va, va + length);
+        struct vma *v = vma_add(va, end, prot, VMA_F_SHARED, NULL, 0);
+        if (!v) return -12;
         for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
-            uint32_t pg = pgoff + i / PAGE_SIZE;
-            uint32_t phys = shmap_frame(e, node, pg);
-            if (!phys) return -12;
-            uint32_t *pte = paging_get_pte(va + i);
-            if ((*paging_get_pde(va + i) & PAGE_PRESENT) && (*pte & PAGE_PRESENT)) {
-                uint32_t old = *pte & ~0xFFFU;
-                paging_unmap(va + i);
-                mmap_stash_old(old);   /* free AFTER shootdown (flush-before-free) */
-            }
+            uint32_t phys = shmap_frame(e, fnode, pgoff + i / PAGE_SIZE);
+            if (!phys) { unmap_range(va, end); return -12; }
             pmm_frame_incref(phys);          /* this mapping's ref */
-            uint32_t pflags = PAGE_PRESENT | PAGE_USER | PAGE_SHARED;
-            if (prot & 2) pflags |= PAGE_WRITABLE;   /* PROT_WRITE */
-            paging_map(va + i, phys, pflags);
+            paging_map(va + i, phys, pte_flags_for(prot, 1));
         }
-        mmap_free_stashed();
-        (void)reserved;
         return (int)va;
     }
 
-    /* ── Large anonymous mapping: DEMAND-PAGED ──
-     * Record a VMA and return; pages fault in (zeroed) on first touch.  Only
-     * LARGE anonymous regions (>= 1 MiB) are lazy — the big win is 8 MiB thread
-     * stacks (mostly untouched).  Smaller anonymous mmaps (glibc malloc arenas,
-     * dlopen scratch buffers) stay EAGER: some glibc paths are sensitive to lazy
-     * population and demand-paging them broke dlopen(libxul).  MAP_FIXED overlay
-     * coverage is torn down first. */
-#define VMA_DEMAND_MIN (4U * 1024U * 1024U)   /* only big (≥4 MiB) regions: thread stacks */
-    if ((flags & 0x20) && length >= VMA_DEMAND_MIN) {
-        uint32_t prot = regs->edx;
-        vma_remove_range(va, va + length);
+    /* ── MAP_SHARED | MAP_ANONYMOUS: zero-filled frames shared across fork ──
+     * Linux backs these with shmem (shmem_zero_setup): the pages are one copy
+     * that parent and child both see.  PAGE_SHARED makes fork share the frame
+     * instead of COW'ing it; the frames are populated now because a shared
+     * page has no per-process re-population path. */
+    if (shared && anon) {
+        struct vma *v = vma_add(va, end, prot, VMA_F_SHARED, NULL, 0);
+        if (!v) return -12;
         for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
-            uint32_t *pte = paging_get_pte(va + i);
-            if ((*paging_get_pde(va + i) & PAGE_PRESENT) && (*pte & PAGE_PRESENT)) {
-                uint32_t old = *pte & ~0xFFFU;
-                paging_unmap(va + i);
-                mmap_stash_old(old);   /* free AFTER shootdown (flush-before-free) */
-            }
+            uint32_t phys = pmm_alloc_frame();
+            if (!phys) { unmap_range(va, end); return -12; }
+            pmm_frame_incref(phys);
+            preempt_disable();
+            __builtin_memset(paging_temp_map(phys), 0, PAGE_SIZE);
+            paging_temp_unmap();
+            preempt_enable();
+            paging_map(va + i, phys, pte_flags_for(prot, 1));
         }
-        if (vma_add(va, va + length, prot) < 0) return -12;
-        mmap_free_stashed();
-        (void)reserved;
         return (int)va;
     }
 
-    /* ── Large MAP_PRIVATE file-backed: DEMAND-PAGE ──
-     * Eagerly copying a big library (libxul.so is ~175 MiB) reads the whole
-     * file through the slow ATA-PIO path at map time even though startup only
-     * touches a fraction of it — minutes of latency.  Instead record a
-     * file-backed VMA and fault pages in from the file on first touch (the
-     * standard Linux behaviour).  Only LARGE (≥1 MiB) private mappings of a
-     * plain file with NO shared-frame (shmap) entry qualify — small dlopen
-     * scratch mappings and shared/tmpfs files keep the eager path, which some
-     * glibc/IPC paths depend on. */
-#define VMA_FILE_DEMAND_MIN (1U * 1024U * 1024U)
-    if (!(flags & 0x20) && !(flags & 0x01) && length >= VMA_FILE_DEMAND_MIN &&
-        fd >= 0 && fd < MAX_FD && current_proc->ofile[fd].type == FD_FILE &&
-        current_proc->ofile[fd].node &&
-        !shmap_lookup(current_proc->ofile[fd].node)) {
-        vfs_node_t *fnode = current_proc->ofile[fd].node;
-        uint32_t prot = regs->edx;
-        vma_remove_range(va, va + length);
-        for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
-            uint32_t *pte = paging_get_pte(va + i);
-            if ((*paging_get_pde(va + i) & PAGE_PRESENT) && (*pte & PAGE_PRESENT)) {
-                uint32_t old = *pte & ~0xFFFU;
-                paging_unmap(va + i);
-                mmap_stash_old(old);   /* free AFTER shootdown (flush-before-free) */
-            }
-        }
-        if (vma_add_file(va, va + length, prot, fnode, pgoff * PAGE_SIZE) < 0)
+    /* ── MAP_PRIVATE anonymous ──
+     * Record the VMA; prot is honoured for every page (Linux: PROT_NONE ranges
+     * are reservations that fault on any access, read-only ranges fault on
+     * write).  Large regions fault in lazily; small ones are populated now. */
+    if (anon) {
+        struct vma *v = vma_add(va, end, prot, 0, NULL, 0);
+        if (!v) return -12;
+        if (length < VMA_DEMAND_MIN && !vma_populate_range(v, va, end)) {
+            unmap_range(va, end);
             return -12;
+        }
+        return (int)va;
+    }
+
+    /* ── MAP_PRIVATE file-backed ──
+     * Pages fault in from the file (copy-on-fault: the frame is private, so
+     * writes never reach the file).  Eagerly copying a big library (libxul.so
+     * is ~175 MiB) would read the whole file through the slow ATA-PIO path even
+     * though startup touches a fraction of it, so large mappings are lazy. */
+    {
+        struct vma *v = vma_add(va, end, prot, 0, fnode, pgoff * PAGE_SIZE);
+        if (!v) return -12;
         if (fnode->size > 100u * 1024u * 1024u && pgoff == 0) {
-            static int logged_big2 = 0;
-            if (!logged_big2) { logged_big2 = 1;
-                printk("[gdbaid] big mmap base=0x%08x size=%u fd=%d pid=%d (demand)\n",
+            static int logged_big = 0;
+            if (!logged_big) { logged_big = 1;
+                printk("[gdbaid] big mmap base=0x%08x size=%u fd=%d pid=%d\n",
                        (unsigned)va, (unsigned)fnode->size, fd, current_proc->pid);
             }
         }
-        mmap_free_stashed();
-        (void)reserved;
+        if (length < VMA_FILE_DEMAND_MIN && !vma_populate_range(v, va, end)) {
+            unmap_range(va, end);
+            return -12;
+        }
         return (int)va;
     }
-
-    /* MAP_PRIVATE file-backed (copy contents at map time).
-     * For MAP_FIXED overlays (ld.so reserves a library's span, then maps each
-     * LOAD segment over it) the target page may already be mapped — release
-     * the old frame first so we don't leak it.  Also drop any anonymous VMA
-     * covering this range (the file mapping replaces the reservation). */
-    vma_remove_range(va, va + length);
-    for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
-        uint32_t *pte = paging_get_pte(va + i);
-        if ((*paging_get_pde(va + i) & PAGE_PRESENT) && (*pte & PAGE_PRESENT)) {
-            uint32_t old = *pte & ~0xFFFU;
-            paging_unmap(va + i);
-            pmm_frame_decref(old);
-        }
-        uint32_t phys = pmm_alloc_frame();
-        if (!phys) return -12;
-        pmm_frame_incref(phys);
-        paging_map(va + i, phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-        __builtin_memset((void *)(va + i), 0, PAGE_SIZE);
-    }
-
-    if (!(flags & 0x20)) {            /* file-backed: copy in the contents */
-        if (fd < 0 || fd >= MAX_FD ||
-            current_proc->ofile[fd].type != FD_FILE) {
-            /* [shmmap] Firefox's compositor shared memory (shared_memory_posix.cc)
-             * mmaps a memfd/shm fd MAP_SHARED and gets EBADF here → NULL buffer →
-             * ImageBridgeChild::InitSameProcess NULL-deref crash.  Log the fd + its
-             * ACTUAL type so we can see why it's not FD_FILE (closed? wrong type?
-             * memfd not registered?). */
-            if (g_ipc_launch_started && current_proc &&
-                current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-                current_proc->name[4]=='f') {
-                static int sm = 0;
-                if (sm < 40) { sm++;
-                    int ty = (fd >= 0 && fd < MAX_FD) ?
-                             (int)current_proc->ofile[fd].type : -1;
-                    printk("[shmmap] EBADF mmap fd=%d type=%d flags=%x len=%x pid=%d\n",
-                           fd, ty, (unsigned)flags, (unsigned)length,
-                           current_proc->pid); }
-            }
-            return -9;
-        }
-        {
-            vfs_node_t *fnode = current_proc->ofile[fd].node;
-            struct shmap_entry *se = shmap_lookup(fnode);
-            uint32_t off = pgoff * PAGE_SIZE;
-            uint32_t want = length;
-            if (se) {
-                /* This file has shared (MAP_SHARED) frames — a MAP_PRIVATE/RO
-                 * mapping must see the SAME data (Firefox writes via a MAP_SHARED
-                 * mapping then reads it back via a MAP_PRIVATE/RO one).  Copy each
-                 * page from the shared frame, not the stale tmpfs data buffer. */
-                for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
-                    uint32_t sf = shmap_peek(se, pgoff + i / PAGE_SIZE);
-                    if (sf) {
-                        const uint8_t *kp = (const uint8_t *)paging_temp_map(sf);
-                        __builtin_memcpy((void *)(va + i), kp, PAGE_SIZE);
-                        paging_temp_unmap();
-                    }
-                }
-            } else if (off < fnode->size) {
-                if (want > fnode->size - off) want = fnode->size - off;
-                vfs_read(fnode, off, want, (uint8_t *)va);
-            }
-            /* [gdbaid] one-shot: report libxul.so's load base (the ~150MB file
-             * mapping) so a remote debugger can compute symbol VAs. */
-            if (fnode->size > 100u * 1024u * 1024u && off == 0) {
-                static int logged_big = 0;
-                if (!logged_big) { logged_big = 1;
-                    printk("[gdbaid] big mmap base=0x%08x size=%u fd=%d pid=%d\n",
-                           (unsigned)va, (unsigned)fnode->size, fd, current_proc->pid);
-                }
-            }
-        }
-    }
-
-    mmap_free_stashed();   /* shootdown + free replaced frames (flush-before-free) */
-    (void)reserved;   /* region was reserved up front from the shared cursor */
-
-    return (int)va;
 }
 
 /* ── sys_mmap(struct mmap_arg*) — EAX=90 (old i386 variant) ─────────────── */
@@ -3162,76 +3802,386 @@ static int sys_mmap_old(registers_t *regs) {
         fake.edi = a.fd;
         /* byte offset → page offset (mmap2 semantics); must be aligned */
         if (a.offset & (PAGE_SIZE - 1)) return -22;
+        fake.ebp = a.offset / PAGE_SIZE;
         return sys_mmap2(&fake);
     }
 }
 
 /* ── sys_munmap(addr, len) — EAX=91 ─────────────────────────────────────── */
 static int sys_munmap(registers_t *regs) {
-    uint32_t addr = regs->ebx & ~(uint32_t)(PAGE_SIZE - 1);
-    uint32_t len  = (regs->ecx + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
+    uint32_t addr = regs->ebx;
+    uint32_t len  = regs->ecx;
+    if (addr & (PAGE_SIZE - 1)) return -22;          /* Linux: EINVAL */
+    if (len == 0) return -22;
+    len = (len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
+    if (addr + len < addr || addr + len > 0xC0000000U) return -22;
+    /* Unmapping a range with no mapping is not an error (Linux). */
+    unmap_range(addr, addr + len);
+    return 0;
+}
 
-    vma_remove_range(addr, addr + len);   /* drop lazy (unfaulted) coverage */
-
-    /* FLUSH-BEFORE-FREE (Linux mmu_gather rule): clear the PTEs first, then
-     * tlb_shootdown(), and only AFTER the shootdown release the frames.  Freeing
-     * a frame inside the loop (before the shootdown) is a use-after-free: a
-     * sibling thread on another CPU may still hold a stale TLB entry for the page
-     * and would read/write the frame after it has been reclaimed and handed to
-     * another allocation → memory corruption (wild pointers / clobbered code).
-     * Batch the collected frames so an arbitrarily large munmap uses bounded
-     * stack: drain (shootdown + decref) each full batch and once at the end. */
-    uint32_t batch[256];
-    int nb = 0;
-    for (uint32_t va = addr; va < addr + len; va += PAGE_SIZE) {
-        if (!(*paging_get_pde(va) & PAGE_PRESENT)) continue;
-        uint32_t *pte = paging_get_pte(va);
-        if (!(*pte & PAGE_PRESENT)) continue;
-        batch[nb++] = *pte & ~0xFFFU;       /* remember frame; free AFTER flush */
-        paging_unmap(va);                   /* clear PTE + local invlpg */
-        if (nb == 256) {
-            tlb_shootdown();                /* no CPU keeps a stale entry now */
-            for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
-            nb = 0;
+/* Apply `prot` to the page table entry of one populated user page.  Linux
+ * change_protection(): PROT_NONE turns the entry into a not-present
+ * _PAGE_PROTNONE entry that keeps its frame; PROT_WRITE is granted only to
+ * pages that are not copy-on-write — a COW page stays read-only and the write
+ * fault copies it (or reuses it when it is the last reference). */
+static void pte_apply_prot(uint32_t va, uint32_t prot) {
+    if (!(*paging_get_pde(va) & PAGE_PRESENT)) return;      /* not populated */
+    uint32_t *pte = paging_get_pte(va);
+    uint32_t old = *pte;
+    if (!pte_mapped(old) || !(old & PAGE_USER)) return;
+    uint32_t nw = old & ~(uint32_t)(PAGE_PRESENT | PAGE_WRITABLE | PAGE_PROTNONE |
+                                    PAGE_WRPROT);
+    if (prot == 0) {
+        nw |= PAGE_PROTNONE;
+    } else {
+        nw |= PAGE_PRESENT;
+        if (prot & PROT_WRITE_K) {
+            if (!(old & PAGE_COW)) nw |= PAGE_WRITABLE;
+        } else {
+            /* Record the denial on the page itself.  The VMA registry already
+             * carries the protection of everything it covers, but the ELF
+             * image (ld.so's PT_GNU_RELRO), the brk heap and the main stack are
+             * not in it, and for those the write fault has nothing else to
+             * consult: without this a COW break would hand write permission
+             * straight back and the two address spaces would diverge in
+             * silence where Linux raises SIGSEGV. */
+            nw |= PAGE_WRPROT;
         }
     }
-    tlb_shootdown();                        /* flush the remainder before freeing */
-    for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
-    return 0;
+    if (nw != old) {
+        *pte = nw;
+        tlb_flush_single(va);
+    }
 }
 
 /* ── sys_mprotect(addr, len, prot) — EAX=125 ────────────────────────────── */
 static int sys_mprotect(registers_t *regs) {
     uint32_t addr = regs->ebx;
     uint32_t len  = regs->ecx;
-    int prot = (int)regs->edx;
+    uint32_t prot = regs->edx;
 
     if (addr & (PAGE_SIZE - 1)) return -22;
     if (len == 0) return 0;
-    if (prot & ~0x7) return -22;
+    if (prot & ~(0x7U | 0x01000000U | 0x02000000U)) return -22;   /* GROWSDOWN/UP tolerated */
+    prot &= 0x7U;
     uint32_t end = addr + ((len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1));
     if (end < addr || end > 0xC0000000U) return -22;
 
-    /* Record the new prot on any demand-paged VMA covering this range, so pages
-     * that fault in LATER get the right permissions.  Pages not yet present are
-     * fine — with demand paging they simply aren't mapped yet (a hard -ENOMEM
-     * here would break glibc's pthread guard-page mprotect on a lazy stack). */
-    vma_protect_range(addr, end, (uint32_t)(prot & 0x7));
+    /* Record the new prot on the VMAs covering this range, so pages that fault
+     * in LATER get the right permissions.  Gaps are tolerated (Linux returns
+     * ENOMEM): ld.so's RELRO mprotect targets the executable image, which is
+     * not a VMA here, and glibc treats that failure as fatal. */
+    vma_protect_range(addr, end, prot);
 
-    for (uint32_t va = addr; va < end; va += PAGE_SIZE) {
-        uint32_t *pde = paging_get_pde(va);
-        if (!(*pde & PAGE_PRESENT)) continue;            /* not yet faulted in */
-        uint32_t *pte = paging_get_pte(va);
-        if (!(*pte & PAGE_PRESENT) || !(*pte & PAGE_USER)) continue;
-        if (prot & 0x2)
-            *pte |= PAGE_WRITABLE;
-        else
-            *pte &= ~(uint32_t)PAGE_WRITABLE;
-        tlb_flush_single(va);
+    for (uint32_t va = addr; va < end; ) {
+        if (!(*paging_get_pde(va) & PAGE_PRESENT)) {
+            uint32_t n = (va & ~0x3FFFFFU) + 0x400000U;
+            if (n <= va) break;
+            va = n;
+            continue;
+        }
+        pte_apply_prot(va, prot);
+        va += PAGE_SIZE;
     }
     /* SMP: permission reductions must be seen by sibling threads on other CPUs
      * before they next touch the page (W^X / JIT correctness). */
     tlb_shootdown();
+    return 0;
+}
+
+/* ── sys_madvise(addr, len, advice) — EAX=219 ────────────────────────────── */
+#define MADV_DONTNEED_K 4
+#define MADV_FREE_K     8
+static int sys_madvise(registers_t *regs) {
+    uint32_t addr = regs->ebx;
+    uint32_t len  = regs->ecx;
+    int advice = (int)regs->edx;
+    if (addr & (PAGE_SIZE - 1)) return -22;
+    if (advice < 0 || advice > 25) return -22;
+    if (len == 0) return 0;
+    uint32_t end = (addr + len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
+    if (end < addr || end > 0xC0000000U) return -22;
+
+    /* Linux returns ENOMEM if the range has any unmapped gap.  We approximate:
+     * an entirely unmapped range is -ENOMEM, a partially mapped one is advised. */
+    if (vma_range_free(addr, end - addr)) return -12;
+
+    if (advice != MADV_DONTNEED_K) return 0;    /* MADV_FREE and hints: no-op.
+                                                 * MADV_FREE is lazy on Linux: the
+                                                 * data persists until reclaim,
+                                                 * and we never reclaim. */
+
+    /* MADV_DONTNEED zaps the range (mm/madvise.c zap_page_range_single): the
+     * next touch of a private page gives a fresh zero page (or the file page
+     * again); the other side of a COW share keeps its copy because we only
+     * drop THIS address space's reference.  Pages we cannot re-populate stay
+     * mapped: shared frames (no per-VMA population path), and pages outside
+     * any VMA (brk heap, stack) which are zeroed in place instead — for a COW
+     * page in place means a private zero frame, so the sharer is untouched. */
+    uint32_t batch[256];
+    int nb = 0;
+    for (uint32_t va = addr; va < end; ) {
+        if (!(*paging_get_pde(va) & PAGE_PRESENT)) {
+            uint32_t n = (va & ~0x3FFFFFU) + 0x400000U;
+            if (n <= va) break;
+            va = n;
+            continue;
+        }
+        uint32_t *pte = paging_get_pte(va);
+        uint32_t old = *pte;
+        if (pte_mapped(old) && (old & PAGE_USER) && !(old & PAGE_SHARED)) {
+            uint32_t frame = old & ~0xFFFU;
+            if (vma_find(va)) {
+                batch[nb++] = frame;             /* free AFTER the shootdown */
+                *pte = 0;
+                tlb_flush_single(va);
+                if (nb == 256) {
+                    tlb_shootdown();
+                    for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
+                    nb = 0;
+                }
+            } else if (old & PAGE_PRESENT) {
+                if (pmm_frame_refcount(frame) > 1) {
+                    /* COW-shared: give this side a private zero frame */
+                    uint32_t nf = pmm_alloc_frame();
+                    if (nf) {
+                        pmm_frame_incref(nf);
+                        preempt_disable();
+                        __builtin_memset(paging_temp_map(nf), 0, PAGE_SIZE);
+                        paging_temp_unmap();
+                        preempt_enable();
+                        /* Keep the page's own protection.  PAGE_WRPROT means
+                         * the process took write permission away with
+                         * mprotect(), and handing it a fresh frame is no
+                         * reason to give that permission back — the same rule
+                         * the write-fault handler applies when it refuses to
+                         * break COW on such a page.  Without this the entry
+                         * would come back writable while still flagged
+                         * write-protected, and the next store would succeed
+                         * where Linux raises SIGSEGV. */
+                        uint32_t nflags = old & 0xFFFU & ~(uint32_t)PAGE_COW;
+                        if (!(old & PAGE_WRPROT)) nflags |= PAGE_WRITABLE;
+                        *pte = nf | nflags;
+                        tlb_flush_single(va);
+                        batch[nb++] = frame;
+                        if (nb == 256) {
+                            tlb_shootdown();
+                            for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
+                            nb = 0;
+                        }
+                    }
+                } else {
+                    preempt_disable();
+                    __builtin_memset(paging_temp_map(frame), 0, PAGE_SIZE);
+                    paging_temp_unmap();
+                    preempt_enable();
+                }
+            }
+        }
+        va += PAGE_SIZE;
+    }
+    tlb_shootdown();
+    for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
+    return 0;
+}
+
+/* ── sys_mincore(addr, len, vec) — EAX=218 ──────────────────────────────── */
+static int sys_mincore(registers_t *regs) {
+    uint32_t addr = regs->ebx;
+    uint32_t len  = regs->ecx;
+    uint8_t *vec  = (uint8_t *)(uintptr_t)regs->edx;
+    if (addr & (PAGE_SIZE - 1)) return -22;
+    uint32_t end = (addr + len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
+    if (end < addr || end > 0xC0000000U) return -12;
+    uint32_t npages = (end - addr) / PAGE_SIZE;
+    if (!access_ok(vec, npages)) return -14;
+    uint8_t buf[256];
+    uint32_t done = 0;
+    while (done < npages) {
+        uint32_t n = npages - done;
+        if (n > sizeof(buf)) n = sizeof(buf);
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t va = addr + (done + i) * PAGE_SIZE;
+            int mapped = (*paging_get_pde(va) & PAGE_PRESENT) &&
+                         pte_mapped(*paging_get_pte(va));
+            /* Linux: ENOMEM if a page is in no mapping at all. */
+            if (!mapped && !vma_find(va)) return -12;
+            buf[i] = mapped ? 1 : 0;              /* resident */
+        }
+        if (copy_to_user(vec + done, buf, n) < 0) return -14;
+        done += n;
+    }
+    return 0;
+}
+
+/* ── sys_mremap(old_addr, old_size, new_size, flags, new_addr) — EAX=163 ──
+ * Linux mm/mremap.c: shrink in place, grow in place when the space after the
+ * mapping is free, otherwise (MREMAP_MAYMOVE) move the page table entries to
+ * a new range — no data is copied.  glibc/musl realloc() and JS ArrayBuffer
+ * growth use this for large blocks. */
+#define MREMAP_MAYMOVE_K   1
+#define MREMAP_FIXED_K     2
+#define MREMAP_DONTUNMAP_K 4
+
+/* Attributes of the last VMA piece of the old range, captured before any list
+ * surgery (the extension of a grown mapping continues them). */
+struct mremap_tail { uint32_t prot, flags, off, fsize; vfs_node_t *file; };
+
+/* Move the page table entries of [old,old+len) to new (both page aligned,
+ * non-overlapping) and the VMA coverage with them.  The pieces are snapshotted
+ * first because inserting at the destination may merge with (and free) nodes
+ * of the source range. */
+#define MREMAP_MAX_PIECES 32
+static int mremap_move(uint32_t old, uint32_t len, uint32_t new) {
+    struct proc *o = mmap_owner();
+    if (!o) return -12;
+    struct { uint32_t s, e, prot, flags, off, fsize; vfs_node_t *file; } pcs[MREMAP_MAX_PIECES];
+    int np = 0;
+    for (struct vma *v = o->vmas; v && v->start < old + len; v = v->next) {
+        if (v->end <= old) continue;
+        if (np == MREMAP_MAX_PIECES) {
+            while (np) { np--; if (pcs[np].file) vfs_close(pcs[np].file); }
+            return -12;
+        }
+        uint32_t cs = v->start > old ? v->start : old;
+        uint32_t ce = v->end < old + len ? v->end : old + len;
+        pcs[np].s = new + (cs - old); pcs[np].e = new + (ce - old);
+        pcs[np].prot = v->prot; pcs[np].flags = v->flags; pcs[np].fsize = v->file_size;
+        pcs[np].file = v->file; pcs[np].off = v->file ? v->file_off + (cs - v->start) : 0;
+        if (v->file) vfs_retain(v->file);         /* survive the removal below */
+        np++;
+    }
+    vma_remove_range(old, old + len);
+    for (uint32_t off = 0; off < len; off += PAGE_SIZE) {
+        uint32_t va = old + off;
+        if (!(*paging_get_pde(va) & PAGE_PRESENT)) continue;
+        uint32_t *pte = paging_get_pte(va);
+        uint32_t e = *pte;
+        if (!pte_mapped(e)) continue;
+        *pte = 0;
+        tlb_flush_single(va);
+        paging_map(new + off, e & ~0xFFFU, e & 0xFFFU);   /* same frame, same flags */
+    }
+    tlb_shootdown();
+    for (int i = 0; i < np; i++) {
+        struct vma *nv = vma_alloc(pcs[i].s, pcs[i].e, pcs[i].prot, pcs[i].flags,
+                                   pcs[i].file, pcs[i].off);
+        if (nv) { nv->file_size = pcs[i].fsize; vma_insert(o, nv); }
+        if (pcs[i].file) vfs_close(pcs[i].file);
+    }
+    return 0;
+}
+
+/* Add the extension [s,e) of a grown mapping, continuing the tail piece. */
+static int mremap_extend(uint32_t s, uint32_t e, const struct mremap_tail *t) {
+    if ((t->flags & VMA_F_SHARED) && !t->file) return -12;   /* shared anon: no lazy path */
+    struct proc *o = mmap_owner();
+    struct vma *nv = o ? vma_alloc(s, e, t->prot, t->flags, t->file, t->off) : NULL;
+    if (!nv) return -12;
+    nv->file_size = t->fsize;
+    vma_insert(o, nv);
+    return 0;
+}
+
+static int sys_mremap(registers_t *regs) {
+    uint32_t old_addr = regs->ebx;
+    uint32_t old_size = regs->ecx;
+    uint32_t new_size = regs->edx;
+    uint32_t flags    = regs->esi;
+    uint32_t new_addr = regs->edi;
+
+    if (old_addr & (PAGE_SIZE - 1)) return -22;
+    if (flags & ~(uint32_t)(MREMAP_MAYMOVE_K | MREMAP_FIXED_K)) return -22;
+    if ((flags & MREMAP_FIXED_K) && !(flags & MREMAP_MAYMOVE_K)) return -22;
+    if (new_size == 0) return -22;
+    old_size = (old_size + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
+    new_size = (new_size + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
+    if (old_addr + old_size < old_addr || old_addr + old_size > 0xC0000000U) return -22;
+    if (old_size == 0) return -22;               /* shared-dup form not supported */
+
+    /* The old range must be fully covered by mappings (Linux: EFAULT otherwise). */
+    for (uint32_t a = old_addr; a < old_addr + old_size; ) {
+        struct vma *c = vma_find(a);
+        if (!c) return -14;
+        a = c->end;
+    }
+    struct mremap_tail t;
+    {
+        struct vma *last = vma_find(old_addr + old_size - PAGE_SIZE);
+        uint32_t tail = old_addr + old_size;
+        t.prot = last->prot; t.flags = last->flags; t.fsize = last->file_size;
+        t.file = last->file; t.off = last->file ? last->file_off + (tail - last->start) : 0;
+        if (t.file) vfs_retain(t.file);         /* outlives the list surgery below */
+    }
+    int ret;
+
+    if (flags & MREMAP_FIXED_K) {
+        if ((new_addr & (PAGE_SIZE - 1)) || new_addr + new_size < new_addr ||
+            new_addr + new_size > (uint32_t)USER_STACK_BASE ||
+            (new_addr < old_addr + old_size && old_addr < new_addr + new_size)) {
+            ret = -22;
+            goto out;
+        }
+        unmap_range(new_addr, new_addr + new_size);
+        uint32_t mv = old_size < new_size ? old_size : new_size;
+        ret = mremap_move(old_addr, mv, new_addr);
+        if (ret < 0) goto out;
+        if (mv < old_size) unmap_range(old_addr + mv, old_addr + old_size);
+        if (new_size > mv) {
+            ret = mremap_extend(new_addr + mv, new_addr + new_size, &t);
+            if (ret < 0) goto out;
+        }
+        ret = (int)new_addr;
+        goto out;
+    }
+
+    if (new_size <= old_size) {                  /* shrink (or same size) in place */
+        if (new_size < old_size) unmap_range(old_addr + new_size, old_addr + old_size);
+        ret = (int)old_addr;
+        goto out;
+    }
+
+    /* grow: in place if the space right after is free */
+    {
+        uint32_t grow = new_size - old_size;
+        uint32_t tail = old_addr + old_size;
+        if (tail + grow > tail && tail + grow <= MMAP_TOP && vma_range_free(tail, grow) &&
+            !((t.flags & VMA_F_SHARED) && !t.file)) {
+            ret = mremap_extend(tail, tail + grow, &t);
+            if (ret == 0) ret = (int)old_addr;
+            goto out;
+        }
+    }
+    if (!(flags & MREMAP_MAYMOVE_K)) { ret = -12; goto out; }
+    if ((t.flags & VMA_F_SHARED) && !t.file) { ret = -12; goto out; }   /* shared anon: cannot grow */
+
+    {
+        uint32_t dest = vma_gap_find(new_size, new_size >= 0x100000U ? 0x100000U : PAGE_SIZE);
+        if (!dest) dest = vma_gap_find(new_size, PAGE_SIZE);
+        if (!dest) { ret = -12; goto out; }
+        ret = mremap_move(old_addr, old_size, dest);
+        if (ret < 0) goto out;
+        ret = mremap_extend(dest + old_size, dest + new_size, &t);
+        if (ret < 0) { unmap_range(dest, dest + new_size); goto out; }
+        ret = (int)dest;
+    }
+out:
+    if (t.file) vfs_close(t.file);
+    return ret;
+}
+
+/* msync (144) and mlock/munlock/mlockall/munlockall (150-153): there is no
+ * writeback (tmpfs/memfd frames ARE the file) and no swap, so every page is
+ * always "locked" and "synced".  Accept and return 0 like Linux would after
+ * doing the work. */
+static int sys_msync(registers_t *regs) {
+    uint32_t addr = regs->ebx;
+    if (addr & (PAGE_SIZE - 1)) return -22;
+    return 0;
+}
+static int sys_mlock_noop(registers_t *regs) {
+    (void)regs;
     return 0;
 }
 
@@ -3295,18 +4245,12 @@ static int sys_gettid(registers_t *regs) {
 }
 
 /* ── sys_exit_group(status) — EAX=252 ───────────────────────────────────── */
+/* Linux do_group_exit(): the exit code is fixed for the whole group first, then
+ * every other thread is SIGKILLed and the caller exits.  waitpid reports the
+ * leader once the last thread is gone, with THIS status (not the SIGKILL the
+ * siblings, or the leader itself, died of). */
 static void sys_exit_group(registers_t *regs) {
-    /* Kill every other thread in this thread group, then exit ourselves. */
-    if (current_proc) {
-        for (int i = 0; i < MAX_PROCS; i++) {
-            struct proc *p = &ptable[i];
-            if (p == current_proc || p->state == PROC_UNUSED) continue;
-            if (p->state == PROC_ZOMBIE) continue;
-            if (p->tgid == current_proc->tgid)
-                signal_send(p, SIGKILL);
-        }
-    }
-    sys_exit(regs);
+    proc_group_exit(((int)regs->ebx & 0xff) << 8);
 }
 
 /* ── sys_set_thread_area(user_desc*) — EAX=243 ──────────────────────────── */
@@ -3340,16 +4284,11 @@ static int sys_set_tid_address(registers_t *regs) {
 static int sys_clock_gettime(registers_t *regs) {
     int clk = (int)regs->ebx;
     struct ktimespec *ts = (struct ktimespec *)(uintptr_t)regs->ecx;
+    int64_t sec; uint32_t nsec;
+    int r = kclock_get(clk, &sec, &nsec);
+    if (r < 0) return r;
     if (ts) {
-        struct ktimespec kts;
-        uint32_t t = pit_ticks();
-        if (clk == 1 || clk == 4) {        /* MONOTONIC / MONOTONIC_RAW */
-            kts.tv_sec  = (int32_t)(t / 100);
-            kts.tv_nsec = (int32_t)((t % 100) * 10000000L);
-        } else {                           /* REALTIME and the rest */
-            kts.tv_sec  = (int32_t)(rtc_boot_epoch() + t / 100);
-            kts.tv_nsec = (int32_t)((t % 100) * 10000000L);
-        }
+        struct ktimespec kts = { (int32_t)sec, (int32_t)nsec };
         int cr = copy_to_user(ts, &kts, sizeof(kts));
         if (cr < 0) return cr;
     }
@@ -3357,16 +4296,14 @@ static int sys_clock_gettime(registers_t *regs) {
 }
 
 /* ── sys_clock_gettime64(clockid, timespec64*) — EAX=403 ────────────────── */
-/* time64 variant: struct timespec { int64_t tv_sec; int32_t tv_nsec; pad }. */
+/* time64 variant: struct __kernel_timespec { int64_t tv_sec; int64_t tv_nsec; }. */
 static int sys_clock_gettime64(registers_t *regs) {
     int clk = (int)regs->ebx;
     void *uts = (void *)(uintptr_t)regs->ecx;
+    int64_t sec; uint32_t nsec;
+    int r = kclock_get(clk, &sec, &nsec);
+    if (r < 0) return r;
     if (uts) {
-        uint32_t t = pit_ticks();
-        int64_t sec;
-        int32_t nsec = (int32_t)((t % 100) * 10000000L);
-        if (clk == 1 || clk == 4) sec = (int64_t)(t / 100);
-        else                      sec = (int64_t)rtc_boot_epoch() + (int64_t)(t / 100);
         struct { int64_t s; int64_t ns; } kt = { sec, (int64_t)nsec };
         int cr = copy_to_user(uts, &kt, sizeof(kt));
         if (cr < 0) return cr;
@@ -3437,15 +4374,6 @@ static int sys_rt_sigaction(registers_t *regs) {
     const uint32_t *act  = (const uint32_t *)(uintptr_t)regs->ecx;
     uint32_t       *oact = (uint32_t *)(uintptr_t)regs->edx;
 
-    if (current_proc && current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-        current_proc->name[4]=='f') {
-        static int rs = 0;
-        if (rs < 30) { rs++;
-            printk("[rtsig] tid=%d sig=%d act=%x oact=%x ssz=%x (KILL=%d STOP=%d)\n",
-                   current_proc->pid, sig, (unsigned)regs->ecx, (unsigned)regs->edx,
-                   (unsigned)regs->esi, SIGKILL, SIGSTOP);
-        }
-    }
     if (sig < 1 || sig > 64) return -22;
     if (sig == SIGKILL || sig == SIGSTOP) return -22;
 
@@ -3463,8 +4391,12 @@ static int sys_rt_sigaction(registers_t *regs) {
         return 0;
     }
 
-    sighandler_t old_handler = current_proc->sig_handlers[sig];
-    uint32_t     old_flags   = current_proc->sig_flags[sig];
+    /* The table is shared by the thread group (CLONE_SIGHAND): a change made
+     * by any thread is immediately in force for all of them (Linux
+     * do_sigaction writes the shared sighand_struct under siglock). */
+    struct sighand *sh = current_proc->sighand;
+    sighandler_t old_handler = sh->handlers[sig];
+    uint32_t     old_flags   = sh->flags[sig];
 
     if (oact) {
         uint32_t koact[8];
@@ -3478,20 +4410,34 @@ static int sys_rt_sigaction(registers_t *regs) {
         uint32_t kact[8];
         int cr = copy_from_user(kact, act, sizeof(kact));
         if (cr < 0) return cr;
-        current_proc->sig_handlers[sig] = (sighandler_t)(uintptr_t)kact[0];
-        current_proc->sig_flags[sig]    = kact[1];  /* sa_flags (SA_RESTART etc.) */
+        sh->handlers[sig] = (sighandler_t)(uintptr_t)kact[0];
+        sh->flags[sig]    = kact[1];  /* sa_flags (SA_RESTART etc.) */
+        /* Linux do_sigaction: setting SIG_IGN (or SIG_DFL for a default-ignored
+         * signal) discards matching signals already pending on every thread. */
+        sighandler_t nh = sh->handlers[sig];
+        if (nh == SIG_IGN || (nh == SIG_DFL && (sig == SIGCHLD || sig == SIGCONT)))
+            for (int i = 0; i < MAX_PROCS; i++)
+                if (ptable[i].state != PROC_UNUSED && ptable[i].sighand == sh)
+                    ptable[i].pending_sigs &= ~(1u << sig);
     }
     return 0;
 }
 
 /* ── sys_rt_sigprocmask(how, set, oset, sigsetsize) — EAX=175 ────────────── */
+/* The user sigset_t numbers bit (sig - 1) for signal sig (Linux sigmask(sig) =
+ * 1UL << ((sig) - 1), include/linux/signal.h), whereas the kernel's pending_sigs
+ * and blocked_sigs use bit sig.  Convert at the boundary; only the first word
+ * (signals 1..32) is honoured. */
+static uint32_t sigset_from_user(uint32_t uset) { return uset << 1; }
+static uint32_t sigset_to_user(uint32_t kset)   { return kset >> 1; }
+
 static int sys_rt_sigprocmask(registers_t *regs) {
     int       how  = (int)regs->ebx;
     uint32_t *nset = (uint32_t *)(uintptr_t)regs->ecx;
     uint32_t *oset = (uint32_t *)(uintptr_t)regs->edx;
 
     if (oset) {
-        uint32_t old = current_proc->blocked_sigs;
+        uint32_t old = sigset_to_user(current_proc->blocked_sigs);
         int cr = copy_to_user(oset, &old, sizeof(old));
         if (cr < 0) return cr;
     }
@@ -3500,6 +4446,7 @@ static int sys_rt_sigprocmask(registers_t *regs) {
         uint32_t set = 0;
         int cr = copy_from_user(&set, nset, sizeof(set));
         if (cr < 0) return cr;
+        set = sigset_from_user(set);
         /* SIGKILL and SIGSTOP cannot be blocked */
         set &= ~((1u << SIGKILL) | (1u << SIGSTOP));
         switch (how) {
@@ -3546,7 +4493,8 @@ static int sys_dup(registers_t *regs) {
 /* ── sys_getppid() — EAX=64 ─────────────────────────────────────────────── */
 static int sys_getppid(registers_t *regs) {
     (void)regs;
-    return (current_proc && current_proc->parent) ? current_proc->parent->pid : 1;
+    /* parent is always a group leader, so its pid is the parent's tgid. */
+    return (current_proc && current_proc->parent) ? current_proc->parent->tgid : 1;
 }
 
 /* ── sys_setsid() — EAX=66 ───────────────────────────────────────────────── */
@@ -3570,13 +4518,9 @@ static int sys_umask(registers_t *regs) {
     return (int)old_mask;
 }
 
-/* ── sys_mknod(const char *path, mode_t mode, dev_t dev) — EAX=14 ────────── */
-static int sys_mknod(registers_t *regs) {
-    char path[256];
-    if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0) return -14;
-    uint32_t mode = regs->ecx;
-    /* dev = regs->edx (ignored for FIFOs) */
-
+/* Create a FIFO / character device / regular file node at an already-resolved
+ * absolute path.  Shared by mknod(14) and mknodat(297). */
+static int do_mknod(const char *path, uint32_t mode) {
     char dir_path[256], base[256];
     if (path_split(path, dir_path, base) < 0) return -22;
     if (base[0] == '\0') return -22;
@@ -3590,9 +4534,31 @@ static int sys_mknod(registers_t *regs) {
     if (fmt == 0x1000)       vfs_flag = VFS_FLAG_FIFO;    /* S_IFIFO  = 0010000 */
     else if (fmt == 0x2000)  vfs_flag = VFS_FLAG_CHARDEV; /* S_IFCHR  = 0020000 */
     else if (fmt == 0x8000)  vfs_flag = VFS_FLAG_FILE;    /* S_IFREG  = 0100000 */
+    else if (fmt == 0)       vfs_flag = VFS_FLAG_FILE;    /* mode 0 = regular file */
     else return -22;  /* -EINVAL: unsupported type */
 
     return dir->create_fn(dir, base, vfs_flag);
+}
+
+/* ── sys_mknod(const char *path, mode_t mode, dev_t dev) — EAX=14 ────────── */
+static int sys_mknod(registers_t *regs) {
+    char path[256], resolved[256];
+    if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0) return -14;
+    /* dev = regs->edx (ignored for FIFOs) */
+    int r = resolve_path_at_fd(AT_FDCWD, path, resolved, sizeof(resolved));
+    if (r < 0) return r;
+    return do_mknod(resolved, regs->ecx);
+}
+
+/* ── sys_mknodat(dirfd, path, mode, dev) — EAX=297 ───────────────────────────
+ * Linux implements mknod(2) as mknodat(AT_FDCWD, …) (fs/namei.c do_mknodat)
+ * and glibc's mkfifo()/mknod() issue this syscall directly. */
+static int sys_mknodat(registers_t *regs) {
+    char path[256], resolved[256];
+    if (copy_user_str((const char *)(uintptr_t)regs->ecx, path, 256) < 0) return -14;
+    int r = resolve_path_at_fd((int)regs->ebx, path, resolved, sizeof(resolved));
+    if (r < 0) return r;
+    return do_mknod(resolved, regs->edx);
 }
 
 /* ── sys_reboot(magic, magic2, cmd, arg) — EAX=88 ───────────────────────── */
@@ -3769,6 +4735,22 @@ static int sys_ftruncate(registers_t *regs) {
     return vfs_truncate(f->node, (uint32_t)regs->ecx);
 }
 
+/* ── sys_truncate64(path, length_lo, length_hi) — EAX=193 ───────────────────
+ * ── sys_ftruncate64(fd,  length_lo, length_hi) — EAX=194 ───────────────────
+ * Linux i386 carries a 64-bit-offset (f)truncate pair alongside the legacy
+ * 92/93; musl always issues these (src/unistd/{f,}truncate.c pass the length
+ * as the __SYSCALL_LL_O register pair ECX:EDX).  Our files are below 4 GiB, so
+ * a nonzero high word is -EFBIG, exactly what Linux reports past s_maxbytes. */
+static int sys_truncate64(registers_t *regs) {
+    if (regs->edx) return -27;                     /* -EFBIG */
+    return sys_truncate(regs);                     /* ECX already holds the low word */
+}
+
+static int sys_ftruncate64(registers_t *regs) {
+    if (regs->edx) return -27;                     /* -EFBIG */
+    return sys_ftruncate(regs);
+}
+
 /* ── sys_fallocate(fd, mode, offset, len) — EAX=324 ─────────────────────────
  * Firefox sizes its memfd-backed shared memory with fallocate(fd, 0, 0, size);
  * returning -ENOSYS made it log "fallocate failed to set shm size".  On i386
@@ -3828,13 +4810,15 @@ static int fd_write_ready(int fd) {
 }
 
 /* ── sys_select(n, readfds, writefds, exceptfds, timeout) — EAX=82 ────────── */
-static int sys_select(registers_t *regs) {
-    int       n        = (int)regs->ebx;
-    uint32_t *readfds  = (uint32_t *)(uintptr_t)regs->ecx;
-    uint32_t *writefds = (uint32_t *)(uintptr_t)regs->edx;
-    /* exceptfds ignored; fd_sets span MAX_FD bits (2 words at 64) */
+/* Common body of select(2)/_newselect and pselect6.  toms < 0 blocks without
+ * a deadline; 0 polls once; > 0 is the timeout in ms (fs/select.c
+ * core_sys_select -> do_select with a schedule_hrtimeout deadline).  Returns
+ * 0 when the deadline passes with nothing ready and -ERESTARTNOHAND when a
+ * signal interrupts the wait (EINTR once its handler has run; man 7 signal
+ * lists select among the calls that are never restarted by SA_RESTART). */
+static int do_select(int n, uint32_t *readfds, uint32_t *writefds,
+                     uint32_t *exceptfds, int toms) {
 #define SELECT_WORDS ((MAX_FD + 31) / 32)
-
     if (n <= 0) return 0;
     if (n > MAX_FD) n = MAX_FD;
 
@@ -3849,18 +4833,10 @@ static int sys_select(registers_t *regs) {
         if (cr < 0) return cr;
     }
 
-    /* Check if timeout is zero (non-blocking) */
-    struct { long tv_sec; long tv_usec; } *tv =
-        (void *)(uintptr_t)regs->edi;
-    int nonblock = 0;
-    if (tv) {
-        struct { long tv_sec; long tv_usec; } ktv;
-        int cr = copy_from_user(&ktv, tv, sizeof(ktv));
-        if (cr < 0) return cr;
-        nonblock = (ktv.tv_sec == 0 && ktv.tv_usec == 0);
-    }
+    struct kdeadline dl;
+    if (toms > 0) deadline_set_ms(&dl, (uint32_t)toms);
 
-    for (int attempt = 0; ; attempt++) {
+    for (;;) {
         uint32_t rd_out[SELECT_WORDS] = {0}, wr_out[SELECT_WORDS] = {0};
         int ready = 0;
         for (int fd = 0; fd < n; fd++) {
@@ -3868,7 +4844,8 @@ static int sys_select(registers_t *regs) {
             if (rd_in[w] & b) { if (fd_read_ready(fd))  { rd_out[w] |= b; ready++; } }
             if (wr_in[w] & b) { if (fd_write_ready(fd)) { wr_out[w] |= b; ready++; } }
         }
-        if (ready > 0 || nonblock || attempt >= 600) {
+        int expired = (toms == 0) || (toms > 0 && deadline_expired(&dl));
+        if (ready > 0 || expired) {
             if (readfds) {
                 int cr = copy_to_user(readfds, rd_out, words * 4);
                 if (cr < 0) return cr;
@@ -3877,10 +4854,73 @@ static int sys_select(registers_t *regs) {
                 int cr = copy_to_user(writefds, wr_out, words * 4);
                 if (cr < 0) return cr;
             }
+            if (exceptfds) {        /* exceptional conditions are not tracked */
+                uint32_t ex_out[SELECT_WORDS] = {0};
+                int cr = copy_to_user(exceptfds, ex_out, words * 4);
+                if (cr < 0) return cr;
+            }
             return ready;
         }
-        io_wait_sleep(5);   /* woken early by any I/O activity */
+        if (signal_interrupt_pending(current_proc))
+            return -ERESTARTNOHAND;
+        uint32_t cap = 50;
+        if (toms > 0) cap = deadline_sleep_ticks(&dl, cap);
+        io_wait_sleep(cap);   /* woken early by any I/O activity or a signal */
+        if (signal_interrupt_pending(current_proc))
+            return -ERESTARTNOHAND;
     }
+}
+
+/* select(n, in, out, ex, struct timeval *) — EAX=82 (old, via struct) and 142
+ * (_newselect).  Linux updates the timeval with the time left (unless
+ * STICKY_TIMEOUTS); a NULL timeval blocks indefinitely. */
+static int sys_select(registers_t *regs) {
+    int       n        = (int)regs->ebx;
+    uint32_t *readfds  = (uint32_t *)(uintptr_t)regs->ecx;
+    uint32_t *writefds = (uint32_t *)(uintptr_t)regs->edx;
+    uint32_t *exceptfds = (uint32_t *)(uintptr_t)regs->esi;
+    struct { int32_t tv_sec; int32_t tv_usec; } *tv = (void *)(uintptr_t)regs->edi;
+    int toms = -1;
+    if (tv) {
+        struct { int32_t tv_sec; int32_t tv_usec; } ktv;
+        int cr = copy_from_user(&ktv, tv, sizeof(ktv));
+        if (cr < 0) return cr;
+        if (ktv.tv_sec < 0 || ktv.tv_usec < 0) return -22;
+        if (ktv.tv_sec > 2000000) toms = 0x7fffffff;
+        /* Round the sub-millisecond remainder UP: Linux's
+         * poll_select_set_timeout() never shortens the requested interval. */
+        else toms = ktv.tv_sec * 1000 + (ktv.tv_usec + 999) / 1000;
+    }
+    uint32_t start = pit_ticks();
+    int ret = do_select(n, readfds, writefds, exceptfds, toms);
+    if (tv && toms >= 0) {
+        uint32_t used_ms = (pit_ticks() - start) * 10U;
+        uint32_t left_ms = used_ms < (uint32_t)toms ? (uint32_t)toms - used_ms : 0;
+        struct { int32_t tv_sec; int32_t tv_usec; } krem =
+            { (int32_t)(left_ms / 1000U), (int32_t)((left_ms % 1000U) * 1000U) };
+        copy_to_user(tv, &krem, sizeof(krem));
+    }
+    return ret;
+}
+
+/* pselect6(n, in, out, ex, struct timespec *, sigmask*) — EAX=308.  The
+ * timeout is a TIMESPEC (nanoseconds, not microseconds) and is not updated;
+ * the temporary sigmask is not applied (S6, out of scope here). */
+static int sys_pselect6(registers_t *regs) {
+    int       n        = (int)regs->ebx;
+    uint32_t *readfds  = (uint32_t *)(uintptr_t)regs->ecx;
+    uint32_t *writefds = (uint32_t *)(uintptr_t)regs->edx;
+    uint32_t *exceptfds = (uint32_t *)(uintptr_t)regs->esi;
+    uint32_t  tsp      = regs->edi;
+    int toms = -1;
+    if (tsp) {
+        struct { int32_t s, ns; } ts;
+        if (copy_from_user(&ts, (void *)(uintptr_t)tsp, sizeof(ts)) < 0) return -14;
+        if (ts.s < 0 || ts.ns < 0) return -22;
+        if (ts.s > 2000000) toms = 0x7fffffff;
+        else toms = ts.s * 1000 + (ts.ns + 999999) / 1000000;   /* round up */
+    }
+    return do_select(n, readfds, writefds, exceptfds, toms);
 }
 
 /* ── sys_poll(fds, nfds, timeout) — EAX=168 ────────────────────────────────── */
@@ -3898,88 +4938,6 @@ static int sys_select(registers_t *regs) {
 static void io_wait_sleep(uint32_t max_ticks) {
     current_proc->wake_tick = pit_ticks() + max_ticks;
     sleep_on(&io_activity);
-}
-
-/* ── [wbt] wedge-backtrace capture ──────────────────────────────────────────
- * At the moment a firefox thread blocks (futex wait / infinite poll), scan ITS
- * OWN user stack for return addresses inside libxul's text mapping and stash
- * them in the PCB.  The scheduler's stall detector dumps the stashed captures
- * ([wbt] lines) for offline symbolization against the exact Mozilla .sym file.
- * The call-preceded filter — the bytes immediately before the candidate must
- * decode as a CALL (E8 rel32 or FF /2 forms) — is what removes the noise that
- * made raw stack-scan dumps unusable.  libxul loads at 0x43300000 (no ASLR,
- * deterministic — see [gdbaid]); size 175628760. */
-#define LIBXUL_TEXT_LO 0x43300000U
-#define LIBXUL_TEXT_HI (0x43300000U + 175628760U)
-static void fx_capture_wait_bt(registers_t *regs) {
-    if (!g_ipc_launch_started || !current_proc) return;
-    if (!(current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-          current_proc->name[4]=='f')) return;
-    current_proc->wait_bt_n = 0;
-    uint32_t sp = regs->useresp;
-    if (sp < 0x1000 || sp >= 0xC0000000U) return;
-    int n = 0;
-    for (uint32_t off = 0; off < 16384 && n < 28; off += 4) {
-        uint32_t v = 0;
-        if (copy_from_user(&v, (const void *)(uintptr_t)(sp + off), 4) < 0)
-            break;                              /* ran off the mapped stack */
-        if (v < LIBXUL_TEXT_LO + 8 || v >= LIBXUL_TEXT_HI) continue;
-        uint8_t cb[8];
-        if (copy_from_user(cb, (const void *)(uintptr_t)(v - 8), 8) < 0)
-            continue;
-        if (!(cb[3] == 0xE8 ||                  /* call rel32   (v-5) */
-              cb[6] == 0xFF ||                  /* call reg     (v-2) */
-              cb[5] == 0xFF ||                  /* call [r+d8]  (v-3) */
-              cb[2] == 0xFF ||                  /* call [r+d32] (v-6) */
-              cb[1] == 0xFF))                   /* call [sib+d32] (v-7) */
-            continue;
-        current_proc->wait_bt[n++] = v;
-    }
-    current_proc->wait_bt_n = (uint8_t)n;
-
-    /* [wburl] LEADER only: find the modal's document URL.  nsCString stores its
-     * text on the HEAP with only a {char* data; u32 len; u32 flags} on the stack,
-     * so scan each stack WORD as a candidate heap pointer, dereference it, and if
-     * the pointed-to bytes begin with a chrome/about/resource/jar URL scheme,
-     * print it.  Reveals exactly which dialog OpenWindowInternal opens — no
-     * MOZ_LOG needed. */
-    if (current_proc->pid == current_proc->tgid) {
-        int printed = 0;
-        for (uint32_t off = 0; off < 16384 && printed < 16; off += 4) {
-            uint32_t ptr = 0;
-            if (copy_from_user(&ptr, (const void *)(uintptr_t)(sp + off), 4) < 0)
-                continue;
-            /* Firefox heap lives roughly in [0x08000000, 0x60000000). */
-            if (ptr < 0x08000000U || ptr >= 0x60000000U) continue;
-            char s[72];
-            if (copy_from_user(s, (const void *)(uintptr_t)ptr, sizeof(s) - 1) < 0)
-                continue;
-            s[sizeof(s) - 1] = '\0';
-            int sl = 0, letters = 0, spaces = 0;
-            while (sl < 71 && s[sl] >= 0x20 && s[sl] < 0x7f) {
-                if ((s[sl]|0x20) >= 'a' && (s[sl]|0x20) <= 'z') letters++;
-                if (s[sl] == ' ') spaces++;
-                sl++;
-            }
-            s[sl] = '\0';
-            int is_url = (sl >= 9 &&
-                ((s[0]=='c'&&s[1]=='h'&&s[2]=='r'&&s[3]=='o'&&s[4]=='m'&&s[5]=='e'&&s[6]==':') ||
-                 (s[0]=='r'&&s[1]=='e'&&s[2]=='s'&&s[3]=='o'&&s[4]=='u'&&s[5]=='r'&&s[6]=='c') ||
-                 (s[0]=='j'&&s[1]=='a'&&s[2]=='r'&&s[3]==':')));
-            /* A prompt MESSAGE/title: a natural-language run (>=16 chars, mostly
-             * letters, has spaces) — reveals what alert/confirm is blocking. */
-            int is_msg = (sl >= 16 && letters * 2 >= sl && spaces >= 2);
-            /* Also surface any profile-path string Firefox holds, to see whether
-             * it actually resolved -profile /tmp/ffp or resolved to something
-             * else (the "profile cannot be loaded" modal implies a bad path). */
-            int is_prof = (sl >= 4 && (dbg_str_has(s, "ffp") || dbg_str_has(s, ".mozilla") ||
-                           dbg_str_has(s, "/tmp/") || dbg_str_has(s, "rofile")));
-            if (is_url || is_msg || is_prof) {
-                printk("[wburl] %s\n", s);
-                printed++;
-            }
-        }
-    }
 }
 
 /* [lockop] log a profile-relevant filesystem op + its result, gated to firefox
@@ -4035,13 +4993,8 @@ static int sys_poll(registers_t *regs) {
         return cr;
     }
 
-    uint32_t start = pit_ticks();
-    uint32_t timeout_ticks = 0;
-    int bt_captured = 0;    /* [wbt] snapshot at most once per poll call */
-    if (toms > 0) {
-        timeout_ticks = ((uint32_t)toms + 9U) / 10U;
-        if (!timeout_ticks) timeout_ticks = 1;
-    }
+    struct kdeadline dl;
+    if (toms > 0) deadline_set_ms(&dl, (uint32_t)toms);
 
     for (;;) {
         int ready = 0;
@@ -4083,11 +5036,45 @@ static int sys_poll(registers_t *regs) {
             kfree(kfds);
             return cr < 0 ? cr : ready;
         }
-        if (toms > 0 && (uint32_t)(pit_ticks() - start) >= timeout_ticks)
+        if (toms > 0 && deadline_expired(&dl))
         {
             cr = copy_to_user(fds, kfds, fds_len);
             kfree(kfds);
             return cr < 0 ? cr : 0;
+        }
+        {   /* [pollstall] The Firefox main thread parks in an infinite poll()
+             * and never comes back while work sits in its event queue (see
+             * docs/audit/firefox-first-paint.md).  Its wake-up path is
+             * nsAppShell::ScheduleNativeEventCallback(), which writes one byte
+             * to a pipe that the GLib main loop polls (widget/gtk/nsAppShell.cpp
+             * :413-415, :396-399).  This dumps the whole polled fd set with each
+             * fd's type and readiness every ~10 s of a blocked poll, which
+             * distinguishes "the byte is in the pipe and poll fails to report
+             * it" (kernel bug) from "no byte was ever written" (the appshell's
+             * mNativeEventPending coalescing flag is stuck). */
+            if (toms < 0 && current_proc && current_proc->pid == current_proc->tgid &&
+                current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
+                current_proc->name[4]=='f') {
+                static uint32_t last_dump;
+                uint32_t now = pit_ticks();
+                if ((uint32_t)(now - last_dump) >= 1000) {   /* 10 s */
+                    last_dump = now;
+                    printk("[pollstall] pid=%d nfds=%u:", current_proc->pid,
+                           (unsigned)nfds);
+                    for (uint32_t i = 0; i < nfds && i < 16; i++) {
+                        int fd = (int)kfds[i * 2];
+                        if (fd < 0 || fd >= MAX_FD) { printk(" fd%d=inval", fd); continue; }
+                        proc_file_t *f = &current_proc->ofile[fd];
+                        printk(" fd%d:t%d%s%s", fd, (int)f->type,
+                               fd_read_ready(fd) ? "R" : "-",
+                               fd_write_ready(fd) ? "W" : "-");
+                        if (f->type == FD_PIPE_R && f->pipe)
+                            printk("(cnt=%u nw=%d)", (unsigned)f->pipe->count,
+                                   f->pipe->nwriters);
+                    }
+                    printk("\n");
+                }
+            }
         }
         {   /* [pollfd] decisive diag: which fd is the firefox MAIN thread
              * blocking on with an infinite/long timeout, and what is that fd's
@@ -4124,25 +5111,22 @@ static int sys_poll(registers_t *regs) {
                            rxc, wrc, (unsigned)rxp, (unsigned)txp, (unsigned)nfds, toms);
                 }
             }
-            /* [wbt] long/infinite poll block: snapshot once per poll call. */
-            if (toms < 0 && !bt_captured) {
-                bt_captured = 1;
-                fx_capture_wait_bt(regs);
+            /* A deliverable signal interrupts the wait (fs/select.c
+             * do_sys_poll returns -ERESTARTNOHAND: EINTR once the handler has
+             * run, a transparent restart if none did; SA_RESTART never applies
+             * to poll).  Check before AND after sleeping so a signal that
+             * arrived while we scanned the fds is not slept through. */
+            if (signal_interrupt_pending(current_proc)) {
+                kfree(kfds);
+                return -ERESTARTNOHAND;
             }
             /* Sleep until I/O activity (or the poll timeout). */
             uint32_t cap = 50;
-            if (toms > 0) {
-                uint32_t left = timeout_ticks - (uint32_t)(pit_ticks() - start);
-                if (left < cap) cap = left ? left : 1;
-            }
+            if (toms > 0) cap = deadline_sleep_ticks(&dl, cap);
             io_wait_sleep(cap);
-            /* SIGKILL must abort the wait (uncatchable): without this the loop
-             * re-checks + re-sleeps forever and the thread never returns to
-             * user mode to die — so kill(pid,SIGKILL) of a poll()-blocked
-             * process (e.g. the ff watchdog killing a stalled Firefox) hangs. */
-            if (current_proc->pending_sigs & (1u << SIGKILL)) {
+            if (signal_interrupt_pending(current_proc)) {
                 kfree(kfds);
-                return -4;  /* -EINTR → returns to user → SIGKILL delivered */
+                return -ERESTARTNOHAND;
             }
         }
     }
@@ -4170,7 +5154,7 @@ static int sys_ppoll(registers_t *regs, int time64) {
             sec = ts.s; nsec = ts.ns;
         }
         if (sec < 0 || sec > 2000000) toms = 0x7fffffff;   /* cap, avoid overflow */
-        else toms = sec * 1000 + nsec / 1000000;
+        else toms = sec * 1000 + (nsec + 999999) / 1000000;     /* round up */
         if (toms < 0) toms = 0;
     }
     registers_t fake = *regs;
@@ -4278,12 +5262,8 @@ static int sys_epoll_wait(registers_t *regs) {
     if (!uevents || !access_ok(uevents, (size_t)maxevents * 12)) return -14;
     struct epoll *ep = current_proc->ofile[epfd].epoll;
 
-    uint32_t start = pit_ticks();
-    uint32_t timeout_ticks = 0;
-    if (toms > 0) { timeout_ticks = ((uint32_t)toms + 9U) / 10U; if (!timeout_ticks) timeout_ticks = 1; }
-
-    extern volatile unsigned g_ff_io_nudge;
-    unsigned nudge_at_entry = g_ff_io_nudge;
+    struct kdeadline dl;
+    if (toms > 0) deadline_set_ms(&dl, (uint32_t)toms);
 
     for (;;) {
         int n = 0;
@@ -4303,111 +5283,15 @@ static int sys_epoll_wait(registers_t *regs) {
                 n++;
             }
         }
-        {   /* [epw] launch-phase diag: does the firefox IO thread's epoll_wait
-             * ever return events (i.e. does the ScheduleWork socketpair wakeup
-             * get delivered)?  Log returns with n>0 and the registered fds. */
-            extern volatile int g_ipc_launch_started;
-            if (g_ipc_launch_started && n > 0 && current_proc &&
-                current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-                current_proc->name[4]=='f') {
-                static int ew = 0;
-                if (ew < 60) { ew++;
-                    printk("[epw] pid=%d epoll_wait -> %d events\n",
-                           current_proc->pid, n);
-                }
-            }
-        }
         if (n > 0 || toms == 0) return n;
-        if (toms > 0 && (uint32_t)(pit_ticks() - start) >= timeout_ticks) return 0;
-        /* Launch-phase epoll self-heal v2: the 'IPC I/O Parent' thread parks in
-         * event_base_loop(EVLOOP_ONCE), which only returns when a REAL event
-         * fires.  Its libevent wakeup is a 1-byte write to a self-pipe via
-         * MessagePumpLibevent::ScheduleWork — which doesn't reach it on our
-         * single-CPU scheduler, so the dispatched Launch task in its
-         * incoming_queue_ is never run.  Returning 0 (v1) was useless: EVLOOP_ONCE
-         * ignores it and re-polls.  Instead, REPORT a registered pipe-read fd as
-         * EPOLLIN (a real event) so libevent's OnWakeup fires, event_base_loop
-         * returns, and the pump runs DoWork() → drains incoming_queue_ → runs
-         * Launch.  Gated to firefox + launch phase; fires after ~150 ms idle. */
-        {
-            extern volatile int g_ipc_launch_started;
-            /* Fire the self-heal the instant a dispatch happened (g_ff_io_nudge
-             * changed since we entered — event-driven, minimal latency) OR after
-             * a 150ms timed fallback.  Immediate firing is what got Firefox's
-             * browser chrome to lay out; a 20ms rate-limit regressed it.  Spin is
-             * bounded because we only count pipe + unix-socket writes (real
-             * dispatch/IPC signals), not the high-rate eventfd/vsync wakeups. */
-            /* 2026-07-04: DISABLED.  The self-heal reports EMPTY *blocking* pipes
-             * as EPOLLIN; libevent then invokes that fd's callback, whose read()
-             * blocks in pipe_read on a pipe nobody ever writes → the IPC I/O
-             * thread is STRANDED out of its epoll loop and the launch-completion
-             * continuation (→ mProcessState=PROCESS_CREATED + Monitor.Notify)
-             * never runs (observed directly: 120s hang with 'IPC I/O Parent'
-             * s4#3 in sys_read while the main thread waited forever).  The heal
-             * was load-bearing ONLY pre-SMP/pre-futex-scoping, when mis-routed
-             * wakes and single-CPU serialization needed emergent kicks.  Native
-             * wakeups are complete now: pipe/usocket writes do wake_up(buf) +
-             * io_wake(), and epoll re-scans immediately.  Flip to 1 to restore. */
-            #define FF_EPOLL_SELF_HEAL 0
-            int nudged = (g_ff_io_nudge != nudge_at_entry);
-            if (FF_EPOLL_SELF_HEAL && g_ipc_launch_started && current_proc &&
-                current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-                current_proc->name[4]=='f' &&
-                (nudged || (uint32_t)(pit_ticks() - start) >= 15)) {
-                /* Report a registered pipe-read fd as EPOLLIN so libevent's
-                 * OnWakeup fires and the pump runs DoWork() → drains
-                 * incoming_queue_.  NB (2026-06-25): an "inject a real wakeup byte
-                 * into the libevent self-pipe" variant was tried (more correct —
-                 * it makes the IO threads park in epoll_wait instead of risking a
-                 * blocking OnWakeup read), but it regressed the empirical
-                 * progress (0/2 runs reached 553x108 vs this version's ~30-50%),
-                 * so this proven spurious-report form is kept.  See
-                 * firefox-paint-blocker memory for the full handshake analysis. */
-                for (int i = 0; i < EPOLL_MAX_ITEMS && n < maxevents; i++) {
-                    int wfd = ep->items[i].fd;
-                    if (wfd < 0 || wfd >= MAX_FD) continue;
-                    if (current_proc->ofile[wfd].type != FD_PIPE_R) continue;
-                    if (!(ep->items[i].events & EPOLLIN_K)) continue;
-                    /* Report EVERY registered pipe-read fd, even empty/blocking
-                     * ones.  This is deliberately NOT narrowed — FOUR "cleaner"
-                     * variants were tried (2026-06-25) and every one REGRESSED:
-                     * (1) only count>0, (2) inject a byte into the self-pipe only,
-                     * (3) only non-blocking pipes, (4) broad report + force the
-                     * reported fd O_NONBLOCK.  The broad blocking report is
-                     * load-bearing in an emergent way (the blocking read appears
-                     * to genuinely wait for a peer write that wake_up(pipe)
-                     * delivers).  See firefox-paint-blocker memory before retrying. */
-                    struct { uint32_t events; uint8_t data[8]; }
-                        __attribute__((packed)) out;
-                    out.events = EPOLLIN_K;
-                    __builtin_memcpy(out.data, ep->items[i].data, 8);
-                    if (copy_to_user((uint8_t *)uevents + (size_t)n * 12, &out, 12) < 0)
-                        return -14;
-                    n++;
-                }
-                if (n > 0) {
-                    static int sh = 0;
-                    if (sh < 8) { sh++;
-                        printk("[ephe2] pid=%d report %d pipe EPOLLIN (spurious)\n",
-                               current_proc->pid, n); }
-                    return n;
-                }
-            }
-        }
+        if (toms > 0 && deadline_expired(&dl)) return 0;
+        /* Interruptible like poll (fs/eventpoll.c ep_poll: -EINTR when a
+         * signal is pending, no SA_RESTART restart). */
+        if (signal_interrupt_pending(current_proc)) return -ERESTARTNOHAND;
         uint32_t cap = 50;
-        if (toms > 0) {
-            uint32_t left = timeout_ticks - (uint32_t)(pit_ticks() - start);
-            if (left < cap) cap = left ? left : 1;
-        }
+        if (toms > 0) cap = deadline_sleep_ticks(&dl, cap);
         io_wait_sleep(cap);
-        /* SIGKILL must abort the wait (uncatchable), exactly like sys_poll and
-         * sys_futex: without this a thread parked in an infinite-timeout
-         * epoll_wait NEVER re-enters signal delivery and survives the watchdog's
-         * SIGKILL of its thread group — each killed Firefox attempt leaked its
-         * epoll-parked IO threads (observed: orphaned s4#256 threads reparented
-         * to init), exhausting the 64-slot ptable across watchdog retries. */
-        if (current_proc->pending_sigs & (1u << SIGKILL))
-            return -4;  /* -EINTR */
+        if (signal_interrupt_pending(current_proc)) return -ERESTARTNOHAND;
     }
 }
 
@@ -4508,15 +5392,6 @@ static int sys_prctl(registers_t *regs) {
         if (copy_from_user(nm, (void *)(uintptr_t)regs->ecx, 16) == 0) {
             nm[16] = 0;
             printk("[tname] tid=%d name='%s'\n", current_proc->pid, nm);
-            extern volatile int g_ipc_launch_tid;
-            extern volatile int g_ipc_launch_started;
-            if (nm[0]=='I'&&nm[1]=='P'&&nm[2]=='C'&&nm[4]=='L') { /* "IPC Launch" */
-                g_ipc_launch_tid = current_proc->pid;
-                g_ipc_launch_started = 1;   /* arm diags early — the IPC Launch
-                                             * thread is created at the START of
-                                             * the launch, before the Launch
-                                             * dispatch's ScheduleWork pipe write */
-            }
         }
     }
     return 0;
@@ -4621,6 +5496,32 @@ static int sys_unlink_kernel_path(const char *path) {
     return vfs_unlink(dir, base);
 }
 
+/* Remove an empty directory (Linux fs/namei.c do_rmdir): -ENOTDIR when the
+ * target is not a directory, -ENOTEMPTY while it still has entries. */
+static int sys_rmdir_kernel_path(const char *path) {
+    vfs_node_t *n = vfs_open(path);
+    if (!n) return -2;
+    if ((n->flags & 0x7U) != VFS_FLAG_DIR) return -20;   /* -ENOTDIR */
+    vfs_dirent_t de;
+    for (uint32_t i = 0; i < 65536 && vfs_readdir(n, i, &de) == 0; i++) {
+        if (de.name[0] == '.' &&
+            (de.name[1] == '\0' || (de.name[1] == '.' && de.name[2] == '\0')))
+            continue;                                    /* "." and ".." */
+        return -39;                                      /* -ENOTEMPTY */
+    }
+    return sys_unlink_kernel_path(path);
+}
+
+/* ── sys_rmdir(path) — EAX=40 ───────────────────────────────────────────── */
+static int sys_rmdir(registers_t *regs) {
+    char path[256], resolved[256];
+    if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, sizeof(path)) < 0)
+        return -14;
+    int r = resolve_path_at_fd(AT_FDCWD, path, resolved, sizeof(resolved));
+    if (r < 0) return r;
+    return sys_rmdir_kernel_path(resolved);
+}
+
 static int sys_mkdirat(registers_t *regs) {
     int dirfd = (int)regs->ebx;
     const char *upath = (const char *)(uintptr_t)regs->ecx;
@@ -4642,6 +5543,9 @@ static int sys_unlinkat(registers_t *regs) {
     if (r < 0) return r;
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
+    /* AT_REMOVEDIR turns unlinkat() into rmdir() (Linux do_unlinkat). */
+    if (flags & AT_REMOVEDIR)
+        return sys_rmdir_kernel_path(resolved);
     return sys_unlink_kernel_path(resolved);
 }
 
@@ -4719,12 +5623,62 @@ static int sys_renameat(registers_t *regs) {
     return sys_rename_kernel_path(oldres, newres);
 }
 
-/* ── sys_clock_nanosleep(clkid, flags, rqtp, rmtp) — EAX=253 ─────────────── */
+/* ── sys_clock_nanosleep(clkid, flags, rqtp, rmtp) — EAX=267 / 407 ────────
+ * TIMER_ABSTIME sleeps until an absolute instant of the given clock (used by
+ * std::this_thread::sleep_until, Rust thread::sleep_until, pthread timed
+ * waits); a relative request is nanosleep on that clock.  On EINTR the
+ * remainder is written for relative sleeps only (Linux common_nsleep). */
+static int do_clock_nanosleep(int clk, int flags, int64_t rsec, int64_t rnsec,
+                              uint32_t *rem_sec, uint32_t *rem_nsec, int *write_rem) {
+    uint32_t ds, dn; int expired;
+    *write_rem = 0;
+    int r = knanosleep_deadline(clk, flags, rsec, rnsec, &ds, &dn, &expired);
+    if (r < 0) return r;
+    if (expired) return 0;
+    r = ksleep_until_mono(ds, dn, rem_sec, rem_nsec);
+    if (r == -4) {
+        if (!(flags & TIMER_ABSTIME_K)) *write_rem = 1;
+        /* See sys_nanosleep: -EINTR here would be restarted with the original
+         * request under an SA_RESTART handler. */
+        return -ERESTARTNOHAND;
+    }
+    return r;
+}
+
 static int sys_clock_nanosleep(registers_t *regs) {
-    registers_t fake = *regs;
-    fake.ebx = regs->edx;  /* timespec *req */
-    fake.ecx = regs->esi;  /* timespec *rem */
-    return sys_nanosleep(&fake);
+    int clk = (int)regs->ebx, flags = (int)regs->ecx;
+    struct ktimespec *req = (struct ktimespec *)(uintptr_t)regs->edx;
+    struct ktimespec *rem = (struct ktimespec *)(uintptr_t)regs->esi;
+    if (!req) return -14;
+    struct ktimespec kreq;
+    int cr = copy_from_user(&kreq, req, sizeof(kreq));
+    if (cr < 0) return cr;
+    uint32_t rs = 0, rn = 0; int wr;
+    int r = do_clock_nanosleep(clk, flags, kreq.tv_sec, kreq.tv_nsec, &rs, &rn, &wr);
+    if (wr && rem) {
+        struct ktimespec krem = { (int32_t)rs, (int32_t)rn };
+        cr = copy_to_user(rem, &krem, sizeof(krem));
+        if (cr < 0) return cr;
+    }
+    return r;
+}
+
+static int sys_clock_nanosleep_time64(registers_t *regs) {
+    int clk = (int)regs->ebx, flags = (int)regs->ecx;
+    void *req = (void *)(uintptr_t)regs->edx;
+    void *rem = (void *)(uintptr_t)regs->esi;
+    if (!req) return -14;
+    struct { int64_t s; int64_t ns; } kreq;
+    int cr = copy_from_user(&kreq, req, sizeof(kreq));
+    if (cr < 0) return cr;
+    uint32_t rs = 0, rn = 0; int wr;
+    int r = do_clock_nanosleep(clk, flags, kreq.s, kreq.ns, &rs, &rn, &wr);
+    if (wr && rem) {
+        struct { int64_t s; int64_t ns; } krem = { (int64_t)rs, (int64_t)rn };
+        cr = copy_to_user(rem, &krem, sizeof(krem));
+        if (cr < 0) return cr;
+    }
+    return r;
 }
 
 /* ── sys_getresuid32 / sys_getresgid32 — EAX=209/211 ────────────────────────
@@ -4818,21 +5772,25 @@ static int sys_sched_setattr(registers_t *regs) {
     return 0;                              /* accept SCHED_NORMAL/BATCH/IDLE, ignore */
 }
 
-/* ── sys_clock_getres(clkid, timespec*) — EAX=266 ───────────────────────────
- * Report the PIT tick period (10 ms).  Firefox calls this to learn the timer
- * granularity; a bogus stub left it reading uninitialised memory. */
+/* ── sys_clock_getres(clkid, timespec*) — EAX=266 / 406 ──────────────────── */
 static int sys_clock_getres(registers_t *regs) {
+    uint32_t ns;
+    int r = kclock_res((int)regs->ebx, &ns);
+    if (r < 0) return r;
     void *uts = (void *)(uintptr_t)regs->ecx;
-    if (uts && access_ok(uts, 8)) {
-        struct { int32_t sec; int32_t nsec; } ts = { 0, 10000000 };
+    if (uts) {
+        struct { int32_t sec; int32_t nsec; } ts = { 0, (int32_t)ns };
         if (copy_to_user(uts, &ts, sizeof(ts)) < 0) return -14;
     }
     return 0;
 }
 static int sys_clock_getres_time64(registers_t *regs) {
+    uint32_t ns;
+    int r = kclock_res((int)regs->ebx, &ns);
+    if (r < 0) return r;
     void *uts = (void *)(uintptr_t)regs->ecx;
-    if (uts && access_ok(uts, 12)) {
-        struct { int64_t sec; int64_t nsec; } ts = { 0, 10000000 };
+    if (uts) {
+        struct { int64_t sec; int64_t nsec; } ts = { 0, (int64_t)ns };
         if (copy_to_user(uts, &ts, sizeof(ts)) < 0) return -14;
     }
     return 0;
@@ -4898,7 +5856,21 @@ static int sys_memfd_create(registers_t *regs) {
     while (seq) { num[n++] = '0' + (seq % 10); seq /= 10; }
     while (n) path[p++] = num[--n];
     path[p] = '\0';
-    return sys_open_kernel_path(path, O_RDWR | O_CREAT | O_TRUNC);
+    int fd = sys_open_kernel_path(path, O_RDWR | O_CREAT | O_TRUNC);
+    if (fd < 0) return fd;
+    /* MFD_CLOEXEC = 0x0001 (Linux mm/memfd.c hands O_CLOEXEC to get_unused_fd). */
+    current_proc->ofile[fd].cloexec = (regs->ecx & 0x1) ? 1 : 0;
+    /* Back the file with the shared page registry rather than a contiguous
+     * tmpfs buffer, so the file's pages and every MAP_SHARED mapping of it are
+     * the same frames (Linux shmem — see shmem_read above). */
+    vfs_node_t *mn = current_proc->ofile[fd].node;
+    if (mn) {
+        mn->read_fn     = shmem_read;
+        mn->write_fn    = shmem_write;
+        mn->truncate_fn = shmem_truncate;
+        mn->size        = 0;
+    }
+    return fd;
 }
 
 /* Helper: find a process by pid in the global table. */
@@ -4934,85 +5906,35 @@ static int sys_getpgid(registers_t *regs) {
     return p->pgrp;
 }
 
-/* ── sys_madvise(addr, len, advice) — EAX=219 ──────────────────────────────
- * MADV_DONTNEED(4)/MADV_FREE(8) must actually drop the page contents: the next
- * access to anonymous memory must read back ZERO.  mozjemalloc (Firefox's
- * allocator) poisons freed memory with 0xe5, then MADV_DONTNEED's the chunk and
- * later REUSES the same virtual range expecting zeroed pages — if we no-op the
- * advice, the recycled pages still hold the 0xe5 poison, so mozjemalloc reads a
- * "freed" object back as live garbage → the intermittent use-after-free crash.
- * Zero every PRESENT page in the range (absent/demand-paged pages already read
- * as zero, so skip them).  Other advice is accepted as a hint (no-op). */
-#define MADV_DONTNEED_K 4
-#define MADV_FREE_K     8
-static int sys_madvise(registers_t *regs) {
-    uint32_t addr = regs->ebx & ~(uint32_t)(PAGE_SIZE - 1);
-    uint32_t len  = regs->ecx;
-    int advice = (int)regs->edx;
-    if (advice < 0 || advice > 16) return -22;
-    if (len == 0) return 0;
-    uint32_t end = (regs->ebx + len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
-    if (end < addr || end > 0xC0000000U) return -22;
-
-    /* Linux returns ENOMEM if the range has any unmapped gap.  We approximate:
-     * the range must be covered by present pages or a demand-paged VMA.  (Real
-     * callers — mozjemalloc — only advise their own committed chunks, so this
-     * stays correct for them while satisfying the unmapped-range test.) */
-    if (!mmap_range_free(addr, end - addr)) {
-        /* not free → at least partly mapped; fall through to apply advice */
-    } else {
-        return -12;   /* entirely unmapped → -ENOMEM */
+/* Thread-directed signal (Linux do_tkill -> do_send_specific): queued on
+ * exactly the thread `tid`, which must belong to thread group `tgid` (or any
+ * group when tgid is -1, i.e. tkill).  Whether it is fatal for the whole group
+ * is decided at delivery: a SIG_DFL fatal signal ends the group; a handled one
+ * runs the handler on this thread; a blocked one stays pending on it. */
+static int do_tkill(int tgid, int tid, int sig) {
+    if (sig < 0 || sig >= NSIGS) return -22;
+    if (tid <= 0) return -22;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *p = &ptable[i];
+        if (p->state == PROC_UNUSED || p->state == PROC_ZOMBIE) continue;
+        if (p->pid != tid) continue;
+        if (tgid > 0 && p->tgid != tgid) return -3;   /* -ESRCH */
+        if (sig) signal_send(p, sig);
+        return 0;
     }
-
-    /* MADV_DONTNEED is defined to give a ZERO page on next access, so zero the
-     * present pages.  MADV_FREE is LAZY: the data must PERSIST until the kernel
-     * reclaims under memory pressure (which our simple kernel never does), so
-     * treat it as a no-op — eagerly zeroing it destroys data mozjemalloc still
-     * considers live. */
-    if (advice == MADV_DONTNEED_K) {
-        for (uint32_t va = addr; va < end; ) {
-            if (!(*paging_get_pde(va) & PAGE_PRESENT)) {
-                va = (va & ~0x3FFFFFU) + 0x400000U;     /* skip absent 4 MiB PDE */
-                continue;
-            }
-            uint32_t *pte = paging_get_pte(va);
-            if ((*pte & PAGE_PRESENT) && (*pte & PAGE_USER) && (*pte & PAGE_WRITABLE))
-                __builtin_memset((void *)(uintptr_t)va, 0, PAGE_SIZE);
-            va += PAGE_SIZE;
-        }
-    }
-    return 0;
-}
-
-/* ── sys_mincore(addr, len, vec) — EAX=218 (stub) ───────────────────────── */
-static int sys_mincore(registers_t *regs) {
-    (void)regs;
-    return -12;  /* -ENOMEM stub */
+    return -3;  /* -ESRCH */
 }
 
 /* ── sys_tgkill(tgid, tid, sig) — EAX=270 ───────────────────────────────── */
 static int sys_tgkill(registers_t *regs) {
-    /* In single-threaded model tgid==pid; delegate to kill */
     int tgid = (int)regs->ebx;
-    int tid  = (int)regs->ecx;
-    int sig  = (int)regs->edx;
-    /* Target the specific thread (tid) when present — glibc's per-thread
-     * signalling (e.g. setxid) addresses an individual tid, not the leader. */
-    for (int i = 0; i < MAX_PROCS; i++) {
-        if (ptable[i].state == PROC_UNUSED) continue;
-        if (ptable[i].pid == tid && ptable[i].tgid == tgid) {
-            signal_send(&ptable[i], sig);
-            return 0;
-        }
-    }
-    /* Fall back to the group leader if no exact tid match. */
-    for (int i = 0; i < MAX_PROCS; i++) {
-        if (ptable[i].pid == tgid && ptable[i].state != PROC_UNUSED) {
-            signal_send(&ptable[i], sig);
-            return 0;
-        }
-    }
-    return -3;  /* -ESRCH */
+    if (tgid <= 0) return -22;
+    return do_tkill(tgid, (int)regs->ecx, (int)regs->edx);
+}
+
+/* ── sys_tkill(tid, sig) — EAX=238 (musl raise()/pthread_kill use this) ──── */
+static int sys_tkill(registers_t *regs) {
+    return do_tkill(-1, (int)regs->ebx, (int)regs->ecx);
 }
 
 /* ── sys_pipe2(fds[2], flags) — EAX=331 ─────────────────────────────────── */
@@ -5168,6 +6090,7 @@ static int futex_wake_n(uint32_t uaddr, int is_private, uint32_t phys,
             struct proc *p = &ptable[i];
             if (FUTEX_MATCH(p)) {
                 p->sleep_chan = (void *)0; p->wake_tick = 0;
+                p->futex_wait = 2;         /* woken by a FUTEX_WAKE */
                 p->state = PROC_RUNNABLE; woken++;
             }
         }
@@ -5181,6 +6104,7 @@ static int futex_wake_n(uint32_t uaddr, int is_private, uint32_t phys,
             }
             if (!best) break;
             best->sleep_chan = (void *)0; best->wake_tick = 0;
+            best->futex_wait = 2;          /* woken by a FUTEX_WAKE */
             best->state = PROC_RUNNABLE; woken++;
         }
     }
@@ -5190,10 +6114,6 @@ static int futex_wake_n(uint32_t uaddr, int is_private, uint32_t phys,
 }
 
 /* ── sys_futex(uaddr, op, val, timeout, uaddr2, val3) — EAX=240 ─────────── */
-/*
- * Only FUTEX_WAIT(0), FUTEX_WAKE(1), and their _PRIVATE variants (|128) are
- * needed for musl's mutex/condvar.  Everything else returns -ENOSYS.
- */
 static int sys_futex(registers_t *regs, int time64) {
     uint32_t *uaddr = (uint32_t *)(uintptr_t)regs->ebx;
     int       raw_op = (int)regs->ecx;
@@ -5211,15 +6131,6 @@ static int sys_futex(registers_t *regs, int time64) {
      * its timeout makes a thread that's waiting "up to N ms for the next frame"
      * sleep FOREVER (the compositor/refresh-driver hang).  Convert the timeout
      * to a relative tick deadline (wake_tick) so scheduler_tick wakes us. */
-    /* [fk] trace the content-fork thread's futex WAITs after it forks — does it
-     * block, and on what?  (Compact, capped.) */
-    if (g_forker_tid && current_proc && current_proc->pid == g_forker_tid &&
-        (op == 0 || op == 9)) {
-        static int fkw = 0;
-        if (fkw < 40) { fkw++;
-            printk("[fk] tid=%d WAIT %x op=%d\n", current_proc->pid,
-                   (unsigned)(uintptr_t)uaddr, op); }
-    }
     if (op == 0 || op == 9) {  /* FUTEX_WAIT / FUTEX_WAIT_BITSET */
         uint32_t cur = 0;
         int cr = copy_from_user(&cur, uaddr, sizeof(cur));
@@ -5239,50 +6150,31 @@ static int sys_futex(registers_t *regs, int time64) {
                     return -14;
                 tsec = ts.s; tnsec = ts.ns;
             }
-            uint32_t now = pit_ticks();
-            int32_t rel_ms;
+            /* Both forms become an ABSOLUTE deadline on the fine-grained
+             * monotonic clock, and the wake tick is the first tick at or
+             * AFTER it (Linux arms an hrtimer on the absolute deadline, so a
+             * futex timeout never fires early).  The old code converted an
+             * absolute deadline through the 10 ms tick counter and then
+             * TRUNCATED the relative milliseconds to whole ticks, which could
+             * wake a waiter up to a tick early. */
+            struct kdeadline dl;
             if (op == 9) {      /* WAIT_BITSET → timeout is ABSOLUTE */
-                int32_t now_sec  = (int32_t)(now / 100);
-                if (clock_realtime) now_sec += (int32_t)rtc_boot_epoch();
-                int32_t now_nsec = (int32_t)((now % 100) * 10000000);
-                int32_t rel_sec  = (int32_t)tsec - now_sec;
-                if (rel_sec > 2000000) rel_sec = 2000000;   /* clamp (no overflow) */
-                if (rel_sec < -2000000) rel_sec = -2000000;
-                rel_ms = rel_sec * 1000 + (tnsec - now_nsec) / 1000000;
+                int64_t ds = tsec;
+                if (clock_realtime) ds -= (int64_t)rtc_boot_epoch();
+                if (ds < 0) return -110;                    /* -ETIMEDOUT */
+                if (ds > 2000000) ds = 2000000;             /* clamp */
+                dl.sec  = (uint32_t)ds;
+                dl.nsec = (uint32_t)tnsec;
+                if (dl.nsec >= 1000000000U) return -22;     /* -EINVAL */
+                if (deadline_expired(&dl)) return -110;     /* already past */
             } else {            /* WAIT → timeout is RELATIVE */
                 if (tsec > 2000000) tsec = 2000000;
-                rel_ms = (int32_t)tsec * 1000 + tnsec / 1000000;
+                if (tnsec < 0 || tnsec >= 1000000000) return -22;
+                if (tsec == 0 && tnsec == 0) return -110;   /* zero: immediate */
+                deadline_set(&dl, (uint32_t)tsec, (uint32_t)tnsec);
             }
-            if (rel_ms <= 0) return -110;   /* -ETIMEDOUT: already expired */
-            uint32_t ticks = (uint32_t)rel_ms / 10;          /* 100 Hz */
-            if (!ticks) ticks = 1;
-            current_proc->wake_tick = now + ticks;
+            current_proc->wake_tick = deadline_wake_tick(&dl);
         }
-        {
-            static int fw = 0;
-            uint32_t a = (uint32_t)(uintptr_t)uaddr;
-            /* Broadened: log ALL firefox futex WAITs (any address) during the IPC
-             * launch window, so content-CHILD futexes on the stack (0x5bxxxxxx)
-             * are captured too — needed to find which WAIT addr never gets a WAKE
-             * (lost signal vs signaler-never-runs). */
-            if (fw < 400 && current_proc && g_ipc_launch_started &&
-                current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-                current_proc->name[4]=='f') {
-                fw++; printk("[fxw] pid=%d t%d WAIT %x val=%x op=%d\n",
-                             current_proc->pid, current_proc->tgid,
-                             (unsigned)a, (unsigned)val, op);
-            }
-        }
-        if (g_ipc_launch_tid && current_proc->pid == g_ipc_launch_tid) {
-            g_ipclaunch_waitaddr = (uint32_t)(uintptr_t)uaddr;
-            static int il = 0;
-            if (il < 40) { il++; printk("[ilfx] WAIT %x val=%x op=%d\n",
-                                        (unsigned)(uintptr_t)uaddr, (unsigned)val, op); }
-        }
-        /* op 9 (WAIT_BITSET) is what glibc 2.36's condvar uses (both timed and
-         * untimed via FUTEX_BITSET_MATCH_ANY); op 0 is mutex/raw-futex.  Only
-         * condvar waiters may be spuriously woken by the lost-wakeup safety net. */
-        current_proc->futex_cond = (op == 9);
         current_proc->futex_wait = 1;
         /* Address-space-scoped futex key (mirrors Linux get_futex_key): private
          * futexes match by (tgid, uaddr); shared by physical page.  A shared futex
@@ -5295,36 +6187,19 @@ static int sys_futex(registers_t *regs, int time64) {
             current_proc->futex_shared = (!is_private && fphys) ? 1 : 0;
             current_proc->futex_phys   = fphys;
         }
-        fx_capture_wait_bt(regs);   /* [wbt] snapshot where this thread parks */
-        /* [wfph] record the WaitForProcessHandle condvar address (STICKY, precise):
-         * only when the MAIN thread's captured backtrace contains WaitForProcessHandle
-         * (libxul base 0x43300000 + 0x1596184 = 0x48c9d184, ±0x40).  Once set, do
-         * NOT overwrite — so the WAKE path decisively shows whether THIS specific
-         * condvar is ever signaled (launcher Notify reached kernel) vs never. */
-        if (op == 9 && current_proc->pid == current_proc->tgid &&
-            g_ipc_launch_started && g_wfph_watch_addr == 0 &&
-            current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-            current_proc->name[4]=='f') {
-            for (int k = 0; k < current_proc->wait_bt_n; k++) {
-                int32_t dd = (int32_t)(current_proc->wait_bt[k] - 0x48c9d184u);
-                if (dd > -0x40 && dd < 0x40) {
-                    g_wfph_watch_addr = (uint32_t)(uintptr_t)uaddr;
-                    g_wfph_watch_tgid = current_proc->tgid;
-                    printk("[wfph] WATCH set addr=%x tgid=%d (WaitForProcessHandle)\n",
-                           (unsigned)(uintptr_t)uaddr, current_proc->tgid);
-                    break;
-                }
-            }
-        }
-        sleep_on((void *)uaddr);
-        current_proc->futex_cond = 0;
+        int timed_out = sleep_on((void *)uaddr);
+        int woken = (current_proc->futex_wait == 2);
         current_proc->futex_wait = 0;
-        current_proc->wake_tick = 0;
-        /* SIGKILL must abort (uncatchable) so a futex-blocked thread returns to
-         * user mode and dies — else kill() of a thread parked here hangs. */
-        if (current_proc->pending_sigs & (1u << SIGKILL))
-            return -4;  /* -EINTR */
-        return 0;   /* glibc re-checks predicate+clock; returns ETIMEDOUT itself */
+        /* Linux kernel/futex/waitwake.c futex_wait(): a wake by FUTEX_WAKE
+         * returns 0 (checked first: "If we were woken (and unqueued), we
+         * succeeded"); deadline expiry returns -ETIMEDOUT; a signal returns
+         * -ERESTARTSYS (EINTR to the caller unless SA_RESTART re-issues the
+         * call).  Nothing else ends the wait, so glibc never sees a bare 0
+         * without a real wake. */
+        if (woken) return 0;
+        if (timed_out) return -110;                        /* -ETIMEDOUT */
+        if (signal_interrupt_pending(current_proc)) return -4;  /* -EINTR */
+        return 0;
     }
     if (op == 1 || op == 10) {  /* FUTEX_WAKE / FUTEX_WAKE_BITSET */
         if ((int)val <= 0) return 0;
@@ -5334,60 +6209,6 @@ static int sys_futex(registers_t *regs, int time64) {
             int woke = futex_wake_n((uint32_t)(uintptr_t)uaddr,
                                     is_private || !wphys, wphys,
                                     current_proc->tgid, (int)val);
-            if (woke > 0) g_futex_progress_tick = pit_ticks();  /* real handoff */
-            /* [fk] the content-fork thread issuing a WAKE = it reached a Notify
-             * (Monitor.Notify → sets/signals the WaitForProcessHandle predicate).
-             * If we see the forker WAKE but the main thread stays parked → the
-             * WAKE isn't reaching the right waiter (kernel routing).  If the
-             * forker NEVER WAKEs (only WAITs / exits) → it never Notifies. */
-            if (g_forker_tid && current_proc && current_proc->pid == g_forker_tid) {
-                static int fkk = 0;
-                if (fkk < 40) { fkk++;
-                    printk("[fk] tid=%d WAKE %x val=%d woke=%d\n",
-                           current_proc->pid, (unsigned)(uintptr_t)uaddr,
-                           (int)val, woke); }
-            }
-            /* [wfph] decisive: did ANY wake target the stuck WaitForProcessHandle
-             * condvar (±64B)?  If yes → the launch-complete cond_signal IS sent
-             * (glibc lost it = BZ#25847 = glibc 2.41 fixes it).  If we NEVER see a
-             * wake here while the main thread stays parked → the launcher never
-             * Notifies (a different, non-glibc bug). */
-            if (g_wfph_watch_addr && current_proc &&
-                current_proc->tgid == g_wfph_watch_tgid) {  /* SAME address space
-                * as the watched condvar — the ONLY wakes that touch the real
-                * WaitForProcessHandle condvar (futex addrs are per-AS). */
-                uint32_t a = (uint32_t)(uintptr_t)uaddr;
-                int32_t d = (int32_t)(a - g_wfph_watch_addr);
-                if (d > -64 && d < 64) {
-                    static int wf = 0;
-                    if (wf < 30) { wf++;
-                        printk("[wfph] FFWAKE %x (watch%+d) by pid=%d t%d val=%d woke=%d\n",
-                               (unsigned)a, (int)d, current_proc->pid,
-                               current_proc->tgid, (int)val, woke); }
-                }
-            }
-            if (g_ipclaunch_waitaddr) {
-                uint32_t a = (uint32_t)(uintptr_t)uaddr;
-                int32_t d = (int32_t)(a - g_ipclaunch_waitaddr);
-                if (d > -64 && d < 64) {     /* same condvar struct (within ±64B) */
-                    static int ilw = 0;
-                    if (ilw < 40) { ilw++;
-                        printk("[ilfx] WAKE %x (waitaddr%+d) by tid=%d woke=%d\n",
-                               (unsigned)a, (int)d, current_proc->pid, woke); }
-                }
-            }
-            static int fk = 0;
-            uint32_t a = (uint32_t)(uintptr_t)uaddr;
-            /* Broadened to match [fxw]: log ALL firefox futex WAKEs (any address)
-             * during the launch window so we can match WAIT addrs↔WAKE addrs and
-             * find the content-child WAIT that never gets a WAKE. */
-            if (fk < 400 && current_proc && g_ipc_launch_started &&
-                current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-                current_proc->name[4]=='f') {
-                fk++; printk("[fxk] pid=%d t%d WAKE %x val=%x woke=%d\n",
-                             current_proc->pid, current_proc->tgid,
-                             (unsigned)a, (unsigned)val, woke);
-            }
             return woke;
         }
     }
@@ -5410,7 +6231,6 @@ static int sys_futex(registers_t *regs, int time64) {
                        : futex_resolve_phys((uint32_t)(uintptr_t)uaddr);
         int woke = futex_wake_n((uint32_t)(uintptr_t)uaddr, is_private || !rphys,
                                 rphys, current_proc->tgid, (int)n);
-        if (woke > 0) g_futex_progress_tick = pit_ticks();
         return woke;
     }
     if (op == 5) {  /* FUTEX_WAKE_OP — wake both futexes conservatively */
@@ -5463,22 +6283,32 @@ static int sys_rename_kernel_path(const char *oldpath, const char *newpath) {
     vfs_node_t *dst_dir = vfs_open_parent_at(newpath, new_dir);
     if (!src_dir || !dst_dir) return -2;
 
-    /* Find the source node */
+    /* Find the source node.  Only its flags survive the unlink/create below:
+     * a vfs_node is not reference counted, and tmpfs_unlink() kfree()s the node
+     * it removes, so a pointer obtained before a directory is mutated must not
+     * be dereferenced after it.  Re-resolve instead. */
     vfs_node_t *src = vfs_finddir(src_dir, old_base);
     if (!src) return -2;
+    uint32_t src_flags = src->flags;
 
     /* If the target already exists, unlink it */
     vfs_unlink(dst_dir, new_base);
 
     /* Copy data into a new node then unlink the old */
     if (!dst_dir->create_fn) return -1;
-    if (dst_dir->create_fn(dst_dir, new_base, src->flags) < 0) return -1;
+    if (dst_dir->create_fn(dst_dir, new_base, src_flags) < 0) return -1;
     vfs_node_t *dst = vfs_finddir(dst_dir, new_base);
     if (!dst) return -1;
+    src = vfs_finddir(src_dir, old_base);      /* may have moved/been freed */
+    if (!src) return -2;
 
     if (!(src->flags & VFS_FLAG_DIR) && src->size > 0 && src->read_fn && dst->write_fn) {
-        /* Copy file contents in 4KiB chunks */
-        uint8_t tmp_buf[4096];
+        /* Copy file contents in 4 KiB chunks.  The buffer is heap-allocated, not
+         * a local: with it on the stack this function's frame was 5164 bytes,
+         * and a syscall that recurses into the filesystem (and can take an IRQ
+         * on the way) has no business eating a sixth of a KSTACKSIZE stack. */
+        uint8_t *tmp_buf = (uint8_t *)kmalloc(4096);
+        if (!tmp_buf) return -12;                  /* -ENOMEM */
         uint32_t copied = 0;
         while (copied < src->size) {
             uint32_t chunk = src->size - copied;
@@ -5488,6 +6318,7 @@ static int sys_rename_kernel_path(const char *oldpath, const char *newpath) {
             vfs_write(dst, copied, got, tmp_buf);
             copied += got;
         }
+        kfree(tmp_buf);
         if (dst->truncate_fn) dst->truncate_fn(dst, src->size);
     }
 
@@ -5658,39 +6489,58 @@ static int sys_rt_sigsuspend(registers_t *regs) {
         uint32_t raw = 0;
         int cr = copy_from_user(&raw, mask, sizeof(raw));
         if (cr < 0) return cr;
-        uint32_t m = raw & ~((1u << SIGKILL) | (1u << SIGSTOP));
+        uint32_t m = sigset_from_user(raw) & ~((1u << SIGKILL) | (1u << SIGSTOP));
         current_proc->blocked_sigs = m;
     }
 
-    /* Sleep until a signal wakes us (signal_send clears sleep_chan) */
-    sleep_on((void *)&sys_rt_sigsuspend);
+    /* Linux set_restore_sigmask(): stash the caller's mask instead of putting
+     * it back here, and let the signal-return path reinstate it once it has
+     * decided what to deliver (kernel/signal.c sigsuspend + signal_delivered).
+     * Restoring it here would re-block the very signal this call is waiting
+     * for, so signal_return_to_user() would see nothing deliverable, take the
+     * `restartable` path for the -ERESTARTNOHAND below, and re-enter this
+     * syscall — which finds the signal pending under the temporary mask, does
+     * not sleep, and returns -ERESTARTNOHAND again: an unbreakable spin in
+     * which the handler never runs. */
+    current_proc->saved_sigmask   = old_mask;
+    current_proc->restore_sigmask = 1;
 
-    current_proc->blocked_sigs = old_mask;
-    return -4;  /* -EINTR — always */
+    /* Sleep until a DELIVERABLE signal wakes us (signal_send only wakes for
+     * those); if one is already pending under the new mask, do not sleep.
+     * Linux sigsuspend returns -ERESTARTNOHAND: EINTR once a handler has run,
+     * a transparent restart if the signal turned out to do nothing. */
+    if (!signal_interrupt_pending(current_proc))
+        sleep_on((void *)&sys_rt_sigsuspend);
+
+    return -ERESTARTNOHAND;
 }
 
 /* ── sys_clone(flags, child_stack, ...) — EAX=120 ──────────────────────── */
-/*
- * musl calls clone() even for fork().  We only support fork-like clone
- * (no CLONE_VM — no shared address space).  If CLONE_VM is requested,
- * return -ENOSYS; otherwise treat it as fork.
- */
 /* Linux i386 clone(flags, stack, ptid, newtls, ctid) — args in EBX,ECX,EDX,ESI,EDI. */
-#define CLONE_VM             0x00000100
-#define CLONE_FILES          0x00000400
-#define CLONE_VFORK          0x00004000
-#define CLONE_THREAD         0x00010000
-#define CLONE_PARENT_SETTID  0x00100000
-#define CLONE_CHILD_CLEARTID 0x00200000
-#define CLONE_SETTLS         0x00080000
-#define CLONE_CHILD_SETTID   0x01000000
 
+/*
+ * Thread-group model (kernel/fork.c copy_process):
+ *   - no CLONE_VM            : fork.  COW copy of the address space, own group.
+ *   - CLONE_VM, no THREAD    : own thread group (tgid = pid, own signal state,
+ *                              parent = creating process) that RUNS IN THE
+ *                              CREATOR'S ADDRESS SPACE: glibc posix_spawn
+ *                              (CLONE_VM|CLONE_VFORK), vfork, Breakpad.  An
+ *                              exit_group() there ends only the child.
+ *   - CLONE_THREAD           : a thread of the creator's group (tgid inherited,
+ *                              parent inherited from the group).  Requires
+ *                              CLONE_SIGHAND, which requires CLONE_VM.
+ * The handler table is shared under CLONE_SIGHAND and copied otherwise; the fd
+ * table is shared under CLONE_FILES and copied otherwise.
+ */
 static int sys_clone(registers_t *regs) {
-    int flags = (int)regs->ebx;
+    uint32_t flags       = regs->ebx;
     uint32_t child_stack = regs->ecx;
     uint32_t uptid       = regs->edx;   /* CLONE_PARENT_SETTID target */
     uint32_t newtls      = regs->esi;   /* CLONE_SETTLS: struct user_desc* */
     uint32_t uctid       = regs->edi;   /* CLONE_CHILD_(SET|CLEAR)TID target */
+
+    if ((flags & CLONE_THREAD) && !(flags & CLONE_SIGHAND)) return -22;
+    if ((flags & CLONE_SIGHAND) && !(flags & CLONE_VM)) return -22;
 
     if (!(flags & CLONE_VM)) {
         /* No CLONE_VM → COW copy of the address space (like fork).  But if the
@@ -5698,16 +6548,9 @@ static int sys_clone(registers_t *regs) {
          * frozen snapshot onto a fresh stack and runs an entry fn), the child
          * must run on THAT stack, not the parent's — else its clone trampoline
          * pops garbage and jumps into the weeds. */
-        return do_fork(regs, child_stack);
+        return do_fork(regs, child_stack, flags, uptid, uctid);
     }
 
-    /*
-     * Thread create: share the address space.  The child gets its own proc
-     * slot, kernel stack, and trapframe; pgdir_phys is the parent's (with a
-     * share count so reaping only frees it when the last user is gone).
-     * Threads keep the leader's tgid: getpid() reports the group, gettid()
-     * the thread.  pthread_join is waitpid(tid) in this kernel.
-     */
     struct proc *parent = current_proc;
     struct proc *child;
 
@@ -5727,15 +6570,21 @@ static int sys_clone(registers_t *regs) {
     child->tf->eax = 0;                 /* clone returns 0 in the child */
     child->tf->useresp = child_stack;
 
-    child->parent = parent;
     __builtin_memcpy(child->name, parent->name, sizeof(parent->name));
-    __builtin_memcpy(child->sig_handlers, parent->sig_handlers,
-                     sizeof(parent->sig_handlers));
-    __builtin_memcpy(child->sig_flags, parent->sig_flags,
-                     sizeof(parent->sig_flags));
     child->pending_sigs  = 0;
     child->blocked_sigs  = parent->blocked_sigs;
     child->sigframe_addr = 0;
+    if (flags & CLONE_SIGHAND) {
+        /* One handler table for the group (Linux copy_sighand: refcount++). */
+        sighand_put(child->sighand);
+        child->sighand = parent->sighand;
+        child->sighand->refcount++;
+    } else if (parent->sighand) {
+        __builtin_memcpy(child->sighand->handlers, parent->sighand->handlers,
+                         sizeof(child->sighand->handlers));
+        __builtin_memcpy(child->sighand->flags, parent->sighand->flags,
+                         sizeof(child->sighand->flags));
+    }
     __builtin_memcpy(child->cwd, parent->cwd, sizeof(parent->cwd));
     child->heap_end  = parent->heap_end;
     child->umask     = parent->umask;
@@ -5750,11 +6599,21 @@ static int sys_clone(registers_t *regs) {
 
     child->pgdir_phys = parent->pgdir_phys;
     pgdir_retain(child->pgdir_phys);
-    /* Threads share the parent's thread group.  (A vfork'd process also lands
-     * here, but it EXECs immediately and sys_exec resets its tgid to its own
-     * pid — so glxtest's exit_group() no longer kills Firefox.  We can't key on
-     * CLONE_THREAD here: our native libc's threads don't set it.) */
-    child->tgid     = parent->tgid;
+
+    if (flags & CLONE_THREAD) {
+        /* Same group as the creator; the group's parent is the parent of every
+         * thread (copy_process: p->real_parent = current->real_parent), so a
+         * thread's exit is never a "child exit" for the creating thread. */
+        child->tgid   = parent->tgid;
+        child->parent = parent->parent;
+    } else {
+        /* Own group in a shared address space.  Its parent is the creating
+         * PROCESS; its VMA list and mmap cursor stay with the address-space
+         * owner (the creator's group leader), which mmap_owner() follows. */
+        child->tgid     = child->pid;
+        child->parent   = proc_group_leader(parent);
+        child->vm_owner = mmap_owner();
+    }
 
     /* CLONE_SETTLS: each thread gets its OWN TLS base (the thread pointer that
      * %gs:0 resolves to).  Read it from the user_desc the caller passed; the
@@ -5785,7 +6644,7 @@ static int sys_clone(registers_t *regs) {
         child->fdt->refcount++;
         child->ofile = child->fdt->f;
     } else {
-        /* Private copy (CLONE_VM without CLONE_FILES — rare). */
+        /* Private copy (CLONE_VM without CLONE_FILES: posix_spawn, vfork). */
         for (int i = 0; i < MAX_FD; i++) {
             child->ofile[i] = parent->ofile[i];
             fd_retain(&parent->ofile[i]);
@@ -5795,17 +6654,17 @@ static int sys_clone(registers_t *regs) {
 
     /* CLONE_VFORK: the child shares our address space; block until it execs
      * (which gives it a fresh pgdir, un-sharing) or exits.  Without this the
-     * child runs concurrently in the shared address space and races us. */
+     * child runs concurrently in the shared address space and races us.  The
+     * wait is killable only (kernel/fork.c wait_for_vfork_done: TASK_KILLABLE),
+     * other signals are delivered once the child has gone its own way. */
     if (flags & CLONE_VFORK) {
-        printk("[launch] VFORK parent pid=%d (%s) -> child pid=%d, waiting for exec/exit\n",
-               parent->pid, parent->name, child->pid);
         child->vfork_parent = parent;
         parent->vfork_waiting = 1;
         child->state = PROC_RUNNABLE;
-        while (parent->vfork_waiting)
+        while (parent->vfork_waiting) {
+            if (parent->pending_sigs & (1u << SIGKILL)) break;
             sleep_on((void *)&parent->vfork_waiting);
-        printk("[launch] VFORK parent pid=%d resumed (child %d exec'd or exited)\n",
-               parent->pid, child->pid);
+        }
         return child->pid;
     }
 
@@ -5879,18 +6738,29 @@ static int socket_arg_count(int call) {
     case 15: return 5; /* getsockopt */
     case 16: return 3; /* sendmsg(fd, msghdr*, flags) */
     case 17: return 3; /* recvmsg(fd, msghdr*, flags) */
+    case 18: return 4; /* accept4(fd, addr, addrlen, flags) */
     default: return -1;
     }
 }
 
 /* Core of the socket API, working on an already-fetched kernel args array.
  * Shared by socketcall(102) and the direct i386 socket syscalls (359-373). */
+#define SOCK_CLOEXEC_K   0x80000
+#define SOCK_NONBLOCK_K  0x800
 static int socketcall_core(int call, uint32_t *kargs) {
+    /* accept4(fd, addr, addrlen, flags) is socketcall index 18 (Linux
+     * SYS_ACCEPT4).  Its SOCK_CLOEXEC/SOCK_NONBLOCK apply to the NEW
+     * descriptor only (net/socket.c __sys_accept4), so carry them aside and
+     * run the ordinary accept path. */
+    int accept4_flags = 0;
+    if (call == 18) { accept4_flags = (int)kargs[3]; call = 5; }
+
     /* musl ORs SOCK_NONBLOCK (0x800) / SOCK_CLOEXEC (0x80000) into type */
     if (call == 1) { /* socket(domain, type, protocol) */
         int domain   = (int)kargs[0];
         int type     = (int)kargs[1] & 0xFF;
-        int nonblock = ((int)kargs[1] & 0x800) != 0;
+        int nonblock = ((int)kargs[1] & SOCK_NONBLOCK_K) != 0;
+        int cloexec  = ((int)kargs[1] & SOCK_CLOEXEC_K) != 0;
 
         if (domain == AF_UNIX_K) {           /* AF_UNIX local socket */
             usocket_t *us = usocket_create(type);
@@ -5901,6 +6771,7 @@ static int socketcall_core(int call, uint32_t *kargs) {
                     current_proc->ofile[fd].usock = us;
                     current_proc->ofile[fd].flags =
                         O_RDWR | (nonblock ? O_NONBLOCK : 0);
+                    current_proc->ofile[fd].cloexec = (uint8_t)cloexec;
                     return fd;
                 }
             }
@@ -5918,6 +6789,7 @@ static int socketcall_core(int call, uint32_t *kargs) {
                 current_proc->ofile[fd].socket = sock;
                 current_proc->ofile[fd].flags =
                     O_RDWR | (nonblock ? O_NONBLOCK : 0);
+                current_proc->ofile[fd].cloexec = (uint8_t)cloexec;
                 return fd;
             }
         }
@@ -5927,13 +6799,6 @@ static int socketcall_core(int call, uint32_t *kargs) {
 
     if (call == 8) { /* socketpair(domain, type, protocol, sv[2]) */
         int domain = (int)kargs[0];
-        if (current_proc && current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-            current_proc->name[4]=='f') {
-            printk("[ipc] pid=%d socketpair domain=%d type=%d\n",
-                   current_proc->pid, domain, (int)kargs[1]);
-            extern volatile int g_ipc_launch_started;
-            g_ipc_launch_started = 1;            /* arm the launcher syscall trace */
-        }
         if (domain != AF_UNIX_K) return -95;     /* only AF_UNIX pairs */
         uint32_t *usv = (uint32_t *)(uintptr_t)kargs[3];
         if (!access_ok(usv, 2 * sizeof(uint32_t))) return -14;
@@ -5949,13 +6814,16 @@ static int socketcall_core(int call, uint32_t *kargs) {
             usocket_release(a); usocket_release(b);
             return -24;
         }
-        int nb = ((int)kargs[1] & 0x800) != 0;
+        int nb = ((int)kargs[1] & SOCK_NONBLOCK_K) != 0;
+        int ce = ((int)kargs[1] & SOCK_CLOEXEC_K) != 0;
         current_proc->ofile[fda].type = FD_USOCKET;
         current_proc->ofile[fda].usock = a;
         current_proc->ofile[fda].flags = O_RDWR | (nb ? O_NONBLOCK : 0);
+        current_proc->ofile[fda].cloexec = (uint8_t)ce;
         current_proc->ofile[fdb].type = FD_USOCKET;
         current_proc->ofile[fdb].usock = b;
         current_proc->ofile[fdb].flags = O_RDWR | (nb ? O_NONBLOCK : 0);
+        current_proc->ofile[fdb].cloexec = (uint8_t)ce;
         uint32_t sv[2] = { (uint32_t)fda, (uint32_t)fdb };
         if (copy_to_user(usv, sv, sizeof(sv)) < 0) return -14;
         return 0;
@@ -6003,7 +6871,10 @@ static int socketcall_core(int call, uint32_t *kargs) {
                 if (current_proc->ofile[nfd].type == FD_NONE) {
                     current_proc->ofile[nfd].type  = FD_USOCKET;
                     current_proc->ofile[nfd].usock = ns;
-                    current_proc->ofile[nfd].flags = O_RDWR;
+                    current_proc->ofile[nfd].flags = O_RDWR |
+                        ((accept4_flags & SOCK_NONBLOCK_K) ? O_NONBLOCK : 0);
+                    current_proc->ofile[nfd].cloexec =
+                        (accept4_flags & SOCK_CLOEXEC_K) ? 1 : 0;
                     return nfd;
                 }
             usocket_release(ns);
@@ -6311,7 +7182,7 @@ static int sys_socket_direct(registers_t *regs, int which) {
     case 361: return socketcall_core(2,  kargs);   /* bind */
     case 362: return socketcall_core(3,  kargs);   /* connect */
     case 363: return socketcall_core(4,  kargs);   /* listen */
-    case 364: return socketcall_core(5,  kargs);   /* accept4 → accept */
+    case 364: return socketcall_core(18, kargs);   /* accept4 (flags honoured) */
     case 365: return socketcall_core(15, kargs);   /* getsockopt */
     case 366: return socketcall_core(14, kargs);   /* setsockopt */
     case 367: return socketcall_core(6,  kargs);   /* getsockname */
@@ -6375,6 +7246,7 @@ void syscall_dispatch(registers_t *regs) {
     case 37:  ret = sys_kill(regs);            break;
     case 38:  ret = sys_rename(regs);          break;
     case 39:  ret = sys_mkdir(regs);           break;
+    case 40:  ret = sys_rmdir(regs);           break;
     case 41:  ret = sys_dup(regs);             break;
     case 42:  ret = sys_pipe(regs);            break;
     case 43:  ret = sys_times(regs);           break;
@@ -6401,8 +7273,7 @@ void syscall_dispatch(registers_t *regs) {
     case 78:  ret = sys_gettimeofday(regs);    break;
     case 82:  ret = sys_select(regs);          break;
     case 142: ret = sys_select(regs);          break;  /* _newselect */
-    case 308: ret = sys_select(regs);          break;  /* pselect6 (musl);
-        timeout is a timespec but only zero-checked; sigmask ignored */
+    case 308: ret = sys_pselect6(regs);        break;  /* pselect6 */
     case 83:  ret = sys_symlink(regs);         break;
     case 85:  ret = sys_readlink(regs);        break;
     case 88:  ret = sys_reboot(regs);          break;
@@ -6410,6 +7281,8 @@ void syscall_dispatch(registers_t *regs) {
     case 91:  ret = sys_munmap(regs);          break;
     case 92:  ret = sys_truncate(regs);        break;
     case 93:  ret = sys_ftruncate(regs);       break;
+    case 193: ret = sys_truncate64(regs);      break;
+    case 194: ret = sys_ftruncate64(regs);     break;
     case 324: ret = sys_fallocate(regs);       break;  /* fallocate */
     case 106: ret = sys_stat(regs);            break;
     case 108: ret = sys_fstat(regs);           break;
@@ -6456,7 +7329,7 @@ void syscall_dispatch(registers_t *regs) {
     case 224: ret = sys_gettid(regs);          break;
     case 243: ret = sys_set_thread_area(regs); break;
     case 252: sys_exit_group(regs);            break;  /* noreturn */
-    case 253: ret = sys_clock_nanosleep(regs); break;
+    case 267: ret = sys_clock_nanosleep(regs); break;  /* clock_nanosleep */
     case 209: ret = sys_getresuid32(regs);     break;  /* getresuid32 */
     case 211: ret = sys_getresgid32(regs);     break;  /* getresgid32 */
     case 225: ret = 0;                         break;  /* readahead: no-op */
@@ -6484,7 +7357,7 @@ void syscall_dispatch(registers_t *regs) {
     case 355: ret = sys_getrandom(regs);       break;
     case 383: ret = sys_statx(regs);           break;  /* statx (fontconfig) */
     case 403: ret = sys_clock_gettime64(regs); break;  /* clock_gettime64 */
-    case 407: ret = sys_clock_nanosleep(regs); break;  /* clock_nanosleep_time64 */
+    case 407: ret = sys_clock_nanosleep_time64(regs); break;
     case 422: ret = sys_futex(regs, 1);        break;  /* futex_time64 (64-bit ts) */
     /* chmod/chown stubs */
     case 15:  ret = sys_chmod(regs);           break;
@@ -6495,7 +7368,7 @@ void syscall_dispatch(registers_t *regs) {
     case 240: ret = sys_futex(regs, 0);        break;  /* futex (32-bit ts) */
     case 116: ret = sys_sysinfo(regs);         break;
     case 90:  ret = sys_mmap_old(regs);        break;
-    case 163: ret = -12;                       break;  /* mremap: ENOMEM */
+    case 163: ret = sys_mremap(regs);          break;
     case 191: ret = sys_ugetrlimit(regs);      break;  /* ugetrlimit */
     case 199: ret = sys_getuid(regs);          break;  /* getuid32 */
     case 200: ret = sys_getgid(regs);          break;  /* getgid32 */
@@ -6508,8 +7381,13 @@ void syscall_dispatch(registers_t *regs) {
     case 143: ret = sys_flock(regs);           break;
     case 145: ret = sys_readv(regs);           break;
     case 218: ret = sys_mincore(regs);         break;
+    case 144: ret = sys_msync(regs);           break;
+    case 150: case 151: case 152: case 153:
+              ret = sys_mlock_noop(regs);      break;  /* mlock/munlock/mlockall/munlockall */
+    case 13:  ret = sys_time(regs);            break;
     case 219: ret = sys_madvise(regs);         break;
     case 270: ret = sys_tgkill(regs);          break;
+    case 238: ret = sys_tkill(regs);           break;
     case 331: ret = sys_pipe2(regs);           break;
     case 102: ret = sys_socketcall(regs);      break;
     /* Direct i386 socket syscalls (modern musl uses these, not socketcall). */
@@ -6545,6 +7423,7 @@ void syscall_dispatch(registers_t *regs) {
         break;
 
     case 296: ret = sys_mkdirat(regs);         break;
+    case 297: ret = sys_mknodat(regs);         break;
     case 300: ret = sys_fstatat64(regs);       break;
     case 301: ret = sys_unlinkat(regs);        break;
     case 302: ret = sys_renameat(regs);        break;
@@ -6600,37 +7479,6 @@ void syscall_dispatch(registers_t *regs) {
         }
     }
 
-    /* [lt] launcher syscall trace: after Firefox creates the IPC channel
-     * socketpair, log every syscall from a NON-main firefox thread so we can see
-     * exactly where the IPC child launch stalls before reaching fork. */
-    if (g_ipc_launch_started && current_proc && current_proc->pid != current_proc->tgid &&
-        current_proc->name[0]=='f' && current_proc->name[1]=='i' && current_proc->name[4]=='f') {
-        /* Trace EVERY syscall from the "IPC Launch" thread specifically — it
-         * runs DoSetup/DoLaunch (fork+exec).  If it stalls before fork, the last
-         * syscall here is where.  futex(240)/futex_time64(403) idle-waits are
-         * skipped to cut noise. */
-        if (g_ipc_launch_tid && current_proc->pid == g_ipc_launch_tid &&
-            num != 240 && num != 403) {
-            static int lt2 = 0;
-            if (lt2 < 400) { lt2++;
-                printk("[ipclaunch] sys=%u ret=%d ebx=%x ecx=%x\n",
-                       (unsigned)num, ret, (unsigned)regs->ebx, (unsigned)regs->ecx);
-            }
-        }
-        /* [postfork] Any firefox thread that forked a child (clone/fork returned a
-         * positive pid) then blocks — trace its subsequent blocking reads/polls so
-         * we can see the post-fork sync-pipe wait that gates mProcessState (the
-         * WaitForProcessHandle predicate).  num 120=clone 2=fork; 3=read 168=poll
-         * 142=select 145=readv. */
-        if ((num == 3 || num == 168 || num == 142 || num == 145) && (int)ret < 0) {
-            static int pf = 0;
-            if (pf < 60) { pf++;
-                printk("[postfork] pid=%d sys=%u ret=%d fd=%x\n",
-                       current_proc->pid, (unsigned)num, ret, (unsigned)regs->ebx);
-            }
-        }
-    }
-
     /* [einval-trace] catch any EINVAL returned to a firefox thread (the glxtest
      * "poll failed: Invalid argument" culprit). */
     if (ret == -22 && current_proc && current_proc->name[0]=='f' &&
@@ -6643,8 +7491,10 @@ void syscall_dispatch(registers_t *regs) {
         }
     }
 
-    /* Deliver any pending signals before returning to user mode */
-    signal_deliver_pending(regs);
+    /* Deliver any pending signals before returning to user mode; an
+     * interrupted blocking call is restarted or fails with EINTR here (the
+     * syscall number lets the restart re-issue it). */
+    signal_return_to_user(regs, (int)num);
 
     /* Linux-style wakeup preemption: if this syscall woke another thread, yield
      * at the return-to-user boundary so the woken thread runs promptly (closes

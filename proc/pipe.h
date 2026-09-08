@@ -32,9 +32,6 @@ int pipe_read(pipe_buf_t *p, char *buf, int len, int nonblock);
  */
 int pipe_write(pipe_buf_t *p, const char *buf, int len, int nonblock);
 
-/* Inject one wakeup byte (epoll self-heal for a libevent self-pipe). */
-int pipe_inject_byte(pipe_buf_t *p);
-
 /* Called when a read-end FD is closed; frees pipe if both ends gone. */
 void pipe_close_read(pipe_buf_t *p);
 

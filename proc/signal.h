@@ -50,12 +50,56 @@ typedef struct {
     char _pad[116];
 } siginfo_t;
 
+/* Kernel-internal restart codes (never visible to user space; the values are
+ * Linux's include/linux/errno.h ones).  A blocking syscall that is interrupted
+ * by a signal returns one of these; signal_return_to_user() decides what the
+ * caller sees, exactly as Linux's handle_signal()/arch do_signal() do:
+ *   -EINTR (4)            : behaves like Linux -ERESTARTSYS.  If a handler runs
+ *                           and was installed with SA_RESTART, the syscall is
+ *                           re-executed with its original number; otherwise the
+ *                           user sees EINTR.  If no handler runs (the signal was
+ *                           a stop signal or has since become ignored) the
+ *                           syscall is always restarted.
+ *   -ERESTARTNOHAND (514) : restarted only if NO handler runs; when a handler
+ *                           runs the user always sees EINTR regardless of
+ *                           SA_RESTART.  This is what Linux returns from poll,
+ *                           select, epoll_wait, nanosleep and sigsuspend
+ *                           (fs/select.c do_sys_poll, kernel/time/hrtimer.c
+ *                           nanosleep, kernel/signal.c sigsuspend). */
+#define ERESTARTNOHAND  514
+
+/* Shared signal-handler table (Linux struct sighand_struct, kernel/fork.c
+ * copy_sighand).  Threads created with CLONE_SIGHAND (which CLONE_THREAD
+ * requires) share ONE table, so a sigaction() issued by any thread is in force
+ * for every thread of the process; fork() copies it; exec resets it. */
+struct sighand {
+    int          refcount;
+    sighandler_t handlers[NSIGS];   /* per-signal: SIG_DFL/SIG_IGN/fn */
+    uint32_t     flags[NSIGS];      /* per-signal sa_flags (SA_RESTART etc.) */
+};
+struct sighand *sighand_alloc(void);                 /* zeroed table, refcount=1 */
+struct sighand *sighand_copy(struct sighand *src);   /* private copy, refcount=1 */
+void            sighand_put(struct sighand *sh);     /* decref; free at 0 */
+
 /* Forward declarations */
 struct proc;
 struct registers;
 
-/* Set signal sig pending on process p; wake it if sleeping */
+/* Queue sig on the single thread p (Linux send_signal for a thread-directed
+ * signal: tgkill, a synchronous fault).  Wakes p only when the signal is
+ * deliverable to it (unblocked and neither ignored nor default-ignored); an
+ * ignored signal is discarded like Linux sig_ignored(). */
 void signal_send(struct proc *p, int sig);
+
+/* Process-directed signal (kill, SIGCHLD, tty signals): queue sig on ONE thread
+ * of p's thread group that does not block it, preferring the group leader, as
+ * Linux complete_signal() does.  If every thread blocks it, it stays pending on
+ * the leader until unblocked. */
+void signal_send_group(struct proc *p, int sig);
+
+/* Deliver sig to every process whose pgrp is pg (one thread per process).
+ * Returns the number of processes signalled. */
+int signal_send_pgrp(int pg, int sig);
 
 /*
  * True if p has a pending unblocked signal that will actually do something
@@ -67,9 +111,19 @@ void signal_send(struct proc *p, int sig);
 int signal_interrupt_pending(struct proc *p);
 
 /*
- * Check and deliver pending signals for current_proc.
- * Called at the end of every syscall before returning to user mode.
- * regs is the trapframe; may not return if a fatal signal kills the process.
+ * Check and deliver pending signals for current_proc before it returns to
+ * user mode.  regs is the trapframe; may not return if a fatal signal ends the
+ * process.  syscall_nr is the number of the syscall being returned from (so an
+ * interrupted call can be restarted), or -1 when returning from an interrupt
+ * or exception.
  */
-void signal_deliver_pending(struct registers *regs);
+void signal_return_to_user(struct registers *regs, int syscall_nr);
+static inline void signal_deliver_pending(struct registers *regs) {
+    signal_return_to_user(regs, -1);
+}
 int  sigreturn_restore(struct registers *regs, uint32_t addr, uint32_t marker);
+
+/* Start a group exit (Linux do_group_exit): freeze `status` as the process's
+ * exit status, SIGKILL every other thread of the calling thread's group, then
+ * exit the calling thread.  status is already wait-encoded (see proc_exit). */
+void proc_group_exit(int status) __attribute__((noreturn));

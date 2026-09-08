@@ -56,6 +56,16 @@ typedef struct vfs_node {
     int               (*write_ready_fn)(struct vfs_node *);
     void              (*retain_fn) (struct vfs_node *);
     void              (*close_fn)  (struct vfs_node *);
+    /* Cloning device (Linux /dev/ptmx): the node a *lookup* returns only
+     * describes the device, and the node a *descriptor* holds is a fresh one
+     * this hook allocates.  The open path calls it once the open is certain to
+     * succeed — after the permission check and after a free descriptor slot has
+     * been found — and retains whatever it returns, so a lookup that never
+     * becomes an open (stat, access, execve, a failed open) reserves nothing.
+     * Returning NULL means the device has no capacity left; the open then fails
+     * exactly as a missing node would.  A finddir_fn that allocates per lookup
+     * instead of setting this leaks on every stat(). */
+    struct vfs_node * (*open_fn)   (struct vfs_node *);
     /* Persist mode/uid/gid changes (chmod/chown); NULL = in-memory only. */
     int               (*setattr_fn)(struct vfs_node *, uint32_t mode,
                                     uint32_t uid, uint32_t gid);

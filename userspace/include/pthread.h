@@ -3,9 +3,11 @@
 /*
  * pthread-lite for MaeroOS.
  *
- * Threads are kernel tasks sharing the address space (clone + CLONE_VM);
- * a pthread_t is the kernel tid and pthread_join is waitpid(tid).
- * Mutexes are futex-backed.  Known limit: errno is process-global.
+ * Threads are kernel tasks in the caller's thread group (clone with
+ * CLONE_VM | CLONE_THREAD | CLONE_SIGHAND ...); a pthread_t is the kernel tid
+ * and pthread_join waits on the thread's tid word (CLONE_CHILD_CLEARTID
+ * futex), like NPTL.  At most 64 live threads per process.  Mutexes are
+ * futex-backed.  Known limit: errno is process-global.
  */
 
 typedef int pthread_t;

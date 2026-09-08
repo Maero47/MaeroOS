@@ -77,6 +77,13 @@ void scheduler_start(void) {
 
             __asm__ volatile("mov %0, %%cr3" :: "r"(kernel_pgdir_phys) : "memory");
             current_proc = NULL;
+            /* A non-leader thread that just exited is released here, on the
+             * scheduler's own stack, now that its kernel stack is no longer in
+             * use.  Linux release_task()s such threads immediately in
+             * exit_notify(): they are never reported by wait(), only the group
+             * leader is (once every thread is gone). */
+            if (p->state == PROC_ZOMBIE && p->pid != p->tgid)
+                proc_release(p);
             __asm__ volatile("sti");
         }
 
@@ -106,148 +113,19 @@ void scheduler_start(void) {
     }
 }
 
-extern volatile int g_ipc_launch_started;   /* set when Firefox starts an IPC launch */
-extern volatile uint32_t g_futex_progress_tick;  /* pit_ticks of last real futex handoff */
-
 void scheduler_tick(int user_mode) {
     uint32_t now = pit_ticks();
     for (int i = 0; i < MAX_PROCS; i++) {
         struct proc *p = &ptable[i];
         if (p->state == PROC_SLEEPING && p->wake_tick &&
             (int32_t)(now - p->wake_tick) >= 0) {
+            /* Deadline expiry is the only wake that means "timed out"; record
+             * it so sleep_on() can tell its caller (FUTEX_WAIT -> -ETIMEDOUT,
+             * poll/select -> 0) instead of the caller guessing from the clock. */
             p->wake_tick = 0;
             p->sleep_chan = (void *)0;
+            p->sleep_timed_out = 1;
             p->state = PROC_RUNNABLE;
-        }
-    }
-
-    /* ── glibc-2.36 condvar lost-wakeup safety net (BZ#25847) ────────────────
-     * The glibc on disk (2.36) has the pthread_cond_signal lost-wakeup bug
-     * (fixed in glibc 2.41): "undoing stealing" across condvar group rotations
-     * can deliver a signal to a g_signals group with NO waiter (seen as
-     * FUTEX_WAKE woke=0 loops) while the real waiters sit in the other group —
-     * the wakeup is lost and they park forever.  POSIX explicitly permits
-     * spurious condvar wakeups and glibc re-checks its predicate in a loop, so
-     * spuriously waking a parked futex waiter is ALWAYS safe — at worst it
-     * re-sleeps.  Now that SMP runs the producer concurrently the predicate
-     * genuinely gets set, so a spurious wake recovers the lost notification
-     * (pre-SMP this failed because the producer itself was stuck).
-     *
-     * Fire only on a detected STALL: several futex waiters parked AND no
-     * successful condvar handoff (FUTEX_WAKE woke>0) for ~100 ms.  This covers
-     * every phase (content-process launch AND compositor), costs nothing during
-     * normal operation, and self-terminates the instant progress resumes (a
-     * recovered handoff bumps g_futex_progress_tick).  Covers BOTH timed
-     * (pthread_cond_timedwait) and untimed waiters. */
-    {
-        /* PER-WAITER recovery: a global "no handoff" metric is masked by the
-         * pipeline's background condvar traffic (~half the wakes still land,
-         * woke>0), so detect the stall PER WAITER via how long it's been parked.
-         * Spurious-wake any CONDVAR (op=9) waiter parked >= PARK_TICKS; glibc
-         * re-checks its predicate, so for a BZ#25847 lost signal (predicate
-         * already set by the now-concurrent producer) it proceeds, and for a
-         * genuinely-idle waiter it just re-sleeps.  Self-rate-limited: re-sleep
-         * resets sleep_tick, so a still-blocked waiter isn't re-pinged for
-         * another PARK_TICKS.  Gated to >=4 condvar waiters so it stays off
-         * during the smokes / idle single-threaded apps. */
-        const uint32_t PARK_TICKS = 15;   /* 150 ms parked → re-deliver */
-        int cwaiters = 0;
-        for (int i = 0; i < MAX_PROCS; i++) {
-            struct proc *p = &ptable[i];
-            if (p->state == PROC_SLEEPING && p->futex_cond) cwaiters++;
-        }
-        /* Spurious-wake only CONDVAR (op=9) waiters: POSIX guarantees condvar
-         * waiters re-check their predicate, so this can NEVER corrupt correct
-         * code, and it recovers a genuine BZ#25847 lost signal (predicate set,
-         * notification lost).  NB: waking mutex/raw-futex (op=0) waiters too was
-         * tried (to chase a deeper mutex-domain ordering logjam) — the gentle
-         * per-waiter form didn't advance and the aggressive global form crashed
-         * (over-churn races), so it's NOT done: that residual stall is an
-         * emergent scheduling/ordering issue, not a lost wakeup, and is properly
-         * fixed by glibc 2.41 (see [[glibc-condvar-lost-wakeup]]). */
-        if (cwaiters >= 4) {
-            for (int i = 0; i < MAX_PROCS; i++) {
-                struct proc *p = &ptable[i];
-                if (p->state != PROC_SLEEPING || !p->futex_cond) continue;
-                if ((uint32_t)(now - p->sleep_tick) < PARK_TICKS) continue;
-                uint32_t ch = (uint32_t)(uintptr_t)p->sleep_chan;
-                if (ch >= 0x1000 && ch < 0xC0000000U) {
-                    p->sleep_chan = (void *)0;
-                    p->wake_tick  = 0;
-                    p->state      = PROC_RUNNABLE;
-                }
-            }
-        }
-
-        /* ── Aggressive multiprocess-deadlock recovery ───────────────────────
-         * The remaining Firefox blocker is a multiprocess STARTUP deadlock: the
-         * IPC-launch parent waits forever on a handshake condvar that a CHILD
-         * thread should signal, but the child is itself wedged on a futex (a
-         * glibc-2.36 condvar/mutex ordering issue under our scheduler) and never
-         * signals → both sides park forever.  The op=9-only net above can't break
-         * it: the stuck child waits on a MUTEX (op=0), and the parent's predicate
-         * is genuinely unset (the signal never came).  So, ONLY while a Firefox
-         * IPC launch is in flight AND nothing has handed off for a while, wake
-         * EVERY long-parked futex waiter (op=0 mutex + op=9 condvar) so each
-         * re-checks its predicate and re-sorts — forcing the wedged child to make
-         * progress and eventually signal the parent.  Safe: every glibc futex
-         * re-checks on wake and re-sleeps if its predicate is unmet (a mutex
-         * waiter whose lock is still held just re-blocks).  This was tried before
-         * and "crashed", but that was the now-fixed shared-address-space
-         * corruption ([[smp-fill-before-map]]), not the wake itself — re-enabled
-         * now that the corruption root cause is gone.  Gated tight (launch active
-         * + 250 ms global stall) so it never runs during normal operation. */
-        if (g_ipc_launch_started &&
-            (uint32_t)(now - g_futex_progress_tick) >= 25) {   /* 250 ms no handoff */
-            {   /* [wbt] dump: on a persistent stall, print each parked firefox
-                 * thread's captured user backtrace (call-preceded libxul return
-                 * addresses stashed at block time by fx_capture_wait_bt) for
-                 * offline symbolization against the Mozilla .sym file.  Every
-                 * 8th sweep ≈ one dump per ~2 s of continuous stall; capped. */
-                static uint32_t wbt_sweeps = 0, wbt_dumps = 0;
-                wbt_sweeps++;
-                if ((wbt_sweeps % 8) == 1 && wbt_dumps < 10) {
-                    wbt_dumps++;
-                    for (int i = 0; i < MAX_PROCS; i++) {
-                        struct proc *p = &ptable[i];
-                        if (p->state != PROC_SLEEPING || !p->wait_bt_n) continue;
-                        if (!(p->name[0]=='f' && p->name[1]=='i' &&
-                              p->name[4]=='f')) continue;
-                        printk("[wbt] pid=%d t%d cond=%d fx=%d chan=%x park=%u:",
-                               p->pid, p->tgid, p->futex_cond, p->futex_wait,
-                               (unsigned)(uintptr_t)p->sleep_chan,
-                               (unsigned)(now - p->sleep_tick));
-                        for (int k = 0; k < p->wait_bt_n; k++)
-                            printk(" %x", (unsigned)p->wait_bt[k]);
-                        printk("\n");
-                    }
-                }
-            }
-            const uint32_t AGG_PARK = 20;                       /* parked ≥200 ms */
-            for (int i = 0; i < MAX_PROCS; i++) {
-                struct proc *p = &ptable[i];
-                if (p->state != PROC_SLEEPING || !p->futex_wait) continue;
-                /* Wake ONLY MUTEX (op=0) waiters, never CONDVAR (op=9) ones.
-                 * Waking a mutex waiter is provably safe: it re-checks the lock
-                 * word and re-sleeps if still held, or acquires (data consistent
-                 * because the previous holder released).  The wedged launch
-                 * child is stuck on a MUTEX, so this breaks the deadlock.
-                 * Spuriously waking a CONDVAR waiter, by contrast, can make it
-                 * proceed past an ORDERING dependency before a sibling thread has
-                 * initialised shared state → NULL deref (the content-process
-                 * SIGSEGV seen when the blunt all-futex sweep broke through).
-                 * Condvar waiters are still covered by the gentle op=9 net above
-                 * (which only recovers genuine BZ#25847 lost signals). */
-                if (p->futex_cond) continue;
-                if ((uint32_t)(now - p->sleep_tick) < AGG_PARK) continue;
-                uint32_t ch = (uint32_t)(uintptr_t)p->sleep_chan;
-                if (ch >= 0x1000 && ch < 0xC0000000U) {
-                    p->sleep_chan = (void *)0;
-                    p->wake_tick  = 0;
-                    p->state      = PROC_RUNNABLE;
-                }
-            }
-            g_futex_progress_tick = now;   /* rate-limit: one sweep per stall window */
         }
     }
 
@@ -289,15 +167,23 @@ void yield(void) {
  * Waking an arbitrary waiter feeds glibc-2.36's BZ#25847 signal-steal. */
 static uint32_t g_sleep_seq = 0;
 
-void sleep_on(void *chan) {
-    if (!current_proc) return;
+int sleep_on(void *chan) {
+    if (!current_proc) return 0;
     current_proc->sleep_chan = chan;
     current_proc->sleep_tick = pit_ticks();
     current_proc->sleep_seq  = ++g_sleep_seq;
+    current_proc->sleep_timed_out = 0;
     current_proc->state     = PROC_SLEEPING;
     __asm__ volatile("cli");
     swtch(&current_proc->context, scheduler_ctx);
     __asm__ volatile("sti");
+    /* Every wake path clears wake_tick, but make it unconditional here so a
+     * deadline set for THIS sleep can never fire into a later untimed sleep
+     * (Linux timeouts are per call: a stale one is simply not a thing). */
+    current_proc->wake_tick = 0;
+    int timed_out = current_proc->sleep_timed_out;
+    current_proc->sleep_timed_out = 0;
+    return timed_out;
 }
 
 void proc_stop_self(void) {
@@ -406,20 +292,13 @@ int wake_up_n_tgid(void *chan, int n, int tgid) {
  * boundary (after all syscall work + signal delivery, NOT mid-syscall, so no
  * non-reentrant kernel state is in flight).  If a wake happened during this
  * syscall (g_resched_pending), the waker yields so the just-woken thread runs
- * promptly — closing the wake-to-run gap that lets glibc-2.36's Riegel condvar
- * steal a signal from the IPC Launch thread.  Guarded by no_preempt so lwIP and
- * other non-reentrant sections are never interrupted. */
-extern volatile int g_ipc_launch_started;
+ * promptly (Linux try_to_wake_up -> check_preempt_curr).  Applies to every
+ * wake, not just to one application's launch phase.  Guarded by no_preempt so
+ * lwIP and other non-reentrant sections are never interrupted. */
 void resched_on_return(void) {
     if (!current_proc || current_proc->no_preempt) return;
     if (!g_resched_pending) return;
     g_resched_pending = 0;
-    /* Only apply wakeup-preemption during Firefox's content-process launch.
-     * Linux preempts on wake only for higher-priority tasks; doing it for every
-     * equal-priority round-robin wake system-wide over-yields and disturbs boot
-     * / disk I/O.  Gating on the launch phase (same as the scheduler_tick
-     * self-heal) confines it to exactly where the glibc condvar steal hurts. */
-    if (!g_ipc_launch_started) return;
     yield();
 }
 
@@ -447,30 +326,6 @@ void proc_exit(int status) {
     __asm__ volatile("cli");
     if (!current_proc) for (;;) __asm__ volatile("hlt");
 
-    /* [ff-exit-trace] When a firefox thread exits, dump its user EIP + a scan of
-     * its stack for libxul/code return addresses.  If the thread running a
-     * std::call_once static init exits mid-init, the once-flag stays stuck and
-     * the main thread (a contender) hangs forever — this catches that case.
-     * The exiting thread's pgdir is still active, so we read the stack directly. */
-    if (current_proc->tf) {
-        const char *nm = current_proc->name;
-        int isff = (nm[0]=='f'&&nm[1]=='i'&&nm[2]=='r'&&nm[3]=='e'&&nm[4]=='f');
-        if (isff) {
-            printk("[ff-exit] pid=%d tgid=%d status=%d eip=%x stk:",
-                   current_proc->pid, current_proc->tgid, status,
-                   (unsigned)current_proc->tf->eip);
-            uint32_t sp = current_proc->tf->useresp & ~3U;
-            int n = 0;
-            for (uint32_t a = sp; a < sp + 2048 && n < 16; a += 4) {
-                if (!(*paging_get_pde(a) & 1)) { a = (a & ~0x3FFFFFU) + 0x400000U - 4; continue; }
-                if (!(*paging_get_pte(a) & 1)) continue;
-                uint32_t v = *(volatile uint32_t *)(uintptr_t)a;
-                if (v >= 0x10000000U && v < 0x60000000U) { printk(" %x", (unsigned)v); n++; }
-            }
-            printk("\n");
-        }
-    }
-
     /* CLONE_VFORK: if a parent is blocked waiting for us to exec-or-exit, wake
      * it now (we're exiting without having exec'd, e.g. a failed child spawn). */
     if (current_proc->vfork_parent) {
@@ -479,6 +334,7 @@ void proc_exit(int status) {
         vp->vfork_waiting = 0;
         wake_up((void *)&vp->vfork_waiting);
     }
+    current_proc->vm_owner = NULL;
 
     /* CLONE_CHILD_CLEARTID: a joinable thread is exiting — zero its tid word
      * and futex-wake any pthread_join() waiter.  The address space is shared
@@ -546,8 +402,14 @@ void proc_exit(int status) {
         current_proc->robust_list_head = 0;
     }
 
-    current_proc->exit_status = status;
-    current_proc->state       = PROC_ZOMBIE;
+    /* Exit status, wait-encoded like Linux (exit code << 8, or the signal
+     * number): the callers pass it in that form.  Once a group exit has fixed
+     * the process's status on the leader (exit_group, fatal signal), a later
+     * death of the leader itself (SIGKILL from thread_group_kill) must not
+     * overwrite it: waitpid reports signal->group_exit_code in Linux. */
+    if (!current_proc->group_exit)
+        current_proc->exit_status = status;
+    current_proc->state = PROC_ZOMBIE;
 
     vma_clear(current_proc);   /* free demand-paged anon VMAs (no-op for threads) */
 
@@ -562,29 +424,49 @@ void proc_exit(int status) {
         vfs_close(current_proc->ctty);
         current_proc->ctty = (void *)0;
     }
+    /* Likewise the shared handler table. */
+    sighand_put(current_proc->sighand);
+    current_proc->sighand = (struct sighand *)0;
 
     /* Drop shared-memory bookkeeping (frame refs released when the pgdir is
      * torn down at reap time). */
     shm_proc_cleanup(current_proc);
 
-    /* Reparent children to init (PID 1) */
-    struct proc *init = (void *)0;
-    for (int i = 0; i < MAX_PROCS; i++)
-        if (ptable[i].pid == 1) { init = &ptable[i]; break; }
-    for (int i = 0; i < MAX_PROCS; i++)
-        if (ptable[i].parent == current_proc)
-            ptable[i].parent = init;
+    /* Linux exit_notify(): children belong to the PROCESS, and the parent is
+     * told about the PROCESS.  A non-leader thread exiting says nothing to
+     * anyone (no SIGCHLD, nothing to wait for) unless it was the last thread
+     * of a group whose leader already exited, in which case the leader's death
+     * becomes reportable now.  A leader exiting while siblings live likewise
+     * stays a zombie in silence until the last sibling is gone
+     * (kernel/exit.c release_task -> do_notify_parent(leader)). */
+    struct proc *leader   = proc_group_leader(current_proc);
+    int          is_leader = (current_proc->pid == current_proc->tgid);
+    int          notify    = 0;
+    if (is_leader) {
+        notify = proc_group_empty(current_proc);
+    } else if (leader && leader != current_proc && leader->state == PROC_ZOMBIE) {
+        notify = proc_group_empty(leader);
+    }
 
-    /* Promptly free any orphan zombies now parented to init — init reaps
-     * orphans but can be blocked in a per-child waitpid() while a burst of them
-     * (a watchdog SIGKILL of Firefox's process tree) accumulates and exhausts
-     * the process table. */
-    { extern void reap_orphan_zombies(void); reap_orphan_zombies(); }
+    if (notify && leader) {
+        /* The process is gone: reparent its children to init (PID 1) and free
+         * any orphan zombies now parented to init — init reaps orphans but can
+         * be blocked in a per-child waitpid() while a burst of them (a watchdog
+         * SIGKILL of a process tree) accumulates and exhausts the table. */
+        struct proc *init = (void *)0;
+        for (int i = 0; i < MAX_PROCS; i++)
+            if (ptable[i].pid == 1 && ptable[i].state != PROC_UNUSED) { init = &ptable[i]; break; }
+        for (int i = 0; i < MAX_PROCS; i++)
+            if (ptable[i].state != PROC_UNUSED && ptable[i].parent == leader)
+                ptable[i].parent = init;
+        { extern void reap_orphan_zombies(void); reap_orphan_zombies(); }
 
-    /* Notify parent */
-    if (current_proc->parent) {
-        signal_send(current_proc->parent, SIGCHLD);
-        wake_up(current_proc->parent);  /* wake parent from waitpid sleep */
+        /* SIGCHLD to the parent PROCESS (any thread of it that does not block
+         * it), and wake whichever of its threads sleeps in waitpid. */
+        if (leader->parent) {
+            signal_send_group(leader->parent, SIGCHLD);
+            wake_up(leader->parent);
+        }
     }
 
     swtch(&current_proc->context, scheduler_ctx);

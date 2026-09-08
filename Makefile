@@ -71,8 +71,21 @@ $(LWIP_OBJS): CFLAGS := $(LWIP_CFLAGS)
 TARGET   := kernel.elf
 QEMU_ISO_PID := .qemu-iso.pid
 
-E2FSTOOLS := /opt/homebrew/opt/e2fsprogs/sbin
-GCC_INCLUDE := $(shell $(CC) -print-file-name=include)
+# Host tool discovery.  Everything here is deferred (plain `=`) or silenced so
+# that a missing tool fails when the recipe that needs it runs, not while Make
+# parses this file.  macOS/Homebrew paths are the fallback, Linux is the default.
+# find_tool: first of the given names on PATH, else the first name looked up in
+# the usual sbin/Homebrew directories, else the bare name (so the error message
+# at use time names the missing tool).
+TOOL_DIRS := /usr/sbin /sbin /opt/homebrew/opt/e2fsprogs/sbin /usr/local/opt/e2fsprogs/sbin
+find_tool = $(shell for t in $(1); do command -v "$$t" 2>/dev/null && exit 0; done; \
+	for d in $(TOOL_DIRS); do [ -x "$$d/$(firstword $(1))" ] && echo "$$d/$(firstword $(1))" && exit 0; done; \
+	echo $(firstword $(1)))
+MKE2FS  = $(call find_tool,mke2fs mkfs.ext2)
+DEBUGFS = $(call find_tool,debugfs)
+# toybox's build scripts need GNU sed: `gsed` on macOS, plain `sed` on Linux.
+SED     = $(shell command -v gsed 2>/dev/null || echo sed)
+GCC_INCLUDE := $(shell $(CC) -print-file-name=include 2>/dev/null)
 TOYBOX_DIR := third_party/toybox
 GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null)
 TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
@@ -84,7 +97,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk repo repo-serve start resolutions icons
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk abiprobes smoke-abi smoke-firefox repo repo-serve start resolutions icons
 
 all: $(TARGET)
 
@@ -108,9 +121,14 @@ userspace:
 
 toybox: userspace
 	rm -f $(TOYBOX_DIR)/toybox $(TOYBOX_DIR)/generated/unstripped/toybox
+	# Fresh checkout: generated/ (gitignored) is created here, which would make
+	# the committed .config.maeros look stale and trigger silentoldconfig, whose
+	# kconfig/conf sources are not in the tree.  Generate first, then re-date the
+	# config so the main build never tries to reconfigure.
+	$(MAKE) -C $(TOYBOX_DIR) generated/Config.in generated/Config.probed generated/unstripped/kconfig SED=$(SED) HOSTCC=cc && touch $(TOYBOX_DIR)/.config.maeros
 	$(MAKE) -C $(TOYBOX_DIR) toybox \
 		KCONFIG_CONFIG=.config.maeros \
-		SED=gsed \
+		SED=$(SED) \
 		LDOPTIMIZE='-Wl,--gc-sections' \
 		CC=$(CC) \
 		HOSTCC=cc \
@@ -134,12 +152,14 @@ INITRD_EXCLUDE := --exclude=./cairoprobe --exclude=./pangoprobe \
 	--exclude=./firefox --exclude=./fflib \
 	--exclude=./usr/share/icons \
 	--exclude=./gtkprobe
+# COPYFILE_DISABLE=1 stops macOS tar from adding ._* AppleDouble entries; it is
+# an ordinary ignored environment variable for GNU tar on Linux.
 initrd: userspace toybox
 	COPYFILE_DISABLE=1 tar --format=ustar $(INITRD_EXCLUDE) -cf initrd.tar -C testfiles .
 	@echo "initrd.tar created."
 
 # Create an ext2 disk image populated from testfiles/.
-# Requires e2fsprogs (brew install e2fsprogs).
+# Requires e2fsprogs (apt install e2fsprogs / brew install e2fsprogs).
 #
 # DISK_SIZE_MB / DISK_PRUNE / DISK_IMG are overridable so the same recipe builds
 # both the lean default disk (used by smoke-disk / run-disk) and the large
@@ -153,22 +173,22 @@ DISK_PRUNE   ?= -path 'testfiles/firefox' -o -path 'testfiles/fflib'
 disk: userspace
 	@echo "[DISK]  Building ext2 disk image ($(DISK_SIZE_MB) MiB) -> $(DISK_IMG)..."
 	dd if=/dev/zero bs=1M count=$(DISK_SIZE_MB) 2>/dev/null | tr '\000' '\000' > $(DISK_IMG)
-	$(E2FSTOOLS)/mke2fs -t ext2 -b 1024 -F $(DISK_IMG) 2>/dev/null
+	$(MKE2FS) -t ext2 -b 1024 -F $(DISK_IMG) 2>/dev/null
 	@find testfiles \( $(DISK_PRUNE) \) -prune -o -type d -print | while read d; do \
 	    if [ "$$d" != "testfiles" ]; then \
 	        rel=$${d#testfiles/}; \
 	        echo "  [DISK]  mkdir /$$rel"; \
-	        $(E2FSTOOLS)/debugfs -w -R "mkdir /$$rel" $(DISK_IMG) || true; \
+	        $(DEBUGFS) -w -R "mkdir /$$rel" $(DISK_IMG) || true; \
 	    fi; \
 	done
 	@find testfiles \( $(DISK_PRUNE) \) -prune -o -type f -print | while read f; do \
 	    rel=$${f#testfiles/}; \
 	    echo "  [DISK]  $$f -> /$$rel"; \
-	    $(E2FSTOOLS)/debugfs -w \
+	    $(DEBUGFS) -w \
 	        -R "write $$f /$$rel" $(DISK_IMG) || true; \
 	    magic=$$(head -c4 "$$f" | od -An -tx1 | tr -d ' \n'); \
 	    if [ "$$magic" = "7f454c46" ]; then \
-	        $(E2FSTOOLS)/debugfs -w -R "sif /$$rel mode 0100755" $(DISK_IMG) \
+	        $(DEBUGFS) -w -R "sif /$$rel mode 0100755" $(DISK_IMG) \
 	            2>/dev/null || true; \
 	    fi; \
 	done
@@ -176,17 +196,25 @@ disk: userspace
 	    echo "[DISK]  Applying ownership/permission manifest..."; \
 	    grep -v '^#' tools/diskperms.txt | while read p u g m; do \
 	        [ -z "$$p" ] && continue; \
-	        $(E2FSTOOLS)/debugfs -w -R "sif /$$p uid $$u" $(DISK_IMG) 2>/dev/null || true; \
-	        $(E2FSTOOLS)/debugfs -w -R "sif /$$p gid $$g" $(DISK_IMG) 2>/dev/null || true; \
-	        $(E2FSTOOLS)/debugfs -w -R "sif /$$p mode $$m" $(DISK_IMG) 2>/dev/null || true; \
+	        $(DEBUGFS) -w -R "sif /$$p uid $$u" $(DISK_IMG) 2>/dev/null || true; \
+	        $(DEBUGFS) -w -R "sif /$$p gid $$g" $(DISK_IMG) 2>/dev/null || true; \
+	        $(DEBUGFS) -w -R "sif /$$p mode $$m" $(DISK_IMG) 2>/dev/null || true; \
 	    done; \
 	fi
 	@echo "[DISK]  Done: $(DISK_IMG)"
 
 # Large disk WITH the Firefox + glibc library trees (175 MiB libxul etc.).
 # Used to run the prebuilt Firefox ESR; see `make run-firefox`.
-disk-ff:
+# The Firefox runtime tree is gitignored; rebuild it from public sources when
+# it is missing (ports/firefox/fetch-runtime.sh, cached under ports/firefox/prebuilt).
+testfiles/firefox/firefox-bin:
+	sh ports/firefox/fetch-runtime.sh
+
+disk-ff: testfiles/firefox/firefox-bin
 	$(MAKE) disk DISK_SIZE_MB=1024 DISK_IMG=disk-ff.img DISK_PRUNE="-path testfiles/nonexistent"
+
+# -accel kvm when this user can open /dev/kvm (native speed, real CPU), else TCG.
+QEMU_ACCEL := $(shell test -r /dev/kvm -a -w /dev/kvm && echo "-accel kvm" || echo "-accel tcg")
 
 # Run in QEMU — uses built-in multiboot loader (no ISO required)
 run: $(TARGET) initrd
@@ -223,11 +251,16 @@ run-disk: $(TARGET) initrd disk
 # Boot with the Firefox disk attached (2 GiB RAM).  At the shell, run:
 #   /disk/firefox/firefox-bin --version      (proven: prints "Mozilla Firefox 115.15.0esr")
 # LD_LIBRARY_PATH and DISPLAY are pre-set by login for the GTK/X stack.
-run-firefox: $(TARGET) initrd disk-ff
+# Firefox needs the desktop, and the desktop needs a framebuffer, which only
+# the GRUB ISO path provides (gfxpayload).  The -kernel path boots without
+# /dev/fb0, so init never starts the graphical session and ff cannot run.
+# With /disk/ffauto on the disk the desktop launches ff by itself.
+run-firefox: $(TARGET) iso disk-ff
 	qemu-system-i386 \
-		-kernel $(TARGET) \
-		-initrd initrd.tar \
+		-cdrom maeros.iso \
 		-drive file=disk-ff.img,format=raw,if=ide \
+		$(QEMU_ACCEL) \
+		-vga std \
 		-serial stdio \
 		-m 2048M \
 		-no-reboot \
@@ -263,6 +296,24 @@ smoke-x: $(TARGET) initrd
 smoke-gtk: $(TARGET) initrd
 	python3 tools/smoke_gtk.py
 
+# Linux-ABI probes (docs/audit/firefox-first-paint.md section 8).  The static
+# musl probes are built into testfiles/abiprobes/ so the initrd picks them up;
+# smoke_abi.py boots QEMU itself (it needs -m 1024M for P18) and runs each one.
+# Needs i686-linux-musl-gcc (ports/abiprobes/README.md).
+abiprobes:
+	$(MAKE) -C ports/abiprobes
+
+smoke-abi: $(TARGET) abiprobes initrd
+	python3 tools/smoke_abi.py
+
+# Does Firefox 115 paint a window on the desktop?  Boots the ISO with the
+# Firefox disk headless (KVM when available), lets the desktop launch ff, and
+# judges PASS/FAIL from the serial console.  Artifacts (serial log, screendump,
+# summary) land in build/ff-smoke/<timestamp>-<accel>-smpN/.  Options pass
+# through SMOKE_FF_ARGS, e.g. make smoke-firefox SMOKE_FF_ARGS="--smp 2 --accel tcg".
+smoke-firefox: $(TARGET) iso disk-ff
+	python3 tools/smoke_firefox.py $(SMOKE_FF_ARGS)
+
 # Run with full interrupt + CPU-reset logging
 debug: $(TARGET)
 	qemu-system-i386 \
@@ -295,21 +346,19 @@ repo: $(wildcard ports/packages/*/*)
 	python3 tools/mkrepo.py
 
 repo-serve: repo
-	@lsof -ti tcp:8000 | xargs kill 2>/dev/null || true
+	@sh tools/run-maeros.sh --free-port 8000
 	@echo "Serving app repo at http://localhost:8000 (guest: 10.0.2.2:8000)"
 	cd repo && python3 -m http.server 8000
 
-# `make start` auto-fits the guest resolution to this Mac's screen and serves
-# the app repo.  Override the resolution with `make start RES=1280x720`.
+# `make start` auto-fits the guest resolution to the host screen (osascript on
+# macOS, xrandr/xdpyinfo on Linux) and serves the app repo.  Override the
+# resolution with `make start RES=1280x720`.
 start: disk iso repo
 	SERVE_REPO=1 sh tools/run-maeros.sh $(RES)
 
 # Just list the supported resolutions + the auto-pick for this screen.
 resolutions:
-	@sh tools/run-maeros.sh --list 2>/dev/null || \
-	 sh -c 'BOUNDS=$$(osascript -e "tell application \"Finder\" to get bounds of window of desktop"); \
-	        echo "Host screen points: $$BOUNDS"; \
-	        echo "Supported: 1920x1080 1680x1050 1600x900 1440x900 1366x768 1280x800 1280x720 1152x720 1024x768 800x600"'
+	@sh tools/run-maeros.sh --list
 
 run-iso: iso
 	@if [ -f "$(QEMU_ISO_PID)" ]; then \

@@ -5,6 +5,18 @@
 #include <io.h>
 #include <stddef.h>
 
+/* Signal delivery on return from an interrupt to ring 3 (Linux
+ * exit_to_user_mode_loop -> arch_do_signal_or_restart on every IRQ return):
+ * a thread that never enters the kernel on its own, e.g. one spinning in user
+ * mode, otherwise sees a signal — including the SIGKILL of a group exit —
+ * only at its next syscall.  Done after the EOI so that a fatal signal, which
+ * switches away for good in proc_exit, cannot leave the interrupt in service. */
+extern void signal_return_to_user(registers_t *regs, int syscall_nr);
+static void irq_return_signals(registers_t *regs) {
+    if ((regs->cs & 3) == 3)
+        signal_return_to_user(regs, -1);
+}
+
 /*
  * C handler chains for each hardware IRQ (0-15).  PCI devices share lines
  * (e.g. RTL8139 + AC97 both on IRQ 11 under QEMU), so each IRQ supports a
@@ -48,6 +60,7 @@ void irq_handler(registers_t *regs) {
         int user_mode = (regs->cs & 3) != 0;
         extern void scheduler_tick(int user_mode);
         scheduler_tick(user_mode);
+        irq_return_signals(regs);
         return;
     }
 
@@ -82,4 +95,6 @@ void irq_handler(registers_t *regs) {
     if (irq >= 8)
         outb(0xA0, 0x20);   /* Slave EOI */
     outb(0x20, 0x20);       /* Master EOI (always) */
+
+    irq_return_signals(regs);
 }

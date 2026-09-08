@@ -2,7 +2,8 @@ CC  := i686-elf-gcc
 AS  := nasm
 AR  := i686-elf-ar
 
-GCC_INCLUDE := $(shell $(CC) -print-file-name=include)
+# Silenced so a missing cross compiler fails at compile time, not at parse time.
+GCC_INCLUDE := $(shell $(CC) -print-file-name=include 2>/dev/null)
 
 CFLAGS := -std=gnu99 -O2 -g \
           -nostdlib -nostdinc -static \

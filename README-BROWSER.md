@@ -165,8 +165,71 @@ took ~4 years to first-paint a modern web engine — with a team.
 - **X layer**: Xvfb-style in-process server speaking our shm surfaces;
   then GTK2-era apps (Dillo!, gFTP, Leafpad) run.
 
+## How to test: does Firefox paint yet?
+
+`make smoke-firefox` is the one number that matters for the summit. It
+boots the GRUB ISO (the only boot path with a framebuffer) plus
+`disk-ff.img` headless in QEMU, lets the desktop launch `ff`, and judges
+PASS/FAIL from the serial console. It exits 0 only when `ff` prints
+`ff: Firefox painted`, which the launcher does only after maeroX saw the
+first PutImage **and** the browser process survived a 5 s grace check (a
+crash-reporter dialog painting does not count).
+
+```sh
+. ~/opt/cross/maeros-env.sh
+make smoke-firefox                                   # KVM if /dev/kvm is writable, else TCG; -smp 1
+make smoke-firefox SMOKE_FF_ARGS="--smp 2"           # SMP guest
+make smoke-firefox SMOKE_FF_ARGS="--accel tcg --timeout 1200"
+python3 tools/smoke_firefox.py --help                # all options
+```
+
+What happens in the guest: with a framebuffer and the disk userland,
+`/disk/init` runs `/etc/rc`, the services and then the graphical session
+as the unprivileged user, so no shell prompt reaches the serial line while
+the desktop is up. The desktop auto-launches `/disk/ff` a few seconds after
+its window manager starts because the marker file `/disk/ffauto`
+(`testfiles/ffauto`, committed) is on the disk; the desktop inherits init's
+console, so everything `ff` and Firefox print lands on the serial line.
+Remove `testfiles/ffauto` and rebuild the disk to get back a desktop that
+waits for a click, but the smoke test then fails with "the ff launcher
+never started".
+
+Verdicts and exit codes:
+
+| Serial evidence | Result | Exit |
+|---|---|---|
+| `ff: Firefox painted — window is up (attempt N)` | PASS | 0 |
+| `ff: gave up after 20 attempts` | FAIL | 1 |
+| `=== KERNEL PANIC ===` | FAIL | 1 |
+| QEMU dies, the launcher never starts, or the overall timeout (6 min KVM / 15 min TCG) passes | FAIL | 1 |
+| Missing ISO/disk/QEMU/`testfiles/ffauto`, or a boot without a framebuffer | ERROR | 2 |
+
+Every run writes `build/ff-smoke/<timestamp>-<accel>-smpN/` (gitignored):
+
+- `serial.log` — the complete serial console, verbatim.
+- `screen.png` — the last VGA screendump (`screen.ppm` if PNG is not
+  possible); `screen-paint.png` right after the paint line on a PASS.
+- `summary.txt` — verdict, timeline (graphical session, `ff` start, first
+  `firefox-bin` exec, first Firefox X window, first paint), one line per
+  concluded attempt (stalled / exited status=N / crash-reporter paint), the
+  last maeroX trace line with its `putimg=` counter, every
+  `[SIG] pid=N killed by signal S` line, the last 40 kernel trace lines and
+  the `moz.log` tail that `ff` dumps on a stall.
+- `qemu-cmdline.txt` — the exact QEMU command.
+
+`make run-firefox` boots the same ISO + disk with a window (and KVM when
+available) for watching by hand. `make disk-ff` fetches the Firefox runtime
+via `ports/firefox/fetch-runtime.sh` when `testfiles/firefox/firefox-bin`
+is missing. Note that `disk-ff` rebuilds the 1 GiB image on every
+invocation (a few minutes).
+
 ## Practical notes
 
+- The Firefox runtime tree (`testfiles/firefox/`, gitignored) and the glibc
+  in `testfiles/lib/` are rebuilt from public sources by
+  `sh ports/firefox/fetch-runtime.sh` (official Firefox 115 ESR tarball plus
+  Debian i386 packages, no Docker/root); `ports/firefox/check-runtime.sh`
+  proves the tree is closed under dynamic linking.  See `ports/firefox/README.md`.
 - Cross builds: `ports/Dockerfile.cross` (linux/amd64 + musl.cc i686).
   The toolchain tarball is vendored at `ports/i686-linux-musl-cross.tgz`.
 - Most ports build `-static -no-pie`; **as of Phase 30 the kernel also runs
