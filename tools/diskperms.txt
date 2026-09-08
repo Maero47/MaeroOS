@@ -18,3 +18,5 @@ etc/doas.conf           0     0     0100644
 doas                    0     0     0104755
 passwd                  0     0     0104755
 ff                      1000  100   0100755
+ffout                   1000  100   040775
+ffout/README.txt        1000  100   0100644
