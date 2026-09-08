@@ -728,7 +728,12 @@ static vfs_node_t *pty_alloc_master(void) {
         memset(p, 0, sizeof(*p));
         p->used = 1;
         p->id = i;
-        p->master_refs = 1;
+        /* The descriptor that this lookup is feeding takes the reference
+         * itself, in the open path (vfs_retain -> pty_master_retain), the same
+         * way every other filesystem's nodes are referenced.  Pre-taking it
+         * here as well double-counted once open() started retaining, and the
+         * pair was never freed: ptytest ran out of PTYs at round 7. */
+        p->master_refs = 0;
         p->slave_closed = 1;
         p->termios = tty_termios;
 
@@ -813,7 +818,7 @@ static vfs_node_t *ptsdir_finddir(vfs_node_t *node, const char *name) {
     if (!name || !name[0] || name[1]) return NULL;
     int id = name[0] - '0';
     if (id < 0 || id >= MAX_PTYS || !ptys[id].used) return NULL;
-    ptys[id].slave_refs++;
+    /* No slave_refs++ here either — see pty_alloc_master(); the opener retains. */
     ptys[id].slave_closed = 0;
     return &ptys[id].slave;
 }

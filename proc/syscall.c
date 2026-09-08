@@ -540,8 +540,10 @@ static int sys_eventfd(unsigned int initval, int flags) {
 
 void fd_retain(proc_file_t *f) {
     if (f->type == FD_FILE)    vfs_retain(f->node);
-    if (f->type == FD_PIPE_R)  f->pipe->nreaders++;
-    if (f->type == FD_PIPE_W)  f->pipe->nwriters++;
+    /* A named pipe's descriptor also holds the FIFO's vfs node; an anonymous
+     * pipe leaves node NULL and vfs_retain/vfs_close ignore it. */
+    if (f->type == FD_PIPE_R)  { f->pipe->nreaders++; vfs_retain(f->node); }
+    if (f->type == FD_PIPE_W)  { f->pipe->nwriters++; vfs_retain(f->node); }
     if (f->type == FD_SOCKET)  net_socket_retain(f->socket);
     if (f->type == FD_USOCKET) usocket_retain(f->usock);
     if (f->type == FD_EPOLL)   epoll_retain(f->epoll);
@@ -550,8 +552,8 @@ void fd_retain(proc_file_t *f) {
 
 void fd_release(proc_file_t *f) {
     if (f->type == FD_FILE)    vfs_close(f->node);
-    if (f->type == FD_PIPE_R)  pipe_close_read(f->pipe);
-    if (f->type == FD_PIPE_W)  pipe_close_write(f->pipe);
+    if (f->type == FD_PIPE_R)  { pipe_close_read(f->pipe);  vfs_close(f->node); }
+    if (f->type == FD_PIPE_W)  { pipe_close_write(f->pipe); vfs_close(f->node); }
     if (f->type == FD_SOCKET)  net_socket_release(f->socket);
     if (f->type == FD_USOCKET) usocket_release(f->usock);
     if (f->type == FD_EPOLL)   epoll_release(f->epoll);
@@ -1109,6 +1111,7 @@ static int sys_open_kernel_path(const char *path, int flags) {
                     current_proc->ofile[i].type = FD_PIPE_R;
                     pb->nreaders++;
                 }
+                vfs_retain(node);              /* see the FD_FILE case below */
                 current_proc->ofile[i].pipe    = pb;
                 current_proc->ofile[i].node    = node;
                 current_proc->ofile[i].flags   = flags;  /* incl. O_NONBLOCK */
@@ -1128,6 +1131,12 @@ static int sys_open_kernel_path(const char *path, int flags) {
     /* Find a free file descriptor slot */
     for (int i = 0; i < MAX_FD; i++) {
         if (current_proc->ofile[i].type == FD_NONE) {
+            /* The descriptor is a long-lived reference to the node, so it takes
+             * one: fd_release() drops it again, and fd_retain() adds one per
+             * dup/fork.  Without this a tmpfs file unlinked while open was freed
+             * under the descriptor and the next close jumped through a recycled
+             * function pointer. */
+            vfs_retain(node);
             current_proc->ofile[i].type    = FD_FILE;
             current_proc->ofile[i].node    = node;
             current_proc->ofile[i].offset  = (flags & O_APPEND) ? node->size : 0;
@@ -3338,10 +3347,16 @@ static int shmap_try_reclaim(struct shmap_entry *e) {
     for (uint32_t p = 0; p < e->npages; p++)
         if (e->frames && e->frames[p]) pmm_frame_decref(e->frames[p]);
     if (e->frames) kfree(e->frames);
-    e->frames = NULL; e->npages = 0; e->node = NULL;
+    e->frames = NULL; e->npages = 0;
+    vfs_close(e->node);                 /* drop the registry's reference */
+    e->node = NULL;
     return 1;
 }
 
+/* The registry keys on the node pointer and outlives every mapping of it, so it
+ * must hold a reference of its own: otherwise the node could be freed, its
+ * address reused by a different file, and the stale key would match the wrong
+ * one.  shmap_try_reclaim() drops the reference when it retires an entry. */
 static struct shmap_entry *shmap_get(vfs_node_t *node) {
     struct shmap_entry *free_e = NULL;
     for (int i = 0; i < SHMAP_MAX; i++) {
@@ -3353,6 +3368,7 @@ static struct shmap_entry *shmap_get(vfs_node_t *node) {
             if (shmaps[i].node && shmap_try_reclaim(&shmaps[i])) { free_e = &shmaps[i]; break; }
         if (!free_e) return NULL;
     }
+    vfs_retain(node);                   /* the registry's own reference */
     free_e->node   = node;
     free_e->frames = NULL;
     free_e->npages = 0;
@@ -5015,6 +5031,40 @@ static int sys_poll(registers_t *regs) {
             kfree(kfds);
             return cr < 0 ? cr : 0;
         }
+        {   /* [pollstall] The Firefox main thread parks in an infinite poll()
+             * and never comes back while work sits in its event queue (see
+             * docs/audit/firefox-first-paint.md).  Its wake-up path is
+             * nsAppShell::ScheduleNativeEventCallback(), which writes one byte
+             * to a pipe that the GLib main loop polls (widget/gtk/nsAppShell.cpp
+             * :413-415, :396-399).  This dumps the whole polled fd set with each
+             * fd's type and readiness every ~10 s of a blocked poll, which
+             * distinguishes "the byte is in the pipe and poll fails to report
+             * it" (kernel bug) from "no byte was ever written" (the appshell's
+             * mNativeEventPending coalescing flag is stuck). */
+            if (toms < 0 && current_proc && current_proc->pid == current_proc->tgid &&
+                current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
+                current_proc->name[4]=='f') {
+                static uint32_t last_dump;
+                uint32_t now = pit_ticks();
+                if ((uint32_t)(now - last_dump) >= 1000) {   /* 10 s */
+                    last_dump = now;
+                    printk("[pollstall] pid=%d nfds=%u:", current_proc->pid,
+                           (unsigned)nfds);
+                    for (uint32_t i = 0; i < nfds && i < 16; i++) {
+                        int fd = (int)kfds[i * 2];
+                        if (fd < 0 || fd >= MAX_FD) { printk(" fd%d=inval", fd); continue; }
+                        proc_file_t *f = &current_proc->ofile[fd];
+                        printk(" fd%d:t%d%s%s", fd, (int)f->type,
+                               fd_read_ready(fd) ? "R" : "-",
+                               fd_write_ready(fd) ? "W" : "-");
+                        if (f->type == FD_PIPE_R && f->pipe)
+                            printk("(cnt=%u nw=%d)", (unsigned)f->pipe->count,
+                                   f->pipe->nwriters);
+                    }
+                    printk("\n");
+                }
+            }
+        }
         {   /* [pollfd] decisive diag: which fd is the firefox MAIN thread
              * blocking on with an infinite/long timeout, and what is that fd's
              * type + pipe/socket peer state?  Identifies the ManageChildProcess
@@ -6222,22 +6272,32 @@ static int sys_rename_kernel_path(const char *oldpath, const char *newpath) {
     vfs_node_t *dst_dir = vfs_open_parent_at(newpath, new_dir);
     if (!src_dir || !dst_dir) return -2;
 
-    /* Find the source node */
+    /* Find the source node.  Only its flags survive the unlink/create below:
+     * a vfs_node is not reference counted, and tmpfs_unlink() kfree()s the node
+     * it removes, so a pointer obtained before a directory is mutated must not
+     * be dereferenced after it.  Re-resolve instead. */
     vfs_node_t *src = vfs_finddir(src_dir, old_base);
     if (!src) return -2;
+    uint32_t src_flags = src->flags;
 
     /* If the target already exists, unlink it */
     vfs_unlink(dst_dir, new_base);
 
     /* Copy data into a new node then unlink the old */
     if (!dst_dir->create_fn) return -1;
-    if (dst_dir->create_fn(dst_dir, new_base, src->flags) < 0) return -1;
+    if (dst_dir->create_fn(dst_dir, new_base, src_flags) < 0) return -1;
     vfs_node_t *dst = vfs_finddir(dst_dir, new_base);
     if (!dst) return -1;
+    src = vfs_finddir(src_dir, old_base);      /* may have moved/been freed */
+    if (!src) return -2;
 
     if (!(src->flags & VFS_FLAG_DIR) && src->size > 0 && src->read_fn && dst->write_fn) {
-        /* Copy file contents in 4KiB chunks */
-        uint8_t tmp_buf[4096];
+        /* Copy file contents in 4 KiB chunks.  The buffer is heap-allocated, not
+         * a local: with it on the stack this function's frame was 5164 bytes,
+         * and a syscall that recurses into the filesystem (and can take an IRQ
+         * on the way) has no business eating a sixth of a KSTACKSIZE stack. */
+        uint8_t *tmp_buf = (uint8_t *)kmalloc(4096);
+        if (!tmp_buf) return -12;                  /* -ENOMEM */
         uint32_t copied = 0;
         while (copied < src->size) {
             uint32_t chunk = src->size - copied;
@@ -6247,6 +6307,7 @@ static int sys_rename_kernel_path(const char *oldpath, const char *newpath) {
             vfs_write(dst, copied, got, tmp_buf);
             copied += got;
         }
+        kfree(tmp_buf);
         if (dst->truncate_fn) dst->truncate_fn(dst, src->size);
     }
 
@@ -7174,6 +7235,7 @@ void syscall_dispatch(registers_t *regs) {
     case 37:  ret = sys_kill(regs);            break;
     case 38:  ret = sys_rename(regs);          break;
     case 39:  ret = sys_mkdir(regs);           break;
+    case 40:  ret = sys_rmdir(regs);           break;
     case 41:  ret = sys_dup(regs);             break;
     case 42:  ret = sys_pipe(regs);            break;
     case 43:  ret = sys_times(regs);           break;
@@ -7208,6 +7270,8 @@ void syscall_dispatch(registers_t *regs) {
     case 91:  ret = sys_munmap(regs);          break;
     case 92:  ret = sys_truncate(regs);        break;
     case 93:  ret = sys_ftruncate(regs);       break;
+    case 193: ret = sys_truncate64(regs);      break;
+    case 194: ret = sys_ftruncate64(regs);     break;
     case 324: ret = sys_fallocate(regs);       break;  /* fallocate */
     case 106: ret = sys_stat(regs);            break;
     case 108: ret = sys_fstat(regs);           break;
@@ -7347,11 +7411,8 @@ void syscall_dispatch(registers_t *regs) {
         ret = 0;
         break;
 
-    case 40:  ret = sys_rmdir(regs);           break;  /* rmdir */
-    case 193: ret = sys_truncate64(regs);      break;  /* truncate64 */
-    case 194: ret = sys_ftruncate64(regs);     break;  /* ftruncate64 */
-    case 297: ret = sys_mknodat(regs);         break;  /* mknodat */
     case 296: ret = sys_mkdirat(regs);         break;
+    case 297: ret = sys_mknodat(regs);         break;
     case 300: ret = sys_fstatat64(regs);       break;
     case 301: ret = sys_unlinkat(regs);        break;
     case 302: ret = sys_renameat(regs);        break;
