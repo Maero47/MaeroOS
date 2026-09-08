@@ -154,10 +154,16 @@ Five runs per configuration, `make smoke-firefox` (KVM, `-smp 1`, 2 GiB):
 | + dirty-row present, + ext2 clustering | 81.6 81.3 82.8 82.7 82.0 | 82.1 s | 1.5 s |
 | (rejected) per-slot 32 MiB cache | 112.5 (one run, abandoned) | - | - |
 | + slab-backed, memory-sized cache | 67.3 65.5 67.1 67.9 65.8 | **66.7 s** | 2.4 s |
+| the same, with `-cpu host` | 66.9 67.7 65.7 66.8 67.3 | 66.9 s | 2.0 s |
 
-The run-to-run spread collapsing from ~32 s to ~1.5 s is itself a result: the
+The run-to-run spread collapsing from ~32 s to ~2 s is itself a result: the
 variance was the variable amount of screen blitting and repeated disk reading,
 not scheduling nondeterminism.
+
+`-cpu host` neither breaks the guest nor helps it: 66.9 s against 66.7 s is a
+tenth of the spread. That follows from the breakdown — user code is under 4 % of
+a startup, so a wider instruction set has almost nothing to speed up.
+`tools/smoke_firefox.py --cpu <model>` re-checks this in one command.
 
 ## What is left
 
