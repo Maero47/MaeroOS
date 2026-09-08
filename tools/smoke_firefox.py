@@ -74,7 +74,7 @@ FF_STALLED  = "ff: Firefox stalled"
 FF_EXITED   = "ff: Firefox exited"
 FF_CRASHREP = "ff: paint was the crash reporter"
 PANIC       = "=== KERNEL PANIC ==="
-PAINT_SHOTS = 6            # frames sampled across --hold to pick screen-paint
+PAINT_SHOTS = 10           # frames sampled across --hold to pick screen-paint
 MOZ_TAIL_BEGIN = "=== tail("
 MOZ_TAIL_END   = "=== end tail ==="
 SIG_KILLED  = re.compile(r"\[SIG\] pid=(\d+) killed by signal (\d+)")
@@ -130,25 +130,31 @@ def read_ppm(path):
 
 
 def frame_detail(frame):
-    """How much is actually drawn in this frame.
+    """How much of the browser is drawn in this frame: near-white pixel count.
 
-    All the candidate frames show the same desktop, so the only thing that
-    changes between them is how much of the browser has been painted.  Counting
-    distinct colours captures that directly: a maeroX window that is still an
-    empty rectangle contributes one flat colour, while rendered chrome adds
-    hundreds through antialiased text, icons and borders.  Sampling every third
-    pixel keeps this fast enough to run between screendumps.
+    Firefox's chrome and its blank about:blank content area are a large light
+    rectangle; everything else on this desktop is dark or saturated (blue
+    wallpaper, black console, maeroX's own dark background when it has no
+    client content to composite).  Measured on real screendumps: a frame
+    showing the chrome scores 134k-136k, one where the maeroX window is still
+    empty scores 27k-42k.
+
+    Counting distinct colours was tried first and is useless here - the
+    wallpaper gradient alone contributes thousands, so a painted frame (5180)
+    and a blank one (5116) are indistinguishable.
     """
     if not frame:
         return -1
     w, h, rgb = frame
     stride = w * 3
-    seen = set()
-    for y in range(0, h, 3):
+    n = 0
+    for y in range(0, h, 2):
         row = rgb[y * stride:(y + 1) * stride]
-        for x in range(0, len(row) - 2, 9):
-            seen.add(row[x:x + 3])
-    return len(seen)
+        for x in range(0, len(row) - 2, 6):
+            r, g, b = row[x], row[x + 1], row[x + 2]
+            if r >= 200 and g >= 200 and b >= 200 and max(r, g, b) - min(r, g, b) <= 24:
+                n += 1
+    return n
 
 
 def write_png(path, frame):
@@ -288,6 +294,7 @@ class Run:
         self.result = None         # PASS / FAIL / ERROR
         self.reason = ""
         self.shots = {}
+        self.paint_scores = []
 
     # ── serial intake ────────────────────────────────────────────────────
     def feed(self, chunk):
@@ -439,6 +446,11 @@ class Run:
         else:
             L.append("  (none captured)")
         L.append("")
+        if self.paint_scores:
+            L.append("paint-frame light-pixel scores (>~100000 = chrome visible, "
+                     "<~50000 = the maeroX window was blank in that frame)")
+            L.append("  " + " ".join(str(x) for x in self.paint_scores))
+            L.append("")
         L.append("screendumps")
         for k, v in self.shots.items():
             L.append("  %-6s %s" % (k, v))
@@ -461,9 +473,9 @@ def main():
     ap.add_argument("--out", default=os.path.join("build", "ff-smoke"), help="artifact root")
     ap.add_argument("--tag", default=None, help="suffix for the artifact directory (default: accel-smpN)")
     ap.add_argument("--qemu", default="qemu-system-i386")
-    ap.add_argument("--hold", type=float, default=10.0,
+    ap.add_argument("--hold", type=float, default=25.0,
                     help="seconds to keep sampling frames after the paint verdict "
-                         "before choosing screen-paint.png (default 10)")
+                         "before choosing screen-paint.png (default 25)")
     ap.add_argument("-v", "--verbose", action="store_true", help="echo every serial line")
     args = ap.parse_args()
 
@@ -587,14 +599,17 @@ def main():
                 cand = qmp.screendump_ppm(os.path.join(tmp, "paint%d.ppm" % k))
                 frame = read_ppm(cand) if cand else None
                 score = frame_detail(frame)
+                run.paint_scores.append(score)
                 if score > best_score:
                     best, best_score = frame, score
             paint_png = os.path.join(args.outdir, "screen-paint.png")
             if best:
                 write_png(paint_png, best)
                 run.shots["screen-paint"] = paint_png
-                print("smoke-firefox: screen-paint from the richest of %d frames "
-                      "over %.1fs (%d distinct colours)" % (n, args.hold, best_score))
+                print("smoke-firefox: screen-paint = best of %d frames over %.0fs "
+                      "(%d light pixels; scores %s)"
+                      % (n, args.hold, best_score,
+                         ",".join(str(x) for x in run.paint_scores)))
             else:
                 shot("screen-paint")   # QMP unavailable: fall back to one dump
         elif run.panic_lines:
