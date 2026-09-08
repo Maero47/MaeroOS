@@ -27,7 +27,10 @@ Verdict:
 Artifacts go to build/ff-smoke/<timestamp>-<tag>/ (gitignored):
   serial.log        the complete serial console, verbatim
   screen.png        the last VGA screendump (screen.ppm if PNG is impossible)
-  screen-paint.png  the screendump taken right after the paint line (PASS only)
+  screen-paint.png  the richest of several frames sampled over --hold seconds
+                    after the paint line (PASS only) — the paint marker fires on
+                    the first PutImage, so one immediate dump can catch an empty
+                    window
   summary.txt       verdict, timings, attempt list, crash lines, last kernel
                     lines, moz.log tail
   qemu-cmdline.txt  the exact QEMU command
@@ -48,10 +51,12 @@ import re
 import selectors
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+import zlib
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -69,6 +74,7 @@ FF_STALLED  = "ff: Firefox stalled"
 FF_EXITED   = "ff: Firefox exited"
 FF_CRASHREP = "ff: paint was the crash reporter"
 PANIC       = "=== KERNEL PANIC ==="
+PAINT_SHOTS = 6            # frames sampled across --hold to pick screen-paint
 MOZ_TAIL_BEGIN = "=== tail("
 MOZ_TAIL_END   = "=== end tail ==="
 SIG_KILLED  = re.compile(r"\[SIG\] pid=(\d+) killed by signal (\d+)")
@@ -85,6 +91,84 @@ def kvm_usable():
 
 def fmt_t(t):
     return "%7.1fs" % t if t is not None else "      - "
+
+
+def read_ppm(path):
+    """Parse a binary P6 PPM.  Returns (width, height, rgb bytes) or None."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    if not data.startswith(b"P6"):
+        return None
+    fields, i = [], 2
+    while len(fields) < 3 and i < len(data):
+        while i < len(data) and data[i:i + 1].isspace():
+            i += 1
+        if data[i:i + 1] == b"#":                      # comment to end of line
+            while i < len(data) and data[i:i + 1] != b"\n":
+                i += 1
+            continue
+        start = i
+        while i < len(data) and not data[i:i + 1].isspace():
+            i += 1
+        try:
+            fields.append(int(data[start:i]))
+        except ValueError:
+            return None
+    if len(fields) < 3:
+        return None
+    i += 1                                             # single whitespace byte
+    w, h, maxval = fields
+    if maxval != 255 or w <= 0 or h <= 0:
+        return None
+    rgb = data[i:i + w * h * 3]
+    if len(rgb) < w * h * 3:
+        return None
+    return w, h, rgb
+
+
+def frame_detail(frame):
+    """How much is actually drawn in this frame.
+
+    All the candidate frames show the same desktop, so the only thing that
+    changes between them is how much of the browser has been painted.  Counting
+    distinct colours captures that directly: a maeroX window that is still an
+    empty rectangle contributes one flat colour, while rendered chrome adds
+    hundreds through antialiased text, icons and borders.  Sampling every third
+    pixel keeps this fast enough to run between screendumps.
+    """
+    if not frame:
+        return -1
+    w, h, rgb = frame
+    stride = w * 3
+    seen = set()
+    for y in range(0, h, 3):
+        row = rgb[y * stride:(y + 1) * stride]
+        for x in range(0, len(row) - 2, 9):
+            seen.add(row[x:x + 3])
+    return len(seen)
+
+
+def write_png(path, frame):
+    """Write an RGB frame as a PNG.  No third-party imaging library needed."""
+    w, h, rgb = frame
+    stride = w * 3
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)                                  # filter type 0 (None)
+        raw += rgb[y * stride:(y + 1) * stride]
+
+    def chunk(tag, payload):
+        return (struct.pack(">I", len(payload)) + tag + payload +
+                struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF))
+
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+        f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)))
+        f.write(chunk(b"IDAT", zlib.compress(bytes(raw), 6)))
+        f.write(chunk(b"IEND", b""))
 
 
 class Qmp:
@@ -133,6 +217,18 @@ class Qmp:
             req["arguments"] = args
         self.sock.sendall((json.dumps(req) + "\n").encode())
         return self._recv()
+
+    def screendump_ppm(self, path_ppm):
+        """Dump one frame as PPM (easy to parse and score).  Path or None."""
+        if not self.sock:
+            return None
+        try:
+            r = self._cmd("screendump", filename=path_ppm)
+        except OSError:
+            return None
+        if "return" in r and os.path.exists(path_ppm) and os.path.getsize(path_ppm) > 0:
+            return path_ppm
+        return None
 
     def screendump(self, path_png, path_ppm):
         """Return the path written (png preferred, ppm fallback) or None."""
@@ -365,6 +461,9 @@ def main():
     ap.add_argument("--out", default=os.path.join("build", "ff-smoke"), help="artifact root")
     ap.add_argument("--tag", default=None, help="suffix for the artifact directory (default: accel-smpN)")
     ap.add_argument("--qemu", default="qemu-system-i386")
+    ap.add_argument("--hold", type=float, default=10.0,
+                    help="seconds to keep sampling frames after the paint verdict "
+                         "before choosing screen-paint.png (default 10)")
     ap.add_argument("-v", "--verbose", action="store_true", help="echo every serial line")
     args = ap.parse_args()
 
@@ -475,10 +574,29 @@ def main():
         if run.result is None:
             run.result, run.reason = "FAIL", "timeout after %ds without a verdict from ff" % args.timeout
         if run.result == "PASS":
-            # The paint line already survived ff's 5 s grace check; hold a
-            # little longer so the screendump shows the window, not the flash.
-            pump(3.0)
-            shot("screen-paint")
+            # The paint marker is dropped on the FIRST PutImage, which is well
+            # before Firefox has drawn its whole chrome and before the desktop
+            # has composited it, so a single screendump here races the frame and
+            # can catch an empty window.  Hold for a while, sample several
+            # frames and keep the one with the most drawn detail — this image is
+            # the run's evidence, so it has to show what actually got painted.
+            best, best_score = None, -1
+            n = max(2, PAINT_SHOTS)
+            for k in range(n):
+                pump(max(0.2, float(args.hold) / n))
+                cand = qmp.screendump_ppm(os.path.join(tmp, "paint%d.ppm" % k))
+                frame = read_ppm(cand) if cand else None
+                score = frame_detail(frame)
+                if score > best_score:
+                    best, best_score = frame, score
+            paint_png = os.path.join(args.outdir, "screen-paint.png")
+            if best:
+                write_png(paint_png, best)
+                run.shots["screen-paint"] = paint_png
+                print("smoke-firefox: screen-paint from the richest of %d frames "
+                      "over %.1fs (%d distinct colours)" % (n, args.hold, best_score))
+            else:
+                shot("screen-paint")   # QMP unavailable: fall back to one dump
         elif run.panic_lines:
             pump(2.0)         # collect the register dump / stack trace
         else:
