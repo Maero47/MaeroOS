@@ -1,5 +1,5 @@
 /*
- * P21 exec de_thread - tests C3.
+ * P23 exec de_thread - tests C3.
  *
  * Linux: execve() from a multithreaded process runs de_thread() (fs/exec.c):
  * every OTHER thread of the group is killed and waited for before the new
@@ -21,7 +21,7 @@
  * the pid must still be the pid fork() returned.  Both cases are covered: the
  * exec issued by the group leader, and the exec issued by a worker thread.
  */
-#define PROBE_NAME "p21_exec_dethread"
+#define PROBE_NAME "p23_exec_dethread"
 #include "probe.h"
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -86,7 +86,7 @@ static void run_case(int exec_from_thread, const char *what)
 {
     /* A fresh memfd per case: the counter must start at zero so "it moved"
      * proves the sibling of THIS process ran. */
-    int fd = memfd_create("p21", 0);
+    int fd = memfd_create("p23", 0);
     if (fd < 0)
         probe_fail("memfd_create: %s", strerror(errno));
     if (ftruncate(fd, 4096) != 0)

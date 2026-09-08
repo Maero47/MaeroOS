@@ -2502,6 +2502,60 @@ static int ksleep_until_mono(uint32_t dsec, uint32_t dnsec, uint32_t *rsec, uint
     }
 }
 
+/* ── Timeout deadlines (select / poll / epoll_wait / futex) ──────────────────
+ * Linux never lets a timeout-based wait return EARLY: poll_select_set_timeout()
+ * and schedule_hrtimeout_range() round the requested interval UP, so the
+ * elapsed time the caller measures is always >= what it asked for.
+ *
+ * A tick counter alone cannot promise that.  pit_ticks() is sampled at an
+ * arbitrary point INSIDE the current 10 ms tick, so "N ticks have gone by"
+ * means anywhere from (N-1)*10 ms to N*10 ms of real time — a 100 ms select
+ * armed for 10 ticks could return after 91 ms, which is what p08 caught.
+ *
+ * So a deadline is kept as an ABSOLUTE instant on the fine-grained monotonic
+ * clock — the same clock clock_gettime() reports, so the caller's own
+ * measurement agrees with ours — and the scheduler's wake tick is derived with
+ * clock_mono_to_tick(), the first tick at or after that instant. */
+struct kdeadline { uint32_t sec, nsec; };
+
+/* Deadline `sec` seconds + `nsec` nanoseconds from now. */
+static void deadline_set(struct kdeadline *d, uint32_t sec, uint32_t nsec) {
+    uint32_t s, ns;
+    clock_mono(&s, &ns);
+    s  += sec + nsec / 1000000000U;
+    ns += nsec % 1000000000U;
+    if (ns >= 1000000000U) { ns -= 1000000000U; s++; }
+    d->sec = s; d->nsec = ns;
+}
+
+/* Deadline `ms` milliseconds from now. */
+static void deadline_set_ms(struct kdeadline *d, uint32_t ms) {
+    deadline_set(d, ms / 1000U, (ms % 1000U) * 1000000U);
+}
+
+/* Non-zero once the monotonic clock has reached the deadline. */
+static int deadline_expired(const struct kdeadline *d) {
+    uint32_t s, ns;
+    clock_mono(&s, &ns);
+    return s > d->sec || (s == d->sec && ns >= d->nsec);
+}
+
+/* The tick this sleeper must be woken at so it cannot wake before `d`. */
+static uint32_t deadline_wake_tick(const struct kdeadline *d) {
+    uint32_t wt = clock_mono_to_tick(d->sec, d->nsec);
+    uint32_t now = pit_ticks();
+    if ((int32_t)(wt - now) <= 0) wt = now + 1;   /* never in the past */
+    return wt ? wt : 1;                            /* 0 means "no deadline" */
+}
+
+/* Ticks to sleep before the next readiness re-check: at most `cap`, and never
+ * past the deadline's wake tick. */
+static uint32_t deadline_sleep_ticks(const struct kdeadline *d, uint32_t cap) {
+    uint32_t left = deadline_wake_tick(d) - pit_ticks();
+    if ((int32_t)left <= 0) return 1;
+    return left < cap ? left : cap;
+}
+
 /* Validate a timespec (Linux timespec64_valid): nsec in [0, 1e9). */
 static int ts_valid(int64_t sec, int64_t nsec) {
     return sec >= 0 && nsec >= 0 && nsec < 1000000000LL;
@@ -4687,12 +4741,8 @@ static int do_select(int n, uint32_t *readfds, uint32_t *writefds,
         if (cr < 0) return cr;
     }
 
-    uint32_t start = pit_ticks();
-    uint32_t timeout_ticks = 0;
-    if (toms > 0) {
-        timeout_ticks = ((uint32_t)toms + 9U) / 10U;
-        if (!timeout_ticks) timeout_ticks = 1;
-    }
+    struct kdeadline dl;
+    if (toms > 0) deadline_set_ms(&dl, (uint32_t)toms);
 
     for (;;) {
         uint32_t rd_out[SELECT_WORDS] = {0}, wr_out[SELECT_WORDS] = {0};
@@ -4702,8 +4752,7 @@ static int do_select(int n, uint32_t *readfds, uint32_t *writefds,
             if (rd_in[w] & b) { if (fd_read_ready(fd))  { rd_out[w] |= b; ready++; } }
             if (wr_in[w] & b) { if (fd_write_ready(fd)) { wr_out[w] |= b; ready++; } }
         }
-        int expired = (toms == 0) ||
-                      (toms > 0 && (uint32_t)(pit_ticks() - start) >= timeout_ticks);
+        int expired = (toms == 0) || (toms > 0 && deadline_expired(&dl));
         if (ready > 0 || expired) {
             if (readfds) {
                 int cr = copy_to_user(readfds, rd_out, words * 4);
@@ -4723,10 +4772,7 @@ static int do_select(int n, uint32_t *readfds, uint32_t *writefds,
         if (signal_interrupt_pending(current_proc))
             return -ERESTARTNOHAND;
         uint32_t cap = 50;
-        if (toms > 0) {
-            uint32_t left = timeout_ticks - (uint32_t)(pit_ticks() - start);
-            if (left < cap) cap = left ? left : 1;
-        }
+        if (toms > 0) cap = deadline_sleep_ticks(&dl, cap);
         io_wait_sleep(cap);   /* woken early by any I/O activity or a signal */
         if (signal_interrupt_pending(current_proc))
             return -ERESTARTNOHAND;
@@ -4749,7 +4795,9 @@ static int sys_select(registers_t *regs) {
         if (cr < 0) return cr;
         if (ktv.tv_sec < 0 || ktv.tv_usec < 0) return -22;
         if (ktv.tv_sec > 2000000) toms = 0x7fffffff;
-        else toms = ktv.tv_sec * 1000 + ktv.tv_usec / 1000;
+        /* Round the sub-millisecond remainder UP: Linux's
+         * poll_select_set_timeout() never shortens the requested interval. */
+        else toms = ktv.tv_sec * 1000 + (ktv.tv_usec + 999) / 1000;
     }
     uint32_t start = pit_ticks();
     int ret = do_select(n, readfds, writefds, exceptfds, toms);
@@ -4778,7 +4826,7 @@ static int sys_pselect6(registers_t *regs) {
         if (copy_from_user(&ts, (void *)(uintptr_t)tsp, sizeof(ts)) < 0) return -14;
         if (ts.s < 0 || ts.ns < 0) return -22;
         if (ts.s > 2000000) toms = 0x7fffffff;
-        else toms = ts.s * 1000 + ts.ns / 1000000;
+        else toms = ts.s * 1000 + (ts.ns + 999999) / 1000000;   /* round up */
     }
     return do_select(n, readfds, writefds, exceptfds, toms);
 }
@@ -4853,12 +4901,8 @@ static int sys_poll(registers_t *regs) {
         return cr;
     }
 
-    uint32_t start = pit_ticks();
-    uint32_t timeout_ticks = 0;
-    if (toms > 0) {
-        timeout_ticks = ((uint32_t)toms + 9U) / 10U;
-        if (!timeout_ticks) timeout_ticks = 1;
-    }
+    struct kdeadline dl;
+    if (toms > 0) deadline_set_ms(&dl, (uint32_t)toms);
 
     for (;;) {
         int ready = 0;
@@ -4900,7 +4944,7 @@ static int sys_poll(registers_t *regs) {
             kfree(kfds);
             return cr < 0 ? cr : ready;
         }
-        if (toms > 0 && (uint32_t)(pit_ticks() - start) >= timeout_ticks)
+        if (toms > 0 && deadline_expired(&dl))
         {
             cr = copy_to_user(fds, kfds, fds_len);
             kfree(kfds);
@@ -4952,10 +4996,7 @@ static int sys_poll(registers_t *regs) {
             }
             /* Sleep until I/O activity (or the poll timeout). */
             uint32_t cap = 50;
-            if (toms > 0) {
-                uint32_t left = timeout_ticks - (uint32_t)(pit_ticks() - start);
-                if (left < cap) cap = left ? left : 1;
-            }
+            if (toms > 0) cap = deadline_sleep_ticks(&dl, cap);
             io_wait_sleep(cap);
             if (signal_interrupt_pending(current_proc)) {
                 kfree(kfds);
@@ -4987,7 +5028,7 @@ static int sys_ppoll(registers_t *regs, int time64) {
             sec = ts.s; nsec = ts.ns;
         }
         if (sec < 0 || sec > 2000000) toms = 0x7fffffff;   /* cap, avoid overflow */
-        else toms = sec * 1000 + nsec / 1000000;
+        else toms = sec * 1000 + (nsec + 999999) / 1000000;     /* round up */
         if (toms < 0) toms = 0;
     }
     registers_t fake = *regs;
@@ -5095,10 +5136,8 @@ static int sys_epoll_wait(registers_t *regs) {
     if (!uevents || !access_ok(uevents, (size_t)maxevents * 12)) return -14;
     struct epoll *ep = current_proc->ofile[epfd].epoll;
 
-    uint32_t start = pit_ticks();
-    uint32_t timeout_ticks = 0;
-    if (toms > 0) { timeout_ticks = ((uint32_t)toms + 9U) / 10U; if (!timeout_ticks) timeout_ticks = 1; }
-
+    struct kdeadline dl;
+    if (toms > 0) deadline_set_ms(&dl, (uint32_t)toms);
 
     for (;;) {
         int n = 0;
@@ -5119,15 +5158,12 @@ static int sys_epoll_wait(registers_t *regs) {
             }
         }
         if (n > 0 || toms == 0) return n;
-        if (toms > 0 && (uint32_t)(pit_ticks() - start) >= timeout_ticks) return 0;
+        if (toms > 0 && deadline_expired(&dl)) return 0;
         /* Interruptible like poll (fs/eventpoll.c ep_poll: -EINTR when a
          * signal is pending, no SA_RESTART restart). */
         if (signal_interrupt_pending(current_proc)) return -ERESTARTNOHAND;
         uint32_t cap = 50;
-        if (toms > 0) {
-            uint32_t left = timeout_ticks - (uint32_t)(pit_ticks() - start);
-            if (left < cap) cap = left ? left : 1;
-        }
+        if (toms > 0) cap = deadline_sleep_ticks(&dl, cap);
         io_wait_sleep(cap);
         if (signal_interrupt_pending(current_proc)) return -ERESTARTNOHAND;
     }
@@ -5983,24 +6019,30 @@ static int sys_futex(registers_t *regs, int time64) {
                     return -14;
                 tsec = ts.s; tnsec = ts.ns;
             }
-            uint32_t now = pit_ticks();
-            int32_t rel_ms;
+            /* Both forms become an ABSOLUTE deadline on the fine-grained
+             * monotonic clock, and the wake tick is the first tick at or
+             * AFTER it (Linux arms an hrtimer on the absolute deadline, so a
+             * futex timeout never fires early).  The old code converted an
+             * absolute deadline through the 10 ms tick counter and then
+             * TRUNCATED the relative milliseconds to whole ticks, which could
+             * wake a waiter up to a tick early. */
+            struct kdeadline dl;
             if (op == 9) {      /* WAIT_BITSET → timeout is ABSOLUTE */
-                int32_t now_sec  = (int32_t)(now / 100);
-                if (clock_realtime) now_sec += (int32_t)rtc_boot_epoch();
-                int32_t now_nsec = (int32_t)((now % 100) * 10000000);
-                int32_t rel_sec  = (int32_t)tsec - now_sec;
-                if (rel_sec > 2000000) rel_sec = 2000000;   /* clamp (no overflow) */
-                if (rel_sec < -2000000) rel_sec = -2000000;
-                rel_ms = rel_sec * 1000 + (tnsec - now_nsec) / 1000000;
+                int64_t ds = tsec;
+                if (clock_realtime) ds -= (int64_t)rtc_boot_epoch();
+                if (ds < 0) return -110;                    /* -ETIMEDOUT */
+                if (ds > 2000000) ds = 2000000;             /* clamp */
+                dl.sec  = (uint32_t)ds;
+                dl.nsec = (uint32_t)tnsec;
+                if (dl.nsec >= 1000000000U) return -22;     /* -EINVAL */
+                if (deadline_expired(&dl)) return -110;     /* already past */
             } else {            /* WAIT → timeout is RELATIVE */
                 if (tsec > 2000000) tsec = 2000000;
-                rel_ms = (int32_t)tsec * 1000 + tnsec / 1000000;
+                if (tnsec < 0 || tnsec >= 1000000000) return -22;
+                if (tsec == 0 && tnsec == 0) return -110;   /* zero: immediate */
+                deadline_set(&dl, (uint32_t)tsec, (uint32_t)tnsec);
             }
-            if (rel_ms <= 0) return -110;   /* -ETIMEDOUT: already expired */
-            uint32_t ticks = (uint32_t)rel_ms / 10;          /* 100 Hz */
-            if (!ticks) ticks = 1;
-            current_proc->wake_tick = now + ticks;
+            current_proc->wake_tick = deadline_wake_tick(&dl);
         }
         current_proc->futex_wait = 1;
         /* Address-space-scoped futex key (mirrors Linux get_futex_key): private
