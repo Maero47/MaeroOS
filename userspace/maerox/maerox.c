@@ -25,7 +25,15 @@
 #define X_SOCKET_PATH "/tmp/.X11-unix/X0"
 #define MAX_XCLIENTS  8
 #define MAX_RES       128
-#define INBUF_SIZE    65536
+/* Big enough for the LARGEST request the setup reply allows: we advertise
+ * maximum-request-length = 65535 (units of 4 bytes), so Xlib chunks a big
+ * PutImage into pieces of up to 65535*4 = 262140 bytes and expects the server
+ * to take them.  With a 64 KiB buffer any request over 64 KiB wedged the
+ * connection: process_client() would call read() with zero space left, read()
+ * returns 0, and 0 is our "client closed" signal — so the first full-window
+ * PutImage (818*531*4 = 1.7 MB, chunked to 256 KiB pieces) disconnected
+ * Firefox instead of painting. */
+#define INBUF_SIZE    270336   /* 264 KiB >= 65535 * 4 */
 
 #define ROOT_WINDOW   0x00000001u
 #define ROOT_COLORMAP 0x00000020u
@@ -345,6 +353,43 @@ static void send_configure(xclient_t *c, xres_t *w) {
     write_all(c->fd, e, 32);
 }
 
+/* X TIMESTAMPs are milliseconds since server start.  Zero is reserved
+ * (CurrentTime), and GDK compares the value it gets back from
+ * gdk_x11_get_server_time() against its own monotonic clock, so hand out a real
+ * monotonically increasing millisecond count. */
+static uint32_t x_time(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 1;
+    uint32_t ms = (uint32_t)ts.tv_sec * 1000u + (uint32_t)(ts.tv_nsec / 1000000);
+    return ms ? ms : 1;
+}
+
+/* PropertyNotify: a property on a window changed (state 0) or was deleted
+ * (state 1).
+ *
+ * This event is what unblocks gdk_x11_get_server_time() (GTK 3.24,
+ * gdk/x11/gdkwindow-x11.c:5624-5648): it writes a one-byte GDK_TIMESTAMP_PROP
+ * property and then sits in XIfEvent() until a PropertyNotify for that window
+ * and atom arrives — "The window must have GDK_PROPERTY_CHANGE_MASK in its
+ * events mask or a hang will result", says its own doc comment.  Without this
+ * event the Firefox main thread parked in that XIfEvent forever, which is why
+ * the browser window was never shown.
+ *
+ * Like every other event maeroX sends (Expose, MapNotify, ConfigureNotify) this
+ * ignores the window's event mask, which maeroX does not track. */
+static void send_property_notify(xclient_t *c, uint32_t window, uint32_t atom,
+                                 int deleted) {
+    uint8_t e[32];
+    memset(e, 0, sizeof(e));
+    e[0] = 28;                          /* PropertyNotify */
+    put16(e + 2, c->seq);
+    put32(e + 4, window);
+    put32(e + 8, atom);
+    put32(e + 12, x_time());            /* time */
+    e[16] = (uint8_t)(deleted ? 1 : 0); /* state: 0 NewValue, 1 Deleted */
+    write_all(c->fd, e, 32);
+}
+
 /* A pointer event (ButtonPress/Release/Motion) relative to a window. */
 static void send_pointer(xclient_t *c, xres_t *w, int type, int detail,
                          int ex, int ey) {
@@ -353,7 +398,7 @@ static void send_pointer(xclient_t *c, xres_t *w, int type, int detail,
     e[0] = type;
     e[1] = detail;
     put16(e + 2, c->seq);
-    put32(e + 4, 0);                    /* time */
+    put32(e + 4, x_time());             /* time */
     put32(e + 8, 0x00000001);           /* root window */
     put32(e + 12, w->xid);              /* event window */
     put32(e + 16, 0);                   /* child = None */
@@ -694,9 +739,21 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
             char s[130];
             memcpy(s, q + 24, dlen); s[dlen] = '\0';
             for (uint32_t i = 0; i < dlen; i++) if (s[i] == '\0') s[i] = '|';
-            printf("maerox: ChangeProperty xid=0x%x atom=%u str='%s'\n",
-                   (unsigned)wid, (unsigned)prop, s);
+            int anlen = 0;
+            const char *an = atom_name(prop, &anlen);
+            char nm[64];
+            if (anlen > 63) anlen = 63;
+            memcpy(nm, an, (size_t)anlen); nm[anlen] = '\0';
+            printf("maerox: ChangeProperty xid=0x%x atom=%u(%s) str='%s'\n",
+                   (unsigned)wid, (unsigned)prop, nm, s);
         }
+        /* Every property change generates a PropertyNotify; GTK's
+         * gdk_x11_get_server_time() blocks in XIfEvent until it sees one. */
+        send_property_notify(c, wid, prop, 0);
+        break;
+    }
+    case 19: {       /* DeleteProperty */
+        send_property_notify(c, r32(q + 4), r32(q + 8), 1);
         break;
     }
     case 12: {       /* ConfigureWindow — GDK resizes/moves the window */
@@ -1086,11 +1143,16 @@ static void client_free_resources(xclient_t *c) {
 }
 
 static void process_client(xclient_t *c) {
-    int r = read(c->fd, c->inbuf + c->inlen, INBUF_SIZE - c->inlen);
-    if (r == 0) { xt("XT client disconnected (last seq=%d)\n", c->seq);
-                  close(c->fd); client_free_resources(c);
-                  c->used = 0; dirty = 1; return; }   /* closed */
-    if (r > 0) c->inlen += r;
+    /* Only read when there is room: read(fd, p, 0) returns 0, which is also how
+     * a closed connection reports itself, so a full buffer would look like a
+     * disconnect. */
+    if (c->inlen < INBUF_SIZE) {
+        int r = read(c->fd, c->inbuf + c->inlen, INBUF_SIZE - c->inlen);
+        if (r == 0) { xt("XT client disconnected (last seq=%d)\n", c->seq);
+                      close(c->fd); client_free_resources(c);
+                      c->used = 0; dirty = 1; return; }   /* closed */
+        if (r > 0) c->inlen += r;
+    }
 
     if (!c->setup_done) {
         if (c->inlen < 12) return;
@@ -1113,6 +1175,11 @@ static void process_client(xclient_t *c) {
     while (c->setup_done && c->inlen >= 4) {
         int qlen = (int)r16(c->inbuf + 2) * 4;
         if (qlen < 4) { c->inlen = 0; break; }       /* malformed; drop */
+        if (qlen > INBUF_SIZE) {                     /* cannot ever complete */
+            xt("XT oversize request op=%d len=%d > inbuf %d, dropping\n",
+               c->inbuf[0], qlen, INBUF_SIZE);
+            c->inlen = 0; break;
+        }
         if (c->inlen < qlen) break;                  /* wait for the rest */
         dispatch(c, c->inbuf, qlen);
         memmove(c->inbuf, c->inbuf + qlen, c->inlen - qlen);
