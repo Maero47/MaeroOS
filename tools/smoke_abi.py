@@ -72,17 +72,14 @@ PROBES = {
     "p20_shared_futex":        (60, ""),
     "p21_sigsuspend":          (60, ""),
     "p22_mprotect_cow":        (60, ""),
+    "p23_exec_dethread":       (90, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.
 # Delete an entry when the corresponding kernel change lands (the run then
 # reports XPASS until you do).
 XFAIL = {
-    "p07_ftruncate64":         "syscalls 194/193/297/40 missing",
     "p10_unix_socket":         "U2-U5: SCM_RIGHTS position, recvmsg 0, flags, POLLHUP",
-    "p14_exec_arg_size":       "C4: 4 KiB arg page, EXEC_MAXARGS 64",
-    "p15_socket_cloexec":      "C5: SOCK_CLOEXEC ignored",
-    "p16_memfd_cloexec_size":  "C5, M5: MFD_CLOEXEC ignored, write not reflected",
     "p19_siginfo":             "S6: si_addr/si_code, sa_mask, sigaltstack",
     # p01-p06, p08, p09, p11-p13, p17, p18, p20 were listed here before the
     # process-model and memory/clock work landed on this branch; they are

@@ -39,6 +39,7 @@ regression tests for the fixes in audit section 5.
 | P20 | `p20_shared_futex.c`        | F5, F6 | 14 |
 | P21 | `p21_sigsuspend.c`          | review round 1, finding 1 | - |
 | P22 | `p22_mprotect_cow.c`        | review round 1, finding 3 (M1) | 9 |
+| P23 | `p23_exec_dethread.c`       | C3 | 10 |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the
