@@ -129,10 +129,42 @@ Three changes:
 
 Transactions **367 k -> 63 k**, hit rate **34 % -> 55 %**, `ata` **71.6 s -> 34.4 s**.
 
+### A measured wrong turn worth recording
+
+The obvious next step — make the cache much bigger — made the system *slower*.
+A 32 MiB cache whose buffers were allocated one `kmalloc` per slot cut `ata` from
+34.4 s to 28.2 s but pushed `pgfault` from 5.6 s to **20.5 s**, and first paint
+went from 82 s to **112 s**. `kmalloc` is a first-fit walk of one free list
+(`mm/heap.c`), and both ext2 and the page-fault path allocate on every call, so
+32 k extra 1 KiB blocks on that list make every later allocation walk past them.
+
+Allocating all the buffers as a single slab and carving the slots out of it
+gives the heap one entry no matter how big the cache is, and gets both: `ata`
+26.0 s and `pgfault` 4.5 s. The cache is sized at mount from an eighth of free
+physical memory (16 MiB on the 2 GiB machine), rounded to a power-of-two set
+count so the bucket index stays a mask.
+
+## Results
+
+Five runs per configuration, `make smoke-firefox` (KVM, `-smp 1`, 2 GiB):
+
+| Configuration | First paint (s) | Mean | Spread |
+|---|---|---:|---:|
+| baseline (`5a88eee` + kprof) | 217.8 200.5 224.0 232.4 224.7 | 219.9 s | 31.9 s |
+| + dirty-row present, + ext2 clustering | 81.6 81.3 82.8 82.7 82.0 | 82.1 s | 1.5 s |
+| (rejected) per-slot 32 MiB cache | 112.5 (one run, abandoned) | - | - |
+| + slab-backed, memory-sized cache | 67.3 65.5 67.1 67.9 65.8 | **66.7 s** | 2.4 s |
+
+The run-to-run spread collapsing from ~32 s to ~1.5 s is itself a result: the
+variance was the variable amount of screen blitting and repeated disk reading,
+not scheduling nondeterminism.
+
 ## What is left
 
-At first paint in ~84 s, the remaining profile is roughly: `ata` 34 s, other
-syscalls 22 s (`mmap2` 7.0, `sched_yield` 6.9, `clock_gettime64` 1.7), `pgfault`
-5.6 s, `sched` 3.2 s, `user` 2.3 s, `fb` 1.3 s. Disk is still the largest single
-cost and the next thing worth attacking; `sched_yield` at 315 k calls and `mmap2`
-at 3.6 ms per call are both worth a look. See the report on this branch.
+At ~70 s the remaining profile is `ata` 26.0 s, other syscalls 20.5 s, `pgfault`
+4.5 s, `sched` 3.5 s, `user` 2.2 s, `fb` 1.3 s. Disk is still the largest single
+cost. Two more leads, both measured but not acted on:
+
+* `sched_yield` — ~315 k calls, ~6.9 s. Worth finding out who spins.
+* `mmap2` — ~1900 calls at ~3.6 ms each. `vma_gap_find` calls
+  `first_mapped_page`, which walks a candidate range page by page, per candidate.
