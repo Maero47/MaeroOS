@@ -2,6 +2,8 @@
 #include "vfs.h"
 #include "../drivers/ata.h"
 #include "../mm/heap.h"
+#include "../mm/pmm.h"
+#include <kernel/config.h>
 #include "../lib/string.h"
 #include "../kernel/printk.h"
 #include "../arch/i686/cpu/pit.h"
@@ -119,16 +121,27 @@ static int g_mounted = 0;
  *
  * Set-associative (bucket = block number mod EXT2_CACHE_BUCKETS, LRU within the
  * bucket), so a large cache costs no more per lookup than the old linear scan
- * over 8 slots.  Slot buffers are allocated on first use, so an unused cache
- * costs nothing beyond the descriptors. */
+ * over 8 slots.  Slot buffers are allocated on first use and the total is
+ * capped at a share of the free physical memory measured when the filesystem is
+ * mounted, so the cache is large on the 2 GiB machine that runs the browser and
+ * stays small on a 128 MiB one.  Once the budget is reached a claim recycles a
+ * slot that already owns a buffer instead of allocating another. */
 /* Most blocks that a run of consecutive file blocks can carry in one ATA
  * transaction.  128 KiB is 256 sectors, past what one command can express;
  * 64 blocks keeps a transaction's interrupts-off window near 100 us. */
 #define EXT2_READ_CLUSTER  64
 
-#define EXT2_CACHE_BUCKETS 512                  /* power of two */
+#define EXT2_CACHE_BUCKETS 8192                 /* power of two */
 #define EXT2_CACHE_WAYS    4
 #define EXT2_CACHE_SLOTS   (EXT2_CACHE_BUCKETS * EXT2_CACHE_WAYS)
+
+/* Share of free physical memory the cache may hold, and a floor so that a tiny
+ * machine still gets a useful one. */
+#define EXT2_CACHE_MEM_SHARE  8                 /* one eighth of free RAM */
+#define EXT2_CACHE_MIN_BYTES  (256u * 1024u)
+
+static uint32_t g_cache_budget;                 /* bytes the cache may allocate */
+static uint32_t g_cache_bytes;                  /* bytes it has allocated       */
 
 typedef struct {
     uint32_t blk;
@@ -158,15 +171,27 @@ static ext2_cache_entry_t *ext2_cache_find(uint32_t blk) {
  * misses, which is correct, only slower). */
 static ext2_cache_entry_t *ext2_cache_claim(uint32_t blk) {
     ext2_cache_entry_t *set = ext2_cache_set(blk);
-    ext2_cache_entry_t *slot = (ext2_cache_entry_t *)0;
+    ext2_cache_entry_t *empty = (ext2_cache_entry_t *)0;   /* no buffer yet */
+    ext2_cache_entry_t *lru   = (ext2_cache_entry_t *)0;   /* LRU that has one */
     for (int i = 0; i < EXT2_CACHE_WAYS; i++) {
-        if (set[i].valid && set[i].blk == blk) { slot = &set[i]; break; }
-        if (!set[i].valid) { slot = &set[i]; break; }
-        if (!slot || set[i].age < slot->age) slot = &set[i];
+        if (set[i].valid && set[i].blk == blk) return &set[i];   /* already ours */
+        if (set[i].data) {
+            if (!lru || set[i].age < lru->age) lru = &set[i];
+        } else if (!empty) {
+            empty = &set[i];
+        }
     }
+    /* Take an empty slot while there is budget to back it; past the budget,
+     * recycle a slot that already owns a buffer rather than growing. */
+    int can_grow = empty && g_cache_bytes + g_state.block_size <= g_cache_budget;
+    ext2_cache_entry_t *slot = can_grow ? empty : (lru ? lru : empty);
+    if (!slot) return (ext2_cache_entry_t *)0;
     if (!slot->data) {
+        if (g_cache_bytes + g_state.block_size > g_cache_budget)
+            return (ext2_cache_entry_t *)0;
         slot->data = (uint8_t *)kmalloc(g_state.block_size);
         if (!slot->data) { slot->valid = 0; return (ext2_cache_entry_t *)0; }
+        g_cache_bytes += g_state.block_size;
     }
     return slot;
 }
@@ -250,8 +275,17 @@ static void ext2_cache_init(void) {
         g_cache[i].age = 0;
         g_cache[i].valid = 0;
         /* Buffers are allocated on demand in ext2_cache_claim(); a remount
-         * keeps the ones already allocated. */
+         * keeps the ones already allocated, and g_cache_bytes still counts
+         * them, so the budget is not double-spent. */
     }
+    uint64_t share = ((uint64_t)pmm_free_frames() * PAGE_SIZE) / EXT2_CACHE_MEM_SHARE;
+    uint64_t cap   = (uint64_t)EXT2_CACHE_SLOTS * g_state.block_size;
+    if (share > cap) share = cap;
+    if (share < EXT2_CACHE_MIN_BYTES) share = EXT2_CACHE_MIN_BYTES;
+    g_cache_budget = (uint32_t)share;
+    printk("[EXT2] block cache up to %u KiB (%u slots of %u B)\n",
+           (unsigned)(g_cache_budget / 1024u), (unsigned)EXT2_CACHE_SLOTS,
+           (unsigned)g_state.block_size);
     g_cache_ready = 1;
 }
 
@@ -968,8 +1002,16 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
          * contiguous file costs one ATA transaction instead of four. */
         if (blk_off == 0 && to_copy == blk_size) {
             if (!ext2_cache_lookup(blk_num, buf + done)) {
+                /* Cluster only into a KERNEL destination.  ata_read transfers
+                 * with interrupts disabled straight into the caller's buffer,
+                 * and sys_read hands us the user pointer unbounced: a longer
+                 * transaction into user memory would widen the window in which
+                 * a demand-paged destination page faults in the middle of a
+                 * live PIO transfer.  The mmap page-fill path, which is where
+                 * nearly all of the reads are, fills a kernel temp mapping. */
                 uint32_t run = 1;
-                while (run < EXT2_READ_CLUSTER &&
+                while ((uintptr_t)(buf + done) >= KERNEL_VMA &&
+                       run < EXT2_READ_CLUSTER &&
                        done + (run + 1) * blk_size <= size &&
                        ext2_file_blk_cached(&inode, blk_idx + run, &ic)
                            == blk_num + run)
