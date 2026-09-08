@@ -55,7 +55,8 @@ PROBES = {
 # Delete an entry when the corresponding kernel change lands (the run then
 # reports XPASS until you do).
 XFAIL = {
-    "p07_ftruncate64":         "syscalls 194/193/297/40 missing",
+    # p07_ftruncate64 was here ("syscalls 194/193/297/40 missing") and now
+    # passes: truncate64/ftruncate64/rmdir/mknodat are implemented.
     "p10_unix_socket":         "U2-U5: SCM_RIGHTS position, recvmsg 0, flags, POLLHUP",
     "p14_exec_arg_size":       "C4: 4 KiB arg page, EXEC_MAXARGS 64",
     "p15_socket_cloexec":      "C5: SOCK_CLOEXEC ignored",

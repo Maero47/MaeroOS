@@ -4116,12 +4116,7 @@ static int sys_umask(registers_t *regs) {
 }
 
 /* ── sys_mknod(const char *path, mode_t mode, dev_t dev) — EAX=14 ────────── */
-static int sys_mknod(registers_t *regs) {
-    char path[256];
-    if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0) return -14;
-    uint32_t mode = regs->ecx;
-    /* dev = regs->edx (ignored for FIFOs) */
-
+static int sys_mknod_kernel_path(const char *path, uint32_t mode) {
     char dir_path[256], base[256];
     if (path_split(path, dir_path, base) < 0) return -22;
     if (base[0] == '\0') return -22;
@@ -4138,6 +4133,13 @@ static int sys_mknod(registers_t *regs) {
     else return -22;  /* -EINVAL: unsupported type */
 
     return dir->create_fn(dir, base, vfs_flag);
+}
+
+static int sys_mknod(registers_t *regs) {
+    char path[256];
+    if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0) return -14;
+    /* dev = regs->edx (ignored for FIFOs) */
+    return sys_mknod_kernel_path(path, regs->ecx);
 }
 
 /* ── sys_reboot(magic, magic2, cmd, arg) — EAX=88 ───────────────────────── */
@@ -4312,6 +4314,35 @@ static int sys_ftruncate(registers_t *regs) {
     proc_file_t *f = &current_proc->ofile[fd];
     if (f->type != FD_FILE || !f->node) return -9;
     return vfs_truncate(f->node, (uint32_t)regs->ecx);
+}
+
+/* ── sys_truncate64(path, len_lo, len_hi) — EAX=193 ─────────────────────────
+ * ── sys_ftruncate64(fd, len_lo, len_hi)  — EAX=194 ─────────────────────────
+ * On i386 glibc and musl compile plain truncate()/ftruncate() into these
+ * 64-bit-offset variants (glibc sysdeps/unix/sysv/linux/ftruncate64.c, musl
+ * src/unistd/ftruncate.c), splitting the length across two registers with
+ * __LONG_LONG_PAIR, i.e. ecx = low word, edx = high word.  Without them every
+ * glibc program on this kernel got ENOSYS from ftruncate(), including the
+ * shared-memory sizing fallback in Chromium's SharedMemory::Create.  Our files
+ * live in RAM/ext2 and are addressed with a 32-bit size, so a non-zero high
+ * word is -EFBIG rather than a silent truncation. */
+static int sys_truncate64(registers_t *regs) {
+    char path[256];
+    if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0)
+        return -14;
+    if (regs->edx != 0) return -27;                /* -EFBIG: > 4 GiB */
+    vfs_node_t *n = vfs_open_at(path);
+    if (!n) return -2;
+    return vfs_truncate(n, regs->ecx);
+}
+
+static int sys_ftruncate64(registers_t *regs) {
+    int fd = (int)regs->ebx;
+    if (fd < 0 || fd >= MAX_FD) return -9;
+    proc_file_t *f = &current_proc->ofile[fd];
+    if (f->type != FD_FILE || !f->node) return -9;
+    if (regs->edx != 0) return -27;                /* -EFBIG: > 4 GiB */
+    return vfs_truncate(f->node, regs->ecx);
 }
 
 /* ── sys_fallocate(fd, mode, offset, len) — EAX=324 ─────────────────────────
@@ -4614,6 +4645,40 @@ static int sys_poll(registers_t *regs) {
             cr = copy_to_user(fds, kfds, fds_len);
             kfree(kfds);
             return cr < 0 ? cr : 0;
+        }
+        {   /* [pollstall] The Firefox main thread parks in an infinite poll()
+             * and never comes back while work sits in its event queue (see
+             * docs/audit/firefox-first-paint.md).  Its wake-up path is
+             * nsAppShell::ScheduleNativeEventCallback(), which writes one byte
+             * to a pipe that the GLib main loop polls (widget/gtk/nsAppShell.cpp
+             * :413-415, :396-399).  This dumps the whole polled fd set with each
+             * fd's type and readiness every ~10 s of a blocked poll, which
+             * distinguishes "the byte is in the pipe and poll fails to report
+             * it" (kernel bug) from "no byte was ever written" (the appshell's
+             * mNativeEventPending coalescing flag is stuck). */
+            if (toms < 0 && current_proc && current_proc->pid == current_proc->tgid &&
+                current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
+                current_proc->name[4]=='f') {
+                static uint32_t last_dump;
+                uint32_t now = pit_ticks();
+                if ((uint32_t)(now - last_dump) >= 1000) {   /* 10 s */
+                    last_dump = now;
+                    printk("[pollstall] pid=%d nfds=%u:", current_proc->pid,
+                           (unsigned)nfds);
+                    for (uint32_t i = 0; i < nfds && i < 16; i++) {
+                        int fd = (int)kfds[i * 2];
+                        if (fd < 0 || fd >= MAX_FD) { printk(" fd%d=inval", fd); continue; }
+                        proc_file_t *f = &current_proc->ofile[fd];
+                        printk(" fd%d:t%d%s%s", fd, (int)f->type,
+                               fd_read_ready(fd) ? "R" : "-",
+                               fd_write_ready(fd) ? "W" : "-");
+                        if (f->type == FD_PIPE_R && f->pipe)
+                            printk("(cnt=%u nw=%d)", (unsigned)f->pipe->count,
+                                   f->pipe->nwriters);
+                    }
+                    printk("\n");
+                }
+            }
         }
         {   /* [pollfd] decisive diag: which fd is the firefox MAIN thread
              * blocking on with an infinite/long timeout, and what is that fd's
@@ -5041,6 +5106,39 @@ static int sys_unlink_kernel_path(const char *path) {
     vfs_node_t *dir = vfs_open_parent_at(path, dir_path);
     if (!dir) return -2;
     return vfs_unlink(dir, base);
+}
+
+/* ── sys_rmdir(path) — EAX=40 ───────────────────────────────────────────────
+ * Same removal as unlink, but Linux only removes directories here and reports
+ * ENOTDIR for anything else, so keep that check: toybox rmdir and glibc's
+ * rmdir() both rely on it. */
+static int sys_rmdir(registers_t *regs) {
+    char path[256];
+    if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0)
+        return -14;
+    vfs_node_t *n = vfs_open_at(path);
+    if (!n) return -2;
+    if (!(n->flags & VFS_FLAG_DIR)) return -20;    /* -ENOTDIR */
+    char resolved[256];
+    int r = canonicalize_path_at_cwd(path, resolved, sizeof(resolved));
+    if (r < 0) return r;
+    return sys_unlink_kernel_path(resolved);
+}
+
+/* ── sys_mknodat(dirfd, path, mode, dev) — EAX=297 ─────────────────────────
+ * glibc routes mknod()/mkfifo() through mknodat(AT_FDCWD, ...) (io/mknod.c,
+ * sysdeps/unix/sysv/linux/mkfifo.c), so bare sys_mknod is never reached from a
+ * glibc program. */
+static int sys_mknodat(registers_t *regs) {
+    int dirfd = (int)regs->ebx;
+    const char *upath = (const char *)(uintptr_t)regs->ecx;
+    uint32_t mode = regs->edx;
+    char path[256], resolved[256];
+    int r = copy_user_str(upath, path, sizeof(path));
+    if (r < 0) return r;
+    r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
+    if (r < 0) return r;
+    return sys_mknod_kernel_path(resolved, mode);
 }
 
 static int sys_mkdirat(registers_t *regs) {
@@ -6698,6 +6796,7 @@ void syscall_dispatch(registers_t *regs) {
     case 37:  ret = sys_kill(regs);            break;
     case 38:  ret = sys_rename(regs);          break;
     case 39:  ret = sys_mkdir(regs);           break;
+    case 40:  ret = sys_rmdir(regs);           break;
     case 41:  ret = sys_dup(regs);             break;
     case 42:  ret = sys_pipe(regs);            break;
     case 43:  ret = sys_times(regs);           break;
@@ -6732,6 +6831,8 @@ void syscall_dispatch(registers_t *regs) {
     case 91:  ret = sys_munmap(regs);          break;
     case 92:  ret = sys_truncate(regs);        break;
     case 93:  ret = sys_ftruncate(regs);       break;
+    case 193: ret = sys_truncate64(regs);      break;
+    case 194: ret = sys_ftruncate64(regs);     break;
     case 324: ret = sys_fallocate(regs);       break;  /* fallocate */
     case 106: ret = sys_stat(regs);            break;
     case 108: ret = sys_fstat(regs);           break;
@@ -6872,6 +6973,7 @@ void syscall_dispatch(registers_t *regs) {
         break;
 
     case 296: ret = sys_mkdirat(regs);         break;
+    case 297: ret = sys_mknodat(regs);         break;
     case 300: ret = sys_fstatat64(regs);       break;
     case 301: ret = sys_unlinkat(regs);        break;
     case 302: ret = sys_renameat(regs);        break;
