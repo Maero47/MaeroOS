@@ -4446,8 +4446,14 @@ static int do_select(int n, uint32_t *readfds, uint32_t *writefds,
     uint32_t start = pit_ticks();
     uint32_t timeout_ticks = 0;
     if (toms > 0) {
-        timeout_ticks = ((uint32_t)toms + 9U) / 10U;
-        if (!timeout_ticks) timeout_ticks = 1;
+        /* select(2) must never return BEFORE the timeout has elapsed (Linux
+         * rounds the deadline up to the next timer interrupt; POSIX allows
+         * only overrun, never underrun).  pit_ticks() advances every 10 ms and
+         * `start` is sampled at an arbitrary point inside a tick, so waiting
+         * for exactly ceil(toms/10) ticks can return up to 10 ms early — a
+         * 100 ms select measured 93.7 ms.  One extra tick covers the partial
+         * first one; the cost is at most one tick of overrun. */
+        timeout_ticks = ((uint32_t)toms + 9U) / 10U + 1U;
     }
 
     for (;;) {
@@ -4612,8 +4618,9 @@ static int sys_poll(registers_t *regs) {
     uint32_t start = pit_ticks();
     uint32_t timeout_ticks = 0;
     if (toms > 0) {
-        timeout_ticks = ((uint32_t)toms + 9U) / 10U;
-        if (!timeout_ticks) timeout_ticks = 1;
+        /* Same partial-first-tick correction as do_select() above: poll(2) may
+         * overrun its timeout but must not undershoot it. */
+        timeout_ticks = ((uint32_t)toms + 9U) / 10U + 1U;
     }
 
     for (;;) {
