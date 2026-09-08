@@ -28,6 +28,21 @@
  *      (the one-reference "reuse" path)
  *   D  control: an ordinary COW break still works and stays private
  *   E  control: mprotect(PROT_READ|PROT_WRITE) restores writability
+ *   F  mprotect(PROT_READ), fork, then MADV_DONTNEED, then write -> SIGSEGV
+ *   G  the same on a brk-heap page instead of an image page
+ *
+ * F and G exist because MADV_DONTNEED reaches the same "give this address
+ * space its own frame" decision by a different route than a write fault: with
+ * a live sharer it replaces the page with a fresh frame, and rebuilding that
+ * entry is another chance to hand back a write permission the process asked us
+ * to take away.
+ *
+ * Only G checks what the page reads back afterwards.  MADV_DONTNEED restores
+ * zeroes for anonymous memory (the brk heap), but for a private file mapping —
+ * which is what the executable's own data is — Linux drops the private copy and
+ * the next read comes from the file again, so "reads as zero" is not a portable
+ * assertion for an image page.  What both cases assert is the part this probe
+ * is about: the store afterwards must still fault.
  */
 #define PROBE_NAME "p22_mprotect_cow"
 #include "probe.h"
@@ -36,12 +51,19 @@
 
 #define PAGE 4096
 
+#ifndef MADV_DONTNEED
+#define MADV_DONTNEED 4
+#endif
+
 /* In the image, one page to itself: the alignment plus the size mean no other
  * object shares this page and mprotect cannot disturb anything else. */
 static volatile unsigned char guarded[PAGE] __attribute__((aligned(PAGE))) = { 1 };
 
 /* A second one for the controls. */
 static volatile unsigned char plain[PAGE] __attribute__((aligned(PAGE))) = { 1 };
+
+/* A third for the MADV_DONTNEED case. */
+static volatile unsigned char advised[PAGE] __attribute__((aligned(PAGE))) = { 1 };
 
 static void protect_ro(volatile unsigned char *p)
 {
@@ -92,6 +114,26 @@ static void child_sole_owner_then_write(void)
     _exit(0);
 }
 
+/* In the child: drop the page with MADV_DONTNEED while the parent still shares
+ * it, optionally check that the advice took effect, then write — which must
+ * fault.  Exit codes report the checks that come first, since a correct kernel
+ * kills us on the store and nothing after it runs. */
+static void child_madvise_then_write(volatile unsigned char *p, int expect_zero)
+{
+    if (madvise((void *)(uintptr_t)p, PAGE, MADV_DONTNEED) != 0)
+        _exit(4);                       /* the advice itself failed */
+    if (expect_zero && (p[0] != 0 || p[7] != 0))
+        _exit(5);                       /* MADV_DONTNEED did not zap the page */
+    p[7] = 0xDD;                        /* must fault */
+    _exit(0);
+}
+
+static void child_madvise_image(void) { child_madvise_then_write(advised, 0); }
+
+static volatile unsigned char *heap_page;
+
+static void child_madvise_heap(void) { child_madvise_then_write(heap_page, 1); }
+
 static void expect_segv(const char *label, int outcome)
 {
     if (outcome == -SIGSEGV) {
@@ -100,6 +142,10 @@ static void expect_segv(const char *label, int outcome)
     }
     if (outcome == 0)
         probe_fail("%s: the write to a PROT_READ page SUCCEEDED (no fault)", label);
+    if (outcome == 4)
+        probe_fail("%s: madvise(MADV_DONTNEED) failed", label);
+    if (outcome == 5)
+        probe_fail("%s: MADV_DONTNEED left the old contents in place", label);
     if (outcome < 0)
         probe_fail("%s: killed by signal %d, expected SIGSEGV (%d)", label,
                    -outcome, SIGSEGV);
@@ -185,6 +231,45 @@ int main(void)
                    "restored (outcome %d)", r);
     probe_info("E: mprotect(PROT_READ|PROT_WRITE) restores writability in both "
                "the process and its children");
+
+    /* ── F: MADV_DONTNEED must not hand write permission back ───────────── */
+    advised[0] = 0x77;
+    advised[7] = 0x77;
+    protect_ro(advised);
+    expect_segv("F (mprotect, fork, MADV_DONTNEED)", run_child(child_madvise_image));
+    /* The parent shared the page throughout, so its own copy is untouched. */
+    if (advised[7] != 0x77)
+        probe_fail("F: the child's MADV_DONTNEED changed the parent's page (%02x)",
+                   advised[7]);
+    probe_info("F: the parent's copy of the page survived the child's MADV_DONTNEED");
+
+    /* ── G: the same on the brk heap, the case the report names ─────────── */
+    {
+        /* musl's sbrk() refuses any non-zero increment, so grow the break with
+         * the raw syscall.  musl's allocator does not use brk, so the pages
+         * taken here belong to nobody else.  Both kernels return the new
+         * break. */
+        uintptr_t cur = (uintptr_t)syscall(SYS_brk, (void *)0);
+        uintptr_t want = ((cur + PAGE - 1) & ~(uintptr_t)(PAGE - 1)) + 3 * PAGE;
+        uintptr_t got = cur ? (uintptr_t)syscall(SYS_brk, (void *)want) : 0;
+        if (!cur || got < want) {
+            probe_info("G: the break could not be grown (brk(0)=%#lx, brk(%#lx)=%#lx), "
+                       "skipping the brk-heap variant",
+                       (unsigned long)cur, (unsigned long)want, (unsigned long)got);
+        } else {
+            uintptr_t aligned = (cur + PAGE - 1) & ~(uintptr_t)(PAGE - 1);
+            heap_page = (volatile unsigned char *)aligned;
+            heap_page[0] = 0x88;
+            heap_page[7] = 0x88;
+            protect_ro(heap_page);
+            expect_segv("G (brk heap, mprotect, fork, MADV_DONTNEED)",
+                        run_child(child_madvise_heap));
+            if (heap_page[7] != 0x88)
+                probe_fail("G: the child's MADV_DONTNEED changed the parent's heap "
+                           "page (%02x)", heap_page[7]);
+            probe_info("G: a brk-heap page behaves the same as an image page");
+        }
+    }
 
     probe_pass();
 }

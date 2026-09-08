@@ -3581,7 +3581,18 @@ static int sys_madvise(registers_t *regs) {
                         __builtin_memset(paging_temp_map(nf), 0, PAGE_SIZE);
                         paging_temp_unmap();
                         preempt_enable();
-                        *pte = nf | (old & 0xFFFU & ~(uint32_t)PAGE_COW) | PAGE_WRITABLE;
+                        /* Keep the page's own protection.  PAGE_WRPROT means
+                         * the process took write permission away with
+                         * mprotect(), and handing it a fresh frame is no
+                         * reason to give that permission back — the same rule
+                         * the write-fault handler applies when it refuses to
+                         * break COW on such a page.  Without this the entry
+                         * would come back writable while still flagged
+                         * write-protected, and the next store would succeed
+                         * where Linux raises SIGSEGV. */
+                        uint32_t nflags = old & 0xFFFU & ~(uint32_t)PAGE_COW;
+                        if (!(old & PAGE_WRPROT)) nflags |= PAGE_WRITABLE;
+                        *pte = nf | nflags;
                         tlb_flush_single(va);
                         batch[nb++] = frame;
                         if (nb == 256) {

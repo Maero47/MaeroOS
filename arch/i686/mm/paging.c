@@ -460,6 +460,10 @@ static void page_fault_handler(registers_t *regs) {
              * side): no copy needed, just make the page writable again (Linux
              * wp_page_reuse). */
             if (pmm_frame_refcount(old_phys) == 1) {
+                /* Grants write while keeping the entry's other bits, which is
+                 * only correct because the test above has already excluded
+                 * PAGE_WRPROT pages; do not relax that guard without changing
+                 * this line too. */
                 *pte = (*pte & ~(uint32_t)PAGE_COW) | PAGE_WRITABLE;
                 tlb_flush_single(cr2 & ~0xFFFU);
                 tlb_shootdown();
