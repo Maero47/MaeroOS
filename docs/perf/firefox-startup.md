@@ -167,10 +167,14 @@ a startup, so a wider instruction set has almost nothing to speed up.
 
 ## What is left
 
-At ~70 s the remaining profile is `ata` 26.0 s, other syscalls 20.5 s, `pgfault`
-4.5 s, `sched` 3.5 s, `user` 2.2 s, `fb` 1.3 s. Disk is still the largest single
-cost. Two more leads, both measured but not acted on:
+At the mark of a 67.1 s run (`build/ff-smoke/20260908-225513-slab-3`, 55.1 s of
+guest time): `ata` 25.0 s, other syscalls 19.0 s, `pgfault` 4.5 s, `sched` 3.0 s,
+`user` 2.1 s, `fb` 1.3 s, `irq` 0.2 s, `idle` still 0. Disk is still the largest
+single cost. Three leads, measured but not acted on:
 
-* `sched_yield` — ~315 k calls, ~6.9 s. Worth finding out who spins.
-* `mmap2` — ~1900 calls at ~3.6 ms each. `vma_gap_find` calls
+* **Disk volume.** The reads are well batched now, so the next win is reading
+  *less*: fault-around on file-backed VMAs (populate 8 pages per fault instead of
+  1) would cut the 67 k file faults and the transactions with them.
+* **`sched_yield`** — ~302 k calls, 6.7 s, now the largest single syscall.
+* **`mmap2`** — ~1900 calls at ~3.0 ms each. `vma_gap_find` calls
   `first_mapped_page`, which walks a candidate range page by page, per candidate.
