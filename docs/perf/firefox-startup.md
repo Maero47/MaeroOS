@@ -383,7 +383,7 @@ the disk, and the disk is now mostly cache.
 
 ## What is left
 
-At the mark of a 34.7 s run (`build/ff-smoke/20260909-141324-final-t`, 23.0 s of
+At the mark of a 34.7 s run (`build/ff-smoke/20260909-132926-final-t`, 23.0 s of
 guest time):
 
 | Bucket | Time | Share |
