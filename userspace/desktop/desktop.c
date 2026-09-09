@@ -152,6 +152,12 @@ static int fb_fd = -1;
 static uint32_t fallback_row[MAX_W];
 static uint32_t *row = fallback_row;
 static uint32_t *backbuf;
+/* Last frame written to the screen, so present() can skip unchanged scanlines.
+ * shadow_valid is cleared whenever something other than us draws (a fullscreen
+ * app), which forces the next present to be a full blit. */
+static uint32_t *shadow;
+static int       shadow_valid;
+static void present_invalidate(void) { shadow_valid = 0; }
 /* Desktop event log (shown in the System window). */
 static char log_lines[MAX_LOG][LOG_MAX];
 static int log_count;
@@ -4494,20 +4500,75 @@ static void blank_framebuffer(void) {
     if (!backbuf) return;
     for (size_t i = 0; i < (size_t)fb_w * fb_h; i++)
         backbuf[i] = 0;
+    present_invalidate();     /* a fullscreen app draws next; forget the shadow */
     present();
 }
 
-static int present(void) {
-    if (!backbuf) return 0;
-    if (fb_pitch == fb_w * 4) {
-        lseek(fb_fd, 0, 0);
-        if (write(fb_fd, backbuf, (int)(fb_w * fb_h * 4)) < 0) return -1;
-        return 0;
+/* Copy `rows` scanlines starting at `y0` from the back buffer to the screen. */
+static int present_rows(unsigned y0, unsigned rows) {
+    if (fb_pitch == fb_w * 4) {          /* rows are contiguous: one write */
+        lseek(fb_fd, (int)(y0 * fb_pitch), 0);
+        return write(fb_fd, backbuf + (size_t)y0 * fb_w,
+                     (int)(rows * fb_w * 4)) < 0 ? -1 : 0;
     }
-    for (unsigned y = 0; y < fb_h; y++) {
+    for (unsigned y = y0; y < y0 + rows; y++) {
         lseek(fb_fd, (int)(y * fb_pitch), 0);
         if (write(fb_fd, backbuf + (size_t)y * fb_w, (int)(fb_w * 4)) < 0)
             return -1;
+    }
+    return 0;
+}
+
+/*
+ * Present the composited frame.
+ *
+ * The screen is device memory, so a full-screen blit runs at MMIO speed rather
+ * than RAM speed: 4 MiB at 1280x800 costs ~10 ms, and the compositor recomposes
+ * and presents every frame even when only a few scanlines changed.  Measured
+ * over a Firefox startup that was ~80 s of the ~185 s to first paint - the
+ * single largest cost in the system.
+ *
+ * So keep a shadow of the last frame actually presented, in ordinary cached
+ * memory, and write only the runs of scanlines that differ.  Comparing 4 MiB of
+ * cached RAM is roughly an order of magnitude cheaper than writing it to the
+ * framebuffer, and during a browser startup almost every row is identical from
+ * frame to frame.  Contiguous dirty rows are coalesced into one write so the
+ * syscall count stays low.
+ *
+ * The shadow is only valid while the desktop is the only thing drawing.  A
+ * fullscreen app owns the screen directly, so blank_framebuffer() (the handoff)
+ * and the app's exit both invalidate it and the next present is a full blit.
+ * If the shadow cannot be allocated, every present is a full blit - the
+ * behaviour this replaced.
+ */
+static int present(void) {
+    if (!backbuf) return 0;
+    const unsigned rowpx = fb_w;
+
+    if (!shadow || !shadow_valid) {
+        if (present_rows(0, fb_h) < 0) return -1;
+        if (shadow) {
+            memcpy(shadow, backbuf, (size_t)fb_w * fb_h * 4);
+            shadow_valid = 1;
+        }
+        return 0;
+    }
+
+    for (unsigned y = 0; y < fb_h; ) {
+        if (memcmp(backbuf + (size_t)y * rowpx, shadow + (size_t)y * rowpx,
+                   rowpx * 4) == 0) {
+            y++;
+            continue;
+        }
+        unsigned start = y;
+        while (y < fb_h &&
+               memcmp(backbuf + (size_t)y * rowpx, shadow + (size_t)y * rowpx,
+                      rowpx * 4) != 0) {
+            memcpy(shadow + (size_t)y * rowpx, backbuf + (size_t)y * rowpx,
+                   rowpx * 4);
+            y++;
+        }
+        if (present_rows(start, y - start) < 0) return -1;
     }
     return 0;
 }
@@ -4635,6 +4696,8 @@ int main(void) {
     /* Allocate the full-screen back buffer; fall back to direct writes if the
      * heap can't satisfy it so the desktop still boots on tight memory. */
     backbuf = (uint32_t *)malloc((size_t)fb_w * fb_h * 4);
+    shadow  = backbuf ? (uint32_t *)malloc((size_t)fb_w * fb_h * 4) : 0;
+    shadow_valid = 0;
     load_desktop_conf();
     load_wallpaper();
     make_wallpaper_blur();
@@ -4846,6 +4909,7 @@ int main(void) {
                     fullscreen_kbd_fd = -1;
                 }
                 add_log("FULLSCREEN APP EXITED");
+                present_invalidate();   /* the app drew straight to the screen */
                 dirty = 1;
             } else {
                 /* Raw-input app owns event0; we don't drain it, so poll()

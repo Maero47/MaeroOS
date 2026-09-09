@@ -123,6 +123,9 @@ void tsc_tick_sample(void) {
 
 int clock_tsc_calibrated(void) { return g_calibrated; }
 
+/* Calibrated TSC rate, for kprof's cycles->ms conversion.  0 until calibrated. */
+uint32_t tsc_cycles_per_tick(void) { return g_calibrated ? g_cycles_per_tick : 0; }
+
 /* Snapshot (tick, tsc_at_tick, sub-tick ns) consistently. */
 static void clock_snapshot(uint32_t *tick, uint32_t *sub_ns) {
     uint32_t s, t;

@@ -75,6 +75,9 @@ PROBES = {
     "p23_exec_dethread":       (90, ""),
     "p24_unlink_open":         (60, ""),
     "p25_ptmx_lookup":         (60, ""),
+    # Writes and deletes 2 MiB twelve times over the ATA PIO disk, so it needs
+    # far longer than a probe that only exercises the ABI in memory.
+    "p26_unlink_frees_space":  (240, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.
@@ -175,7 +178,10 @@ def kill_qemu(proc):
 def boot(args):
     """Start QEMU and wait for the shell prompt.  Returns (proc, sel, log)."""
     proc = subprocess.Popen(
+        # The ext2 volume is attached because p26 measures real filesystem
+        # free space; the probes that predate it ignore it.
         [args.qemu, "-kernel", "kernel.elf", "-initrd", "initrd.tar",
+         "-drive", "file=disk.img,format=raw,index=0,media=disk",
          "-serial", "stdio", "-display", "none", "-m", args.mem,
          "-no-reboot", "-no-shutdown"],
         cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

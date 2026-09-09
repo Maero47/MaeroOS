@@ -51,7 +51,7 @@ all: $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
 	     $(TESTFILES)/desktop $(TESTFILES)/wmctl $(TESTFILES)/gui_demo \
 	     $(TESTFILES)/wmevtest $(TESTFILES)/uidemo $(TESTFILES)/files \
 	     $(TESTFILES)/dmesg $(TESTFILES)/shmprobe $(TESTFILES)/threadprobe $(TESTFILES)/term $(TESTFILES)/browse \
-     $(TESTFILES)/extprobe $(TESTFILES)/store $(TESTFILES)/pkg $(TESTFILES)/wavplay $(TESTFILES)/statprobe $(TESTFILES)/edit $(TESTFILES)/calc $(TESTFILES)/taskmgr $(TESTFILES)/view $(TESTFILES)/settings \
+     $(TESTFILES)/raceprobe $(TESTFILES)/extprobe $(TESTFILES)/store $(TESTFILES)/pkg $(TESTFILES)/wavplay $(TESTFILES)/statprobe $(TESTFILES)/edit $(TESTFILES)/calc $(TESTFILES)/taskmgr $(TESTFILES)/view $(TESTFILES)/settings \
      $(TESTFILES)/reboot $(TESTFILES)/shutdown $(TESTFILES)/poweroff $(TESTFILES)/halt \
      $(TESTFILES)/sudo $(TESTFILES)/whoami $(TESTFILES)/uname $(TESTFILES)/clear $(TESTFILES)/hostname \
      $(TESTFILES)/which $(TESTFILES)/free $(TESTFILES)/uptime $(TESTFILES)/du $(TESTFILES)/df $(TESTFILES)/top $(TESTFILES)/wget $(TESTFILES)/bbwrap \
@@ -593,6 +593,12 @@ settings/settings.o: settings/settings.c include/gui.h include/draw.h
 	$(CC) $(CFLAGS) -c $< -o $@
 $(TESTFILES)/settings: settings/settings.o $(GUIAPP_DEPS)
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) settings/settings.o libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o libwm/wm.o libc/libc.a
+
+raceprobe/raceprobe.o: raceprobe/raceprobe.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TESTFILES)/raceprobe: $(CRT0_OBJ) raceprobe/raceprobe.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) raceprobe/raceprobe.o libc/libc.a
 
 extprobe/extprobe.o: extprobe/extprobe.c
 	$(CC) $(CFLAGS) -c $< -o $@

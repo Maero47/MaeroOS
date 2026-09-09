@@ -25,11 +25,13 @@
 #include "../kernel/printk.h"
 #include "../fs/vfs.h"
 #include "../fs/devfs.h"
+#include "../fs/ext2.h"
 #include "../net/socket.h"
 #include <registers.h>
 #include <kernel/config.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <kernel/kprof.h>
 
 /* ── Kernel-internal ABI structs (matching Linux i386 userspace layout) ──── */
 
@@ -458,7 +460,6 @@ static void fill_kstat64(struct kstat64 *st, vfs_node_t *n) {
 
 static int sys_mkdir_kernel_path(const char *path);
 static int sys_unlink_kernel_path(const char *path);
-static void fx_lockdbg(const char *op, const char *path, int rc);
 static void io_wait_sleep(uint32_t max_ticks);
 static void epoll_retain(struct epoll *ep);
 static void epoll_release(struct epoll *ep);
@@ -614,8 +615,6 @@ void fdtable_put(struct proc *p) {
  * WIFEXITED/WEXITSTATUS expect; a death by signal stores the bare signal
  * number instead (kernel/exit.c: tsk->exit_code = code, do_group_exit(sig)). */
 static void sys_exit(registers_t *regs) {
-    printk("[SYSCALL] sys_exit(%d) from pid %d\n",
-           (int)regs->ebx, current_proc ? current_proc->pid : -1);
     proc_exit(((int)regs->ebx & 0xff) << 8);   /* noreturn */
 }
 
@@ -831,9 +830,6 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
 
     child->state = PROC_RUNNABLE;
 
-    printk("[SYSCALL] %s: parent pid=%d child pid=%d%s\n",
-           child_stack ? "clone(fork)" : "sys_fork",
-           parent->pid, child->pid, child_stack ? " (child stack)" : "");
     return child->pid;  /* parent gets child's PID */
 }
 
@@ -996,8 +992,6 @@ static int sys_waitpid(registers_t *regs) {
                     int cr = copy_to_user(status_ptr, &status, sizeof(status));
                     if (cr < 0) return cr;
                 }
-                printk("[SYSCALL] sys_waitpid: collected child pid=%d status=0x%x\n",
-                       child_pid, p->exit_status);
                 proc_release(p);
                 return child_pid;
             }
@@ -1162,15 +1156,6 @@ static int sys_open_kernel_path(const char *path, int flags) {
 }
 
 /* ── sys_open(const char *path, int flags, int mode) — EAX=5 ─────────────── */
-/* DEBUG helper: does haystack contain needle? (for the iconopen trace) */
-static int dbg_str_has(const char *s, const char *sub) {
-    for (; *s; s++) {
-        const char *a = s, *b = sub;
-        while (*a && *b && *a == *b) { a++; b++; }
-        if (!*b) return 1;
-    }
-    return 0;
-}
 
 static int sys_open(registers_t *regs) {
     const char *upath = (const char *)(uintptr_t)regs->ebx;
@@ -1187,16 +1172,6 @@ static int sys_open(registers_t *regs) {
     r = resolve_path_at_fd(AT_FDCWD, path, resolved, sizeof(resolved));
     if (r < 0) return r;
     int rc = sys_open_kernel_path(resolved, flags);
-    fx_lockdbg("open", path, rc);
-    {   /* DEBUG: trace image/icon/theme opens to pin the GTK NULL-pixbuf source */
-        static int ic = 0;
-        if (ic < 80 && (dbg_str_has(path, ".png") || dbg_str_has(path, ".svg") ||
-                        dbg_str_has(path, "icon") || dbg_str_has(path, "theme") ||
-                        dbg_str_has(path, "hicolor") || dbg_str_has(path, "pixmap"))) {
-            ic++;
-            printk("[iconopen] %s -> %d\n", path, rc);
-        }
-    }
     return rc;
 }
 
@@ -1955,33 +1930,6 @@ static int sys_exec(registers_t *regs) {
 
     printk("[SYSCALL] exec '%s' pid=%d entry=0x%08x argc=%d\n",
            path, current_proc->pid, (unsigned)entry, argc);
-    /* [argv] dump firefox's argv to confirm -profile <dir> actually reaches
-     * firefox-bin (the "profile cannot be loaded" modal implies it doesn't). */
-    if (path[0] && dbg_str_has(path, "firefox")) {
-        for (int ai = 0; ai < argc && ai < 20; ai++)
-            printk("[argv] pid=%d [%d]='%s'\n", current_proc->pid, ai, KARGV(ai));
-        /* [fdtab] For a CONTENT process (-contentproc), dump the inherited fd
-         * table right after exec: which fd numbers survived, and their types.
-         * Chromium remaps the prefMap/jsInit shared-memory memfds (FD_FILE=1) to
-         * specific numbers the child mmaps; if those numbers hold FD_EPOLL(6) or
-         * FD_NONE(0) instead, the remapping/inheritance is broken → mmap EBADF. */
-        int is_content = 0;
-        for (int ai = 1; ai < argc && ai < 4; ai++)
-            if (dbg_str_has(KARGV(ai), "contentproc")) is_content = 1;
-        if (is_content) {
-            for (int fd = 0; fd < MAX_FD; fd++) {
-                int ty = (int)current_proc->ofile[fd].type;
-                if (ty != FD_NONE)
-                    printk("[fdtab] pid=%d fd=%d type=%d%s\n",
-                           current_proc->pid, fd, ty,
-                           ty == FD_FILE && current_proc->ofile[fd].node ?
-                             (dbg_str_has(current_proc->ofile[fd].node->name, "memfd") ?
-                                " MEMFD" : "") : "");
-            }
-        }
-    }
-    /* (watchpoint_arm exists for KVM/real-hw debugging of the GTK heap race;
-     * QEMU TCG ignores guest DR registers so it's not armed here.) */
     es_free(&av);
     es_free(&ev);
 #undef KARGV
@@ -2128,21 +2076,6 @@ static int sys_dup2(registers_t *regs) {
     if (dst->type != FD_NONE)
         fd_release(dst);
 
-    /* [dup2fd] trace firefox dup2 of a MEMFD (Chromium fds_to_remap places the
-     * prefs/prefMap/jsInit shared-memory memfds at specific target numbers for
-     * the content child).  old→new + the memfd's size reveals which shared
-     * memory (by size: prefs 20194 / prefMap 234963 / jsInit 240916) lands at
-     * which fd — to explain why the child mmaps jsInit at fd 11 (empty). */
-    if (src->type == FD_FILE && src->node &&
-        dbg_str_has(src->node->name, "memfd") && current_proc &&
-        current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-        current_proc->name[4]=='f') {
-        static int d2 = 0;
-        if (d2 < 40) { d2++;
-            printk("[dup2fd] pid=%d memfd %d->%d size=%u\n",
-                   current_proc->pid, oldfd, newfd,
-                   (unsigned)src->node->size); }
-    }
 
     /* Copy the entry and bump refcount */
     *dst = *src;
@@ -2690,7 +2623,6 @@ static int sys_stat(registers_t *regs) {
     if (!access_ok(st, sizeof(*st))) return -14;
 
     vfs_node_t *n = vfs_open_at(path);
-    fx_lockdbg("stat", path, n ? 0 : -2);
     if (!n) return -2;
     struct kstat kst;
     fill_kstat(&kst, n);
@@ -2862,16 +2794,6 @@ static int sys_getdents64(registers_t *regs) {
         int cr = copy_to_user(buf + written, rec, reclen);
         if (cr < 0) return cr;
         written += reclen;
-    }
-    {   /* DEBUG: count entries returned for icon dirs (does GTK see the icons?) */
-        static int dc = 0;
-        if (dc < 30 && dbg_str_has(f->path, "icons") && regs->edx >= 256) {
-            dc++;
-            int n = 0; vfs_dirent_t dd;
-            for (int k = 0; vfs_readdir(f->node, k, &dd) >= 0 && k < 4096; k++) n++;
-            printk("[gdents] %s: off=%u wrote=%u total_entries=%d\n",
-                   f->path, (unsigned)f->offset, (unsigned)written, n);
-        }
     }
     return (int)written;
 }
@@ -3542,6 +3464,7 @@ static int vma_populate_page(struct vma *v, uint32_t addr) {
     if (!phys) return 0;
     pmm_frame_incref(phys);
 
+    kprof_count(v->file ? KPE_PF_FILE : KPE_PF_ANON);
     preempt_disable();
     uint8_t *kva = (uint8_t *)paging_temp_map(phys);
     __builtin_memset(kva, 0, PAGE_SIZE);
@@ -3773,13 +3696,6 @@ static int sys_mmap2(registers_t *regs) {
     {
         struct vma *v = vma_add(va, end, prot, 0, fnode, pgoff * PAGE_SIZE);
         if (!v) return -12;
-        if (fnode->size > 100u * 1024u * 1024u && pgoff == 0) {
-            static int logged_big = 0;
-            if (!logged_big) { logged_big = 1;
-                printk("[gdbaid] big mmap base=0x%08x size=%u fd=%d pid=%d\n",
-                       (unsigned)va, (unsigned)fnode->size, fd, current_proc->pid);
-            }
-        }
         if (length < VMA_FILE_DEMAND_MIN && !vma_populate_range(v, va, end)) {
             unmap_range(va, end);
             return -12;
@@ -4194,7 +4110,6 @@ static int sys_stat64(registers_t *regs) {
     if (!access_ok(st, sizeof(*st))) return -14;
 
     vfs_node_t *n = vfs_open_at(path);
-    fx_lockdbg("stat64", path, n ? 0 : -2);
     if (!n) return -2;
     struct kstat64 kst;
     fill_kstat64(&kst, n);
@@ -4344,7 +4259,6 @@ static int sys_statx(registers_t *regs) {
     } else {
         n = vfs_open_at(path);
     }
-    fx_lockdbg("statx", path, n ? 0 : -2);
     if (!n) return -2;
 
     struct kstat64 kst;
@@ -4468,7 +4382,6 @@ static int sys_access(registers_t *regs) {
         return -14;
     vfs_node_t *n = vfs_open_at(path);
     int rc = n ? 0 : -2;  /* 0=exists, -ENOENT=not found */
-    fx_lockdbg("access", path, rc);
     return rc;
 }
 
@@ -4647,7 +4560,6 @@ static int sys_lstat64_real(registers_t *regs) {
         __builtin_memcpy(abspath + cwdlen, path, __builtin_strlen(path) + 1);
         n = vfs_open_nofollow(abspath);
     }
-    fx_lockdbg("lstat64", path, n ? 0 : -2);
     if (!n) return -2;
     struct kstat64 kst;
     fill_kstat64(&kst, n);
@@ -4672,12 +4584,6 @@ static int sys_symlink(registers_t *regs) {
         __builtin_memcpy(abspath, linkpath, __builtin_strlen(linkpath) + 1);
     }
     int rc = vfs_symlink(target, abspath);
-    {   /* [lockop] nsProfileLock's symlink lock: target="<host>:<pid>",
-         * link="<profile>/lock".  A nonzero rc → lock fails → modal dialog. */
-        static int sl = 0;
-        if (sl < 20) { sl++;
-            printk("[lockop] symlink '%s' -> '%s' = %d\n", abspath, target, rc); }
-    }
     return rc;
 }
 
@@ -4701,7 +4607,6 @@ static int sys_readlink(registers_t *regs) {
         __builtin_memcpy(abspath + cwdlen, path, __builtin_strlen(path) + 1);
         n = vfs_open_nofollow(abspath);
     }
-    fx_lockdbg("readlink", path, n ? (n->flags == VFS_FLAG_SYMLINK ? 0 : -22) : -2);
     if (!n) return -2;
     if (n->flags != VFS_FLAG_SYMLINK) return -22;   /* -EINVAL: not a symlink */
 
@@ -4940,49 +4845,14 @@ static void io_wait_sleep(uint32_t max_ticks) {
     sleep_on(&io_activity);
 }
 
-/* [lockop] log a profile-relevant filesystem op + its result, gated to firefox
- * and to paths under the profile dir (/tmp/ffp), to find the exact operation
- * whose failure makes Firefox report "profile cannot be loaded / inaccessible". */
-static void fx_lockdbg(const char *op, const char *path, int rc) {
-    static int lk = 0;
-    if (lk >= 160 || !current_proc) return;
-    if (!(current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-          current_proc->name[4]=='f')) return;
-    /* Log the profile dir, the mozilla/home config areas, AND any FAILING op
-     * (rc<0) — the failure that makes Firefox report "profile inaccessible" is
-     * on some path; catch it wherever it is. */
-    /* Log the full non-library op sequence (skip .so loader noise) so we can see
-     * exactly what Firefox does right before it gives up loading the profile. */
-    if (dbg_str_has(path, ".so") || dbg_str_has(path, "/lib/") ||
-        dbg_str_has(path, "/disk/firefox/") || dbg_str_has(path, "fontconfig") ||
-        dbg_str_has(path, "/etc/") || dbg_str_has(path, "/usr/"))
-        return;
-    lk++;
-    printk("[lockop] %s '%s' -> %d\n", op, path, rc);
-}
 
 static int sys_poll(registers_t *regs) {
     uint32_t *fds  = (uint32_t *)(uintptr_t)regs->ebx;
     uint32_t  nfds = regs->ecx;
     int       toms = (int)regs->edx;
-    {
-        static int pll = 0;
-        if (pll < 60 && current_proc && current_proc->name[0]=='f' &&
-            current_proc->name[1]=='i' && current_proc->name[4]=='f') {
-            pll++;
-            printk("[pollarg] pid=%d nfds=%u toms=%d fds=%x\n",
-                   current_proc->pid, (unsigned)nfds, toms, (unsigned)(uintptr_t)fds);
-        }
-    }
 
     if (!nfds) return 0;
-    if (nfds > 1024) {
-        printk("[poll-einval] pid=%d name=%s nfds=%u fds=%x toms=%d\n",
-               current_proc ? current_proc->pid : -1,
-               current_proc ? current_proc->name : "?",
-               (unsigned)nfds, (unsigned)(uintptr_t)fds, toms);
-        return -22;  /* -EINVAL */
-    }
+    if (nfds > 1024) return -22;   /* -EINVAL */
     if (!fds) return -14;  /* -EFAULT */
     size_t fds_len = (size_t)nfds * 8;
     uint32_t *kfds = (uint32_t *)kmalloc(fds_len);
@@ -5009,18 +4879,6 @@ static int sys_poll(registers_t *regs) {
             }
             if (fd >= MAX_FD || current_proc->ofile[fd].type == FD_NONE) {
                 rev = POLLNVAL;
-                {   /* A firefox process polling an INVALID fd (FD_NONE) → POLLNVAL.
-                     * This is the glxtest/ManageChildProcess "poll failed" bug:
-                     * the result-pipe fd went invalid.  Log fd + nfds to find it. */
-                    static int pnv = 0;
-                    if (pnv < 60 && current_proc && current_proc->name[0]=='f' &&
-                        current_proc->name[1]=='i' && current_proc->name[4]=='f') {
-                        pnv++;
-                        printk("[pollnval] pid=%d t%d fd=%d nfds=%u events=%x\n",
-                               current_proc->pid, current_proc->tgid, fd,
-                               (unsigned)nfds, (unsigned)(uint16_t)events);
-                    }
-                }
             } else {
                 proc_file_t *f = &current_proc->ofile[fd];
                 if ((events & POLLIN)  && fd_read_ready(fd))  rev |= POLLIN;
@@ -5042,75 +4900,7 @@ static int sys_poll(registers_t *regs) {
             kfree(kfds);
             return cr < 0 ? cr : 0;
         }
-        {   /* [pollstall] The Firefox main thread parks in an infinite poll()
-             * and never comes back while work sits in its event queue (see
-             * docs/audit/firefox-first-paint.md).  Its wake-up path is
-             * nsAppShell::ScheduleNativeEventCallback(), which writes one byte
-             * to a pipe that the GLib main loop polls (widget/gtk/nsAppShell.cpp
-             * :413-415, :396-399).  This dumps the whole polled fd set with each
-             * fd's type and readiness every ~10 s of a blocked poll, which
-             * distinguishes "the byte is in the pipe and poll fails to report
-             * it" (kernel bug) from "no byte was ever written" (the appshell's
-             * mNativeEventPending coalescing flag is stuck). */
-            if (toms < 0 && current_proc && current_proc->pid == current_proc->tgid &&
-                current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-                current_proc->name[4]=='f') {
-                static uint32_t last_dump;
-                uint32_t now = pit_ticks();
-                if ((uint32_t)(now - last_dump) >= 1000) {   /* 10 s */
-                    last_dump = now;
-                    printk("[pollstall] pid=%d nfds=%u:", current_proc->pid,
-                           (unsigned)nfds);
-                    for (uint32_t i = 0; i < nfds && i < 16; i++) {
-                        int fd = (int)kfds[i * 2];
-                        if (fd < 0 || fd >= MAX_FD) { printk(" fd%d=inval", fd); continue; }
-                        proc_file_t *f = &current_proc->ofile[fd];
-                        printk(" fd%d:t%d%s%s", fd, (int)f->type,
-                               fd_read_ready(fd) ? "R" : "-",
-                               fd_write_ready(fd) ? "W" : "-");
-                        if (f->type == FD_PIPE_R && f->pipe)
-                            printk("(cnt=%u nw=%d)", (unsigned)f->pipe->count,
-                                   f->pipe->nwriters);
-                    }
-                    printk("\n");
-                }
-            }
-        }
-        {   /* [pollfd] decisive diag: which fd is the firefox MAIN thread
-             * blocking on with an infinite/long timeout, and what is that fd's
-             * type + pipe/socket peer state?  Identifies the ManageChildProcess
-             * (glxtest result pipe) stall. */
-            if (toms < 0 && nfds >= 1 && current_proc &&
-                current_proc->pid == current_proc->tgid &&
-                current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-                current_proc->name[4]=='f') {
-                static int pf = 0;
-                if (pf < 30) { pf++;
-                    int fd0 = (int)kfds[0];
-                    short ev0 = (short)(kfds[1] & 0xffff);
-                    int ty = (fd0 >= 0 && fd0 < MAX_FD) ? (int)current_proc->ofile[fd0].type : -1;
-                    int nr = -1, nw = -1;
-                    if (ty == FD_PIPE_R || ty == FD_PIPE_W) {
-                        nr = current_proc->ofile[fd0].pipe->nreaders;
-                        nw = current_proc->ofile[fd0].pipe->nwriters;
-                    }
-                    /* For an AF_UNIX socket (the IPC handshake fd) report the rx
-                     * buffer state: count (peer wrote?) + writer_closed (peer
-                     * gone?).  Distinguishes "child alive but not writing" from
-                     * an orphaned/mis-wired socket. */
-                    int rxc = -1, wrc = -1;
-                    uint32_t rxp = 0, txp = 0;
-                    if (ty == FD_USOCKET && current_proc->ofile[fd0].usock) {
-                        extern int usocket_rx_state(struct usocket *s, int *wclosed);
-                        extern void usocket_dbg_ptrs(struct usocket *s, uint32_t *rx, uint32_t *tx);
-                        rxc = usocket_rx_state(current_proc->ofile[fd0].usock, &wrc);
-                        usocket_dbg_ptrs(current_proc->ofile[fd0].usock, &rxp, &txp);
-                    }
-                    printk("[pollfd] pid=%d fd=%d type=%d events=%x nr=%d nw=%d rxcount=%d wclosed=%d rx=%x tx=%x nfds=%u toms=%d\n",
-                           current_proc->pid, fd0, ty, (unsigned)(uint16_t)ev0, nr, nw,
-                           rxc, wrc, (unsigned)rxp, (unsigned)txp, (unsigned)nfds, toms);
-                }
-            }
+        {
             /* A deliverable signal interrupts the wait (fs/select.c
              * do_sys_poll returns -ERESTARTNOHAND: EINTR once the handler has
              * run, a transparent restart if none did; SA_RESTART never applies
@@ -5382,18 +5172,7 @@ static int sys_ugetrlimit(registers_t *regs) {
 
 /* ── sys_prctl(option, arg2…) — EAX=172 (stub) ──────────────────────────── */
 static int sys_prctl(registers_t *regs) {
-    /* [tname] log PR_SET_NAME(15) for firefox threads so we can see which named
-     * threads exist (esp. whether the "IPC Launch" thread is ever created). */
-    if ((int)regs->ebx == 15 && regs->ecx && current_proc &&
-        current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-        current_proc->name[4]=='f') {
-        char nm[20];
-        __builtin_memset(nm, 0, sizeof(nm));
-        if (copy_from_user(nm, (void *)(uintptr_t)regs->ecx, 16) == 0) {
-            nm[16] = 0;
-            printk("[tname] tid=%d name='%s'\n", current_proc->pid, nm);
-        }
-    }
+    (void)regs;
     return 0;
 }
 
@@ -5447,16 +5226,6 @@ static int sys_openat(registers_t *regs) {
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
     int rc = sys_open_kernel_path(resolved, flags);
-    fx_lockdbg("openat", path, rc);
-    {   /* DEBUG: trace image/icon/theme opens (glibc open() routes here) */
-        static int ic = 0;
-        if (ic < 120 && (dbg_str_has(path, ".png") || dbg_str_has(path, ".svg") ||
-                         dbg_str_has(path, "icon") || dbg_str_has(path, "theme") ||
-                         dbg_str_has(path, "hicolor") || dbg_str_has(path, "pixmap"))) {
-            ic++;
-            printk("[iconopen] %s -> %d\n", path, rc);
-        }
-    }
     return rc;
 }
 
@@ -5467,13 +5236,12 @@ static int sys_mkdir_kernel_path(const char *path) {
     if (base[0] == '\0') return -22;
 
     vfs_node_t *dir = vfs_open_parent_at(path, dir_path);
-    if (!dir || !dir->create_fn) { fx_lockdbg("mkdir", path, -2); return -2; }
+    if (!dir || !dir->create_fn) return -2;
     /* Need write+search on the parent to create a directory in it. */
     if (vfs_access_check(dir, current_proc->euid, current_proc->egid,
                          VFS_WANT_W | VFS_WANT_X) < 0)
-        { fx_lockdbg("mkdir", path, -13); return -13; }
+        return -13;
     int r = dir->create_fn(dir, base, VFS_FLAG_DIR);
-    fx_lockdbg("mkdir", path, r);
     if (r < 0) return r;
     /* Stamp the creator as owner with 0777 & ~umask so the user who made
      * the directory can actually write into it (ext2 create hardcodes
@@ -5560,7 +5328,6 @@ static int sys_fstatat64(registers_t *regs) {
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
     vfs_node_t *n = vfs_open(resolved);
-    fx_lockdbg("fstatat", path, n ? 0 : -2);
     if (!n) return -2;
     struct kstat64 kst;
     fill_kstat64(&kst, n);
@@ -5578,7 +5345,6 @@ static int sys_faccessat(registers_t *regs) {
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
     int rc = vfs_open(resolved) ? 0 : -2;
-    fx_lockdbg("faccessat", path, rc);
     return rc;
 }
 
@@ -5797,8 +5563,11 @@ static int sys_clock_getres_time64(registers_t *regs) {
 }
 
 /* ── sys_statfs64(path, sz, buf) / fstatfs64(fd, sz, buf) — EAX=268/269 ──────
- * Firefox checks free space / fs type for its profile + cache.  Report a
- * generic, roomy ext2-like filesystem. */
+ * Firefox checks free space / fs type for its profile + cache.  Report the real
+ * numbers when an ext2 filesystem is mounted, so df agrees with dumpe2fs and a
+ * program can actually observe space being consumed and released; fall back to
+ * the old roomy constants when nothing is mounted (initrd-only boots, where
+ * there is no block accounting to report). */
 static int sys_statfs64_fill(void *ubuf, uint32_t bufsz) {
     /* struct statfs64 (i386): f_type, f_bsize, f_blocks, f_bfree, f_bavail,
      * f_files, f_ffree, f_fsid[2], f_namelen, f_frsize, f_flags, f_spare[4].
@@ -5811,14 +5580,25 @@ static int sys_statfs64_fill(void *ubuf, uint32_t bufsz) {
     } s;
     __builtin_memset(&s, 0, sizeof(s));
     s.f_type    = 0xEF53;              /* EXT2_SUPER_MAGIC */
-    s.f_bsize   = 4096;
-    s.f_blocks  = 256 * 1024;         /* ~1 GiB */
-    s.f_bfree   = 192 * 1024;
-    s.f_bavail  = 192 * 1024;
-    s.f_files   = 65536;
-    s.f_ffree   = 60000;
+    uint32_t bs, blocks, bfree, inodes, ifree;
+    if (ext2_statfs(&bs, &blocks, &bfree, &inodes, &ifree) == 0) {
+        s.f_bsize  = bs;
+        s.f_frsize = bs;
+        s.f_blocks = blocks;
+        s.f_bfree  = bfree;
+        s.f_bavail = bfree;
+        s.f_files  = inodes;
+        s.f_ffree  = ifree;
+    } else {
+        s.f_bsize  = 4096;
+        s.f_frsize = 4096;
+        s.f_blocks = 256 * 1024;      /* ~1 GiB */
+        s.f_bfree  = 192 * 1024;
+        s.f_bavail = 192 * 1024;
+        s.f_files  = 65536;
+        s.f_ffree  = 60000;
+    }
     s.f_namelen = 255;
-    s.f_frsize  = 4096;
     if (!access_ok(ubuf, bufsz)) return -14;
     uint32_t n = bufsz < sizeof(s) ? bufsz : sizeof(s);
     if (copy_to_user(ubuf, &s, n) < 0) return -14;
@@ -7203,29 +6983,9 @@ void syscall_dispatch(registers_t *regs) {
     int ret = -38;   /* -ENOSYS */
 
     if (current_proc) current_proc->last_syscall = (int)num;
-    {   /* diagnostic: periodic live-process snapshot to spot stalls */
-        static uint32_t last_snap = 0;
-        uint32_t now = pit_ticks();
-        if (now - last_snap >= 300) { last_snap = now; proc_debug_snapshot(); }
-    }
-    /* Bochs watchpoint hunt: when gtkprobe has the corrupting arena slot
-     * (0x40073000) mapped, print its physical address and hit a Bochs MAGIC
-     * BREAKPOINT (xchg %bx,%bx) ONCE — the debugger then sets `watch w <phys>`
-     * to catch the instruction that writes 0x80000000.  A no-op under QEMU. */
-    {
-        static int gtk_broke = 0;
-        if (!gtk_broke && current_proc &&
-            __builtin_strcmp(current_proc->name, "gtkprobe") == 0 &&
-            (*paging_get_pde(0x40073000U) & 0x1) &&
-            (*paging_get_pte(0x40073000U) & 0x1)) {
-            uint32_t ph = (*paging_get_pte(0x40073000U) & ~0xFFFU) |
-                          (0x40073000U & 0xFFFU);
-            printk("[bochs-hunt] gtkprobe 0x40073000 -> phys 0x%08x (MAGIC BREAK)\n",
-                   (unsigned)ph);
-            gtk_broke = 1;
-            __asm__ volatile("xchgw %bx, %bx");   /* Bochs magic breakpoint */
-        }
-    }
+    /* kprof's periodic dump.  Here rather than in the timer tick so the printk
+     * runs with interrupts enabled and does not cost the tick counter time. */
+    kprof_tick();
 
     switch (num) {
     case 1:   sys_exit(regs);                  break;  /* noreturn */
@@ -7417,6 +7177,14 @@ void syscall_dispatch(registers_t *regs) {
     case 500: ret = shm_sys_create(regs->ebx); break;
     case 501: ret = shm_sys_map((int)regs->ebx);   break;
     case 502: ret = shm_sys_unmap((int)regs->ebx); break;
+    case 503:  /* kprof: dump the cycle accounting (see include/kernel/kprof.h) */
+        kprof_dump("mark");
+        ret = 0;
+        break;
+    case 504:  /* kprof: reset the counters */
+        kprof_reset();
+        ret = 0;
+        break;
     case 505:  /* register Ctrl+Alt+Backspace kill target (desktop only) */
         keyboard_set_kill_target((int)regs->ebx);
         ret = 0;
@@ -7434,62 +7202,24 @@ void syscall_dispatch(registers_t *regs) {
         /* Don't spam the log for common no-op syscalls */
         if (num != 174 && num != 175 && num != 176 &&
             num != 57 && num != 65 && num != 66 && num != 82 &&
-            num != 85 && num != 132 && num != 172 && num != 186)
-            printk("[SYSCALL] unimplemented %u from pid %d\n",
-                   (unsigned)num, current_proc ? current_proc->pid : -1);
+            num != 85 && num != 132 && num != 172 && num != 186) {
+            /* Report each unimplemented number ONCE.  Firefox calls getrusage
+             * (77) in a loop, and an unconditional printk there emitted
+             * thousands of identical lines per startup. */
+            static uint8_t warned[512];
+            uint32_t slot = num < 512 ? num : 511;
+            if (!warned[slot]) {
+                warned[slot] = 1;
+                printk("[SYSCALL] unimplemented %u from pid %d\n",
+                       (unsigned)num, current_proc ? current_proc->pid : -1);
+            }
+        }
         break;
     }
 
     regs->eax = (uint32_t)(int32_t)ret;
 
-    /* [ftrace] raw firefox MAIN-thread syscall sequence during startup, to find
-     * the exact call whose failure triggers ProfileMissingDialog.  Skip the
-     * high-frequency noise (futex, mmap/mprotect, r/w, time, sigaction). */
-    if (current_proc && current_proc->pid == current_proc->tgid &&
-        current_proc->name[0]=='f' && current_proc->name[1]=='i' &&
-        current_proc->name[4]=='f') {
-        switch (num) {
-        case 240: case 403: case 192: case 125: case 3: case 4: case 6:
-        case 146: case 145: case 265: case 78: case 174: case 175: case 13:
-        case 14: case 90: case 91: case 45: case 197: case 108: case 33:
-            break;
-        default: {
-            static int ft = 0;
-            if (ft < 260) { ft++;
-                /* Decode the path arg for path-based syscalls so we can see
-                 * which file resolution leads to the profile error.  The at-fd
-                 * variants (openat 295, statx 383, faccessat 307, fstatat64 300,
-                 * readlinkat 305, mkdirat 296) take path at ECX (arg2, after the
-                 * dirfd); the plain variants take path at EBX. */
-                int at = (num==295||num==383||num==307||num==300||num==305||num==296);
-                uint32_t pptr = at ? regs->ecx : regs->ebx;
-                char pbuf[96]; pbuf[0]=0;
-                int haspath = (num==5||num==295||num==195||num==196||num==106||
-                               num==33||num==307||num==383||num==300||num==85||
-                               num==305||num==39||num==296||num==83||num==38);
-                if (haspath) copy_user_str((const void*)(uintptr_t)pptr, pbuf, sizeof(pbuf));
-                /* skip library-loader noise to keep the profile ops visible */
-                if (!(haspath && (dbg_str_has(pbuf, ".so") || dbg_str_has(pbuf, "/lib") ||
-                                  dbg_str_has(pbuf, "/disk/firefox/") ||
-                                  dbg_str_has(pbuf, "/usr/") || dbg_str_has(pbuf, "/etc/"))))
-                    printk("[ftrace] sys=%u ret=%d path='%s'\n",
-                           (unsigned)num, ret, haspath ? pbuf : "");
-            }
-        }
-        }
-    }
 
-    /* [einval-trace] catch any EINVAL returned to a firefox thread (the glxtest
-     * "poll failed: Invalid argument" culprit). */
-    if (ret == -22 && current_proc && current_proc->name[0]=='f' &&
-        current_proc->name[1]=='i' && current_proc->name[4]=='f') {
-        static int ev = 0;
-        if (ev < 40) { ev++;
-            printk("[einval] pid=%d syscall=%u ebx=%x ecx=%x edx=%x esi=%x\n",
-                   current_proc->pid, (unsigned)num, (unsigned)regs->ebx,
-                   (unsigned)regs->ecx, (unsigned)regs->edx, (unsigned)regs->esi);
-        }
-    }
 
     /* Deliver any pending signals before returning to user mode; an
      * interrupted blocking call is restarted or fails with EINTR here (the

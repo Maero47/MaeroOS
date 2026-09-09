@@ -473,6 +473,9 @@ def main():
     ap.add_argument("--out", default=os.path.join("build", "ff-smoke"), help="artifact root")
     ap.add_argument("--tag", default=None, help="suffix for the artifact directory (default: accel-smpN)")
     ap.add_argument("--qemu", default="qemu-system-i386")
+    ap.add_argument("--cpu", default=None,
+                    help="QEMU -cpu model (default: QEMU's own). "
+                         "Use to test what the guest does with a wider feature set, e.g. --cpu host")
     ap.add_argument("--hold", type=float, default=25.0,
                     help="seconds to keep sampling frames after the paint verdict "
                          "before choosing screen-paint.png (default 25)")
@@ -526,10 +529,13 @@ def main():
            "-monitor", "none",
            "-qmp", "unix:%s,server,nowait" % qmp_path,
            "-no-reboot", "-no-shutdown"]
+    if args.cpu:
+        cmd[1:1] = ["-cpu", args.cpu]
     with open(os.path.join(args.outdir, "qemu-cmdline.txt"), "w") as f:
         f.write(" ".join(cmd) + "\n")
 
-    print("smoke-firefox: accel=%s smp=%d mem=%s timeout=%ds" % (accel, args.smp, args.mem, args.timeout))
+    print("smoke-firefox: accel=%s smp=%d mem=%s cpu=%s timeout=%ds"
+          % (accel, args.smp, args.mem, args.cpu or "default", args.timeout))
     print("smoke-firefox: artifacts -> %s" % args.outdir)
 
     run = Run(args)

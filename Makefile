@@ -303,7 +303,9 @@ smoke-gtk: $(TARGET) initrd
 abiprobes:
 	$(MAKE) -C ports/abiprobes
 
-smoke-abi: $(TARGET) abiprobes initrd
+# The disk is a dependency because p26_unlink_frees_space measures real ext2
+# free space; every other probe runs out of the initrd alone.
+smoke-abi: $(TARGET) abiprobes initrd disk
 	python3 tools/smoke_abi.py
 
 # Does Firefox 115 paint a window on the desktop?  Boots the ISO with the

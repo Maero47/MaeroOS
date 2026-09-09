@@ -304,18 +304,9 @@ int usocket_write_ready(usocket_t *s) {
  * correlated (rx ptr) against a writer's tx ptr ([uflow] WR) — to detect a
  * socketpair routing/inheritance MISMATCH (parent polls one pair, child writes
  * another). */
-void usocket_dbg_ptrs(usocket_t *s, uint32_t *rx, uint32_t *tx) {
-    if (rx) *rx = s ? (uint32_t)(uintptr_t)s->rx : 0;
-    if (tx) *tx = s ? (uint32_t)(uintptr_t)s->tx : 0;
-}
 
 /* Diagnostic: rx buffer fill + whether the peer (writer) has closed.  -1 rx
  * means there is no rx buffer (unconnected). */
-int usocket_rx_state(usocket_t *s, int *wclosed) {
-    if (!s || !s->rx) { if (wclosed) *wclosed = -1; return -1; }
-    if (wclosed) *wclosed = s->rx->writer_closed;
-    return (int)s->rx->count;
-}
 
 void usocket_retain(usocket_t *s) { if (s) s->refs++; }
 

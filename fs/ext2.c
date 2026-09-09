@@ -2,12 +2,15 @@
 #include "vfs.h"
 #include "../drivers/ata.h"
 #include "../mm/heap.h"
+#include "../mm/pmm.h"
+#include <kernel/config.h>
 #include "../lib/string.h"
 #include "../kernel/printk.h"
 #include "../arch/i686/cpu/pit.h"
 #include "../proc/scheduler.h"
 #include <stdint.h>
 #include <stddef.h>
+#include <kernel/kprof.h>
 
 /* ── ext2 on-disk structures ──────────────────────────────────────────────── */
 
@@ -108,7 +111,43 @@ typedef struct {
 static ext2_state_t g_state;
 static int g_mounted = 0;
 
-#define EXT2_CACHE_SLOTS 8
+/* ── Block cache ──────────────────────────────────────────────────────────────
+ * Every block read that misses costs one ATA PIO transaction, and under KVM
+ * every port access in that transaction is a VM exit into QEMU (~2 us).  The
+ * cache this replaced held 8 blocks, i.e. less than one page fault's worth: a
+ * 4 KiB fault on libxul.so reads the group descriptor, the inode block, up to
+ * three indirect blocks and four data blocks, so the metadata was evicted by
+ * the data of the very fault that needed it and re-read from disk every time.
+ *
+ * Set-associative (bucket = block number masked to the set count, LRU within the
+ * set), so a large cache costs no more per lookup than the old linear scan over
+ * 8 slots.  Sized at mount from a share of the free physical memory, so it is
+ * large on the 2 GiB machine that runs the browser and small on a 128 MiB one.
+ *
+ * The block buffers come out of ONE slab allocation rather than one kmalloc per
+ * slot.  kmalloc is a first-fit walk of a single free list (mm/heap.c), and the
+ * filesystem and the page-fault path both allocate on every call, so putting
+ * tens of thousands of 1 KiB blocks on that list makes every later allocation
+ * walk past them: measured, a 32 MiB cache built from per-slot allocations
+ * quadrupled page-fault time (5.6 s -> 20.5 s over a Firefox startup) and lost
+ * far more than the extra cache hits gained.  One slab costs one list entry. */
+/* Most blocks that a run of consecutive file blocks can carry in one ATA
+ * transaction.  128 KiB is 256 sectors, past what one command can express;
+ * 64 blocks keeps a transaction's interrupts-off window near 100 us. */
+#define EXT2_READ_CLUSTER  64
+
+#define EXT2_CACHE_MAX_SETS 4096                /* power of two */
+#define EXT2_CACHE_WAYS     4
+#define EXT2_CACHE_SLOTS    (EXT2_CACHE_MAX_SETS * EXT2_CACHE_WAYS)
+
+/* Share of free physical memory the cache may hold, and a floor so that a tiny
+ * machine still gets a useful one. */
+#define EXT2_CACHE_MEM_SHARE  8                 /* one eighth of free RAM */
+#define EXT2_CACHE_MIN_SETS   8
+
+static uint8_t  *g_cache_slab;                  /* one allocation for all slots */
+static uint32_t  g_cache_setmask;               /* sets in use, minus one       */
+
 typedef struct {
     uint32_t blk;
     uint32_t age;
@@ -119,6 +158,34 @@ typedef struct {
 static ext2_cache_entry_t g_cache[EXT2_CACHE_SLOTS];
 static uint32_t g_cache_age = 1;
 static int g_cache_ready = 0;
+
+static inline ext2_cache_entry_t *ext2_cache_set(uint32_t blk) {
+    return &g_cache[(blk & g_cache_setmask) * EXT2_CACHE_WAYS];
+}
+
+/* The slot holding `blk`, or NULL. */
+static ext2_cache_entry_t *ext2_cache_find(uint32_t blk) {
+    ext2_cache_entry_t *set = ext2_cache_set(blk);
+    for (int i = 0; i < EXT2_CACHE_WAYS; i++)
+        if (set[i].valid && set[i].blk == blk) return &set[i];
+    return (ext2_cache_entry_t *)0;
+}
+
+/* A slot in blk's set to (re)use: its own slot, then a free one, then the LRU.
+ * Returns NULL if the buffer could not be allocated (the cache then just
+ * misses, which is correct, only slower). */
+/* The slot in blk's set to (re)use: its own, then a free one, then the LRU.
+ * Every slot already owns its slab buffer, so this cannot fail. */
+static ext2_cache_entry_t *ext2_cache_claim(uint32_t blk) {
+    ext2_cache_entry_t *set = ext2_cache_set(blk);
+    ext2_cache_entry_t *lru = &set[0];
+    for (int i = 0; i < EXT2_CACHE_WAYS; i++) {
+        if (set[i].valid && set[i].blk == blk) return &set[i];   /* already ours */
+        if (!set[i].valid) return &set[i];
+        if (set[i].age < lru->age) lru = &set[i];
+    }
+    return lru;
+}
 
 /* Per-node private data */
 typedef struct { uint32_t ino; } ext2_priv_t;
@@ -156,6 +223,23 @@ static int ext2_raw_read_block(uint32_t blk, void *buf) {
     return 0;
 }
 
+/* Read `n` physically consecutive blocks in ONE ATA transaction.  A transaction
+ * costs ~12 port accesses before the first sector moves, so reading the four
+ * 1 KiB blocks of a page fault separately paid that fixed cost four times.
+ * `n` is bounded by the caller (EXT2_READ_CLUSTER), and the sector count of one
+ * ATA command by 255. */
+static int ext2_raw_read_blocks(uint32_t blk, uint32_t n, void *buf) {
+    uint32_t lba  = g_state.lba_offset + blk * g_state.sectors_per_block;
+    uint32_t rem  = n * g_state.sectors_per_block;
+    uint8_t *p    = (uint8_t *)buf;
+    while (rem > 0) {
+        uint8_t k = (rem > 128) ? 128 : (uint8_t)rem;
+        if (ata_read(lba, k, p) < 0) return -1;
+        lba += k; p += (uint32_t)k * 512; rem -= k;
+    }
+    return 0;
+}
+
 static int ext2_raw_write_block(uint32_t blk, const void *buf) {
     uint32_t lba = g_state.lba_offset + blk * g_state.sectors_per_block;
     if (g_state.sectors_per_block <= 255) {
@@ -181,23 +265,63 @@ static void ext2_cache_init(void) {
         g_cache[i].blk = 0;
         g_cache[i].age = 0;
         g_cache[i].valid = 0;
-        if (!g_cache[i].data)
-            g_cache[i].data = (uint8_t *)kmalloc(g_state.block_size);
-        if (!g_cache[i].data)
-            return;
+        g_cache[i].data = (uint8_t *)0;
     }
+
+    /* How many sets can we afford?  A share of free memory, capped by the slot
+     * array, floored so a small machine still caches something.  Sets are a
+     * power of two so the bucket index is a mask. */
+    /* Frames * (PAGE_SIZE / SHARE) rather than (frames * PAGE_SIZE) / SHARE:
+     * the kernel links no libgcc 64-bit division helpers, and the share divides
+     * the page size exactly. */
+    uint32_t share = pmm_free_frames() * (PAGE_SIZE / EXT2_CACHE_MEM_SHARE);
+    uint32_t want  = share / (g_state.block_size * EXT2_CACHE_WAYS);
+    uint32_t sets  = EXT2_CACHE_MIN_SETS;
+    while (sets * 2u <= want && sets * 2u <= EXT2_CACHE_MAX_SETS) sets *= 2u;
+
+    /* One slab for every buffer.  If it will not fit, halve and retry rather
+     * than fall back to per-slot allocations, which would flood the heap's
+     * free list (see the note above). */
+    while (sets >= EXT2_CACHE_MIN_SETS) {
+        uint32_t bytes = sets * EXT2_CACHE_WAYS * g_state.block_size;
+        g_cache_slab = (uint8_t *)kmalloc(bytes);
+        if (g_cache_slab) break;
+        sets /= 2u;
+    }
+    if (!g_cache_slab) {
+        printk("[EXT2] block cache unavailable (no memory)\n");
+        g_cache_ready = 0;
+        return;
+    }
+
+    g_cache_setmask = sets - 1u;
+    for (uint32_t i = 0; i < sets * EXT2_CACHE_WAYS; i++)
+        g_cache[i].data = g_cache_slab + (size_t)i * g_state.block_size;
+    printk("[EXT2] block cache %u KiB (%u sets x %u ways of %u B)\n",
+           (unsigned)(sets * EXT2_CACHE_WAYS * g_state.block_size / 1024u),
+           (unsigned)sets, (unsigned)EXT2_CACHE_WAYS,
+           (unsigned)g_state.block_size);
     g_cache_ready = 1;
 }
 
-static ext2_cache_entry_t *ext2_cache_pick_slot(void) {
-    ext2_cache_entry_t *slot = &g_cache[0];
-    for (uint32_t i = 0; i < EXT2_CACHE_SLOTS; i++) {
-        if (!g_cache[i].valid)
-            return &g_cache[i];
-        if (g_cache[i].age < slot->age)
-            slot = &g_cache[i];
+static void ext2_cache_insert(uint32_t blk, const void *buf);
+
+/* Copy `blk` out of the cache if it is there.  1 on a hit, 0 on a miss. */
+static int ext2_cache_lookup(uint32_t blk, void *buf) {
+    int hit = 0;
+    kprof_count(KPE_EXT2_BLK);
+    preempt_disable();
+    if (g_cache_ready) {
+        ext2_cache_entry_t *e = ext2_cache_find(blk);
+        if (e) {
+            memcpy(buf, e->data, g_state.block_size);
+            e->age = g_cache_age++;
+            hit = 1;
+        }
     }
-    return slot;
+    preempt_enable();
+    kprof_count(hit ? KPE_EXT2_HIT : KPE_EXT2_MISS);
+    return hit;
 }
 
 static int ext2_read_block(uint32_t blk, void *buf) {
@@ -207,33 +331,46 @@ static int ext2_read_block(uint32_t blk, void *buf) {
      * read, so it resumes copying a DIFFERENT block's bytes → corrupt directory
      * data → spurious ENOENT on a file that exists (the intermittent
      * "/disk/shell not found" boot flake and flaky smoke-disk).  Serialize the
-     * whole cache access (the raw ATA read already runs with IRQs off). */
+     * whole cache access (the raw ATA read already runs with IRQs off).
+     *
+     * CACHE INVARIANT: the guard must span the raw read AND the insert that
+     * publishes it, never just the insert.  A writer running in between would
+     * make the disk newer than what we are about to publish, and our insert
+     * would then leave the cache permanently stale for that block.  The
+     * clustered read in ext2_read_node holds the same invariant. */
+    kprof_count(KPE_EXT2_BLK);
     preempt_disable();
     if (g_cache_ready) {
-        for (uint32_t i = 0; i < EXT2_CACHE_SLOTS; i++) {
-            if (g_cache[i].valid && g_cache[i].blk == blk) {
-                memcpy(buf, g_cache[i].data, g_state.block_size);
-                g_cache[i].age = g_cache_age++;
-                preempt_enable();
-                return 0;
-            }
+        ext2_cache_entry_t *hit = ext2_cache_find(blk);
+        if (hit) {
+            memcpy(buf, hit->data, g_state.block_size);
+            hit->age = g_cache_age++;
+            preempt_enable();
+            kprof_count(KPE_EXT2_HIT);
+            return 0;
         }
     }
 
+    kprof_count(KPE_EXT2_MISS);
     if (ext2_raw_read_block(blk, buf) < 0) {
         preempt_enable();
         return -1;
     }
-
-    if (g_cache_ready) {
-        ext2_cache_entry_t *slot = ext2_cache_pick_slot();
-        memcpy(slot->data, buf, g_state.block_size);
-        slot->blk = blk;
-        slot->age = g_cache_age++;
-        slot->valid = 1;
-    }
+    ext2_cache_insert(blk, buf);
     preempt_enable();
     return 0;
+}
+
+/* Publish `buf` as the cached contents of `blk`.  Caller holds preempt_disable
+ * (the slot buffers are shared mutable state). */
+static void ext2_cache_insert(uint32_t blk, const void *buf) {
+    if (!g_cache_ready) return;
+    ext2_cache_entry_t *slot = ext2_cache_claim(blk);
+    if (!slot || !slot->data) return;
+    memcpy(slot->data, buf, g_state.block_size);
+    slot->blk = blk;
+    slot->age = g_cache_age++;
+    slot->valid = 1;
 }
 
 static int ext2_write_block(uint32_t blk, const void *buf) {
@@ -241,21 +378,7 @@ static int ext2_write_block(uint32_t blk, const void *buf) {
         return -1;
 
     preempt_disable();   /* same shared-cache hazard as ext2_read_block */
-    if (g_cache_ready) {
-        ext2_cache_entry_t *slot = NULL;
-        for (uint32_t i = 0; i < EXT2_CACHE_SLOTS; i++) {
-            if (g_cache[i].valid && g_cache[i].blk == blk) {
-                slot = &g_cache[i];
-                break;
-            }
-        }
-        if (!slot)
-            slot = ext2_cache_pick_slot();
-        memcpy(slot->data, buf, g_state.block_size);
-        slot->blk = blk;
-        slot->age = g_cache_age++;
-        slot->valid = 1;
-    }
+    ext2_cache_insert(blk, buf);
     preempt_enable();
     return 0;
 }
@@ -512,6 +635,24 @@ static int ext2_free_block(uint32_t blk) {
         ext2_update_super_free_counts(1, 0);
     }
     kfree(bitmap);
+    return 0;
+}
+
+/* Live free-space numbers for statfs().  The superblock counters are updated by
+ * ext2_alloc_block/ext2_free_block (via ext2_update_super_free_counts), so what
+ * df reports is what dumpe2fs reports. */
+int ext2_statfs(uint32_t *block_size, uint32_t *blocks, uint32_t *bfree,
+                uint32_t *inodes, uint32_t *ifree) {
+    if (!g_mounted) return -1;
+    uint8_t sb_buf[2048];
+    if (ata_read(g_state.lba_offset + 2, 4, sb_buf) < 0) return -1;
+    ext2_sb_t *sb = (ext2_sb_t *)sb_buf;
+    if (sb->s_magic != 0xEF53) return -1;
+    if (block_size) *block_size = g_state.block_size;
+    if (blocks)     *blocks     = sb->s_blocks_count;
+    if (bfree)      *bfree      = sb->s_free_blocks_count;
+    if (inodes)     *inodes     = sb->s_inodes_count;
+    if (ifree)      *ifree      = sb->s_free_inodes_count;
     return 0;
 }
 
@@ -807,59 +948,6 @@ static uint32_t ext2_file_blk_alloc(ext2_inode_t *ino, uint32_t idx) {
     return blk;
 }
 
-static int ext2_file_blk_free(ext2_inode_t *ino, uint32_t idx) {
-    uint32_t ptrs_per_blk = g_state.block_size / 4;
-
-    if (idx < 12) {
-        if (ino->i_block[idx]) {
-            ext2_free_block(ino->i_block[idx]);
-            ino->i_block[idx] = 0;
-            if (ino->i_blocks >= g_state.sectors_per_block)
-                ino->i_blocks -= g_state.sectors_per_block;
-        }
-        return 0;
-    }
-
-    idx -= 12;
-    if (idx >= ptrs_per_blk || !ino->i_block[12])
-        return 0;
-
-    uint32_t *ind = (uint32_t *)kmalloc(g_state.block_size);
-    if (!ind) return -1;
-    if (ext2_read_block(ino->i_block[12], ind) < 0) {
-        kfree(ind);
-        return -1;
-    }
-
-    if (ind[idx]) {
-        ext2_free_block(ind[idx]);
-        ind[idx] = 0;
-        if (ino->i_blocks >= g_state.sectors_per_block)
-            ino->i_blocks -= g_state.sectors_per_block;
-    }
-
-    int any = 0;
-    for (uint32_t i = 0; i < ptrs_per_blk; i++) {
-        if (ind[i]) {
-            any = 1;
-            break;
-        }
-    }
-
-    if (any) {
-        int r = ext2_write_block(ino->i_block[12], ind);
-        kfree(ind);
-        return r;
-    }
-
-    kfree(ind);
-    ext2_free_block(ino->i_block[12]);
-    ino->i_block[12] = 0;
-    if (ino->i_blocks >= g_state.sectors_per_block)
-        ino->i_blocks -= g_state.sectors_per_block;
-    return 0;
-}
-
 /* ── VFS read_fn for ext2 file nodes ─────────────────────────────────────── */
 
 static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
@@ -894,9 +982,61 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
         }
 
         /* Whole-block aligned copy: read straight into the destination,
-         * skipping the bounce buffer (the common case for mmap/page reads). */
+         * skipping the bounce buffer (the common case for mmap/page reads).
+         * On a cache miss, extend the read over as many physically consecutive
+         * blocks as the request still needs, so a 4 KiB page fault on a
+         * contiguous file costs one ATA transaction instead of four. */
         if (blk_off == 0 && to_copy == blk_size) {
-            if (ext2_read_block(blk_num, buf + done) < 0) break;
+            if (!ext2_cache_lookup(blk_num, buf + done)) {
+                /* Cluster only into a KERNEL destination.  ata_read transfers
+                 * with interrupts disabled straight into the caller's buffer,
+                 * and sys_read hands us the user pointer unbounced: a longer
+                 * transaction into user memory would widen the window in which
+                 * a demand-paged destination page faults in the middle of a
+                 * live PIO transfer.  The mmap page-fill path, which is where
+                 * nearly all of the reads are, fills a kernel temp mapping. */
+                uint32_t run = 1;
+                while ((uintptr_t)(buf + done) >= KERNEL_VMA &&
+                       run < EXT2_READ_CLUSTER &&
+                       done + (run + 1) * blk_size <= size &&
+                       ext2_file_blk_cached(&inode, blk_idx + run, &ic)
+                           == blk_num + run)
+                    run++;
+                if (run > 1) {
+                    /* CACHE INVARIANT: the raw read and the inserts that
+                     * publish it MUST be one non-preemptible section, exactly
+                     * as in ext2_read_block.  Otherwise a writer that runs in
+                     * between puts fresh contents in the cache and on the disk,
+                     * and this thread then republishes the copy it read BEFORE
+                     * that write - leaving the cache permanently disagreeing
+                     * with the disk for those blocks.  That is silent data
+                     * corruption, not a stale-performance problem.
+                     *
+                     * Holding the guard across the transfer is nearly free
+                     * here: ata_read already runs the whole transfer with
+                     * interrupts disabled (one cluster is at most 128 sectors,
+                     * a single ATA command), so preemption was impossible for
+                     * the expensive part anyway.  The guard only adds the gaps
+                     * around it - which are precisely the gaps the race needs.
+                     * That is why this is a wider guard rather than a
+                     * generation stamp on each block: same outcome, no new
+                     * state, and it matches the single-block path. */
+                    int failed;
+                    preempt_disable();
+                    failed = ext2_raw_read_blocks(blk_num, run, buf + done) < 0;
+                    if (!failed)
+                        for (uint32_t r = 0; r < run; r++)
+                            ext2_cache_insert(blk_num + r,
+                                              buf + done + r * blk_size);
+                    preempt_enable();
+                    if (failed) break;
+                    kprof_add(KPE_EXT2_BLK, run);
+                    kprof_add(KPE_EXT2_MISS, run);
+                    done += run * blk_size;
+                    continue;
+                }
+                if (ext2_read_block(blk_num, buf + done) < 0) break;
+            }
         } else {
             if (ext2_read_block(blk_num, blk_buf) < 0) break;
             memcpy(buf + done, blk_buf + blk_off, to_copy);
@@ -1144,29 +1284,184 @@ static int ext2_init_dir_block(uint32_t blk, uint32_t self_ino,
     return r;
 }
 
-static void ext2_free_inode_blocks(ext2_inode_t *inode) {
+/*
+ * Free the blocks of one indirect subtree that lie at or after file-block index
+ * `from`, and the indirect blocks that become empty as a result.
+ *
+ *   blk    the indirect block being walked
+ *   level  how many pointer levels it holds: 1 = pointers to data blocks,
+ *          2 = pointers to singly-indirect blocks, 3 = to doubly-indirect
+ *   base   the file-block index that its first entry maps
+ *   bufs   one scratch block per level, so a recursive call cannot clobber its
+ *          caller's table.  Allocated once by ext2_free_blocks_from().
+ *
+ * Returns 1 if the subtree ended up completely empty, in which case `blk`
+ * itself has been freed and the caller must clear its pointer.
+ */
+static int ext2_free_subtree(uint32_t blk, int level, uint32_t base,
+                             uint32_t from, uint32_t **bufs, uint32_t *freed) {
+    uint32_t n = g_state.block_size / 4;
+    uint32_t span = 1;                       /* file blocks one entry covers */
+    for (int l = 1; l < level; l++) span *= n;
+
+    uint32_t *tbl = bufs[level - 1];
+    if (!tbl || ext2_read_block(blk, tbl) < 0)
+        return 0;                            /* cannot read it: leave it alone */
+
+    int dirty = 0, any = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!tbl[i]) continue;
+        uint32_t idx = base + i * span;
+        if (idx + span <= from) { any = 1; continue; }   /* wholly kept */
+        if (level > 1) {
+            if (ext2_free_subtree(tbl[i], level - 1, idx, from, bufs, freed)) {
+                tbl[i] = 0;
+                dirty = 1;
+            } else {
+                any = 1;                     /* partially kept */
+            }
+        } else {
+            ext2_free_block(tbl[i]);         /* span is 1, so idx >= from */
+            (*freed)++;
+            tbl[i] = 0;
+            dirty = 1;
+        }
+    }
+
+    if (!any) {                              /* nothing left: drop the table */
+        ext2_free_block(blk);
+        (*freed)++;
+        return 1;
+    }
+    if (dirty) ext2_write_block(blk, tbl);
+    return 0;
+}
+
+/*
+ * Release every block of `inode` from file-block index `from` onward, including
+ * the indirect blocks that stop being needed.  from == 0 empties the file.
+ *
+ * The driver reads all three indirect levels (ext2_file_blk) and allocates two
+ * of them (ext2_file_blk_alloc stops at doubly indirect, ~256 MiB with 1 KiB
+ * blocks), but the free path used to stop after the singly-indirect chain.
+ * Everything a file held beyond ~268 KiB was therefore lost on unlink: the
+ * bitmap bits stayed set with nothing referencing them, so the space could
+ * never be reused and only fsck could recover it.  Walk all three levels, so
+ * that guest-written files (doubly) and host-written ones such as libxul on the
+ * Firefox image (triply) are both released completely.
+ */
+static void ext2_free_blocks_from(ext2_inode_t *inode, uint32_t from) {
     if (!inode) return;
+    uint32_t n = g_state.block_size / 4;
+    uint32_t freed = 0;
+    uint32_t *bufs[3];
+    for (int i = 0; i < 3; i++) bufs[i] = (uint32_t *)kmalloc(g_state.block_size);
+
     for (uint32_t i = 0; i < 12; i++) {
-        if (inode->i_block[i]) {
+        if (i >= from && inode->i_block[i]) {
             ext2_free_block(inode->i_block[i]);
+            freed++;
             inode->i_block[i] = 0;
         }
     }
 
-    if (inode->i_block[12]) {
-        uint32_t *ind = (uint32_t *)kmalloc(g_state.block_size);
-        if (ind && ext2_read_block(inode->i_block[12], ind) == 0) {
-            uint32_t ptrs_per_blk = g_state.block_size / 4;
-            for (uint32_t i = 0; i < ptrs_per_blk; i++) {
-                if (ind[i])
-                    ext2_free_block(ind[i]);
-            }
+    uint32_t base = 12, span = 1;
+    for (int lvl = 1; lvl <= 3; lvl++) {
+        span *= n;                           /* file blocks this tree covers */
+        uint32_t slot = 11 + (uint32_t)lvl;  /* i_block[12], [13], [14] */
+        if (inode->i_block[slot] && base + span > from) {
+            if (ext2_free_subtree(inode->i_block[slot], lvl, base, from,
+                                  bufs, &freed))
+                inode->i_block[slot] = 0;
         }
-        if (ind) kfree(ind);
-        ext2_free_block(inode->i_block[12]);
-        inode->i_block[12] = 0;
+        base += span;
     }
-    inode->i_blocks = 0;
+
+    for (int i = 0; i < 3; i++) if (bufs[i]) kfree(bufs[i]);
+
+    /* i_blocks counts 512-byte sectors, data and indirect blocks alike. */
+    uint32_t sectors = freed * g_state.sectors_per_block;
+    inode->i_blocks = (inode->i_blocks > sectors) ? inode->i_blocks - sectors : 0;
+    if (from == 0) inode->i_blocks = 0;
+}
+
+static void ext2_free_inode_blocks(ext2_inode_t *inode) {
+    ext2_free_blocks_from(inode, 0);
+}
+
+/* ── Open-inode table (deferred release, Unix unlink-while-open) ───────────
+ *
+ * POSIX: unlink() removes the NAME.  The inode and its blocks live until the
+ * last descriptor and the last mapping referring to them are gone.  tmpfs was
+ * fixed for this; ext2 was not - ext2_unlink() freed the blocks and the inode
+ * immediately, so a process still holding the file read an inode marked free
+ * whose blocks the allocator was free to hand to somebody else.  That is worse
+ * than a leak: it is cross-file corruption, and "write a temp file, unlink it,
+ * keep using the fd" is an ordinary thing for a program to do.
+ *
+ * ext2 builds a FRESH vfs_node_t on every lookup, so node identity cannot carry
+ * the count the way tmpfs's does.  Key it on the inode number instead: every
+ * long-lived holder of any node for that inode counts once, through the
+ * retain_fn/close_fn that vfs_retain()/vfs_close() already drive for open
+ * descriptors, inherited fd tables, file-backed VMAs and the shared-mapping
+ * registry.
+ *
+ * An orphan whose last reference is dropped by a reboot rather than a close
+ * still leaks, exactly as it would on any filesystem without an on-disk orphan
+ * list; recovering that needs fsck.  Table exhaustion degrades to the old
+ * behaviour (immediate release) rather than to a dangling inode. */
+#define EXT2_OPEN_MAX 128
+typedef struct {
+    uint32_t ino;        /* 0 = free slot */
+    int      refs;
+    int      orphan;     /* name is gone; release when refs reaches 0 */
+} ext2_open_t;
+
+static ext2_open_t g_open[EXT2_OPEN_MAX];
+
+static ext2_open_t *ext2_open_find(uint32_t ino) {
+    for (int i = 0; i < EXT2_OPEN_MAX; i++)
+        if (g_open[i].ino == ino) return &g_open[i];
+    return (ext2_open_t *)0;
+}
+
+/* Drop an orphaned inode for good: its blocks, then the inode itself. */
+static void ext2_release_orphan(uint32_t ino) {
+    ext2_inode_t victim;
+    if (ext2_read_inode(ino, &victim) == 0) {
+        ext2_free_inode_blocks(&victim);
+        victim.i_size = 0;
+        victim.i_dtime = ext2_now();
+        ext2_write_inode(ino, &victim);
+    }
+    ext2_free_inode(ino);
+}
+
+static void ext2_retain_node(vfs_node_t *node) {
+    if (!node || !node->private) return;
+    uint32_t ino = ((ext2_priv_t *)node->private)->ino;
+    preempt_disable();
+    ext2_open_t *e = ext2_open_find(ino);
+    if (!e) {
+        e = ext2_open_find(0);
+        if (e) { e->ino = ino; e->refs = 0; e->orphan = 0; }
+    }
+    if (e) e->refs++;
+    preempt_enable();
+}
+
+static void ext2_close_node(vfs_node_t *node) {
+    if (!node || !node->private) return;
+    uint32_t ino = ((ext2_priv_t *)node->private)->ino;
+    int release = 0;
+    preempt_disable();
+    ext2_open_t *e = ext2_open_find(ino);
+    if (e && --e->refs <= 0) {
+        release = e->orphan;
+        e->ino = 0; e->refs = 0; e->orphan = 0;
+    }
+    preempt_enable();
+    if (release) ext2_release_orphan(ino);
 }
 
 /* ── Helper: build a vfs_node_t from an ext2 directory entry ─────────────── */
@@ -1214,6 +1509,10 @@ static vfs_node_t *ext2_make_node(uint32_t ino_num, const char *name,
         node->read_fn  = ext2_read_node;
         node->write_fn = ext2_write_node;
         node->truncate_fn = ext2_truncate;
+        /* Reference tracking so unlink can defer the release; see the
+         * open-inode table above. */
+        node->retain_fn = ext2_retain_node;
+        node->close_fn  = ext2_close_node;
     }
 
     node->setattr_fn = ext2_setattr;
@@ -1317,13 +1616,37 @@ static int ext2_unlink(vfs_node_t *dir, const char *name) {
     if (ext2_remove_dirent(&dir_inode, name, NULL) < 0) return -1;
 
     uint32_t now = ext2_now();
-    ext2_free_inode_blocks(&victim);
-    victim.i_dtime = now;
-    victim.i_links_count = 0;
-    victim.i_size = 0;
+
+    /* Drop one link.  The inode only dies when the last name for it is gone -
+     * and even then not while a descriptor or a mapping still holds it, which
+     * is what the open-inode table records.  (link() is not implemented today,
+     * so i_links_count is 1 for a regular file and 2 for a directory, but doing
+     * this by the count rather than by assumption keeps unlink correct if hard
+     * links ever arrive.) */
+    if (victim.i_links_count > 0) victim.i_links_count--;
     victim.i_ctime = now;
-    ext2_write_inode(victim_ino, &victim);
-    ext2_free_inode(victim_ino);
+
+    if (victim.i_links_count > 0) {          /* another name still refers to it */
+        ext2_write_inode(victim_ino, &victim);
+    } else {
+        preempt_disable();
+        ext2_open_t *e = ext2_open_find(victim_ino);
+        int in_use = (e && e->refs > 0);
+        if (in_use) e->orphan = 1;
+        preempt_enable();
+
+        if (in_use) {
+            /* Name gone, data still reachable through the open descriptors.
+             * ext2_close_node() releases it when the last one closes. */
+            ext2_write_inode(victim_ino, &victim);
+        } else {
+            ext2_free_inode_blocks(&victim);
+            victim.i_dtime = now;
+            victim.i_size = 0;
+            ext2_write_inode(victim_ino, &victim);
+            ext2_free_inode(victim_ino);
+        }
+    }
 
     dir_inode.i_mtime = now;
     dir_inode.i_ctime = now;
@@ -1359,23 +1682,28 @@ static int ext2_truncate(vfs_node_t *node, uint32_t new_size) {
                           g_state.block_size;
     uint32_t new_blocks = (new_size + g_state.block_size - 1) /
                           g_state.block_size;
-    uint32_t max_blocks = 12 + (g_state.block_size / 4);
-    if (new_blocks > max_blocks) return -1;
+    /* The limit belongs to GROWING only, and it is what ext2_file_blk_alloc can
+     * actually reach (direct + singly + doubly indirect).  Applying it to every
+     * call also refused to SHRINK a file bigger than that - ftruncate() on a
+     * multi-megabyte file returned -1 instead of releasing the tail. */
+    uint32_t ppb = g_state.block_size / 4;
+    uint32_t max_blocks = 12 + ppb + ppb * ppb;
+    if (new_blocks > old_blocks && new_blocks > max_blocks) return -1;
 
     if (new_blocks > old_blocks) {
         uint32_t i;
         for (i = old_blocks; i < new_blocks; i++) {
             if (!ext2_file_blk_alloc(&inode, i)) {
-                while (i > old_blocks) {
-                    i--;
-                    ext2_file_blk_free(&inode, i);
-                }
+                ext2_free_blocks_from(&inode, old_blocks);   /* undo this call */
                 return -1;
             }
         }
     } else if (new_blocks < old_blocks) {
-        for (uint32_t i = old_blocks; i > new_blocks; i--)
-            ext2_file_blk_free(&inode, i - 1);
+        /* Free the tail, including any indirect blocks it leaves empty.  This
+         * used to go through a per-index helper that silently did nothing
+         * beyond the singly-indirect range, so shrinking a large file leaked
+         * exactly like unlink did. */
+        ext2_free_blocks_from(&inode, new_blocks);
     }
     inode.i_size = new_size;
     inode.i_mtime = ext2_now();

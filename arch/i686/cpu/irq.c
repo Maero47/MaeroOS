@@ -4,6 +4,7 @@
 #include "apic.h"
 #include <io.h>
 #include <stddef.h>
+#include <kernel/kprof.h>
 
 /* Signal delivery on return from an interrupt to ring 3 (Linux
  * exit_to_user_mode_loop -> arch_do_signal_or_restart on every IRQ return):
@@ -50,7 +51,15 @@ void irq_remove_handler(uint8_t irq) {
  * to the PIC.  Spurious IRQ7 (master) and IRQ15 (slave) are detected by reading
  * the In-Service Register before sending EOI — they must NOT receive EOI.
  */
+static void irq_handler_body(registers_t *regs);
+
 void irq_handler(registers_t *regs) {
+    int kp_old = kprof_switch(KPB_IRQ);
+    irq_handler_body(regs);
+    kprof_switch(kp_old);
+}
+
+static void irq_handler_body(registers_t *regs) {
     /* ── LAPIC timer (vector 0xF0): the AP's preemption clock ────────────────
      * Not a PIC IRQ — acknowledge via the Local APIC, never the 8259.  Drive
      * the scheduler tick exactly like the PIT does on the BSP (preempt only
