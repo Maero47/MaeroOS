@@ -188,8 +188,14 @@ int elf_load_bias(vfs_node_t *node, uint32_t pgdir_phys, uint32_t want_bias,
                     return -1;
                 }
                 pmm_frame_incref(phys);
-                pgdir_map(pgdir_phys, va, phys,
-                          PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+                if (pgdir_map(pgdir_phys, va, phys,
+                              PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
+                    printk("[ELF] OOM mapping segment page\n");
+                    pmm_frame_decref(phys);
+                    if (owned_hdr) { kfree(owned_hdr); }
+                    if (bounce)    { kfree(bounce); }
+                    return -1;    /* caller: exec fails with -ENOMEM */
+                }
                 dst = (uint8_t *)paging_temp_map(phys);
                 memset(dst, 0, PAGE_SIZE);   /* zero-fill BSS/holes up front */
             }

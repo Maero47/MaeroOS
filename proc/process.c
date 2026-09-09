@@ -274,9 +274,15 @@ struct proc *proc_create_userproc(const uint8_t *code, uint32_t code_len,
         p->state = PROC_UNUSED;
         return NULL;
     }
-    pgdir_map(p->pgdir_phys, USER_CODE_BASE, code_phys,
-              PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
     pmm_frame_incref(code_phys);
+    if (pgdir_map(p->pgdir_phys, USER_CODE_BASE, code_phys,
+                  PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
+        pmm_frame_decref(code_phys);
+        pgdir_free_user(p->pgdir_phys);
+        kfree(p->kstack);
+        p->state = PROC_UNUSED;
+        return NULL;
+    }
 
     /* Copy bytecode into the frame via temp mapping */
     uint8_t *cp = (uint8_t *)paging_temp_map(code_phys);
@@ -294,9 +300,18 @@ struct proc *proc_create_userproc(const uint8_t *code, uint32_t code_len,
             p->state = PROC_UNUSED;
             return NULL;
         }
-        pgdir_map(p->pgdir_phys, va, stack_phys,
-                  PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
         pmm_frame_incref(stack_phys);
+        if (pgdir_map(p->pgdir_phys, va, stack_phys,
+                      PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
+            /* Only this frame needs an explicit drop: it is NOT in the
+             * pgdir (the map is what failed).  Everything already mapped,
+             * code page included, is decref'd by pgdir_free_user. */
+            pmm_frame_decref(stack_phys);
+            pgdir_free_user(p->pgdir_phys);
+            kfree(p->kstack);
+            p->state = PROC_UNUSED;
+            return NULL;
+        }
     }
 
     /* Fill the trapframe for ring-3 entry */
@@ -358,9 +373,15 @@ struct proc *proc_create_from_elf(vfs_node_t *node, const char *name) {
             p->state = PROC_UNUSED;
             return NULL;
         }
-        pgdir_map(p->pgdir_phys, va, stack_phys,
-                  PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
         pmm_frame_incref(stack_phys);
+        if (pgdir_map(p->pgdir_phys, va, stack_phys,
+                      PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
+            pmm_frame_decref(stack_phys);
+            pgdir_free_user(p->pgdir_phys);
+            kfree(p->kstack);
+            p->state = PROC_UNUSED;
+            return NULL;
+        }
         if (va == USER_STACK_TOP - PAGE_SIZE)
             stack_top_phys = stack_phys;
     }

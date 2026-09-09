@@ -96,7 +96,20 @@ vfs_node_t *vfs_open(const char *path);
 uint32_t vfs_read(vfs_node_t *node, uint32_t offset, uint32_t size,
                   uint8_t *buf);
 
-/* Write up to `size` bytes at `offset` to a file node; returns bytes written */
+/*
+ * A write_fn may return VFS_WRITE_ENOMEM instead of a byte count to say "I
+ * allocated nothing and wrote nothing".  A plain 0 cannot carry that: write(2)
+ * returning 0 for a non-zero request is not an error to its caller, so a libc
+ * write loop spins on it forever.  tmpfs, whose file bodies come straight out
+ * of the kernel heap, is the writer that can hit it.
+ *
+ * Every caller of vfs_write() must test for it before using the value as a
+ * length.
+ */
+#define VFS_WRITE_ENOMEM  0xFFFFFFFFU
+
+/* Write up to `size` bytes at `offset` to a file node; returns bytes written,
+ * or VFS_WRITE_ENOMEM. */
 uint32_t vfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
                    const uint8_t *buf);
 

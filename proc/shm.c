@@ -4,6 +4,7 @@
 #include "../mm/pmm.h"
 #include "../include/kernel/config.h"
 #include "../lib/string.h"
+#include "../kernel/panic.h"
 #include <stddef.h>
 
 typedef struct {
@@ -86,10 +87,19 @@ int shm_sys_map(int id) {
     if (base + obj->npages * PAGE_SIZE >= USER_STACK_BASE)
         return -12;
 
+    /* Reserve the page tables before taking any reference, so the whole
+     * attach either happens or leaves the process exactly as it was.  Linux
+     * shmat() returns ENOMEM here too. */
+    if (paging_reserve_range(base, base + obj->npages * PAGE_SIZE, 1) != 0)
+        return -12;
+
     for (uint32_t i = 0; i < obj->npages; i++) {
         pmm_frame_incref(obj->frames[i]);   /* this mapping's reference */
-        paging_map(base + i * PAGE_SIZE, obj->frames[i],
-                   PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_SHARED);
+        /* Cannot fail: the table was reserved above. */
+        if (paging_map(base + i * PAGE_SIZE, obj->frames[i],
+                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER |
+                       PAGE_SHARED) != 0)
+            panic("shmat: reserved page table vanished", NULL);
     }
     p->mmap_next = base + obj->npages * PAGE_SIZE;
 

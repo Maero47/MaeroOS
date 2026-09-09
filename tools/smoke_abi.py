@@ -80,6 +80,11 @@ PROBES = {
     "p26_unlink_frees_space":  (240, ""),
     # Writes 3 MiB and reads it back three ways over the ATA PIO disk.
     "p27_indirect_blocks":     (240, ""),
+    # Drives the physical allocator, the descriptor tables, the kernel heap
+    # (tmpfs) and execve's argument collector to refusal, then requires the
+    # kernel to still fork and exec.  Hundreds of MiB are zeroed and freed
+    # under TCG, so it is the slowest probe in the set.
+    "p28_alloc_failure":       (300, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

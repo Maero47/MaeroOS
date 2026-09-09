@@ -41,8 +41,24 @@ static inline uint32_t *paging_get_pde(uint32_t virt) {
 }
 
 void paging_init(void);
-void paging_map(uint32_t virt, uint32_t phys, uint32_t flags);
+/* Map one page.  Returns 0, or -1 if the page table it needs could not be
+ * allocated (physical memory exhausted).  On failure nothing was changed. */
+int  paging_map(uint32_t virt, uint32_t phys, uint32_t flags)
+     __attribute__((warn_unused_result));
+
+/* Ensure the page table covering `virt` exists, so a later paging_map() of any
+ * address in that 4 MiB cannot fail.  0 on success, -1 on OOM. */
+int  paging_reserve_table(uint32_t virt, int user);
+
+/* The same for every table spanning [start, end).  0 on success, -1 on OOM. */
+int  paging_reserve_range(uint32_t start, uint32_t end, int user)
+     __attribute__((warn_unused_result));
+
 void paging_unmap(uint32_t virt);
+
+/* Rate-limited one-line "out of <what>" diagnostic, shared by every kernel
+ * memory-exhaustion path so a burst does not flood the log. */
+void kmem_oom_report(const char *what, unsigned detail);
 uint32_t paging_get_physical(uint32_t virt);
 
 /* Make kernel .text and .rodata read-only (W^X enforcement) */
@@ -69,7 +85,9 @@ uint32_t pgdir_create(void);
 
 /* Map a page in a specific page directory (not necessarily the current CR3).
  * Caller must ensure IF=0 around this call. */
-void pgdir_map(uint32_t pgdir_phys, uint32_t virt, uint32_t phys, uint32_t flags);
+/* Map a page in another page directory.  0 on success, -1 on OOM. */
+int  pgdir_map(uint32_t pgdir_phys, uint32_t virt, uint32_t phys, uint32_t flags)
+     __attribute__((warn_unused_result));
 
 /* Return the physical frame backing `virt` in pgdir_phys, or 0 if unmapped.
  * Caller must ensure IF=0 (switches CR3 transiently). */

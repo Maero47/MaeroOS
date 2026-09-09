@@ -7,6 +7,7 @@
 #include "../../../proc/signal.h"
 #include "../cpu/isr.h"
 #include "../cpu/gdt.h"
+#include "../cpu/pit.h"
 #include <kernel/config.h>
 #include <stdint.h>
 #include <kernel/kprof.h>
@@ -67,11 +68,13 @@ static void reserve_kernel_pagetables(uint32_t start, uint32_t end) {
         uint32_t *pde = paging_get_pde(va);
         if (*pde & PAGE_PRESENT) continue;
         uint32_t pt_phys = pmm_alloc_frame();
-        if (!pt_phys) {
-            printk("[VMM]  FATAL: OOM reserving kernel page table for 0x%08x\n",
-                   (unsigned)va);
-            for (;;) __asm__ volatile("hlt");
-        }
+        /* FATAL by design (audit category (c)): called from paging_init before
+         * the heap exists, to put the kernel's PDEs in place so every later
+         * process pgdir snapshots them.  Nothing has allocated from the PMM
+         * yet, so failing means the machine has less RAM than the kernel
+         * image, and there is no caller to tell. */
+        if (!pt_phys)
+            panic("paging_init: no memory for a kernel page table", 0);
         pmm_frame_incref(pt_phys);          /* permanent — never freed */
         *pde = pt_phys | PAGE_PRESENT | PAGE_WRITABLE;   /* kernel-only PDE */
         uint32_t *pt = paging_get_pte(va);  /* recursive window to the new PT */
@@ -81,10 +84,10 @@ static void reserve_kernel_pagetables(uint32_t start, uint32_t end) {
 
 void paging_init(void) {
     uint32_t pd_phys = pmm_alloc_frame();
-    if (!pd_phys) {
-        printk("[PAGING] FATAL: could not allocate page directory frame\n");
-        for (;;) __asm__ volatile("hlt");
-    }
+    /* FATAL by design (audit category (c)): the kernel page directory, the
+     * very first allocation the kernel makes. */
+    if (!pd_phys)
+        panic("paging_init: no memory for the kernel page directory", 0);
 
     /*
      * The allocator may return a frame above the boot-time 4 MiB mapping.
@@ -130,42 +133,109 @@ void paging_init(void) {
            (unsigned)pd_phys);
 }
 
-void paging_map(uint32_t virt, uint32_t phys, uint32_t flags) {
-    virt &= ~0xFFFU;
-    phys &= ~0xFFFU;
+/*
+ * Exhaustion must stay visible in the log without a failing loop drowning
+ * every other line: one line per second of PIT time, then a count of what was
+ * suppressed when the next one gets through.  Shared by the paging, heap and
+ * page-fault OOM paths so a single burst produces a single readable trace.
+ */
+void kmem_oom_report(const char *what, unsigned detail) {
+    static uint32_t next_tick;
+    static uint32_t suppressed;
+    uint32_t now = pit_ticks();
 
+    /* pit_ticks() is 0 until pit_init(); before that every call prints, which
+     * is what early boot wants. */
+    if (now && now < next_tick) { suppressed++; return; }
+    next_tick = now + 100;                       /* 100 Hz → one line/second */
+    if (suppressed) {
+        printk("[OOM] out of %s (0x%08x); %u further failures suppressed\n",
+               what, detail, (unsigned)suppressed);
+        suppressed = 0;
+    } else {
+        printk("[OOM] out of %s (0x%08x)\n", what, detail);
+    }
+}
+
+/*
+ * Ensure a page table exists for the 4 MiB region containing `virt`.
+ *
+ * Returns 0 if the PDE is present on return, -1 if the table frame could not
+ * be allocated.  Split out of paging_map so a caller that must not fail
+ * halfway (mremap moving PTEs, shmat mapping a whole segment) can reserve
+ * every table it will need BEFORE it starts mutating page tables, and fail
+ * cleanly with -ENOMEM while the address space is still untouched.
+ *
+ * `user` selects whether the table is reachable from ring 3; a table shared by
+ * user and kernel pages keeps PAGE_USER on the PDE (the PTE still gates the
+ * individual page), which is what paging_map has always done.
+ */
+int paging_reserve_table(uint32_t virt, int user) {
     uint32_t *pde = paging_get_pde(virt);
-    if (!(*pde & PAGE_PRESENT)) {
-        /*
-         * Allocating a page table for a not-present PDE must be atomic w.r.t.
-         * preemption.  Threads of one process share the page directory, and a
-         * large mmap (e.g. an 8 MiB thread stack) memsets pages preemptibly —
-         * so two threads whose distinct VAs land in the same 4 MiB PDE could
-         * both see "not present" and each allocate a page table, the second
-         * overwriting the first's PDE and orphaning its PTEs (lost mappings →
-         * zeroed TLS, non-deterministic crashes).  Guard with saved-IF cli.
-         */
-        uint32_t eflags;
-        __asm__ volatile("pushf; pop %0; cli" : "=r"(eflags) :: "memory");
-        if (!(*pde & PAGE_PRESENT)) {        /* re-check inside the critical section */
-            uint32_t pt_phys = pmm_alloc_frame();
-            if (!pt_phys) {
-                if (eflags & 0x200) __asm__ volatile("sti");
-                printk("[VMM]  FATAL: OOM allocating page table for 0x%08x\n",
-                       (unsigned)virt);
-                for (;;) __asm__ volatile("hlt");
-            }
-            *pde = pt_phys | PAGE_PRESENT | PAGE_WRITABLE | (flags & PAGE_USER);
+    if (*pde & PAGE_PRESENT) return 0;
+
+    /*
+     * Allocating a page table for a not-present PDE must be atomic w.r.t.
+     * preemption.  Threads of one process share the page directory, and a
+     * large mmap (e.g. an 8 MiB thread stack) memsets pages preemptibly —
+     * so two threads whose distinct VAs land in the same 4 MiB PDE could
+     * both see "not present" and each allocate a page table, the second
+     * overwriting the first's PDE and orphaning its PTEs (lost mappings →
+     * zeroed TLS, non-deterministic crashes).  Guard with saved-IF cli.
+     */
+    uint32_t eflags;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(eflags) :: "memory");
+    int rc = 0;
+    if (!(*pde & PAGE_PRESENT)) {        /* re-check inside the critical section */
+        uint32_t pt_phys = pmm_alloc_frame();
+        if (!pt_phys) {
+            rc = -1;
+        } else {
+            *pde = pt_phys | PAGE_PRESENT | PAGE_WRITABLE |
+                   (user ? PAGE_USER : 0U);
             /* Zero the new page table via the recursive window */
             uint32_t *pt = paging_get_pte(virt & ~0x3FFFFFU);
             for (int i = 0; i < 1024; i++)
                 pt[i] = 0;
         }
-        if (eflags & 0x200) __asm__ volatile("sti");
     }
+    if (eflags & 0x200) __asm__ volatile("sti");
+    if (rc != 0)
+        kmem_oom_report("page tables", virt);
+    return rc;
+}
+
+/*
+ * Reserve every page table [start, end) will need.  0 on success, -1 on OOM
+ * (some tables may have been allocated; they are empty and simply stay in the
+ * directory, which costs a frame, not correctness).
+ *
+ * For a caller whose mapping loop must not fail halfway.
+ */
+int paging_reserve_range(uint32_t start, uint32_t end, int user) {
+    for (uint32_t v = start & ~0x3FFFFFU; v < end; v += 0x400000U) {
+        if (paging_reserve_table(v, user) != 0) return -1;
+        if (v + 0x400000U < v) break;              /* 4 GiB wrap */
+    }
+    return 0;
+}
+
+/*
+ * Map one page.  Returns 0, or -1 if the page table it needs cannot be
+ * allocated — it used to print and hlt forever, which made every user-driven
+ * mapping (mmap, brk, stack growth, COW) a machine halt.  On failure NOTHING
+ * has been changed, so a caller can propagate -ENOMEM without unwinding.
+ */
+int paging_map(uint32_t virt, uint32_t phys, uint32_t flags) {
+    virt &= ~0xFFFU;
+    phys &= ~0xFFFU;
+
+    if (paging_reserve_table(virt, (flags & PAGE_USER) != 0) != 0)
+        return -1;
 
     *paging_get_pte(virt) = phys | flags;
     tlb_flush_single(virt);
+    return 0;
 }
 
 static void map_higher_half_physical_memory(void) {
@@ -192,12 +262,20 @@ static void map_higher_half_physical_memory(void) {
     uint32_t direct_max = HEAP_START - KERNEL_VMA;   /* 256 MiB window */
     uint32_t map_limit  = total_phys < direct_max ? total_phys : direct_max;
 
-    paging_map(KERNEL_VMA + 0x3FF000U, 0x3FF000U,
-               PAGE_PRESENT | PAGE_WRITABLE);
+    /* FATAL by design (audit category (c)): the direct map is built once from
+     * paging_init, before the heap and before any process; the kernel cannot
+     * address its own RAM without it.  The page tables it needs come out of
+     * memory nothing has allocated from yet, so failing here means the machine
+     * has less RAM than the kernel image. */
+    if (paging_map(KERNEL_VMA + 0x3FF000U, 0x3FF000U,
+                   PAGE_PRESENT | PAGE_WRITABLE) != 0)
+        panic("paging_init: cannot map the VGA/BIOS page", 0);
 
     /* boot.asm maps 0-8 MiB; extend from there up to the window limit. */
     for (uint32_t phys = 0x800000U; phys < map_limit; phys += PAGE_SIZE) {
-        paging_map(KERNEL_VMA + phys, phys, PAGE_PRESENT | PAGE_WRITABLE);
+        if (paging_map(KERNEL_VMA + phys, phys,
+                       PAGE_PRESENT | PAGE_WRITABLE) != 0)
+            panic("paging_init: cannot build the higher-half direct map", 0);
     }
 
     printk("[VMM]  RAM: %u MiB total; higher-half direct map covers %u MiB "
@@ -302,12 +380,13 @@ uint32_t pgdir_create(void) {
  * Temporarily switches CR3 to pgdir_phys so that the recursive mapping
  * works relative to the target pgdir.  IF must be 0 at call time.
  */
-void pgdir_map(uint32_t pgdir_phys, uint32_t virt, uint32_t phys, uint32_t flags) {
+int pgdir_map(uint32_t pgdir_phys, uint32_t virt, uint32_t phys, uint32_t flags) {
     uint32_t prev_cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(prev_cr3));
     __asm__ volatile("mov %0, %%cr3" :: "r"(pgdir_phys) : "memory");
-    paging_map(virt, phys, flags);
+    int rc = paging_map(virt, phys, flags);
     __asm__ volatile("mov %0, %%cr3" :: "r"(prev_cr3) : "memory");
+    return rc;
 }
 
 /* Return the physical frame backing `virt` in pgdir_phys, or 0 if unmapped. */
@@ -411,8 +490,20 @@ static void page_fault_handler(registers_t *regs) {
 
             kprof_count(KPE_PF_COW);
             uint32_t new_phys = pmm_alloc_frame();
-            if (!new_phys)
-                panic("COW fault: out of physical memory", regs);
+            if (!new_phys) {
+                /* Linux: do_wp_page returns VM_FAULT_OOM and
+                 * pagefault_out_of_memory() picks a victim.  We have no OOM
+                 * killer to choose with, so the victim is the process that
+                 * asked for the page.  Killing one greedy process keeps the
+                 * machine alive, which panicking here did not. */
+                kmem_oom_report("memory to break a COW page", (unsigned)cr2);
+                if ((err & 0x4U) && current_proc)
+                    proc_group_exit(SIGKILL);          /* does not return */
+                /* Kernel-mode fault (copy_to_user into a COW page): hand the
+                 * syscall its -EFAULT fixup rather than dying. */
+                if (fixup_exception(regs)) return;
+                panic("COW fault: out of physical memory in kernel mode", regs);
+            }
 
             /* Copy old frame → new frame via temp mappings.  The #PF handler is
              * a trap gate (IF preserved), so it runs with interrupts ENABLED.
@@ -493,11 +584,17 @@ static void page_fault_handler(registers_t *regs) {
             if (phys) {
                 kprof_count(KPE_PF_STACK);
                 pmm_frame_incref(phys);
-                paging_map(page, phys,
-                           PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-                __builtin_memset((void *)page, 0, PAGE_SIZE);
-                tlb_flush_single(page);
-                return;
+                if (paging_map(page, phys,
+                               PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
+                    /* No page table for the new stack page.  Give the frame
+                     * back and fall through: the process gets SIGSEGV, which
+                     * is what a stack that cannot grow means. */
+                    pmm_frame_decref(phys);
+                } else {
+                    __builtin_memset((void *)page, 0, PAGE_SIZE);
+                    tlb_flush_single(page);
+                    return;
+                }
             }
         }
     }

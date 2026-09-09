@@ -1,6 +1,7 @@
 #include "framebuffer.h"
 #include "../arch/i686/mm/paging.h"
 #include "../kernel/printk.h"
+#include "../kernel/panic.h"
 #include "../lib/string.h"
 #include <kernel/config.h>
 #include <stdint.h>
@@ -74,9 +75,14 @@ void framebuffer_init(const multiboot_info_t *mbi) {
     uint32_t page_off = fb.phys & 0xFFFU;
     uint32_t map_len = (fb.size + page_off + 0xFFFU) & ~0xFFFU;
 
+    /* FATAL by design (audit category (c)): the framebuffer is mapped once
+     * from framebuffer_init during boot, from the multiboot info, before any
+     * process exists.  A half-mapped framebuffer would be written past its
+     * mapped tail on the first console scroll. */
     for (uint32_t off = 0; off < map_len; off += PAGE_SIZE) {
-        paging_map(FB_VIRT_BASE + off, phys_page + off,
-                   PAGE_PRESENT | PAGE_WRITABLE | PAGE_NOCACHE);
+        if (paging_map(FB_VIRT_BASE + off, phys_page + off,
+                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_NOCACHE) != 0)
+            panic("framebuffer_init: cannot map the framebuffer", NULL);
     }
     fb.virt = FB_VIRT_BASE + page_off;
     fb.ready = 1;

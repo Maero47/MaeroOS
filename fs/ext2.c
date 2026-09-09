@@ -1140,7 +1140,12 @@ static uint32_t ext2_write_node(vfs_node_t *node, uint32_t offset,
     uint32_t blk_size = g_state.block_size;
     uint32_t done = 0;
     uint8_t *blk_buf = (uint8_t *)kmalloc(blk_size);
-    if (!blk_buf) return 0;
+    /* Out of kernel memory, not out of disk: say so.  A plain 0 here means
+     * "wrote nothing" to a caller that cannot distinguish it from progress,
+     * and a libc write loop spins on it.  The full-disk case below is
+     * different - it breaks after a partial write and returns a short count,
+     * which write(2) callers already handle. */
+    if (!blk_buf) return VFS_WRITE_ENOMEM;
 
     while (done < size) {
         uint32_t file_off = offset + done;

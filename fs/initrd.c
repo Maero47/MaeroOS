@@ -3,6 +3,7 @@
 #include "../mm/heap.h"
 #include "../lib/string.h"
 #include "../kernel/printk.h"
+#include "../kernel/panic.h"
 #include <kernel/config.h>
 #include <stdint.h>
 
@@ -43,11 +44,14 @@ void initrd_init(uint32_t mod_phys_start, uint32_t mod_phys_end) {
     uint32_t        size = mod_phys_end - mod_phys_start;
 
     /* Create the root directory node */
+    /* FATAL by design (audit category (c)): initrd_init runs from kmain with a
+     * nearly empty heap and is the only thing that creates the VFS root.
+     * Returning left vfs_root NULL and let the boot carry on into vfs_mount(),
+     * which faults on it a few lines later with nothing to say about why - a
+     * silent half-broken kernel where a named panic belongs. */
     vfs_root = (vfs_node_t *)kmalloc(sizeof(vfs_node_t));
-    if (!vfs_root) {
-        printk("[INITRD] FATAL: out of memory for root node\n");
-        return;
-    }
+    if (!vfs_root)
+        panic("initrd_init: no memory for the VFS root node", NULL);
     memset(vfs_root, 0, sizeof(vfs_node_t));
     vfs_root->flags = VFS_FLAG_DIR;
     vfs_root->mask  = 0755;       /* root dir: world-traversable */
@@ -114,7 +118,12 @@ void initrd_init(uint32_t mod_phys_start, uint32_t mod_phys_end) {
                     if (leaf && !is_dir) {
                         if (child) break;       /* duplicate file — skip */
                         vfs_node_t *node = (vfs_node_t *)kmalloc(sizeof(vfs_node_t));
-                        if (!node) break;
+                        /* FATAL by design (audit category (c)): `break` here
+                         * silently truncated the initrd, and a boot missing an
+                         * arbitrary subset of /init, /bin and the libraries
+                         * fails later in ways that say nothing about the cause. */
+                        if (!node)
+                            panic("initrd_init: no memory for an initrd file node", NULL);
                         memset(node, 0, sizeof(vfs_node_t));
                         node->flags = VFS_FLAG_FILE;
                         node->size  = file_size;
@@ -132,7 +141,8 @@ void initrd_init(uint32_t mod_phys_start, uint32_t mod_phys_end) {
                     /* Directory component (intermediate, or an explicit dir). */
                     if (!child) {
                         child = (vfs_node_t *)kmalloc(sizeof(vfs_node_t));
-                        if (!child) break;
+                        if (!child)     /* category (c), as above */
+                            panic("initrd_init: no memory for an initrd directory node", NULL);
                         memset(child, 0, sizeof(vfs_node_t));
                         child->flags = VFS_FLAG_DIR;
                         child->mask  = 0755;

@@ -203,7 +203,10 @@ static int boot_one_ap(uint8_t apicid) {
     /* The AP turns paging on while still executing at linear 0x8000, so that
      * page must be valid in the kernel pgdir until it reaches higher-half C.
      * Identity-map it (kernel pgdir only — never copied into user pgdirs). */
-    paging_map(TRAMP_PHYS, TRAMP_PHYS, PAGE_PRESENT | PAGE_WRITABLE);
+    if (paging_map(TRAMP_PHYS, TRAMP_PHYS, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
+        kfree(stack);
+        return 0;                  /* this AP stays offline; the BSP runs on */
+    }
 
     g_ap_alive = 0;
 
