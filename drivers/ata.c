@@ -42,12 +42,34 @@ static inline void ata_irq_restore(uint32_t f) {
 #define ATA_SR_ERR  0x01   /* error */
 
 /* Commands */
-#define ATA_CMD_READ   0x20
-#define ATA_CMD_WRITE  0x30
-#define ATA_CMD_FLUSH  0xE7
-#define ATA_CMD_IDENT  0xEC
+#define ATA_CMD_READ       0x20
+#define ATA_CMD_READ_MUL   0xC4
+#define ATA_CMD_WRITE      0x30
+#define ATA_CMD_FLUSH      0xE7
+#define ATA_CMD_IDENT      0xEC
+#define ATA_CMD_SET_MULT   0xC6
 
 static int drive_present = 0;
+
+/*
+ * Sectors the drive transfers per DRQ assertion (READ MULTIPLE block size), or
+ * 0 when multiple mode is not in use and every sector needs its own handshake.
+ *
+ * Under KVM each port access in a PIO transaction is an exit into QEMU, and
+ * single-sector PIO spends three of them per 512 bytes: poll the status for
+ * DRQ, `rep insw` the data, read the alternate status to let the drive settle.
+ * Two of those three are handshake, not data.  READ MULTIPLE is the ATA
+ * feature for exactly this: the drive asserts DRQ once per block of N sectors
+ * and the host transfers the whole block, so the handshake is paid once per
+ * block instead of once per sector.  Measured on this workload a sector cost
+ * ~46 us with the per-sector handshake.
+ *
+ * The drive states its maximum block in IDENTIFY word 47 and the host selects
+ * one with SET MULTIPLE MODE; both are checked, and anything unexpected leaves
+ * multi = 0 and the original single-sector path, which is still correct.
+ */
+static uint32_t ata_multi = 0;
+#define ATA_MULTI_WANT 16      /* 8 KiB per handshake */
 
 /* Read alternate status 4 times (~400 ns delay).  Required after a write to the
  * command or drive-select register, before the status register is meaningful. */
@@ -127,12 +149,35 @@ void ata_init(void) {
 
     ata_wait_bsy();
 
-    /* Drain the 256-word identify data */
+    /* Read the 256-word identify data; word 47 low byte is the largest block
+     * READ/WRITE MULTIPLE may use (0 means the drive does not support it). */
+    uint16_t ident[256];
     for (int i = 0; i < 256; i++)
-        inw(ATA_DATA);
+        ident[i] = inw(ATA_DATA);
 
     drive_present = 1;
-    printk("[ATA]  Primary master ready.\n");
+
+    uint32_t max_multi = ident[47] & 0xFFu;
+    if (max_multi) {
+        uint32_t want = max_multi < ATA_MULTI_WANT ? max_multi : ATA_MULTI_WANT;
+        ata_wait_bsy();
+        outb(ATA_DRIVE, 0xA0);
+        outb(ATA_NSECT, (uint8_t)want);
+        outb(ATA_CMD,   ATA_CMD_SET_MULT);
+        ata_delay();
+        ata_wait_bsy();
+        uint8_t st = inb(ATA_STATUS);
+        /* The drive rejects a block size it cannot do by setting ERR; anything
+         * short of a clean ready-without-error leaves multiple mode off. */
+        if (!(st & (ATA_SR_ERR | ATA_SR_DF)) && (st & ATA_SR_DRDY))
+            ata_multi = want;
+    }
+
+    if (ata_multi)
+        printk("[ATA]  Primary master ready (READ MULTIPLE, %u sectors/block).\n",
+               (unsigned)ata_multi);
+    else
+        printk("[ATA]  Primary master ready.\n");
 }
 
 int ata_present(void) {
@@ -158,21 +203,27 @@ int ata_read(uint32_t lba, uint8_t count, void *buf) {
     outb(ATA_LBAL,  (uint8_t)(lba));
     outb(ATA_LBAM,  (uint8_t)(lba >> 8));
     outb(ATA_LBAH,  (uint8_t)(lba >> 16));
-    outb(ATA_CMD,   ATA_CMD_READ);
+    outb(ATA_CMD,   ata_multi ? ATA_CMD_READ_MUL : ATA_CMD_READ);
     ata_delay();
 
-    int nsect = (count == 0) ? 256 : (int)count;
-    uint16_t *ptr = (uint16_t *)buf;
+    uint32_t nsect = (count == 0) ? 256u : (uint32_t)count;
+    uint32_t blk   = ata_multi ? ata_multi : 1u;
+    uint16_t *ptr  = (uint16_t *)buf;
 
-    for (int s = 0; s < nsect; s++) {
+    /* One DRQ handshake per block; the last block is short when the transfer
+     * is not a whole number of blocks, exactly as the standard specifies. */
+    for (uint32_t done = 0; done < nsect; ) {
+        uint32_t n = nsect - done;
+        if (n > blk) n = blk;
         if (ata_wait_drq() < 0) {
             ata_irq_restore(irq);
             kprof_probe_end(kp_id, kp_t0);
             kprof_switch(kp_old);
             return -1;
         }
-        insw(ATA_DATA, ptr, 256);  /* 256 words = 512 bytes */
-        ptr += 256;
+        insw(ATA_DATA, ptr, n * 256u);   /* 256 words = 512 bytes per sector */
+        ptr  += n * 256u;
+        done += n;
         ata_settle();
     }
     ata_irq_restore(irq);
