@@ -11,6 +11,7 @@
 #include "../arch/i686/cpu/tss.h"
 #include "../arch/i686/cpu/idt.h"
 #include "../arch/i686/cpu/pic.h"
+#include "../arch/i686/cpu/tsc.h"
 #include "../arch/i686/cpu/apic.h"
 #include "../arch/i686/cpu/smp.h"
 #include "../arch/i686/cpu/percpu.h"
@@ -150,6 +151,10 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     keyboard_init();
     mouse_init();
     pit_init(100);
+    /* Measure the TSC against PIT channel 2 while interrupts are still off:
+     * the tick interrupt can be coalesced, so counting ticks does not measure
+     * wall time (arch/i686/cpu/tsc.c). */
+    tsc_init();
 
     /* Network bottom-half: keeps DHCP/TCP alive without userspace polling */
     if (net_find_interface("eth0"))

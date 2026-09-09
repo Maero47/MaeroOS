@@ -462,7 +462,8 @@ run's `screen-paint.png` scores ~134 810 light pixels, i.e. real browser chrome
 | + ATA READ MULTIPLE | 46.0 45.6 45.9 45.9 45.5 | 45.8 s | 0.5 s |
 | + the cached CPU id | 35.1 34.8 34.9 35.0 34.9 | 34.9 s | 0.3 s |
 | the same, before the sizing fix | 34.7 34.7 34.7 34.7 34.7 | 34.7 s | 0.0 s |
-| final tree (cache sizing fixed) | 34.9 35.1 35.3 34.8 35.0 | **35.0 s** | 0.5 s |
+| + the cache sizing fixed | 34.9 35.1 35.3 34.8 35.0 | 35.0 s | 0.5 s |
+| final tree, 20 boots (19 passes) | 34.4 .. 37.3 | **34.9 s** | 2.9 s |
 
 The last two rows are hours apart and the host drifts between them, so the
 comparison to make is a same-session one: re-measuring the pre-fix commit
@@ -476,6 +477,128 @@ is now **6.3x** faster than where this work started.
 
 The spread collapsing to nothing is itself a result: what remained variable was
 the disk, and the disk is now mostly cache.
+
+## The clock was measuring the wrong thing
+
+Found in review, not by this work: the TSC's one-second refinement reported
+**8.3 GHz on a 3.7 GHz machine**, in five boots out of six.
+
+### What the raw inputs said
+
+The refinement computes cycles-per-tick as (TSC span) / (ticks delivered).
+Printing both ends of the window rather than guessing at the ratio:
+
+```
+[TSC] 36705961 cycles per 10 ms tick (3670 MHz, initial)
+[TSCDBG] win=100 span=8105196kcyc avg=82997207 pit0=4 pit=100
+         n=96 min=17353 max=4294967295 over2x=11
+[TSC] 82997207 cycles per 10 ms tick (8299 MHz, 1 s average)
+[TSCDBG] win=1000 span=37286035kcyc avg=38180899 pit0=4 pit=1000
+         n=900 min=17278 max=1333633401 over2x=7
+```
+
+The arithmetic is right and the tick accounting is right: the tick counter moved
+from 4 to 100 while 96 intervals were sampled, and 4 more had been sampled
+before, so the divisor of 100 is exactly the number of intervals in the span.
+What is wrong is the span. 8.1e9 cycles at the true rate is **2.17 seconds** of
+wall time for 100 ticks — and `max=4294967295` is the saturation value, so at
+least one "tick interval" exceeded 2^32 cycles: **a single interrupt standing in
+for about 113 ticks.**
+
+The guest runs long stretches with interrupts disabled — a PIO disk transfer
+holds IF=0 for the whole transfer, and early boot is nothing but disk — and the
+PIC collapses every tick missed during one such stretch into one pending
+interrupt. QEMU then repays the backlog at faster than 100 Hz: ticks 100..1000
+took 7.83 s, i.e. 115 Hz. So the ten-second average was right only because the
+catch-up had finished by then, and the one-second average was taken while the
+deficit was at its maximum.
+
+The comment in the code asserted that "over 1 s and 10 s the tick count is
+faithful to wall time". Over 1 s it is not.
+
+### Fixed by measuring against something that cannot be coalesced
+
+PIT channel 2 is the one channel whose gate is software-controlled and whose
+output is readable, both through port 0x61, so a calibration against it is a
+busy-wait with no interrupt anywhere in it — which is the whole point. This is
+what a PC has always done (Linux: `pit_calibrate_tsc`). `tsc_init()` runs it
+once, after `pit_init()` and before `sti`, and the passive tick-interval path is
+then never used.
+
+Two things fell out of it. It is **stable to 0.05 %** — 3700 to 3702 MHz across
+twenty boots — and it is **the same under KVM and TCG**, where the passive path
+gave 3670 and 1459 MHz respectively. And the value it reports is 3700 MHz, which
+is the 5600X's invariant-TSC base clock: so the ten-second average that looked
+correct at 3818 MHz was itself **3.1 % high**, because even at ten seconds the
+tick count had not quite caught up.
+
+Every `kprof` millisecond figure in the sections above was converted with that
+3818 MHz rate and is therefore about 3 % low in absolute terms. Bucket shares,
+ratios and the before/after comparisons are unaffected — both sides used the
+same rate — and first paint is measured on the host, not by the guest clock.
+
+### And a bound, so a bad refinement can never be adopted
+
+The passive path stays as a fallback for hardware whose channel 2 does not
+behave, and a refinement there is now adopted only if it is within **±50 %** of
+the rate it would replace. A real TSC rate does not change — it is invariant on
+any CPU this kernel will meet, and under a hypervisor the guest's follows the
+host's — so the only legitimate movement is the bias in the estimate being
+replaced.
+
+The bound comes from both requirements rather than being picked round. It must
+reject the coalescing error, measured at **2.26x**. It must admit the real
+correction, bounded by how wrong the initial estimate can be: that estimate is a
+*minimum* over consecutive tick intervals, so it can only be biased low, by a
+short catch-up interval, never high, and the worst bias observed is **1.24x**
+(3067 MHz against a true 3818). Anything between 1.24x and 2.26x works; 1.5x
+leaves 21 % of headroom above the largest correction that has to get through and
+rejects the error it has to stop by 51 %. ±25 % was tried first and left under
+one per cent of headroom on the admit side — it would have worked on these boots
+by luck.
+
+Forcing the fallback (channel 2 stubbed out) shows both halves working:
+
+```
+[TSC] PIT channel 2 unusable; falling back to tick intervals
+[TSC] 30671224 cycles per 10 ms tick (3067 MHz, initial)
+[TSC] 1 s average rejected: 8475 MHz against 3067 MHz (outside +-50%)
+[TSC] 38181950 cycles per 10 ms tick (3818 MHz, 10 s average)
+```
+
+### Twenty boots
+
+`make smoke-firefox`, back to back: **19 PASS, 1 FAIL**, mean first paint over
+the passes **34.9 s**. Every one of the twenty printed exactly one `[TSC]` line,
+all of them `PIT ch2`: five at 3700 MHz, eleven at 3701, four at 3702. No
+refinement ran, so none could be adopted, and nothing landed outside a sane band.
+
+### The wedge is a different bug, and it is still there
+
+One of the twenty hung, and its clock was correct from boot (3701 MHz, PIT ch2)
+— so the wedge is not the calibration. What it is:
+
+* First paint never arrives; the harness times out after 360 s. No panic, no
+  `[SIG]`, no page fault, no output at all for the last 340 s.
+* The last activity is Firefox's X handshake, ~19 s in, right after its first
+  window is created.
+* **Two independent periodic outputs stop at the same moment**: `kprof`'s dump,
+  which is emitted from syscall entry and gated on the tick counter, and
+  maeroX's trace histogram, which its main loop emits every 167 iterations. The
+  last kprof dump is `t=10.00s`; there is no `t=20.00s`.
+
+The leading hypothesis is that the tick source stops. Every timeout in this
+kernel is tick-based (`wake_tick`), so if `pit_ticks()` freezes, every timed
+wait becomes indefinite, every thread ends up blocked, no syscalls run, and
+neither periodic output can fire — one cause that explains all of it. That is
+not proved: a lost futex wakeup that happens to catch every thread would look
+the same from the outside. Distinguishing them needs a thread-state dump
+triggered from the serial line, which this kernel does not have; that is the
+next step, not a guess to act on.
+
+Rate, honestly: the review saw it once in six boots, this round once in twenty,
+and roughly thirty earlier `smoke-firefox` runs in the same session did not hit
+it at all. It predates this branch.
 
 ## What is left
 
