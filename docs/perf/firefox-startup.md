@@ -172,6 +172,36 @@ gives the heap one entry no matter how big the cache is, and gets both: `ata`
 physical memory (16 MiB on the 2 GiB machine), rounded to a power-of-two set
 count so the bucket index stays a mask.
 
+### Two ext2 defects found and fixed alongside
+
+Neither is a performance problem, but both were found by this work and both are
+in `fs/ext2.c`.
+
+**Blocks were lost on delete.** `ext2_free_inode_blocks` walked the direct blocks
+and the singly-indirect chain and stopped, although the driver reads all three
+indirect levels and allocates two of them. Everything a file held past ~268 KiB
+(1 KiB blocks) was lost the moment it was deleted — the bitmap bits stayed set
+with nothing referencing them. One create-and-delete cycle of a 12 MiB file cost
+**12 074 blocks**, and repeated cycles filled the disk. Truncate leaked the same
+way when shrinking, and its size ceiling was applied to every call rather than
+only to growth, so `ftruncate` on a large file returned `-1` instead of releasing
+the tail. Both now go through `ext2_free_blocks_from(inode, from)`, which walks
+all three levels and drops indirect blocks that stop being needed.
+
+**Unlink released an inode that was still open.** `ext2_unlink` freed the blocks
+and the inode immediately, so the allocator could hand a live file's blocks to
+another file — the same defect tmpfs had, and worse than a leak. ext2 makes a
+fresh `vfs_node_t` per lookup, so the reference count cannot live on the node as
+tmpfs's does; it is keyed on the inode number instead, fed by the
+`retain_fn`/`close_fn` hooks `vfs_retain`/`vfs_close` already drive.
+
+`statfs` reported fixed constants, so nothing could observe any of this; it now
+reports the superblock's live counters when an ext2 volume is mounted.
+
+`ports/abiprobes/p26_unlink_frees_space` checks all three properties, is verified
+against real Linux, and fails on the unfixed kernel with *"10 create/unlink
+cycles of a 2048 KiB file lost 17880 KiB"*.
+
 ## Results
 
 Five runs per configuration, `make smoke-firefox` (KVM, `-smp 1`, 2 GiB):
@@ -184,6 +214,7 @@ Five runs per configuration, `make smoke-firefox` (KVM, `-smp 1`, 2 GiB):
 | + slab-backed, memory-sized cache | 67.3 65.5 67.1 67.9 65.8 | **66.7 s** | 2.4 s |
 | the same, with `-cpu host` | 66.9 67.7 65.7 66.8 67.3 | 66.9 s | 2.0 s |
 | + the clustered-read cache guard | 67.9 67.5 66.5 67.4 66.7 | 67.2 s | 1.4 s |
+| + the ext2 space-accounting fixes | 68.5 66.3 66.6 68.9 68.7 | 67.8 s | 2.6 s |
 
 The run-to-run spread collapsing from ~32 s to ~2 s is itself a result: the
 variance was the variable amount of screen blitting and repeated disk reading,
