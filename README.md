@@ -268,15 +268,19 @@ the musl.cc `i686-linux-musl` toolchain into `ports/` and `~/opt`, and checks ev
 tool. The only step that needs root is the apt install, and even that is optional.
 
 ```sh
-tools/setup-linux.sh --dry-run   # show what it would do
+tools/setup-linux.sh --dry-run   # show what it would do (both plans)
+tools/setup-linux.sh --sudo      # force the apt path: print the list, install nothing
 tools/setup-linux.sh --apt       # apt install (sudo), build and fetch toolchains, verify
 tools/setup-linux.sh --no-sudo   # no root at all, see below
 tools/setup-linux.sh --check     # just report present/missing tools
 export PATH="$HOME/opt/bin:$HOME/opt/cross/bin:$HOME/opt/i686-linux-musl-cross/bin:$PATH"
 ```
 
-**Without root.** `--no-sudo` (chosen automatically when `make`, `nasm`, QEMU, the GRUB
-BIOS modules or a compiler are missing and `--apt` was not given) never calls `sudo`.
+**Without root.** `--no-sudo` never calls `sudo`. It is also chosen automatically when
+`make`, `nasm`, QEMU, the GRUB BIOS modules or a compiler are missing and `--apt` was not
+given; the run says so in its header and names `--sudo`, which forces the apt path and
+prints the package list without installing anything. `--dry-run` shows the apt list in
+both modes, so the apt command is always obtainable.
 It asks apt which of `make nasm bison flex m4 texinfo qemu-system-x86 qemu-system-gui
 grub-pc-bin mtools xorriso e2fsprogs xz-utils zstd shellcheck` (plus dependencies) are
 not installed, downloads exactly those with `apt-get download`, which checks each `.deb`
@@ -289,17 +293,27 @@ the library path, `-L` firmware directories and `QEMU_MODULE_DIR` for QEMU,
 wrappers that link statically (its dynamic loader is not installed on the host); the
 `i686-elf` binutils and GCC are then built with it, with gmp/mpfr/mpc/isl in-tree via
 gcc's `contrib/download_prerequisites` and without LTO/plugin support, since a static
-`ld` cannot load plugins. Only `~/opt/bin` is added to `PATH`; nothing outside `~/opt`
-and `ports/` is written. `make toybox` uses that `cc` as `HOSTCC`. The run is idempotent
+`ld` cannot load plugins. A host that already has `gcc` and `g++` keeps them and the musl
+toolchain is not fetched. Only `~/opt/bin` is added to `PATH`; nothing outside `~/opt`
+and `ports/` is written. `make toybox` uses `cc` as `HOSTCC`. The run is idempotent
 and resumable: unpacked packages, extracted tarballs and finished toolchains are skipped
 on the next run.
+
+Nothing in `~/opt/bin` permanently shadows a package installed later. No wrapper is
+written for a tool the system already provides, every wrapper starts by handing off to a
+system tool of the same name if one exists, a wrapper that a package supersedes is
+rewritten as a plain hand-off on the next `--no-sudo` run, and `--sudo` or `--apt`
+deletes those files outright. GRUB is the one exception: its wrappers keep precedence
+until the system GRUB also has its BIOS modules in `/usr/lib/grub/i386-pc`, because
+without them it cannot build the ISO. `--check` lists which tools come from wrappers and
+which of those are already superseded.
 
 `make initrd` also builds toybox from `third_party/toybox/.config.maeros`, the applet set
 that compiles and links against the MaeroOS libc (about 100 applets; the rest need
 headers or syscalls the libc does not provide yet).
 
-`PREFIX=`, `OPT_DIR=`, `BIN_DIR=`, `HOSTPKGS_DIR=`, `BINUTILS_VER=` and `GCC_VER=`
-override the defaults; the script is idempotent and skips anything already built.
+`PREFIX=`, `OPT_DIR=`, `BIN_DIR=`, `HOSTPKGS_DIR=`, `MAEROS_SYS_PATH=`, `BINUTILS_VER=`
+and `GCC_VER=` override the defaults; the script is idempotent and skips anything already built.
 Downloads come from `ftp.gnu.org` and `musl.cc` over TLS and are checked against pinned
 digests before anything is extracted; a different GCC or binutils version needs its
 digest in `GCC_SHA256=` / `BINUTILS_SHA256=` (or `MAEROS_SKIP_HASH=1`). Running Docker (`docker.io`) and
