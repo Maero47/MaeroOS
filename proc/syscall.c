@@ -3675,15 +3675,18 @@ static int sys_mmap2(registers_t *regs) {
             length = (fb_len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
         end = va + length;
         if (!vma_add(va, end, prot, VMA_F_SHARED, NULL, 0)) return -12;
-        for (uint32_t i = 0; i < length; i += PAGE_SIZE)
+        /* SHARED: no COW on fork; bit 4 is PCD. */
+        for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
             if (paging_map(va + i, fb_phys + i,
                            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER |
                            PAGE_SHARED | (1U << 4)) != 0) {
-                /* Device frames, not refcounted: unmap_range drops the PTEs
-                 * and the VMA without touching the physical allocator. */
+                /* Device frames are not refcounted, so unmap_range drops the
+                 * PTEs and the VMA without touching the physical allocator —
+                 * the same path munmap of an fb0 mapping already takes. */
                 unmap_range(va, end);
                 return -12;
-            }               /* SHARED: no COW on fork; PCD */
+            }
+        }
         return (int)va;
     }
 
