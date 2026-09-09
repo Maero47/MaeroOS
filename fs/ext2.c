@@ -136,16 +136,46 @@ static int g_mounted = 0;
  * 64 blocks keeps a transaction's interrupts-off window near 100 us. */
 #define EXT2_READ_CLUSTER  64
 
-#define EXT2_CACHE_MAX_SETS 4096                /* power of two */
 #define EXT2_CACHE_WAYS     4
-#define EXT2_CACHE_SLOTS    (EXT2_CACHE_MAX_SETS * EXT2_CACHE_WAYS)
 
-/* Share of free physical memory the cache may hold, and a floor so that a tiny
- * machine still gets a useful one. */
-#define EXT2_CACHE_MEM_SHARE  8                 /* one eighth of free RAM */
+/* The cache is bounded by three separate things, and it has to consult all of
+ * them because they run out independently.
+ *
+ * PHYSICAL MEMORY: a share of what is free at mount.  The cache is never handed
+ * back, so this is what keeps a small machine honest -- and it is what governs
+ * there: a 128 MiB guest lands on 8 MiB of buffers and a 512 MiB one on 32 MiB.
+ *
+ * HEAP ADDRESS SPACE: whatever is left after reserving a fixed margin for
+ * everything else.  The kernel heap is a fixed 256 MiB span
+ * (HEAP_START..HEAP_MAX in kernel/config.h) that every other kernel allocation
+ * also comes out of and that nothing ever releases, so it -- not physical
+ * memory -- is the resource that binds on the 2 GiB machine, and sizing against
+ * free RAM alone never looked at it.
+ *
+ * The margin is absolute rather than a share, because what matters to the rest
+ * of the kernel is how many bytes it can still get, not what fraction of the
+ * window some other subsystem took.  Measured (the kprof heap line): everything
+ * in the kernel other than this cache uses 5.5 MiB of heap to Firefox's first
+ * paint, and the heap only grows, so that is a peak and not an average.  The
+ * margin is 64 MiB, an order of magnitude above the measured demand.
+ *
+ * A CEILING: what the workload is worth.  Measured at six sizes with
+ * `make smoke-firefox` (docs/perf/firefox-startup.md): 4, 8 and 16 MiB of
+ * buffers are indistinguishable from each other at 41.3 s, 32 MiB gives 40.8 s,
+ * 64 MiB 38.0 s and 128 MiB 35.4 s.  There is no knee below 128 MiB -- a
+ * startup touches ~92 700 distinct 1 KiB blocks and cycles over them, so a
+ * cache that holds part of the working set holds almost none of the value.
+ * 128 MiB is where it fits: 94 370 blocks fetched against 92 640 distinct, so
+ * 98 % of the fetches are first-time reads and there is nothing left to win.
+ * A budget of 160 MiB is what yields exactly those 32768 sets (128 MiB of
+ * buffers plus 2 MiB of slot descriptors); the next power of two would need
+ * 273 MiB and buy nothing. */
+#define EXT2_CACHE_MEM_SHARE  8                      /* one eighth of free RAM */
+#define EXT2_CACHE_HEAP_KEEP  (64u * 1024u * 1024u)  /* heap left for the rest */
 #define EXT2_CACHE_MIN_SETS   8
+#define EXT2_CACHE_MAX_BYTES  (160u * 1024u * 1024u)
 
-static uint8_t  *g_cache_slab;                  /* one allocation for all slots */
+static uint8_t  *g_cache_slab;                  /* one allocation for all buffers */
 static uint32_t  g_cache_setmask;               /* sets in use, minus one       */
 
 typedef struct {
@@ -155,7 +185,10 @@ typedef struct {
     uint8_t *data;
 } ext2_cache_entry_t;
 
-static ext2_cache_entry_t g_cache[EXT2_CACHE_SLOTS];
+/* The slot array is allocated at mount alongside the slab, so the cache size is
+ * decided by the machine rather than reserved in the kernel's BSS. */
+static ext2_cache_entry_t *g_cache;
+static uint32_t g_cache_slots;
 static uint32_t g_cache_age = 1;
 static int g_cache_ready = 0;
 
@@ -206,7 +239,43 @@ static uint32_t ext2_now(void) {
     return pit_ticks() / 100U;
 }
 
+/* Read-volume accounting.  The question this profiling round asks is whether
+ * the disk time is spent fetching data the kernel has never seen or re-fetching
+ * blocks it read and then evicted, and the bucket totals cannot tell those
+ * apart.  One bit per block of the volume answers it exactly: every block that
+ * comes off the platter is counted, and the ones whose bit was still clear are
+ * counted again as distinct.  128 KiB for the 1 GiB image, one bit test per
+ * block fetched. */
+static uint8_t *g_seen;                 /* bit per block: fetched at least once */
+static uint32_t g_seen_blocks;
+
+static void ext2_seen_init(void) {
+    g_seen = (uint8_t *)0;
+    g_seen_blocks = 0;
+    if (!g_state.blocks_count || g_state.blocks_count > (1u << 24)) return;
+    uint32_t bytes = (g_state.blocks_count + 7u) / 8u;
+    g_seen = (uint8_t *)kmalloc(bytes);
+    if (!g_seen) return;
+    memset(g_seen, 0, bytes);
+    g_seen_blocks = g_state.blocks_count;
+}
+
+/* Count `n` blocks starting at `blk` as fetched from disk. */
+static void ext2_account_fetch(uint32_t blk, uint32_t n) {
+    kprof_add(KPE_EXT2_DISK, n);
+    if (!g_seen) return;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t b = blk + i;
+        if (b >= g_seen_blocks) return;
+        if (!(g_seen[b >> 3] & (uint8_t)(1u << (b & 7u)))) {
+            g_seen[b >> 3] |= (uint8_t)(1u << (b & 7u));
+            kprof_count(KPE_EXT2_DISTINCT);
+        }
+    }
+}
+
 static int ext2_raw_read_block(uint32_t blk, void *buf) {
+    ext2_account_fetch(blk, 1);
     uint32_t lba = g_state.lba_offset + blk * g_state.sectors_per_block;
     /* Read sectors_per_block sectors; handle block sizes > 255*512 by looping */
     if (g_state.sectors_per_block <= 255) {
@@ -229,6 +298,7 @@ static int ext2_raw_read_block(uint32_t blk, void *buf) {
  * `n` is bounded by the caller (EXT2_READ_CLUSTER), and the sector count of one
  * ATA command by 255. */
 static int ext2_raw_read_blocks(uint32_t blk, uint32_t n, void *buf) {
+    ext2_account_fetch(blk, n);
     uint32_t lba  = g_state.lba_offset + blk * g_state.sectors_per_block;
     uint32_t rem  = n * g_state.sectors_per_block;
     uint8_t *p    = (uint8_t *)buf;
@@ -261,31 +331,50 @@ static int ext2_raw_write_block(uint32_t blk, const void *buf) {
 static void ext2_cache_init(void) {
     g_cache_ready = 0;
     g_cache_age = 1;
-    for (uint32_t i = 0; i < EXT2_CACHE_SLOTS; i++) {
-        g_cache[i].blk = 0;
-        g_cache[i].age = 0;
-        g_cache[i].valid = 0;
-        g_cache[i].data = (uint8_t *)0;
-    }
+    if (g_cache_slab) { kfree(g_cache_slab); g_cache_slab = (uint8_t *)0; }
+    if (g_cache) { kfree(g_cache); g_cache = (ext2_cache_entry_t *)0; }
+    g_cache_slots = 0;
 
-    /* How many sets can we afford?  A share of free memory, capped by the slot
-     * array, floored so a small machine still caches something.  Sets are a
-     * power of two so the bucket index is a mask. */
+    /* The budget is the smallest of the three bounds above.  Sets are a power
+     * of two so the bucket index stays a mask, and a set costs its buffers AND
+     * its slot descriptors -- both come out of the same heap. */
     /* Frames * (PAGE_SIZE / SHARE) rather than (frames * PAGE_SIZE) / SHARE:
      * the kernel links no libgcc 64-bit division helpers, and the share divides
      * the page size exactly. */
-    uint32_t share = pmm_free_frames() * (PAGE_SIZE / EXT2_CACHE_MEM_SHARE);
-    uint32_t want  = share / (g_state.block_size * EXT2_CACHE_WAYS);
-    uint32_t sets  = EXT2_CACHE_MIN_SETS;
-    while (sets * 2u <= want && sets * 2u <= EXT2_CACHE_MAX_SETS) sets *= 2u;
+    uint32_t budget = pmm_free_frames() * (PAGE_SIZE / EXT2_CACHE_MEM_SHARE);
+    size_t   room   = heap_headroom();
+    uint32_t heap   = room > EXT2_CACHE_HEAP_KEEP
+                      ? (uint32_t)(room - EXT2_CACHE_HEAP_KEEP) : 0u;
+    if (budget > heap)                 budget = heap;
+    if (budget > EXT2_CACHE_MAX_BYTES) budget = EXT2_CACHE_MAX_BYTES;
 
-    /* One slab for every buffer.  If it will not fit, halve and retry rather
-     * than fall back to per-slot allocations, which would flood the heap's
-     * free list (see the note above). */
+    uint32_t per_set = EXT2_CACHE_WAYS *
+                       (g_state.block_size + (uint32_t)sizeof(ext2_cache_entry_t));
+    uint32_t want    = budget / per_set;
+    uint32_t sets    = EXT2_CACHE_MIN_SETS;
+    while (sets * 2u <= want) sets *= 2u;
+
+    /* One slab for every buffer, one array for every slot.  If they will not
+     * fit, halve and retry rather than fall back to per-slot allocations, which
+     * would flood the heap's free list (see the note above).
+     *
+     * kmalloc_try, not kmalloc: plain kmalloc cannot fail for a request this
+     * size -- it grows the heap, and running out of heap address space or of
+     * physical frames halts the machine instead of returning NULL.  This loop
+     * used to be written against kmalloc and was therefore unreachable: it read
+     * as a safety valve while the only two outcomes were success and a wedged
+     * kernel. */
     while (sets >= EXT2_CACHE_MIN_SETS) {
-        uint32_t bytes = sets * EXT2_CACHE_WAYS * g_state.block_size;
-        g_cache_slab = (uint8_t *)kmalloc(bytes);
-        if (g_cache_slab) break;
+        uint32_t slots = sets * EXT2_CACHE_WAYS;
+        g_cache = (ext2_cache_entry_t *)kmalloc_try(slots * sizeof(*g_cache));
+        if (g_cache) {
+            g_cache_slab = (uint8_t *)kmalloc_try(slots * g_state.block_size);
+            if (g_cache_slab) { g_cache_slots = slots; break; }
+            kfree(g_cache);
+            g_cache = (ext2_cache_entry_t *)0;
+        }
+        printk("[EXT2] block cache: %u sets did not fit, halving\n",
+               (unsigned)sets);
         sets /= 2u;
     }
     if (!g_cache_slab) {
@@ -295,12 +384,20 @@ static void ext2_cache_init(void) {
     }
 
     g_cache_setmask = sets - 1u;
-    for (uint32_t i = 0; i < sets * EXT2_CACHE_WAYS; i++)
+    for (uint32_t i = 0; i < g_cache_slots; i++) {
+        g_cache[i].blk = 0;
+        g_cache[i].age = 0;
+        g_cache[i].valid = 0;
         g_cache[i].data = g_cache_slab + (size_t)i * g_state.block_size;
-    printk("[EXT2] block cache %u KiB (%u sets x %u ways of %u B)\n",
+    }
+    printk("[EXT2] block cache %u KiB (%u sets x %u ways of %u B) + %u KiB slots"
+           "; budget %u KiB, heap headroom now %u KiB\n",
            (unsigned)(sets * EXT2_CACHE_WAYS * g_state.block_size / 1024u),
            (unsigned)sets, (unsigned)EXT2_CACHE_WAYS,
-           (unsigned)g_state.block_size);
+           (unsigned)g_state.block_size,
+           (unsigned)(g_cache_slots * sizeof(*g_cache) / 1024u),
+           (unsigned)(budget / 1024u),
+           (unsigned)(heap_headroom() / 1024u));
     g_cache_ready = 1;
 }
 
@@ -361,6 +458,75 @@ static int ext2_read_block(uint32_t blk, void *buf) {
     return 0;
 }
 
+/* ── Reading a few bytes out of a block ──────────────────────────────────────
+ * A block group descriptor is 32 bytes, an inode 128 or 256, an indirect
+ * pointer 4.  Reading any of them through ext2_read_block cost a kmalloc, a
+ * whole-block memcpy out of the cache and a kfree, to then use a fraction of
+ * the result: measured over a Firefox startup, 3.0 s in ext2_read_inode and
+ * 3.0 s in the indirect-block walk, on a machine where the whole disk cost
+ * 11 s.  These two helpers read the bytes straight out of the cache slot.
+ *
+ * The slot pointer NEVER escapes: ext2_cache_get returns it with the cache's
+ * preempt guard held and the caller must copy what it needs and release
+ * immediately.  Holding two slots at once would be a use-after-free -- the
+ * second fetch can evict the first when both land in the same set. */
+static ext2_cache_entry_t *ext2_cache_get(uint32_t blk) {
+    kprof_count(KPE_EXT2_BLK);
+    preempt_disable();                     /* released by ext2_cache_put */
+    if (!g_cache_ready) return (ext2_cache_entry_t *)0;
+
+    ext2_cache_entry_t *e = ext2_cache_find(blk);
+    if (e) {
+        e->age = g_cache_age++;
+        kprof_count(KPE_EXT2_HIT);
+        return e;
+    }
+
+    kprof_count(KPE_EXT2_MISS);
+    ext2_cache_entry_t *slot = ext2_cache_claim(blk);
+    if (!slot || !slot->data) return (ext2_cache_entry_t *)0;
+    /* Invalidate before the transfer: a failed read must not leave the slot
+     * claiming to hold `blk` with the evicted block's bytes still in it. */
+    slot->valid = 0;
+    if (ext2_raw_read_block(blk, slot->data) < 0) return (ext2_cache_entry_t *)0;
+    slot->blk = blk;
+    slot->age = g_cache_age++;
+    slot->valid = 1;
+    return slot;
+}
+
+static void ext2_cache_put(void) { preempt_enable(); }
+
+/* Copy `len` bytes at offset `off` inside block `blk`.  0 on success. */
+static int ext2_read_block_part(uint32_t blk, uint32_t off, uint32_t len,
+                                void *out) {
+    if (off + len > g_state.block_size) return -1;
+    ext2_cache_entry_t *e = ext2_cache_get(blk);
+    if (!e) {
+        ext2_cache_put();
+        /* No cache (or it could not be fetched into one): fall back to the
+         * copying path, which owns its own buffer. */
+        uint8_t *tmp = (uint8_t *)kmalloc(g_state.block_size);
+        if (!tmp) return -1;
+        if (ext2_read_block(blk, tmp) < 0) { kfree(tmp); return -1; }
+        memcpy(out, tmp + off, len);
+        kfree(tmp);
+        return 0;
+    }
+    memcpy(out, e->data + off, len);
+    ext2_cache_put();
+    return 0;
+}
+
+/* The `idx`-th 32-bit pointer stored in indirect block `blk`, or 0. */
+static uint32_t ext2_ind_word(uint32_t blk, uint32_t idx) {
+    uint32_t v = 0;
+    if (!blk) return 0;
+    if (idx >= g_state.block_size / 4) return 0;
+    if (ext2_read_block_part(blk, idx * 4u, 4u, &v) < 0) return 0;
+    return v;
+}
+
 /* Publish `buf` as the cached contents of `blk`.  Caller holds preempt_disable
  * (the slot buffers are shared mutable state). */
 static void ext2_cache_insert(uint32_t blk, const void *buf) {
@@ -412,15 +578,8 @@ static int ext2_read_bgd(uint32_t grp, ext2_bgd_t *out) {
     uint32_t per_block = g_state.block_size / sizeof(ext2_bgd_t);
     uint32_t bgd_blk   = g_state.first_data_block + 1 + (per_block ? grp / per_block : 0);
     uint32_t idx       = per_block ? grp % per_block : grp;
-    uint8_t *bgd_block = (uint8_t *)kmalloc(g_state.block_size);
-    if (!bgd_block) return -1;
-    if (ext2_read_block(bgd_blk, bgd_block) < 0) {
-        kfree(bgd_block);
-        return -1;
-    }
-    memcpy(out, bgd_block + idx * sizeof(ext2_bgd_t), sizeof(ext2_bgd_t));
-    kfree(bgd_block);
-    return 0;
+    return ext2_read_block_part(bgd_blk, idx * sizeof(ext2_bgd_t),
+                                sizeof(ext2_bgd_t), out);
 }
 
 static int ext2_write_bgd(uint32_t grp, const ext2_bgd_t *in) {
@@ -452,12 +611,7 @@ static int ext2_read_inode(uint32_t ino, ext2_inode_t *out) {
     uint32_t blk = bgd.bg_inode_table + idx / inodes_per_block;
     uint32_t off = (idx % inodes_per_block) * g_state.inode_size;
 
-    uint8_t *blk_buf = (uint8_t *)kmalloc(g_state.block_size);
-    if (!blk_buf) return -1;
-    if (ext2_read_block(blk, blk_buf) < 0) { kfree(blk_buf); return -1; }
-    memcpy(out, blk_buf + off, sizeof(ext2_inode_t));
-    kfree(blk_buf);
-    return 0;
+    return ext2_read_block_part(blk, off, sizeof(ext2_inode_t), out);
 }
 
 static int ext2_write_inode(uint32_t ino, const ext2_inode_t *in) {
@@ -658,143 +812,37 @@ int ext2_statfs(uint32_t *block_size, uint32_t *blocks, uint32_t *bfree,
 
 /* ── Resolve an indirect block pointer ───────────────────────────────────── */
 
-/* Reentrant cache of recently-read indirect blocks, one slot per level
- * (0=singly, 1=doubly, 2=triply).  Lives on the caller's stack so concurrent
- * reads never share it.  Sequential reads of a large file (libxul.so = 175 MiB)
- * otherwise re-read up to 3 indirect blocks per 1 KiB data block from the PIO
- * disk — hundreds of thousands of redundant reads.  With the cache the doubly/
- * triply blocks are read once per 64 MiB and the singly once per 256 KiB. */
-typedef struct {
-    uint32_t blk[3];      /* cached disk block number, 0 = empty */
-    uint32_t *buf[3];     /* cached block contents (block_size bytes) */
-} ext2_indcache_t;
-
-static uint32_t *ext2_ind_get(ext2_indcache_t *c, int lvl, uint32_t blk) {
-    if (blk == 0) return 0;
-    if (c->blk[lvl] == blk && c->buf[lvl]) return c->buf[lvl];
-    if (!c->buf[lvl]) {
-        c->buf[lvl] = (uint32_t *)kmalloc(g_state.block_size);
-        if (!c->buf[lvl]) return 0;
-    }
-    if (ext2_read_block(blk, c->buf[lvl]) < 0) { c->blk[lvl] = 0; return 0; }
-    c->blk[lvl] = blk;
-    return c->buf[lvl];
-}
-
-/* Cached variant: resolves file-block `idx` reusing already-read indirect
- * blocks from `c`.  Equivalent to ext2_file_blk but fast for sequential scans. */
-static uint32_t ext2_file_blk_cached(ext2_inode_t *ino, uint32_t idx,
-                                     ext2_indcache_t *c) {
+/* Returns the physical block number for file-block index `idx`.
+ *
+ * Each indirect level is one 4-byte read out of the block cache
+ * (ext2_ind_word), so resolving a block in the doubly-indirect range costs two
+ * cache lookups and eight bytes of copying.  The previous version kept a
+ * per-call cache of whole indirect blocks because reaching one cost a kmalloc
+ * and a 1 KiB memcpy; now that reaching one is a lookup, the cache saved less
+ * than it cost to fill, and the block cache is the only cache in the path. */
+static uint32_t ext2_file_blk(ext2_inode_t *ino, uint32_t idx) {
     uint32_t ppb = g_state.block_size / 4;
+
     if (idx < 12) return ino->i_block[idx];
     idx -= 12;
-    if (idx < ppb) {                                  /* singly */
-        uint32_t *ind = ext2_ind_get(c, 0, ino->i_block[12]);
-        return ind ? ind[idx] : 0;
-    }
+
+    if (idx < ppb)                                    /* singly */
+        return ext2_ind_word(ino->i_block[12], idx);
     idx -= ppb;
+
     if (idx < ppb * ppb) {                            /* doubly */
-        uint32_t *dind = ext2_ind_get(c, 1, ino->i_block[13]);
-        if (!dind) return 0;
-        uint32_t *ind = ext2_ind_get(c, 0, dind[idx / ppb]);
-        return ind ? ind[idx % ppb] : 0;
+        uint32_t ind = ext2_ind_word(ino->i_block[13], idx / ppb);
+        return ext2_ind_word(ind, idx % ppb);
     }
     idx -= ppb * ppb;
+
     if (idx < ppb * ppb * ppb) {                      /* triply */
         uint32_t per2 = ppb * ppb;
-        uint32_t *tind = ext2_ind_get(c, 2, ino->i_block[14]);
-        if (!tind) return 0;
-        uint32_t *dind = ext2_ind_get(c, 1, tind[idx / per2]);
-        if (!dind) return 0;
-        uint32_t *ind = ext2_ind_get(c, 0, dind[(idx % per2) / ppb]);
-        return ind ? ind[idx % ppb] : 0;
+        uint32_t dind = ext2_ind_word(ino->i_block[14], idx / per2);
+        uint32_t ind  = ext2_ind_word(dind, (idx % per2) / ppb);
+        return ext2_ind_word(ind, idx % ppb);
     }
     return 0;
-}
-
-static void ext2_indcache_free(ext2_indcache_t *c) {
-    for (int i = 0; i < 3; i++) if (c->buf[i]) kfree(c->buf[i]);
-}
-
-/* Returns the physical block number for file-block index `idx` */
-static uint32_t ext2_file_blk(ext2_inode_t *ino, uint32_t idx) {
-    uint32_t ptrs_per_blk = g_state.block_size / 4;
-
-    if (idx < 12)
-        return ino->i_block[idx];
-
-    idx -= 12;
-
-    /* Singly indirect */
-    if (idx < ptrs_per_blk) {
-        if (!ino->i_block[12]) return 0;
-        uint32_t *ind = (uint32_t *)kmalloc(g_state.block_size);
-        if (!ind) return 0;
-        if (ext2_read_block(ino->i_block[12], ind) < 0) {
-            kfree(ind);
-            return 0;
-        }
-        uint32_t blk = ind[idx];
-        kfree(ind);
-        return blk;
-    }
-    idx -= ptrs_per_blk;
-
-    /* Doubly indirect */
-    if (idx < ptrs_per_blk * ptrs_per_blk) {
-        if (!ino->i_block[13]) return 0;
-        uint32_t *dind = (uint32_t *)kmalloc(g_state.block_size);
-        if (!dind) return 0;
-        if (ext2_read_block(ino->i_block[13], dind) < 0) {
-            kfree(dind);
-            return 0;
-        }
-        uint32_t ind_blk = dind[idx / ptrs_per_blk];
-        kfree(dind);
-        if (!ind_blk) return 0;
-
-        uint32_t *ind = (uint32_t *)kmalloc(g_state.block_size);
-        if (!ind) return 0;
-        if (ext2_read_block(ind_blk, ind) < 0) {
-            kfree(ind);
-            return 0;
-        }
-        uint32_t blk = ind[idx % ptrs_per_blk];
-        kfree(ind);
-        return blk;
-    }
-    idx -= ptrs_per_blk * ptrs_per_blk;
-
-    /* Triply indirect.  With 1 KiB blocks the doubly-indirect range only covers
-     * ~64 MiB, so large files (libxul.so is 175 MiB) MUST use this path — without
-     * it, reads past 64 MiB return zeros and silently corrupt the file. */
-    if (idx < ptrs_per_blk * ptrs_per_blk * ptrs_per_blk) {
-        if (!ino->i_block[14]) return 0;
-        uint32_t per2 = ptrs_per_blk * ptrs_per_blk;
-
-        uint32_t *tind = (uint32_t *)kmalloc(g_state.block_size);
-        if (!tind) return 0;
-        if (ext2_read_block(ino->i_block[14], tind) < 0) { kfree(tind); return 0; }
-        uint32_t dind_blk = tind[idx / per2];
-        kfree(tind);
-        if (!dind_blk) return 0;
-
-        uint32_t *dind = (uint32_t *)kmalloc(g_state.block_size);
-        if (!dind) return 0;
-        if (ext2_read_block(dind_blk, dind) < 0) { kfree(dind); return 0; }
-        uint32_t ind_blk = dind[(idx % per2) / ptrs_per_blk];
-        kfree(dind);
-        if (!ind_blk) return 0;
-
-        uint32_t *ind = (uint32_t *)kmalloc(g_state.block_size);
-        if (!ind) return 0;
-        if (ext2_read_block(ind_blk, ind) < 0) { kfree(ind); return 0; }
-        uint32_t blk = ind[idx % ptrs_per_blk];
-        kfree(ind);
-        return blk;
-    }
-
-    return 0;   /* beyond triply-indirect range (> 16 GiB with 1 KiB blocks) */
 }
 
 static uint32_t ext2_file_blk_alloc(ext2_inode_t *ino, uint32_t idx) {
@@ -956,16 +1004,20 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
     ext2_priv_t *priv = (ext2_priv_t *)node->private;
 
     ext2_inode_t inode;
-    if (ext2_read_inode(priv->ino, &inode) < 0) return 0;
+    uint64_t kp_i = kprof_probe_begin();
+    int inode_err = ext2_read_inode(priv->ino, &inode) < 0;
+    kprof_probe_end(KPP_E2_INODE, kp_i);
+    if (inode_err) return 0;
 
     if (offset >= inode.i_size) return 0;
     if (offset + size > inode.i_size) size = inode.i_size - offset;
 
     uint32_t blk_size = g_state.block_size;
     uint32_t done = 0;
-    uint8_t *blk_buf = (uint8_t *)kmalloc(blk_size);
-    if (!blk_buf) return 0;
-    ext2_indcache_t ic = {{0,0,0},{0,0,0}};
+    /* The bounce buffer is only needed for a partial block; a page fault, which
+     * is nearly every read here, is whole-block aligned and never touches it.
+     * Allocating it unconditionally cost a kmalloc+kfree pair per read. */
+    uint8_t *blk_buf = (uint8_t *)0;
 
     while (done < size) {
         uint32_t file_off   = offset + done;
@@ -974,7 +1026,9 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
         uint32_t to_copy    = blk_size - blk_off;
         if (to_copy > size - done) to_copy = size - done;
 
-        uint32_t blk_num = ext2_file_blk_cached(&inode, blk_idx, &ic);
+        uint64_t kp_b = kprof_probe_begin();
+        uint32_t blk_num = ext2_file_blk(&inode, blk_idx);
+        kprof_probe_end(KPP_E2_BMAP, kp_b);
         if (blk_num == 0) {
             memset(buf + done, 0, to_copy);
             done += to_copy;
@@ -987,7 +1041,10 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
          * blocks as the request still needs, so a 4 KiB page fault on a
          * contiguous file costs one ATA transaction instead of four. */
         if (blk_off == 0 && to_copy == blk_size) {
-            if (!ext2_cache_lookup(blk_num, buf + done)) {
+            uint64_t kp_c = kprof_probe_begin();
+            int miss = !ext2_cache_lookup(blk_num, buf + done);
+            kprof_probe_end(KPP_E2_COPY, kp_c);
+            if (miss) {
                 /* Cluster only into a KERNEL destination.  ata_read transfers
                  * with interrupts disabled straight into the caller's buffer,
                  * and sys_read hands us the user pointer unbounced: a longer
@@ -999,8 +1056,7 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
                 while ((uintptr_t)(buf + done) >= KERNEL_VMA &&
                        run < EXT2_READ_CLUSTER &&
                        done + (run + 1) * blk_size <= size &&
-                       ext2_file_blk_cached(&inode, blk_idx + run, &ic)
-                           == blk_num + run)
+                       ext2_file_blk(&inode, blk_idx + run) == blk_num + run)
                     run++;
                 if (run > 1) {
                     /* CACHE INVARIANT: the raw read and the inserts that
@@ -1038,13 +1094,22 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
                 if (ext2_read_block(blk_num, buf + done) < 0) break;
             }
         } else {
+            if (!blk_buf) {
+                uint64_t kp_a = kprof_probe_begin();
+                blk_buf = (uint8_t *)kmalloc(blk_size);
+                kprof_probe_end(KPP_E2_ALLOC, kp_a);
+                if (!blk_buf) break;
+            }
             if (ext2_read_block(blk_num, blk_buf) < 0) break;
             memcpy(buf + done, blk_buf + blk_off, to_copy);
         }
         done += to_copy;
     }
-    kfree(blk_buf);
-    ext2_indcache_free(&ic);
+    if (blk_buf) {
+        uint64_t kp_f = kprof_probe_begin();
+        kfree(blk_buf);
+        kprof_probe_end(KPP_E2_ALLOC, kp_f);
+    }
     /* noatime: do NOT write the inode back on read.  Firefox's startup is
      * enormously read-heavy (libxul + hundreds of chrome/config files, many
      * small reads); an atime write-back per read turned every read into a
@@ -1833,6 +1898,7 @@ vfs_node_t *ext2_mount(uint32_t lba_offset) {
     g_state.inode_size        = (sb->s_rev_level >= 1) ? sb->s_inode_size : 128;
 
     ext2_cache_init();
+    ext2_seen_init();
     g_mounted = 1;
 
     printk("[EXT2]  Mounted: block_size=%u  inodes=%u  inode_size=%u cache=%s\n",

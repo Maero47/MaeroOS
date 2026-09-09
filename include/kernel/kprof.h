@@ -42,7 +42,51 @@ enum {
     KPE_ATA_RD, KPE_ATA_RD_SECT, KPE_ATA_WR, KPE_ATA_WR_SECT,
     KPE_EXT2_BLK, KPE_EXT2_HIT, KPE_EXT2_MISS,
     KPE_WAKE, KPE_RESCHED, KPE_FB_KB,
+    KPE_EXT2_DISK,          /* blocks actually fetched off the platter      */
+    KPE_EXT2_DISTINCT,      /* of those, blocks fetched for the first time  */
+    KPE_EXT2_RA,            /* blocks fetched purely as read-ahead          */
+    KPE_EXT2_RA_USED,       /* read-ahead blocks later served from the cache */
+    KPE_PF_FILE_SEQ,        /* file fault on the page after the previous one */
+    KPE_PF_FILE_AROUND,     /* pages populated by fault-around, not faulted  */
     KPE_MAX
+};
+
+/*
+ * Probes — named (cycles, count) accumulators for zooming into one code span.
+ *
+ * They are ADDITIVE and deliberately outside the exclusive bucket accounting:
+ * a probe may nest inside another probe or inside any bucket, so probe totals
+ * do not sum to anything and must never be added to the bucket table.  They
+ * answer "how much of syscall X is this function", which the buckets cannot.
+ */
+enum {
+    KPP_SYS_PRO,        /* syscall_dispatch prologue (before the switch)     */
+    KPP_SYS_EPI,        /* syscall_dispatch epilogue (signals + resched)     */
+    KPP_YIELD_PRE,      /* yield() up to the park                            */
+    KPP_SCHED_SCAN,     /* scheduler ptable scan up to picking a thread      */
+    KPP_SCHED_DISP,     /* dispatch prologue: tss, tls, cr3, fpu             */
+    KPP_GAP_FIND,       /* vma_gap_find                                      */
+    KPP_FIRST_MAPPED,   /* first_mapped_page                                 */
+    KPP_MMAP_POP,       /* eager population inside mmap2                     */
+    KPP_MMAP_UNMAP,     /* unmap_range inside mmap2                          */
+    KPP_FAULT_READ,     /* vfs_read inside a file-backed fault               */
+    KPP_FAULT_ZERO,     /* the memset of a freshly allocated fault frame     */
+    KPP_ATA_SMALL,      /* ata_read of <= 4 sectors                          */
+    KPP_ATA_BIG,        /* ata_read of  > 4 sectors                          */
+    KPP_E2_ALLOC,       /* the kmalloc/kfree pair in ext2_read_node          */
+    KPP_E2_INODE,       /* ext2_read_inode per read                          */
+    KPP_E2_BMAP,        /* ext2_file_blk_cached (the block map walk)         */
+    KPP_E2_COPY,        /* fetching one block into the destination           */
+    KPP_SYS_BODY,       /* the syscall's own work (the dispatch switch)      */
+    KPP_SYS_RESCHED,    /* resched_on_return (may yield: not CPU time)       */
+    KPP_DISP_TSS,       /* tss_set_kernel_stack + gdt_set_tls per dispatch   */
+    KPP_DISP_CR3,       /* the cr3 reload per dispatch                       */
+    KPP_DISP_FPU,       /* fxrstor per dispatch                              */
+    KPP_SCHED_KCR3,     /* the cr3 reload back to the kernel pgdir per switch */
+    KPP_SCHED_FPUSAVE,  /* fxsave per switch                                 */
+    KPP_DUMP,           /* the profiler's own periodic dump (printk to serial) */
+    KPP_CALIB,          /* an empty span: the cost of a probe pair itself      */
+    KPP_MAX
 };
 
 /* Charge the cycles since the last switch to the current bucket, make `bucket`
@@ -52,8 +96,12 @@ static inline int kprof_sys_bucket(uint32_t nr) {
     return KPB_SYSBASE + (int)(nr < KPROF_NSYS ? nr : KPROF_NSYS - 1);
 }
 
-void kprof_count(int ev);
-void kprof_add(int ev, uint32_t n);
+/* The event counters are hit several times per block-cache operation and
+ * millions of times per startup, so they are incremented in place rather than
+ * through a call into kprof.c. */
+extern uint64_t kprof_ev[KPE_MAX];
+static inline void kprof_count(int ev) { kprof_ev[ev]++; }
+static inline void kprof_add(int ev, uint32_t n) { kprof_ev[ev] += n; }
 
 /* One entry into syscall `nr` from user mode.  Separate from the bucket
  * switches, which also fire when a parked thread is re-dispatched. */
@@ -63,6 +111,11 @@ void kprof_syscall_enter(uint32_t nr);
  * The token is the caller's, so concurrent sleepers do not share state. */
 uint64_t kprof_sleep_begin(void);
 void     kprof_sleep_end(uint64_t token, int syscall_nr);
+
+/* Probe timing.  kprof_probe_begin() is a bare rdtsc; the end call charges the
+ * delta to `id`.  Cheap enough to leave in place (two rdtsc per span). */
+uint64_t kprof_probe_begin(void);
+void     kprof_probe_end(int id, uint64_t t0);
 
 void kprof_dump(const char *tag);
 void kprof_reset(void);

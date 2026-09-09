@@ -78,6 +78,8 @@ PROBES = {
     # Writes and deletes 2 MiB twelve times over the ATA PIO disk, so it needs
     # far longer than a probe that only exercises the ABI in memory.
     "p26_unlink_frees_space":  (240, ""),
+    # Writes 3 MiB and reads it back three ways over the ATA PIO disk.
+    "p27_indirect_blocks":     (240, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.
@@ -177,6 +179,12 @@ def kill_qemu(proc):
 
 def boot(args):
     """Start QEMU and wait for the shell prompt.  Returns (proc, sel, log)."""
+    # p26 measures real ext2 free space, so the volume must exist.  Without this
+    # QEMU fails to open it and the run dies at "no shell prompt within N s",
+    # which says nothing about the actual cause.
+    if not os.path.exists(os.path.join(ROOT, "disk.img")):
+        raise SystemExit("smoke_abi: disk.img is missing - run `make disk` first "
+                         "(or use `make smoke-abi`, which builds it)")
     proc = subprocess.Popen(
         # The ext2 volume is attached because p26 measures real filesystem
         # free space; the probes that predate it ignore it.

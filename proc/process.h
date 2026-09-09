@@ -191,6 +191,10 @@ struct proc {
     /* Next available address for anonymous mmap allocations */
     uint32_t         mmap_next;
 
+    /* Last file-backed page this thread faulted on, for the profiler's
+     * sequentiality counter (see KPE_PF_FILE_SEQ). */
+    uint32_t         last_file_fault;
+
     /* Demand-paged anonymous memory regions (mmap MAP_ANONYMOUS).  Owned by the
      * thread-group leader (threads share the address space).  Pages in a VMA are
      * allocated lazily on first fault instead of eagerly at mmap time — this

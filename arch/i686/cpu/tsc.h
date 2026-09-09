@@ -12,6 +12,11 @@
 #define TICK_HZ   100U
 #define TICK_NS   (1000000000U / TICK_HZ)   /* 10 ms */
 
+/* Measure the TSC rate against PIT channel 2, before the tick starts.  Call
+ * with interrupts disabled, after pit_init().  Falls back silently (the passive
+ * tick-interval calibration) if the channel does not behave. */
+void tsc_init(void);
+
 /* Called from the PIT interrupt handler, once per tick, BEFORE the tick
  * counter is published. */
 void tsc_tick_sample(void);

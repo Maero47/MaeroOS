@@ -2,6 +2,8 @@
 #include "printk.h"
 #include "../arch/i686/cpu/tsc.h"
 #include "../arch/i686/cpu/pit.h"
+#include "../mm/heap.h"
+#include <kernel/config.h>
 
 /*
  * See include/kernel/kprof.h for the model.  Everything here is plain 64-bit
@@ -11,10 +13,21 @@
 
 static uint64_t g_cyc[KPROF_NBUCKET];
 static uint32_t g_cnt[KPROF_NBUCKET];      /* entries into each bucket */
-static uint64_t g_ev[KPE_MAX];
+uint64_t kprof_ev[KPE_MAX];
 static uint32_t g_syscnt[KPROF_NSYS];      /* true invocations, per syscall   */
 static uint64_t g_sleep_cyc[KPROF_NSYS];   /* blocked wall time per syscall  */
 static uint32_t g_sleep_cnt[KPROF_NSYS];
+
+static uint64_t g_probe_cyc[KPP_MAX];
+static uint32_t g_probe_cnt[KPP_MAX];
+static const char *const g_probe_name[KPP_MAX] = {
+    "sys_pro", "sys_epi", "yield_pre", "sch_scan", "sch_disp",
+    "gap_find", "first_mapped", "mmap_pop", "mmap_unmap",
+    "fault_read", "fault_zero", "ata<=4", "ata>4",
+    "e2_alloc", "e2_inode", "e2_bmap", "e2_copy",
+    "sys_body", "sys_resched", "disp_tss", "disp_cr3", "disp_fpu", "sch_kcr3", "sch_fpusave",
+    "kdump", "calib",
+};
 
 static int      g_cur = KPB_USER;
 static uint64_t g_last;                    /* TSC at the last bucket change  */
@@ -45,11 +58,15 @@ int kprof_switch(int bucket) {
     return old;
 }
 
-void kprof_count(int ev) { g_ev[ev]++; }
+
+uint64_t kprof_probe_begin(void) { return rdtsc64(); }
+void kprof_probe_end(int id, uint64_t t0) {
+    g_probe_cyc[id] += rdtsc64() - t0;
+    g_probe_cnt[id]++;
+}
 void kprof_syscall_enter(uint32_t nr) {
     g_syscnt[nr < KPROF_NSYS ? nr : KPROF_NSYS - 1]++;
 }
-void kprof_add(int ev, uint32_t n) { g_ev[ev] += n; }
 
 /* Blocked time.  sleep_on() records the TSC before switching away and charges
  * the elapsed wall time to the syscall that blocked when it comes back, so
@@ -85,10 +102,11 @@ void kprof_reset(void) {
     uint32_t fl;
     __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
     for (int i = 0; i < KPROF_NBUCKET; i++) { g_cyc[i] = 0; g_cnt[i] = 0; }
-    for (int i = 0; i < KPE_MAX; i++) g_ev[i] = 0;
+    for (int i = 0; i < KPE_MAX; i++) kprof_ev[i] = 0;
     for (int i = 0; i < KPROF_NSYS; i++) {
         g_sleep_cyc[i] = 0; g_sleep_cnt[i] = 0; g_syscnt[i] = 0;
     }
+    for (int i = 0; i < KPP_MAX; i++) { g_probe_cyc[i] = 0; g_probe_cnt[i] = 0; }
     g_base = g_last = rdtsc64();
     g_on = 1;
     if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
@@ -113,17 +131,41 @@ void kprof_dump(const char *tag) {
            cyc_ms(g_cyc[KPB_IRQ]), cyc_ms(g_cyc[KPB_PGFAULT]), cyc_ms(g_cyc[KPB_ATA]),
            cyc_ms(g_cyc[KPB_FB]), cyc_ms(g_cyc[KPB_EXC]), cyc_ms(sysc));
     printk("[kprof] ev sysc=%u ctxsw=%u pf(cow=%u anon=%u file=%u stk=%u oth=%u)\n",
-           (unsigned)g_ev[KPE_SYSCALL], (unsigned)g_ev[KPE_CTXSW],
-           (unsigned)g_ev[KPE_PF_COW], (unsigned)g_ev[KPE_PF_ANON],
-           (unsigned)g_ev[KPE_PF_FILE], (unsigned)g_ev[KPE_PF_STACK],
-           (unsigned)g_ev[KPE_PF_OTHER]);
+           (unsigned)kprof_ev[KPE_SYSCALL], (unsigned)kprof_ev[KPE_CTXSW],
+           (unsigned)kprof_ev[KPE_PF_COW], (unsigned)kprof_ev[KPE_PF_ANON],
+           (unsigned)kprof_ev[KPE_PF_FILE], (unsigned)kprof_ev[KPE_PF_STACK],
+           (unsigned)kprof_ev[KPE_PF_OTHER]);
     printk("[kprof] ev ata(rd=%u sect=%u wr=%u wsect=%u) ext2(blk=%u hit=%u miss=%u) wake=%u resched=%u\n",
-           (unsigned)g_ev[KPE_ATA_RD], (unsigned)g_ev[KPE_ATA_RD_SECT],
-           (unsigned)g_ev[KPE_ATA_WR], (unsigned)g_ev[KPE_ATA_WR_SECT],
-           (unsigned)g_ev[KPE_EXT2_BLK], (unsigned)g_ev[KPE_EXT2_HIT],
-           (unsigned)g_ev[KPE_EXT2_MISS], (unsigned)g_ev[KPE_WAKE],
-           (unsigned)g_ev[KPE_RESCHED]);
-    printk("[kprof] ev fb_kb=%u\n", (unsigned)g_ev[KPE_FB_KB]);
+           (unsigned)kprof_ev[KPE_ATA_RD], (unsigned)kprof_ev[KPE_ATA_RD_SECT],
+           (unsigned)kprof_ev[KPE_ATA_WR], (unsigned)kprof_ev[KPE_ATA_WR_SECT],
+           (unsigned)kprof_ev[KPE_EXT2_BLK], (unsigned)kprof_ev[KPE_EXT2_HIT],
+           (unsigned)kprof_ev[KPE_EXT2_MISS], (unsigned)kprof_ev[KPE_WAKE],
+           (unsigned)kprof_ev[KPE_RESCHED]);
+    /* The heap only ever grows, so the headroom at any dump is the low-water
+     * mark: HEAP_MAX minus this is everything the kernel has ever needed. */
+    printk("[kprof] heap headroom=%uKiB used=%uKiB\n",
+           (unsigned)(heap_headroom() / 1024u),
+           (unsigned)((HEAP_MAX - HEAP_START - heap_headroom()) / 1024u));
+    printk("[kprof] ev fb_kb=%u disk_blk=%u distinct=%u ra=%u ra_used=%u pf_seq=%u pf_around=%u\n",
+           (unsigned)kprof_ev[KPE_FB_KB], (unsigned)kprof_ev[KPE_EXT2_DISK],
+           (unsigned)kprof_ev[KPE_EXT2_DISTINCT], (unsigned)kprof_ev[KPE_EXT2_RA],
+           (unsigned)kprof_ev[KPE_EXT2_RA_USED], (unsigned)kprof_ev[KPE_PF_FILE_SEQ],
+           (unsigned)kprof_ev[KPE_PF_FILE_AROUND]);
+
+    /* Probes: additive spans, printed only when used.  Never summed with the
+     * buckets above -- see the note in kprof.h. */
+    {
+        int any = 0;
+        for (int i = 0; i < KPP_MAX; i++) if (g_probe_cnt[i]) any = 1;
+        if (any) {
+            printk("[kprof] probe");
+            for (int i = 0; i < KPP_MAX; i++)
+                if (g_probe_cnt[i])
+                    printk(" %s:%ums/%u", g_probe_name[i],
+                           cyc_ms(g_probe_cyc[i]), (unsigned)g_probe_cnt[i]);
+            printk("\n");
+        }
+    }
 
     /* Top syscalls by kernel CPU time, then by blocked wall time. */
     for (int pass = 0; pass < 2; pass++) {
@@ -159,5 +201,14 @@ void kprof_tick(void) {
     uint32_t now = pit_ticks();
     if (now - last < 1000) return;            /* every 10 s of tick time */
     last = now;
+    /* Calibrate: 256 empty spans, so a probe reading can be corrected for the
+     * cost of taking it -- and so the cost of an rdtsc on this host, which is
+     * the whole instrument, is a printed number rather than an assumption. */
+    for (int i = 0; i < 256; i++) {
+        uint64_t c0 = kprof_probe_begin();
+        kprof_probe_end(KPP_CALIB, c0);
+    }
+    uint64_t d0 = kprof_probe_begin();
     kprof_dump("periodic");
+    kprof_probe_end(KPP_DUMP, d0);
 }

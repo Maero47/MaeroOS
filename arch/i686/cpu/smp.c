@@ -232,6 +232,10 @@ uint32_t smp_boot_aps(void) {
     /* APIC IDs for QEMU -smp N are 0..N-1; probe every id except the BSP's. */
     for (uint32_t id = 0; id < hint; id++) {
         if (id == bsp) continue;
+        /* From here a second CPU may execute kernel code, so this_cpu_id() must
+         * go back to asking the hardware.  Before the AP is started, not after:
+         * the AP's very first kernel code calls it. */
+        smp_percpu_go_multi();
         if (boot_one_ap((uint8_t)id)) {
             g_cpu_count++;
             printk("[SMP]  CPU %u (apic id %u) online\n", (unsigned)g_cpu_count - 1, (unsigned)id);

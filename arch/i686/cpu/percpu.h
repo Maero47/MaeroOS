@@ -20,6 +20,11 @@ extern struct cpu cpus[MAX_CPUS];
 /* Index of the calling CPU (0 before the LAPIC is up). */
 uint32_t this_cpu_id(void);
 
+/* Stop caching the calling CPU's id.  MUST be called before the first AP is
+ * started: until it is, this_cpu_id() answers from a value read once, which is
+ * only correct while a single CPU executes. */
+void smp_percpu_go_multi(void);
+
 /*
  * Big Kernel Lock.  A single global spinlock held whenever a CPU executes
  * kernel code; user-mode runs lock-free and concurrently across CPUs.  The

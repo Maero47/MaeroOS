@@ -225,16 +225,420 @@ tenth of the spread. That follows from the breakdown — user code is under 4 % 
 a startup, so a wider instruction set has almost nothing to speed up.
 `tools/smoke_firefox.py --cpu <model>` re-checks this in one command.
 
+## Round three: 67.7 s -> 34.7 s
+
+Five runs of the round-two tree (`d88019c`) measured **67.7 s** (70.3 67.4 67.0
+67.0 66.8). At the mark of the 67.0 s run (`build/ff-smoke/20260909-120012-base-3`,
+54.9 s of guest time):
+
+| Bucket | Time | Share |
+|---|---:|---:|
+| `ata` | 24.70 s | 45.0 % |
+| other syscalls | 19.19 s | 34.9 % |
+| `pgfault` | 4.56 s | 8.3 % |
+| `sched` | 3.01 s | 5.5 % |
+| `user` | 2.03 s | 3.7 % |
+| `fb` | 1.26 s | 2.3 % |
+| `irq` | 0.18 s | 0.3 % |
+| `idle` | **0.00 s** | 0.0 % |
+| **total** | **54.92 s** | `accounted == elapsed` |
+
+The syscall half: `sched_yield` 6.96 s over 299 613 calls, `mmap2` 5.46 s over
+1943, `exit_group` 1.50 s over 8, `clock_gettime64` 1.14 s over 80 977, `execve`
+1.11 s over 16, then nothing above 0.5 s.
+
+### Probes
+
+`kprof_probe_begin`/`kprof_probe_end` are named (cycles, count) accumulators for
+one code span. They are **additive** and deliberately outside the exclusive
+bucket accounting — a probe may nest inside another probe or inside any bucket —
+so probe totals sum to nothing and must never be added to the bucket table. They
+answer "how much of this syscall is that function", which buckets cannot. A
+calibration probe times 256 empty spans per dump, so the instrument's own cost
+is a printed number rather than an assumption: it is under 0.5 ms per 1024
+spans, i.e. below the resolution of everything measured with it.
+
+Two exact counters were added for this round's central question. One bit per
+block of the volume, set the first time the block comes off the platter, splits
+disk traffic into `disk_blk` (blocks fetched) and `distinct` (blocks fetched for
+the first time). A third counts file faults that land on the page after the same
+thread's previous file fault.
+
+### Fifty-seven per cent of the disk traffic was re-reading
+
+A startup fetched **216 314 blocks and only 92 800 distinct ones**. The reads
+were well batched but the same blocks kept coming back.
+
+The cache had a memory-based sizing already, and a compile-time set count that
+overrode it: the 2 GiB machine wanted 255 MiB and got 4096 sets, 16 MiB. The
+slot array is now allocated at mount alongside the buffer slab, so the size is
+decided by the machine rather than reserved in BSS.
+
+Blocks fetched **216 314 -> 94 715**, of which 92 702 distinct: with the working
+set resident, essentially nothing is read twice. `ata` **24.7 s -> 11.1 s**.
+
+#### How big, and out of what
+
+Three things bound the cache and they run out independently, so the sizing
+consults all three. The first version consulted only the first, which is how it
+came to ask for half of the kernel's address space on the strength of a number
+that never looked at it.
+
+**A share of free physical memory** (one eighth, measured at mount). The cache is
+never handed back, so this is what keeps a small machine honest — and it is what
+governs there.
+
+**Heap address space, minus a fixed margin.** The kernel heap is a fixed 256 MiB
+span (`HEAP_START`..`HEAP_MAX`) that every other kernel allocation also comes out
+of and that nothing ever releases. On the 2 GiB machine it, not physical memory,
+is the resource that binds: an eighth of free RAM is 255 MiB, which is the whole
+window. The margin is **absolute, not a share**, because what matters to the rest
+of the kernel is how many bytes it can still get, not what fraction some other
+subsystem took. It is set from measurement: a `[kprof] heap` line reports
+headroom at every dump, and everything in the kernel other than this cache uses
+**5.5 MiB** of heap to first paint (138 624 KiB used at the mark, of which
+133 120 KiB is the cache). The heap only grows, so that is a peak. The margin is
+64 MiB — an order of magnitude above the measured demand.
+
+**A ceiling: what the workload is worth.** Measured at six sizes, one
+`make smoke-firefox` each, everything else held constant:
+
+| Buffers | First paint | Blocks fetched | `ata` |
+|---:|---:|---:|---:|
+| 4 MiB | 41.3 s | 218 598 | 13.8 s |
+| 8 MiB | 41.3 s | 217 104 | 13.4 s |
+| 16 MiB | 41.3 s | 215 310 | 13.4 s |
+| 32 MiB | 40.8 s | 205 626 | 12.8 s |
+| 64 MiB | 38.0 s | 135 312 | 12.8 s |
+| 128 MiB | 35.4 s | 94 370 | 6.2 s |
+
+**There is no knee below 128 MiB.** That is the whole shape of the result and it
+is worth stating plainly: a cache that holds *part* of this working set holds
+almost none of the value. A startup touches ~92 700 distinct 1 KiB blocks and
+cycles over them, so at 16 MiB — a sixth of the working set — LRU evicts every
+block before it is wanted again and the cache is worth 1.5 % of the traffic
+against a 4 MiB one. The value appears all at once when the cache finally
+exceeds the working set: 128 MiB fetches 94 370 blocks against 92 640 distinct,
+so 98 % of the fetches are first-time reads and there is nothing left to win.
+The ceiling is therefore 128 MiB of buffers, expressed as a 160 MiB budget
+because that is what yields exactly those 32 768 sets once the slot descriptors
+are counted; the next power of two would need 273 MiB and buy nothing.
+
+What each bound actually decides, booted and read off the console:
+
+| Machine | Free at mount | Binds | Buffers | Heap left after mount |
+|---|---:|---|---:|---:|
+| 2048 MiB | 2040 MiB | the ceiling | 128 MiB | 125.9 MiB |
+| 512 MiB | 504 MiB | physical share | 32 MiB | 223.4 MiB |
+| 128 MiB | 120 MiB | physical share | 4 MiB | 251.8 MiB |
+
+#### The fallback has to be able to run
+
+The halving loop that gives up sets when they do not fit was, as first written,
+unreachable. `kmalloc()` cannot fail for a request the free list does not
+already hold: it grows the heap, and both `heap_expand()` (out of heap address
+space) and `vmm_alloc_page()` (out of physical frames) print and enter a `hlt`
+loop rather than return. The loop read as a safety valve while the only two
+outcomes were success and a wedged kernel — which is worse than no loop, because
+the next reader trusts it.
+
+`kmalloc_try()` checks both resources before it can reach either halt and returns
+NULL instead. Demonstrated by removing the heap clamp — recreating exactly the
+sizing that had no clamp — and asking for a 1 GiB budget against the 256 MiB
+window:
+
+```
+[EXT2] block cache: 131072 sets did not fit, halving
+[EXT2] block cache: 65536 sets did not fit, halving
+[EXT2] block cache 131072 KiB (32768 sets x 4 ways of 1024 B) + 2048 KiB slots
+[EXT2]  Mounted: block_size=1024  inodes=65536  inode_size=256 cache=on
+```
+
+The same request through plain `kmalloc()` ends the boot:
+
+```
+[HEAP] FATAL: heap exhausted (at 0xe0000000)
+```
+
+— 25 serial lines and no further output, against a system that boots and runs.
+
+`kmalloc()` halting the machine on exhaustion is still the root problem, and it
+is not confined to this cache: **any allocation a workload can drive should be
+able to fail.** `kmalloc_try()` is the primitive for callers that have a smaller
+size they could take; converting the rest of the kernel to handle failure is a
+much larger change and is not attempted here.
+
+### Fault-around: measured, and not worth doing
+
+Of 67 000 file-backed faults, **6805** land on the page after that thread's
+previous file-backed fault. Ninety per cent are scattered, so populating a run
+of 8 or 16 pages per fault would mostly fetch pages nobody asked for — and with
+the cache now holding the whole working set, a page fetched early is not a page
+saved later, it is only a page fetched. The lead is closed with a number rather
+than acted on.
+
+### Copying a whole block to read a few bytes out of it
+
+ext2 reached its metadata through `ext2_read_block`, which copies a whole block
+out of the cache into a buffer the caller `kmalloc`'d. A block group descriptor
+is 32 bytes, an inode 128, an indirect pointer 4: each of those reads allocated
+1 KiB, copied 1 KiB, used a fraction and freed the buffer. Over a startup that
+was 3.0 s in `ext2_read_inode`, 3.0 s in the indirect walk and 0.9 s in the
+`kmalloc`/`kfree` pairs.
+
+`ext2_cache_get` hands out the cache slot itself with the cache's preempt guard
+held, and `ext2_read_block_part` copies out only the bytes asked for. The slot
+pointer never escapes the guard and **only one slot is ever held at a time** —
+holding two would be a use-after-free, because the second fetch can evict the
+first when both land in the same set. That is why the indirect walk reads one
+32-bit word at a time rather than borrowing whole indirect blocks. With reaching
+an indirect block reduced to a lookup, the per-call cache of whole indirect
+blocks cost more to fill than it saved and is gone.
+
+`ext2_read_inode` 3.0 s -> 1.06 s, the allocation pairs 0.90 s -> 0.02 s.
+
+### The ATA handshake was two thirds of the transfer
+
+Splitting `ata_read` by transaction size gives a cost model from the totals
+alone: a 2-sector transaction cost 160.6 us and an 8-sector one 434.2 us, so
+**45.6 us per sector and 69 us fixed per command**. Single-sector PIO spends
+three port accesses on every 512 bytes — poll the status for DRQ, `rep insw` the
+data, read the alternate status to let the drive settle — and under KVM each of
+those is an exit into QEMU. Two of the three are handshake, not data.
+
+READ MULTIPLE is the ATA feature for exactly that: the drive asserts DRQ once
+per block of N sectors and the host transfers the whole block. The drive states
+its largest block in IDENTIFY word 47, the host selects one with SET MULTIPLE
+MODE, and both are checked — a drive that does not offer multiple mode, or
+rejects the block size, leaves `ata_multi` at 0 and the original single-sector
+path. A transfer that is not a whole number of blocks ends with a short block.
+
+Per sector **45.6 us -> 17.0 us**, `ata` **11.1 s -> 6.5 s**.
+
+### Every reference to the running thread read the Local APIC
+
+This is the one the profiler found by elimination rather than by suspicion, and
+it was worth more than everything above it.
+
+Guarding a single block-cache lookup measured **8.6 us**. Probing inside it, the
+set scan was 0.01 us and the 1 KiB copy 0.18 us. The time was in the two lines
+around them: `preempt_disable()`, and `preempt_enable()`. An empty probe pair in
+the same place measured 0.005 us, so it was not the instrument.
+
+`current_proc` is `cpus[this_cpu_id()].proc`, and `this_cpu_id()` answered by
+reading the Local APIC ID register. That register lives in the LAPIC's MMIO
+page, so a guest read of it exits to the hypervisor — about **1.6 us**.
+`preempt_disable()` names `current_proc` twice and `preempt_enable()` three
+times: five exits, 8 us, for 0.2 us of work. The same tax was on `sys_pro`
+(2 exits), `disp_tss` (2), `yield_pre` (1) and `signal_return_to_user` (~5), and
+on every other line of the kernel that mentions the running thread.
+
+While only one CPU executes, the answer cannot change, so it is read once and
+remembered; `smp_percpu_go_multi()` turns the cache off before the first AP is
+started and every call reads the register again from then on. The fast path is
+not an assumption about the machine but a fact about how many CPUs are running.
+Verified with `--smp 2`: the AP comes online and Firefox paints.
+
+| | before | after |
+|---|---:|---:|
+| `pgfault` bucket | 3.94 s | **0.26 s** |
+| syscall buckets | 17.90 s | **7.04 s** |
+| indirect-block walk | 3.06 s | **0.12 s** |
+| `ext2_read_inode` | 1.10 s | **0.014 s** |
+| signal delivery on syscall return | 3.28 s | **0.22 s** |
+| first paint | 46.2 s | **34.6 s** |
+
+## Results
+
+Five runs per configuration, `make smoke-firefox` (KVM, `-smp 1`, 2 GiB). Every
+run's `screen-paint.png` scores ~134 810 light pixels, i.e. real browser chrome
+(see `tools/smoke_firefox.py`; below ~40 000 means no evidence).
+
+| Configuration | First paint (s) | Mean | Spread |
+|---|---|---:|---:|
+| round-two tree (`d88019c`) | 70.3 67.4 67.0 67.0 66.8 | 67.7 s | 3.5 s |
+| + 128 MiB block cache | 54.2 53.6 53.5 54.1 54.2 | 53.9 s | 0.7 s |
+| + ext2 metadata without the block copy | 52.5 51.1 51.4 52.1 50.7 | 51.6 s | 1.8 s |
+| + ATA READ MULTIPLE | 46.0 45.6 45.9 45.9 45.5 | 45.8 s | 0.5 s |
+| + the cached CPU id | 35.1 34.8 34.9 35.0 34.9 | 34.9 s | 0.3 s |
+| the same, before the sizing fix | 34.7 34.7 34.7 34.7 34.7 | 34.7 s | 0.0 s |
+| + the cache sizing fixed | 34.9 35.1 35.3 34.8 35.0 | 35.0 s | 0.5 s |
+| final tree, 20 boots (19 passes) | 34.4 .. 37.3 | **34.9 s** | 2.9 s |
+
+The last two rows are hours apart and the host drifts between them, so the
+comparison to make is a same-session one: re-measuring the pre-fix commit
+immediately before the final five runs gave 35.8 35.8 34.9, mean **35.5 s**,
+against the fixed tree's 35.0 s. The sizing fix changes nothing about the cache
+the 2 GiB machine ends up with — 32 768 sets either way — and the numbers agree
+that it does not.
+
+**67.7 s -> 34.7 s, a 48.7 % cut.** With the original 220 s baseline, first paint
+is now **6.3x** faster than where this work started.
+
+The spread collapsing to nothing is itself a result: what remained variable was
+the disk, and the disk is now mostly cache.
+
+## The clock was measuring the wrong thing
+
+Found in review, not by this work: the TSC's one-second refinement reported
+**8.3 GHz on a 3.7 GHz machine**, in five boots out of six.
+
+### What the raw inputs said
+
+The refinement computes cycles-per-tick as (TSC span) / (ticks delivered).
+Printing both ends of the window rather than guessing at the ratio:
+
+```
+[TSC] 36705961 cycles per 10 ms tick (3670 MHz, initial)
+[TSCDBG] win=100 span=8105196kcyc avg=82997207 pit0=4 pit=100
+         n=96 min=17353 max=4294967295 over2x=11
+[TSC] 82997207 cycles per 10 ms tick (8299 MHz, 1 s average)
+[TSCDBG] win=1000 span=37286035kcyc avg=38180899 pit0=4 pit=1000
+         n=900 min=17278 max=1333633401 over2x=7
+```
+
+The arithmetic is right and the tick accounting is right: the tick counter moved
+from 4 to 100 while 96 intervals were sampled, and 4 more had been sampled
+before, so the divisor of 100 is exactly the number of intervals in the span.
+What is wrong is the span. 8.1e9 cycles at the true rate is **2.17 seconds** of
+wall time for 100 ticks — and `max=4294967295` is the saturation value, so at
+least one "tick interval" exceeded 2^32 cycles: **a single interrupt standing in
+for about 113 ticks.**
+
+The guest runs long stretches with interrupts disabled — a PIO disk transfer
+holds IF=0 for the whole transfer, and early boot is nothing but disk — and the
+PIC collapses every tick missed during one such stretch into one pending
+interrupt. QEMU then repays the backlog at faster than 100 Hz: ticks 100..1000
+took 7.83 s, i.e. 115 Hz. So the ten-second average was right only because the
+catch-up had finished by then, and the one-second average was taken while the
+deficit was at its maximum.
+
+The comment in the code asserted that "over 1 s and 10 s the tick count is
+faithful to wall time". Over 1 s it is not.
+
+### Fixed by measuring against something that cannot be coalesced
+
+PIT channel 2 is the one channel whose gate is software-controlled and whose
+output is readable, both through port 0x61, so a calibration against it is a
+busy-wait with no interrupt anywhere in it — which is the whole point. This is
+what a PC has always done (Linux: `pit_calibrate_tsc`). `tsc_init()` runs it
+once, after `pit_init()` and before `sti`, and the passive tick-interval path is
+then never used.
+
+Two things fell out of it. It is **stable to 0.05 %** — 3700 to 3702 MHz across
+twenty boots — and it is **the same under KVM and TCG**, where the passive path
+gave 3670 and 1459 MHz respectively. And the value it reports is 3700 MHz, which
+is the 5600X's invariant-TSC base clock: so the ten-second average that looked
+correct at 3818 MHz was itself **3.1 % high**, because even at ten seconds the
+tick count had not quite caught up.
+
+Every `kprof` millisecond figure in the sections above was converted with that
+3818 MHz rate and is therefore about 3 % low in absolute terms. Bucket shares,
+ratios and the before/after comparisons are unaffected — both sides used the
+same rate — and first paint is measured on the host, not by the guest clock.
+
+### And a bound, so a bad refinement can never be adopted
+
+The passive path stays as a fallback for hardware whose channel 2 does not
+behave, and a refinement there is now adopted only if it is within **±50 %** of
+the rate it would replace. A real TSC rate does not change — it is invariant on
+any CPU this kernel will meet, and under a hypervisor the guest's follows the
+host's — so the only legitimate movement is the bias in the estimate being
+replaced.
+
+The bound comes from both requirements rather than being picked round. It must
+reject the coalescing error, measured at **2.26x**. It must admit the real
+correction, bounded by how wrong the initial estimate can be: that estimate is a
+*minimum* over consecutive tick intervals, so it can only be biased low, by a
+short catch-up interval, never high, and the worst bias observed is **1.24x**
+(3067 MHz against a true 3818). Anything between 1.24x and 2.26x works; 1.5x
+leaves 21 % of headroom above the largest correction that has to get through and
+rejects the error it has to stop by 51 %. ±25 % was tried first and left under
+one per cent of headroom on the admit side — it would have worked on these boots
+by luck.
+
+Forcing the fallback (channel 2 stubbed out) shows both halves working:
+
+```
+[TSC] PIT channel 2 unusable; falling back to tick intervals
+[TSC] 30671224 cycles per 10 ms tick (3067 MHz, initial)
+[TSC] 1 s average rejected: 8475 MHz against 3067 MHz (outside +-50%)
+[TSC] 38181950 cycles per 10 ms tick (3818 MHz, 10 s average)
+```
+
+### Twenty boots
+
+`make smoke-firefox`, back to back: **19 PASS, 1 FAIL**, mean first paint over
+the passes **34.9 s**. Every one of the twenty printed exactly one `[TSC]` line,
+all of them `PIT ch2`: five at 3700 MHz, eleven at 3701, four at 3702. No
+refinement ran, so none could be adopted, and nothing landed outside a sane band.
+
+### The wedge is a different bug, and it is still there
+
+One of the twenty hung, and its clock was correct from boot (3701 MHz, PIT ch2)
+— so the wedge is not the calibration. What it is:
+
+* First paint never arrives; the harness times out after 360 s. No panic, no
+  `[SIG]`, no page fault, no output at all for the last 340 s.
+* The last activity is Firefox's X handshake, ~19 s in, right after its first
+  window is created.
+* **Two independent periodic outputs stop at the same moment**: `kprof`'s dump,
+  which is emitted from syscall entry and gated on the tick counter, and
+  maeroX's trace histogram, which its main loop emits every 167 iterations. The
+  last kprof dump is `t=10.00s`; there is no `t=20.00s`.
+
+The leading hypothesis is that the tick source stops. Every timeout in this
+kernel is tick-based (`wake_tick`), so if `pit_ticks()` freezes, every timed
+wait becomes indefinite, every thread ends up blocked, no syscalls run, and
+neither periodic output can fire — one cause that explains all of it. That is
+not proved: a lost futex wakeup that happens to catch every thread would look
+the same from the outside. Distinguishing them needs a thread-state dump
+triggered from the serial line, which this kernel does not have; that is the
+next step, not a guess to act on.
+
+Rate, honestly: the review saw it once in six boots, this round once in twenty,
+and roughly thirty earlier `smoke-firefox` runs in the same session did not hit
+it at all. It predates this branch.
+
 ## What is left
 
-At the mark of a 67.1 s run (`build/ff-smoke/20260908-225513-slab-3`, 55.1 s of
-guest time): `ata` 25.0 s, other syscalls 19.0 s, `pgfault` 4.5 s, `sched` 3.0 s,
-`user` 2.1 s, `fb` 1.3 s, `irq` 0.2 s, `idle` still 0. Disk is still the largest
-single cost. Three leads, measured but not acted on:
+At the mark of a 34.7 s run (`build/ff-smoke/20260909-132926-final-t`, 23.0 s of
+guest time):
 
-* **Disk volume.** The reads are well batched now, so the next win is reading
-  *less*: fault-around on file-backed VMAs (populate 8 pages per fault instead of
-  1) would cut the 67 k file faults and the transactions with them.
-* **`sched_yield`** — ~302 k calls, 6.7 s, now the largest single syscall.
-* **`mmap2`** — ~1900 calls at ~3.0 ms each. `vma_gap_find` calls
-  `first_mapped_page`, which walks a candidate range page by page, per candidate.
+| Bucket | Time | Share |
+|---|---:|---:|
+| `sched` | 7.39 s | 32.1 % |
+| other syscalls | 6.77 s | 29.4 % |
+| `ata` | 6.36 s | 27.6 % |
+| `fb` | 1.24 s | 5.4 % |
+| `user` | 0.92 s | 4.0 % |
+| `pgfault` | 0.22 s | 0.9 % |
+| `irq` | 0.11 s | 0.5 % |
+| `idle` | **0.00 s** | 0.0 % |
+
+The shape has changed completely. Disk was 45 % and is now 28 %; the page-fault
+handler was 4.6 s and is now 0.22 s; and the scheduler, which was 5 % of a
+startup, is now the largest single bucket — not because it got slower but
+because of what it now has to absorb:
+
+* **The yield storm.** Firefox spins on `sched_yield`, and now that a yield is
+  cheap it spins far faster: **299 613 calls before, 14.5 million after**. The
+  spin is bounded by what it waits for, not by how fast we serve it, so the
+  count rose to fill the same wall time. Those 14.5 M context switches are the
+  7.4 s of `sched` and 2.2 s of the `sched_yield` bucket — roughly **40 % of
+  what a startup now costs**, spent making no progress.
+* **Two `cr3` reloads per context switch, 2.49 s.** The dispatch loads the
+  incoming thread's page directory and reloads the kernel's on the way back out,
+  and each write flushes the TLB. Threads of one process share a page directory,
+  so for a switch inside Firefox both writes are avoidable — but only by not
+  returning to the kernel page directory between threads, which is what makes
+  tearing an address space down safe. Sized, not attempted.
+* **`fxsave`/`fxrstor` on every switch, 1.22 s.** Lazy FPU (CR0.TS) is the
+  standard answer.
+* **`ata` 6.36 s.** 189 184 sectors at 17.0 us and 29 636 commands at ~94 us
+  fixed. The sector count is now the distinct working set (92 649 blocks) and
+  cannot fall without Firefox touching less; the fixed half, 2.8 s, would come
+  down with larger transactions, which needs readahead — and readahead against a
+  fault distribution that is 90 % scattered is a bet, not a win.
+* **`exit_group` 2.37 s over 9 calls.** Tearing down an address space costs
+  260 ms. Nothing else in the profile is that concentrated.

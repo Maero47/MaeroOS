@@ -1,5 +1,6 @@
 #include "heap.h"
 #include "vmm.h"
+#include "pmm.h"
 #include "../kernel/printk.h"
 #include "../arch/i686/mm/paging.h"
 #include <kernel/config.h>
@@ -94,35 +95,77 @@ void heap_init(void) {
            (unsigned)heap_head->size);
 }
 
-static void *kmalloc_nolock(size_t size) {
-    if (!size) return NULL;
-    size = ALIGN8(size);
+static void *kmalloc_nolock(size_t size);
 
-    /* First-fit scan */
-    block_header_t *b = heap_head;
-    while (b) {
+/* First-fit scan that allocates nothing, so a caller can ask whether a request
+ * can be met out of what is already mapped. */
+static block_header_t *first_fit(size_t size) {
+    for (block_header_t *b = heap_head; b; b = b->next) {
         if (b->magic != HEAP_MAGIC) {
             printk("[HEAP] PANIC: corrupt block at 0x%08x\n", (unsigned)(uintptr_t)b);
             panic("heap corruption", NULL);
         }
-        if (b->is_free && b->size >= size) {
-            /* Split if the remainder is large enough to hold a new header + data */
-            if (b->size >= size + MIN_SPLIT) {
-                block_header_t *nb = (block_header_t *)((uint8_t *)b
-                                      + sizeof(block_header_t) + size);
-                nb->magic   = HEAP_MAGIC;
-                nb->size    = b->size - size - sizeof(block_header_t);
-                nb->is_free = 1;
-                nb->next    = b->next;
-                nb->prev    = b;
-                if (nb->next) nb->next->prev = nb;
-                b->next = nb;
-                b->size = size;
-            }
-            b->is_free = 0;
-            return (void *)((uint8_t *)b + sizeof(block_header_t));
+        if (b->is_free && b->size >= size) return b;
+    }
+    return NULL;
+}
+
+size_t heap_headroom(void) {
+    uint32_t irq = heap_irq_save();
+    size_t r = (size_t)(HEAP_MAX - (unsigned long)heap_end);
+    heap_irq_restore(irq);
+    return r;
+}
+
+/* Pages heap_expand() would map to satisfy `size` (which must be ALIGN8'd). */
+static size_t expand_pages_for(size_t size) {
+    size_t needed = size + sizeof(block_header_t);
+    size_t pages  = (needed + PAGE_SIZE - 1) / PAGE_SIZE;
+    return pages < 1 ? 1 : pages;
+}
+
+void *kmalloc_try(size_t size) {
+    if (!size) return NULL;
+    uint32_t irq = heap_irq_save();
+    size_t asz = ALIGN8(size);
+    void *r = NULL;
+
+    if (first_fit(asz)) {
+        r = kmalloc_nolock(asz);            /* fits already: cannot expand */
+    } else {
+        /* Growing is the only way.  Refuse unless BOTH the heap window and
+         * physical memory can supply the pages, because reaching either of
+         * their exhaustion paths halts the machine. */
+        size_t pages = expand_pages_for(asz);
+        if (pages <= (size_t)((HEAP_MAX - (unsigned long)heap_end) / PAGE_SIZE) &&
+            pages <= (size_t)pmm_free_frames())
+            r = kmalloc_nolock(asz);
+    }
+    heap_irq_restore(irq);
+    return r;
+}
+
+static void *kmalloc_nolock(size_t size) {
+    if (!size) return NULL;
+    size = ALIGN8(size);
+
+    block_header_t *b = first_fit(size);
+    if (b) {
+        /* Split if the remainder is large enough to hold a new header + data */
+        if (b->size >= size + MIN_SPLIT) {
+            block_header_t *nb = (block_header_t *)((uint8_t *)b
+                                  + sizeof(block_header_t) + size);
+            nb->magic   = HEAP_MAGIC;
+            nb->size    = b->size - size - sizeof(block_header_t);
+            nb->is_free = 1;
+            nb->next    = b->next;
+            nb->prev    = b;
+            if (nb->next) nb->next->prev = nb;
+            b->next = nb;
+            b->size = size;
         }
-        b = b->next;
+        b->is_free = 0;
+        return (void *)((uint8_t *)b + sizeof(block_header_t));
     }
 
     /* No fitting block — expand heap */

@@ -1,6 +1,7 @@
 #include "tsc.h"
 #include "pit.h"
 #include "../../../kernel/printk.h"
+#include <io.h>
 
 /*
  * TSC-interpolated tick clock.
@@ -54,6 +55,10 @@ static uint32_t udiv64_32(uint64_t n, uint32_t d);
 static uint64_t g_cal_tsc0;                 /* TSC at the first accepted sample */
 static uint32_t g_cal_ticks;                /* ticks elapsed since g_cal_tsc0   */
 
+/* Non-zero once the PIT channel-2 calibration below has produced a rate; the
+ * passive tick-interval path is then not used at all. */
+static int g_hw_calibrated;
+
 static void tsc_set_rate(uint32_t cycles_per_tick, const char *how) {
     /* mult = TICK_NS * 2^SHIFT / cycles_per_tick.  For any TSC rate between
      * ~10 MHz and ~40 GHz this stays inside 32 bits. */
@@ -62,6 +67,49 @@ static void tsc_set_rate(uint32_t cycles_per_tick, const char *how) {
     g_ns_mult = udiv64_32(num, cycles_per_tick);
     printk("[TSC] %u cycles per 10 ms tick (%u MHz, %s)\n",
            (unsigned)cycles_per_tick, (unsigned)(cycles_per_tick / 10000U), how);
+}
+
+/*
+ * Adopt a refined rate, but only if it is credible.
+ *
+ * The passive path measures cycles-per-tick as (TSC span) / (ticks delivered),
+ * which is only the rate if the ticks delivered account for the wall time the
+ * span covers.  Early in boot they do not: the guest runs long stretches with
+ * interrupts disabled (a PIO disk transfer holds IF=0 for the whole transfer),
+ * the PIC collapses every tick missed during one such stretch into a single
+ * pending interrupt, and QEMU repays the backlog afterwards at faster than
+ * 100 Hz.  Measured on this host, the first 100 ticks covered 2.17 SECONDS of
+ * wall time -- one interval alone exceeded 2^32 cycles, a single interrupt
+ * standing in for about 113 ticks -- so the one-second refinement reported
+ * 8.3 GHz on a 3.8 GHz machine, and the ten-second one was right only because
+ * the catch-up had repaid the deficit by then.
+ *
+ * A real TSC rate does not change: it is invariant on any CPU this kernel will
+ * meet, and under a hypervisor the guest's TSC follows the host's.  So the only
+ * legitimate movement is the bias in the estimate being replaced, and a
+ * refinement beyond that is evidence the window did not measure the wall time
+ * it claims -- not that the machine changed speed.
+ *
+ * The band is +-50 %, chosen from both requirements rather than picked round.
+ * It must REJECT the coalescing error, measured at 2.26x.  It must ADMIT the
+ * real correction, which is bounded by how wrong the initial estimate can be:
+ * that estimate is a MINIMUM over consecutive tick intervals, so it can only be
+ * biased low, by a short catch-up interval, never high, and the worst bias
+ * observed over these boots is 1.24x (3075 MHz against a true 3818).  Any bound
+ * between 1.24x and 2.26x works; 1.5x leaves 21 % of headroom above the largest
+ * correction that has to get through and rejects the error it has to stop by a
+ * margin of 51 %.  +-25 % was tried first and left less than one per cent of
+ * headroom on the admit side -- it would have worked on these boots by luck.
+ */
+static void tsc_refine(uint32_t avg, const char *how) {
+    if (avg < 1000) return;
+    uint32_t cur = g_cycles_per_tick;
+    if (avg > cur + cur / 2U || avg < cur / 2U) {
+        printk("[TSC] %s rejected: %u MHz against %u MHz (outside +-50%%)\n",
+               how, (unsigned)(avg / 10000U), (unsigned)(cur / 10000U));
+        return;
+    }
+    tsc_set_rate(avg, how);
 }
 
 /* 64 / 32 -> 32 unsigned division by shift-subtract (calibration only). */
@@ -78,7 +126,10 @@ static uint32_t udiv64_32(uint64_t n, uint32_t d) {
 void tsc_tick_sample(void) {
     uint64_t now = rdtsc64();
 
-    if (!g_calibrated) {
+    if (g_hw_calibrated) {
+        /* The rate came from a busy-wait against PIT channel 2 and is not
+         * subject to anything the tick interrupt does.  Nothing to measure. */
+    } else if (!g_calibrated) {
         if (g_prev_tsc) {
             uint64_t d = now - g_prev_tsc;
             /* Reject absurd samples (first tick after a long IF=0 stretch). */
@@ -106,7 +157,7 @@ void tsc_tick_sample(void) {
         if (g_cal_ticks == 100 || g_cal_ticks == 1000) {
             uint64_t span = now - g_cal_tsc0;
             uint32_t avg = udiv64_32(span, g_cal_ticks);
-            if (avg >= 1000) tsc_set_rate(avg, g_cal_ticks == 100 ? "1 s average" : "10 s average");
+            tsc_refine(avg, g_cal_ticks == 100 ? "1 s average" : "10 s average");
         }
     }
 
@@ -119,6 +170,62 @@ void tsc_tick_sample(void) {
     g_tick_snap   = pit_ticks() + 1;
     __asm__ volatile("" ::: "memory");
     g_seq++;
+}
+
+/*
+ * Calibrate the TSC against PIT channel 2, the way a PC has always done it
+ * (Linux: pit_calibrate_tsc).
+ *
+ * Channel 2 is the one channel whose gate is software-controlled and whose
+ * output is readable, both through port 0x61, so the whole measurement is a
+ * busy-wait with no interrupt anywhere in it.  That is the entire point: the
+ * tick interrupt can be coalesced and its count is therefore not a measure of
+ * wall time, while a counter the CPU polls directly cannot lose anything.
+ *
+ * Returns cycles per TICK_NS, or 0 if the channel does not behave (no hang: the
+ * poll is bounded, and the caller falls back to the passive path).
+ * Must be called with interrupts disabled, before the tick starts.
+ */
+#define PIT_FREQ_HZ 1193182U
+
+static uint32_t tsc_calibrate_ch2(void) {
+    /* One tick's worth of PIT counts: 11932 / 1193182 Hz = 10.0001 ms, 15 ppm
+     * long, which is far below the accuracy anything here needs. */
+    const uint32_t latch = PIT_FREQ_HZ / TICK_HZ;
+    uint8_t saved = inb(0x61);
+
+    /* Gate channel 2 on (bit 0), speaker data off (bit 1) so nothing sounds. */
+    outb(0x61, (uint8_t)((saved & ~0x02U) | 0x01U));
+    outb(0x43, 0xB0);                       /* ch2, lo/hi, mode 0, binary */
+    outb(0x42, (uint8_t)(latch & 0xFF));
+    outb(0x42, (uint8_t)(latch >> 8));
+
+    uint64_t t0 = rdtsc64();
+    /* Mode 0 drives OUT high when the count reaches zero; 0x61 bit 5 is it. */
+    uint32_t guard = 0;
+    while (!(inb(0x61) & 0x20)) {
+        if (++guard > 20000000U) {          /* channel dead: give up, no hang */
+            outb(0x61, saved);
+            return 0;
+        }
+    }
+    uint64_t d = rdtsc64() - t0;
+    outb(0x61, saved);
+
+    /* Anything outside 10 MHz .. 100 GHz is not a TSC rate we can use. */
+    if (d < (uint64_t)TICK_HZ * 100000ULL || d > 1000000000ULL) return 0;
+    return (uint32_t)d;
+}
+
+void tsc_init(void) {
+    uint32_t cpt = tsc_calibrate_ch2();
+    if (!cpt) {
+        printk("[TSC] PIT channel 2 unusable; falling back to tick intervals\n");
+        return;
+    }
+    tsc_set_rate(cpt, "PIT ch2");
+    g_hw_calibrated = 1;
+    g_calibrated = 1;
 }
 
 int clock_tsc_calibrated(void) { return g_calibrated; }
