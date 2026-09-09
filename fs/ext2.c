@@ -638,6 +638,24 @@ static int ext2_free_block(uint32_t blk) {
     return 0;
 }
 
+/* Live free-space numbers for statfs().  The superblock counters are updated by
+ * ext2_alloc_block/ext2_free_block (via ext2_update_super_free_counts), so what
+ * df reports is what dumpe2fs reports. */
+int ext2_statfs(uint32_t *block_size, uint32_t *blocks, uint32_t *bfree,
+                uint32_t *inodes, uint32_t *ifree) {
+    if (!g_mounted) return -1;
+    uint8_t sb_buf[2048];
+    if (ata_read(g_state.lba_offset + 2, 4, sb_buf) < 0) return -1;
+    ext2_sb_t *sb = (ext2_sb_t *)sb_buf;
+    if (sb->s_magic != 0xEF53) return -1;
+    if (block_size) *block_size = g_state.block_size;
+    if (blocks)     *blocks     = sb->s_blocks_count;
+    if (bfree)      *bfree      = sb->s_free_blocks_count;
+    if (inodes)     *inodes     = sb->s_inodes_count;
+    if (ifree)      *ifree      = sb->s_free_inodes_count;
+    return 0;
+}
+
 /* ── Resolve an indirect block pointer ───────────────────────────────────── */
 
 /* Reentrant cache of recently-read indirect blocks, one slot per level
@@ -928,59 +946,6 @@ static uint32_t ext2_file_blk_alloc(ext2_inode_t *ino, uint32_t idx) {
     uint32_t blk = ind[idx];
     kfree(ind);
     return blk;
-}
-
-static int ext2_file_blk_free(ext2_inode_t *ino, uint32_t idx) {
-    uint32_t ptrs_per_blk = g_state.block_size / 4;
-
-    if (idx < 12) {
-        if (ino->i_block[idx]) {
-            ext2_free_block(ino->i_block[idx]);
-            ino->i_block[idx] = 0;
-            if (ino->i_blocks >= g_state.sectors_per_block)
-                ino->i_blocks -= g_state.sectors_per_block;
-        }
-        return 0;
-    }
-
-    idx -= 12;
-    if (idx >= ptrs_per_blk || !ino->i_block[12])
-        return 0;
-
-    uint32_t *ind = (uint32_t *)kmalloc(g_state.block_size);
-    if (!ind) return -1;
-    if (ext2_read_block(ino->i_block[12], ind) < 0) {
-        kfree(ind);
-        return -1;
-    }
-
-    if (ind[idx]) {
-        ext2_free_block(ind[idx]);
-        ind[idx] = 0;
-        if (ino->i_blocks >= g_state.sectors_per_block)
-            ino->i_blocks -= g_state.sectors_per_block;
-    }
-
-    int any = 0;
-    for (uint32_t i = 0; i < ptrs_per_blk; i++) {
-        if (ind[i]) {
-            any = 1;
-            break;
-        }
-    }
-
-    if (any) {
-        int r = ext2_write_block(ino->i_block[12], ind);
-        kfree(ind);
-        return r;
-    }
-
-    kfree(ind);
-    ext2_free_block(ino->i_block[12]);
-    ino->i_block[12] = 0;
-    if (ino->i_blocks >= g_state.sectors_per_block)
-        ino->i_blocks -= g_state.sectors_per_block;
-    return 0;
 }
 
 /* ── VFS read_fn for ext2 file nodes ─────────────────────────────────────── */
@@ -1319,29 +1284,184 @@ static int ext2_init_dir_block(uint32_t blk, uint32_t self_ino,
     return r;
 }
 
-static void ext2_free_inode_blocks(ext2_inode_t *inode) {
+/*
+ * Free the blocks of one indirect subtree that lie at or after file-block index
+ * `from`, and the indirect blocks that become empty as a result.
+ *
+ *   blk    the indirect block being walked
+ *   level  how many pointer levels it holds: 1 = pointers to data blocks,
+ *          2 = pointers to singly-indirect blocks, 3 = to doubly-indirect
+ *   base   the file-block index that its first entry maps
+ *   bufs   one scratch block per level, so a recursive call cannot clobber its
+ *          caller's table.  Allocated once by ext2_free_blocks_from().
+ *
+ * Returns 1 if the subtree ended up completely empty, in which case `blk`
+ * itself has been freed and the caller must clear its pointer.
+ */
+static int ext2_free_subtree(uint32_t blk, int level, uint32_t base,
+                             uint32_t from, uint32_t **bufs, uint32_t *freed) {
+    uint32_t n = g_state.block_size / 4;
+    uint32_t span = 1;                       /* file blocks one entry covers */
+    for (int l = 1; l < level; l++) span *= n;
+
+    uint32_t *tbl = bufs[level - 1];
+    if (!tbl || ext2_read_block(blk, tbl) < 0)
+        return 0;                            /* cannot read it: leave it alone */
+
+    int dirty = 0, any = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!tbl[i]) continue;
+        uint32_t idx = base + i * span;
+        if (idx + span <= from) { any = 1; continue; }   /* wholly kept */
+        if (level > 1) {
+            if (ext2_free_subtree(tbl[i], level - 1, idx, from, bufs, freed)) {
+                tbl[i] = 0;
+                dirty = 1;
+            } else {
+                any = 1;                     /* partially kept */
+            }
+        } else {
+            ext2_free_block(tbl[i]);         /* span is 1, so idx >= from */
+            (*freed)++;
+            tbl[i] = 0;
+            dirty = 1;
+        }
+    }
+
+    if (!any) {                              /* nothing left: drop the table */
+        ext2_free_block(blk);
+        (*freed)++;
+        return 1;
+    }
+    if (dirty) ext2_write_block(blk, tbl);
+    return 0;
+}
+
+/*
+ * Release every block of `inode` from file-block index `from` onward, including
+ * the indirect blocks that stop being needed.  from == 0 empties the file.
+ *
+ * The driver reads all three indirect levels (ext2_file_blk) and allocates two
+ * of them (ext2_file_blk_alloc stops at doubly indirect, ~256 MiB with 1 KiB
+ * blocks), but the free path used to stop after the singly-indirect chain.
+ * Everything a file held beyond ~268 KiB was therefore lost on unlink: the
+ * bitmap bits stayed set with nothing referencing them, so the space could
+ * never be reused and only fsck could recover it.  Walk all three levels, so
+ * that guest-written files (doubly) and host-written ones such as libxul on the
+ * Firefox image (triply) are both released completely.
+ */
+static void ext2_free_blocks_from(ext2_inode_t *inode, uint32_t from) {
     if (!inode) return;
+    uint32_t n = g_state.block_size / 4;
+    uint32_t freed = 0;
+    uint32_t *bufs[3];
+    for (int i = 0; i < 3; i++) bufs[i] = (uint32_t *)kmalloc(g_state.block_size);
+
     for (uint32_t i = 0; i < 12; i++) {
-        if (inode->i_block[i]) {
+        if (i >= from && inode->i_block[i]) {
             ext2_free_block(inode->i_block[i]);
+            freed++;
             inode->i_block[i] = 0;
         }
     }
 
-    if (inode->i_block[12]) {
-        uint32_t *ind = (uint32_t *)kmalloc(g_state.block_size);
-        if (ind && ext2_read_block(inode->i_block[12], ind) == 0) {
-            uint32_t ptrs_per_blk = g_state.block_size / 4;
-            for (uint32_t i = 0; i < ptrs_per_blk; i++) {
-                if (ind[i])
-                    ext2_free_block(ind[i]);
-            }
+    uint32_t base = 12, span = 1;
+    for (int lvl = 1; lvl <= 3; lvl++) {
+        span *= n;                           /* file blocks this tree covers */
+        uint32_t slot = 11 + (uint32_t)lvl;  /* i_block[12], [13], [14] */
+        if (inode->i_block[slot] && base + span > from) {
+            if (ext2_free_subtree(inode->i_block[slot], lvl, base, from,
+                                  bufs, &freed))
+                inode->i_block[slot] = 0;
         }
-        if (ind) kfree(ind);
-        ext2_free_block(inode->i_block[12]);
-        inode->i_block[12] = 0;
+        base += span;
     }
-    inode->i_blocks = 0;
+
+    for (int i = 0; i < 3; i++) if (bufs[i]) kfree(bufs[i]);
+
+    /* i_blocks counts 512-byte sectors, data and indirect blocks alike. */
+    uint32_t sectors = freed * g_state.sectors_per_block;
+    inode->i_blocks = (inode->i_blocks > sectors) ? inode->i_blocks - sectors : 0;
+    if (from == 0) inode->i_blocks = 0;
+}
+
+static void ext2_free_inode_blocks(ext2_inode_t *inode) {
+    ext2_free_blocks_from(inode, 0);
+}
+
+/* ── Open-inode table (deferred release, Unix unlink-while-open) ───────────
+ *
+ * POSIX: unlink() removes the NAME.  The inode and its blocks live until the
+ * last descriptor and the last mapping referring to them are gone.  tmpfs was
+ * fixed for this; ext2 was not - ext2_unlink() freed the blocks and the inode
+ * immediately, so a process still holding the file read an inode marked free
+ * whose blocks the allocator was free to hand to somebody else.  That is worse
+ * than a leak: it is cross-file corruption, and "write a temp file, unlink it,
+ * keep using the fd" is an ordinary thing for a program to do.
+ *
+ * ext2 builds a FRESH vfs_node_t on every lookup, so node identity cannot carry
+ * the count the way tmpfs's does.  Key it on the inode number instead: every
+ * long-lived holder of any node for that inode counts once, through the
+ * retain_fn/close_fn that vfs_retain()/vfs_close() already drive for open
+ * descriptors, inherited fd tables, file-backed VMAs and the shared-mapping
+ * registry.
+ *
+ * An orphan whose last reference is dropped by a reboot rather than a close
+ * still leaks, exactly as it would on any filesystem without an on-disk orphan
+ * list; recovering that needs fsck.  Table exhaustion degrades to the old
+ * behaviour (immediate release) rather than to a dangling inode. */
+#define EXT2_OPEN_MAX 128
+typedef struct {
+    uint32_t ino;        /* 0 = free slot */
+    int      refs;
+    int      orphan;     /* name is gone; release when refs reaches 0 */
+} ext2_open_t;
+
+static ext2_open_t g_open[EXT2_OPEN_MAX];
+
+static ext2_open_t *ext2_open_find(uint32_t ino) {
+    for (int i = 0; i < EXT2_OPEN_MAX; i++)
+        if (g_open[i].ino == ino) return &g_open[i];
+    return (ext2_open_t *)0;
+}
+
+/* Drop an orphaned inode for good: its blocks, then the inode itself. */
+static void ext2_release_orphan(uint32_t ino) {
+    ext2_inode_t victim;
+    if (ext2_read_inode(ino, &victim) == 0) {
+        ext2_free_inode_blocks(&victim);
+        victim.i_size = 0;
+        victim.i_dtime = ext2_now();
+        ext2_write_inode(ino, &victim);
+    }
+    ext2_free_inode(ino);
+}
+
+static void ext2_retain_node(vfs_node_t *node) {
+    if (!node || !node->private) return;
+    uint32_t ino = ((ext2_priv_t *)node->private)->ino;
+    preempt_disable();
+    ext2_open_t *e = ext2_open_find(ino);
+    if (!e) {
+        e = ext2_open_find(0);
+        if (e) { e->ino = ino; e->refs = 0; e->orphan = 0; }
+    }
+    if (e) e->refs++;
+    preempt_enable();
+}
+
+static void ext2_close_node(vfs_node_t *node) {
+    if (!node || !node->private) return;
+    uint32_t ino = ((ext2_priv_t *)node->private)->ino;
+    int release = 0;
+    preempt_disable();
+    ext2_open_t *e = ext2_open_find(ino);
+    if (e && --e->refs <= 0) {
+        release = e->orphan;
+        e->ino = 0; e->refs = 0; e->orphan = 0;
+    }
+    preempt_enable();
+    if (release) ext2_release_orphan(ino);
 }
 
 /* ── Helper: build a vfs_node_t from an ext2 directory entry ─────────────── */
@@ -1389,6 +1509,10 @@ static vfs_node_t *ext2_make_node(uint32_t ino_num, const char *name,
         node->read_fn  = ext2_read_node;
         node->write_fn = ext2_write_node;
         node->truncate_fn = ext2_truncate;
+        /* Reference tracking so unlink can defer the release; see the
+         * open-inode table above. */
+        node->retain_fn = ext2_retain_node;
+        node->close_fn  = ext2_close_node;
     }
 
     node->setattr_fn = ext2_setattr;
@@ -1492,13 +1616,37 @@ static int ext2_unlink(vfs_node_t *dir, const char *name) {
     if (ext2_remove_dirent(&dir_inode, name, NULL) < 0) return -1;
 
     uint32_t now = ext2_now();
-    ext2_free_inode_blocks(&victim);
-    victim.i_dtime = now;
-    victim.i_links_count = 0;
-    victim.i_size = 0;
+
+    /* Drop one link.  The inode only dies when the last name for it is gone -
+     * and even then not while a descriptor or a mapping still holds it, which
+     * is what the open-inode table records.  (link() is not implemented today,
+     * so i_links_count is 1 for a regular file and 2 for a directory, but doing
+     * this by the count rather than by assumption keeps unlink correct if hard
+     * links ever arrive.) */
+    if (victim.i_links_count > 0) victim.i_links_count--;
     victim.i_ctime = now;
-    ext2_write_inode(victim_ino, &victim);
-    ext2_free_inode(victim_ino);
+
+    if (victim.i_links_count > 0) {          /* another name still refers to it */
+        ext2_write_inode(victim_ino, &victim);
+    } else {
+        preempt_disable();
+        ext2_open_t *e = ext2_open_find(victim_ino);
+        int in_use = (e && e->refs > 0);
+        if (in_use) e->orphan = 1;
+        preempt_enable();
+
+        if (in_use) {
+            /* Name gone, data still reachable through the open descriptors.
+             * ext2_close_node() releases it when the last one closes. */
+            ext2_write_inode(victim_ino, &victim);
+        } else {
+            ext2_free_inode_blocks(&victim);
+            victim.i_dtime = now;
+            victim.i_size = 0;
+            ext2_write_inode(victim_ino, &victim);
+            ext2_free_inode(victim_ino);
+        }
+    }
 
     dir_inode.i_mtime = now;
     dir_inode.i_ctime = now;
@@ -1534,23 +1682,28 @@ static int ext2_truncate(vfs_node_t *node, uint32_t new_size) {
                           g_state.block_size;
     uint32_t new_blocks = (new_size + g_state.block_size - 1) /
                           g_state.block_size;
-    uint32_t max_blocks = 12 + (g_state.block_size / 4);
-    if (new_blocks > max_blocks) return -1;
+    /* The limit belongs to GROWING only, and it is what ext2_file_blk_alloc can
+     * actually reach (direct + singly + doubly indirect).  Applying it to every
+     * call also refused to SHRINK a file bigger than that - ftruncate() on a
+     * multi-megabyte file returned -1 instead of releasing the tail. */
+    uint32_t ppb = g_state.block_size / 4;
+    uint32_t max_blocks = 12 + ppb + ppb * ppb;
+    if (new_blocks > old_blocks && new_blocks > max_blocks) return -1;
 
     if (new_blocks > old_blocks) {
         uint32_t i;
         for (i = old_blocks; i < new_blocks; i++) {
             if (!ext2_file_blk_alloc(&inode, i)) {
-                while (i > old_blocks) {
-                    i--;
-                    ext2_file_blk_free(&inode, i);
-                }
+                ext2_free_blocks_from(&inode, old_blocks);   /* undo this call */
                 return -1;
             }
         }
     } else if (new_blocks < old_blocks) {
-        for (uint32_t i = old_blocks; i > new_blocks; i--)
-            ext2_file_blk_free(&inode, i - 1);
+        /* Free the tail, including any indirect blocks it leaves empty.  This
+         * used to go through a per-index helper that silently did nothing
+         * beyond the singly-indirect range, so shrinking a large file leaked
+         * exactly like unlink did. */
+        ext2_free_blocks_from(&inode, new_blocks);
     }
     inode.i_size = new_size;
     inode.i_mtime = ext2_now();

@@ -25,6 +25,7 @@
 #include "../kernel/printk.h"
 #include "../fs/vfs.h"
 #include "../fs/devfs.h"
+#include "../fs/ext2.h"
 #include "../net/socket.h"
 #include <registers.h>
 #include <kernel/config.h>
@@ -5562,8 +5563,11 @@ static int sys_clock_getres_time64(registers_t *regs) {
 }
 
 /* ── sys_statfs64(path, sz, buf) / fstatfs64(fd, sz, buf) — EAX=268/269 ──────
- * Firefox checks free space / fs type for its profile + cache.  Report a
- * generic, roomy ext2-like filesystem. */
+ * Firefox checks free space / fs type for its profile + cache.  Report the real
+ * numbers when an ext2 filesystem is mounted, so df agrees with dumpe2fs and a
+ * program can actually observe space being consumed and released; fall back to
+ * the old roomy constants when nothing is mounted (initrd-only boots, where
+ * there is no block accounting to report). */
 static int sys_statfs64_fill(void *ubuf, uint32_t bufsz) {
     /* struct statfs64 (i386): f_type, f_bsize, f_blocks, f_bfree, f_bavail,
      * f_files, f_ffree, f_fsid[2], f_namelen, f_frsize, f_flags, f_spare[4].
@@ -5576,14 +5580,25 @@ static int sys_statfs64_fill(void *ubuf, uint32_t bufsz) {
     } s;
     __builtin_memset(&s, 0, sizeof(s));
     s.f_type    = 0xEF53;              /* EXT2_SUPER_MAGIC */
-    s.f_bsize   = 4096;
-    s.f_blocks  = 256 * 1024;         /* ~1 GiB */
-    s.f_bfree   = 192 * 1024;
-    s.f_bavail  = 192 * 1024;
-    s.f_files   = 65536;
-    s.f_ffree   = 60000;
+    uint32_t bs, blocks, bfree, inodes, ifree;
+    if (ext2_statfs(&bs, &blocks, &bfree, &inodes, &ifree) == 0) {
+        s.f_bsize  = bs;
+        s.f_frsize = bs;
+        s.f_blocks = blocks;
+        s.f_bfree  = bfree;
+        s.f_bavail = bfree;
+        s.f_files  = inodes;
+        s.f_ffree  = ifree;
+    } else {
+        s.f_bsize  = 4096;
+        s.f_frsize = 4096;
+        s.f_blocks = 256 * 1024;      /* ~1 GiB */
+        s.f_bfree  = 192 * 1024;
+        s.f_bavail = 192 * 1024;
+        s.f_files  = 65536;
+        s.f_ffree  = 60000;
+    }
     s.f_namelen = 255;
-    s.f_frsize  = 4096;
     if (!access_ok(ubuf, bufsz)) return -14;
     uint32_t n = bufsz < sizeof(s) ? bufsz : sizeof(s);
     if (copy_to_user(ubuf, &s, n) < 0) return -14;

@@ -48,15 +48,15 @@ def main():
     ap.add_argument("--passes", type=int, default=12, help="reader passes")
     ap.add_argument("--mem", default="128M")
     ap.add_argument("--timeout", type=int, default=900)
-    ap.add_argument("--keep-disk", action="store_true",
-                    help="reuse disk.img instead of rebuilding it first "
-                         "(each run creates and deletes a large file, so a "
-                         "fresh image keeps iterations independent)")
+    ap.add_argument("--fresh-disk", action="store_true",
+                    help="rebuild disk.img before running.  Not needed: the run "
+                         "creates and deletes a large file and gives the space "
+                         "back, so repeated runs are independent on one image")
     args = ap.parse_args()
 
     os.chdir(ROOT)
-    if not args.keep_disk:
-        print("race_probe: rebuilding disk.img for a hermetic run")
+    if args.fresh_disk:
+        print("race_probe: rebuilding disk.img")
         if subprocess.call(["make", "disk"], stdout=subprocess.DEVNULL,
                            stderr=subprocess.STDOUT) != 0:
             print("race_probe: ERROR make disk failed")
