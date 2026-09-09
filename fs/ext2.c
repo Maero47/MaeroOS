@@ -138,19 +138,42 @@ static int g_mounted = 0;
 
 #define EXT2_CACHE_WAYS     4
 
-/* Share of free physical memory the cache may hold, a floor so that a tiny
- * machine still gets a useful one, and a ceiling.
+/* The cache is bounded by three separate things, and it has to consult all of
+ * them because they run out independently.
  *
- * The ceiling is what the working set asks for, not a guess: a Firefox startup
- * fetches ~216 000 blocks off the platter but only ~93 000 DISTINCT ones (the
- * disk_blk/distinct counters in kprof), so 57 % of the disk traffic was blocks
- * the kernel had already read and evicted.  128 MiB holds all of them with room
- * to spare and still leaves the 2 GiB machine 94 % of its memory.  Anything
- * larger buys nothing on this workload; the share keeps a small machine honest
- * (a 128 MiB guest still lands on 8 MiB, exactly as before). */
-#define EXT2_CACHE_MEM_SHARE  8                 /* one eighth of free RAM */
+ * PHYSICAL MEMORY: a share of what is free at mount.  The cache is never handed
+ * back, so this is what keeps a small machine honest -- and it is what governs
+ * there: a 128 MiB guest lands on 8 MiB of buffers and a 512 MiB one on 32 MiB.
+ *
+ * HEAP ADDRESS SPACE: whatever is left after reserving a fixed margin for
+ * everything else.  The kernel heap is a fixed 256 MiB span
+ * (HEAP_START..HEAP_MAX in kernel/config.h) that every other kernel allocation
+ * also comes out of and that nothing ever releases, so it -- not physical
+ * memory -- is the resource that binds on the 2 GiB machine, and sizing against
+ * free RAM alone never looked at it.
+ *
+ * The margin is absolute rather than a share, because what matters to the rest
+ * of the kernel is how many bytes it can still get, not what fraction of the
+ * window some other subsystem took.  Measured (the kprof heap line): everything
+ * in the kernel other than this cache uses 5.5 MiB of heap to Firefox's first
+ * paint, and the heap only grows, so that is a peak and not an average.  The
+ * margin is 64 MiB, an order of magnitude above the measured demand.
+ *
+ * A CEILING: what the workload is worth.  Measured at six sizes with
+ * `make smoke-firefox` (docs/perf/firefox-startup.md): 4, 8 and 16 MiB of
+ * buffers are indistinguishable from each other at 41.3 s, 32 MiB gives 40.8 s,
+ * 64 MiB 38.0 s and 128 MiB 35.4 s.  There is no knee below 128 MiB -- a
+ * startup touches ~92 700 distinct 1 KiB blocks and cycles over them, so a
+ * cache that holds part of the working set holds almost none of the value.
+ * 128 MiB is where it fits: 94 370 blocks fetched against 92 640 distinct, so
+ * 98 % of the fetches are first-time reads and there is nothing left to win.
+ * A budget of 160 MiB is what yields exactly those 32768 sets (128 MiB of
+ * buffers plus 2 MiB of slot descriptors); the next power of two would need
+ * 273 MiB and buy nothing. */
+#define EXT2_CACHE_MEM_SHARE  8                      /* one eighth of free RAM */
+#define EXT2_CACHE_HEAP_KEEP  (64u * 1024u * 1024u)  /* heap left for the rest */
 #define EXT2_CACHE_MIN_SETS   8
-#define EXT2_CACHE_MAX_BYTES  (128u * 1024u * 1024u)
+#define EXT2_CACHE_MAX_BYTES  (160u * 1024u * 1024u)
 
 static uint8_t  *g_cache_slab;                  /* one allocation for all buffers */
 static uint32_t  g_cache_setmask;               /* sets in use, minus one       */
@@ -312,30 +335,46 @@ static void ext2_cache_init(void) {
     if (g_cache) { kfree(g_cache); g_cache = (ext2_cache_entry_t *)0; }
     g_cache_slots = 0;
 
-    /* How many sets can we afford?  A share of free memory, capped by
-     * EXT2_CACHE_MAX_BYTES, floored so a small machine still caches something.
-     * Sets are a power of two so the bucket index is a mask. */
+    /* The budget is the smallest of the three bounds above.  Sets are a power
+     * of two so the bucket index stays a mask, and a set costs its buffers AND
+     * its slot descriptors -- both come out of the same heap. */
     /* Frames * (PAGE_SIZE / SHARE) rather than (frames * PAGE_SIZE) / SHARE:
      * the kernel links no libgcc 64-bit division helpers, and the share divides
      * the page size exactly. */
-    uint32_t share = pmm_free_frames() * (PAGE_SIZE / EXT2_CACHE_MEM_SHARE);
-    if (share > EXT2_CACHE_MAX_BYTES) share = EXT2_CACHE_MAX_BYTES;
-    uint32_t want  = share / (g_state.block_size * EXT2_CACHE_WAYS);
-    uint32_t sets  = EXT2_CACHE_MIN_SETS;
+    uint32_t budget = pmm_free_frames() * (PAGE_SIZE / EXT2_CACHE_MEM_SHARE);
+    size_t   room   = heap_headroom();
+    uint32_t heap   = room > EXT2_CACHE_HEAP_KEEP
+                      ? (uint32_t)(room - EXT2_CACHE_HEAP_KEEP) : 0u;
+    if (budget > heap)                 budget = heap;
+    if (budget > EXT2_CACHE_MAX_BYTES) budget = EXT2_CACHE_MAX_BYTES;
+
+    uint32_t per_set = EXT2_CACHE_WAYS *
+                       (g_state.block_size + (uint32_t)sizeof(ext2_cache_entry_t));
+    uint32_t want    = budget / per_set;
+    uint32_t sets    = EXT2_CACHE_MIN_SETS;
     while (sets * 2u <= want) sets *= 2u;
 
     /* One slab for every buffer, one array for every slot.  If they will not
      * fit, halve and retry rather than fall back to per-slot allocations, which
-     * would flood the heap's free list (see the note above). */
+     * would flood the heap's free list (see the note above).
+     *
+     * kmalloc_try, not kmalloc: plain kmalloc cannot fail for a request this
+     * size -- it grows the heap, and running out of heap address space or of
+     * physical frames halts the machine instead of returning NULL.  This loop
+     * used to be written against kmalloc and was therefore unreachable: it read
+     * as a safety valve while the only two outcomes were success and a wedged
+     * kernel. */
     while (sets >= EXT2_CACHE_MIN_SETS) {
         uint32_t slots = sets * EXT2_CACHE_WAYS;
-        g_cache = (ext2_cache_entry_t *)kmalloc(slots * sizeof(*g_cache));
+        g_cache = (ext2_cache_entry_t *)kmalloc_try(slots * sizeof(*g_cache));
         if (g_cache) {
-            g_cache_slab = (uint8_t *)kmalloc(slots * g_state.block_size);
+            g_cache_slab = (uint8_t *)kmalloc_try(slots * g_state.block_size);
             if (g_cache_slab) { g_cache_slots = slots; break; }
             kfree(g_cache);
             g_cache = (ext2_cache_entry_t *)0;
         }
+        printk("[EXT2] block cache: %u sets did not fit, halving\n",
+               (unsigned)sets);
         sets /= 2u;
     }
     if (!g_cache_slab) {
@@ -351,10 +390,14 @@ static void ext2_cache_init(void) {
         g_cache[i].valid = 0;
         g_cache[i].data = g_cache_slab + (size_t)i * g_state.block_size;
     }
-    printk("[EXT2] block cache %u KiB (%u sets x %u ways of %u B)\n",
+    printk("[EXT2] block cache %u KiB (%u sets x %u ways of %u B) + %u KiB slots"
+           "; budget %u KiB, heap headroom now %u KiB\n",
            (unsigned)(sets * EXT2_CACHE_WAYS * g_state.block_size / 1024u),
            (unsigned)sets, (unsigned)EXT2_CACHE_WAYS,
-           (unsigned)g_state.block_size);
+           (unsigned)g_state.block_size,
+           (unsigned)(g_cache_slots * sizeof(*g_cache) / 1024u),
+           (unsigned)(budget / 1024u),
+           (unsigned)(heap_headroom() / 1024u));
     g_cache_ready = 1;
 }
 

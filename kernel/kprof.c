@@ -2,6 +2,8 @@
 #include "printk.h"
 #include "../arch/i686/cpu/tsc.h"
 #include "../arch/i686/cpu/pit.h"
+#include "../mm/heap.h"
+#include <kernel/config.h>
 
 /*
  * See include/kernel/kprof.h for the model.  Everything here is plain 64-bit
@@ -139,6 +141,11 @@ void kprof_dump(const char *tag) {
            (unsigned)kprof_ev[KPE_EXT2_BLK], (unsigned)kprof_ev[KPE_EXT2_HIT],
            (unsigned)kprof_ev[KPE_EXT2_MISS], (unsigned)kprof_ev[KPE_WAKE],
            (unsigned)kprof_ev[KPE_RESCHED]);
+    /* The heap only ever grows, so the headroom at any dump is the low-water
+     * mark: HEAP_MAX minus this is everything the kernel has ever needed. */
+    printk("[kprof] heap headroom=%uKiB used=%uKiB\n",
+           (unsigned)(heap_headroom() / 1024u),
+           (unsigned)((HEAP_MAX - HEAP_START - heap_headroom()) / 1024u));
     printk("[kprof] ev fb_kb=%u disk_blk=%u distinct=%u ra=%u ra_used=%u pf_seq=%u pf_around=%u\n",
            (unsigned)kprof_ev[KPE_FB_KB], (unsigned)kprof_ev[KPE_EXT2_DISK],
            (unsigned)kprof_ev[KPE_EXT2_DISTINCT], (unsigned)kprof_ev[KPE_EXT2_RA],

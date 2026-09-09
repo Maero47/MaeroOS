@@ -271,14 +271,102 @@ were well batched but the same blocks kept coming back.
 
 The cache had a memory-based sizing already, and a compile-time set count that
 overrode it: the 2 GiB machine wanted 255 MiB and got 4096 sets, 16 MiB. The
-slot array is now allocated at mount alongside the buffer slab, so the ceiling
-can be expressed in bytes rather than reserved in BSS, and it is 128 MiB — what
-the measured working set asks for with room to spare, and still 94 % of the
-machine left. A 128 MiB guest is unaffected: the one-eighth-of-free-memory share
-still binds there and still lands on 8 MiB.
+slot array is now allocated at mount alongside the buffer slab, so the size is
+decided by the machine rather than reserved in BSS.
 
 Blocks fetched **216 314 -> 94 715**, of which 92 702 distinct: with the working
 set resident, essentially nothing is read twice. `ata` **24.7 s -> 11.1 s**.
+
+#### How big, and out of what
+
+Three things bound the cache and they run out independently, so the sizing
+consults all three. The first version consulted only the first, which is how it
+came to ask for half of the kernel's address space on the strength of a number
+that never looked at it.
+
+**A share of free physical memory** (one eighth, measured at mount). The cache is
+never handed back, so this is what keeps a small machine honest — and it is what
+governs there.
+
+**Heap address space, minus a fixed margin.** The kernel heap is a fixed 256 MiB
+span (`HEAP_START`..`HEAP_MAX`) that every other kernel allocation also comes out
+of and that nothing ever releases. On the 2 GiB machine it, not physical memory,
+is the resource that binds: an eighth of free RAM is 255 MiB, which is the whole
+window. The margin is **absolute, not a share**, because what matters to the rest
+of the kernel is how many bytes it can still get, not what fraction some other
+subsystem took. It is set from measurement: a `[kprof] heap` line reports
+headroom at every dump, and everything in the kernel other than this cache uses
+**5.5 MiB** of heap to first paint (138 624 KiB used at the mark, of which
+133 120 KiB is the cache). The heap only grows, so that is a peak. The margin is
+64 MiB — an order of magnitude above the measured demand.
+
+**A ceiling: what the workload is worth.** Measured at six sizes, one
+`make smoke-firefox` each, everything else held constant:
+
+| Buffers | First paint | Blocks fetched | `ata` |
+|---:|---:|---:|---:|
+| 4 MiB | 41.3 s | 218 598 | 13.8 s |
+| 8 MiB | 41.3 s | 217 104 | 13.4 s |
+| 16 MiB | 41.3 s | 215 310 | 13.4 s |
+| 32 MiB | 40.8 s | 205 626 | 12.8 s |
+| 64 MiB | 38.0 s | 135 312 | 12.8 s |
+| 128 MiB | 35.4 s | 94 370 | 6.2 s |
+
+**There is no knee below 128 MiB.** That is the whole shape of the result and it
+is worth stating plainly: a cache that holds *part* of this working set holds
+almost none of the value. A startup touches ~92 700 distinct 1 KiB blocks and
+cycles over them, so at 16 MiB — a sixth of the working set — LRU evicts every
+block before it is wanted again and the cache is worth 1.5 % of the traffic
+against a 4 MiB one. The value appears all at once when the cache finally
+exceeds the working set: 128 MiB fetches 94 370 blocks against 92 640 distinct,
+so 98 % of the fetches are first-time reads and there is nothing left to win.
+The ceiling is therefore 128 MiB of buffers, expressed as a 160 MiB budget
+because that is what yields exactly those 32 768 sets once the slot descriptors
+are counted; the next power of two would need 273 MiB and buy nothing.
+
+What each bound actually decides, booted and read off the console:
+
+| Machine | Free at mount | Binds | Buffers | Heap left after mount |
+|---|---:|---|---:|---:|
+| 2048 MiB | 2040 MiB | the ceiling | 128 MiB | 125.9 MiB |
+| 512 MiB | 504 MiB | physical share | 32 MiB | 223.4 MiB |
+| 128 MiB | 120 MiB | physical share | 4 MiB | 251.8 MiB |
+
+#### The fallback has to be able to run
+
+The halving loop that gives up sets when they do not fit was, as first written,
+unreachable. `kmalloc()` cannot fail for a request the free list does not
+already hold: it grows the heap, and both `heap_expand()` (out of heap address
+space) and `vmm_alloc_page()` (out of physical frames) print and enter a `hlt`
+loop rather than return. The loop read as a safety valve while the only two
+outcomes were success and a wedged kernel — which is worse than no loop, because
+the next reader trusts it.
+
+`kmalloc_try()` checks both resources before it can reach either halt and returns
+NULL instead. Demonstrated by removing the heap clamp — recreating exactly the
+sizing that had no clamp — and asking for a 1 GiB budget against the 256 MiB
+window:
+
+```
+[EXT2] block cache: 131072 sets did not fit, halving
+[EXT2] block cache: 65536 sets did not fit, halving
+[EXT2] block cache 131072 KiB (32768 sets x 4 ways of 1024 B) + 2048 KiB slots
+[EXT2]  Mounted: block_size=1024  inodes=65536  inode_size=256 cache=on
+```
+
+The same request through plain `kmalloc()` ends the boot:
+
+```
+[HEAP] FATAL: heap exhausted (at 0xe0000000)
+```
+
+— 25 serial lines and no further output, against a system that boots and runs.
+
+`kmalloc()` halting the machine on exhaustion is still the root problem, and it
+is not confined to this cache: **any allocation a workload can drive should be
+able to fail.** `kmalloc_try()` is the primitive for callers that have a smaller
+size they could take; converting the rest of the kernel to handle failure is a
+much larger change and is not attempted here.
 
 ### Fault-around: measured, and not worth doing
 
@@ -373,7 +461,15 @@ run's `screen-paint.png` scores ~134 810 light pixels, i.e. real browser chrome
 | + ext2 metadata without the block copy | 52.5 51.1 51.4 52.1 50.7 | 51.6 s | 1.8 s |
 | + ATA READ MULTIPLE | 46.0 45.6 45.9 45.9 45.5 | 45.8 s | 0.5 s |
 | + the cached CPU id | 35.1 34.8 34.9 35.0 34.9 | 34.9 s | 0.3 s |
-| final tree | 34.7 34.7 34.7 34.7 34.7 | **34.7 s** | 0.0 s |
+| the same, before the sizing fix | 34.7 34.7 34.7 34.7 34.7 | 34.7 s | 0.0 s |
+| final tree (cache sizing fixed) | 34.9 35.1 35.3 34.8 35.0 | **35.0 s** | 0.5 s |
+
+The last two rows are hours apart and the host drifts between them, so the
+comparison to make is a same-session one: re-measuring the pre-fix commit
+immediately before the final five runs gave 35.8 35.8 34.9, mean **35.5 s**,
+against the fixed tree's 35.0 s. The sizing fix changes nothing about the cache
+the 2 GiB machine ends up with — 32 768 sets either way — and the numbers agree
+that it does not.
 
 **67.7 s -> 34.7 s, a 48.7 % cut.** With the original 220 s baseline, first paint
 is now **6.3x** faster than where this work started.
