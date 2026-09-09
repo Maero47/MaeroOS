@@ -225,16 +225,201 @@ tenth of the spread. That follows from the breakdown — user code is under 4 % 
 a startup, so a wider instruction set has almost nothing to speed up.
 `tools/smoke_firefox.py --cpu <model>` re-checks this in one command.
 
+## Round three: 67.7 s -> 34.7 s
+
+Five runs of the round-two tree (`d88019c`) measured **67.7 s** (70.3 67.4 67.0
+67.0 66.8). At the mark of the 67.0 s run (`build/ff-smoke/20260909-120012-base-3`,
+54.9 s of guest time):
+
+| Bucket | Time | Share |
+|---|---:|---:|
+| `ata` | 24.70 s | 45.0 % |
+| other syscalls | 19.19 s | 34.9 % |
+| `pgfault` | 4.56 s | 8.3 % |
+| `sched` | 3.01 s | 5.5 % |
+| `user` | 2.03 s | 3.7 % |
+| `fb` | 1.26 s | 2.3 % |
+| `irq` | 0.18 s | 0.3 % |
+| `idle` | **0.00 s** | 0.0 % |
+| **total** | **54.92 s** | `accounted == elapsed` |
+
+The syscall half: `sched_yield` 6.96 s over 299 613 calls, `mmap2` 5.46 s over
+1943, `exit_group` 1.50 s over 8, `clock_gettime64` 1.14 s over 80 977, `execve`
+1.11 s over 16, then nothing above 0.5 s.
+
+### Probes
+
+`kprof_probe_begin`/`kprof_probe_end` are named (cycles, count) accumulators for
+one code span. They are **additive** and deliberately outside the exclusive
+bucket accounting — a probe may nest inside another probe or inside any bucket —
+so probe totals sum to nothing and must never be added to the bucket table. They
+answer "how much of this syscall is that function", which buckets cannot. A
+calibration probe times 256 empty spans per dump, so the instrument's own cost
+is a printed number rather than an assumption: it is under 0.5 ms per 1024
+spans, i.e. below the resolution of everything measured with it.
+
+Two exact counters were added for this round's central question. One bit per
+block of the volume, set the first time the block comes off the platter, splits
+disk traffic into `disk_blk` (blocks fetched) and `distinct` (blocks fetched for
+the first time). A third counts file faults that land on the page after the same
+thread's previous file fault.
+
+### Fifty-seven per cent of the disk traffic was re-reading
+
+A startup fetched **216 314 blocks and only 92 800 distinct ones**. The reads
+were well batched but the same blocks kept coming back.
+
+The cache had a memory-based sizing already, and a compile-time set count that
+overrode it: the 2 GiB machine wanted 255 MiB and got 4096 sets, 16 MiB. The
+slot array is now allocated at mount alongside the buffer slab, so the ceiling
+can be expressed in bytes rather than reserved in BSS, and it is 128 MiB — what
+the measured working set asks for with room to spare, and still 94 % of the
+machine left. A 128 MiB guest is unaffected: the one-eighth-of-free-memory share
+still binds there and still lands on 8 MiB.
+
+Blocks fetched **216 314 -> 94 715**, of which 92 702 distinct: with the working
+set resident, essentially nothing is read twice. `ata` **24.7 s -> 11.1 s**.
+
+### Fault-around: measured, and not worth doing
+
+Of 67 000 file-backed faults, **6805** land on the page after that thread's
+previous file-backed fault. Ninety per cent are scattered, so populating a run
+of 8 or 16 pages per fault would mostly fetch pages nobody asked for — and with
+the cache now holding the whole working set, a page fetched early is not a page
+saved later, it is only a page fetched. The lead is closed with a number rather
+than acted on.
+
+### Copying a whole block to read a few bytes out of it
+
+ext2 reached its metadata through `ext2_read_block`, which copies a whole block
+out of the cache into a buffer the caller `kmalloc`'d. A block group descriptor
+is 32 bytes, an inode 128, an indirect pointer 4: each of those reads allocated
+1 KiB, copied 1 KiB, used a fraction and freed the buffer. Over a startup that
+was 3.0 s in `ext2_read_inode`, 3.0 s in the indirect walk and 0.9 s in the
+`kmalloc`/`kfree` pairs.
+
+`ext2_cache_get` hands out the cache slot itself with the cache's preempt guard
+held, and `ext2_read_block_part` copies out only the bytes asked for. The slot
+pointer never escapes the guard and **only one slot is ever held at a time** —
+holding two would be a use-after-free, because the second fetch can evict the
+first when both land in the same set. That is why the indirect walk reads one
+32-bit word at a time rather than borrowing whole indirect blocks. With reaching
+an indirect block reduced to a lookup, the per-call cache of whole indirect
+blocks cost more to fill than it saved and is gone.
+
+`ext2_read_inode` 3.0 s -> 1.06 s, the allocation pairs 0.90 s -> 0.02 s.
+
+### The ATA handshake was two thirds of the transfer
+
+Splitting `ata_read` by transaction size gives a cost model from the totals
+alone: a 2-sector transaction cost 160.6 us and an 8-sector one 434.2 us, so
+**45.6 us per sector and 69 us fixed per command**. Single-sector PIO spends
+three port accesses on every 512 bytes — poll the status for DRQ, `rep insw` the
+data, read the alternate status to let the drive settle — and under KVM each of
+those is an exit into QEMU. Two of the three are handshake, not data.
+
+READ MULTIPLE is the ATA feature for exactly that: the drive asserts DRQ once
+per block of N sectors and the host transfers the whole block. The drive states
+its largest block in IDENTIFY word 47, the host selects one with SET MULTIPLE
+MODE, and both are checked — a drive that does not offer multiple mode, or
+rejects the block size, leaves `ata_multi` at 0 and the original single-sector
+path. A transfer that is not a whole number of blocks ends with a short block.
+
+Per sector **45.6 us -> 17.0 us**, `ata` **11.1 s -> 6.5 s**.
+
+### Every reference to the running thread read the Local APIC
+
+This is the one the profiler found by elimination rather than by suspicion, and
+it was worth more than everything above it.
+
+Guarding a single block-cache lookup measured **8.6 us**. Probing inside it, the
+set scan was 0.01 us and the 1 KiB copy 0.18 us. The time was in the two lines
+around them: `preempt_disable()`, and `preempt_enable()`. An empty probe pair in
+the same place measured 0.005 us, so it was not the instrument.
+
+`current_proc` is `cpus[this_cpu_id()].proc`, and `this_cpu_id()` answered by
+reading the Local APIC ID register. That register lives in the LAPIC's MMIO
+page, so a guest read of it exits to the hypervisor — about **1.6 us**.
+`preempt_disable()` names `current_proc` twice and `preempt_enable()` three
+times: five exits, 8 us, for 0.2 us of work. The same tax was on `sys_pro`
+(2 exits), `disp_tss` (2), `yield_pre` (1) and `signal_return_to_user` (~5), and
+on every other line of the kernel that mentions the running thread.
+
+While only one CPU executes, the answer cannot change, so it is read once and
+remembered; `smp_percpu_go_multi()` turns the cache off before the first AP is
+started and every call reads the register again from then on. The fast path is
+not an assumption about the machine but a fact about how many CPUs are running.
+Verified with `--smp 2`: the AP comes online and Firefox paints.
+
+| | before | after |
+|---|---:|---:|
+| `pgfault` bucket | 3.94 s | **0.26 s** |
+| syscall buckets | 17.90 s | **7.04 s** |
+| indirect-block walk | 3.06 s | **0.12 s** |
+| `ext2_read_inode` | 1.10 s | **0.014 s** |
+| signal delivery on syscall return | 3.28 s | **0.22 s** |
+| first paint | 46.2 s | **34.6 s** |
+
+## Results
+
+Five runs per configuration, `make smoke-firefox` (KVM, `-smp 1`, 2 GiB). Every
+run's `screen-paint.png` scores ~134 810 light pixels, i.e. real browser chrome
+(see `tools/smoke_firefox.py`; below ~40 000 means no evidence).
+
+| Configuration | First paint (s) | Mean | Spread |
+|---|---|---:|---:|
+| round-two tree (`d88019c`) | 70.3 67.4 67.0 67.0 66.8 | 67.7 s | 3.5 s |
+| + 128 MiB block cache | 54.2 53.6 53.5 54.1 54.2 | 53.9 s | 0.7 s |
+| + ext2 metadata without the block copy | 52.5 51.1 51.4 52.1 50.7 | 51.6 s | 1.8 s |
+| + ATA READ MULTIPLE | 46.0 45.6 45.9 45.9 45.5 | 45.8 s | 0.5 s |
+| + the cached CPU id | 35.1 34.8 34.9 35.0 34.9 | 34.9 s | 0.3 s |
+| final tree | 34.7 34.7 34.7 34.7 34.7 | **34.7 s** | 0.0 s |
+
+**67.7 s -> 34.7 s, a 48.7 % cut.** With the original 220 s baseline, first paint
+is now **6.3x** faster than where this work started.
+
+The spread collapsing to nothing is itself a result: what remained variable was
+the disk, and the disk is now mostly cache.
+
 ## What is left
 
-At the mark of a 67.1 s run (`build/ff-smoke/20260908-225513-slab-3`, 55.1 s of
-guest time): `ata` 25.0 s, other syscalls 19.0 s, `pgfault` 4.5 s, `sched` 3.0 s,
-`user` 2.1 s, `fb` 1.3 s, `irq` 0.2 s, `idle` still 0. Disk is still the largest
-single cost. Three leads, measured but not acted on:
+At the mark of a 34.7 s run (`build/ff-smoke/20260909-141324-final-t`, 23.0 s of
+guest time):
 
-* **Disk volume.** The reads are well batched now, so the next win is reading
-  *less*: fault-around on file-backed VMAs (populate 8 pages per fault instead of
-  1) would cut the 67 k file faults and the transactions with them.
-* **`sched_yield`** — ~302 k calls, 6.7 s, now the largest single syscall.
-* **`mmap2`** — ~1900 calls at ~3.0 ms each. `vma_gap_find` calls
-  `first_mapped_page`, which walks a candidate range page by page, per candidate.
+| Bucket | Time | Share |
+|---|---:|---:|
+| `sched` | 7.39 s | 32.1 % |
+| other syscalls | 6.77 s | 29.4 % |
+| `ata` | 6.36 s | 27.6 % |
+| `fb` | 1.24 s | 5.4 % |
+| `user` | 0.92 s | 4.0 % |
+| `pgfault` | 0.22 s | 0.9 % |
+| `irq` | 0.11 s | 0.5 % |
+| `idle` | **0.00 s** | 0.0 % |
+
+The shape has changed completely. Disk was 45 % and is now 28 %; the page-fault
+handler was 4.6 s and is now 0.22 s; and the scheduler, which was 5 % of a
+startup, is now the largest single bucket — not because it got slower but
+because of what it now has to absorb:
+
+* **The yield storm.** Firefox spins on `sched_yield`, and now that a yield is
+  cheap it spins far faster: **299 613 calls before, 14.5 million after**. The
+  spin is bounded by what it waits for, not by how fast we serve it, so the
+  count rose to fill the same wall time. Those 14.5 M context switches are the
+  7.4 s of `sched` and 2.2 s of the `sched_yield` bucket — roughly **40 % of
+  what a startup now costs**, spent making no progress.
+* **Two `cr3` reloads per context switch, 2.49 s.** The dispatch loads the
+  incoming thread's page directory and reloads the kernel's on the way back out,
+  and each write flushes the TLB. Threads of one process share a page directory,
+  so for a switch inside Firefox both writes are avoidable — but only by not
+  returning to the kernel page directory between threads, which is what makes
+  tearing an address space down safe. Sized, not attempted.
+* **`fxsave`/`fxrstor` on every switch, 1.22 s.** Lazy FPU (CR0.TS) is the
+  standard answer.
+* **`ata` 6.36 s.** 189 184 sectors at 17.0 us and 29 636 commands at ~94 us
+  fixed. The sector count is now the distinct working set (92 649 blocks) and
+  cannot fall without Firefox touching less; the fixed half, 2.8 s, would come
+  down with larger transactions, which needs readahead — and readahead against a
+  fault distribution that is 90 % scattered is a bet, not a win.
+* **`exit_group` 2.37 s over 9 calls.** Tearing down an address space costs
+  260 ms. Nothing else in the profile is that concentrated.
