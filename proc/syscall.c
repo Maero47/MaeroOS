@@ -15,6 +15,7 @@
 #include "../drivers/framebuffer.h"
 #include "../drivers/keyboard.h"
 #include "../kernel/random.h"
+#include "../kernel/panic.h"
 #include "../arch/i686/cpu/pit.h"
 #include "../arch/i686/cpu/tsc.h"
 #include "../arch/i686/cpu/gdt.h"
@@ -925,6 +926,10 @@ static int sys_write(registers_t *regs) {
         if (!f->node->write_fn)   return -9;   /* node not writable */
         uint32_t written = vfs_write(f->node, f->offset,
                                      (uint32_t)len, (const uint8_t *)buf);
+        /* Out of kernel memory for the file body.  Linux tmpfs returns ENOMEM
+         * from shmem_alloc_and_acct_folio for exactly this; returning 0 would
+         * spin any libc write loop. */
+        if (written == VFS_WRITE_ENOMEM) return -12;   /* -ENOMEM */
         f->offset += written;
         return (int)written;
     }
@@ -1227,8 +1232,12 @@ static int sys_brk(registers_t *regs) {
             uint32_t phys = pmm_alloc_frame();
             if (!phys) return -12;  /* -ENOMEM */
             pmm_frame_incref(phys);
-            paging_map(va, phys,
-                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+            if (paging_map(va, phys,
+                           PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
+                pmm_frame_decref(phys);
+                return -12;         /* -ENOMEM; heap_end unchanged, so the
+                                     * pages mapped so far are simply spare */
+            }
             /* Zero the new page */
             __builtin_memset((void *)va, 0, PAGE_SIZE);
         }
@@ -1805,8 +1814,15 @@ static int sys_exec(registers_t *regs) {
             }
             paging_temp_unmap();
             preempt_enable();
-            pgdir_map(new_pgdir, va, stack_phys,
-                      PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+            if (pgdir_map(new_pgdir, va, stack_phys,
+                          PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
+                pmm_frame_decref(stack_phys);
+                kfree(uargv_ptrs);
+                kfree(uenvp_ptrs);
+                kfree(kstack);
+                pgdir_free_user(new_pgdir);
+                EXEC_FAIL(-12);
+            }
         }
     }
     kfree(uargv_ptrs);
@@ -3504,8 +3520,11 @@ static int vma_populate_page(struct vma *v, uint32_t addr) {
     paging_temp_unmap();
     preempt_enable();
 
-    paging_map(addr, phys, pte_flags_for(v->prot, 0));     /* publish: complete */
-    return 1;
+    if (paging_map(addr, phys, pte_flags_for(v->prot, 0)) != 0) {
+        pmm_frame_decref(phys);        /* drop the ref taken above */
+        return 0;                      /* caller turns this into SIGSEGV */
+    }
+    return 1;                          /* publish: complete */
 }
 
 /* Page-fault populate.  Returns 1 if handled, 0 if the address isn't a
@@ -3657,9 +3676,14 @@ static int sys_mmap2(registers_t *regs) {
         end = va + length;
         if (!vma_add(va, end, prot, VMA_F_SHARED, NULL, 0)) return -12;
         for (uint32_t i = 0; i < length; i += PAGE_SIZE)
-            paging_map(va + i, fb_phys + i,
-                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER |
-                       PAGE_SHARED | (1U << 4));   /* SHARED: no COW on fork; PCD */
+            if (paging_map(va + i, fb_phys + i,
+                           PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER |
+                           PAGE_SHARED | (1U << 4)) != 0) {
+                /* Device frames, not refcounted: unmap_range drops the PTEs
+                 * and the VMA without touching the physical allocator. */
+                unmap_range(va, end);
+                return -12;
+            }               /* SHARED: no COW on fork; PCD */
         return (int)va;
     }
 
@@ -3676,7 +3700,12 @@ static int sys_mmap2(registers_t *regs) {
             uint32_t phys = shmap_frame(e, fnode, pgoff + i / PAGE_SIZE);
             if (!phys) { unmap_range(va, end); return -12; }
             pmm_frame_incref(phys);          /* this mapping's ref */
-            paging_map(va + i, phys, pte_flags_for(prot, 1));
+            if (paging_map(va + i, phys, pte_flags_for(prot, 1)) != 0) {
+                pmm_frame_decref(phys);      /* give this mapping's ref back;
+                                              * the registry keeps its own */
+                unmap_range(va, end);
+                return -12;
+            }
         }
         return (int)va;
     }
@@ -3697,7 +3726,11 @@ static int sys_mmap2(registers_t *regs) {
             __builtin_memset(paging_temp_map(phys), 0, PAGE_SIZE);
             paging_temp_unmap();
             preempt_enable();
-            paging_map(va + i, phys, pte_flags_for(prot, 1));
+            if (paging_map(va + i, phys, pte_flags_for(prot, 1)) != 0) {
+                pmm_frame_decref(phys);      /* the only ref: frees the frame */
+                unmap_range(va, end);
+                return -12;
+            }
         }
         return (int)va;
     }
@@ -4000,6 +4033,16 @@ static int mremap_move(uint32_t old, uint32_t len, uint32_t new) {
         if (v->file) vfs_retain(v->file);         /* survive the removal below */
         np++;
     }
+    /* Reserve every destination page table FIRST.  The move clears each source
+     * PTE before re-publishing it at the destination, so a mapping failure
+     * partway would lose the page outright — the frame would still be
+     * referenced by nothing the process can reach.  Failing here instead costs
+     * only the snapshot's file refs. */
+    if (paging_reserve_range(new, new + len, 1) != 0) {
+        while (np) { np--; if (pcs[np].file) vfs_close(pcs[np].file); }
+        return -12;
+    }
+
     vma_remove_range(old, old + len);
     for (uint32_t off = 0; off < len; off += PAGE_SIZE) {
         uint32_t va = old + off;
@@ -4009,7 +4052,9 @@ static int mremap_move(uint32_t old, uint32_t len, uint32_t new) {
         if (!pte_mapped(e)) continue;
         *pte = 0;
         tlb_flush_single(va);
-        paging_map(new + off, e & ~0xFFFU, e & 0xFFFU);   /* same frame, same flags */
+        /* Cannot fail: the table was reserved above. */
+        if (paging_map(new + off, e & ~0xFFFU, e & 0xFFFU) != 0)
+            panic("mremap: reserved page table vanished", NULL);
     }
     tlb_shootdown();
     for (int i = 0; i < np; i++) {
@@ -5244,7 +5289,9 @@ static int sys_pwrite64(registers_t *regs) {
     if (f->type != FD_FILE || !f->node) return -9;
     if (f->flags == O_RDONLY || !f->node->write_fn) return -9;
 
-    return (int)vfs_write(f->node, off, (uint32_t)len, (const uint8_t *)buf);
+    uint32_t wrote = vfs_write(f->node, off, (uint32_t)len, (const uint8_t *)buf);
+    if (wrote == VFS_WRITE_ENOMEM) return -12;        /* -ENOMEM */
+    return (int)wrote;
 }
 
 /* ── sys_openat(dirfd, path, flags, mode) — EAX=295 ─────────────────────── */
@@ -6127,7 +6174,11 @@ static int sys_rename_kernel_path(const char *oldpath, const char *newpath) {
             if (chunk > 4096) chunk = 4096;
             uint32_t got = vfs_read(src, copied, chunk, tmp_buf);
             if (!got) break;
-            vfs_write(dst, copied, got, tmp_buf);
+            if (vfs_write(dst, copied, got, tmp_buf) == VFS_WRITE_ENOMEM) {
+                kfree(tmp_buf);
+                vfs_unlink(dst_dir, new_base);   /* no half-copied destination */
+                return -12;                      /* -ENOMEM */
+            }
             copied += got;
         }
         kfree(tmp_buf);

@@ -53,7 +53,18 @@ extern void panic(const char *msg, void *regs) __attribute__((noreturn));
 
 /* ── Internal helpers ─────────────────────────────────────────────────────── */
 
-static void heap_expand(size_t min_bytes) {
+/*
+ * Map `min_bytes` more of the heap window.  Returns 1 if the whole request was
+ * mapped, 0 if it ran out of heap address space (HEAP_MAX) or of physical
+ * frames first.
+ *
+ * It used to print "heap exhausted" and hlt forever, which is why kmalloc()
+ * could not fail and every "if (!p) return -ENOMEM" in the kernel was dead
+ * code.  Partial progress is kept rather than unwound: heap_end tracks what is
+ * actually mapped, and kmalloc_nolock folds whatever was gained into the free
+ * list before failing, so the pages are not lost.
+ */
+static int heap_expand(size_t min_bytes) {
     /* Round up to whole pages, at least one */
     size_t needed = min_bytes + sizeof(block_header_t);
     size_t pages  = (needed + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -61,13 +72,17 @@ static void heap_expand(size_t min_bytes) {
 
     for (size_t i = 0; i < pages; i++) {
         if (heap_end >= HEAP_MAX) {
-            printk("[HEAP] FATAL: heap exhausted (at 0x%08x)\n",
-                   (unsigned)heap_end);
-            for (;;) __asm__ volatile("hlt");
+            kmem_oom_report("kernel heap address space", (unsigned)heap_end);
+            return 0;
         }
-        vmm_alloc_page(heap_end, PAGE_WRITABLE);
+        if (vmm_alloc_page(heap_end, PAGE_WRITABLE) != 0) {
+            kmem_oom_report("physical memory for the kernel heap",
+                            (unsigned)heap_end);
+            return 0;
+        }
         heap_end += PAGE_SIZE;
     }
+    return 1;
 }
 
 static block_header_t *get_end_block(void) {
@@ -79,8 +94,11 @@ static block_header_t *get_end_block(void) {
 /* ── Public API ───────────────────────────────────────────────────────────── */
 
 void heap_init(void) {
-    /* Map the first heap page */
-    vmm_alloc_page(HEAP_START, PAGE_WRITABLE);
+    /* Map the first heap page.  FATAL by design (audit category (c)): this runs
+     * from kmain before there is a process, a scheduler or a caller to return
+     * an error to, and a kernel with no heap at all cannot make progress. */
+    if (vmm_alloc_page(HEAP_START, PAGE_WRITABLE) != 0)
+        panic("heap_init: no memory for the first heap page", NULL);
     heap_end = HEAP_START + PAGE_SIZE;
 
     heap_head        = (block_header_t *)HEAP_START;
@@ -134,8 +152,12 @@ void *kmalloc_try(size_t size) {
         r = kmalloc_nolock(asz);            /* fits already: cannot expand */
     } else {
         /* Growing is the only way.  Refuse unless BOTH the heap window and
-         * physical memory can supply the pages, because reaching either of
-         * their exhaustion paths halts the machine. */
+         * physical memory can supply the pages.  kmalloc() now fails cleanly
+         * too, so this is no longer about avoiding a halt — it is a politer
+         * policy: a caller with a smaller acceptable size (the ext2 block
+         * cache) should not consume the last frames into the kernel heap,
+         * where only the kernel heap can ever use them again, merely to
+         * discover it cannot have the big size. */
         size_t pages = expand_pages_for(asz);
         if (pages <= (size_t)((HEAP_MAX - (unsigned long)heap_end) / PAGE_SIZE) &&
             pages <= (size_t)pmm_free_frames())
@@ -145,41 +167,35 @@ void *kmalloc_try(size_t size) {
     return r;
 }
 
-static void *kmalloc_nolock(size_t size) {
-    if (!size) return NULL;
-    size = ALIGN8(size);
-
-    block_header_t *b = first_fit(size);
-    if (b) {
-        /* Split if the remainder is large enough to hold a new header + data */
-        if (b->size >= size + MIN_SPLIT) {
-            block_header_t *nb = (block_header_t *)((uint8_t *)b
-                                  + sizeof(block_header_t) + size);
-            nb->magic   = HEAP_MAGIC;
-            nb->size    = b->size - size - sizeof(block_header_t);
-            nb->is_free = 1;
-            nb->next    = b->next;
-            nb->prev    = b;
-            if (nb->next) nb->next->prev = nb;
-            b->next = nb;
-            b->size = size;
-        }
-        b->is_free = 0;
-        return (void *)((uint8_t *)b + sizeof(block_header_t));
+/* Carve `size` out of the free block `b`, splitting off the remainder if it is
+ * big enough to hold a header plus something useful. */
+static void *heap_carve(block_header_t *b, size_t size) {
+    if (b->size >= size + MIN_SPLIT) {
+        block_header_t *nb = (block_header_t *)((uint8_t *)b
+                              + sizeof(block_header_t) + size);
+        nb->magic   = HEAP_MAGIC;
+        nb->size    = b->size - size - sizeof(block_header_t);
+        nb->is_free = 1;
+        nb->next    = b->next;
+        nb->prev    = b;
+        if (nb->next) nb->next->prev = nb;
+        b->next = nb;
+        b->size = size;
     }
+    b->is_free = 0;
+    return (void *)((uint8_t *)b + sizeof(block_header_t));
+}
 
-    /* No fitting block — expand heap */
-    block_header_t *tail = get_end_block();
-    uint32_t old_end = heap_end;
-    heap_expand(size);
+/* Fold the pages heap_expand() just mapped, [old_end, heap_end), into the free
+ * list — extending the tail block if it is free, otherwise as a new block.
+ * Safe to call when nothing was gained. */
+static void heap_absorb(block_header_t *tail, uint32_t old_end) {
+    if (heap_end == old_end) return;
 
-    /* If the tail block is free, extend it into the new pages */
     if (tail && tail->is_free) {
         tail->size += heap_end - old_end;
-        return kmalloc_nolock(size);  /* retry, will fit now */
+        return;
     }
-
-    /* Otherwise create a new block in the new region */
     block_header_t *nb = (block_header_t *)old_end;
     nb->magic   = HEAP_MAGIC;
     nb->size    = heap_end - old_end - sizeof(block_header_t);
@@ -188,8 +204,28 @@ static void *kmalloc_nolock(size_t size) {
     nb->prev    = tail;
     if (tail) tail->next = nb;
     if (!heap_head) heap_head = nb;
+}
 
-    return kmalloc_nolock(size);
+static void *kmalloc_nolock(size_t size) {
+    if (!size) return NULL;
+    size = ALIGN8(size);
+
+    block_header_t *b = first_fit(size);
+    if (b) return heap_carve(b, size);
+
+    /* No fitting block — grow the heap.  A partial expansion is absorbed too,
+     * so the pages that were mapped stay usable; the retry is a single
+     * first_fit rather than the recursion this used to do, because with a
+     * failing heap_expand() that recursion could no longer be assumed to
+     * terminate on the first retry. */
+    block_header_t *tail = get_end_block();
+    uint32_t old_end = heap_end;
+    int full = heap_expand(size);
+    heap_absorb(tail, old_end);
+    if (!full) return NULL;
+
+    b = first_fit(size);
+    return b ? heap_carve(b, size) : NULL;
 }
 
 void *kmalloc(size_t size) {

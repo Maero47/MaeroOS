@@ -119,7 +119,7 @@ static uint32_t tmpfs_write(vfs_node_t *node, uint32_t off, uint32_t len,
         uint32_t newcap = tn->capacity ? tn->capacity : 64;
         while (newcap < end) newcap *= 2;
         uint8_t *newbuf = (uint8_t *)kmalloc(newcap);
-        if (!newbuf) return 0;
+        if (!newbuf) return VFS_WRITE_ENOMEM;   /* → write() gets -ENOMEM */
         if (tn->data) {
             memcpy(newbuf, tn->data, tn->capacity);
             kfree(tn->data);
@@ -159,7 +159,7 @@ static int tmpfs_truncate(vfs_node_t *node, uint32_t new_size) {
         uint32_t newcap = tn->capacity ? tn->capacity : 64;
         while (newcap < new_size) newcap *= 2;
         uint8_t *newbuf = (uint8_t *)kmalloc(newcap);
-        if (!newbuf) return -1;
+        if (!newbuf) return -12;        /* -ENOMEM, see sys_ftruncate */
         if (tn->data) {
             memcpy(newbuf, tn->data, node->size);
             kfree(tn->data);
