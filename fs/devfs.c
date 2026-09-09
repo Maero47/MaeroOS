@@ -12,6 +12,7 @@
 #include "../proc/process.h"
 #include "../proc/scheduler.h"
 #include "../proc/signal.h"
+#include "../arch/i686/cpu/pit.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -118,6 +119,29 @@ void tty_set_termios(const void *buf) {
 /* Terminal foreground process group (0 = unset, use shell's pgrp) */
 int tty_fg_pgrp = 0;
 
+/*
+ * One byte from the serial console, waiting for it by SLEEPING.
+ *
+ * int 0x80 is an interrupt gate, so a syscall runs with IF=0 from entry to
+ * exit.  Busy-waiting on the UART's line-status register inside one therefore
+ * stops the timer tick, and with it every other process on the machine, until a
+ * character happens to arrive: a serial console read with nobody typing froze
+ * the whole guest, silently and with no way in but an NMI.  Nothing raises an
+ * interrupt on serial input (the UART's IER is 0), so this is a short timed
+ * sleep that re-checks the line status on each wake — the machine idles with
+ * interrupts on instead of holding them off.
+ *
+ * Before the scheduler exists (current_proc == NULL) there is nothing to sleep
+ * on and nothing else to starve, so the bare spin is still correct there.
+ */
+char console_serial_getc(void) {
+    while (current_proc && !serial_data_ready()) {
+        current_proc->wake_tick = pit_ticks() + 1;      /* re-check in 10 ms */
+        sleep_on(&io_activity);
+    }
+    return serial_getc();
+}
+
 static vfs_node_t *proc_ctty_node(void) {
     if (current_proc && current_proc->ctty)
         return current_proc->ctty;
@@ -147,7 +171,7 @@ static uint32_t tty_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf
 
     uint32_t i = 0;
     while (i < len) {
-        char c = serial_getc();
+        char c = console_serial_getc();
         if (c == '\r') c = '\n';
 
         /* ^C — SIGINT (always, regardless of termios) */

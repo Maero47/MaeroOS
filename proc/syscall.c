@@ -871,7 +871,7 @@ static int sys_read(registers_t *regs) {
     if (fd == 0 && f->type == FD_NONE) {
         int n = 0;
         while (n < len) {
-            char c = serial_getc();
+            char c = console_serial_getc();
             if (c == '\r') c = '\n';
             if (c == 3) {               /* Ctrl-C → SIGINT */
                 signal_send(current_proc, SIGINT);
