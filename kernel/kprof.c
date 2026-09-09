@@ -21,7 +21,10 @@ static uint32_t g_probe_cnt[KPP_MAX];
 static const char *const g_probe_name[KPP_MAX] = {
     "sys_pro", "sys_epi", "yield_pre", "sch_scan", "sch_disp",
     "gap_find", "first_mapped", "mmap_pop", "mmap_unmap",
-    "fault_read", "fault_zero", "ata<=4", "ata>4", "kdump", "calib",
+    "fault_read", "fault_zero", "ata<=4", "ata>4",
+    "e2_alloc", "e2_inode", "e2_bmap", "e2_copy",
+    "sys_body", "sys_resched", "disp_tss", "disp_cr3", "disp_fpu",
+    "kdump", "calib",
 };
 
 static int      g_cur = KPB_USER;

@@ -73,6 +73,15 @@ enum {
     KPP_FAULT_ZERO,     /* the memset of a freshly allocated fault frame     */
     KPP_ATA_SMALL,      /* ata_read of <= 4 sectors                          */
     KPP_ATA_BIG,        /* ata_read of  > 4 sectors                          */
+    KPP_E2_ALLOC,       /* the kmalloc/kfree pair in ext2_read_node          */
+    KPP_E2_INODE,       /* ext2_read_inode per read                          */
+    KPP_E2_BMAP,        /* ext2_file_blk_cached (the block map walk)         */
+    KPP_E2_COPY,        /* fetching one block into the destination           */
+    KPP_SYS_BODY,       /* the syscall's own work (the dispatch switch)      */
+    KPP_SYS_RESCHED,    /* resched_on_return (may yield: not CPU time)       */
+    KPP_DISP_TSS,       /* tss_set_kernel_stack + gdt_set_tls per dispatch   */
+    KPP_DISP_CR3,       /* the cr3 reload per dispatch                       */
+    KPP_DISP_FPU,       /* fxrstor per dispatch                              */
     KPP_DUMP,           /* the profiler's own periodic dump (printk to serial) */
     KPP_CALIB,          /* an empty span: the cost of a probe pair itself      */
     KPP_MAX

@@ -56,17 +56,23 @@ void scheduler_start(void) {
             p->time_slice  = DEFAULT_TIMESLICE;
             p->sched_count++;
 
+            uint64_t d_t = kprof_probe_begin();
             tss_set_kernel_stack((uint32_t)(uintptr_t)(p->kstack + KSTACKSIZE));
             /* ALWAYS reprogram this CPU's TLS (%gs) base — even to 0.  Skipping
              * it when p->tls_base==0 left the PREVIOUS thread's base in this CPU's
              * GDT entry 6; the next iret reloads %gs from it, so a no-TLS thread
              * would read/write another thread's TLS → wild-pointer corruption. */
             gdt_set_tls(p->tls_base);
+            kprof_probe_end(KPP_DISP_TSS, d_t);
 
+            uint64_t d_c = kprof_probe_begin();
             if (p->pgdir_phys)
                 __asm__ volatile("mov %0, %%cr3" :: "r"(p->pgdir_phys) : "memory");
+            kprof_probe_end(KPP_DISP_CR3, d_c);
 
+            uint64_t d_f = kprof_probe_begin();
             fpu_restore(fpu_area(p));
+            kprof_probe_end(KPP_DISP_FPU, d_f);
             kprof_probe_end(KPP_SCHED_DISP, disp_t0);
             kprof_count(KPE_CTXSW);
             kprof_switch(p->kprof_bucket);   /* charge the dispatch to KPB_SCHED */

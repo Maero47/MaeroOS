@@ -3516,6 +3516,14 @@ int vma_handle_fault(uint32_t addr) {
     if (!v) return 0;
     if (v->prot == 0) return 0;                 /* PROT_NONE guard → SIGSEGV */
     if (v->flags & VMA_F_SHARED) return 0;      /* shared frames are eager-only */
+    /* Is this file fault the page immediately after the previous file fault of
+     * the same thread?  That is the question fault-around turns on: a purely
+     * sequential walk is worth reading ahead for, a scattered one is not. */
+    if (v->file && current_proc) {
+        if (addr == current_proc->last_file_fault + PAGE_SIZE)
+            kprof_count(KPE_PF_FILE_SEQ);
+        current_proc->last_file_fault = addr;
+    }
     return vma_populate_page(v, addr);
 }
 
@@ -7013,6 +7021,7 @@ void syscall_dispatch(registers_t *regs) {
     kprof_tick();
     kprof_probe_end(KPP_SYS_PRO, kp_pro);
 
+    uint64_t kp_body = kprof_probe_begin();
     switch (num) {
     case 1:   sys_exit(regs);                  break;  /* noreturn */
     case 2:   ret = sys_fork(regs);            break;
@@ -7243,6 +7252,7 @@ void syscall_dispatch(registers_t *regs) {
         break;
     }
 
+    kprof_probe_end(KPP_SYS_BODY, kp_body);
     regs->eax = (uint32_t)(int32_t)ret;
 
     uint64_t kp_epi = kprof_probe_begin();
@@ -7255,6 +7265,8 @@ void syscall_dispatch(registers_t *regs) {
     /* Linux-style wakeup preemption: if this syscall woke another thread, yield
      * at the return-to-user boundary so the woken thread runs promptly (closes
      * the glibc-2.36 condvar signal-steal window for the IPC Launch thread). */
-    resched_on_return();
     kprof_probe_end(KPP_SYS_EPI, kp_epi);
+    uint64_t kp_rs = kprof_probe_begin();
+    resched_on_return();
+    kprof_probe_end(KPP_SYS_RESCHED, kp_rs);
 }

@@ -415,6 +415,75 @@ static int ext2_read_block(uint32_t blk, void *buf) {
     return 0;
 }
 
+/* ── Reading a few bytes out of a block ──────────────────────────────────────
+ * A block group descriptor is 32 bytes, an inode 128 or 256, an indirect
+ * pointer 4.  Reading any of them through ext2_read_block cost a kmalloc, a
+ * whole-block memcpy out of the cache and a kfree, to then use a fraction of
+ * the result: measured over a Firefox startup, 3.0 s in ext2_read_inode and
+ * 3.0 s in the indirect-block walk, on a machine where the whole disk cost
+ * 11 s.  These two helpers read the bytes straight out of the cache slot.
+ *
+ * The slot pointer NEVER escapes: ext2_cache_get returns it with the cache's
+ * preempt guard held and the caller must copy what it needs and release
+ * immediately.  Holding two slots at once would be a use-after-free -- the
+ * second fetch can evict the first when both land in the same set. */
+static ext2_cache_entry_t *ext2_cache_get(uint32_t blk) {
+    kprof_count(KPE_EXT2_BLK);
+    preempt_disable();                     /* released by ext2_cache_put */
+    if (!g_cache_ready) return (ext2_cache_entry_t *)0;
+
+    ext2_cache_entry_t *e = ext2_cache_find(blk);
+    if (e) {
+        e->age = g_cache_age++;
+        kprof_count(KPE_EXT2_HIT);
+        return e;
+    }
+
+    kprof_count(KPE_EXT2_MISS);
+    ext2_cache_entry_t *slot = ext2_cache_claim(blk);
+    if (!slot || !slot->data) return (ext2_cache_entry_t *)0;
+    /* Invalidate before the transfer: a failed read must not leave the slot
+     * claiming to hold `blk` with the evicted block's bytes still in it. */
+    slot->valid = 0;
+    if (ext2_raw_read_block(blk, slot->data) < 0) return (ext2_cache_entry_t *)0;
+    slot->blk = blk;
+    slot->age = g_cache_age++;
+    slot->valid = 1;
+    return slot;
+}
+
+static void ext2_cache_put(void) { preempt_enable(); }
+
+/* Copy `len` bytes at offset `off` inside block `blk`.  0 on success. */
+static int ext2_read_block_part(uint32_t blk, uint32_t off, uint32_t len,
+                                void *out) {
+    if (off + len > g_state.block_size) return -1;
+    ext2_cache_entry_t *e = ext2_cache_get(blk);
+    if (!e) {
+        ext2_cache_put();
+        /* No cache (or it could not be fetched into one): fall back to the
+         * copying path, which owns its own buffer. */
+        uint8_t *tmp = (uint8_t *)kmalloc(g_state.block_size);
+        if (!tmp) return -1;
+        if (ext2_read_block(blk, tmp) < 0) { kfree(tmp); return -1; }
+        memcpy(out, tmp + off, len);
+        kfree(tmp);
+        return 0;
+    }
+    memcpy(out, e->data + off, len);
+    ext2_cache_put();
+    return 0;
+}
+
+/* The `idx`-th 32-bit pointer stored in indirect block `blk`, or 0. */
+static uint32_t ext2_ind_word(uint32_t blk, uint32_t idx) {
+    uint32_t v = 0;
+    if (!blk) return 0;
+    if (idx >= g_state.block_size / 4) return 0;
+    if (ext2_read_block_part(blk, idx * 4u, 4u, &v) < 0) return 0;
+    return v;
+}
+
 /* Publish `buf` as the cached contents of `blk`.  Caller holds preempt_disable
  * (the slot buffers are shared mutable state). */
 static void ext2_cache_insert(uint32_t blk, const void *buf) {
@@ -466,15 +535,8 @@ static int ext2_read_bgd(uint32_t grp, ext2_bgd_t *out) {
     uint32_t per_block = g_state.block_size / sizeof(ext2_bgd_t);
     uint32_t bgd_blk   = g_state.first_data_block + 1 + (per_block ? grp / per_block : 0);
     uint32_t idx       = per_block ? grp % per_block : grp;
-    uint8_t *bgd_block = (uint8_t *)kmalloc(g_state.block_size);
-    if (!bgd_block) return -1;
-    if (ext2_read_block(bgd_blk, bgd_block) < 0) {
-        kfree(bgd_block);
-        return -1;
-    }
-    memcpy(out, bgd_block + idx * sizeof(ext2_bgd_t), sizeof(ext2_bgd_t));
-    kfree(bgd_block);
-    return 0;
+    return ext2_read_block_part(bgd_blk, idx * sizeof(ext2_bgd_t),
+                                sizeof(ext2_bgd_t), out);
 }
 
 static int ext2_write_bgd(uint32_t grp, const ext2_bgd_t *in) {
@@ -506,12 +568,7 @@ static int ext2_read_inode(uint32_t ino, ext2_inode_t *out) {
     uint32_t blk = bgd.bg_inode_table + idx / inodes_per_block;
     uint32_t off = (idx % inodes_per_block) * g_state.inode_size;
 
-    uint8_t *blk_buf = (uint8_t *)kmalloc(g_state.block_size);
-    if (!blk_buf) return -1;
-    if (ext2_read_block(blk, blk_buf) < 0) { kfree(blk_buf); return -1; }
-    memcpy(out, blk_buf + off, sizeof(ext2_inode_t));
-    kfree(blk_buf);
-    return 0;
+    return ext2_read_block_part(blk, off, sizeof(ext2_inode_t), out);
 }
 
 static int ext2_write_inode(uint32_t ino, const ext2_inode_t *in) {
@@ -712,143 +769,37 @@ int ext2_statfs(uint32_t *block_size, uint32_t *blocks, uint32_t *bfree,
 
 /* ── Resolve an indirect block pointer ───────────────────────────────────── */
 
-/* Reentrant cache of recently-read indirect blocks, one slot per level
- * (0=singly, 1=doubly, 2=triply).  Lives on the caller's stack so concurrent
- * reads never share it.  Sequential reads of a large file (libxul.so = 175 MiB)
- * otherwise re-read up to 3 indirect blocks per 1 KiB data block from the PIO
- * disk — hundreds of thousands of redundant reads.  With the cache the doubly/
- * triply blocks are read once per 64 MiB and the singly once per 256 KiB. */
-typedef struct {
-    uint32_t blk[3];      /* cached disk block number, 0 = empty */
-    uint32_t *buf[3];     /* cached block contents (block_size bytes) */
-} ext2_indcache_t;
-
-static uint32_t *ext2_ind_get(ext2_indcache_t *c, int lvl, uint32_t blk) {
-    if (blk == 0) return 0;
-    if (c->blk[lvl] == blk && c->buf[lvl]) return c->buf[lvl];
-    if (!c->buf[lvl]) {
-        c->buf[lvl] = (uint32_t *)kmalloc(g_state.block_size);
-        if (!c->buf[lvl]) return 0;
-    }
-    if (ext2_read_block(blk, c->buf[lvl]) < 0) { c->blk[lvl] = 0; return 0; }
-    c->blk[lvl] = blk;
-    return c->buf[lvl];
-}
-
-/* Cached variant: resolves file-block `idx` reusing already-read indirect
- * blocks from `c`.  Equivalent to ext2_file_blk but fast for sequential scans. */
-static uint32_t ext2_file_blk_cached(ext2_inode_t *ino, uint32_t idx,
-                                     ext2_indcache_t *c) {
+/* Returns the physical block number for file-block index `idx`.
+ *
+ * Each indirect level is one 4-byte read out of the block cache
+ * (ext2_ind_word), so resolving a block in the doubly-indirect range costs two
+ * cache lookups and eight bytes of copying.  The previous version kept a
+ * per-call cache of whole indirect blocks because reaching one cost a kmalloc
+ * and a 1 KiB memcpy; now that reaching one is a lookup, the cache saved less
+ * than it cost to fill, and the block cache is the only cache in the path. */
+static uint32_t ext2_file_blk(ext2_inode_t *ino, uint32_t idx) {
     uint32_t ppb = g_state.block_size / 4;
+
     if (idx < 12) return ino->i_block[idx];
     idx -= 12;
-    if (idx < ppb) {                                  /* singly */
-        uint32_t *ind = ext2_ind_get(c, 0, ino->i_block[12]);
-        return ind ? ind[idx] : 0;
-    }
+
+    if (idx < ppb)                                    /* singly */
+        return ext2_ind_word(ino->i_block[12], idx);
     idx -= ppb;
+
     if (idx < ppb * ppb) {                            /* doubly */
-        uint32_t *dind = ext2_ind_get(c, 1, ino->i_block[13]);
-        if (!dind) return 0;
-        uint32_t *ind = ext2_ind_get(c, 0, dind[idx / ppb]);
-        return ind ? ind[idx % ppb] : 0;
+        uint32_t ind = ext2_ind_word(ino->i_block[13], idx / ppb);
+        return ext2_ind_word(ind, idx % ppb);
     }
     idx -= ppb * ppb;
+
     if (idx < ppb * ppb * ppb) {                      /* triply */
         uint32_t per2 = ppb * ppb;
-        uint32_t *tind = ext2_ind_get(c, 2, ino->i_block[14]);
-        if (!tind) return 0;
-        uint32_t *dind = ext2_ind_get(c, 1, tind[idx / per2]);
-        if (!dind) return 0;
-        uint32_t *ind = ext2_ind_get(c, 0, dind[(idx % per2) / ppb]);
-        return ind ? ind[idx % ppb] : 0;
+        uint32_t dind = ext2_ind_word(ino->i_block[14], idx / per2);
+        uint32_t ind  = ext2_ind_word(dind, (idx % per2) / ppb);
+        return ext2_ind_word(ind, idx % ppb);
     }
     return 0;
-}
-
-static void ext2_indcache_free(ext2_indcache_t *c) {
-    for (int i = 0; i < 3; i++) if (c->buf[i]) kfree(c->buf[i]);
-}
-
-/* Returns the physical block number for file-block index `idx` */
-static uint32_t ext2_file_blk(ext2_inode_t *ino, uint32_t idx) {
-    uint32_t ptrs_per_blk = g_state.block_size / 4;
-
-    if (idx < 12)
-        return ino->i_block[idx];
-
-    idx -= 12;
-
-    /* Singly indirect */
-    if (idx < ptrs_per_blk) {
-        if (!ino->i_block[12]) return 0;
-        uint32_t *ind = (uint32_t *)kmalloc(g_state.block_size);
-        if (!ind) return 0;
-        if (ext2_read_block(ino->i_block[12], ind) < 0) {
-            kfree(ind);
-            return 0;
-        }
-        uint32_t blk = ind[idx];
-        kfree(ind);
-        return blk;
-    }
-    idx -= ptrs_per_blk;
-
-    /* Doubly indirect */
-    if (idx < ptrs_per_blk * ptrs_per_blk) {
-        if (!ino->i_block[13]) return 0;
-        uint32_t *dind = (uint32_t *)kmalloc(g_state.block_size);
-        if (!dind) return 0;
-        if (ext2_read_block(ino->i_block[13], dind) < 0) {
-            kfree(dind);
-            return 0;
-        }
-        uint32_t ind_blk = dind[idx / ptrs_per_blk];
-        kfree(dind);
-        if (!ind_blk) return 0;
-
-        uint32_t *ind = (uint32_t *)kmalloc(g_state.block_size);
-        if (!ind) return 0;
-        if (ext2_read_block(ind_blk, ind) < 0) {
-            kfree(ind);
-            return 0;
-        }
-        uint32_t blk = ind[idx % ptrs_per_blk];
-        kfree(ind);
-        return blk;
-    }
-    idx -= ptrs_per_blk * ptrs_per_blk;
-
-    /* Triply indirect.  With 1 KiB blocks the doubly-indirect range only covers
-     * ~64 MiB, so large files (libxul.so is 175 MiB) MUST use this path — without
-     * it, reads past 64 MiB return zeros and silently corrupt the file. */
-    if (idx < ptrs_per_blk * ptrs_per_blk * ptrs_per_blk) {
-        if (!ino->i_block[14]) return 0;
-        uint32_t per2 = ptrs_per_blk * ptrs_per_blk;
-
-        uint32_t *tind = (uint32_t *)kmalloc(g_state.block_size);
-        if (!tind) return 0;
-        if (ext2_read_block(ino->i_block[14], tind) < 0) { kfree(tind); return 0; }
-        uint32_t dind_blk = tind[idx / per2];
-        kfree(tind);
-        if (!dind_blk) return 0;
-
-        uint32_t *dind = (uint32_t *)kmalloc(g_state.block_size);
-        if (!dind) return 0;
-        if (ext2_read_block(dind_blk, dind) < 0) { kfree(dind); return 0; }
-        uint32_t ind_blk = dind[(idx % per2) / ptrs_per_blk];
-        kfree(dind);
-        if (!ind_blk) return 0;
-
-        uint32_t *ind = (uint32_t *)kmalloc(g_state.block_size);
-        if (!ind) return 0;
-        if (ext2_read_block(ind_blk, ind) < 0) { kfree(ind); return 0; }
-        uint32_t blk = ind[idx % ptrs_per_blk];
-        kfree(ind);
-        return blk;
-    }
-
-    return 0;   /* beyond triply-indirect range (> 16 GiB with 1 KiB blocks) */
 }
 
 static uint32_t ext2_file_blk_alloc(ext2_inode_t *ino, uint32_t idx) {
@@ -1010,16 +961,20 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
     ext2_priv_t *priv = (ext2_priv_t *)node->private;
 
     ext2_inode_t inode;
-    if (ext2_read_inode(priv->ino, &inode) < 0) return 0;
+    uint64_t kp_i = kprof_probe_begin();
+    int inode_err = ext2_read_inode(priv->ino, &inode) < 0;
+    kprof_probe_end(KPP_E2_INODE, kp_i);
+    if (inode_err) return 0;
 
     if (offset >= inode.i_size) return 0;
     if (offset + size > inode.i_size) size = inode.i_size - offset;
 
     uint32_t blk_size = g_state.block_size;
     uint32_t done = 0;
-    uint8_t *blk_buf = (uint8_t *)kmalloc(blk_size);
-    if (!blk_buf) return 0;
-    ext2_indcache_t ic = {{0,0,0},{0,0,0}};
+    /* The bounce buffer is only needed for a partial block; a page fault, which
+     * is nearly every read here, is whole-block aligned and never touches it.
+     * Allocating it unconditionally cost a kmalloc+kfree pair per read. */
+    uint8_t *blk_buf = (uint8_t *)0;
 
     while (done < size) {
         uint32_t file_off   = offset + done;
@@ -1028,7 +983,9 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
         uint32_t to_copy    = blk_size - blk_off;
         if (to_copy > size - done) to_copy = size - done;
 
-        uint32_t blk_num = ext2_file_blk_cached(&inode, blk_idx, &ic);
+        uint64_t kp_b = kprof_probe_begin();
+        uint32_t blk_num = ext2_file_blk(&inode, blk_idx);
+        kprof_probe_end(KPP_E2_BMAP, kp_b);
         if (blk_num == 0) {
             memset(buf + done, 0, to_copy);
             done += to_copy;
@@ -1041,7 +998,10 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
          * blocks as the request still needs, so a 4 KiB page fault on a
          * contiguous file costs one ATA transaction instead of four. */
         if (blk_off == 0 && to_copy == blk_size) {
-            if (!ext2_cache_lookup(blk_num, buf + done)) {
+            uint64_t kp_c = kprof_probe_begin();
+            int miss = !ext2_cache_lookup(blk_num, buf + done);
+            kprof_probe_end(KPP_E2_COPY, kp_c);
+            if (miss) {
                 /* Cluster only into a KERNEL destination.  ata_read transfers
                  * with interrupts disabled straight into the caller's buffer,
                  * and sys_read hands us the user pointer unbounced: a longer
@@ -1053,8 +1013,7 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
                 while ((uintptr_t)(buf + done) >= KERNEL_VMA &&
                        run < EXT2_READ_CLUSTER &&
                        done + (run + 1) * blk_size <= size &&
-                       ext2_file_blk_cached(&inode, blk_idx + run, &ic)
-                           == blk_num + run)
+                       ext2_file_blk(&inode, blk_idx + run) == blk_num + run)
                     run++;
                 if (run > 1) {
                     /* CACHE INVARIANT: the raw read and the inserts that
@@ -1092,13 +1051,22 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
                 if (ext2_read_block(blk_num, buf + done) < 0) break;
             }
         } else {
+            if (!blk_buf) {
+                uint64_t kp_a = kprof_probe_begin();
+                blk_buf = (uint8_t *)kmalloc(blk_size);
+                kprof_probe_end(KPP_E2_ALLOC, kp_a);
+                if (!blk_buf) break;
+            }
             if (ext2_read_block(blk_num, blk_buf) < 0) break;
             memcpy(buf + done, blk_buf + blk_off, to_copy);
         }
         done += to_copy;
     }
-    kfree(blk_buf);
-    ext2_indcache_free(&ic);
+    if (blk_buf) {
+        uint64_t kp_f = kprof_probe_begin();
+        kfree(blk_buf);
+        kprof_probe_end(KPP_E2_ALLOC, kp_f);
+    }
     /* noatime: do NOT write the inode back on read.  Firefox's startup is
      * enormously read-heavy (libxul + hundreds of chrome/config files, many
      * small reads); an atime write-back per read turned every read into a
