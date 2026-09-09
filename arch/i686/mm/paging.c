@@ -68,11 +68,13 @@ static void reserve_kernel_pagetables(uint32_t start, uint32_t end) {
         uint32_t *pde = paging_get_pde(va);
         if (*pde & PAGE_PRESENT) continue;
         uint32_t pt_phys = pmm_alloc_frame();
-        if (!pt_phys) {
-            printk("[VMM]  FATAL: OOM reserving kernel page table for 0x%08x\n",
-                   (unsigned)va);
-            for (;;) __asm__ volatile("hlt");
-        }
+        /* FATAL by design (audit category (c)): called from paging_init before
+         * the heap exists, to put the kernel's PDEs in place so every later
+         * process pgdir snapshots them.  Nothing has allocated from the PMM
+         * yet, so failing means the machine has less RAM than the kernel
+         * image, and there is no caller to tell. */
+        if (!pt_phys)
+            panic("paging_init: no memory for a kernel page table", 0);
         pmm_frame_incref(pt_phys);          /* permanent — never freed */
         *pde = pt_phys | PAGE_PRESENT | PAGE_WRITABLE;   /* kernel-only PDE */
         uint32_t *pt = paging_get_pte(va);  /* recursive window to the new PT */
@@ -82,10 +84,10 @@ static void reserve_kernel_pagetables(uint32_t start, uint32_t end) {
 
 void paging_init(void) {
     uint32_t pd_phys = pmm_alloc_frame();
-    if (!pd_phys) {
-        printk("[PAGING] FATAL: could not allocate page directory frame\n");
-        for (;;) __asm__ volatile("hlt");
-    }
+    /* FATAL by design (audit category (c)): the kernel page directory, the
+     * very first allocation the kernel makes. */
+    if (!pd_phys)
+        panic("paging_init: no memory for the kernel page directory", 0);
 
     /*
      * The allocator may return a frame above the boot-time 4 MiB mapping.
