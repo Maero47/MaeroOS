@@ -3044,7 +3044,14 @@ int proc_vma_iter_ex(struct proc *p, int idx, uint32_t *start, uint32_t *end,
 }
 
 /* Address of the first page in [start,end) whose PTE owns a frame, or 0. */
+static uint32_t first_mapped_page_inner(uint32_t start, uint32_t end);
 static uint32_t first_mapped_page(uint32_t start, uint32_t end) {
+    uint64_t kp = kprof_probe_begin();
+    uint32_t r = first_mapped_page_inner(start, end);
+    kprof_probe_end(KPP_FIRST_MAPPED, kp);
+    return r;
+}
+static uint32_t first_mapped_page_inner(uint32_t start, uint32_t end) {
     for (uint32_t a = start; a < end; ) {
         if (!(*paging_get_pde(a) & PAGE_PRESENT)) {
             uint32_t n = (a & ~0x3FFFFFU) + 0x400000U;   /* next 4 MiB PDE */
@@ -3077,7 +3084,14 @@ static int vma_range_free(uint32_t va, uint32_t length) {
  * Returns 0 when nothing fits (-ENOMEM).  Linux searches top-down from
  * mmap_base; bottom-up first-fit gives the same reuse guarantee and keeps
  * the layout this kernel's users already expect (libraries low, stacks high). */
+static uint32_t vma_gap_find_inner(uint32_t length, uint32_t align);
 static uint32_t vma_gap_find(uint32_t length, uint32_t align) {
+    uint64_t kp = kprof_probe_begin();
+    uint32_t r = vma_gap_find_inner(length, align);
+    kprof_probe_end(KPP_GAP_FIND, kp);
+    return r;
+}
+static uint32_t vma_gap_find_inner(uint32_t length, uint32_t align) {
     struct proc *o = mmap_owner();
     if (!o || !length) return 0;
     if (align < PAGE_SIZE) align = PAGE_SIZE;
@@ -3466,8 +3480,10 @@ static int vma_populate_page(struct vma *v, uint32_t addr) {
 
     kprof_count(v->file ? KPE_PF_FILE : KPE_PF_ANON);
     preempt_disable();
+    uint64_t kp_z = kprof_probe_begin();
     uint8_t *kva = (uint8_t *)paging_temp_map(phys);
     __builtin_memset(kva, 0, PAGE_SIZE);
+    kprof_probe_end(KPP_FAULT_ZERO, kp_z);
     if (v->file) {
         uint32_t foff = v->file_off + (addr - v->start);
         struct shmap_entry *se = shmap_lookup(v->file);
@@ -3480,7 +3496,9 @@ static int vma_populate_page(struct vma *v, uint32_t addr) {
         } else if (foff < v->file_size) {
             uint32_t want = PAGE_SIZE;
             if (want > v->file_size - foff) want = v->file_size - foff;
+            uint64_t kp_r = kprof_probe_begin();
             vfs_read(v->file, foff, want, kva);
+            kprof_probe_end(KPP_FAULT_READ, kp_r);
         }
     }
     paging_temp_unmap();
@@ -3598,7 +3616,9 @@ static int sys_mmap2(registers_t *regs) {
         if (flags & MAP_FIXED_NOREPLACE_K) {
             if (!vma_range_free(va, length)) return -17;   /* -EEXIST */
         } else {
+            uint64_t kp = kprof_probe_begin();
             unmap_range(va, va + length);                 /* replace */
+            kprof_probe_end(KPP_MMAP_UNMAP, kp);
         }
     } else {
         uint32_t hint = addr & ~(uint32_t)(PAGE_SIZE - 1);
@@ -3681,9 +3701,11 @@ static int sys_mmap2(registers_t *regs) {
     if (anon) {
         struct vma *v = vma_add(va, end, prot, 0, NULL, 0);
         if (!v) return -12;
-        if (length < VMA_DEMAND_MIN && !vma_populate_range(v, va, end)) {
-            unmap_range(va, end);
-            return -12;
+        if (length < VMA_DEMAND_MIN) {
+            uint64_t kp = kprof_probe_begin();
+            int okp = vma_populate_range(v, va, end);
+            kprof_probe_end(KPP_MMAP_POP, kp);
+            if (!okp) { unmap_range(va, end); return -12; }
         }
         return (int)va;
     }
@@ -3696,9 +3718,11 @@ static int sys_mmap2(registers_t *regs) {
     {
         struct vma *v = vma_add(va, end, prot, 0, fnode, pgoff * PAGE_SIZE);
         if (!v) return -12;
-        if (length < VMA_FILE_DEMAND_MIN && !vma_populate_range(v, va, end)) {
-            unmap_range(va, end);
-            return -12;
+        if (length < VMA_FILE_DEMAND_MIN) {
+            uint64_t kp = kprof_probe_begin();
+            int okp = vma_populate_range(v, va, end);
+            kprof_probe_end(KPP_MMAP_POP, kp);
+            if (!okp) { unmap_range(va, end); return -12; }
         }
         return (int)va;
     }
@@ -6982,10 +7006,12 @@ void syscall_dispatch(registers_t *regs) {
     uint32_t num = regs->eax;
     int ret = -38;   /* -ENOSYS */
 
+    uint64_t kp_pro = kprof_probe_begin();
     if (current_proc) current_proc->last_syscall = (int)num;
     /* kprof's periodic dump.  Here rather than in the timer tick so the printk
      * runs with interrupts enabled and does not cost the tick counter time. */
     kprof_tick();
+    kprof_probe_end(KPP_SYS_PRO, kp_pro);
 
     switch (num) {
     case 1:   sys_exit(regs);                  break;  /* noreturn */
@@ -7219,7 +7245,7 @@ void syscall_dispatch(registers_t *regs) {
 
     regs->eax = (uint32_t)(int32_t)ret;
 
-
+    uint64_t kp_epi = kprof_probe_begin();
 
     /* Deliver any pending signals before returning to user mode; an
      * interrupted blocking call is restarted or fails with EINTR here (the
@@ -7230,4 +7256,5 @@ void syscall_dispatch(registers_t *regs) {
      * at the return-to-user boundary so the woken thread runs promptly (closes
      * the glibc-2.36 condvar signal-steal window for the IPC Launch thread). */
     resched_on_return();
+    kprof_probe_end(KPP_SYS_EPI, kp_epi);
 }

@@ -16,6 +16,14 @@ static uint32_t g_syscnt[KPROF_NSYS];      /* true invocations, per syscall   */
 static uint64_t g_sleep_cyc[KPROF_NSYS];   /* blocked wall time per syscall  */
 static uint32_t g_sleep_cnt[KPROF_NSYS];
 
+static uint64_t g_probe_cyc[KPP_MAX];
+static uint32_t g_probe_cnt[KPP_MAX];
+static const char *const g_probe_name[KPP_MAX] = {
+    "sys_pro", "sys_epi", "yield_pre", "sch_scan", "sch_disp",
+    "gap_find", "first_mapped", "mmap_pop", "mmap_unmap",
+    "fault_read", "fault_zero", "ata<=4", "ata>4", "kdump", "calib",
+};
+
 static int      g_cur = KPB_USER;
 static uint64_t g_last;                    /* TSC at the last bucket change  */
 static uint64_t g_base;                    /* TSC when counting started      */
@@ -46,6 +54,12 @@ int kprof_switch(int bucket) {
 }
 
 void kprof_count(int ev) { g_ev[ev]++; }
+
+uint64_t kprof_probe_begin(void) { return rdtsc64(); }
+void kprof_probe_end(int id, uint64_t t0) {
+    g_probe_cyc[id] += rdtsc64() - t0;
+    g_probe_cnt[id]++;
+}
 void kprof_syscall_enter(uint32_t nr) {
     g_syscnt[nr < KPROF_NSYS ? nr : KPROF_NSYS - 1]++;
 }
@@ -89,6 +103,7 @@ void kprof_reset(void) {
     for (int i = 0; i < KPROF_NSYS; i++) {
         g_sleep_cyc[i] = 0; g_sleep_cnt[i] = 0; g_syscnt[i] = 0;
     }
+    for (int i = 0; i < KPP_MAX; i++) { g_probe_cyc[i] = 0; g_probe_cnt[i] = 0; }
     g_base = g_last = rdtsc64();
     g_on = 1;
     if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
@@ -123,7 +138,26 @@ void kprof_dump(const char *tag) {
            (unsigned)g_ev[KPE_EXT2_BLK], (unsigned)g_ev[KPE_EXT2_HIT],
            (unsigned)g_ev[KPE_EXT2_MISS], (unsigned)g_ev[KPE_WAKE],
            (unsigned)g_ev[KPE_RESCHED]);
-    printk("[kprof] ev fb_kb=%u\n", (unsigned)g_ev[KPE_FB_KB]);
+    printk("[kprof] ev fb_kb=%u disk_blk=%u distinct=%u ra=%u ra_used=%u pf_seq=%u pf_around=%u\n",
+           (unsigned)g_ev[KPE_FB_KB], (unsigned)g_ev[KPE_EXT2_DISK],
+           (unsigned)g_ev[KPE_EXT2_DISTINCT], (unsigned)g_ev[KPE_EXT2_RA],
+           (unsigned)g_ev[KPE_EXT2_RA_USED], (unsigned)g_ev[KPE_PF_FILE_SEQ],
+           (unsigned)g_ev[KPE_PF_FILE_AROUND]);
+
+    /* Probes: additive spans, printed only when used.  Never summed with the
+     * buckets above -- see the note in kprof.h. */
+    {
+        int any = 0;
+        for (int i = 0; i < KPP_MAX; i++) if (g_probe_cnt[i]) any = 1;
+        if (any) {
+            printk("[kprof] probe");
+            for (int i = 0; i < KPP_MAX; i++)
+                if (g_probe_cnt[i])
+                    printk(" %s:%ums/%u", g_probe_name[i],
+                           cyc_ms(g_probe_cyc[i]), (unsigned)g_probe_cnt[i]);
+            printk("\n");
+        }
+    }
 
     /* Top syscalls by kernel CPU time, then by blocked wall time. */
     for (int pass = 0; pass < 2; pass++) {
@@ -159,5 +193,14 @@ void kprof_tick(void) {
     uint32_t now = pit_ticks();
     if (now - last < 1000) return;            /* every 10 s of tick time */
     last = now;
+    /* Calibrate: 256 empty spans, so a probe reading can be corrected for the
+     * cost of taking it -- and so the cost of an rdtsc on this host, which is
+     * the whole instrument, is a printed number rather than an assumption. */
+    for (int i = 0; i < 256; i++) {
+        uint64_t c0 = kprof_probe_begin();
+        kprof_probe_end(KPP_CALIB, c0);
+    }
+    uint64_t d0 = kprof_probe_begin();
     kprof_dump("periodic");
+    kprof_probe_end(KPP_DUMP, d0);
 }

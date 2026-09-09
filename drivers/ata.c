@@ -145,6 +145,10 @@ int ata_read(uint32_t lba, uint8_t count, void *buf) {
     kprof_count(KPE_ATA_RD);
     kprof_add(KPE_ATA_RD_SECT, count ? count : 256);
     int kp_old = kprof_switch(KPB_ATA);
+    /* Split the cost by transaction size so the fixed per-command cost and
+     * the per-sector cost can be separated from the totals alone. */
+    int kp_id = (count && count <= 4) ? KPP_ATA_SMALL : KPP_ATA_BIG;
+    uint64_t kp_t0 = kprof_probe_begin();
     uint32_t irq = ata_irq_save();   /* serialize the whole PIO transaction */
     ata_wait_bsy();
 
@@ -161,12 +165,18 @@ int ata_read(uint32_t lba, uint8_t count, void *buf) {
     uint16_t *ptr = (uint16_t *)buf;
 
     for (int s = 0; s < nsect; s++) {
-        if (ata_wait_drq() < 0) { ata_irq_restore(irq); kprof_switch(kp_old); return -1; }
+        if (ata_wait_drq() < 0) {
+            ata_irq_restore(irq);
+            kprof_probe_end(kp_id, kp_t0);
+            kprof_switch(kp_old);
+            return -1;
+        }
         insw(ATA_DATA, ptr, 256);  /* 256 words = 512 bytes */
         ptr += 256;
         ata_settle();
     }
     ata_irq_restore(irq);
+    kprof_probe_end(kp_id, kp_t0);
     kprof_switch(kp_old);
     return 0;
 }

@@ -136,16 +136,23 @@ static int g_mounted = 0;
  * 64 blocks keeps a transaction's interrupts-off window near 100 us. */
 #define EXT2_READ_CLUSTER  64
 
-#define EXT2_CACHE_MAX_SETS 4096                /* power of two */
 #define EXT2_CACHE_WAYS     4
-#define EXT2_CACHE_SLOTS    (EXT2_CACHE_MAX_SETS * EXT2_CACHE_WAYS)
 
-/* Share of free physical memory the cache may hold, and a floor so that a tiny
- * machine still gets a useful one. */
+/* Share of free physical memory the cache may hold, a floor so that a tiny
+ * machine still gets a useful one, and a ceiling.
+ *
+ * The ceiling is what the working set asks for, not a guess: a Firefox startup
+ * fetches ~216 000 blocks off the platter but only ~93 000 DISTINCT ones (the
+ * disk_blk/distinct counters in kprof), so 57 % of the disk traffic was blocks
+ * the kernel had already read and evicted.  128 MiB holds all of them with room
+ * to spare and still leaves the 2 GiB machine 94 % of its memory.  Anything
+ * larger buys nothing on this workload; the share keeps a small machine honest
+ * (a 128 MiB guest still lands on 8 MiB, exactly as before). */
 #define EXT2_CACHE_MEM_SHARE  8                 /* one eighth of free RAM */
 #define EXT2_CACHE_MIN_SETS   8
+#define EXT2_CACHE_MAX_BYTES  (128u * 1024u * 1024u)
 
-static uint8_t  *g_cache_slab;                  /* one allocation for all slots */
+static uint8_t  *g_cache_slab;                  /* one allocation for all buffers */
 static uint32_t  g_cache_setmask;               /* sets in use, minus one       */
 
 typedef struct {
@@ -155,7 +162,10 @@ typedef struct {
     uint8_t *data;
 } ext2_cache_entry_t;
 
-static ext2_cache_entry_t g_cache[EXT2_CACHE_SLOTS];
+/* The slot array is allocated at mount alongside the slab, so the cache size is
+ * decided by the machine rather than reserved in the kernel's BSS. */
+static ext2_cache_entry_t *g_cache;
+static uint32_t g_cache_slots;
 static uint32_t g_cache_age = 1;
 static int g_cache_ready = 0;
 
@@ -206,7 +216,43 @@ static uint32_t ext2_now(void) {
     return pit_ticks() / 100U;
 }
 
+/* Read-volume accounting.  The question this profiling round asks is whether
+ * the disk time is spent fetching data the kernel has never seen or re-fetching
+ * blocks it read and then evicted, and the bucket totals cannot tell those
+ * apart.  One bit per block of the volume answers it exactly: every block that
+ * comes off the platter is counted, and the ones whose bit was still clear are
+ * counted again as distinct.  128 KiB for the 1 GiB image, one bit test per
+ * block fetched. */
+static uint8_t *g_seen;                 /* bit per block: fetched at least once */
+static uint32_t g_seen_blocks;
+
+static void ext2_seen_init(void) {
+    g_seen = (uint8_t *)0;
+    g_seen_blocks = 0;
+    if (!g_state.blocks_count || g_state.blocks_count > (1u << 24)) return;
+    uint32_t bytes = (g_state.blocks_count + 7u) / 8u;
+    g_seen = (uint8_t *)kmalloc(bytes);
+    if (!g_seen) return;
+    memset(g_seen, 0, bytes);
+    g_seen_blocks = g_state.blocks_count;
+}
+
+/* Count `n` blocks starting at `blk` as fetched from disk. */
+static void ext2_account_fetch(uint32_t blk, uint32_t n) {
+    kprof_add(KPE_EXT2_DISK, n);
+    if (!g_seen) return;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t b = blk + i;
+        if (b >= g_seen_blocks) return;
+        if (!(g_seen[b >> 3] & (uint8_t)(1u << (b & 7u)))) {
+            g_seen[b >> 3] |= (uint8_t)(1u << (b & 7u));
+            kprof_count(KPE_EXT2_DISTINCT);
+        }
+    }
+}
+
 static int ext2_raw_read_block(uint32_t blk, void *buf) {
+    ext2_account_fetch(blk, 1);
     uint32_t lba = g_state.lba_offset + blk * g_state.sectors_per_block;
     /* Read sectors_per_block sectors; handle block sizes > 255*512 by looping */
     if (g_state.sectors_per_block <= 255) {
@@ -229,6 +275,7 @@ static int ext2_raw_read_block(uint32_t blk, void *buf) {
  * `n` is bounded by the caller (EXT2_READ_CLUSTER), and the sector count of one
  * ATA command by 255. */
 static int ext2_raw_read_blocks(uint32_t blk, uint32_t n, void *buf) {
+    ext2_account_fetch(blk, n);
     uint32_t lba  = g_state.lba_offset + blk * g_state.sectors_per_block;
     uint32_t rem  = n * g_state.sectors_per_block;
     uint8_t *p    = (uint8_t *)buf;
@@ -261,31 +308,34 @@ static int ext2_raw_write_block(uint32_t blk, const void *buf) {
 static void ext2_cache_init(void) {
     g_cache_ready = 0;
     g_cache_age = 1;
-    for (uint32_t i = 0; i < EXT2_CACHE_SLOTS; i++) {
-        g_cache[i].blk = 0;
-        g_cache[i].age = 0;
-        g_cache[i].valid = 0;
-        g_cache[i].data = (uint8_t *)0;
-    }
+    if (g_cache_slab) { kfree(g_cache_slab); g_cache_slab = (uint8_t *)0; }
+    if (g_cache) { kfree(g_cache); g_cache = (ext2_cache_entry_t *)0; }
+    g_cache_slots = 0;
 
-    /* How many sets can we afford?  A share of free memory, capped by the slot
-     * array, floored so a small machine still caches something.  Sets are a
-     * power of two so the bucket index is a mask. */
+    /* How many sets can we afford?  A share of free memory, capped by
+     * EXT2_CACHE_MAX_BYTES, floored so a small machine still caches something.
+     * Sets are a power of two so the bucket index is a mask. */
     /* Frames * (PAGE_SIZE / SHARE) rather than (frames * PAGE_SIZE) / SHARE:
      * the kernel links no libgcc 64-bit division helpers, and the share divides
      * the page size exactly. */
     uint32_t share = pmm_free_frames() * (PAGE_SIZE / EXT2_CACHE_MEM_SHARE);
+    if (share > EXT2_CACHE_MAX_BYTES) share = EXT2_CACHE_MAX_BYTES;
     uint32_t want  = share / (g_state.block_size * EXT2_CACHE_WAYS);
     uint32_t sets  = EXT2_CACHE_MIN_SETS;
-    while (sets * 2u <= want && sets * 2u <= EXT2_CACHE_MAX_SETS) sets *= 2u;
+    while (sets * 2u <= want) sets *= 2u;
 
-    /* One slab for every buffer.  If it will not fit, halve and retry rather
-     * than fall back to per-slot allocations, which would flood the heap's
-     * free list (see the note above). */
+    /* One slab for every buffer, one array for every slot.  If they will not
+     * fit, halve and retry rather than fall back to per-slot allocations, which
+     * would flood the heap's free list (see the note above). */
     while (sets >= EXT2_CACHE_MIN_SETS) {
-        uint32_t bytes = sets * EXT2_CACHE_WAYS * g_state.block_size;
-        g_cache_slab = (uint8_t *)kmalloc(bytes);
-        if (g_cache_slab) break;
+        uint32_t slots = sets * EXT2_CACHE_WAYS;
+        g_cache = (ext2_cache_entry_t *)kmalloc(slots * sizeof(*g_cache));
+        if (g_cache) {
+            g_cache_slab = (uint8_t *)kmalloc(slots * g_state.block_size);
+            if (g_cache_slab) { g_cache_slots = slots; break; }
+            kfree(g_cache);
+            g_cache = (ext2_cache_entry_t *)0;
+        }
         sets /= 2u;
     }
     if (!g_cache_slab) {
@@ -295,8 +345,12 @@ static void ext2_cache_init(void) {
     }
 
     g_cache_setmask = sets - 1u;
-    for (uint32_t i = 0; i < sets * EXT2_CACHE_WAYS; i++)
+    for (uint32_t i = 0; i < g_cache_slots; i++) {
+        g_cache[i].blk = 0;
+        g_cache[i].age = 0;
+        g_cache[i].valid = 0;
         g_cache[i].data = g_cache_slab + (size_t)i * g_state.block_size;
+    }
     printk("[EXT2] block cache %u KiB (%u sets x %u ways of %u B)\n",
            (unsigned)(sets * EXT2_CACHE_WAYS * g_state.block_size / 1024u),
            (unsigned)sets, (unsigned)EXT2_CACHE_WAYS,
@@ -1833,6 +1887,7 @@ vfs_node_t *ext2_mount(uint32_t lba_offset) {
     g_state.inode_size        = (sb->s_rev_level >= 1) ? sb->s_inode_size : 128;
 
     ext2_cache_init();
+    ext2_seen_init();
     g_mounted = 1;
 
     printk("[EXT2]  Mounted: block_size=%u  inodes=%u  inode_size=%u cache=%s\n",

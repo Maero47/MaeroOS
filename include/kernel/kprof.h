@@ -42,7 +42,40 @@ enum {
     KPE_ATA_RD, KPE_ATA_RD_SECT, KPE_ATA_WR, KPE_ATA_WR_SECT,
     KPE_EXT2_BLK, KPE_EXT2_HIT, KPE_EXT2_MISS,
     KPE_WAKE, KPE_RESCHED, KPE_FB_KB,
+    KPE_EXT2_DISK,          /* blocks actually fetched off the platter      */
+    KPE_EXT2_DISTINCT,      /* of those, blocks fetched for the first time  */
+    KPE_EXT2_RA,            /* blocks fetched purely as read-ahead          */
+    KPE_EXT2_RA_USED,       /* read-ahead blocks later served from the cache */
+    KPE_PF_FILE_SEQ,        /* file fault on the page after the previous one */
+    KPE_PF_FILE_AROUND,     /* pages populated by fault-around, not faulted  */
     KPE_MAX
+};
+
+/*
+ * Probes — named (cycles, count) accumulators for zooming into one code span.
+ *
+ * They are ADDITIVE and deliberately outside the exclusive bucket accounting:
+ * a probe may nest inside another probe or inside any bucket, so probe totals
+ * do not sum to anything and must never be added to the bucket table.  They
+ * answer "how much of syscall X is this function", which the buckets cannot.
+ */
+enum {
+    KPP_SYS_PRO,        /* syscall_dispatch prologue (before the switch)     */
+    KPP_SYS_EPI,        /* syscall_dispatch epilogue (signals + resched)     */
+    KPP_YIELD_PRE,      /* yield() up to the park                            */
+    KPP_SCHED_SCAN,     /* scheduler ptable scan up to picking a thread      */
+    KPP_SCHED_DISP,     /* dispatch prologue: tss, tls, cr3, fpu             */
+    KPP_GAP_FIND,       /* vma_gap_find                                      */
+    KPP_FIRST_MAPPED,   /* first_mapped_page                                 */
+    KPP_MMAP_POP,       /* eager population inside mmap2                     */
+    KPP_MMAP_UNMAP,     /* unmap_range inside mmap2                          */
+    KPP_FAULT_READ,     /* vfs_read inside a file-backed fault               */
+    KPP_FAULT_ZERO,     /* the memset of a freshly allocated fault frame     */
+    KPP_ATA_SMALL,      /* ata_read of <= 4 sectors                          */
+    KPP_ATA_BIG,        /* ata_read of  > 4 sectors                          */
+    KPP_DUMP,           /* the profiler's own periodic dump (printk to serial) */
+    KPP_CALIB,          /* an empty span: the cost of a probe pair itself      */
+    KPP_MAX
 };
 
 /* Charge the cycles since the last switch to the current bucket, make `bucket`
@@ -63,6 +96,11 @@ void kprof_syscall_enter(uint32_t nr);
  * The token is the caller's, so concurrent sleepers do not share state. */
 uint64_t kprof_sleep_begin(void);
 void     kprof_sleep_end(uint64_t token, int syscall_nr);
+
+/* Probe timing.  kprof_probe_begin() is a bare rdtsc; the end call charges the
+ * delta to `id`.  Cheap enough to leave in place (two rdtsc per span). */
+uint64_t kprof_probe_begin(void);
+void     kprof_probe_end(int id, uint64_t t0);
 
 void kprof_dump(const char *tag);
 void kprof_reset(void);

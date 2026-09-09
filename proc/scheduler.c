@@ -42,12 +42,15 @@ void scheduler_init(void) {
 void scheduler_start(void) {
     for (;;) {
         int ran = 0;
+        uint64_t scan_t0 = kprof_probe_begin();
 
         for (int i = 0; i < MAX_PROCS; i++) {
             struct proc *p = &ptable[i];
             if (p->state != PROC_RUNNABLE) continue;
 
             ran = 1;
+            kprof_probe_end(KPP_SCHED_SCAN, scan_t0);
+            uint64_t disp_t0 = kprof_probe_begin();
             current_proc   = p;
             p->state       = PROC_RUNNING;
             p->time_slice  = DEFAULT_TIMESLICE;
@@ -64,6 +67,7 @@ void scheduler_start(void) {
                 __asm__ volatile("mov %0, %%cr3" :: "r"(p->pgdir_phys) : "memory");
 
             fpu_restore(fpu_area(p));
+            kprof_probe_end(KPP_SCHED_DISP, disp_t0);
             kprof_count(KPE_CTXSW);
             kprof_switch(p->kprof_bucket);   /* charge the dispatch to KPB_SCHED */
             swtch(&scheduler_ctx, p->context);
@@ -81,6 +85,7 @@ void scheduler_start(void) {
             if (p->state == PROC_ZOMBIE && p->pid != p->tgid)
                 proc_release(p);
             __asm__ volatile("sti");
+            scan_t0 = kprof_probe_begin();
         }
 
         /* Nothing runnable: halt until the next interrupt (PIT tick, key,
@@ -161,7 +166,9 @@ static inline void kprof_park(void) {
 
 void yield(void) {
     if (!current_proc) return;
+    uint64_t yp = kprof_probe_begin();
     current_proc->state = PROC_RUNNABLE;
+    kprof_probe_end(KPP_YIELD_PRE, yp);
     kprof_park();
     __asm__ volatile("cli");
     swtch(&current_proc->context, scheduler_ctx);
