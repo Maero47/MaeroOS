@@ -68,6 +68,10 @@ void kprof_syscall_enter(uint32_t nr) {
     g_syscnt[nr < KPROF_NSYS ? nr : KPROF_NSYS - 1]++;
 }
 
+uint32_t kprof_syscall_count(uint32_t nr) {
+    return nr < KPROF_NSYS ? g_syscnt[nr] : 0;
+}
+
 /* Blocked time.  sleep_on() records the TSC before switching away and charges
  * the elapsed wall time to the syscall that blocked when it comes back, so
  * "the browser spent 90 s in futex" is measurable independently of who ran. */
@@ -110,6 +114,26 @@ void kprof_reset(void) {
     g_base = g_last = rdtsc64();
     g_on = 1;
     if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
+}
+
+/* Window accounting for the watchdog: the three numbers below are read as
+ * deltas, so each call reports only the interval since the last one. */
+static uint64_t w_user, w_idle, w_tot;
+
+void kprof_window_ms(unsigned *user, unsigned *idle, unsigned *kern) {
+    /* Close the running bucket so the counters include the cycles up to now,
+     * and leave the caller's bucket in effect. */
+    int cur = kprof_switch(KPB_SCHED);
+    g_cur = cur;
+
+    uint64_t tot = 0;
+    for (int i = 0; i < KPROF_NBUCKET; i++) tot += g_cyc[i];
+    uint64_t u = g_cyc[KPB_USER], d = g_cyc[KPB_IDLE];
+    uint64_t du = u - w_user, dd = d - w_idle, dt = tot - w_tot;
+    if (user) *user = cyc_ms(du);
+    if (idle) *idle = cyc_ms(dd);
+    if (kern) *kern = cyc_ms(dt > du + dd ? dt - du - dd : 0);
+    w_user = u; w_idle = d; w_tot = tot;
 }
 
 void kprof_dump(const char *tag) {

@@ -107,6 +107,12 @@ static inline void kprof_add(int ev, uint32_t n) { kprof_ev[ev] += n; }
  * switches, which also fire when a parked thread is re-dispatched. */
 void kprof_syscall_enter(uint32_t nr);
 
+/* Invocations of one syscall so far.  The watchdog subtracts sched_yield from
+ * the total: two respawnprobe services sit in `while (1) sched_yield()` for the
+ * whole life of the machine, so the raw syscall count keeps climbing at ~800k/s
+ * even when nothing else is alive, and is therefore not a progress signal. */
+uint32_t kprof_syscall_count(uint32_t nr);
+
 /* Blocked (not runnable) wall time, attributed to the syscall that blocked.
  * The token is the caller's, so concurrent sleepers do not share state. */
 uint64_t kprof_sleep_begin(void);
@@ -119,4 +125,10 @@ void     kprof_probe_end(int id, uint64_t t0);
 
 void kprof_dump(const char *tag);
 void kprof_reset(void);
+
+/* Milliseconds spent in user code, idle (halted with nothing runnable) and
+ * everything else, SINCE THE PREVIOUS CALL.  One call answers "is this stall
+ * a lost wake-up or a spin?" — an all-idle window means every thread is
+ * asleep, an all-user or all-kernel window means something is looping. */
+void kprof_window_ms(unsigned *user, unsigned *idle, unsigned *kern);
 void kprof_tick(void);          /* called from scheduler_tick: periodic dump */
