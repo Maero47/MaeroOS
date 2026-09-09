@@ -177,6 +177,12 @@ def kill_qemu(proc):
 
 def boot(args):
     """Start QEMU and wait for the shell prompt.  Returns (proc, sel, log)."""
+    # p26 measures real ext2 free space, so the volume must exist.  Without this
+    # QEMU fails to open it and the run dies at "no shell prompt within N s",
+    # which says nothing about the actual cause.
+    if not os.path.exists(os.path.join(ROOT, "disk.img")):
+        raise SystemExit("smoke_abi: disk.img is missing - run `make disk` first "
+                         "(or use `make smoke-abi`, which builds it)")
     proc = subprocess.Popen(
         # The ext2 volume is attached because p26 measures real filesystem
         # free space; the probes that predate it ignore it.

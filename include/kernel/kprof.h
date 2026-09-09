@@ -73,6 +73,11 @@ enum {
     KPP_FAULT_ZERO,     /* the memset of a freshly allocated fault frame     */
     KPP_ATA_SMALL,      /* ata_read of <= 4 sectors                          */
     KPP_ATA_BIG,        /* ata_read of  > 4 sectors                          */
+    KPP_E2_HEAD,        /* ext2_cache_lookup before the set scan             */
+    KPP_E2_TAIL,        /* ext2_cache_lookup after the copy                  */
+    KPP_E2_NULL,        /* an empty span next to e2_copy: probe cost in situ  */
+    KPP_E2_FIND,        /* ext2_cache_find alone (the set scan)              */
+    KPP_E2_MEMCPY,      /* the memcpy out of a cache slot                    */
     KPP_E2_ALLOC,       /* the kmalloc/kfree pair in ext2_read_node          */
     KPP_E2_INODE,       /* ext2_read_inode per read                          */
     KPP_E2_BMAP,        /* ext2_file_blk_cached (the block map walk)         */
@@ -94,8 +99,12 @@ static inline int kprof_sys_bucket(uint32_t nr) {
     return KPB_SYSBASE + (int)(nr < KPROF_NSYS ? nr : KPROF_NSYS - 1);
 }
 
-void kprof_count(int ev);
-void kprof_add(int ev, uint32_t n);
+/* The event counters are hit several times per block-cache operation and
+ * millions of times per startup, so they are incremented in place rather than
+ * through a call into kprof.c. */
+extern uint64_t kprof_ev[KPE_MAX];
+static inline void kprof_count(int ev) { kprof_ev[ev]++; }
+static inline void kprof_add(int ev, uint32_t n) { kprof_ev[ev] += n; }
 
 /* One entry into syscall `nr` from user mode.  Separate from the bucket
  * switches, which also fire when a parked thread is re-dispatched. */

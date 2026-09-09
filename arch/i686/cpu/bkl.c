@@ -6,8 +6,38 @@ struct cpu cpus[MAX_CPUS];
 
 static spinlock_t g_bkl = { 0 };
 
+/*
+ * `current_proc` is `cpus[this_cpu_id()].proc`, so this function is on the path
+ * of every single reference to the running thread -- and it read the Local APIC
+ * ID register to answer.  That register lives in the LAPIC's MMIO page, and a
+ * guest access to it exits to the hypervisor: measured on this kernel, one
+ * `current_proc` dereference cost about 1.6 us.  `preempt_disable()` names it
+ * twice and `preempt_enable()` three times, so guarding one block-cache lookup
+ * cost 8 us against 0.2 us of actual work, and the exits added up to roughly a
+ * third of a Firefox startup.
+ *
+ * While only one CPU is executing, the answer cannot change, so it is read once
+ * and remembered.  The moment an AP is about to be started, smp_percpu_go_multi
+ * turns the cache off and every call reads the register again, exactly as
+ * before -- the fast path is not an assumption about the machine, it is a fact
+ * about how many CPUs are running.
+ */
+static uint32_t g_solo_id;
+static int      g_solo_valid;
+static volatile int g_multi_cpu;
+
+void smp_percpu_go_multi(void) { g_multi_cpu = 1; }
+
 uint32_t this_cpu_id(void) {
     if (!apic_available()) return 0;
+    if (!g_multi_cpu) {
+        if (!g_solo_valid) {
+            uint32_t boot = apic_id();
+            g_solo_id    = boot < MAX_CPUS ? boot : 0;
+            g_solo_valid = 1;
+        }
+        return g_solo_id;
+    }
     uint32_t id = apic_id();
     return id < MAX_CPUS ? id : 0;
 }
