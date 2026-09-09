@@ -78,6 +78,8 @@ PROBES = {
     # Writes and deletes 2 MiB twelve times over the ATA PIO disk, so it needs
     # far longer than a probe that only exercises the ABI in memory.
     "p26_unlink_frees_space":  (240, ""),
+    # Writes 3 MiB and reads it back three ways over the ATA PIO disk.
+    "p27_indirect_blocks":     (240, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

@@ -42,6 +42,8 @@ regression tests for the fixes in audit section 5.
 | P23 | `p23_exec_dethread.c`       | C3 | 10 |
 | P24 | `p24_unlink_open.c`         | tmpfs node lifetime (unlink while open) | — |
 | P25 | `p25_ptmx_lookup.c`         | fix round 1: PTY leaked by a lookup | — |
+| P26 | `p26_unlink_frees_space.c`  | perf round 2: unlink and truncate leaked blocks | — |
+| P27 | `p27_indirect_blocks.c`     | perf round 3: the rewritten ext2 block map | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the
@@ -117,6 +119,21 @@ that a `stat()` of an unopened slave does not change what the master's
 `poll`/`read` report.  It compares the master before and after rather than
 asserting an absolute hangup behaviour, because Linux (blocks until the slave
 has been opened once) and MaeroOS (reports EOF) legitimately differ there.
+
+P27 is a guard rather than a demonstration: nothing was broken when it was
+written.  It exists because the ext2 indirect walk was rewritten for speed --
+it used to copy each whole indirect block out of the block cache into a
+kmalloc'd buffer and index the copy, and now reads the single 32-bit pointer
+it wants straight out of the cache slot.  That is the one piece of the driver
+whose failure mode is silently returning the wrong bytes rather than an error,
+so it is worth asserting.  The probe writes 3 MiB (past the singly-indirect
+range of a 1 KiB-block ext2, ~2.7 MiB into the doubly-indirect one), stamps
+every 4-byte word with its own file offset, and reads it back forwards through
+`read`, backwards through `pread` and again through a private `mmap` -- so a
+page resolved to the wrong disk block reports the offset it actually came
+from.  The triply-indirect range would need a file past ~64 MiB, too slow to
+write over PIO here; Firefox's own 175 MiB `libxul.so` exercises it on every
+`make smoke-firefox`.
 
 `tools/smoke_abi.py` runs each probe from the shell over the serial console,
 reads the verdict line and prints a summary `N pass, M xfail, K unexpected

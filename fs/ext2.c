@@ -363,26 +363,18 @@ static void ext2_cache_insert(uint32_t blk, const void *buf);
 /* Copy `blk` out of the cache if it is there.  1 on a hit, 0 on a miss. */
 static int ext2_cache_lookup(uint32_t blk, void *buf) {
     int hit = 0;
-    uint64_t kp_h = kprof_probe_begin();
     kprof_count(KPE_EXT2_BLK);
     preempt_disable();
-    kprof_probe_end(KPP_E2_HEAD, kp_h);
     if (g_cache_ready) {
-        uint64_t kp_fi = kprof_probe_begin();
         ext2_cache_entry_t *e = ext2_cache_find(blk);
-        kprof_probe_end(KPP_E2_FIND, kp_fi);
         if (e) {
-            uint64_t kp_mc = kprof_probe_begin();
             memcpy(buf, e->data, g_state.block_size);
-            kprof_probe_end(KPP_E2_MEMCPY, kp_mc);
             e->age = g_cache_age++;
             hit = 1;
         }
     }
-    uint64_t kp_t = kprof_probe_begin();
     preempt_enable();
     kprof_count(hit ? KPE_EXT2_HIT : KPE_EXT2_MISS);
-    kprof_probe_end(KPP_E2_TAIL, kp_t);
     return hit;
 }
 
@@ -440,9 +432,7 @@ static ext2_cache_entry_t *ext2_cache_get(uint32_t blk) {
     preempt_disable();                     /* released by ext2_cache_put */
     if (!g_cache_ready) return (ext2_cache_entry_t *)0;
 
-    uint64_t kp_fi = kprof_probe_begin();
     ext2_cache_entry_t *e = ext2_cache_find(blk);
-    kprof_probe_end(KPP_E2_FIND, kp_fi);
     if (e) {
         e->age = g_cache_age++;
         kprof_count(KPE_EXT2_HIT);
@@ -480,9 +470,7 @@ static int ext2_read_block_part(uint32_t blk, uint32_t off, uint32_t len,
         kfree(tmp);
         return 0;
     }
-    uint64_t kp_mc = kprof_probe_begin();
     memcpy(out, e->data + off, len);
-    kprof_probe_end(KPP_E2_MEMCPY, kp_mc);
     ext2_cache_put();
     return 0;
 }
@@ -1010,8 +998,6 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
          * blocks as the request still needs, so a 4 KiB page fault on a
          * contiguous file costs one ATA transaction instead of four. */
         if (blk_off == 0 && to_copy == blk_size) {
-            uint64_t kp_n = kprof_probe_begin();
-            kprof_probe_end(KPP_E2_NULL, kp_n);
             uint64_t kp_c = kprof_probe_begin();
             int miss = !ext2_cache_lookup(blk_num, buf + done);
             kprof_probe_end(KPP_E2_COPY, kp_c);

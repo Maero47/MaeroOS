@@ -79,9 +79,13 @@ void scheduler_start(void) {
             swtch(&scheduler_ctx, p->context);
             /* Back in the scheduler: the outgoing thread already parked its own
              * bucket and left KPB_SCHED current (see kprof_park below). */
+            uint64_t s_f = kprof_probe_begin();
             fpu_save(fpu_area(p));
+            kprof_probe_end(KPP_SCHED_FPUSAVE, s_f);
 
+            uint64_t s_c = kprof_probe_begin();
             __asm__ volatile("mov %0, %%cr3" :: "r"(kernel_pgdir_phys) : "memory");
+            kprof_probe_end(KPP_SCHED_KCR3, s_c);
             current_proc = NULL;
             /* A non-leader thread that just exited is released here, on the
              * scheduler's own stack, now that its kernel stack is no longer in
