@@ -106,6 +106,7 @@ testfiles/awk
 /testfiles/printf
 /testfiles/ps
 /testfiles/ptytest
+/testfiles/raceprobe
 /testfiles/randprobe
 /testfiles/readlink
 /testfiles/reboot

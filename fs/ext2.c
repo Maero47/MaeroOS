@@ -331,7 +331,13 @@ static int ext2_read_block(uint32_t blk, void *buf) {
      * read, so it resumes copying a DIFFERENT block's bytes → corrupt directory
      * data → spurious ENOENT on a file that exists (the intermittent
      * "/disk/shell not found" boot flake and flaky smoke-disk).  Serialize the
-     * whole cache access (the raw ATA read already runs with IRQs off). */
+     * whole cache access (the raw ATA read already runs with IRQs off).
+     *
+     * CACHE INVARIANT: the guard must span the raw read AND the insert that
+     * publishes it, never just the insert.  A writer running in between would
+     * make the disk newer than what we are about to publish, and our insert
+     * would then leave the cache permanently stale for that block.  The
+     * clustered read in ext2_read_node holds the same invariant. */
     kprof_count(KPE_EXT2_BLK);
     preempt_disable();
     if (g_cache_ready) {
@@ -1032,11 +1038,33 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
                            == blk_num + run)
                     run++;
                 if (run > 1) {
-                    if (ext2_raw_read_blocks(blk_num, run, buf + done) < 0) break;
+                    /* CACHE INVARIANT: the raw read and the inserts that
+                     * publish it MUST be one non-preemptible section, exactly
+                     * as in ext2_read_block.  Otherwise a writer that runs in
+                     * between puts fresh contents in the cache and on the disk,
+                     * and this thread then republishes the copy it read BEFORE
+                     * that write - leaving the cache permanently disagreeing
+                     * with the disk for those blocks.  That is silent data
+                     * corruption, not a stale-performance problem.
+                     *
+                     * Holding the guard across the transfer is nearly free
+                     * here: ata_read already runs the whole transfer with
+                     * interrupts disabled (one cluster is at most 128 sectors,
+                     * a single ATA command), so preemption was impossible for
+                     * the expensive part anyway.  The guard only adds the gaps
+                     * around it - which are precisely the gaps the race needs.
+                     * That is why this is a wider guard rather than a
+                     * generation stamp on each block: same outcome, no new
+                     * state, and it matches the single-block path. */
+                    int failed;
                     preempt_disable();
-                    for (uint32_t r = 0; r < run; r++)
-                        ext2_cache_insert(blk_num + r, buf + done + r * blk_size);
+                    failed = ext2_raw_read_blocks(blk_num, run, buf + done) < 0;
+                    if (!failed)
+                        for (uint32_t r = 0; r < run; r++)
+                            ext2_cache_insert(blk_num + r,
+                                              buf + done + r * blk_size);
                     preempt_enable();
+                    if (failed) break;
                     kprof_add(KPE_EXT2_BLK, run);
                     kprof_add(KPE_EXT2_MISS, run);
                     done += run * blk_size;
