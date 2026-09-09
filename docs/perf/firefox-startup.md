@@ -129,6 +129,34 @@ Three changes:
 
 Transactions **367 k -> 63 k**, hit rate **34 % -> 55 %**, `ata` **71.6 s -> 34.4 s**.
 
+### A correctness note on the clustered read
+
+The clustered read must hold the block cache's guard across **both** the disk
+transfer and the inserts that publish it, not just the inserts — otherwise a
+writer running in between makes the disk newer than what the reader is about to
+publish, and the cache is left disagreeing with the disk until those blocks are
+evicted. `ext2_read_block` has always held the guard across both halves; the
+clustered path initially did not, and now does.
+
+Holding it across the transfer is nearly free: `ata_read` already runs the whole
+transfer with interrupts disabled (a cluster is at most 128 sectors, one ATA
+command), so preemption was impossible for the expensive part anyway.
+
+Measured, the window could not in fact be entered on this kernel:
+`scheduler_tick` only preempts a thread it interrupts in **user** mode, the
+window contains no voluntary yield or sleep, and every trap holds the big kernel
+lock. Instrumenting the window to count context switches across it recorded
+**51 626 clustered reads during a Firefox startup with 40+ threads and zero
+crossings**. The defect was latent, not live — but the code was relying on a
+global scheduling property instead of a local invariant, which an
+interrupt-driven disk driver or preemptible kernel sections would silently
+invalidate.
+
+`tools/race_probe.py` (probe in `userspace/raceprobe/`) runs a reader that mmaps
+a file several times larger than the block cache and faults every page, against
+a thread rewriting whole blocks of that file, then verifies every block through
+a fresh open.
+
 ### A measured wrong turn worth recording
 
 The obvious next step — make the cache much bigger — made the system *slower*.
@@ -155,6 +183,7 @@ Five runs per configuration, `make smoke-firefox` (KVM, `-smp 1`, 2 GiB):
 | (rejected) per-slot 32 MiB cache | 112.5 (one run, abandoned) | - | - |
 | + slab-backed, memory-sized cache | 67.3 65.5 67.1 67.9 65.8 | **66.7 s** | 2.4 s |
 | the same, with `-cpu host` | 66.9 67.7 65.7 66.8 67.3 | 66.9 s | 2.0 s |
+| + the clustered-read cache guard | 67.9 67.5 66.5 67.4 66.7 | 67.2 s | 1.4 s |
 
 The run-to-run spread collapsing from ~32 s to ~2 s is itself a result: the
 variance was the variable amount of screen blitting and repeated disk reading,
