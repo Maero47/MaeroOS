@@ -452,17 +452,12 @@ static void send_pointer(xclient_t *c, xres_t *w, int type, int detail,
  *    is the US layout, indexed by LINUX keycode.
  * 3. MODIFIERS.  GetModifierMapping has to name the keycodes that act as
  *    Shift/Lock/Control/Mod1, or the `state` mask in a KeyPress means nothing
- *    to the client.
+ *    to the client.  The mask itself needs no translation: wm.h's WM_MOD_*
+ *    values ARE X11's ShiftMask/LockMask/ControlMask/Mod1Mask.
  */
 #define X_KEYCODE_BASE 8       /* X keycode = Linux keycode + 8 */
 #define KEYMAP_MAX     128     /* Linux keycodes we describe (0..127) */
 #define KEYSYMS_PER_KEYCODE 2  /* column 0 = unshifted, column 1 = shifted */
-
-/* X11 modifier mask bits (SETofKEYBUTMASK), matching wm.h's WM_MOD_*. */
-#define X_SHIFT_MASK   0x01
-#define X_LOCK_MASK    0x02
-#define X_CONTROL_MASK 0x04
-#define X_MOD1_MASK    0x08
 
 /* Linux keycodes of the keys that carry a modifier (see drivers/keyboard.c). */
 #define LK_LEFTCTRL 29
