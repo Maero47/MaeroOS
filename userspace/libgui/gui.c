@@ -300,6 +300,10 @@ void gui_set_layout(gui_window_t *gui, gui_layout_cb callback) {
     gui->layout = callback;
 }
 
+void gui_set_rawkey_handler(gui_window_t *gui, gui_rawkey_cb callback) {
+    if (gui) gui->on_rawkey = callback;
+}
+
 void gui_set_key_handler(gui_window_t *gui, gui_key_cb callback) {
     if (!gui) return;
     gui->on_key = callback;
@@ -599,6 +603,9 @@ int gui_poll(gui_window_t *gui) {
             handle_scroll(gui, &event);
         } else if (event.type == WM_EVENT_KEY) {
             handle_key(gui, &event);
+        } else if (event.type == WM_EVENT_RAWKEY) {
+            if (gui->on_rawkey)
+                gui->on_rawkey(gui, event.code, event.value, event.mods);
         } else if (event.type == WM_EVENT_FOCUS) {
             gui->focused = 1;
         } else if (event.type == WM_EVENT_GEOM) {

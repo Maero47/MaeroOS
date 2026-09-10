@@ -21,6 +21,19 @@ enum {
     WM_EVENT_GEOM = 4,
     WM_EVENT_CLOSE = 5,
     WM_EVENT_SCROLL = 6,   /* mouse wheel at (x,y); value = notches (+ = up) */
+    WM_EVENT_RAWKEY = 7,   /* uncooked key: code + press/release + modifier mask */
+};
+
+/*
+ * Modifier mask carried by WM_EVENT_RAWKEY.  The values are deliberately the
+ * X11 ones (ShiftMask, LockMask, ControlMask, Mod1Mask) so maeroX can put the
+ * mask straight into a KeyPress event's `state` field without a second table.
+ */
+enum {
+    WM_MOD_SHIFT = 1,
+    WM_MOD_LOCK  = 2,
+    WM_MOD_CTRL  = 4,
+    WM_MOD_ALT   = 8,
 };
 
 typedef struct {
@@ -32,6 +45,7 @@ typedef struct {
     int code;
     int value;
     int ascii;
+    int mods;                 /* WM_EVENT_RAWKEY: WM_MOD_* bitmask */
     int w;
     int h;
 } wm_event_t;

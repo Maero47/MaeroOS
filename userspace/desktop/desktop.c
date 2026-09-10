@@ -11,6 +11,7 @@
 #include <sys/ioctl.h>
 #include <syscall.h>
 #include <unistd.h>
+#include <wm.h>          /* WM_MOD_* — the modifier mask sent to clients */
 
 #include "font8x16.h"
 #include "font_ui16.h"   /* AA proportional UI font (tools/mkfont.py) */
@@ -2340,6 +2341,24 @@ static void emit_client_key_event(uint16_t code, int value, char ch) {
     emit_wm_event("key %d %d %d %d", slot, (int)code, value, (int)ch);
 }
 
+/* The uncooked key stream.  "key" above is cooked for text widgets: presses
+ * only, the modifier keys swallowed, Ctrl already folded into the character.
+ * An app that is itself a keyboard consumer (maeroX, which has to build X11
+ * KeyPress/KeyRelease events) needs the opposite — the Linux keycode, whether
+ * it went down or up, and which modifiers were held.  Both streams go out, so
+ * nothing that reads "key" changes behaviour.
+ *
+ * `mods` is the state BEFORE this event, which is what X11 defines `state` to
+ * be: pressing Shift reports a mask without ShiftMask, releasing it reports one
+ * with it. */
+static void emit_client_rawkey_event(uint16_t code, int value, int mods) {
+    int slot;
+
+    if (!is_client_window(active_window)) return;
+    slot = client_index_for_window(active_window) + 1;
+    emit_wm_event("rkey %d %d %d %d", slot, (int)code, value, mods);
+}
+
 /* Re-show a system window that was closed (hidden) or minimized. */
 static void reopen_window(int id) {
     desktop_window_t *win = find_window(id);
@@ -3371,6 +3390,18 @@ static void cycle_windows(void) {
 
 static void handle_key(uint16_t code, int value) {
     char out;
+
+    /* Uncooked forwarding first, with the modifier mask as it was BEFORE this
+     * event and before any of the desktop's own key handling below consumes
+     * it.  Skipped for the keys the desktop keeps for itself (Alt-Tab, Escape)
+     * and while a desktop text field owns the keyboard, so a client never sees
+     * a keystroke the desktop also acted on. */
+    if (!note_focus && !launcher_open && code != KEY_ESC &&
+        !(alt_down && code == KEY_TAB)) {
+        int mods = (shift_down ? WM_MOD_SHIFT : 0) | (caps_on ? WM_MOD_LOCK : 0) |
+                   (ctrl_down ? WM_MOD_CTRL : 0) | (alt_down ? WM_MOD_ALT : 0);
+        emit_client_rawkey_event(code, value, mods);
+    }
 
     if (code == KEY_LEFTSHIFT || code == KEY_RIGHTSHIFT) {
         shift_down = value != 0;

@@ -31,6 +31,8 @@ Artifacts go to build/ff-smoke/<timestamp>-<tag>/ (gitignored):
                     after the paint line (PASS only) — the paint marker fires on
                     the first PutImage, so one immediate dump can catch an empty
                     window
+  screen-typed.png  with --type TEXT only: the frame after TEXT was typed into
+                    Firefox's address bar through QEMU sendkey
   summary.txt       verdict, timings, attempt list, crash lines, last kernel
                     lines, moz.log tail
   qemu-cmdline.txt  the exact QEMU command
@@ -283,6 +285,42 @@ class Qmp:
             self.sock = None
 
 
+# ── typing into the guest ────────────────────────────────────────────────
+# QEMU's monitor `sendkey` injects a PS/2 scancode pair, so a key typed this way
+# travels the whole real path: i8042 -> drivers/keyboard.c -> /dev/input/event0
+# -> the desktop -> the WM event channel -> maeroX -> an X11 KeyPress -> GTK.
+# Nothing about it is synthetic on the guest side.
+QEMU_KEYNAME = {
+    " ": "spc", ".": "dot", ",": "comma", "/": "slash", "-": "minus",
+    "=": "equal", ";": "semicolon", "'": "apostrophe", "[": "bracket_left",
+    "]": "bracket_right", "\\": "backslash", "`": "grave_accent",
+    "\n": "ret", "\t": "tab",
+}
+QEMU_SHIFTED = {
+    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7",
+    "*": "8", "(": "9", ")": "0", "_": "minus", "+": "equal", ":": "semicolon",
+    '"': "apostrophe", "<": "comma", ">": "dot", "?": "slash", "{": "bracket_left",
+    "}": "bracket_right", "|": "backslash", "~": "grave_accent",
+}
+
+
+def qemu_keys_for(text):
+    """Turn a string into a list of QEMU `sendkey` arguments, or raise."""
+    keys = []
+    for ch in text:
+        if ch.islower() or ch.isdigit():
+            keys.append(ch)
+        elif ch.isupper():
+            keys.append("shift-" + ch.lower())
+        elif ch in QEMU_KEYNAME:
+            keys.append(QEMU_KEYNAME[ch])
+        elif ch in QEMU_SHIFTED:
+            keys.append("shift-" + QEMU_SHIFTED[ch])
+        else:
+            raise ValueError("no QEMU key name for %r" % ch)
+    return keys
+
+
 def capture_wedge(qmp, outdir, samples=4, gap=0.75):
     """Photograph a wedged guest from outside it.
 
@@ -342,6 +380,7 @@ class Run:
         self.shots = {}
         self.paint_scores = []
         self.wedge_qmp = None
+        self.type_note = None
 
     # ── serial intake ────────────────────────────────────────────────────
     def feed(self, chunk):
@@ -498,6 +537,9 @@ class Run:
                      "<~50000 = the maeroX window was blank in that frame)")
             L.append("  " + " ".join(str(x) for x in self.paint_scores))
             L.append("")
+        if self.type_note:
+            L.append("typing      : %s" % self.type_note)
+            L.append("")
         if self.wedge_qmp:
             L.append("wedge capture : %s" % self.wedge_qmp)
             L.append("")
@@ -510,6 +552,32 @@ class Run:
         with open(os.path.join(a.outdir, "summary.txt"), "w") as f:
             f.write(text)
         return text
+
+
+def type_into_guest(qmp, args, run, pump, shot):
+    """Focus Firefox's address bar and type args.type_text into it.
+
+    Ctrl+L is the address-bar accelerator; it only works if the modifier state
+    reaches the browser as a real X11 KeyPress with ControlMask set, so this is
+    itself part of what the screenshot proves."""
+    try:
+        keys = qemu_keys_for(args.type_text)
+    except ValueError as exc:
+        print("smoke-firefox: --type: %s" % exc)
+        run.type_note = "not typed: %s" % exc
+        return
+    print("smoke-firefox: typing %r into the address bar (%d keys)"
+          % (args.type_text, len(keys)))
+    pump(2.0)
+    qmp.hmp("sendkey ctrl-l")
+    pump(1.5)
+    for k in keys:
+        qmp.hmp("sendkey " + k)
+        pump(args.type_delay)
+    pump(args.type_settle)
+    p = shot("screen-typed")
+    run.type_note = "typed %r -> %s" % (args.type_text, p or "(no screendump)")
+    print("smoke-firefox: %s" % run.type_note)
 
 
 def main():
@@ -529,6 +597,14 @@ def main():
     ap.add_argument("--hold", type=float, default=25.0,
                     help="seconds to keep sampling frames after the paint verdict "
                          "before choosing screen-paint.png (default 25)")
+    ap.add_argument("--type", dest="type_text", default=None, metavar="TEXT",
+                    help="after the paint verdict, focus Firefox's address bar (Ctrl+L) and "
+                         "type TEXT through QEMU sendkey, then save screen-typed.png. "
+                         "Off by default; the default path is unchanged.")
+    ap.add_argument("--type-delay", type=float, default=0.35,
+                    help="seconds between injected keystrokes (default 0.35)")
+    ap.add_argument("--type-settle", type=float, default=20.0,
+                    help="seconds to wait after typing before the screenshot (default 20). The guest repaints the address bar several seconds behind the keystrokes, so a short settle catches a half-drawn string.")
     ap.add_argument("-v", "--verbose", action="store_true", help="echo every serial line")
     args = ap.parse_args()
 
@@ -668,6 +744,8 @@ def main():
                          ",".join(str(x) for x in run.paint_scores)))
             else:
                 shot("screen-paint")   # QMP unavailable: fall back to one dump
+            if args.type_text:
+                type_into_guest(qmp, args, run, pump, shot)
         elif run.panic_lines:
             pump(2.0)         # collect the register dump / stack trace
         else:
