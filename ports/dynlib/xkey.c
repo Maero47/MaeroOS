@@ -254,14 +254,45 @@ static void expect_key(const char *what,unsigned win,int code,int mods,
     }
 }
 
+/* The channel this probe injects through must not exist unless it was asked
+ * for.  Before anything else, run a server the way the desktop runs one — no
+ * -K — and check that no FIFO appears; then the -K server below has to create
+ * one.  Two observations of the filesystem, not of a flag. */
+static int check_channel_gate(void){
+    pid_t srv=fork();
+    if(srv==0){
+        execl("/maerox","maerox","-H",(char*)0);
+        execl("/disk/maerox","maerox","-H",(char*)0);
+        _exit(127);
+    }
+    if(srv<0) return -1;
+    unlink(KEYFIFO);                       /* clear anything left by an earlier run */
+    int seen=0;
+    for(int i=0;i<100;i++){                /* 2 s: well past the server's startup */
+        int fd=connect_x();
+        if(fd>=0){ close(fd); if(access(KEYFIFO,F_OK)==0) seen=1; break; }
+        usleep(20000);
+    }
+    if(!seen && access(KEYFIFO,F_OK)==0) seen=1;
+    kill(srv,9); waitpid(srv,0,0);
+    return seen;
+}
+
 int main(int argc,char**argv){
     int spawn=0; pid_t srv=0;
     for(int i=1;i<argc;i++) if(!strcmp(argv[i],"--spawn")) spawn=1;
     if(spawn){
+        int gated=check_channel_gate();
+        check("no -K: no injection channel", gated==0);
+    }
+    if(spawn){
         srv=fork();
         if(srv==0){
-            execl("/maerox","maerox","-H",(char*)0);
-            execl("/disk/maerox","maerox","-H",(char*)0);
+            /* -K opens the key-injection channel this probe writes to.  maeroX
+             * refuses it unless it is also headless, so the desktop build never
+             * has one; the probe has to ask for it explicitly. */
+            execl("/maerox","maerox","-H","-K",(char*)0);
+            execl("/disk/maerox","maerox","-H","-K",(char*)0);
             _exit(127);
         }
     }
@@ -301,8 +332,14 @@ int main(int argc,char**argv){
     check("Mod4 modifier -> Super_L keycode",   modifier_has(6,LK_LEFTMETA+8));
     check("keysym(Super_L) == XK_Super_L",      lookup_keysym(LK_LEFTMETA+8,0)==0xffeb);
 
-    fifo=open(KEYFIFO,O_WRONLY);
-    if(fifo<0){ printf("XKEY_FAIL cannot open %s\n",KEYFIFO); if(srv)kill(srv,9); return 1; }
+    check("with -K: the channel exists", access(KEYFIFO,F_OK)==0);
+    /* maeroX creates the FIFO at startup; give it a moment if we got here first. */
+    for(int i=0;i<200 && (fifo=open(KEYFIFO,O_WRONLY))<0;i++) usleep(20000);
+    if(fifo<0){
+        printf("XKEY_FAIL cannot open %s (was maeroX started with -K?)\n",KEYFIFO);
+        if(srv) kill(srv,9);
+        return 1;
+    }
 
     expect_key("plain a",              w, LK_A,        0,            1, 'a');
     expect_key("Shift+a",              w, LK_A,        SHIFT_MASK,   1, 'A');

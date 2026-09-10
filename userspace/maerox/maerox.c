@@ -20,6 +20,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 
 #define X_SOCKET_PATH "/tmp/.X11-unix/X0"
@@ -688,28 +689,50 @@ static void on_x_key(gui_window_t *g, int code, int value, int mods) {
            (unsigned)w->xid);
 }
 
-/* ── test input channel ──────────────────────────────────────────────────────
+/* ── test input channel (-K, headless only) ─────────────────────────────────
  * Real keys arrive over the desktop's window-manager event channel, which only
- * exists when maeroX runs inside the desktop.  A headless server (the X smoke
- * tests) has no desktop, so it also reads key injections from a FIFO — the
- * XTEST extension's job, done with four bytes of shell-visible protocol:
+ * exists when maeroX runs inside the desktop.  A headless server has no
+ * desktop, so with -K it also reads key injections from a FIFO — the XTEST
+ * extension's job, done with four bytes of shell-visible protocol:
  *     printf 'k <linux-keycode> <1 press|0 release> <modmask>\n' > /tmp/.maerox-keys
  * Injections go through on_x_key(), so a test exercises the same keycode
- * conversion, focus lookup and event encoding a real key does. */
+ * conversion, focus lookup and event encoding a real key does.
+ *
+ * IT MUST NOT EXIST OUTSIDE THE TESTS.  Anything that can open this FIFO can
+ * synthesise a KeyPress straight onto the focused client — the browser —
+ * without passing the desktop's focus tracking, the keys the desktop keeps for
+ * itself, or the press/release pairing rule.  So it takes an explicit flag AND
+ * refuses to open in a windowed server: the desktop build has no such channel
+ * at all, and a session cannot acquire one by accident.  keyfifo_open() is the
+ * only place the decision is made; everything downstream keys off keyfifo_fd,
+ * which stays -1 when the channel was refused. */
 #define KEYFIFO_PATH "/tmp/.maerox-keys"
+static int  test_keys;                 /* -K: the injection channel was asked for */
 static int  keyfifo_fd = -1;
 static char keyfifo_line[64];
 static int  keyfifo_used;
 
 static void keyfifo_open(void) {
+    if (!test_keys) return;
+    if (!headless) {                   /* a windowed server has a real keyboard */
+        printf("maerox: -K refused: the key-injection channel is headless-only\n");
+        return;
+    }
     unlink(KEYFIFO_PATH);
-    if (mkfifo(KEYFIFO_PATH, 0666) != 0) return;
+    if (mkfifo(KEYFIFO_PATH, 0600) != 0) return;
+    /* This kernel's mknod(2) keeps only the type bits and drops the permission
+     * bits (do_mknod in proc/syscall.c), and vfs_access_check() reads a FIFO
+     * with no mode as 0666 — so the mode above is advisory and the chmod is
+     * what actually makes the node owner-only.  Not fatal if it fails: the
+     * headless+flag gate is what keeps this out of a real session. */
+    if (chmod(KEYFIFO_PATH, 0600) != 0)
+        printf("maerox: warning: could not restrict " KEYFIFO_PATH " to 0600\n");
     keyfifo_fd = open(KEYFIFO_PATH, O_RDONLY | O_NONBLOCK);
 }
 
 static void keyfifo_poll(void) {
     char ch;
-    if (keyfifo_fd < 0) return;
+    if (keyfifo_fd < 0) return;        /* not opened = channel refused or off */
     while (read(keyfifo_fd, &ch, 1) == 1) {
         if (ch == '\r') continue;
         if (ch != '\n') {
@@ -1568,10 +1591,17 @@ static void process_client(xclient_t *c) {
 }
 
 /* Drain whatever input is waiting: the desktop's window-manager events and the
- * test channel.  Called from the main loop, and from inside the frame dump —
- * see b64_write(). */
+ * test channel, and put anything it changed on screen.  Called from the main
+ * loop, and from inside the frame dump — see b64_write().  Repainting matters
+ * as much as reading: accepting a keystroke during a dump but leaving the
+ * screen untouched until the dump ends would show the user a window frozen
+ * minutes behind what they typed. */
+static void render(void);   /* fwd */
 static void pump_input(void) {
-    if (!headless) gui_poll(&gui);
+    if (!headless) {
+        gui_poll(&gui);
+        if (dirty) render();
+    }
     keyfifo_poll();
 }
 
@@ -1763,6 +1793,8 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "-v")) xdbg = 1;
         else if (!strcmp(argv[i], "-T")) trace_fd = -2;   /* request /dev/tty trace */
         else if (!strcmp(argv[i], "-D")) { dumpmode = 1; trace_fd = -2; }
+        else if (!strcmp(argv[i], "-K") || !strcmp(argv[i], "--test-keys"))
+            test_keys = 1;             /* honoured only when headless */
         else if (!strcmp(argv[i], "-d") || !strcmp(argv[i], "--daemon")) daemon = 1;
         else if (argv[i][0] >= '0' && argv[i][0] <= '9') slot = atoi(argv[i]);
     }
@@ -1791,7 +1823,14 @@ int main(int argc, char *argv[]) {
         gui_set_rawkey_handler(&gui, on_x_key);    /* forward keys as KeyPress */
         render();
     }
-    keyfifo_open();
+    keyfifo_open();   /* after `headless` is final: -K is refused in a window */
+    /* Say once, on the trace, whether this server has an injection channel —
+     * and look at the filesystem rather than only at our own flag, so a node
+     * left behind by anything else is reported too.  smoke_firefox.py's
+     * --keycheck asserts this line reads "absent ... no node" on the desktop
+     * path, which is how a real session is shown not to have one. */
+    xt("XT keychannel: %s (%s)\n", keyfifo_fd >= 0 ? "OPEN" : "absent",
+       access(KEYFIFO_PATH, F_OK) == 0 ? "node present" : "no node");
 
     unsigned tick = 0;
     unsigned last_dump_tick = 0;

@@ -565,6 +565,9 @@ class Run:
 #   XT key code=30(x38) press state=0x8 -> win=0x200012
 XT_KEY = re.compile(r"XT key code=(\d+)\(x(\d+)\) (press|release) "
                     r"state=0x([0-9a-fA-F]+) -> win=0x([0-9a-fA-F]+)")
+# maeroX says once, at startup, whether it has a key-injection channel and
+# whether the node exists on disk: "XT keychannel: absent (no node)".
+XT_KEYCHANNEL = re.compile(r"XT keychannel: (\S+) \(([^)]*)\)")
 
 
 def check_key_trace(run):
@@ -624,6 +627,21 @@ def check_key_trace(run):
         notes.append("FAIL Tab reached the client although the desktop consumed it")
     else:
         notes.append("Tab was kept by the desktop, and no half of it leaked")
+
+    # The key-injection channel is a test-only path.  A desktop session must not
+    # have one — otherwise anything on the machine could type into the browser,
+    # and the typed-text evidence below would not be proof of the real keyboard
+    # path at all.  maeroX reports what it found on the filesystem, not just its
+    # own flag, so a node left by anything else would show up here too.
+    chan = [m.groups() for m in
+            (XT_KEYCHANNEL.search(line) for _, line in run.lines) if m]
+    if not chan:
+        notes.append("FAIL maeroX never reported its key-injection channel state")
+    elif any(state == "OPEN" or node != "no node" for state, node in chan):
+        notes.append("FAIL a key-injection channel exists in the desktop session: %r" % (chan,))
+    else:
+        notes.append("no key-injection channel in the desktop session "
+                     "(maeroX: %s, %s)" % chan[0])
     return not any(n.startswith("FAIL") for n in notes), notes
 
 
