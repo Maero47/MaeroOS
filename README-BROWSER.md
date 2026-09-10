@@ -91,9 +91,13 @@ not kernel work, and Firefox does **not** run yet:
    `GetKeyboardMapping` with the US layout (two keysyms per keycode),
    `GetModifierMapping` with the real Shift/Lock/Control/Alt keycodes, tracks an
    input focus that `SetInputFocus`/`GetInputFocus` agree with, and sends
-   `FocusIn`/`FocusOut`. `xkey` proves it (`XKEY_OK`), and
+   `FocusIn`/`FocusOut`. A release is delivered to whoever received the press —
+   the desktop routes by slot, maeroX by window — so a focus change mid-keystroke
+   cannot split a key in two. `xkey` proves it (`XKEY_OK`),
    `python3 tools/smoke_firefox.py --type "<text>"` types `<text>` into
-   Firefox's address bar with QEMU `sendkey` and saves `screen-typed.png`.
+   Firefox's address bar with QEMU `sendkey` and saves `screen-typed.png`, and
+   `--keycheck` asserts maeroX's key trace for pairing, `Mod1Mask` on an AltGr
+   combination, and that neither half of an Alt-Tab leaks to a client.
 
 ## Next: the GTK stack (Phase 34)
 
