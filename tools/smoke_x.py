@@ -85,6 +85,17 @@ def main():
         if "XEVENT_OK" not in body:
             raise AssertionError("xevent did not receive an Expose event")
 
+        # xkey exercises the keyboard: it takes the input focus, reads the
+        # keymap and the modifier map off the wire, injects keys through
+        # maeroX's test channel and asserts each arrives as a KeyPress with the
+        # right keycode and state and translates to the right character.
+        before = len("".join(log))
+        send(proc, "xkey --spawn\n")
+        wait_for(proc, sel, PROMPT, log, timeout=40, start=before)
+        body = "".join(log)[before:]
+        if "XKEY_OK" not in body:
+            raise AssertionError("xkey did not verify the keyboard path")
+
         # xreal is a REAL Xlib client (linked against cross-built libX11/libxcb):
         # XOpenDisplay -> XCreateSimpleWindow -> XMapWindow -> XFillRectangle.
         before = len("".join(log))

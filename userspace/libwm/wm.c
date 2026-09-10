@@ -164,6 +164,18 @@ static int parse_event_line(const char *line, wm_event_t *event) {
         event->ascii = c;
         return 1;
     }
+    /* "rkey" is the uncooked stream: every press AND release, the modifier
+     * keys themselves included, with the live modifier mask.  It exists
+     * alongside "key" (cooked, presses only) rather than replacing it so that
+     * apps written against the cooked stream keep the behaviour they had. */
+    if (sscanf(line, "rkey %d %d %d %d", &slot, &a, &b, &c) == 4) {
+        event->type = WM_EVENT_RAWKEY;
+        event->slot = slot;
+        event->code = a;
+        event->value = b;
+        event->mods = c;
+        return 1;
+    }
     if (sscanf(line, "focus %d", &slot) == 1) {
         event->type = WM_EVENT_FOCUS;
         event->slot = slot;

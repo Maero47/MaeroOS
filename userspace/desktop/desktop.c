@@ -11,6 +11,7 @@
 #include <sys/ioctl.h>
 #include <syscall.h>
 #include <unistd.h>
+#include <wm.h>          /* WM_MOD_* — the modifier mask sent to clients */
 
 #include "font8x16.h"
 #include "font_ui16.h"   /* AA proportional UI font (tools/mkfont.py) */
@@ -170,6 +171,8 @@ static int esc_state;               /* ANSI filter: 0 none, 1 ESC, 2 CSI */
 static int shift_down;
 static int ctrl_down;
 static int caps_on;
+static int super_down;           /* either Super/Windows key held (Mod4) */
+static int num_on;               /* Num Lock latched (Mod2) */
 static int running = 1;
 
 static const char *preferred_shell_path(void) {
@@ -262,6 +265,7 @@ static void drop_client_pixels(int idx);
 static void emit_client_focus_event(int id);
 static void emit_client_geom_event(const desktop_window_t *win);
 static void emit_client_close_event(int idx);
+static void forget_client_rawkeys(int idx);
 static void copy_text(char *dst, unsigned size, const char *src);
 static void focus_client_app(int idx);
 static void load_desktop_conf(void);
@@ -1441,6 +1445,7 @@ static int app_pid_running(int pid) {
 static void drop_app_window(int idx) {
     desktop_window_t *win = find_window(WIN_CLIENT_BASE + idx);
 
+    forget_client_rawkeys(idx);
     if (win && win->visible) win->visible = 0;
     drop_client_pixels(idx);   /* release its shared surface */
     if (active_window == WIN_CLIENT_BASE + idx)
@@ -2338,6 +2343,62 @@ static void emit_client_key_event(uint16_t code, int value, char ch) {
     if (!is_client_window(active_window)) return;
     slot = client_index_for_window(active_window) + 1;
     emit_wm_event("key %d %d %d %d", slot, (int)code, value, (int)ch);
+}
+
+/* The uncooked key stream.  "key" above is cooked for text widgets: presses
+ * only, the modifier keys swallowed, Ctrl already folded into the character.
+ * An app that is itself a keyboard consumer (maeroX, which has to build X11
+ * KeyPress/KeyRelease events) needs the opposite — the Linux keycode, whether
+ * it went down or up, and which modifiers were held.  Both streams go out, so
+ * nothing that reads "key" changes behaviour.
+ *
+ * `mods` is the state BEFORE this event, which is what X11 defines `state` to
+ * be: pressing Shift reports a mask without ShiftMask, releasing it reports one
+ * with it.
+ *
+ * ── THE PAIRING RULE ────────────────────────────────────────────────────────
+ * A release goes to whoever got the press, or it goes nowhere.
+ *
+ * The press decides everything: which slot the key belongs to for as long as it
+ * is held, recorded in rawkey_slot[].  The release is delivered to that slot no
+ * matter what the focus has done in between, and a release whose press was
+ * never forwarded is dropped outright.  Deciding the release's destination from
+ * the CURRENT focus instead is what let a key be split in two: Alt-Tab forwards
+ * the Alt press to one client, changes the focus while Tab is swallowed, and
+ * then hands the Alt release to a different client — leaving the first with a
+ * key it believes is still held and the second with a release for a key it
+ * never saw.  The same split happened whenever the launcher or a note field
+ * opened mid-keystroke, or a click moved the focus while a key was down.
+ *
+ * X servers behave the same way for the same reason, and a compositor that
+ * grabs a shortcut grabs both edges of it. */
+#define RAWKEY_CODES 256
+static unsigned char rawkey_slot[RAWKEY_CODES];   /* 0 = press not forwarded */
+
+static void emit_client_rawkey_event(uint16_t code, int value, int mods) {
+    int slot;
+
+    if (code >= RAWKEY_CODES) return;
+    if (value) {
+        if (!is_client_window(active_window)) return;
+        slot = client_index_for_window(active_window) + 1;
+        rawkey_slot[code] = (unsigned char)slot;
+    } else {
+        slot = rawkey_slot[code];
+        if (!slot) return;              /* no press was forwarded: drop it */
+        rawkey_slot[code] = 0;
+    }
+    emit_wm_event("rkey %d %d %d %d", slot, (int)code, value, mods);
+}
+
+/* A client that is going away must not be left owning held keys: the slot can
+ * be handed to the next app launched into it, which would then collect a
+ * release for a key it never saw. */
+static void forget_client_rawkeys(int idx) {
+    unsigned char slot = (unsigned char)(idx + 1);
+
+    for (int i = 0; i < RAWKEY_CODES; i++)
+        if (rawkey_slot[i] == slot) rawkey_slot[i] = 0;
 }
 
 /* Re-show a system window that was closed (hidden) or minimized. */
@@ -3369,8 +3430,40 @@ static void cycle_windows(void) {
     focus_window(ids[(cur + 1) % n]);
 }
 
+/* The modifier mask as it stands right now, which for a key event is the state
+ * BEFORE that event: this is read before the tracking below is updated, so a
+ * Shift press reports a mask without ShiftMask and its release reports one with
+ * it, exactly as X11 defines `state`.
+ *
+ * Every bit reported here is one maeroX's GetModifierMapping names a keycode
+ * for, and every keycode it names is tracked here.  The two have to be kept in
+ * step by hand: while only KEY_LEFTALT was tracked, a key pressed with the
+ * RIGHT Alt held went out with no Mod1Mask even though the modifier map
+ * advertised right Alt as a Mod1 key, so every AltGr combination did nothing at
+ * all and no error said so. */
+static int current_mods(void) {
+    return (shift_down  ? WM_MOD_SHIFT : 0) |
+           (caps_on     ? WM_MOD_LOCK  : 0) |
+           (ctrl_down   ? WM_MOD_CTRL  : 0) |
+           (alt_down    ? WM_MOD_ALT   : 0) |
+           (num_on      ? WM_MOD_NUM   : 0) |
+           (super_down  ? WM_MOD_SUPER : 0);
+}
+
 static void handle_key(uint16_t code, int value) {
     char out;
+
+    /* Uncooked forwarding first, before any of the desktop's own key handling
+     * below consumes the event.  Presses of the keys the desktop keeps for
+     * itself (Alt-Tab, Escape) and presses made while a desktop text field owns
+     * the keyboard are not forwarded, so a client never sees a keystroke the
+     * desktop also acted on; their releases are then dropped by the pairing
+     * rule in emit_client_rawkey_event(), which is why the test is on the press
+     * only.  A release always goes to whoever received its press. */
+    if (!value ||
+        (!note_focus && !launcher_open && code != KEY_ESC &&
+         !(alt_down && code == KEY_TAB)))
+        emit_client_rawkey_event(code, value, current_mods());
 
     if (code == KEY_LEFTSHIFT || code == KEY_RIGHTSHIFT) {
         shift_down = value != 0;
@@ -3380,11 +3473,19 @@ static void handle_key(uint16_t code, int value) {
         ctrl_down = value != 0;
         return;
     }
-    if (code == KEY_LEFTALT) {
+    if (code == KEY_LEFTALT || code == KEY_RIGHTALT) {
         alt_down = value != 0;
         return;
     }
+    if (code == KEY_LEFTMETA || code == KEY_RIGHTMETA) {
+        super_down = value != 0;
+        return;
+    }
     if (!value) return;
+    if (code == KEY_NUMLOCK) {
+        num_on = !num_on;
+        return;
+    }
     if (alt_down && code == KEY_TAB) {
         cycle_windows();
         return;
@@ -4860,7 +4961,8 @@ int main(void) {
                         ctrl_down = fev.value != 0;
                         continue;
                     }
-                    if (fev.code == KEY_LEFTALT) {
+                    if (fev.code == KEY_LEFTALT ||
+                        fev.code == KEY_RIGHTALT) {
                         alt_down = fev.value != 0;
                         continue;
                     }

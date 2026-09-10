@@ -136,7 +136,16 @@ static const uint16_t set1_keys[128] = {
     [0x52] = KEY_KP0,        [0x53] = KEY_KPDOT,
 };
 
-/* E0-prefixed scancodes: navigation cluster (Linux evdev key codes). */
+/* E0-prefixed scancodes: navigation cluster, the right-hand modifiers and the
+ * Windows-key cluster (Linux evdev key codes).
+ *
+ * The right-hand modifiers matter more than they look.  A key this table does
+ * not name is dropped outright by keyboard_irq(), so while right Ctrl and right
+ * Alt were missing here they did not exist as far as the rest of the system was
+ * concerned: userspace tracked KEY_RIGHTCTRL/KEY_RIGHTALT and maeroX's
+ * GetModifierMapping advertised their keycodes, but no press could ever arrive
+ * to set the modifier, so every right-Alt (AltGr) combination silently did
+ * nothing. */
 static const uint16_t e0_keys[128] = {
     [0x48] = 103,  /* KEY_UP    */
     [0x50] = 108,  /* KEY_DOWN  */
@@ -146,8 +155,15 @@ static const uint16_t e0_keys[128] = {
     [0x4f] = 107,  /* KEY_END   */
     [0x49] = 104,  /* KEY_PAGEUP   */
     [0x51] = 109,  /* KEY_PAGEDOWN */
+    [0x52] = 110,  /* KEY_INSERT   */
     [0x53] = 111,  /* KEY_DELETE   */
     [0x1c] = 28,   /* keypad Enter → KEY_ENTER */
+    [0x1d] = 97,   /* KEY_RIGHTCTRL */
+    [0x35] = 98,   /* KEY_KPSLASH   */
+    [0x38] = 100,  /* KEY_RIGHTALT  */
+    [0x5b] = 125,  /* KEY_LEFTMETA  */
+    [0x5c] = 126,  /* KEY_RIGHTMETA */
+    [0x5d] = 127,  /* KEY_COMPOSE (menu) */
 };
 
 /* Emergency "kill foreground fullscreen app" hotkey (Ctrl+Alt+Backspace).

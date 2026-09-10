@@ -14,6 +14,11 @@ typedef void (*gui_button_cb)(gui_window_t *gui, int id);
 typedef void (*gui_layout_cb)(gui_window_t *gui);
 /* Raw input hooks for apps that render their own content (terminals etc.) */
 typedef void (*gui_key_cb)(gui_window_t *gui, int code, int value, int ascii);
+/* Uncooked keys: every press and release, modifier keys included, with the
+ * live WM_MOD_* mask.  Set this instead of the cooked hook when the app is
+ * itself a keyboard consumer that needs keycodes (maeroX turns them into X11
+ * KeyPress/KeyRelease). */
+typedef void (*gui_rawkey_cb)(gui_window_t *gui, int code, int value, int mods);
 typedef void (*gui_scroll_cb)(gui_window_t *gui, int delta);
 typedef void (*gui_click_cb)(gui_window_t *gui, int x, int y);
 
@@ -67,7 +72,8 @@ struct gui_window {
     int mouse_down;           /* left button held inside the window */
     int drag_id;              /* widget being dragged (scrollbar), 0 = none */
     gui_layout_cb layout;
-    gui_key_cb on_key;        /* raw key hook (bypasses widget routing) */
+    gui_key_cb on_key;        /* cooked key hook (bypasses widget routing) */
+    gui_rawkey_cb on_rawkey;  /* uncooked key hook (press + release + mods) */
     gui_scroll_cb on_scroll;  /* raw wheel hook (when no widget is hit) */
     gui_click_cb on_click;    /* raw click hook (bypasses widget routing) */
     char bg[12];
@@ -129,6 +135,7 @@ int gui_image(gui_window_t *gui, int id, int x, int y, int index);
 
 void gui_set_layout(gui_window_t *gui, gui_layout_cb callback);
 void gui_set_key_handler(gui_window_t *gui, gui_key_cb callback);
+void gui_set_rawkey_handler(gui_window_t *gui, gui_rawkey_cb callback);
 void gui_set_scroll_handler(gui_window_t *gui, gui_scroll_cb callback);
 void gui_set_click_handler(gui_window_t *gui, gui_click_cb callback);
 int gui_body_width(const gui_window_t *gui);

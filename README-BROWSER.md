@@ -85,6 +85,30 @@ not kernel work, and Firefox does **not** run yet:
    `XOpenDisplay`, creates a window, and paints with `XFillRectangle` on the
    MaeroOS desktop (`XREAL_PAINTED`). The unlock was kernel `sendmsg`/`recvmsg`
    on AF_UNIX (libxcb's transport). The X client library is now **real**.
+   **Keyboard done:** keys travel PS/2 → `drivers/keyboard.c` → the desktop →
+   the WM event channel (`rkey`, the uncooked stream) → maeroX → X11
+   `KeyPress`/`KeyRelease` on the focused window. maeroX answers
+   `GetKeyboardMapping` with the US layout (two keysyms per keycode),
+   `GetModifierMapping` with the real Shift/Lock/Control/Alt keycodes, tracks an
+   input focus that `SetInputFocus`/`GetInputFocus` agree with, and sends
+   `FocusIn`/`FocusOut`. A release is delivered to whoever received the press —
+   the desktop routes by slot, maeroX by window — so a focus change mid-keystroke
+   cannot split a key in two. A **click cannot take the keyboard away** from the
+   window a client asked for: the click hit-test and the compositor share one
+   definition of "topmost" — creation order, never resource-array slot order —
+   and a click offers the focus through the same kiosk policy a map does, so it
+   stops at `focus_explicit`. Without that, clicking in a Firefox page moved the
+   focus to the full-screen MozContainer child, a `FocusIn` GDK discards after a
+   `FocusOut` it does not, and typing stopped working — on the runs where the
+   two windows happened to land in that slot order. `xkey` proves it (`XKEY_OK`,
+   which now also injects clicks with the slots arranged both ways),
+   `python3 tools/smoke_firefox.py --type "<text>"` types `<text>` into
+   Firefox's address bar with QEMU `sendkey` and saves `screen-typed.png`, and
+   `--keycheck` asserts maeroX's key trace for pairing, `Mod1Mask` on an AltGr
+   combination, that neither half of an Alt-Tab leaks to a client, and that the
+   session has no key-injection channel. That channel — maeroX's XTEST
+   stand-in, which the headless probe drives — takes an explicit `-K` and is
+   refused in a windowed server, so the desktop build has none.
 
 ## Next: the GTK stack (Phase 34)
 

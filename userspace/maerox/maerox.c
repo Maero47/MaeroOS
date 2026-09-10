@@ -20,6 +20,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 
 #define X_SOCKET_PATH "/tmp/.X11-unix/X0"
@@ -48,6 +49,7 @@ typedef struct {
     /* window / pixmap */
     int      x, y, w, h;
     uint32_t *px;          /* backing pixels (w*h), NULL for GC */
+    uint32_t parent;       /* window: the CreateWindow parent (ROOT = toplevel) */
     int      mapped;
     int      maximized;    /* kiosk WM: main toplevel resized to fill the screen */
     /* gc */
@@ -436,6 +438,367 @@ static void send_pointer(xclient_t *c, xres_t *w, int type, int detail,
     write_all(c->fd, e, 32);
 }
 
+/* ── keyboard ────────────────────────────────────────────────────────────────
+ * Three separate things have to line up before a client turns a key press into
+ * a character, and all three live here.
+ *
+ * 1. KEYCODES.  The desktop hands maeroX the Linux input-event code from
+ *    drivers/keyboard.c (KEY_A = 30, KEY_ENTER = 28 ...).  X11 on Linux numbers
+ *    the same key eight higher — the protocol reserves keycodes 0-7 — and the
+ *    setup reply already advertises min-keycode 8 / max-keycode 255.  So the
+ *    single conversion in the whole server is:  X keycode = Linux keycode + 8.
+ * 2. THE KEYMAP.  GetKeyboardMapping has to answer with real KEYSYMs from
+ *    X11's keysymdef.h, two per keycode (column 0 unshifted, column 1 shifted),
+ *    or a toolkit has nothing to translate a keycode into.  us_keysyms[] below
+ *    is the US layout, indexed by LINUX keycode.
+ * 3. MODIFIERS.  GetModifierMapping has to name the keycodes that act as
+ *    Shift/Lock/Control/Mod1, or the `state` mask in a KeyPress means nothing
+ *    to the client.  The mask itself needs no translation: wm.h's WM_MOD_*
+ *    values ARE X11's ShiftMask/LockMask/ControlMask/Mod1Mask.
+ */
+#define X_KEYCODE_BASE 8       /* X keycode = Linux keycode + 8 */
+#define KEYMAP_MAX     128     /* Linux keycodes we describe (0..127) */
+#define KEYSYMS_PER_KEYCODE 2  /* column 0 = unshifted, column 1 = shifted */
+
+/* Linux keycodes of the keys that carry a modifier (see drivers/keyboard.c). */
+#define LK_LEFTCTRL 29
+#define LK_LEFTSHIFT 42
+#define LK_RIGHTSHIFT 54
+#define LK_LEFTALT 56
+#define LK_CAPSLOCK 58
+#define LK_NUMLOCK 69
+#define LK_RIGHTCTRL 97
+#define LK_RIGHTALT 100
+#define LK_LEFTMETA 125
+#define LK_RIGHTMETA 126
+
+/* US layout, indexed by Linux keycode: { unshifted keysym, shifted keysym }.
+ * Values are keysymdef.h constants (Latin-1 characters are their own code
+ * point; XK_* function keys live in the 0xff00 page). */
+static const uint32_t us_keysyms[KEYMAP_MAX][KEYSYMS_PER_KEYCODE] = {
+    [1]  = { 0xff1b, 0xff1b },   /* Escape */
+    [2]  = { '1', '!' },  [3]  = { '2', '@' },  [4]  = { '3', '#' },
+    [5]  = { '4', '$' },  [6]  = { '5', '%' },  [7]  = { '6', '^' },
+    [8]  = { '7', '&' },  [9]  = { '8', '*' },  [10] = { '9', '(' },
+    [11] = { '0', ')' },  [12] = { '-', '_' },  [13] = { '=', '+' },
+    [14] = { 0xff08, 0xff08 },   /* BackSpace */
+    [15] = { 0xff09, 0xfe20 },   /* Tab / ISO_Left_Tab */
+    [16] = { 'q', 'Q' },  [17] = { 'w', 'W' },  [18] = { 'e', 'E' },
+    [19] = { 'r', 'R' },  [20] = { 't', 'T' },  [21] = { 'y', 'Y' },
+    [22] = { 'u', 'U' },  [23] = { 'i', 'I' },  [24] = { 'o', 'O' },
+    [25] = { 'p', 'P' },  [26] = { '[', '{' },  [27] = { ']', '}' },
+    [28] = { 0xff0d, 0xff0d },   /* Return */
+    [29] = { 0xffe3, 0xffe3 },   /* Control_L */
+    [30] = { 'a', 'A' },  [31] = { 's', 'S' },  [32] = { 'd', 'D' },
+    [33] = { 'f', 'F' },  [34] = { 'g', 'G' },  [35] = { 'h', 'H' },
+    [36] = { 'j', 'J' },  [37] = { 'k', 'K' },  [38] = { 'l', 'L' },
+    [39] = { ';', ':' },  [40] = { '\'', '"' }, [41] = { '`', '~' },
+    [42] = { 0xffe1, 0xffe1 },   /* Shift_L */
+    [43] = { '\\', '|' },
+    [44] = { 'z', 'Z' },  [45] = { 'x', 'X' },  [46] = { 'c', 'C' },
+    [47] = { 'v', 'V' },  [48] = { 'b', 'B' },  [49] = { 'n', 'N' },
+    [50] = { 'm', 'M' },  [51] = { ',', '<' },  [52] = { '.', '>' },
+    [53] = { '/', '?' },
+    [54] = { 0xffe2, 0xffe2 },   /* Shift_R */
+    [55] = { 0xffaa, 0xffaa },   /* KP_Multiply */
+    [56] = { 0xffe9, 0xffe9 },   /* Alt_L */
+    [57] = { ' ', ' ' },         /* space */
+    [58] = { 0xffe5, 0xffe5 },   /* Caps_Lock */
+    [59] = { 0xffbe, 0xffbe }, [60] = { 0xffbf, 0xffbf },   /* F1  F2  */
+    [61] = { 0xffc0, 0xffc0 }, [62] = { 0xffc1, 0xffc1 },   /* F3  F4  */
+    [63] = { 0xffc2, 0xffc2 }, [64] = { 0xffc3, 0xffc3 },   /* F5  F6  */
+    [65] = { 0xffc4, 0xffc4 }, [66] = { 0xffc5, 0xffc5 },   /* F7  F8  */
+    [67] = { 0xffc6, 0xffc6 }, [68] = { 0xffc7, 0xffc7 },   /* F9  F10 */
+    [69] = { 0xff7f, 0xff7f },   /* Num_Lock    */
+    [70] = { 0xff14, 0xff14 },   /* Scroll_Lock */
+    [71] = { 0xffb7, 0xffb7 }, [72] = { 0xffb8, 0xffb8 }, [73] = { 0xffb9, 0xffb9 },
+    [74] = { 0xffad, 0xffad },   /* KP_Subtract */
+    [75] = { 0xffb4, 0xffb4 }, [76] = { 0xffb5, 0xffb5 }, [77] = { 0xffb6, 0xffb6 },
+    [78] = { 0xffab, 0xffab },   /* KP_Add */
+    [79] = { 0xffb1, 0xffb1 }, [80] = { 0xffb2, 0xffb2 }, [81] = { 0xffb3, 0xffb3 },
+    [82] = { 0xffb0, 0xffb0 },   /* KP_0 */
+    [83] = { 0xffae, 0xffae },   /* KP_Decimal */
+    [87] = { 0xffc8, 0xffc8 }, [88] = { 0xffc9, 0xffc9 },   /* F11 F12 */
+    [96] = { 0xff8d, 0xff8d },   /* KP_Enter  */
+    [97] = { 0xffe4, 0xffe4 },   /* Control_R */
+    [98] = { 0xffaf, 0xffaf },   /* KP_Divide */
+    [100] = { 0xffea, 0xffea },  /* Alt_R  */
+    [102] = { 0xff50, 0xff50 },  /* Home   */
+    [103] = { 0xff52, 0xff52 },  /* Up     */
+    [104] = { 0xff55, 0xff55 },  /* Prior  */
+    [105] = { 0xff51, 0xff51 },  /* Left   */
+    [106] = { 0xff53, 0xff53 },  /* Right  */
+    [107] = { 0xff57, 0xff57 },  /* End    */
+    [108] = { 0xff54, 0xff54 },  /* Down   */
+    [109] = { 0xff56, 0xff56 },  /* Next   */
+    [110] = { 0xff63, 0xff63 },  /* Insert */
+    [111] = { 0xffff, 0xffff },  /* Delete */
+    [125] = { 0xffeb, 0xffeb },  /* Super_L */
+    [126] = { 0xffec, 0xffec },  /* Super_R */
+    [127] = { 0xff67, 0xff67 },  /* Menu    */
+};
+
+/* GetModifierMapping's answer: 8 rows (Shift, Lock, Control, Mod1..Mod5) of
+ * KEYCODES_PER_MODIFIER X keycodes, 0 where a slot is unused.
+ *
+ * Every keycode named here must be one the window manager actually tracks, or
+ * the client is told a combination exists that can never be produced.  These
+ * rows pair with wm.h's WM_MOD_* and with the tracking in the desktop's
+ * current_mods(); change one and change all three. */
+#define KEYCODES_PER_MODIFIER 2
+static const uint8_t modifier_linux_keys[8][KEYCODES_PER_MODIFIER] = {
+    { LK_LEFTSHIFT, LK_RIGHTSHIFT },   /* Shift */
+    { LK_CAPSLOCK,  0 },               /* Lock  */
+    { LK_LEFTCTRL,  LK_RIGHTCTRL },    /* Control */
+    { LK_LEFTALT,   LK_RIGHTALT },     /* Mod1 = Alt */
+    { LK_NUMLOCK,   0 },               /* Mod2 = NumLock */
+    { 0, 0 },                          /* Mod3 unused */
+    { LK_LEFTMETA,  LK_RIGHTMETA },    /* Mod4 = Super */
+    { 0, 0 },                          /* Mod5 unused */
+};
+
+/* ── stacking order ──────────────────────────────────────────────────────────
+ * "Which window is on top" has exactly ONE definition in maeroX, and this is
+ * it: the one created last.  The resource array cannot answer the question —
+ * res_new() reuses the first free slot and pixmaps and GCs are created and
+ * freed constantly, so a window's slot index says nothing about where it sits.
+ * Firefox is the case that punishes a second opinion: it maps a blank toplevel
+ * and a same-size MozContainer child, and which of the two lands in the higher
+ * slot is a coin flip from one boot to the next.  The compositor, the click
+ * hit-test and the key-target fallback all ask here, so they cannot disagree
+ * about what the user is looking at. */
+static int win_above(const xres_t *a, const xres_t *b) {
+    return a->create_seq > b->create_seq;
+}
+
+/* The top-most mapped window, or with hit_test the top-most one containing
+ * (x, y).  NULL (and *out_c NULL) when nothing qualifies. */
+static xres_t *topmost_window(int hit_test, int x, int y, xclient_t **out_c) {
+    xclient_t *bc = NULL; xres_t *bw = NULL;
+    for (int ci = 0; ci < MAX_XCLIENTS; ci++) {
+        if (!clients[ci].used) continue;
+        for (int i = 0; i < clients[ci].nres; i++) {
+            xres_t *w = &clients[ci].res[i];
+            if (w->kind != R_WINDOW || !w->mapped) continue;
+            if (hit_test && (x < w->x || x >= w->x + w->w ||
+                             y < w->y || y >= w->y + w->h)) continue;
+            if (!bw || win_above(w, bw)) { bw = w; bc = &clients[ci]; }
+        }
+    }
+    *out_c = bc;
+    return bw;
+}
+
+/* ── input focus ─────────────────────────────────────────────────────────────
+ * Keys go to one window.  maeroX picks it the way a kiosk WM would — the last
+ * real top-level to be mapped — and then defers to the client the moment it
+ * asks for something else with SetInputFocus, which is what GTK does when it
+ * shows or activates a window.  GetInputFocus answers with the same window, so
+ * a toolkit that reads back what it set sees its own value. */
+static int      focus_ci = -1;         /* index into clients[], -1 = none */
+static uint32_t focus_xid;             /* 0 = none */
+static int      focus_explicit;        /* a client called SetInputFocus */
+static uint8_t  focus_revert = 1;      /* RevertToPointerRoot */
+
+/* FocusIn (9) / FocusOut (10).  GTK needs these to mark a toplevel active;
+ * without them a text widget never shows a caret and drops key events even
+ * when they arrive. */
+static void send_focus(xclient_t *c, uint32_t window, int in) {
+    uint8_t e[32];
+    memset(e, 0, sizeof(e));
+    e[0] = (uint8_t)(in ? 9 : 10);
+    e[1] = 0;                           /* detail = NotifyAncestor */
+    put16(e + 2, c->seq);
+    put32(e + 4, window);               /* event window */
+    e[8] = 0;                           /* mode = NotifyNormal */
+    write_all(c->fd, e, 32);
+}
+
+static void xfocus_set(int ci, uint32_t xid) {
+    if (ci == focus_ci && xid == focus_xid) return;
+    if (focus_ci >= 0 && focus_ci < MAX_XCLIENTS && clients[focus_ci].used &&
+        focus_xid)
+        send_focus(&clients[focus_ci], focus_xid, 0);
+    focus_ci = ci;
+    focus_xid = xid;
+    if (ci >= 0 && ci < MAX_XCLIENTS && clients[ci].used && xid)
+        send_focus(&clients[ci], xid, 1);
+    xt("XT focus -> c%d xid=0x%x\n", ci, (unsigned)xid);
+}
+
+static int client_index(const xclient_t *c) {
+    return (int)(c - clients);
+}
+
+/* The kiosk focus policy, in one place.  A window is offered the keyboard when
+ * it is a real top-level — parented to the root and wide enough not to be a
+ * 1x1/10x10 helper or a small popup — and only while no client has taken
+ * charge of focus itself; a SetInputFocus (which is what GTK issues when it
+ * shows or activates a window) sets focus_explicit and wins from then on.  The
+ * only exception is that somebody must hold the keyboard: with no focus at all
+ * any window will do.
+ *
+ * Both the map path and the click path come through here.  They used to decide
+ * separately, and the click path decided with no guards at all: clicking in a
+ * Firefox page handed the keyboard to the MozContainer child, GDK discarded
+ * the FocusIn (it only tracks focus on toplevels) but processed the toplevel's
+ * FocusOut, and from then on the browser had keys addressed to a window it did
+ * not believe was focused. */
+static void focus_offer(xclient_t *c, xres_t *w) {
+    if (!focus_explicit && w->parent == ROOT_WINDOW && w->w >= 400)
+        xfocus_set(client_index(c), w->xid);
+    else if (focus_xid == 0)
+        xfocus_set(client_index(c), w->xid);
+}
+
+/* The window a key event is addressed to: the focus window while it is still a
+ * mapped window of a live client, else the top-most mapped window (same
+ * creation-order rule the compositor uses, so keys follow what is on screen). */
+static xres_t *key_target(xclient_t **out_c) {
+    if (focus_ci >= 0 && focus_ci < MAX_XCLIENTS && clients[focus_ci].used) {
+        xres_t *w = res_find(&clients[focus_ci], focus_xid);
+        if (w && w->kind == R_WINDOW && w->mapped) {
+            *out_c = &clients[focus_ci];
+            return w;
+        }
+    }
+    return topmost_window(0, 0, 0, out_c);
+}
+
+/* A KeyPress (2) / KeyRelease (3).  Byte-for-byte the same 32-byte layout as a
+ * pointer event: detail is the KEYCODE, state the modifier mask that was in
+ * effect just before the event. */
+static void send_key(xclient_t *c, xres_t *w, int type, int keycode, int state) {
+    uint8_t e[32];
+    memset(e, 0, sizeof(e));
+    e[0] = (uint8_t)type;
+    e[1] = (uint8_t)keycode;            /* detail = keycode */
+    put16(e + 2, c->seq);
+    put32(e + 4, x_time());             /* time */
+    put32(e + 8, ROOT_WINDOW);          /* root */
+    put32(e + 12, w->xid);              /* event window */
+    put32(e + 16, 0);                   /* child = None */
+    put16(e + 20, w->x); put16(e + 22, w->y);   /* root-x/y  */
+    put16(e + 24, 0);    put16(e + 26, 0);      /* event-x/y */
+    put16(e + 28, (uint32_t)state);     /* state */
+    e[30] = 1;                          /* same-screen */
+    write_all(c->fd, e, 32);
+}
+
+static unsigned key_events_sent;
+
+/* ── the pairing rule ────────────────────────────────────────────────────────
+ * A KeyRelease goes to the window that received the KeyPress, or it goes
+ * nowhere.  The focus can move between the two edges of a keystroke — a click,
+ * a SetInputFocus, a window unmapping — and re-deciding the target at release
+ * time would leave one client holding a key forever and hand another a release
+ * for a key it never saw.  So the press records its target, the release reads
+ * it back, and a release with no recorded press is dropped.
+ *
+ * Indexed by Linux keycode; the client index is stored +1 so 0 means "no press
+ * was delivered for this key". */
+static struct { unsigned char ci1; uint32_t xid; } key_down[KEYMAP_MAX + 128];
+
+/* One key from the desktop (or from the test channel): a Linux keycode, 1 for
+ * press / 0 for release, and the WM_MOD_* mask, which is already the X mask. */
+static void on_x_key(gui_window_t *g, int code, int value, int mods) {
+    (void)g;
+    /* Keep the result inside the keycode range the setup reply advertises
+     * (min 8, max 255); anything else is not a key this server can name. */
+    if (code <= 0 || code + X_KEYCODE_BASE > 255) return;
+    xclient_t *c = NULL;
+    xres_t *w = NULL;
+
+    if (value) {
+        w = key_target(&c);
+        if (!c || !w) return;
+        key_down[code].ci1 = (unsigned char)(client_index(c) + 1);
+        key_down[code].xid = w->xid;
+    } else {
+        int ci = (int)key_down[code].ci1 - 1;
+        uint32_t xid = key_down[code].xid;
+        key_down[code].ci1 = 0;
+        key_down[code].xid = 0;
+        if (ci < 0 || ci >= MAX_XCLIENTS || !clients[ci].used) return;
+        c = &clients[ci];
+        w = res_find(c, xid);
+        if (!w || w->kind != R_WINDOW) return;
+    }
+    send_key(c, w, value ? 2 : 3, code + X_KEYCODE_BASE, mods);
+    key_events_sent++;
+    if (key_events_sent <= 256)
+        xt("XT key code=%d(x%d) %s state=0x%x -> win=0x%x\n", code,
+           code + X_KEYCODE_BASE, value ? "press" : "release", mods,
+           (unsigned)w->xid);
+}
+
+/* ── test input channel (-K, headless only) ─────────────────────────────────
+ * Real keys and clicks arrive over the desktop's window-manager event channel,
+ * which only exists when maeroX runs inside the desktop.  A headless server has
+ * no desktop, so with -K it also reads injections from a FIFO — the XTEST
+ * extension's job, done with a few bytes of shell-visible protocol:
+ *     printf 'k <linux-keycode> <1 press|0 release> <modmask>\n' > /tmp/.maerox-keys
+ *     printf 'c <x> <y>\n'                                      > /tmp/.maerox-keys
+ * Injections go through on_x_key() and on_x_click(), so a test exercises the
+ * same keycode conversion, hit-test, focus policy and event encoding a real
+ * key or a real click does.
+ *
+ * IT MUST NOT EXIST OUTSIDE THE TESTS.  Anything that can open this FIFO can
+ * synthesise a KeyPress straight onto the focused client — the browser —
+ * without passing the desktop's focus tracking, the keys the desktop keeps for
+ * itself, or the press/release pairing rule.  So it takes an explicit flag AND
+ * refuses to open in a windowed server: the desktop build has no such channel
+ * at all, and a session cannot acquire one by accident.  keyfifo_open() is the
+ * only place the decision is made; everything downstream keys off keyfifo_fd,
+ * which stays -1 when the channel was refused. */
+#define KEYFIFO_PATH "/tmp/.maerox-keys"
+static int  test_keys;                 /* -K: the injection channel was asked for */
+static int  keyfifo_fd = -1;
+static char keyfifo_line[64];
+static int  keyfifo_used;
+
+static void keyfifo_open(void) {
+    if (!test_keys) return;
+    if (!headless) {                   /* a windowed server has a real keyboard */
+        printf("maerox: -K refused: the key-injection channel is headless-only\n");
+        return;
+    }
+    unlink(KEYFIFO_PATH);
+    if (mkfifo(KEYFIFO_PATH, 0600) != 0) return;
+    /* This kernel's mknod(2) keeps only the type bits and drops the permission
+     * bits (do_mknod in proc/syscall.c), and vfs_access_check() reads a FIFO
+     * with no mode as 0666 — so the mode above is advisory and the chmod is
+     * what actually makes the node owner-only.  Not fatal if it fails: the
+     * headless+flag gate is what keeps this out of a real session. */
+    if (chmod(KEYFIFO_PATH, 0600) != 0)
+        printf("maerox: warning: could not restrict " KEYFIFO_PATH " to 0600\n");
+    keyfifo_fd = open(KEYFIFO_PATH, O_RDONLY | O_NONBLOCK);
+}
+
+static void on_x_click(gui_window_t *g, int x, int y);   /* fwd: click injection */
+
+static void keyfifo_poll(void) {
+    char ch;
+    if (keyfifo_fd < 0) return;        /* not opened = channel refused or off */
+    while (read(keyfifo_fd, &ch, 1) == 1) {
+        if (ch == '\r') continue;
+        if (ch != '\n') {
+            if (keyfifo_used + 1 < (int)sizeof(keyfifo_line))
+                keyfifo_line[keyfifo_used++] = ch;
+            continue;
+        }
+        keyfifo_line[keyfifo_used] = '\0';
+        keyfifo_used = 0;
+        int code = 0, value = 0, mods = 0;
+        if (keyfifo_line[0] == 'k' &&
+            sscanf(keyfifo_line + 1, "%d %d %d", &code, &value, &mods) == 3)
+            on_x_key(NULL, code, value, mods);
+        else if (keyfifo_line[0] == 'c' &&
+                 sscanf(keyfifo_line + 1, "%d %d", &code, &value) == 2)
+            on_x_click(NULL, code, value);
+    }
+}
+
 /* ── drawing into a drawable's backing buffer ────────────────────────────── */
 static void fill_rect(xres_t *d, int x, int y, int w, int h, uint32_t color) {
     if (!d || !d->px) return;
@@ -750,6 +1113,7 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
         xres_t *w = res_new(c, wid, R_WINDOW);
         if (!w) return;
         w->create_seq = ++res_seq;
+        w->parent = r32(q + 8);
         w->x = rs16(q + 12); w->y = rs16(q + 14);
         w->w = (int)r16(q + 16); w->h = (int)r16(q + 18);
         if (w->w < 1) w->w = 1; if (w->h < 1) w->h = 1;
@@ -858,6 +1222,7 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
             send_map_notify(c, w);      /* mark viewable → GDK will paint */
             send_configure(c, w);       /* report geometry */
             send_expose(c, w);          /* ask the client to paint */
+            focus_offer(c, w);          /* kiosk focus policy — one copy of it */
         }
         break;
     }
@@ -1071,11 +1436,25 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
         send_reply(c, 0, data);
         break;
     }
-    case 43: {       /* GetInputFocus → reply (sync) */
+    case 42: {       /* SetInputFocus — the client claims the keyboard */
+        uint32_t wid = r32(q + 4);
+        focus_revert = q[1];
+        /* None (0) and PointerRoot (1) are not windows; treat either as "no
+         * window wants the keyboard" and fall back to the kiosk policy. */
+        if (wid > 1) {
+            focus_explicit = 1;
+            xfocus_set(client_index(c), wid);
+        } else {
+            focus_explicit = 0;
+            xfocus_set(-1, 0);
+        }
+        break;
+    }
+    case 43: {       /* GetInputFocus → the window SetInputFocus/the WM chose */
         uint8_t data[24];
         memset(data, 0, sizeof(data));
-        data[0] = ROOT_WINDOW & 0xFF;    /* focus = root */
-        send_reply(c, 0, data);
+        put32(data + 0, focus_xid ? focus_xid : ROOT_WINDOW);
+        send_reply(c, focus_revert, data);
         break;
     }
     case 98: {       /* QueryExtension */
@@ -1129,15 +1508,21 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
         send_reply(c, 1, data);
         break;
     }
-    case 101: {      /* GetKeyboardMapping → minimal 1 keysym/keycode */
+    case 101: {      /* GetKeyboardMapping → the US layout, 2 keysyms/keycode */
         int first = q[4], count = q[5];
         if (count < 1) count = 1;
-        int per = 1;                       /* keysyms-per-keycode */
+        int per = KEYSYMS_PER_KEYCODE;
         int n = count * per;
         uint8_t *ks = (uint8_t *)malloc((size_t)n * 4);
         if (ks) {
-            for (int i = 0; i < count; i++)
-                put32(ks + i * 4, (uint32_t)(first + i));  /* keycode as keysym */
+            for (int i = 0; i < count; i++) {
+                int lk = first + i - X_KEYCODE_BASE;   /* back to a Linux code */
+                for (int j = 0; j < per; j++) {
+                    uint32_t sym = (lk >= 0 && lk < KEYMAP_MAX)
+                                 ? us_keysyms[lk][j] : 0;   /* 0 = NoSymbol */
+                    put32(ks + (i * per + j) * 4, sym);
+                }
+            }
             send_reply_var(c, (uint8_t)per, NULL, ks, n * 4);
             free(ks);
         } else {
@@ -1145,9 +1530,16 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
         }
         break;
     }
-    case 119: {      /* GetModifierMapping → 8 modifiers, 0 keycodes each */
-        uint8_t extra[8*2]; memset(extra, 0, sizeof(extra));
-        send_reply_var(c, 2 /* keycodes-per-modifier */, NULL, extra, sizeof(extra));
+    case 119: {      /* GetModifierMapping → the real Shift/Lock/Control/Alt keys */
+        uint8_t extra[8 * KEYCODES_PER_MODIFIER];
+        memset(extra, 0, sizeof(extra));
+        for (int m = 0; m < 8; m++)
+            for (int k = 0; k < KEYCODES_PER_MODIFIER; k++) {
+                uint8_t lk = modifier_linux_keys[m][k];
+                extra[m * KEYCODES_PER_MODIFIER + k] =
+                    lk ? (uint8_t)(lk + X_KEYCODE_BASE) : 0;
+            }
+        send_reply_var(c, KEYCODES_PER_MODIFIER, NULL, extra, sizeof(extra));
         break;
     }
     case 78: break;  /* CreateColormap — accept */
@@ -1174,6 +1566,11 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
  * its window/pixmap pixel buffers (MBs per attempt) and glyphsets, degrading
  * later attempts monotonically. */
 static void client_free_resources(xclient_t *c) {
+    if (focus_ci == client_index(c)) { focus_ci = -1; focus_xid = 0; focus_explicit = 0; }
+    /* Held keys belonging to this client die with it; the slot is reused. */
+    for (int i = 0; i < (int)(sizeof(key_down) / sizeof(key_down[0])); i++)
+        if (key_down[i].ci1 == (unsigned char)(client_index(c) + 1))
+            { key_down[i].ci1 = 0; key_down[i].xid = 0; }
     for (int i = 0; i < c->nres; i++) {
         xres_t *r = &c->res[i];
         if (r->kind == R_NONE) continue;
@@ -1236,7 +1633,31 @@ static void process_client(xclient_t *c) {
     }
 }
 
-/* Base64-encode `len` bytes to fd, wrapping at 76 chars/line. */
+/* Drain whatever input is waiting: the desktop's window-manager events and the
+ * test channel, and put anything it changed on screen.  Called from the main
+ * loop, and from inside the frame dump — see b64_write().  Repainting matters
+ * as much as reading: accepting a keystroke during a dump but leaving the
+ * screen untouched until the dump ends would show the user a window frozen
+ * minutes behind what they typed. */
+static void render(void);   /* fwd */
+static void pump_input(void) {
+    if (!headless) {
+        gui_poll(&gui);
+        if (dirty) render();
+    }
+    keyfifo_poll();
+}
+
+/* Base64-encode `len` bytes to fd, wrapping at 76 chars/line.
+ *
+ * Input is drained between lines.  That looks out of place in an encoder, but
+ * this is the only caller and it writes ~1 MB to a 115200-baud serial line —
+ * upwards of a minute during which maeroX is otherwise inside one write().  The
+ * desktop's event channel is a small FIFO opened non-blocking, so once it fills
+ * every further keystroke is thrown away with no error anywhere; a keystroke
+ * dropped between a press and its release then leaves the client believing the
+ * key is still held.  Draining as we go keeps the session alive while the
+ * diagnostic streams. */
 static void b64_write(int fd, const uint8_t *in, int len) {
     static const char *T =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1249,7 +1670,10 @@ static void b64_write(int fd, const uint8_t *in, int len) {
         line[col++] = T[(v >> 12) & 63];
         line[col++] = (i + 1 < len) ? T[(v >> 6) & 63] : '=';
         line[col++] = (i + 2 < len) ? T[v & 63] : '=';
-        if (col >= 76) { line[col++] = '\n'; write(fd, line, col); col = 0; }
+        if (col >= 76) {
+            line[col++] = '\n'; write(fd, line, col); col = 0;
+            pump_input();
+        }
     }
     if (col) { line[col++] = '\n'; write(fd, line, col); }
 }
@@ -1290,19 +1714,16 @@ static void frame_dump(void) {
 }
 
 /* ── compositing ─────────────────────────────────────────────────────────── */
-/* Draw the mapped windows in CREATION order, oldest first, so a window created
- * later covers one created earlier.  maeroX does not track the window
- * hierarchy, and Firefox's toplevel (which it leaves blank) and the MozContainer
- * it actually renders into are both full-screen, so whichever is drawn last
- * decides what the user sees.  Iterating the resource array drew them in slot
- * order, and because res_new() reuses freed pixmap/GC slots the container could
- * land below the toplevel: the browser then painted normally (putimg=24) while
- * the screen showed the toplevel's empty background.  That was a coin flip -
- * 10 of 20 runs. */
-typedef struct { xres_t *w; unsigned seq; } zorder_t;
-
+/* Draw the mapped windows bottom-up in win_above() order — the one shared
+ * definition of the stacking order — so the window the compositor paints last
+ * is the same one the click hit-test and the key-target fallback call topmost.
+ * Iterating the resource array instead drew them in slot order, and because
+ * res_new() reuses freed pixmap/GC slots the MozContainer Firefox renders into
+ * could land below the blank toplevel: the browser painted normally
+ * (putimg=24) while the screen showed the toplevel's empty background.  That
+ * was a coin flip - 10 of 20 runs. */
 static void composite_windows(draw_surface_t *s) {
-    zorder_t order[MAX_XCLIENTS * MAX_RES];
+    xres_t *order[MAX_XCLIENTS * MAX_RES];
     int n = 0;
     for (int ci = 0; ci < MAX_XCLIENTS; ci++) {
         if (!clients[ci].used) continue;
@@ -1310,17 +1731,17 @@ static void composite_windows(draw_surface_t *s) {
         for (int i = 0; i < c->nres && n < (int)(sizeof(order) / sizeof(order[0])); i++) {
             xres_t *w = &c->res[i];
             if (w->kind != R_WINDOW || !w->mapped || !w->px || !w->painted) continue;
-            order[n].w = w; order[n].seq = w->create_seq; n++;
+            order[n++] = w;
         }
     }
     for (int i = 1; i < n; i++) {            /* insertion sort: n is tiny */
-        zorder_t t = order[i];
+        xres_t *t = order[i];
         int j = i - 1;
-        while (j >= 0 && order[j].seq > t.seq) { order[j + 1] = order[j]; j--; }
+        while (j >= 0 && win_above(order[j], t)) { order[j + 1] = order[j]; j--; }
         order[j + 1] = t;
     }
     for (int k = 0; k < n; k++) {
-        xres_t *w = order[k].w;
+        xres_t *w = order[k];
         for (int yy = 0; yy < w->h; yy++) {
             int ty = w->y + yy;
             if (ty < 0 || ty >= s->h) continue;
@@ -1340,23 +1761,18 @@ static int count_clients(void) {
 }
 
 /* Forward a libgui click (surface coords) to the topmost X window under it as a
- * ButtonPress + ButtonRelease pair. */
+ * ButtonPress + ButtonRelease pair.  "Topmost" is topmost_window()'s answer —
+ * the same one the compositor draws by — so the window that gets the button is
+ * the one the user actually clicked on rather than whichever happened to sit in
+ * the higher resource slot.  The button goes to that window; the keyboard moves
+ * only if focus_offer() says the policy allows it. */
 static void on_x_click(gui_window_t *g, int x, int y) {
     (void)g;
-    xclient_t *hit_c = NULL; xres_t *hit_w = NULL;
-    for (int ci = 0; ci < MAX_XCLIENTS; ci++) {
-        if (!clients[ci].used) continue;
-        xclient_t *c = &clients[ci];
-        for (int i = 0; i < c->nres; i++) {
-            xres_t *w = &c->res[i];
-            if (w->kind != R_WINDOW || !w->mapped) continue;
-            if (x >= w->x && x < w->x + w->w && y >= w->y && y < w->y + w->h) {
-                hit_c = c; hit_w = w;       /* keep the last = topmost */
-            }
-        }
-    }
+    xclient_t *hit_c = NULL;
+    xres_t *hit_w = topmost_window(1, x, y, &hit_c);
     if (hit_c && hit_w) {
         int ex = x - hit_w->x, ey = y - hit_w->y;
+        focus_offer(hit_c, hit_w);
         send_pointer(hit_c, hit_w, 4, 1, ex, ey);   /* ButtonPress, button 1 */
         send_pointer(hit_c, hit_w, 5, 1, ex, ey);   /* ButtonRelease */
     }
@@ -1411,6 +1827,8 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "-v")) xdbg = 1;
         else if (!strcmp(argv[i], "-T")) trace_fd = -2;   /* request /dev/tty trace */
         else if (!strcmp(argv[i], "-D")) { dumpmode = 1; trace_fd = -2; }
+        else if (!strcmp(argv[i], "-K") || !strcmp(argv[i], "--test-keys"))
+            test_keys = 1;             /* honoured only when headless */
         else if (!strcmp(argv[i], "-d") || !strcmp(argv[i], "--daemon")) daemon = 1;
         else if (argv[i][0] >= '0' && argv[i][0] <= '9') slot = atoi(argv[i]);
     }
@@ -1436,13 +1854,23 @@ int main(int argc, char *argv[]) {
     if (!daemon)  printf("maerox: listening on " X_SOCKET_PATH "\n");
     if (!headless) {
         gui_set_click_handler(&gui, on_x_click);   /* forward clicks to X clients */
+        gui_set_rawkey_handler(&gui, on_x_key);    /* forward keys as KeyPress */
         render();
     }
+    keyfifo_open();   /* after `headless` is final: -K is refused in a window */
+    /* Say once, on the trace, whether this server has an injection channel —
+     * and look at the filesystem rather than only at our own flag, so a node
+     * left behind by anything else is reported too.  smoke_firefox.py's
+     * --keycheck asserts this line reads "absent ... no node" on the desktop
+     * path, which is how a real session is shown not to have one. */
+    xt("XT keychannel: %s (%s)\n", keyfifo_fd >= 0 ? "OPEN" : "absent",
+       access(KEYFIFO_PATH, F_OK) == 0 ? "node present" : "no node");
 
     unsigned tick = 0;
     unsigned last_dump_tick = 0;
     while (headless || !gui.closed) {
         int events = headless ? 0 : gui_poll(&gui);
+        keyfifo_poll();
         accept_clients();
         for (int i = 0; i < MAX_XCLIENTS; i++)
             if (clients[i].used) process_client(&clients[i]);
@@ -1468,6 +1896,7 @@ int main(int argc, char *argv[]) {
     }
 
     close(listen_fd);
+    if (keyfifo_fd >= 0) { close(keyfifo_fd); unlink(KEYFIFO_PATH); }
     if (!headless) gui_close(&gui);
     return 0;
 }
