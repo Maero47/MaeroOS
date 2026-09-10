@@ -13,6 +13,10 @@
  */
 vfs_node_t *devfs_mount(void);
 
+/* One byte from the serial console, sleeping (not spinning) while the line is
+ * idle — see the comment on the definition in devfs.c. */
+char console_serial_getc(void);
+
 /* Read/write the TTY's struct termios (36 bytes, Linux i386 layout) */
 void tty_get_termios(void *buf);
 void tty_set_termios(const void *buf);

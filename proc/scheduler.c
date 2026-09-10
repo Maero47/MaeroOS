@@ -19,6 +19,7 @@ extern void vma_clear(struct proc *p);   /* free demand-paged VMAs (syscall.c) *
 #include "../kernel/printk.h"
 #include <kernel/config.h>
 #include <kernel/kprof.h>
+#include <kernel/kwatch.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -42,6 +43,7 @@ void scheduler_init(void) {
 void scheduler_start(void) {
     for (;;) {
         int ran = 0;
+        kwatch_poll();          /* emit a stall the timer tick spotted */
         uint64_t scan_t0 = kprof_probe_begin();
 
         for (int i = 0; i < MAX_PROCS; i++) {
@@ -128,6 +130,7 @@ void scheduler_start(void) {
 
 void scheduler_tick(int user_mode) {
     uint32_t now = pit_ticks();
+    kwatch_tick();
     for (int i = 0; i < MAX_PROCS; i++) {
         struct proc *p = &ptable[i];
         if (p->state == PROC_SLEEPING && p->wake_tick &&

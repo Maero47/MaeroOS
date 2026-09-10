@@ -378,6 +378,36 @@ make smoke-gtk      # GLib, Cairo, Pango and a real GTK3 window
 Each script exits non-zero and prints the failing expectation, for example
 `command 'threadprobe' did not produce 'threadprobe ok'`.
 
+### Diagnosing a hang
+
+A wedged boot prints nothing, so three things exist to make one visible.
+
+* **`kwatch`** (`kernel/kwatch.c`) watches the syscall counter from the timer
+  tick.  Twenty seconds without a single syscall is a stall, and it then prints
+  how the window's cycles split between user, idle and kernel — an all-idle
+  window means every thread is asleep and a wake-up was missed — followed by one
+  line per live process: state, how long it has waited, the pipe / AF_UNIX ring
+  / poll channel it is waiting on (decoded by scanning the fd tables), its last
+  syscall and its user EIP.  The per-tick cost is one compare, so it is always
+  on.  The same dump is printed on an **NMI**, which is delivered even when
+  interrupts are off — that is the way into a guest spinning inside a syscall.
+* **`tools/smoke_firefox.py`** photographs a wedged guest through the QEMU
+  monitor before killing it: `info registers`, `info pic`, `info cpus` and the
+  instructions at `$pc`, sampled four times, then an injected NMI whose dump
+  lands in `serial.log`.  It writes `wedge-qmp.txt` next to the run's other
+  artifacts.  Read `EFL`'s IF bit first: syscalls enter through an interrupt
+  gate, so IF=0 with CPL=0 means the guest is spinning in a syscall and no
+  interrupt can reach it — `info pic` then shows IRQ0 stuck in `irr`.
+* **`tools/ff_boot_loop.py`** boots `smoke_firefox.py` over and over (one QEMU
+  at a time) and reports the failure rate, the first-paint mean and where each
+  failing run's artifacts landed, so an intermittent hang can be measured
+  instead of guessed at:
+
+  ```sh
+  python3 tools/ff_boot_loop.py -n 60          # a campaign, ~1 hour
+  python3 tools/ff_boot_loop.py -n 20 --stop-after-fails 1 -- --smp 2
+  ```
+
 ## Repository layout
 
 | Path | Contents |

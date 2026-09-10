@@ -156,3 +156,5 @@ ports/fbDOOM/.git-upstream/
 
 # ── smoke-firefox artifacts (serial logs, screendumps, summaries) ──────────
 /build/ff-smoke/
+# ── ff_boot_loop campaign records (per-run verdicts and timings) ───────────
+/build/ff-loop/

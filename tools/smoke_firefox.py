@@ -257,6 +257,23 @@ class Qmp:
             self.sock = None
         return None
 
+    def hmp(self, command):
+        """Run one HMP monitor command on the live guest and return its text.
+
+        This is the only view into a wedged guest that does not need the guest
+        to cooperate: 'info registers' says whether the CPU is in ring 0 or
+        ring 3 and whether EIP moves, 'info cpus' whether it is halted."""
+        if not self.sock:
+            return "(no qmp)"
+        try:
+            r = self._cmd("human-monitor-command", **{"command-line": command})
+        except OSError:
+            self.sock = None
+            return "(qmp closed)"
+        if "return" in r:
+            return r["return"] or ""
+        return "(error: %s)" % r.get("error")
+
     def close(self):
         if self.sock:
             try:
@@ -264,6 +281,35 @@ class Qmp:
             except OSError:
                 pass
             self.sock = None
+
+
+def capture_wedge(qmp, outdir, samples=4, gap=0.75):
+    """Photograph a wedged guest from outside it.
+
+    Four register samples a fraction of a second apart answer the first
+    question a silent hang poses: is the CPU spinning (EIP moves, or moves
+    within a small range), halted with nothing to do (halted=1), or stuck at
+    one instruction with interrupts off (EIP identical, halted=0)."""
+    L = ["wedge capture (QEMU monitor, guest not consulted)", "=" * 72,
+         "EFL's IF bit is the one to read first: this kernel enters syscalls",
+         "through an interrupt gate, so IF=0 with CPL=0 means the guest is",
+         "spinning inside a syscall and no timer tick can ever land.  'info pic'",
+         "then shows IRQ0 sitting in irr, never delivered.",
+         ""]
+    for k in range(samples):
+        L.append("--- sample %d ---" % k)
+        L.append(qmp.hmp("info cpus"))
+        L.append(qmp.hmp("info registers"))
+        L.append(qmp.hmp("info pic"))
+        L.append(qmp.hmp("x/8i $pc"))
+        if k + 1 < samples:
+            time.sleep(gap)
+    L.append("--- info mem ---")
+    L.append(qmp.hmp("info mem"))
+    path = os.path.join(outdir, "wedge-qmp.txt")
+    with open(path, "w") as f:
+        f.write("\n".join(x if isinstance(x, str) else str(x) for x in L) + "\n")
+    return path
 
 
 class Run:
@@ -295,6 +341,7 @@ class Run:
         self.reason = ""
         self.shots = {}
         self.paint_scores = []
+        self.wedge_qmp = None
 
     # ── serial intake ────────────────────────────────────────────────────
     def feed(self, chunk):
@@ -450,6 +497,9 @@ class Run:
             L.append("paint-frame light-pixel scores (>~100000 = chrome visible, "
                      "<~50000 = the maeroX window was blank in that frame)")
             L.append("  " + " ".join(str(x) for x in self.paint_scores))
+            L.append("")
+        if self.wedge_qmp:
+            L.append("wedge capture : %s" % self.wedge_qmp)
             L.append("")
         L.append("screendumps")
         for k, v in self.shots.items():
@@ -621,7 +671,19 @@ def main():
         elif run.panic_lines:
             pump(2.0)         # collect the register dump / stack trace
         else:
+            # A FAIL with no panic and no ff verdict is a wedge: the guest
+            # stopped saying anything.  Photograph the CPU from outside before
+            # QEMU is killed — this is the only evidence a silent hang leaves.
             pump(0.5)
+            if proc.poll() is None:
+                run.wedge_qmp = capture_wedge(qmp, args.outdir)
+                print("smoke-firefox: wedge capture -> %s" % run.wedge_qmp)
+                # Knock on the guest with an NMI.  It is delivered even with
+                # IF=0, so the kernel's NMI handler can print every process's
+                # state onto the serial line from inside a hang that no timer
+                # tick can reach.  The pump is what lands it in serial.log.
+                qmp.hmp("nmi")
+                pump(3.0)
         shot("screen")
     except KeyboardInterrupt:
         run.result, run.reason = "FAIL", "interrupted"

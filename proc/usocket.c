@@ -348,3 +348,12 @@ void usocket_release(usocket_t *s) {
  * peer's writes (the socket-process reply buffer). */
 void *usocket_rx_id(usocket_t *s) { return s ? (void *)s->rx : 0; }
 void *usocket_tx_id(usocket_t *s) { return s ? (void *)s->tx : 0; }
+
+void usocket_stat(usocket_t *s, uint32_t *rx, uint32_t *tx, uint32_t *cap,
+                  int *peer_gone) {
+    if (cap)       *cap       = UBUF_SIZE;
+    if (rx)        *rx        = (s && s->rx) ? s->rx->count : 0;
+    if (tx)        *tx        = (s && s->tx) ? s->tx->count : 0;
+    if (peer_gone) *peer_gone = (s && ((s->rx && s->rx->writer_closed) ||
+                                       (s->tx && s->tx->reader_closed))) ? 1 : 0;
+}
