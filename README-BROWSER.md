@@ -97,7 +97,10 @@ not kernel work, and Firefox does **not** run yet:
    `python3 tools/smoke_firefox.py --type "<text>"` types `<text>` into
    Firefox's address bar with QEMU `sendkey` and saves `screen-typed.png`, and
    `--keycheck` asserts maeroX's key trace for pairing, `Mod1Mask` on an AltGr
-   combination, and that neither half of an Alt-Tab leaks to a client.
+   combination, that neither half of an Alt-Tab leaks to a client, and that the
+   session has no key-injection channel. That channel — maeroX's XTEST
+   stand-in, which the headless probe drives — takes an explicit `-K` and is
+   refused in a windowed server, so the desktop build has none.
 
 ## Next: the GTK stack (Phase 34)
 
