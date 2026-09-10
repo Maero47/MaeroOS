@@ -40,6 +40,8 @@
 #define LK_BACKSPACE 14
 #define LK_ENTER 28
 #define LK_A 30
+#define LK_C 46
+#define LK_V 47
 #define LK_LEFTSHIFT 42
 #define LK_LEFTCTRL 29
 #define LK_CAPSLOCK 58
@@ -270,6 +272,8 @@ int main(int argc,char**argv){
     expect_key("BackSpace",            w, LK_BACKSPACE,0,            1, 0x08);
     expect_key("Return",               w, LK_ENTER,    0,            1, 0x0d);
     expect_key("Ctrl+a",               w, LK_A,        CONTROL_MASK, 1, 0x01);
+    expect_key("Ctrl+c",               w, LK_C,        CONTROL_MASK, 1, 0x03);
+    expect_key("Ctrl+v",               w, LK_V,        CONTROL_MASK, 1, 0x16);
     expect_key("Alt+a",                w, LK_A,        MOD1_MASK,    1, 'a');
     expect_key("Left arrow (no char)",  w, LK_LEFT,     0,            0, 0);
 
