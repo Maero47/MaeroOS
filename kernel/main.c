@@ -1,7 +1,6 @@
 #include <kernel/types.h>
 #include <kernel/config.h>
 #include <kernel/multiboot.h>
-#include <kernel/kwatch.h>
 #include "../drivers/serial.h"
 #include "../drivers/rtc.h"
 #include "../drivers/ac97.h"
@@ -55,7 +54,6 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     gdt_init();
     tss_init();
     idt_init();
-    kwatch_init();      /* NMI -> full process dump (see kernel/kwatch.c) */
     fpu_init();
     pic_remap();
 

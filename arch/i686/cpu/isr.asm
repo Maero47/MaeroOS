@@ -142,6 +142,39 @@ tlb_ipi_isr:
     popa
     iret
 
+; ─── NMI stub (vector 2) ─────────────────────────────────────────────────────
+; Bare handler: the NMI is the way into a guest that has stopped, and the most
+; likely reason it has stopped is that this CPU is holding the Big Kernel Lock
+; and cannot let go.  Acquiring the lock here would deadlock against exactly
+; the state we came to look at, so this stub does not — like tlb_ipi_isr, it
+; goes straight to its C handler.  The frame it builds is a registers_t.
+global nmi_isr
+extern nmi_handler
+nmi_isr:
+    push dword 0        ; Dummy error code (keeps registers_t layout)
+    push dword 2        ; Interrupt number
+    pusha
+    push ds
+    push es
+    push fs
+    push gs
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    cld
+    push esp
+    call nmi_handler
+    add esp, 4
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    popa
+    add esp, 8          ; Remove int_no and err_code
+    iret
+
 ; ─── Common exception stub ───────────────────────────────────────────────────
 extern isr_handler
 extern bkl_enter

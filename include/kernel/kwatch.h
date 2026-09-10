@@ -21,7 +21,6 @@
 
 #define KWATCH_STALL_SEC   20     /* silence this long is a stall */
 
-void kwatch_init(void);           /* register the NMI state dump           */
 void kwatch_tick(void);           /* every timer tick, from scheduler_tick */
 void kwatch_poll(void);           /* emit a detected stall; scheduler loop  */
 void kwatch_dump(const char *tag);/* dump every live process's state now */

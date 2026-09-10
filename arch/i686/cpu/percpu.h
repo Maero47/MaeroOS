@@ -34,6 +34,7 @@ void smp_percpu_go_multi(void);
  */
 void bkl_enter(void);   /* trap entry: acquire (or nest)        */
 void bkl_leave(void);   /* trap exit:  release (or un-nest)     */
+void bkl_state(int *locked, int *depth);  /* diagnostic: lock word + depth */
 #define bkl_acquire bkl_enter
 #define bkl_release bkl_leave
 

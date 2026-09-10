@@ -8,7 +8,8 @@
 #include "../proc/pipe.h"
 #include "../fs/vfs.h"
 #include "../arch/i686/cpu/pit.h"
-#include "../arch/i686/cpu/isr.h"
+#include "../arch/i686/cpu/percpu.h"
+#include <registers.h>
 
 /* See include/kernel/kwatch.h for what this is for. */
 
@@ -160,6 +161,13 @@ void kwatch_dump(const char *tag) {
            (unsigned)(kprof_syscall_count(SYS_SCHED_YIELD_A) +
                       kprof_syscall_count(SYS_SCHED_YIELD_B)),
            (unsigned)kprof_ev[KPE_CTXSW], (unsigned)kprof_ev[KPE_WAKE]);
+    {
+        int locked = 0, depth = 0;
+        bkl_state(&locked, &depth);
+        printk("[kwatch] bkl: locked=%d depth=%d%s\n", locked, depth,
+               (locked && depth == 0)
+                   ? "  <- held with nothing holding it: self-deadlock" : "");
+    }
     printk("[kwatch] window: user=%ums idle=%ums kernel=%ums -> %s\n",
            u, idl, kern,
            idl > u + kern ? "ASLEEP (nothing runnable: a wake-up was missed)"
@@ -201,18 +209,16 @@ void kwatch_dump(const char *tag) {
  * with it, and no watchdog driven by that tick can ever fire.  An NMI is
  * delivered regardless of IF, so `nmi` from the QEMU monitor gets the same
  * state dump out of a hung guest, plus where the CPU actually was.  Registered
- * through the exception table rather than checked in isr_handler, which is on
- * the syscall path and runs tens of millions of times a boot.
+ * Reached through its own stub (nmi_isr in isr.asm), which deliberately does
+ * not take the Big Kernel Lock: the hang this exists to photograph is one where
+ * that lock is held and cannot be let go, so taking it here would deadlock
+ * against the very state being looked at.
  */
-static void kwatch_nmi(registers_t *regs) {
+void nmi_handler(registers_t *regs) {
     printk("[kwatch] NMI: cs=%x eip=%x eflags=%x (IF=%d)\n",
            (unsigned)regs->cs, (unsigned)regs->eip, (unsigned)regs->eflags,
            (regs->eflags & 0x200) ? 1 : 0);
     kwatch_dump("NMI");
-}
-
-void kwatch_init(void) {
-    isr_install_handler(2, kwatch_nmi);
 }
 
 void kwatch_tick(void) {

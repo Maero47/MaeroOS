@@ -90,6 +90,14 @@ void idt_init(void) {
     idt_set_gate(46, (uint32_t)irq14, 0x08, 0x8E);
     idt_set_gate(47, (uint32_t)irq15, 0x08, 0x8E);
 
+    /* NMI: its own stub, which does NOT take the Big Kernel Lock — see
+     * nmi_isr in isr.asm.  An interrupt gate, so the dump runs with interrupts
+     * off. */
+    {
+        extern void nmi_isr(void);
+        idt_set_gate(2, (uint32_t)nmi_isr, 0x08, 0x8E);
+    }
+
     /* Syscall entry: interrupt gate (clears IF), DPL=3 so ring 3 can invoke it */
     idt_set_gate(0x80, (uint32_t)isr128, 0x08, 0xEE);
 
