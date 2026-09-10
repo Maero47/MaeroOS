@@ -85,6 +85,15 @@ not kernel work, and Firefox does **not** run yet:
    `XOpenDisplay`, creates a window, and paints with `XFillRectangle` on the
    MaeroOS desktop (`XREAL_PAINTED`). The unlock was kernel `sendmsg`/`recvmsg`
    on AF_UNIX (libxcb's transport). The X client library is now **real**.
+   **Keyboard done:** keys travel PS/2 → `drivers/keyboard.c` → the desktop →
+   the WM event channel (`rkey`, the uncooked stream) → maeroX → X11
+   `KeyPress`/`KeyRelease` on the focused window. maeroX answers
+   `GetKeyboardMapping` with the US layout (two keysyms per keycode),
+   `GetModifierMapping` with the real Shift/Lock/Control/Alt keycodes, tracks an
+   input focus that `SetInputFocus`/`GetInputFocus` agree with, and sends
+   `FocusIn`/`FocusOut`. `xkey` proves it (`XKEY_OK`), and
+   `python3 tools/smoke_firefox.py --type "<text>"` types `<text>` into
+   Firefox's address bar with QEMU `sendkey` and saves `screen-typed.png`.
 
 ## Next: the GTK stack (Phase 34)
 
