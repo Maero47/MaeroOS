@@ -34,7 +34,7 @@ Artifacts go to build/ff-smoke/<timestamp>-<tag>/ (gitignored):
   screen-typed.png  with --type TEXT only: the frame after TEXT was typed into
                     Firefox's address bar through QEMU sendkey
   summary.txt       verdict, timings, attempt list, crash lines, last kernel
-                    lines, moz.log tail
+                    lines, moz.log tail, and with --keycheck the key-trace result
   qemu-cmdline.txt  the exact QEMU command
 
 Usage:
@@ -381,6 +381,8 @@ class Run:
         self.paint_scores = []
         self.wedge_qmp = None
         self.type_note = None
+        self.key_notes = None
+        self.key_ok = None
 
     # ── serial intake ────────────────────────────────────────────────────
     def feed(self, chunk):
@@ -537,6 +539,11 @@ class Run:
                      "<~50000 = the maeroX window was blank in that frame)")
             L.append("  " + " ".join(str(x) for x in self.paint_scores))
             L.append("")
+        if self.key_notes:
+            L.append("key checks")
+            for n in self.key_notes:
+                L.append("  " + n)
+            L.append("")
         if self.type_note:
             L.append("typing      : %s" % self.type_note)
             L.append("")
@@ -552,6 +559,123 @@ class Run:
         with open(os.path.join(a.outdir, "summary.txt"), "w") as f:
             f.write(text)
         return text
+
+
+# maeroX's own trace of every key event it delivered, one line each:
+#   XT key code=30(x38) press state=0x8 -> win=0x200012
+XT_KEY = re.compile(r"XT key code=(\d+)\(x(\d+)\) (press|release) "
+                    r"state=0x([0-9a-fA-F]+) -> win=0x([0-9a-fA-F]+)")
+
+
+def check_key_trace(run):
+    """Replay maeroX's key trace and check what a client would have seen.
+
+    Two things are asserted.  First the pairing invariant: every KeyPress is
+    matched by a KeyRelease for the same keycode on the same window, none
+    arrives unmatched, and nothing is left held — an unpaired press leaves the
+    client believing a key is still down.  Second, that right Alt reaches the
+    client as Mod1Mask and that Alt-Tab, which the desktop keeps for itself,
+    delivered a complete Alt pair and no Tab at all.
+
+    Returns (ok, [notes])."""
+    events = []
+    for _, line in run.lines:
+        m = XT_KEY.search(line)
+        if m:
+            events.append((int(m.group(1)), int(m.group(2)), m.group(3),
+                           int(m.group(4), 16), m.group(5)))
+    notes = ["maeroX delivered %d key events" % len(events)]
+    if not events:
+        return False, notes + ["FAIL no key events reached maeroX at all"]
+
+    held, bad = {}, []
+    for code, _kc, edge, _state, win in events:
+        if edge == "press":
+            if code in held:
+                bad.append("keycode %d pressed twice with no release" % code)
+            held[code] = win
+        else:
+            if code not in held:
+                bad.append("keycode %d released with no press" % code)
+            elif held.pop(code) != win:
+                bad.append("keycode %d pressed and released on different windows" % code)
+    for code in held:
+        bad.append("keycode %d never released" % code)
+
+    # KEY_A pressed while KEY_RIGHTALT (100) was held must carry Mod1Mask (0x8).
+    altgr = [e for e in events if e[0] == 30 and e[2] == "press" and e[3] & 0x8]
+    # KEY_LEFTALT (56) from the Alt-Tab: a complete pair, and no KEY_TAB (15).
+    alt_edges = [e[2] for e in events if e[0] == 56]
+    tab_events = [e for e in events if e[0] == 15]
+
+    if bad:
+        notes += ["FAIL pairing: " + b for b in bad]
+    else:
+        notes.append("pairing ok: every press matched a release on the same window")
+    if altgr:
+        notes.append("right Alt sets Mod1Mask: 'a' arrived with state=0x%x" % altgr[0][3])
+    else:
+        notes.append("FAIL right Alt did not set Mod1Mask on the following key")
+    if alt_edges.count("press") == 1 and alt_edges.count("release") == 1:
+        notes.append("Alt-Tab delivered a complete Alt press/release pair")
+    else:
+        notes.append("FAIL Alt-Tab left Alt edges %r" % (alt_edges,))
+    if tab_events:
+        notes.append("FAIL Tab reached the client although the desktop consumed it")
+    else:
+        notes.append("Tab was kept by the desktop, and no half of it leaked")
+    return not any(n.startswith("FAIL") for n in notes), notes
+
+
+def count_key_events(run):
+    return sum(1 for _, line in run.lines if XT_KEY.search(line))
+
+
+def send_and_wait(qmp, run, pump, keys, expect, timeout):
+    """Send one sendkey and wait for the events it should produce.
+
+    A fixed sleep is not good enough here: maeroX streams its diagnostic frame
+    over the same 115200-baud serial line, so how long it takes to get round to
+    a keystroke varies by tens of seconds.  Waiting for the events themselves —
+    and saying so when they never come — is the difference between a real check
+    and one that reports whatever the timing happened to produce."""
+    want = count_key_events(run) + expect
+    r = qmp.hmp("sendkey " + keys)
+    if r and r.strip():
+        print("smoke-firefox:   sendkey %s -> %s" % (keys, r.strip()))
+    end = time.time() + timeout
+    while time.time() < end:
+        pump(1.0)
+        if count_key_events(run) >= want:
+            return True
+    print("smoke-firefox:   sendkey %s: only %d of %d expected events in %ds"
+          % (keys, count_key_events(run) - (want - expect), expect, timeout))
+    return False
+
+
+def run_key_checks(qmp, args, run, pump):
+    """Drive the two paths that used to split a key in two, through real
+    scancodes, then check maeroX's trace.
+
+    Order matters: Alt-Tab moves the focus off the maeroX window, so it goes
+    last."""
+    print("smoke-firefox: key checks — right Alt combination, then Alt-Tab")
+    pump(2.0)
+    # AltGr + a: four events (Alt_R down, a down, a up, Alt_R up), and the 'a'
+    # must carry Mod1Mask.
+    send_and_wait(qmp, run, pump, "alt_r-a", 4, args.keycheck_timeout)
+    # Alt-Tab: the desktop keeps Tab for itself, so only the Alt pair reaches
+    # the client — but it must be a PAIR, on the same window.
+    send_and_wait(qmp, run, pump, "alt-tab", 2, args.keycheck_timeout)
+    ok, notes = check_key_trace(run)
+    for n in notes:
+        print("smoke-firefox:   " + n)
+    run.key_notes = notes
+    run.key_ok = ok
+    if not ok:
+        run.result, run.reason = "FAIL", "key checks failed: " + \
+            "; ".join(n for n in notes if n.startswith("FAIL"))
+    return ok
 
 
 def type_into_guest(qmp, args, run, pump, shot):
@@ -605,6 +729,15 @@ def main():
                     help="seconds between injected keystrokes (default 0.35)")
     ap.add_argument("--type-settle", type=float, default=20.0,
                     help="seconds to wait after typing before the screenshot (default 20). The guest repaints the address bar several seconds behind the keystrokes, so a short settle catches a half-drawn string.")
+    ap.add_argument("--keycheck", action="store_true",
+                    help="after the paint verdict, send a right-Alt combination and Alt-Tab "
+                         "through QEMU sendkey and assert maeroX's key trace: every press "
+                         "matched by a release on the same window, right Alt setting Mod1Mask, "
+                         "and no half of the Alt-Tab leaking to a client. Off by default.")
+    ap.add_argument("--keycheck-timeout", type=float, default=90.0,
+                    help="seconds to wait for each --keycheck keystroke to show up in "
+                         "maeroX's trace (default 90; the guest can be busy streaming a "
+                         "diagnostic frame over the serial line)")
     ap.add_argument("-v", "--verbose", action="store_true", help="echo every serial line")
     args = ap.parse_args()
 
@@ -746,6 +879,8 @@ def main():
                 shot("screen-paint")   # QMP unavailable: fall back to one dump
             if args.type_text:
                 type_into_guest(qmp, args, run, pump, shot)
+            if args.keycheck:
+                run_key_checks(qmp, args, run, pump)
         elif run.panic_lines:
             pump(2.0)         # collect the register dump / stack trace
         else:

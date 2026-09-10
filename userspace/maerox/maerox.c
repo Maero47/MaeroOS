@@ -468,6 +468,8 @@ static void send_pointer(xclient_t *c, xres_t *w, int type, int detail,
 #define LK_NUMLOCK 69
 #define LK_RIGHTCTRL 97
 #define LK_RIGHTALT 100
+#define LK_LEFTMETA 125
+#define LK_RIGHTMETA 126
 
 /* US layout, indexed by Linux keycode: { unshifted keysym, shifted keysym }.
  * Values are keysymdef.h constants (Latin-1 characters are their own code
@@ -530,10 +532,18 @@ static const uint32_t us_keysyms[KEYMAP_MAX][KEYSYMS_PER_KEYCODE] = {
     [109] = { 0xff56, 0xff56 },  /* Next   */
     [110] = { 0xff63, 0xff63 },  /* Insert */
     [111] = { 0xffff, 0xffff },  /* Delete */
+    [125] = { 0xffeb, 0xffeb },  /* Super_L */
+    [126] = { 0xffec, 0xffec },  /* Super_R */
+    [127] = { 0xff67, 0xff67 },  /* Menu    */
 };
 
 /* GetModifierMapping's answer: 8 rows (Shift, Lock, Control, Mod1..Mod5) of
- * KEYCODES_PER_MODIFIER X keycodes, 0 where a slot is unused. */
+ * KEYCODES_PER_MODIFIER X keycodes, 0 where a slot is unused.
+ *
+ * Every keycode named here must be one the window manager actually tracks, or
+ * the client is told a combination exists that can never be produced.  These
+ * rows pair with wm.h's WM_MOD_* and with the tracking in the desktop's
+ * current_mods(); change one and change all three. */
 #define KEYCODES_PER_MODIFIER 2
 static const uint8_t modifier_linux_keys[8][KEYCODES_PER_MODIFIER] = {
     { LK_LEFTSHIFT, LK_RIGHTSHIFT },   /* Shift */
@@ -541,7 +551,9 @@ static const uint8_t modifier_linux_keys[8][KEYCODES_PER_MODIFIER] = {
     { LK_LEFTCTRL,  LK_RIGHTCTRL },    /* Control */
     { LK_LEFTALT,   LK_RIGHTALT },     /* Mod1 = Alt */
     { LK_NUMLOCK,   0 },               /* Mod2 = NumLock */
-    { 0, 0 }, { 0, 0 }, { 0, 0 },      /* Mod3..Mod5 unused */
+    { 0, 0 },                          /* Mod3 unused */
+    { LK_LEFTMETA,  LK_RIGHTMETA },    /* Mod4 = Super */
+    { 0, 0 },                          /* Mod5 unused */
 };
 
 /* ── input focus ─────────────────────────────────────────────────────────────
@@ -631,6 +643,18 @@ static void send_key(xclient_t *c, xres_t *w, int type, int keycode, int state) 
 
 static unsigned key_events_sent;
 
+/* ── the pairing rule ────────────────────────────────────────────────────────
+ * A KeyRelease goes to the window that received the KeyPress, or it goes
+ * nowhere.  The focus can move between the two edges of a keystroke — a click,
+ * a SetInputFocus, a window unmapping — and re-deciding the target at release
+ * time would leave one client holding a key forever and hand another a release
+ * for a key it never saw.  So the press records its target, the release reads
+ * it back, and a release with no recorded press is dropped.
+ *
+ * Indexed by Linux keycode; the client index is stored +1 so 0 means "no press
+ * was delivered for this key". */
+static struct { unsigned char ci1; uint32_t xid; } key_down[KEYMAP_MAX + 128];
+
 /* One key from the desktop (or from the test channel): a Linux keycode, 1 for
  * press / 0 for release, and the WM_MOD_* mask, which is already the X mask. */
 static void on_x_key(gui_window_t *g, int code, int value, int mods) {
@@ -639,11 +663,26 @@ static void on_x_key(gui_window_t *g, int code, int value, int mods) {
      * (min 8, max 255); anything else is not a key this server can name. */
     if (code <= 0 || code + X_KEYCODE_BASE > 255) return;
     xclient_t *c = NULL;
-    xres_t *w = key_target(&c);
-    if (!c || !w) return;
+    xres_t *w = NULL;
+
+    if (value) {
+        w = key_target(&c);
+        if (!c || !w) return;
+        key_down[code].ci1 = (unsigned char)(client_index(c) + 1);
+        key_down[code].xid = w->xid;
+    } else {
+        int ci = (int)key_down[code].ci1 - 1;
+        uint32_t xid = key_down[code].xid;
+        key_down[code].ci1 = 0;
+        key_down[code].xid = 0;
+        if (ci < 0 || ci >= MAX_XCLIENTS || !clients[ci].used) return;
+        c = &clients[ci];
+        w = res_find(c, xid);
+        if (!w || w->kind != R_WINDOW) return;
+    }
     send_key(c, w, value ? 2 : 3, code + X_KEYCODE_BASE, mods);
     key_events_sent++;
-    if (key_events_sent <= 64)
+    if (key_events_sent <= 256)
         xt("XT key code=%d(x%d) %s state=0x%x -> win=0x%x\n", code,
            code + X_KEYCODE_BASE, value ? "press" : "release", mods,
            (unsigned)w->xid);
@@ -1462,6 +1501,10 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
  * later attempts monotonically. */
 static void client_free_resources(xclient_t *c) {
     if (focus_ci == client_index(c)) { focus_ci = -1; focus_xid = 0; focus_explicit = 0; }
+    /* Held keys belonging to this client die with it; the slot is reused. */
+    for (int i = 0; i < (int)(sizeof(key_down) / sizeof(key_down[0])); i++)
+        if (key_down[i].ci1 == (unsigned char)(client_index(c) + 1))
+            { key_down[i].ci1 = 0; key_down[i].xid = 0; }
     for (int i = 0; i < c->nres; i++) {
         xres_t *r = &c->res[i];
         if (r->kind == R_NONE) continue;
@@ -1524,7 +1567,24 @@ static void process_client(xclient_t *c) {
     }
 }
 
-/* Base64-encode `len` bytes to fd, wrapping at 76 chars/line. */
+/* Drain whatever input is waiting: the desktop's window-manager events and the
+ * test channel.  Called from the main loop, and from inside the frame dump —
+ * see b64_write(). */
+static void pump_input(void) {
+    if (!headless) gui_poll(&gui);
+    keyfifo_poll();
+}
+
+/* Base64-encode `len` bytes to fd, wrapping at 76 chars/line.
+ *
+ * Input is drained between lines.  That looks out of place in an encoder, but
+ * this is the only caller and it writes ~1 MB to a 115200-baud serial line —
+ * upwards of a minute during which maeroX is otherwise inside one write().  The
+ * desktop's event channel is a small FIFO opened non-blocking, so once it fills
+ * every further keystroke is thrown away with no error anywhere; a keystroke
+ * dropped between a press and its release then leaves the client believing the
+ * key is still held.  Draining as we go keeps the session alive while the
+ * diagnostic streams. */
 static void b64_write(int fd, const uint8_t *in, int len) {
     static const char *T =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1537,7 +1597,10 @@ static void b64_write(int fd, const uint8_t *in, int len) {
         line[col++] = T[(v >> 12) & 63];
         line[col++] = (i + 1 < len) ? T[(v >> 6) & 63] : '=';
         line[col++] = (i + 2 < len) ? T[v & 63] : '=';
-        if (col >= 76) { line[col++] = '\n'; write(fd, line, col); col = 0; }
+        if (col >= 76) {
+            line[col++] = '\n'; write(fd, line, col); col = 0;
+            pump_input();
+        }
     }
     if (col) { line[col++] = '\n'; write(fd, line, col); }
 }

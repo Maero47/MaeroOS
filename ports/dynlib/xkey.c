@@ -40,8 +40,11 @@
 #define LK_BACKSPACE 14
 #define LK_ENTER 28
 #define LK_A 30
+#define LK_B 48
 #define LK_C 46
 #define LK_V 47
+#define LK_RIGHTALT 100
+#define LK_LEFTMETA 125
 #define LK_LEFTSHIFT 42
 #define LK_LEFTCTRL 29
 #define LK_CAPSLOCK 58
@@ -181,11 +184,42 @@ static void inject(int code,int value,int mods){
     if(fifo>=0) write(fifo,line,n);
 }
 
+/* ── press/release pairing ───────────────────────────────────────────────────
+ * Every KeyPress the client receives must eventually be matched by a
+ * KeyRelease for the SAME keycode on the SAME window, and no KeyRelease may
+ * arrive without a preceding press.  A client that is left holding a key it
+ * never released has a keyboard state that does not match reality: modifiers
+ * stay stuck, shortcuts start firing on their own.  Every event this probe
+ * reads goes through pair_note(), so the invariant is checked for the whole
+ * run, not only where it is being tested on purpose. */
+static unsigned held_win[256];      /* window that got the press, 0 = not held */
+static int      pair_errors;
+
+static void pair_note(const unsigned char *e){
+    unsigned kc=e[1], win=u32(e+12);
+    if(e[0]==2){
+        if(held_win[kc])
+            { printf("  PAIRING FAIL keycode=%u pressed twice with no release\n",kc); pair_errors++; }
+        held_win[kc]=win;
+    } else if(e[0]==3){
+        if(!held_win[kc])
+            { printf("  PAIRING FAIL keycode=%u released with no press\n",kc); pair_errors++; }
+        else if(held_win[kc]!=win)
+            { printf("  PAIRING FAIL keycode=%u pressed on 0x%x released on 0x%x\n",
+                     kc, held_win[kc], win); pair_errors++; }
+        held_win[kc]=0;
+    }
+}
+static int pair_all_released(void){
+    for(int i=0;i<256;i++) if(held_win[i]) return 0;
+    return 1;
+}
+
 /* Read the next KeyPress (2) or KeyRelease (3), skipping other events. */
 static int next_key_event(unsigned char *e){
     for(int i=0;i<64;i++){
         if(rd(X,e,32)!=32) return -1;
-        if(e[0]==2||e[0]==3) return 0;
+        if(e[0]==2||e[0]==3){ pair_note(e); return 0; }
     }
     return -1;
 }
@@ -236,9 +270,11 @@ int main(int argc,char**argv){
     if(handshake()<0){ printf("XKEY_FAIL handshake\n"); if(srv)kill(srv,9); return 1; }
     printf("xkey: keycode range %u..%u\n", min_kc, max_kc);
 
-    unsigned w=alloc_id();
+    unsigned w=alloc_id(), w2=alloc_id();
     create_window(w,40,40,320,200);
     map_window(w);
+    create_window(w2,40,260,320,200);
+    map_window(w2);
     set_input_focus(w);
 
     /* GetInputFocus must agree with the SetInputFocus just issued. */
@@ -261,6 +297,9 @@ int main(int argc,char**argv){
     check("Lock modifier -> Caps_Lock keycode", modifier_has(1,LK_CAPSLOCK+8));
     check("Control modifier -> Control_L keycode", modifier_has(2,LK_LEFTCTRL+8));
     check("Mod1 modifier -> Alt_L keycode",     modifier_has(3,LK_LEFTALT+8));
+    check("Mod1 modifier -> Alt_R keycode",     modifier_has(3,LK_RIGHTALT+8));
+    check("Mod4 modifier -> Super_L keycode",   modifier_has(6,LK_LEFTMETA+8));
+    check("keysym(Super_L) == XK_Super_L",      lookup_keysym(LK_LEFTMETA+8,0)==0xffeb);
 
     fifo=open(KEYFIFO,O_WRONLY);
     if(fifo<0){ printf("XKEY_FAIL cannot open %s\n",KEYFIFO); if(srv)kill(srv,9); return 1; }
@@ -276,6 +315,48 @@ int main(int argc,char**argv){
     expect_key("Ctrl+v",               w, LK_V,        CONTROL_MASK, 1, 0x16);
     expect_key("Alt+a",                w, LK_A,        MOD1_MASK,    1, 'a');
     expect_key("Left arrow (no char)",  w, LK_LEFT,     0,            0, 0);
+    /* Right Alt must set Mod1Mask, the mask the modifier map advertises for it.
+     * The keycode travelling as 108 is the other half: while the kernel dropped
+     * the E0 38 scancode outright, this keycode could not exist at all. */
+    expect_key("Right Alt is a key",   w, LK_RIGHTALT, 0,            0, 0);
+    expect_key("a with Right Alt held", w, LK_A,       MOD1_MASK,    1, 'a');
+
+    /* A release goes to the window that got the press, even when the focus has
+     * moved in between.  This is the invariant that Alt-Tab used to break. */
+    {
+        unsigned char e[32];
+        int ok;
+        inject(LK_A,1,0);                      /* press while w has the focus */
+        ok = next_key_event(e)==0 && e[0]==2 && u32(e+12)==w;
+        set_input_focus(w2);                   /* focus moves mid-keystroke */
+        inject(LK_A,0,0);
+        ok = ok && next_key_event(e)==0 && e[0]==3 && u32(e+12)==w;
+        check("release follows its press window", ok);
+        /* And the NEXT press does go to the new focus. */
+        inject(LK_A,1,0);
+        ok = next_key_event(e)==0 && e[0]==2 && u32(e+12)==w2;
+        inject(LK_A,0,0);
+        ok = ok && next_key_event(e)==0 && e[0]==3 && u32(e+12)==w2;
+        check("next press follows the new focus", ok);
+        set_input_focus(w);
+    }
+
+    /* A release whose press was never delivered must produce nothing at all.
+     * If a stray release were sent it would arrive before the press that
+     * follows it, so reading one event is enough to tell. */
+    {
+        unsigned char e[32];
+        int ok;
+        inject(LK_B,0,0);                      /* release with no press */
+        inject(LK_B,1,0);
+        ok = next_key_event(e)==0 && e[0]==2 && e[1]==(unsigned char)(LK_B+8);
+        inject(LK_B,0,0);
+        ok = ok && next_key_event(e)==0 && e[0]==3;
+        check("unmatched release is not sent", ok);
+    }
+
+    check("every key released at the end", pair_all_released());
+    check("no pairing violations",         pair_errors==0);
 
     close(fifo);
     if(srv){ kill(srv,9); waitpid(srv,0,0); }

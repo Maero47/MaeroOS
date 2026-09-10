@@ -26,14 +26,22 @@ enum {
 
 /*
  * Modifier mask carried by WM_EVENT_RAWKEY.  The values are deliberately the
- * X11 ones (ShiftMask, LockMask, ControlMask, Mod1Mask) so maeroX can put the
- * mask straight into a KeyPress event's `state` field without a second table.
+ * X11 ones (ShiftMask, LockMask, ControlMask, Mod1Mask, Mod2Mask, Mod4Mask) so
+ * maeroX can put the mask straight into a KeyPress event's `state` field
+ * without a second table.
+ *
+ * Every bit here must be one the window manager actually tracks AND one
+ * maeroX's GetModifierMapping names a keycode for.  A mask bit that is
+ * advertised but never set is worse than an absent one: the toolkit believes
+ * the combination exists and the user's key does nothing.
  */
 enum {
-    WM_MOD_SHIFT = 1,
-    WM_MOD_LOCK  = 2,
-    WM_MOD_CTRL  = 4,
-    WM_MOD_ALT   = 8,
+    WM_MOD_SHIFT = 0x01,
+    WM_MOD_LOCK  = 0x02,   /* Caps Lock */
+    WM_MOD_CTRL  = 0x04,
+    WM_MOD_ALT   = 0x08,   /* Mod1: either Alt */
+    WM_MOD_NUM   = 0x10,   /* Mod2: Num Lock */
+    WM_MOD_SUPER = 0x40,   /* Mod4: either Super/Windows key */
 };
 
 typedef struct {
