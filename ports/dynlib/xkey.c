@@ -6,6 +6,9 @@
  *                  KeyPress/KeyRelease with the right keycode and state AND
  *                  translates to the right character -> XKEY_OK.
  *
+ * It also injects CLICKS, to prove that one does not take the keyboard away
+ * from the window the client asked for - see click_focus_case().
+ *
  * The character step is what proves the keymap rather than just the event.  A
  * real Xlib client would call XLookupString(); libX11 is not linkable here (the
  * cross-built libX11.a needs the maeros-cross container), so this file carries
@@ -81,12 +84,22 @@ static int handshake(void){
     unsigned vlen=u16(body+16), off=32+((vlen+3)&~3u)+2*8;
     root=u32(body+off); visual=u32(body+off+32); return 0;
 }
-static void create_window(unsigned wid,int x,int y,int w,int h){
+static void create_window_on(unsigned wid,unsigned parent,int x,int y,int w,int h){
     unsigned char b[64],*p=b; w8(&p,1); w8(&p,24); w16(&p,8);
-    w32(&p,wid); w32(&p,root); w16(&p,x); w16(&p,y); w16(&p,w); w16(&p,h);
+    w32(&p,wid); w32(&p,parent); w16(&p,x); w16(&p,y); w16(&p,w); w16(&p,h);
     w16(&p,0); w16(&p,1); w32(&p,visual); w32(&p,0); write(X,b,p-b);
 }
+static void create_window(unsigned wid,int x,int y,int w,int h){ create_window_on(wid,root,x,y,w,h); }
 static void map_window(unsigned wid){ unsigned char b[8],*p=b; w8(&p,8); w8(&p,0); w16(&p,2); w32(&p,wid); write(X,b,p-b); }
+static void unmap_window(unsigned wid){ unsigned char b[8],*p=b; w8(&p,10); w8(&p,0); w16(&p,2); w32(&p,wid); write(X,b,p-b); }
+/* A pixmap exists here only to occupy a resource slot and then give it back:
+ * that is how this probe controls which of two windows lands in the lower slot
+ * (see the click test below). */
+static void create_pixmap(unsigned pid,int w,int h){
+    unsigned char b[16],*p=b; w8(&p,53); w8(&p,24); w16(&p,4);
+    w32(&p,pid); w32(&p,root); w16(&p,w); w16(&p,h); write(X,b,p-b);
+}
+static void free_pixmap(unsigned pid){ unsigned char b[8],*p=b; w8(&p,54); w8(&p,0); w16(&p,2); w32(&p,pid); write(X,b,p-b); }
 static void set_input_focus(unsigned wid){
     unsigned char b[16],*p=b; w8(&p,42); w8(&p,1 /* RevertToPointerRoot */); w16(&p,3);
     w32(&p,wid); w32(&p,0 /* CurrentTime */); write(X,b,p-b);
@@ -183,6 +196,14 @@ static void inject(int code,int value,int mods){
     int n=snprintf(line,sizeof(line),"k %d %d %d\n",code,value,mods);
     if(fifo>=0) write(fifo,line,n);
 }
+/* A click at a screen position, delivered through the same on_x_click() the
+ * desktop calls, so the hit-test and the focus policy under test are the real
+ * ones and not a test-only copy. */
+static void click(int x,int y){
+    char line[48];
+    int n=snprintf(line,sizeof(line),"c %d %d\n",x,y);
+    if(fifo>=0) write(fifo,line,n);
+}
 
 /* ── press/release pairing ───────────────────────────────────────────────────
  * Every KeyPress the client receives must eventually be matched by a
@@ -215,14 +236,19 @@ static int pair_all_released(void){
     return 1;
 }
 
-/* Read the next KeyPress (2) or KeyRelease (3), skipping other events. */
-static int next_key_event(unsigned char *e){
+/* Read the next event of type t1 or t2, skipping the rest.  Every key event
+ * that passes through goes to pair_note() whether or not it is the one being
+ * waited for, so the pairing invariant covers the whole run. */
+static int next_event(unsigned char *e,int t1,int t2){
     for(int i=0;i<64;i++){
         if(rd(X,e,32)!=32) return -1;
-        if(e[0]==2||e[0]==3){ pair_note(e); return 0; }
+        if(e[0]==2||e[0]==3) pair_note(e);
+        if(e[0]==t1||e[0]==t2) return 0;
     }
     return -1;
 }
+/* Read the next KeyPress (2) or KeyRelease (3), skipping other events. */
+static int next_key_event(unsigned char *e){ return next_event(e,2,3); }
 
 static void check(const char *what,int ok){
     printf("  %-34s %s\n", what, ok?"ok":"FAIL");
@@ -252,6 +278,64 @@ static void expect_key(const char *what,unsigned win,int code,int mods,
     if(next_key_event(e)<0 || e[0]!=3 || e[1]!=(unsigned char)(code+8)){
         printf("  %-34s FAIL (no matching KeyRelease)\n",what); fails++;
     }
+}
+
+/* The window the server says has the keyboard, 0 if the read failed. */
+static unsigned get_input_focus(void){
+    unsigned char b[4],*p=b; w8(&p,43); w8(&p,0); w16(&p,1); write(X,b,p-b);
+    unsigned char r[64];
+    return read_reply(r,sizeof(r))>=32 ? u32(r+8) : 0;
+}
+
+/* ── a click must not steal the keyboard ─────────────────────────────────────
+ * The shape Firefox makes: a full-screen toplevel the browser leaves blank, a
+ * same-size child (the MozContainer) on top of it, and GTK holding the keyboard
+ * on the TOPLEVEL via SetInputFocus.  A click in the page has to land on the
+ * child - it is the window on top - while the keyboard stays where the client
+ * put it.  It did not: the click path ran its own hit-test and then took the
+ * focus unconditionally, so the child got a FocusIn that GDK discards (it only
+ * tracks focus on toplevels) and the toplevel got a FocusOut that GDK does
+ * process.  The browser then had every key addressed to a window it believed
+ * was not focused.
+ *
+ * Whether that happened at all depended on which of the two landed in the
+ * higher resource slot, which is why this runs twice with the slots arranged
+ * both ways - see the call site. */
+static void click_focus_case(const char *what,unsigned top,unsigned child){
+    unsigned char e[32];
+    char label[64];
+
+    set_input_focus(top);                    /* the client claims the keyboard */
+    /* Round-trip before injecting: requests travel over the socket and
+     * injections over the FIFO, and nothing orders one against the other.  A
+     * reply proves the server is past the SetInputFocus (and past the
+     * CreateWindow/MapWindow before it). */
+    unsigned before=get_input_focus();
+    snprintf(label,sizeof(label),"%s: SetInputFocus took",what);
+    check(label, before==top);
+
+    click(640,400);                          /* inside both windows */
+    unsigned btn_win=0;
+    if(next_event(e,4,4)==0) btn_win=u32(e+12);          /* ButtonPress */
+    snprintf(label,sizeof(label),"%s: click -> the child",what);
+    check(label, btn_win==child);
+    next_event(e,5,5);                                   /* its ButtonRelease */
+
+    unsigned focus_win=get_input_focus();
+    snprintf(label,sizeof(label),"%s: focus stays toplevel",what);
+    check(label, focus_win==top);
+
+    inject(LK_A,1,0);
+    unsigned key_win=0;
+    if(next_event(e,2,2)==0) key_win=u32(e+12);
+    inject(LK_A,0,0);
+    next_event(e,3,3);
+    snprintf(label,sizeof(label),"%s: keys -> the toplevel",what);
+    check(label, key_win==top);
+    if(btn_win!=child || focus_win!=top || key_win!=top)
+        printf("    (%s: button->0x%x focus->0x%x key->0x%x, "
+               "toplevel=0x%x child=0x%x)\n",
+               what,btn_win,focus_win,key_win,top,child);
 }
 
 /* The channel this probe injects through must not exist unless it was asked
@@ -391,6 +475,43 @@ int main(int argc,char**argv){
         ok = ok && next_key_event(e)==0 && e[0]==3;
         check("unmatched release is not sent", ok);
     }
+
+    /* ── the click/focus shape, with the resource slots arranged both ways ──
+     * maeroX allocates a resource in the first free slot, so this probe can put a
+     * toplevel and its same-size child on either side of each other in the
+     * array while creating them in a fixed order.  Both arrangements must give
+     * the same answer, because "topmost" is create order and nothing else.
+     *
+     * First: child created after the toplevel and landing ABOVE it in the
+     * array.  Scanning slots and keeping the last match picks the child here,
+     * which is what used to hand it the keyboard.
+     *
+     * A toplevel is created small and mapped: maeroX's kiosk WM resizes any
+     * real top-level to fill the screen, exactly as it does for Firefox.  The
+     * child is created at full size so it is not resized again. */
+    unsigned top1=alloc_id(), child1=alloc_id();
+    create_window(top1,0,0,600,400);
+    map_window(top1);
+    create_window_on(child1,top1,0,0,1280,800);
+    map_window(child1);
+    click_focus_case("child above",top1,child1);
+
+    /* Second: the same shape with the child BELOW the toplevel in the array.
+     * A pixmap takes the next free slot, the toplevel takes the one after it,
+     * the pixmap is freed, and the child drops into the hole - so the child is
+     * created last but sits in the lower slot.  Scanning slots picks the
+     * TOPLEVEL here, so this arrangement is the one that catches a hit-test
+     * still going by slot order: the button must go to the child regardless. */
+    unmap_window(top1);
+    unmap_window(child1);
+    unsigned pad=alloc_id(), top2=alloc_id(), child2=alloc_id();
+    create_pixmap(pad,16,16);
+    create_window(top2,0,0,600,400);
+    map_window(top2);
+    free_pixmap(pad);
+    create_window_on(child2,top2,0,0,1280,800);
+    map_window(child2);
+    click_focus_case("child below",top2,child2);
 
     check("every key released at the end", pair_all_released());
     check("no pairing violations",         pair_errors==0);

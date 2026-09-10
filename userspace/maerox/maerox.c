@@ -557,6 +557,38 @@ static const uint8_t modifier_linux_keys[8][KEYCODES_PER_MODIFIER] = {
     { 0, 0 },                          /* Mod5 unused */
 };
 
+/* ── stacking order ──────────────────────────────────────────────────────────
+ * "Which window is on top" has exactly ONE definition in maeroX, and this is
+ * it: the one created last.  The resource array cannot answer the question —
+ * res_new() reuses the first free slot and pixmaps and GCs are created and
+ * freed constantly, so a window's slot index says nothing about where it sits.
+ * Firefox is the case that punishes a second opinion: it maps a blank toplevel
+ * and a same-size MozContainer child, and which of the two lands in the higher
+ * slot is a coin flip from one boot to the next.  The compositor, the click
+ * hit-test and the key-target fallback all ask here, so they cannot disagree
+ * about what the user is looking at. */
+static int win_above(const xres_t *a, const xres_t *b) {
+    return a->create_seq > b->create_seq;
+}
+
+/* The top-most mapped window, or with hit_test the top-most one containing
+ * (x, y).  NULL (and *out_c NULL) when nothing qualifies. */
+static xres_t *topmost_window(int hit_test, int x, int y, xclient_t **out_c) {
+    xclient_t *bc = NULL; xres_t *bw = NULL;
+    for (int ci = 0; ci < MAX_XCLIENTS; ci++) {
+        if (!clients[ci].used) continue;
+        for (int i = 0; i < clients[ci].nres; i++) {
+            xres_t *w = &clients[ci].res[i];
+            if (w->kind != R_WINDOW || !w->mapped) continue;
+            if (hit_test && (x < w->x || x >= w->x + w->w ||
+                             y < w->y || y >= w->y + w->h)) continue;
+            if (!bw || win_above(w, bw)) { bw = w; bc = &clients[ci]; }
+        }
+    }
+    *out_c = bc;
+    return bw;
+}
+
 /* ── input focus ─────────────────────────────────────────────────────────────
  * Keys go to one window.  maeroX picks it the way a kiosk WM would — the last
  * real top-level to be mapped — and then defers to the client the moment it
@@ -598,6 +630,27 @@ static int client_index(const xclient_t *c) {
     return (int)(c - clients);
 }
 
+/* The kiosk focus policy, in one place.  A window is offered the keyboard when
+ * it is a real top-level — parented to the root and wide enough not to be a
+ * 1x1/10x10 helper or a small popup — and only while no client has taken
+ * charge of focus itself; a SetInputFocus (which is what GTK issues when it
+ * shows or activates a window) sets focus_explicit and wins from then on.  The
+ * only exception is that somebody must hold the keyboard: with no focus at all
+ * any window will do.
+ *
+ * Both the map path and the click path come through here.  They used to decide
+ * separately, and the click path decided with no guards at all: clicking in a
+ * Firefox page handed the keyboard to the MozContainer child, GDK discarded
+ * the FocusIn (it only tracks focus on toplevels) but processed the toplevel's
+ * FocusOut, and from then on the browser had keys addressed to a window it did
+ * not believe was focused. */
+static void focus_offer(xclient_t *c, xres_t *w) {
+    if (!focus_explicit && w->parent == ROOT_WINDOW && w->w >= 400)
+        xfocus_set(client_index(c), w->xid);
+    else if (focus_xid == 0)
+        xfocus_set(client_index(c), w->xid);
+}
+
 /* The window a key event is addressed to: the focus window while it is still a
  * mapped window of a live client, else the top-most mapped window (same
  * creation-order rule the compositor uses, so keys follow what is on screen). */
@@ -609,17 +662,7 @@ static xres_t *key_target(xclient_t **out_c) {
             return w;
         }
     }
-    xclient_t *bc = NULL; xres_t *bw = NULL;
-    for (int ci = 0; ci < MAX_XCLIENTS; ci++) {
-        if (!clients[ci].used) continue;
-        for (int i = 0; i < clients[ci].nres; i++) {
-            xres_t *w = &clients[ci].res[i];
-            if (w->kind != R_WINDOW || !w->mapped) continue;
-            if (!bw || w->create_seq > bw->create_seq) { bw = w; bc = &clients[ci]; }
-        }
-    }
-    *out_c = bc;
-    return bw;
+    return topmost_window(0, 0, 0, out_c);
 }
 
 /* A KeyPress (2) / KeyRelease (3).  Byte-for-byte the same 32-byte layout as a
@@ -690,13 +733,15 @@ static void on_x_key(gui_window_t *g, int code, int value, int mods) {
 }
 
 /* ── test input channel (-K, headless only) ─────────────────────────────────
- * Real keys arrive over the desktop's window-manager event channel, which only
- * exists when maeroX runs inside the desktop.  A headless server has no
- * desktop, so with -K it also reads key injections from a FIFO — the XTEST
- * extension's job, done with four bytes of shell-visible protocol:
+ * Real keys and clicks arrive over the desktop's window-manager event channel,
+ * which only exists when maeroX runs inside the desktop.  A headless server has
+ * no desktop, so with -K it also reads injections from a FIFO — the XTEST
+ * extension's job, done with a few bytes of shell-visible protocol:
  *     printf 'k <linux-keycode> <1 press|0 release> <modmask>\n' > /tmp/.maerox-keys
- * Injections go through on_x_key(), so a test exercises the same keycode
- * conversion, focus lookup and event encoding a real key does.
+ *     printf 'c <x> <y>\n'                                      > /tmp/.maerox-keys
+ * Injections go through on_x_key() and on_x_click(), so a test exercises the
+ * same keycode conversion, hit-test, focus policy and event encoding a real
+ * key or a real click does.
  *
  * IT MUST NOT EXIST OUTSIDE THE TESTS.  Anything that can open this FIFO can
  * synthesise a KeyPress straight onto the focused client — the browser —
@@ -730,6 +775,8 @@ static void keyfifo_open(void) {
     keyfifo_fd = open(KEYFIFO_PATH, O_RDONLY | O_NONBLOCK);
 }
 
+static void on_x_click(gui_window_t *g, int x, int y);   /* fwd: click injection */
+
 static void keyfifo_poll(void) {
     char ch;
     if (keyfifo_fd < 0) return;        /* not opened = channel refused or off */
@@ -746,6 +793,9 @@ static void keyfifo_poll(void) {
         if (keyfifo_line[0] == 'k' &&
             sscanf(keyfifo_line + 1, "%d %d %d", &code, &value, &mods) == 3)
             on_x_key(NULL, code, value, mods);
+        else if (keyfifo_line[0] == 'c' &&
+                 sscanf(keyfifo_line + 1, "%d %d", &code, &value) == 2)
+            on_x_click(NULL, code, value);
     }
 }
 
@@ -1172,14 +1222,7 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
             send_map_notify(c, w);      /* mark viewable → GDK will paint */
             send_configure(c, w);       /* report geometry */
             send_expose(c, w);          /* ask the client to paint */
-            /* Kiosk WM focus policy: the newest real top-level takes the
-             * keyboard.  A client that manages focus itself (GTK calls
-             * SetInputFocus when it shows or activates a window) wins from
-             * then on — focus_explicit stops us overriding its choice. */
-            if (!focus_explicit && w->parent == ROOT_WINDOW && w->w >= 400)
-                xfocus_set(client_index(c), w->xid);
-            else if (focus_xid == 0)
-                xfocus_set(client_index(c), w->xid);
+            focus_offer(c, w);          /* kiosk focus policy — one copy of it */
         }
         break;
     }
@@ -1671,19 +1714,16 @@ static void frame_dump(void) {
 }
 
 /* ── compositing ─────────────────────────────────────────────────────────── */
-/* Draw the mapped windows in CREATION order, oldest first, so a window created
- * later covers one created earlier.  maeroX does not track the window
- * hierarchy, and Firefox's toplevel (which it leaves blank) and the MozContainer
- * it actually renders into are both full-screen, so whichever is drawn last
- * decides what the user sees.  Iterating the resource array drew them in slot
- * order, and because res_new() reuses freed pixmap/GC slots the container could
- * land below the toplevel: the browser then painted normally (putimg=24) while
- * the screen showed the toplevel's empty background.  That was a coin flip -
- * 10 of 20 runs. */
-typedef struct { xres_t *w; unsigned seq; } zorder_t;
-
+/* Draw the mapped windows bottom-up in win_above() order — the one shared
+ * definition of the stacking order — so the window the compositor paints last
+ * is the same one the click hit-test and the key-target fallback call topmost.
+ * Iterating the resource array instead drew them in slot order, and because
+ * res_new() reuses freed pixmap/GC slots the MozContainer Firefox renders into
+ * could land below the blank toplevel: the browser painted normally
+ * (putimg=24) while the screen showed the toplevel's empty background.  That
+ * was a coin flip - 10 of 20 runs. */
 static void composite_windows(draw_surface_t *s) {
-    zorder_t order[MAX_XCLIENTS * MAX_RES];
+    xres_t *order[MAX_XCLIENTS * MAX_RES];
     int n = 0;
     for (int ci = 0; ci < MAX_XCLIENTS; ci++) {
         if (!clients[ci].used) continue;
@@ -1691,17 +1731,17 @@ static void composite_windows(draw_surface_t *s) {
         for (int i = 0; i < c->nres && n < (int)(sizeof(order) / sizeof(order[0])); i++) {
             xres_t *w = &c->res[i];
             if (w->kind != R_WINDOW || !w->mapped || !w->px || !w->painted) continue;
-            order[n].w = w; order[n].seq = w->create_seq; n++;
+            order[n++] = w;
         }
     }
     for (int i = 1; i < n; i++) {            /* insertion sort: n is tiny */
-        zorder_t t = order[i];
+        xres_t *t = order[i];
         int j = i - 1;
-        while (j >= 0 && order[j].seq > t.seq) { order[j + 1] = order[j]; j--; }
+        while (j >= 0 && win_above(order[j], t)) { order[j + 1] = order[j]; j--; }
         order[j + 1] = t;
     }
     for (int k = 0; k < n; k++) {
-        xres_t *w = order[k].w;
+        xres_t *w = order[k];
         for (int yy = 0; yy < w->h; yy++) {
             int ty = w->y + yy;
             if (ty < 0 || ty >= s->h) continue;
@@ -1721,24 +1761,18 @@ static int count_clients(void) {
 }
 
 /* Forward a libgui click (surface coords) to the topmost X window under it as a
- * ButtonPress + ButtonRelease pair. */
+ * ButtonPress + ButtonRelease pair.  "Topmost" is topmost_window()'s answer —
+ * the same one the compositor draws by — so the window that gets the button is
+ * the one the user actually clicked on rather than whichever happened to sit in
+ * the higher resource slot.  The button goes to that window; the keyboard moves
+ * only if focus_offer() says the policy allows it. */
 static void on_x_click(gui_window_t *g, int x, int y) {
     (void)g;
-    xclient_t *hit_c = NULL; xres_t *hit_w = NULL;
-    for (int ci = 0; ci < MAX_XCLIENTS; ci++) {
-        if (!clients[ci].used) continue;
-        xclient_t *c = &clients[ci];
-        for (int i = 0; i < c->nres; i++) {
-            xres_t *w = &c->res[i];
-            if (w->kind != R_WINDOW || !w->mapped) continue;
-            if (x >= w->x && x < w->x + w->w && y >= w->y && y < w->y + w->h) {
-                hit_c = c; hit_w = w;       /* keep the last = topmost */
-            }
-        }
-    }
+    xclient_t *hit_c = NULL;
+    xres_t *hit_w = topmost_window(1, x, y, &hit_c);
     if (hit_c && hit_w) {
         int ex = x - hit_w->x, ey = y - hit_w->y;
-        xfocus_set(client_index(hit_c), hit_w->xid);
+        focus_offer(hit_c, hit_w);
         send_pointer(hit_c, hit_w, 4, 1, ex, ey);   /* ButtonPress, button 1 */
         send_pointer(hit_c, hit_w, 5, 1, ex, ey);   /* ButtonRelease */
     }

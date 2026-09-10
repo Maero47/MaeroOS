@@ -93,7 +93,15 @@ not kernel work, and Firefox does **not** run yet:
    input focus that `SetInputFocus`/`GetInputFocus` agree with, and sends
    `FocusIn`/`FocusOut`. A release is delivered to whoever received the press —
    the desktop routes by slot, maeroX by window — so a focus change mid-keystroke
-   cannot split a key in two. `xkey` proves it (`XKEY_OK`),
+   cannot split a key in two. A **click cannot take the keyboard away** from the
+   window a client asked for: the click hit-test and the compositor share one
+   definition of "topmost" — creation order, never resource-array slot order —
+   and a click offers the focus through the same kiosk policy a map does, so it
+   stops at `focus_explicit`. Without that, clicking in a Firefox page moved the
+   focus to the full-screen MozContainer child, a `FocusIn` GDK discards after a
+   `FocusOut` it does not, and typing stopped working — on the runs where the
+   two windows happened to land in that slot order. `xkey` proves it (`XKEY_OK`,
+   which now also injects clicks with the slots arranged both ways),
    `python3 tools/smoke_firefox.py --type "<text>"` types `<text>` into
    Firefox's address bar with QEMU `sendkey` and saves `screen-typed.png`, and
    `--keycheck` asserts maeroX's key trace for pairing, `Mod1Mask` on an AltGr
