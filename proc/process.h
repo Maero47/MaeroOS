@@ -154,6 +154,19 @@ struct proc {
     uint32_t         saved_sigmask;
     int              restore_sigmask;
 
+    /* Detail of a synchronous fault waiting to be delivered (Linux
+     * force_sig_fault's siginfo): which signal it belongs to, its si_code and
+     * the faulting address.  Consumed by the delivery of that signal, so an
+     * unrelated signal delivered first never picks it up. */
+    int              fault_sig;
+    int              fault_code;
+    uint32_t         fault_addr;
+
+    /* sigaltstack (Linux task->sas_ss_sp / sas_ss_size): the stack SA_ONSTACK
+     * handlers run on.  Size 0 means none is installed.  Inherited by fork,
+     * cleared by exec. */
+    uint32_t         sas_sp, sas_size;
+
     /* Group exit (Linux signal_struct SIGNAL_GROUP_EXIT + group_exit_code),
      * kept on the thread-group leader: set when exit_group() or a fatal signal
      * ends the whole process, so the status waitpid() reports is the group's,

@@ -671,8 +671,12 @@ static void page_fault_handler(registers_t *regs) {
         }
         /* Synchronous fault: thread-directed SIGSEGV.  With SIG_DFL the whole
          * thread group exits (Linux force_sig_fault -> get_signal ->
-         * do_group_exit), not just the faulting thread. */
-        signal_send(current_proc, SIGSEGV);
+         * do_group_exit), not just the faulting thread.  The faulting address
+         * and its cause travel with the signal: a present page means the access
+         * was refused, an absent one that nothing is mapped there (arch/x86/mm/
+         * fault.c: SEGV_ACCERR vs SEGV_MAPERR). */
+        signal_send_fault(current_proc, SIGSEGV,
+                          (err & 0x1U) ? SEGV_ACCERR : SEGV_MAPERR, cr2);
         signal_deliver_pending(regs);  /* → handler, or group exit if SIG_DFL */
         return;
     }

@@ -221,7 +221,19 @@ int user_fault_signal(registers_t *regs, int sig) {
         current_proc->last_fault_eip = regs->eip;
         current_proc->fault_repeat   = 0;
     }
-    signal_send(current_proc, sig);
+    /* si_code/si_addr for the trap, as arch/x86/kernel/traps.c fills them: a
+     * fault in the instruction stream reports the instruction's address, a
+     * #GP (and friends) is a kernel-raised SIGSEGV with no address. */
+    int      code = SI_KERNEL;
+    uint32_t addr = 0;
+    switch (regs->int_no) {
+    case 0:  code = FPE_INTDIV; addr = regs->eip; break;  /* divide error */
+    case 6:  code = ILL_ILLOPN; addr = regs->eip; break;  /* invalid opcode */
+    case 17: code = BUS_ADRALN; addr = regs->eip; break;  /* alignment check */
+    case 16: case 19: code = SI_KERNEL; addr = regs->eip; break;  /* x87/SIMD */
+    default: break;
+    }
+    signal_send_fault(current_proc, sig, code, addr);
     signal_deliver_pending(regs);            /* → handler, or proc_exit if SIG_DFL */
     return 1;
 }
@@ -696,10 +708,14 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
                          sizeof(child->sighand->handlers));
         __builtin_memcpy(child->sighand->flags, parent->sighand->flags,
                          sizeof(child->sighand->flags));
+        __builtin_memcpy(child->sighand->mask, parent->sighand->mask,
+                         sizeof(child->sighand->mask));
     }
     child->pending_sigs  = 0;
     child->blocked_sigs  = parent->blocked_sigs;
     child->sigframe_addr = 0;
+    child->sas_sp        = parent->sas_sp;
+    child->sas_size      = parent->sas_size;
 
     /* Inherit working directory, heap break, umask, mmap state, and pgrp.
      * heap_end/mmap_next live on the thread-group LEADER, so when a non-leader
@@ -1953,10 +1969,17 @@ static int sys_exec(registers_t *regs) {
                          sizeof(current_proc->sighand->handlers));
         __builtin_memset(current_proc->sighand->flags, 0,
                          sizeof(current_proc->sighand->flags));
+        __builtin_memset(current_proc->sighand->mask, 0,
+                         sizeof(current_proc->sighand->mask));
     }
     current_proc->pending_sigs   = 0;
     current_proc->sigframe_addr  = 0;
     current_proc->restore_sigmask = 0;   /* no sigsuspend mask survives exec */
+    current_proc->fault_sig      = 0;
+    /* The alternate signal stack belonged to the old image (fs/exec.c
+     * begin_new_exec: sas_ss_sp = sas_ss_size = 0). */
+    current_proc->sas_sp         = 0;
+    current_proc->sas_size       = 0;
 
     /* Update trapframe to run new program */
     registers_t *tf = current_proc->tf;
@@ -4402,12 +4425,14 @@ static int sys_rt_sigaction(registers_t *regs) {
     struct sighand *sh = current_proc->sighand;
     sighandler_t old_handler = sh->handlers[sig];
     uint32_t     old_flags   = sh->flags[sig];
+    uint32_t     old_mask    = sh->mask[sig];
 
     if (oact) {
         uint32_t koact[8];
         __builtin_memset(koact, 0, sizeof(koact));
         koact[0] = (uint32_t)(uintptr_t)old_handler;
         koact[1] = old_flags;
+        koact[3] = sigset_to_user(old_mask);   /* sa_mask[0] */
         int cr = copy_to_user(oact, koact, sizeof(koact));
         if (cr < 0) return cr;
     }
@@ -4417,6 +4442,11 @@ static int sys_rt_sigaction(registers_t *regs) {
         if (cr < 0) return cr;
         sh->handlers[sig] = (sighandler_t)(uintptr_t)kact[0];
         sh->flags[sig]    = kact[1];  /* sa_flags (SA_RESTART etc.) */
+        /* sa_mask: blocked for the duration of the handler.  SIGKILL and
+         * SIGSTOP are dropped from it (Linux do_sigaction:
+         * sigdelsetmask(&act->sa.sa_mask, sigmask(SIGKILL)|sigmask(SIGSTOP))). */
+        sh->mask[sig] = sigset_from_user(kact[3]) &
+                        ~((1u << SIGKILL) | (1u << SIGSTOP));
         /* Linux do_sigaction: setting SIG_IGN (or SIG_DFL for a default-ignored
          * signal) discards matching signals already pending on every thread. */
         sighandler_t nh = sh->handlers[sig];
@@ -4429,12 +4459,9 @@ static int sys_rt_sigaction(registers_t *regs) {
 }
 
 /* ── sys_rt_sigprocmask(how, set, oset, sigsetsize) — EAX=175 ────────────── */
-/* The user sigset_t numbers bit (sig - 1) for signal sig (Linux sigmask(sig) =
- * 1UL << ((sig) - 1), include/linux/signal.h), whereas the kernel's pending_sigs
- * and blocked_sigs use bit sig.  Convert at the boundary; only the first word
- * (signals 1..32) is honoured. */
-static uint32_t sigset_from_user(uint32_t uset) { return uset << 1; }
-static uint32_t sigset_to_user(uint32_t kset)   { return kset >> 1; }
+/* sigset_from_user()/sigset_to_user() (proc/signal.h) convert between the user
+ * sigset_t, which numbers bit (sig - 1), and the kernel's bit-sig masks.  Only
+ * the first word (signals 1..32) is honoured. */
 
 static int sys_rt_sigprocmask(registers_t *regs) {
     int       how  = (int)regs->ebx;
@@ -5271,9 +5298,44 @@ static int sys_prctl(registers_t *regs) {
     return 0;
 }
 
-/* ── sys_sigaltstack(ss, oss) — EAX=186 (stub) ──────────────────────────── */
+/* ── sys_sigaltstack(ss, oss) — EAX=186 ─────────────────────────────────────
+ * stack_t on i386 is { void *ss_sp; int ss_flags; size_t ss_size; }.  A handler
+ * installed with SA_ONSTACK runs on this stack instead of the interrupted one,
+ * which is how a program survives a SIGSEGV caused by its own stack overflow
+ * (and how glibc/SpiderMonkey handle theirs).  Linux do_sigaltstack:
+ * SS_DISABLE removes it, any other unknown flag is EINVAL, a stack smaller than
+ * MINSIGSTKSZ is ENOMEM, and it may not be changed while running on it. */
+#define MINSIGSTKSZ_K 2048
 static int sys_sigaltstack(registers_t *regs) {
-    (void)regs;
+    uint32_t uss  = regs->ebx;
+    uint32_t uoss = regs->ecx;
+    uint32_t sp   = regs->useresp;
+    int on = current_proc->sas_size &&
+             sp >= current_proc->sas_sp &&
+             sp <  current_proc->sas_sp + current_proc->sas_size;
+
+    if (uoss) {
+        uint32_t old[3];
+        old[0] = current_proc->sas_sp;
+        old[1] = (uint32_t)(on ? SS_ONSTACK
+                               : (current_proc->sas_size ? 0 : SS_DISABLE));
+        old[2] = current_proc->sas_size;
+        if (copy_to_user((void *)(uintptr_t)uoss, old, sizeof(old)) < 0) return -14;
+    }
+    if (uss) {
+        uint32_t ns[3];
+        if (copy_from_user(ns, (void *)(uintptr_t)uss, sizeof(ns)) < 0) return -14;
+        if (on) return -1;                       /* -EPERM while running on it */
+        if (ns[1] & SS_DISABLE) {
+            current_proc->sas_sp = current_proc->sas_size = 0;
+            return 0;
+        }
+        if (ns[1] & ~(uint32_t)SS_ONSTACK) return -22;     /* -EINVAL */
+        if (ns[2] < MINSIGSTKSZ_K) return -12;             /* -ENOMEM */
+        if (!access_ok((void *)(uintptr_t)ns[0], ns[2])) return -14;
+        current_proc->sas_sp   = ns[0];
+        current_proc->sas_size = ns[2];
+    }
     return 0;
 }
 
@@ -6460,6 +6522,8 @@ static int sys_clone(registers_t *regs) {
     child->pending_sigs  = 0;
     child->blocked_sigs  = parent->blocked_sigs;
     child->sigframe_addr = 0;
+    child->sas_sp        = parent->sas_sp;
+    child->sas_size      = parent->sas_size;
     if (flags & CLONE_SIGHAND) {
         /* One handler table for the group (Linux copy_sighand: refcount++). */
         sighand_put(child->sighand);
@@ -6470,6 +6534,8 @@ static int sys_clone(registers_t *regs) {
                          sizeof(child->sighand->handlers));
         __builtin_memcpy(child->sighand->flags, parent->sighand->flags,
                          sizeof(child->sighand->flags));
+        __builtin_memcpy(child->sighand->mask, parent->sighand->mask,
+                         sizeof(child->sighand->mask));
     }
     __builtin_memcpy(child->cwd, parent->cwd, sizeof(parent->cwd));
     child->heap_end  = parent->heap_end;

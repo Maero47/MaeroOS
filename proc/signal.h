@@ -34,9 +34,24 @@ typedef void (*sighandler_t)(int);
 /* sa_flags bits */
 #define SA_SIGINFO    0x00000004
 #define SA_RESTART    0x10000000
+#define SA_ONSTACK    0x08000000
 #define SA_NOCLDSTOP  0x00000001
 #define SA_NODEFER    0x40000000
 #define SA_RESETHAND  0x80000000
+
+/* si_code values (asm-generic/siginfo.h).  A signal raised by kill()/tgkill
+ * carries SI_USER; a synchronous fault carries the code for its cause. */
+#define SI_USER       0
+#define SI_KERNEL     0x80
+#define SEGV_MAPERR   1        /* address not mapped to object */
+#define SEGV_ACCERR   2        /* invalid permissions for mapped object */
+#define BUS_ADRALN    1        /* invalid address alignment */
+#define ILL_ILLOPN    2        /* illegal operand */
+#define FPE_INTDIV    1        /* integer divide by zero */
+
+/* sigaltstack ss_flags (include/uapi/signal.h). */
+#define SS_ONSTACK    1
+#define SS_DISABLE    2
 
 /*
  * siginfo_t — matches Linux i386 ABI (si_signo, si_errno, si_code + union).
@@ -46,8 +61,12 @@ typedef struct {
     int  si_signo;
     int  si_errno;
     int  si_code;
-    /* Padding to 128 bytes total (standard Linux siginfo_t size) */
-    char _pad[116];
+    union {
+        /* Padding to 128 bytes total (standard Linux siginfo_t size) */
+        char _pad[116];
+        struct { uint32_t si_addr; } _sigfault;   /* SIGSEGV/BUS/ILL/FPE */
+        struct { int32_t si_pid; uint32_t si_uid; } _kill;
+    } _u;
 } siginfo_t;
 
 /* Kernel-internal restart codes (never visible to user space; the values are
@@ -76,6 +95,7 @@ struct sighand {
     int          refcount;
     sighandler_t handlers[NSIGS];   /* per-signal: SIG_DFL/SIG_IGN/fn */
     uint32_t     flags[NSIGS];      /* per-signal sa_flags (SA_RESTART etc.) */
+    uint32_t     mask[NSIGS];       /* per-signal sa_mask, blocked while it runs */
 };
 struct sighand *sighand_alloc(void);                 /* zeroed table, refcount=1 */
 struct sighand *sighand_copy(struct sighand *src);   /* private copy, refcount=1 */
@@ -90,6 +110,18 @@ struct registers;
  * deliverable to it (unblocked and neither ignored nor default-ignored); an
  * ignored signal is discarded like Linux sig_ignored(). */
 void signal_send(struct proc *p, int sig);
+
+/* Queue a SYNCHRONOUS fault signal on p, carrying the siginfo detail Linux's
+ * force_sig_fault() attaches: si_code (SEGV_MAPERR, BUS_ADRALN, …) and the
+ * address that caused it.  A SA_SIGINFO handler for that signal sees both; the
+ * detail is consumed by the delivery and never leaks to another signal. */
+void signal_send_fault(struct proc *p, int sig, int code, uint32_t addr);
+
+/* The user sigset_t numbers bit (sig - 1) for signal sig (Linux sigmask()),
+ * whereas pending_sigs/blocked_sigs use bit sig.  Convert at every boundary —
+ * the sigaction sa_mask and the signal frame's uc_sigmask included. */
+static inline uint32_t sigset_from_user(uint32_t uset) { return uset << 1; }
+static inline uint32_t sigset_to_user(uint32_t kset)   { return kset >> 1; }
 
 /* Process-directed signal (kill, SIGCHLD, tty signals): queue sig on ONE thread
  * of p's thread group that does not block it, preferring the group leader, as
