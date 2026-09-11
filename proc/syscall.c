@@ -6704,6 +6704,7 @@ static int socket_arg_count(int call) {
 #define MSG_PEEK_K          0x0002
 #define MSG_DONTWAIT_K      0x0040
 #define MSG_NOSIGNAL_K      0x4000
+#define MSG_CTRUNC_K        0x0008
 #define MSG_CMSG_CLOEXEC_K  0x40000000
 
 /* Per-call MSG_* flags + the descriptor's O_NONBLOCK, as usocket_read()/
@@ -6713,6 +6714,16 @@ static int usock_flags(uint32_t msgflags, int nb) {
     if (msgflags & MSG_PEEK_K)     f |= USOCK_PEEK;
     if (msgflags & MSG_NOSIGNAL_K) f |= USOCK_NOSIGNAL;
     return f;
+}
+
+/* Undo a queued SCM_RIGHTS batch whose sendmsg is not going to carry it after
+ * all (no data written, or the call is failing).  The batch may already have
+ * been delivered — a concurrent reader can have taken it — in which case the
+ * refs are no longer ours to close. */
+static void scm_abort(usocket_t *us, uint32_t id, proc_file_t *pass, int npass) {
+    if (npass <= 0 || !id) return;
+    if (usocket_cancel_fds(us, id))
+        for (int k = 0; k < npass; k++) fd_release(&pass[k]);
 }
 
 static int socketcall_core(int call, uint32_t *kargs) {
@@ -6875,19 +6886,13 @@ static int socketcall_core(int call, uint32_t *kargs) {
             uint32_t iov = mh[2], iovlen = mh[3];
             uint32_t uctrl = mh[4], uctrllen = mh[5];
             if (iovlen > 1024) return -22;
-            /* A recvmsg can only carry fds out if it brought a control buffer;
-             * without one they are dropped like a plain read()'s would be. */
+            /* Only a control buffer big enough for a cmsg header can name
+             * received fds; a recvmsg without one still collects them here
+             * (rather than letting the read drop them silently) so that it can
+             * close them and report MSG_CTRUNC, as scm_recv does. */
             int wantfds = (call == 17 && uctrl && uctrllen >= 12);
             int mflags  = usock_flags(kargs[2], nb);
-            if (wantfds) mflags |= USOCK_WANTFDS;
-            /* Fds that came with no data of their own are deliverable on their
-             * own: take what is there rather than sleeping for bytes that are
-             * not coming (Linux returns them with a zero-length recvmsg). */
-            if (wantfds && usocket_fds_ready(us)) mflags |= USOCK_NONBLOCK;
-            /* Linux attaches the fds to the FIRST skb of the message
-             * (unix_stream_sendmsg), so tag them with the position the data
-             * about to be written starts at. */
-            uint32_t scm_at = (call == 16) ? usocket_txpos(us) : 0;
+            if (call == 17) mflags |= USOCK_WANTFDS;
 
             /* sendmsg: parse SCM_RIGHTS cmsg(s), retain the named fds. */
             proc_file_t pass[SCM_MAX_FDS];
@@ -6920,20 +6925,34 @@ static int socketcall_core(int call, uint32_t *kargs) {
                 }
             }
 
+            /* Linux attaches the fds to the FIRST skb of the message
+             * (unix_stream_sendmsg), so the batch goes in BEFORE the bytes it
+             * rides with: a reader draining concurrently can then never pass
+             * the batch's position while the batch is still invisible to it —
+             * which would hand the fds to the next message's bytes, or lose
+             * them to a plain read().  If the data cannot be written at all,
+             * scm_abort() takes the batch back out. */
+            uint32_t scm_id = 0;
+            if (call == 16 && npass > 0 &&
+                usocket_send_fds(us, pass, npass, &scm_id) < 0) {
+                for (int k = 0; k < npass; k++) fd_release(&pass[k]);
+                npass = 0;                  /* the data still goes out */
+            }
+
             int total = 0, eagain = 0;
             for (uint32_t i = 0; i < iovlen; i++) {
                 uint32_t iv[2];
                 if (copy_from_user(iv, (void *)(uintptr_t)(iov + i * 8),
                                    sizeof(iv)) < 0) {
                     if (total) break;
-                    for (int k = 0; k < npass; k++) fd_release(&pass[k]);
+                    scm_abort(us, scm_id, pass, npass);
                     return -14;
                 }
                 int len = (int)iv[1];
                 if (len <= 0) continue;
                 if (!access_ok((void *)(uintptr_t)iv[0], (size_t)len)) {
                     if (total) break;
-                    for (int k = 0; k < npass; k++) fd_release(&pass[k]);
+                    scm_abort(us, scm_id, pass, npass);
                     return -14;
                 }
                 int n = (call == 16)
@@ -6942,47 +6961,63 @@ static int socketcall_core(int call, uint32_t *kargs) {
                 if (n < 0) {
                     if (total) break;
                     if (call == 16) {
-                        for (int k = 0; k < npass; k++) fd_release(&pass[k]);
+                        scm_abort(us, scm_id, pass, npass);
                         return n;
                     }
-                    /* recvmsg with no data: maybe fds are still deliverable */
                     if (n == -11) { eagain = 1; break; }
                     return n;
                 }
                 total += n;
                 if (n < len) break;          /* short read/write — stop */
                 if (mflags & USOCK_PEEK) break;   /* peek does not advance */
+                /* One message's ancillary data per recvmsg: stop rather than
+                 * read into a second batch whose fds this call cannot also
+                 * deliver (Linux breaks its loop on !unix_skb_scm_eq). */
+                if (call == 17 && usocket_fds_ready(us)) break;
             }
 
-            /* sendmsg: enqueue the retained fds, tagged at the start of the
-             * data they were sent with. */
-            if (call == 16 && npass > 0) {
-                if (usocket_send_fds(us, pass, npass, scm_at) < 0)
-                    for (int k = 0; k < npass; k++) fd_release(&pass[k]);
-            }
+            /* A sendmsg that put no bytes on the stream sends no fds either:
+             * unix_stream_sendmsg never enters its loop for a zero-length
+             * message, so no skb carries them and scm_destroy closes them. */
+            if (call == 16 && total == 0)
+                scm_abort(us, scm_id, pass, npass);
 
-            /* recvmsg: deliver any ready fds + build the control buffer. */
+            /* recvmsg: deliver the ready fds.  An fd is installed only once
+             * there is room for it BOTH in the caller's control buffer and in
+             * the fd table; any that does not fit is closed and MSG_CTRUNC is
+             * reported, so nothing can end up installed but unnameable — an
+             * unclosable leak in the receiving process (Linux
+             * scm_detach_fds + __scm_destroy). */
             if (call == 17) {
-                uint32_t ctrl_used = 0;
+                uint32_t ctrl_used = 0, out_flags = 0;
                 proc_file_t got[SCM_MAX_FDS];
-                int ngot = wantfds ? usocket_recv_fds(us, got, SCM_MAX_FDS) : 0;
+                int ngot = usocket_recv_fds(us, got, SCM_MAX_FDS);
+                int room = wantfds ? (int)((uctrllen - 12) / 4) : 0;
+                if (room > SCM_MAX_FDS) room = SCM_MAX_FDS;
                 if (ngot > 0) {
                     int cloex = (kargs[2] & MSG_CMSG_CLOEXEC_K) ? 1 : 0;
                     int newfds[SCM_MAX_FDS]; int ninst = 0;
                     for (int k = 0; k < ngot; k++) {
                         int slot = -1;
-                        for (int j = 0; j < MAX_FD; j++)
-                            if (current_proc->ofile[j].type == FD_NONE) { slot = j; break; }
-                        if (slot < 0) { printk("[scm] fd table FULL on recv (pid %d)\n",
-                                               current_proc ? current_proc->pid : -1);
-                                        fd_release(&got[k]); continue; }
+                        if (ninst < room) {         /* the cmsg can name it */
+                            for (int j = 0; j < MAX_FD; j++)
+                                if (current_proc->ofile[j].type == FD_NONE) { slot = j; break; }
+                            if (slot < 0)
+                                printk("[scm] fd table FULL on recv (pid %d)\n",
+                                       current_proc ? current_proc->pid : -1);
+                        }
+                        if (slot < 0) {             /* no room: close, truncate */
+                            fd_release(&got[k]);
+                            out_flags |= MSG_CTRUNC_K;
+                            continue;
+                        }
                         current_proc->ofile[slot] = got[k];
                         current_proc->ofile[slot].cloexec = (uint8_t)cloex;
                         newfds[ninst++] = slot;
                     }
-                    uint32_t clen = 12 + (uint32_t)ninst * 4;
-                    if (ninst > 0 && uctrllen >= clen) {
+                    if (ninst > 0) {
                         uint8_t cbuf[256];
+                        uint32_t clen = 12 + (uint32_t)ninst * 4;
                         uint32_t lvl = 1, typ = 1;       /* SOL_SOCKET, SCM_RIGHTS */
                         __builtin_memcpy(cbuf + 0, &clen, 4);
                         __builtin_memcpy(cbuf + 4, &lvl, 4);
@@ -6994,9 +7029,8 @@ static int socketcall_core(int call, uint32_t *kargs) {
                     }
                 }
                 copy_to_user((void *)(uintptr_t)(umsg + 20), &ctrl_used, 4);
-                uint32_t zero = 0;
-                copy_to_user((void *)(uintptr_t)(umsg + 24), &zero, 4);
-                if (total == 0 && ngot == 0 && eagain) return -11;
+                copy_to_user((void *)(uintptr_t)(umsg + 24), &out_flags, 4);
+                if (total == 0 && eagain) return -11;
             }
             return total;
         }

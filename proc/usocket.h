@@ -29,7 +29,6 @@ int  usocket_read_ready(usocket_t *s);   /* data available / EOF / accept ready 
 int  usocket_write_ready(usocket_t *s);  /* space to write and peer alive */
 int  usocket_fds_ready(usocket_t *s);    /* a SCM_RIGHTS batch is deliverable */
 int  usocket_hup(usocket_t *s);          /* peer closed → POLLHUP */
-uint32_t usocket_txpos(usocket_t *s);    /* bytes written to the tx stream */
 const char *usocket_path(usocket_t *s);  /* bound path ("" if none) */
 void *usocket_rx_id(usocket_t *s);       /* diag: shared rx buffer id */
 void *usocket_tx_id(usocket_t *s);       /* diag: shared tx buffer id */

@@ -71,7 +71,8 @@ void fd_release(proc_file_t *f);
 /* SCM_RIGHTS fd-passing over AF_UNIX sockets (defined in usocket.c). */
 #define SCM_MAX_FDS 16
 struct usocket;
-int usocket_send_fds(struct usocket *s, proc_file_t *files, int n, uint32_t at);
+int usocket_send_fds(struct usocket *s, proc_file_t *files, int n, uint32_t *id_out);
+int usocket_cancel_fds(struct usocket *s, uint32_t id);
 int usocket_recv_fds(struct usocket *s, proc_file_t *out, int max);
 
 /* Diagnostic: print a one-line state snapshot of every live process. */

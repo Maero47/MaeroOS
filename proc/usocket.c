@@ -19,11 +19,17 @@
  * stream position where its message STARTS and becomes deliverable once the
  * reader has taken at least one byte from there — an 8 KiB sendmsg read in
  * 4 KiB pieces hands the fds over with the first piece.  Firefox's
- * multiprocess IPC depends on this. */
+ * multiprocess IPC depends on this.
+ *
+ * The batch is queued BEFORE its bytes are written, which is what makes the tag
+ * meaningful to a concurrent reader: the reader can only pass `at` by consuming
+ * bytes that do not exist until after the batch is in the queue, so it can
+ * never drain past the tag while the batch is invisible.  A sendmsg whose data
+ * never makes it takes the batch back out again (usocket_cancel_fds). */
 typedef struct uscm {
     struct uscm *next;
-    uint32_t     at;                  /* tx total_in BEFORE this message's data */
-    int          nodata;              /* the message carried no bytes at all */
+    uint32_t     id;                  /* identity for usocket_cancel_fds() */
+    uint32_t     at;                  /* tx total_in where the message starts */
     int          nfds;
     proc_file_t  files[SCM_MAX_FDS];  /* retained file refs (ownership in queue) */
 } uscm_t;
@@ -84,11 +90,12 @@ static void ucbuf_unref(ucbuf_t *b) {
     }
 }
 
-/* Is this batch's message already being consumed?  A message with no bytes of
- * its own (a sendmsg that carried only fds) stands alone and is deliverable
- * straight away; otherwise the reader has to have passed its start position. */
+/* Is this batch's message already being consumed?  Only then are its fds
+ * deliverable.  A batch whose bytes have not been written yet sits at
+ * at == total_in, which no reader can have passed, so queuing it early never
+ * makes it deliverable early. */
 static int uscm_ready(ucbuf_t *b, uscm_t *m) {
-    return m->nodata || b->total_out > m->at;
+    return b->total_out > m->at;
 }
 
 /* Pop and close every batch the reader has now passed without collecting: a
@@ -283,26 +290,48 @@ int usocket_write(usocket_t *s, const void *buf, int len, int flags) {
 }
 
 /* SCM_RIGHTS: queue a batch of (already-retained) file refs onto the tx stream,
- * tagged with `at`, the write position the message's data STARTED at (the
- * caller takes it from usocket_txpos() before writing), so the fds are handed
- * to the first recvmsg that consumes any of those bytes.  Ownership of the
- * refs transfers into the queue. */
-int usocket_send_fds(usocket_t *s, proc_file_t *files, int n, uint32_t at) {
+ * tagged at the CURRENT write position — so this is called BEFORE writing the
+ * message's data, and the fds are handed to the first recvmsg that consumes any
+ * of the bytes that follow.  Ownership of the refs transfers into the queue.
+ * On success *id_out identifies the batch for usocket_cancel_fds(). */
+int usocket_send_fds(usocket_t *s, proc_file_t *files, int n, uint32_t *id_out) {
+    static uint32_t next_id = 1;
     if (n <= 0) return 0;
     if (n > SCM_MAX_FDS) n = SCM_MAX_FDS;
     ucbuf_t *b = s->tx;
     if (!b) return -107;                               /* -ENOTCONN */
     uscm_t *m = (uscm_t *)kmalloc(sizeof(uscm_t));
     if (!m) return -12;
-    m->next   = NULL;
-    m->at     = at;
-    m->nodata = (at == b->total_in);   /* fds sent without any bytes */
+    m->next = NULL;
+    m->id   = next_id++;
+    if (!next_id) next_id = 1;                         /* 0 means "no batch" */
+    m->at   = b->total_in;        /* the bytes written next ride with it */
     m->nfds = n;
     for (int i = 0; i < n; i++) m->files[i] = files[i];
     if (b->scm_tail) b->scm_tail->next = m; else b->scm_head = m;
     b->scm_tail = m;
+    if (id_out) *id_out = m->id;
     wake_up(b); io_wake();
     return n;
+}
+
+/* Take a queued batch back out: the sendmsg that queued it wrote no data at
+ * all, so on a stream socket Linux would have created no skb and destroyed the
+ * scm (unix_stream_sendmsg never enters its loop for a zero-length message).
+ * Returns 1 when the batch was still queued and the caller owns the refs again,
+ * 0 when it has already been delivered or dropped and they are gone. */
+int usocket_cancel_fds(usocket_t *s, uint32_t id) {
+    ucbuf_t *b = (s && id) ? s->tx : NULL;
+    if (!b) return 0;
+    uscm_t *prev = NULL;
+    for (uscm_t *m = b->scm_head; m; prev = m, m = m->next) {
+        if (m->id != id) continue;
+        if (prev) prev->next = m->next; else b->scm_head = m->next;
+        if (b->scm_tail == m) b->scm_tail = prev;
+        kfree(m);
+        return 1;
+    }
+    return 0;
 }
 
 /* SCM_RIGHTS: pop the next batch whose message the reader has started to
@@ -324,18 +353,11 @@ int usocket_recv_fds(usocket_t *s, proc_file_t *out, int max) {
     return n;
 }
 
-/* True when a recvmsg should wake even with no pending data: a batch of fds is
- * ready for delivery (its accompanying message already being consumed, or it
- * carried no data at all). */
+/* True when a batch of fds is ready for delivery, i.e. the reader has started
+ * consuming the message they were sent with. */
 int usocket_fds_ready(usocket_t *s) {
     ucbuf_t *b = s ? s->rx : NULL;
     return b && b->scm_head && uscm_ready(b, b->scm_head);
-}
-
-/* Bytes written to the tx stream so far — the position a message about to be
- * sent will start at, which is what usocket_send_fds() tags its batch with. */
-uint32_t usocket_txpos(usocket_t *s) {
-    return (s && s->tx) ? s->tx->total_in : 0;
 }
 
 /* POLLHUP: the connected peer is gone.  Closing a connected AF_UNIX stream
