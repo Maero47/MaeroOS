@@ -13,12 +13,17 @@
 #define MAX_BOUND  32       /* named listening sockets system-wide */
 
 /* SCM_RIGHTS in-flight fd batch.  Ancillary file descriptors travel WITH the
- * byte stream: a batch is tagged with the stream position (total bytes written)
- * at the point its data ended, and is delivered to the reader once it has
- * consumed up to that position.  Firefox's multiprocess IPC depends on this. */
+ * byte stream, exactly as on Linux: unix_stream_sendmsg attaches them to the
+ * FIRST skb of the message, and unix_stream_read_generic detaches them as soon
+ * as a recvmsg consumes any chunk of that skb.  So a batch is tagged with the
+ * stream position where its message STARTS and becomes deliverable once the
+ * reader has taken at least one byte from there — an 8 KiB sendmsg read in
+ * 4 KiB pieces hands the fds over with the first piece.  Firefox's
+ * multiprocess IPC depends on this. */
 typedef struct uscm {
     struct uscm *next;
-    uint32_t     at;                  /* tx total_in when this batch was queued */
+    uint32_t     at;                  /* tx total_in BEFORE this message's data */
+    int          nodata;              /* the message carried no bytes at all */
     int          nfds;
     proc_file_t  files[SCM_MAX_FDS];  /* retained file refs (ownership in queue) */
 } uscm_t;
@@ -76,6 +81,27 @@ static void ucbuf_unref(ucbuf_t *b) {
         }
         wake_up(b);
         kfree(b);
+    }
+}
+
+/* Is this batch's message already being consumed?  A message with no bytes of
+ * its own (a sendmsg that carried only fds) stands alone and is deliverable
+ * straight away; otherwise the reader has to have passed its start position. */
+static int uscm_ready(ucbuf_t *b, uscm_t *m) {
+    return m->nodata || b->total_out > m->at;
+}
+
+/* Pop and close every batch the reader has now passed without collecting: a
+ * plain read()/recv(), or a recvmsg with no control buffer, loses the fds
+ * (Linux hands them to scm_recv, which destroys the scm when msg_controllen
+ * is 0). */
+static void ucbuf_drop_ready_fds(ucbuf_t *b) {
+    while (b->scm_head && uscm_ready(b, b->scm_head)) {
+        uscm_t *m = b->scm_head;
+        b->scm_head = m->next;
+        if (!b->scm_head) b->scm_tail = NULL;
+        for (int i = 0; i < m->nfds; i++) fd_release(&m->files[i]);
+        kfree(m);
     }
 }
 
@@ -178,37 +204,48 @@ usocket_t *usocket_accept(usocket_t *s, int nonblock, int *err) {
     return srv;                                        /* refs already 1 */
 }
 
-int usocket_read(usocket_t *s, void *buf, int len, int nonblock) {
+int usocket_read(usocket_t *s, void *buf, int len, int flags) {
     if (len <= 0) return 0;
     ucbuf_t *b = s->rx;
     if (!b) return -107;                               /* -ENOTCONN */
     while (b->count == 0) {
         if (b->writer_closed) return 0;                /* EOF */
-        if (nonblock) return -11;
+        if (flags & USOCK_NONBLOCK) return -11;
         if (signal_interrupt_pending(current_proc)) return -4;
         sleep_on(b);
     }
     int take = len;
     if ((uint32_t)take > b->count) take = (int)b->count;
-    /* Do not read past the next pending SCM_RIGHTS batch boundary, so its fds
-     * are delivered together with (and not before) the data they accompany. */
-    if (b->scm_head && b->scm_head->at > b->total_out) {
-        uint32_t until = b->scm_head->at - b->total_out;
-        if ((uint32_t)take > until) take = (int)until;
-    }
+    /* Never glue two messages that carry different ancillary data: stop at the
+     * START of the next SCM_RIGHTS batch, so the fds of one message are never
+     * handed over together with bytes of the message after it (Linux
+     * unix_stream_read_generic breaks its loop on !unix_skb_scm_eq). */
+    for (uscm_t *m = b->scm_head; m; m = m->next)
+        if (m->at > b->total_out) {
+            uint32_t until = m->at - b->total_out;
+            if ((uint32_t)take > until) take = (int)until;
+            break;
+        }
+    uint32_t head = b->head;
     uint8_t *p = (uint8_t *)buf;
     for (int i = 0; i < take; i++) {
-        p[i] = b->data[b->head];
-        b->head = (b->head + 1) % UBUF_SIZE;
+        p[i] = b->data[head];
+        head = (head + 1) % UBUF_SIZE;
     }
+    if (flags & USOCK_PEEK)
+        return take;               /* MSG_PEEK: data (and fds) stay queued */
+    b->head = head;
     b->count -= (uint32_t)take;
     b->total_out += (uint32_t)take;
+    /* The bytes are gone; unless the caller is a recvmsg that can carry them,
+     * so are the fds that rode with them. */
+    if (!(flags & USOCK_WANTFDS)) ucbuf_drop_ready_fds(b);
     wake_up(b);                                        /* wake blocked writers */
     io_wake();
     return take;
 }
 
-int usocket_write(usocket_t *s, const void *buf, int len, int nonblock) {
+int usocket_write(usocket_t *s, const void *buf, int len, int flags) {
     if (len <= 0) return 0;
     ucbuf_t *b = s->tx;
     if (!b) return -107;
@@ -217,15 +254,17 @@ int usocket_write(usocket_t *s, const void *buf, int len, int nonblock) {
     while (n < len) {
         while (b->count == UBUF_SIZE) {
             if (b->reader_closed) {
-                signal_send(current_proc, SIGPIPE);
+                /* MSG_NOSIGNAL: plain EPIPE, no SIGPIPE (net/socket.c
+                 * sock_sendmsg -> unix_stream_sendmsg send_sig check). */
+                if (!(flags & USOCK_NOSIGNAL)) signal_send(current_proc, SIGPIPE);
                 return n ? n : -32;                    /* -EPIPE */
             }
-            if (nonblock) return n ? n : -11;
+            if (flags & USOCK_NONBLOCK) return n ? n : -11;
             if (signal_interrupt_pending(current_proc)) return n ? n : -4;
             sleep_on(b);
         }
         if (b->reader_closed) {
-            signal_send(current_proc, SIGPIPE);
+            if (!(flags & USOCK_NOSIGNAL)) signal_send(current_proc, SIGPIPE);
             return n ? n : -32;
         }
         int space = (int)(UBUF_SIZE - b->count);
@@ -244,17 +283,20 @@ int usocket_write(usocket_t *s, const void *buf, int len, int nonblock) {
 }
 
 /* SCM_RIGHTS: queue a batch of (already-retained) file refs onto the tx stream,
- * tagged at the current write position so they ride along with the bytes just
- * written.  Ownership of the refs transfers into the queue. */
-int usocket_send_fds(usocket_t *s, proc_file_t *files, int n) {
+ * tagged with `at`, the write position the message's data STARTED at (the
+ * caller takes it from usocket_txpos() before writing), so the fds are handed
+ * to the first recvmsg that consumes any of those bytes.  Ownership of the
+ * refs transfers into the queue. */
+int usocket_send_fds(usocket_t *s, proc_file_t *files, int n, uint32_t at) {
     if (n <= 0) return 0;
     if (n > SCM_MAX_FDS) n = SCM_MAX_FDS;
     ucbuf_t *b = s->tx;
     if (!b) return -107;                               /* -ENOTCONN */
     uscm_t *m = (uscm_t *)kmalloc(sizeof(uscm_t));
     if (!m) return -12;
-    m->next = NULL;
-    m->at   = b->total_in;        /* deliver once reader consumes up to here */
+    m->next   = NULL;
+    m->at     = at;
+    m->nodata = (at == b->total_in);   /* fds sent without any bytes */
     m->nfds = n;
     for (int i = 0; i < n; i++) m->files[i] = files[i];
     if (b->scm_tail) b->scm_tail->next = m; else b->scm_head = m;
@@ -263,13 +305,14 @@ int usocket_send_fds(usocket_t *s, proc_file_t *files, int n) {
     return n;
 }
 
-/* SCM_RIGHTS: pop the next batch whose data the reader has fully consumed.
- * Ownership of the returned refs transfers to the caller (which installs them
- * as fds).  Returns 0 if none ready.  Overflow beyond `max` is dropped. */
+/* SCM_RIGHTS: pop the next batch whose message the reader has started to
+ * consume.  Ownership of the returned refs transfers to the caller (which
+ * installs them as fds).  Returns 0 if none ready.  Overflow beyond `max` is
+ * dropped. */
 int usocket_recv_fds(usocket_t *s, proc_file_t *out, int max) {
     ucbuf_t *b = s->rx;
     if (!b || !b->scm_head) return 0;
-    if (b->scm_head->at > b->total_out) return 0;      /* data not yet read */
+    if (!uscm_ready(b, b->scm_head)) return 0;         /* data not yet read */
     uscm_t *m = b->scm_head;
     int n = m->nfds;
     if (n > max) n = max;
@@ -282,10 +325,27 @@ int usocket_recv_fds(usocket_t *s, proc_file_t *out, int max) {
 }
 
 /* True when a recvmsg should wake even with no pending data: a batch of fds is
- * ready for delivery (its accompanying data already consumed). */
+ * ready for delivery (its accompanying message already being consumed, or it
+ * carried no data at all). */
 int usocket_fds_ready(usocket_t *s) {
-    ucbuf_t *b = s->rx;
-    return b && b->scm_head && b->scm_head->at <= b->total_out;
+    ucbuf_t *b = s ? s->rx : NULL;
+    return b && b->scm_head && uscm_ready(b, b->scm_head);
+}
+
+/* Bytes written to the tx stream so far — the position a message about to be
+ * sent will start at, which is what usocket_send_fds() tags its batch with. */
+uint32_t usocket_txpos(usocket_t *s) {
+    return (s && s->tx) ? s->tx->total_in : 0;
+}
+
+/* POLLHUP: the connected peer is gone.  Closing a connected AF_UNIX stream
+ * socket sets the peer's sk_shutdown to SHUTDOWN_MASK (net/unix/af_unix.c
+ * unix_release_sock), and unix_poll reports EPOLLHUP for exactly that — both
+ * directions dead, which here means our reader end saw the writer go and our
+ * writer end saw the reader go. */
+int usocket_hup(usocket_t *s) {
+    if (!s || !s->rx || !s->tx) return 0;
+    return (s->rx->writer_closed && s->tx->reader_closed) ? 1 : 0;
 }
 
 int usocket_read_ready(usocket_t *s) {

@@ -459,6 +459,38 @@ static void fill_kstat64(struct kstat64 *st, vfs_node_t *n) {
     st->st_ctime   = n->ctime;
 }
 
+/* stat as fstat(2) / statx(AT_EMPTY_PATH) see a DESCRIPTOR.  Only FD_FILE has
+ * a vfs_node_t behind it; every other kind of descriptor gets the mode Linux
+ * reports for that object (S_IFIFO for a pipe, S_IFSOCK for a socket, an
+ * anonymous inode for eventfd/epoll), which is what makes fstat() on a pipe
+ * received over SCM_RIGHTS report S_ISFIFO instead of the root directory. */
+static int fd_kstat64(int fd, struct kstat64 *kst) {
+    if (fd < 0 || fd >= MAX_FD) return -9;
+    proc_file_t *f = &current_proc->ofile[fd];
+    __builtin_memset(kst, 0, sizeof(*kst));
+    kst->st_nlink   = 1;
+    kst->st_blksize = 4096;
+    switch (f->type) {
+    case FD_FILE:
+        if (!f->node) return -9;
+        fill_kstat64(kst, f->node);
+        return 0;
+    case FD_PIPE_R: case FD_PIPE_W:
+        kst->st_mode = 0010666;                 /* S_IFIFO  */
+        return 0;
+    case FD_SOCKET: case FD_USOCKET:
+        kst->st_mode = 0140777;                 /* S_IFSOCK */
+        return 0;
+    case FD_NONE:
+        if (fd > 2) return -9;                  /* -EBADF */
+        kst->st_mode = 0020666;                 /* stdio: a char device */
+        return 0;
+    default:
+        kst->st_mode = 0100600;                 /* anon inode: eventfd, epoll */
+        return 0;
+    }
+}
+
 static int sys_mkdir_kernel_path(const char *path);
 static int sys_unlink_kernel_path(const char *path);
 static void io_wait_sleep(uint32_t max_ticks);
@@ -4210,26 +4242,9 @@ static int sys_fstat64(registers_t *regs) {
     struct kstat64 *st = (struct kstat64 *)(uintptr_t)regs->ecx;
     if (!access_ok(st, sizeof(*st))) return -14;
 
-    if (fd < 0 || fd >= MAX_FD) return -9;
-    proc_file_t *f = &current_proc->ofile[fd];
-
-    if (f->type == FD_NONE) {
-        if (fd <= 2) {
-            struct kstat64 kst;
-            __builtin_memset(&kst, 0, sizeof(kst));
-            kst.st_mode = 0020666;
-            return copy_to_user(st, &kst, sizeof(kst));
-        }
-        return -9;
-    }
-    if (f->type == FD_PIPE_R || f->type == FD_PIPE_W) {
-        struct kstat64 kst;
-        __builtin_memset(&kst, 0, sizeof(kst));
-        kst.st_mode = 0010666;
-        return copy_to_user(st, &kst, sizeof(kst));
-    }
     struct kstat64 kst;
-    fill_kstat64(&kst, f->node);
+    int r = fd_kstat64(fd, &kst);
+    if (r < 0) return r;
     return copy_to_user(st, &kst, sizeof(kst));
 }
 
@@ -4328,21 +4343,17 @@ static int sys_statx(registers_t *regs) {
     void *ubuf = (void *)(uintptr_t)regs->edi;
     if (!access_ok(ubuf, sizeof(struct kstatx))) return -14;
 
-    vfs_node_t *n;
-    if (path[0] == '/' || path[0] == '\0') {
-        /* empty path + AT_EMPTY_PATH(0x1000) → stat dirfd itself */
-        if (path[0] == '\0' && dirfd >= 0 && dirfd < MAX_FD &&
-            current_proc->ofile[dirfd].type == FD_FILE)
-            n = current_proc->ofile[dirfd].node;
-        else
-            n = vfs_open_at(path);
-    } else {
-        n = vfs_open_at(path);
-    }
-    if (!n) return -2;
-
     struct kstat64 kst;
-    fill_kstat64(&kst, n);
+    /* empty path + AT_EMPTY_PATH(0x1000) → stat dirfd itself, whatever kind of
+     * descriptor it is (musl 1.2 implements fstat() as exactly this call). */
+    if (path[0] == '\0' && dirfd >= 0) {
+        int r = fd_kstat64(dirfd, &kst);
+        if (r < 0) return r;
+    } else {
+        vfs_node_t *n = vfs_open_at(path);
+        if (!n) return -2;
+        fill_kstat64(&kst, n);
+    }
 
     struct kstatx sx;
     __builtin_memset(&sx, 0, sizeof(sx));
@@ -4965,6 +4976,10 @@ static int sys_poll(registers_t *regs) {
                 if ((events & POLLOUT) && fd_write_ready(fd)) rev |= POLLOUT;
                 if (f->type == FD_PIPE_R && f->pipe->nwriters == 0) rev |= POLLHUP;
                 if (f->type == FD_PIPE_W && f->pipe->nreaders == 0) rev |= POLLERR;
+                /* A closed AF_UNIX peer is a hangup, reported whether or not
+                 * the caller asked for it (net/unix/af_unix.c unix_poll:
+                 * EPOLLHUP once sk_shutdown is SHUTDOWN_MASK). */
+                if (f->type == FD_USOCKET && usocket_hup(f->usock)) rev |= POLLHUP;
             }
             kfds[i * 2 + 1] = (kfds[i * 2 + 1] & 0xffff) | ((uint32_t)(uint16_t)rev << 16);
             if (rev) ready++;
@@ -5407,11 +5422,16 @@ static int sys_fstatat64(registers_t *regs) {
     char path[256], resolved[256];
     int r = copy_user_str(upath, path, sizeof(path));
     if (r < 0) return r;
+    struct kstat64 kst;
+    if (path[0] == '\0' && dirfd >= 0) {  /* AT_EMPTY_PATH: stat dirfd itself */
+        r = fd_kstat64(dirfd, &kst);
+        if (r < 0) return r;
+        return copy_to_user(st, &kst, sizeof(kst));
+    }
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
     vfs_node_t *n = vfs_open(resolved);
     if (!n) return -2;
-    struct kstat64 kst;
     fill_kstat64(&kst, n);
     return copy_to_user(st, &kst, sizeof(kst));
 }
@@ -6613,6 +6633,22 @@ static int socket_arg_count(int call) {
  * Shared by socketcall(102) and the direct i386 socket syscalls (359-373). */
 #define SOCK_CLOEXEC_K   0x80000
 #define SOCK_NONBLOCK_K  0x800
+
+/* recv/send MSG_* bits this layer honours (include/linux/socket.h). */
+#define MSG_PEEK_K          0x0002
+#define MSG_DONTWAIT_K      0x0040
+#define MSG_NOSIGNAL_K      0x4000
+#define MSG_CMSG_CLOEXEC_K  0x40000000
+
+/* Per-call MSG_* flags + the descriptor's O_NONBLOCK, as usocket_read()/
+ * usocket_write() want them. */
+static int usock_flags(uint32_t msgflags, int nb) {
+    int f = (nb || (msgflags & MSG_DONTWAIT_K)) ? USOCK_NONBLOCK : 0;
+    if (msgflags & MSG_PEEK_K)     f |= USOCK_PEEK;
+    if (msgflags & MSG_NOSIGNAL_K) f |= USOCK_NOSIGNAL;
+    return f;
+}
+
 static int socketcall_core(int call, uint32_t *kargs) {
     /* accept4(fd, addr, addrlen, flags) is socketcall index 18 (Linux
      * SYS_ACCEPT4).  Its SOCK_CLOEXEC/SOCK_NONBLOCK apply to the NEW
@@ -6753,13 +6789,13 @@ static int socketcall_core(int call, uint32_t *kargs) {
             const void *buf = (const void *)(uintptr_t)kargs[1];
             uint32_t len = kargs[2];
             if (!access_ok(buf, len)) return -14;
-            return usocket_write(us, buf, (int)len, nb);
+            return usocket_write(us, buf, (int)len, usock_flags(kargs[3], nb));
         }
         if (call == 10 || call == 12) {      /* recv / recvfrom */
             void *buf = (void *)(uintptr_t)kargs[1];
             uint32_t len = kargs[2];
             if (!access_ok(buf, len)) return -14;
-            return usocket_read(us, buf, (int)len, nb);
+            return usocket_read(us, buf, (int)len, usock_flags(kargs[3], nb));
         }
         if (call == 16 || call == 17) {      /* sendmsg / recvmsg */
             /* struct msghdr { name,namelen,iov,iovlen,control,controllen,flags }.
@@ -6773,6 +6809,19 @@ static int socketcall_core(int call, uint32_t *kargs) {
             uint32_t iov = mh[2], iovlen = mh[3];
             uint32_t uctrl = mh[4], uctrllen = mh[5];
             if (iovlen > 1024) return -22;
+            /* A recvmsg can only carry fds out if it brought a control buffer;
+             * without one they are dropped like a plain read()'s would be. */
+            int wantfds = (call == 17 && uctrl && uctrllen >= 12);
+            int mflags  = usock_flags(kargs[2], nb);
+            if (wantfds) mflags |= USOCK_WANTFDS;
+            /* Fds that came with no data of their own are deliverable on their
+             * own: take what is there rather than sleeping for bytes that are
+             * not coming (Linux returns them with a zero-length recvmsg). */
+            if (wantfds && usocket_fds_ready(us)) mflags |= USOCK_NONBLOCK;
+            /* Linux attaches the fds to the FIRST skb of the message
+             * (unix_stream_sendmsg), so tag them with the position the data
+             * about to be written starts at. */
+            uint32_t scm_at = (call == 16) ? usocket_txpos(us) : 0;
 
             /* sendmsg: parse SCM_RIGHTS cmsg(s), retain the named fds. */
             proc_file_t pass[SCM_MAX_FDS];
@@ -6822,8 +6871,8 @@ static int socketcall_core(int call, uint32_t *kargs) {
                     return -14;
                 }
                 int n = (call == 16)
-                    ? usocket_write(us, (void *)(uintptr_t)iv[0], len, nb)
-                    : usocket_read(us, (void *)(uintptr_t)iv[0], len, nb);
+                    ? usocket_write(us, (void *)(uintptr_t)iv[0], len, mflags)
+                    : usocket_read(us, (void *)(uintptr_t)iv[0], len, mflags);
                 if (n < 0) {
                     if (total) break;
                     if (call == 16) {
@@ -6836,11 +6885,13 @@ static int socketcall_core(int call, uint32_t *kargs) {
                 }
                 total += n;
                 if (n < len) break;          /* short read/write — stop */
+                if (mflags & USOCK_PEEK) break;   /* peek does not advance */
             }
 
-            /* sendmsg: enqueue the retained fds, tagged after the data. */
+            /* sendmsg: enqueue the retained fds, tagged at the start of the
+             * data they were sent with. */
             if (call == 16 && npass > 0) {
-                if (usocket_send_fds(us, pass, npass) < 0)
+                if (usocket_send_fds(us, pass, npass, scm_at) < 0)
                     for (int k = 0; k < npass; k++) fd_release(&pass[k]);
             }
 
@@ -6848,10 +6899,9 @@ static int socketcall_core(int call, uint32_t *kargs) {
             if (call == 17) {
                 uint32_t ctrl_used = 0;
                 proc_file_t got[SCM_MAX_FDS];
-                int ngot = (uctrl && uctrllen >= 12)
-                         ? usocket_recv_fds(us, got, SCM_MAX_FDS) : 0;
+                int ngot = wantfds ? usocket_recv_fds(us, got, SCM_MAX_FDS) : 0;
                 if (ngot > 0) {
-                    int cloex = (kargs[2] & 0x40000000) ? 1 : 0; /* MSG_CMSG_CLOEXEC */
+                    int cloex = (kargs[2] & MSG_CMSG_CLOEXEC_K) ? 1 : 0;
                     int newfds[SCM_MAX_FDS]; int ninst = 0;
                     for (int k = 0; k < ngot; k++) {
                         int slot = -1;
