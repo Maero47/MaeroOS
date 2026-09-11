@@ -21,6 +21,12 @@
  *     must not come back with interrupts disabled, and must not be able to
  *     fault the kernel on its way out (Linux restore_sigcontext keeps IOPL and
  *     IF out of FIX_EFLAGS and forces CS/SS to ring 3);
+ *  S9 a new THREAD does not inherit the creator's alternate signal stack:
+ *     Linux clears it for a task that shares the address space (copy_process:
+ *     sas_ss_reset(p) when (clone_flags & (CLONE_VM|CLONE_VFORK)) == CLONE_VM)
+ *     precisely so two threads cannot build their SA_ONSTACK frames at the
+ *     same address and overwrite each other's saved registers.  A fresh thread
+ *     reports SS_DISABLE; a real fork still inherits the stack;
  *  S8 a signal frame built on the sigaltstack() stack must stay inside it.
  *     Nested SA_ONSTACK deliveries do not switch again — sp is already on the
  *     alternate stack — so each frame lands below the last; the one that would
@@ -149,6 +155,92 @@ static void on_nest(int sig, siginfo_t *si, void *uc)
     (void)si; (void)uc;
     if (++nest_depth < 32)
         syscall(SYS_tgkill, getpid(), raw_gettid(), sig);
+}
+
+/* ── S9: an alternate stack belongs to ONE thread ───────────────────────── */
+
+#define S9_ALT 16384
+static char s9_alt[S9_ALT] __attribute__((aligned(16)));
+static volatile int s9_a_in, s9_b_done, s9_fail;
+
+/* Thread A's handler: stays on the alternate stack while thread B takes its
+ * own SA_ONSTACK signal, so a second frame at the same address would land on
+ * this one's saved registers, ucontext and trampoline. */
+static void s9_on_a(int sig, siginfo_t *si, void *uc)
+{
+    (void)sig; (void)si; (void)uc;
+    s9_a_in = 1;
+    for (int i = 0; i < 5000 && !s9_b_done; i++)
+        sleep_ms(1);
+}
+
+/* Thread B's handler: its frame must be on B's own stack. */
+static void s9_on_b(int sig, siginfo_t *si, void *uc)
+{
+    (void)sig; (void)si; (void)uc;
+    volatile char here = 0;
+    uintptr_t sp = (uintptr_t)&here;
+    if (sp >= (uintptr_t)s9_alt && sp < (uintptr_t)s9_alt + S9_ALT)
+        s9_fail = 2;              /* built on the creator's alternate stack */
+}
+
+static void *s9_thread_b(void *arg)
+{
+    (void)arg;
+    stack_t oss;
+    memset(&oss, 0x7f, sizeof oss);
+    if (sigaltstack(NULL, &oss) != 0)
+        s9_fail = 3;
+    else if (!(oss.ss_flags & SS_DISABLE) || oss.ss_size != 0 || oss.ss_sp != NULL)
+        s9_fail = 4;              /* inherited the creator's alternate stack */
+    if (s9_fail) {
+        /* The stack is already shared: say so rather than going on to collide
+         * the two frames, which would crash instead of reporting. */
+        s9_b_done = 1;
+        return NULL;
+    }
+    while (!s9_a_in)
+        sleep_ms(1);              /* A is inside its handler on that stack */
+    raise(SIGUSR2);
+    s9_b_done = 1;
+    return NULL;
+}
+
+/* The whole case runs in a child: on a kernel that shares the stack the two
+ * frames collide and thread A returns through another thread's saved
+ * registers, which is a crash, not a verdict. */
+static void s9_child(void)
+{
+    struct sigaction sa;
+    /* A wild fault must kill the child outright rather than siglongjmp into
+     * the parent's flow through an inherited handler. */
+    signal(SIGSEGV, SIG_DFL);
+    signal(SIGBUS, SIG_DFL);
+    stack_t ss;
+    ss.ss_sp = s9_alt;
+    ss.ss_size = S9_ALT;
+    ss.ss_flags = 0;
+    if (sigaltstack(&ss, NULL) != 0)
+        _exit(6);
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = s9_on_a;
+    sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR1, &sa, NULL);
+    sa.sa_sigaction = s9_on_b;
+    sigaction(SIGUSR2, &sa, NULL);
+
+    pthread_t b;
+    if (pthread_create(&b, NULL, s9_thread_b, NULL) != 0)
+        _exit(7);
+    volatile uint32_t marker = 0xA5A5A5A5u;
+    uintptr_t sp_before = (uintptr_t)&marker;
+    raise(SIGUSR1);
+    /* Back from the handler: this thread's own frame has to have survived. */
+    if (marker != 0xA5A5A5A5u || (uintptr_t)&marker != sp_before)
+        s9_fail = 5;
+    pthread_join(b, NULL);
+    _exit(s9_fail);
 }
 
 int main(void)
@@ -319,6 +411,64 @@ int main(void)
                        "stack, over memory the process owns", S8_GUARD - i);
     probe_info("nested SA_ONSTACK frames stop at the alternate stack instead of "
                "running past it");
+
+    /* S9: threads must not share one alternate stack; fork still inherits it. */
+    fflush(stdout);
+    pid_t two = fork();
+    if (two < 0)
+        probe_fail("S9: fork: %s", strerror(errno));
+    if (two == 0)
+        s9_child();
+    int st9 = 0, reaped = 0;
+    double t0 = now_ms();
+    while (now_ms() - t0 < 20000) {
+        pid_t w = waitpid(two, &st9, WNOHANG);
+        if (w == two) { reaped = 1; break; }
+        if (w < 0)
+            probe_fail("S9: waitpid: %s", strerror(errno));
+        sleep_ms(20);
+    }
+    if (!reaped) {
+        kill(two, SIGKILL);
+        waitpid(two, &st9, 0);
+        probe_fail("S9: the two-thread SA_ONSTACK case never finished");
+    }
+    if (WIFSIGNALED(st9))
+        probe_fail("S9: the child died of signal %d — a second thread's signal frame "
+                   "landed on the frame the first thread was running on",
+                   WTERMSIG(st9));
+    switch (WEXITSTATUS(st9)) {
+    case 0: break;
+    case 2: probe_fail("S9: the second thread's SA_ONSTACK frame was built on the "
+                       "alternate stack its creator registered");
+    case 3: probe_fail("S9: sigaltstack(NULL, &oss) failed in a fresh thread");
+    case 4: probe_fail("S9: a fresh thread inherited the creator's alternate stack "
+                       "instead of reporting SS_DISABLE");
+    case 5: probe_fail("S9: the first thread came back from its handler with a "
+                       "corrupted frame");
+    case 6: probe_fail("S9: the child could not install its alternate stack");
+    case 7: probe_fail("S9: the child could not create its second thread");
+    default: probe_fail("S9: the child exited with status %d", WEXITSTATUS(st9));
+    }
+    /* A real fork DOES inherit it (Linux copies it; only CLONE_VM clears it). */
+    fflush(stdout);
+    pid_t fk = fork();
+    if (fk < 0)
+        probe_fail("S9: fork: %s", strerror(errno));
+    if (fk == 0) {
+        stack_t q;
+        memset(&q, 0x7f, sizeof q);
+        if (sigaltstack(NULL, &q) != 0)
+            _exit(3);
+        _exit((q.ss_sp == altstack && q.ss_size == sizeof altstack &&
+               !(q.ss_flags & SS_DISABLE)) ? 0 : 4);
+    }
+    if (waitpid(fk, &st9, 0) != fk)
+        probe_fail("S9: waitpid (fork case): %s", strerror(errno));
+    if (!WIFEXITED(st9) || WEXITSTATUS(st9) != 0)
+        probe_fail("S9: a forked child did not inherit the alternate stack (status %d)",
+                   WIFEXITED(st9) ? WEXITSTATUS(st9) : -WTERMSIG(st9));
+    probe_info("a new thread starts with no alternate stack of its own; fork inherits one");
 
     probe_pass();
 }

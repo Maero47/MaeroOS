@@ -674,6 +674,21 @@ static void sys_exit(registers_t *regs) {
 #define CLONE_SETTLS         0x00080000
 #define CLONE_CHILD_SETTID   0x01000000
 
+/* /proc/<pid>/{cmdline,environ,auxv,exe} describe the ADDRESS SPACE on Linux,
+ * so a child reads the same as its creator — a forked one until it execs and
+ * replaces them, a thread for as long as it lives.  Neither path used to carry
+ * them: before allocproc() started clearing the slot, a new task reported
+ * whatever the slot's previous occupant had left there. */
+static void proc_copy_image_ids(struct proc *child, struct proc *parent) {
+    __builtin_memcpy(child->cmdline, parent->cmdline, sizeof(child->cmdline));
+    child->cmdline_len = parent->cmdline_len;
+    __builtin_memcpy(child->environ, parent->environ, sizeof(child->environ));
+    child->environ_len = parent->environ_len;
+    __builtin_memcpy(child->auxv_data, parent->auxv_data, sizeof(child->auxv_data));
+    child->auxv_bytes = parent->auxv_bytes;
+    __builtin_memcpy(child->exe, parent->exe, sizeof(child->exe));
+}
+
 /* Core fork.  child_stack==0 → child shares the parent's stack pointer (classic
  * fork).  child_stack!=0 → child runs on that user stack instead (clone without
  * CLONE_VM but WITH a stack — e.g. Google Breakpad's crash dumper, which clones
@@ -700,6 +715,7 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
      * thread of the parent may wait for it and its SIGCHLD goes to the process. */
     child->parent = proc_group_leader(parent);
     __builtin_memcpy(child->name, parent->name, sizeof(parent->name));
+    proc_copy_image_ids(child, parent);
 
     /* Inherit a private COPY of the handler table (Linux copy_sighand without
      * CLONE_SIGHAND); clear pending signals in child, keep the blocked mask. */
@@ -6519,11 +6535,26 @@ static int sys_clone(registers_t *regs) {
     child->tf->useresp = child_stack;
 
     __builtin_memcpy(child->name, parent->name, sizeof(parent->name));
+    proc_copy_image_ids(child, parent);
     child->pending_sigs  = 0;
     child->blocked_sigs  = parent->blocked_sigs;
     child->sigframe_addr = 0;
-    child->sas_sp        = parent->sas_sp;
-    child->sas_size      = parent->sas_size;
+    /* The alternate signal stack is per TASK and must not be shared with one
+     * that shares the address space: both would build their SA_ONSTACK frames
+     * at the same address, and the second to arrive would overwrite the saved
+     * registers, ucontext and trampoline of a handler already running there.
+     * Linux clears it on exactly this condition (kernel/fork.c copy_process:
+     * sas_ss_reset(p) when (clone_flags & (CLONE_VM|CLONE_VFORK)) == CLONE_VM).
+     * A vfork child keeps it: the parent is suspended until the child execs —
+     * which clears it — or exits, so there is never a second user.  (A real
+     * fork inherits it; that is do_fork's copy, not this one.) */
+    if (flags & CLONE_VFORK) {
+        child->sas_sp   = parent->sas_sp;
+        child->sas_size = parent->sas_size;
+    } else {
+        child->sas_sp   = 0;
+        child->sas_size = 0;
+    }
     if (flags & CLONE_SIGHAND) {
         /* One handler table for the group (Linux copy_sighand: refcount++). */
         sighand_put(child->sighand);

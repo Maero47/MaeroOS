@@ -45,6 +45,17 @@ struct proc *allocproc(void) {
     if (!p) { printk("[proc] table FULL (%d/%d) — clone/fork fails\n",
                      live, MAX_PROCS); return NULL; }
 
+    /* Start from a blank slot.  Everything in a reaped one belongs to its
+     * previous occupant (proc_release has already freed its kernel stack and
+     * page directory), so zero is the right default for every field and only
+     * the non-zero ones are spelled out below.  Clearing the struct rather than
+     * extending the list by hand is deliberate: the sigaltstack and fault-detail
+     * fields added for the siginfo work were missed precisely because this list
+     * has to be kept in step, and /proc/<pid>/environ would otherwise report the
+     * previous occupant's environment until the new process exec'd.  PROC_UNUSED
+     * is 0, so the slot stays free until the state is set on the next line. */
+    __builtin_memset(p, 0, sizeof(*p));
+
     p->state          = PROC_EMBRYO;
     p->pid            = next_pid++;
     p->pgdir_phys     = 0;
