@@ -71,7 +71,8 @@ void fd_release(proc_file_t *f);
 /* SCM_RIGHTS fd-passing over AF_UNIX sockets (defined in usocket.c). */
 #define SCM_MAX_FDS 16
 struct usocket;
-int usocket_send_fds(struct usocket *s, proc_file_t *files, int n);
+int usocket_send_fds(struct usocket *s, proc_file_t *files, int n, uint32_t *id_out);
+int usocket_cancel_fds(struct usocket *s, uint32_t id);
 int usocket_recv_fds(struct usocket *s, proc_file_t *out, int max);
 
 /* Diagnostic: print a one-line state snapshot of every live process. */
@@ -153,6 +154,19 @@ struct proc {
      * the -ERESTARTNOHAND return restarts the call, and the pair spins. */
     uint32_t         saved_sigmask;
     int              restore_sigmask;
+
+    /* Detail of a synchronous fault waiting to be delivered (Linux
+     * force_sig_fault's siginfo): which signal it belongs to, its si_code and
+     * the faulting address.  Consumed by the delivery of that signal, so an
+     * unrelated signal delivered first never picks it up. */
+    int              fault_sig;
+    int              fault_code;
+    uint32_t         fault_addr;
+
+    /* sigaltstack (Linux task->sas_ss_sp / sas_ss_size): the stack SA_ONSTACK
+     * handlers run on.  Size 0 means none is installed.  Inherited by fork,
+     * cleared by exec. */
+    uint32_t         sas_sp, sas_size;
 
     /* Group exit (Linux signal_struct SIGNAL_GROUP_EXIT + group_exit_code),
      * kept on the thread-group leader: set when exit_group() or a fatal signal

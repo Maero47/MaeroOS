@@ -93,8 +93,12 @@ PROBES = {
 XFAIL = {
     # p07_ftruncate64 was here ("syscalls 194/193/297/40 missing") and now
     # passes: truncate64/ftruncate64/rmdir/mknodat are implemented.
-    "p10_unix_socket":         "U2-U5: SCM_RIGHTS position, recvmsg 0, flags, POLLHUP",
-    "p19_siginfo":             "S6: si_addr/si_code, sa_mask, sigaltstack",
+    # p10_unix_socket was here ("U2-U5") and now passes: SCM_RIGHTS batches ride
+    # with the first bytes of their message, MSG_PEEK/MSG_DONTWAIT/MSG_NOSIGNAL
+    # are honoured and poll() reports POLLHUP on a closed AF_UNIX peer.
+    # p19_siginfo was here ("S6") and now passes: faults carry si_addr/si_code,
+    # sa_mask and the signal itself are blocked around the handler, uc_sigmask
+    # holds the pre-handler mask, and sigaltstack/SA_ONSTACK work.
     # p01-p06, p08, p09, p11-p13, p17, p18, p20 were listed here before the
     # process-model and memory/clock work landed on this branch; they are
     # required to pass now.  p20_shared_futex was never listed (F5/F6 are

@@ -221,7 +221,19 @@ int user_fault_signal(registers_t *regs, int sig) {
         current_proc->last_fault_eip = regs->eip;
         current_proc->fault_repeat   = 0;
     }
-    signal_send(current_proc, sig);
+    /* si_code/si_addr for the trap, as arch/x86/kernel/traps.c fills them: a
+     * fault in the instruction stream reports the instruction's address, a
+     * #GP (and friends) is a kernel-raised SIGSEGV with no address. */
+    int      code = SI_KERNEL;
+    uint32_t addr = 0;
+    switch (regs->int_no) {
+    case 0:  code = FPE_INTDIV; addr = regs->eip; break;  /* divide error */
+    case 6:  code = ILL_ILLOPN; addr = regs->eip; break;  /* invalid opcode */
+    case 17: code = BUS_ADRALN; addr = regs->eip; break;  /* alignment check */
+    case 16: case 19: code = SI_KERNEL; addr = regs->eip; break;  /* x87/SIMD */
+    default: break;
+    }
+    signal_send_fault(current_proc, sig, code, addr);
     signal_deliver_pending(regs);            /* → handler, or proc_exit if SIG_DFL */
     return 1;
 }
@@ -459,6 +471,38 @@ static void fill_kstat64(struct kstat64 *st, vfs_node_t *n) {
     st->st_ctime   = n->ctime;
 }
 
+/* stat as fstat(2) / statx(AT_EMPTY_PATH) see a DESCRIPTOR.  Only FD_FILE has
+ * a vfs_node_t behind it; every other kind of descriptor gets the mode Linux
+ * reports for that object (S_IFIFO for a pipe, S_IFSOCK for a socket, an
+ * anonymous inode for eventfd/epoll), which is what makes fstat() on a pipe
+ * received over SCM_RIGHTS report S_ISFIFO instead of the root directory. */
+static int fd_kstat64(int fd, struct kstat64 *kst) {
+    if (fd < 0 || fd >= MAX_FD) return -9;
+    proc_file_t *f = &current_proc->ofile[fd];
+    __builtin_memset(kst, 0, sizeof(*kst));
+    kst->st_nlink   = 1;
+    kst->st_blksize = 4096;
+    switch (f->type) {
+    case FD_FILE:
+        if (!f->node) return -9;
+        fill_kstat64(kst, f->node);
+        return 0;
+    case FD_PIPE_R: case FD_PIPE_W:
+        kst->st_mode = 0010666;                 /* S_IFIFO  */
+        return 0;
+    case FD_SOCKET: case FD_USOCKET:
+        kst->st_mode = 0140777;                 /* S_IFSOCK */
+        return 0;
+    case FD_NONE:
+        if (fd > 2) return -9;                  /* -EBADF */
+        kst->st_mode = 0020666;                 /* stdio: a char device */
+        return 0;
+    default:
+        kst->st_mode = 0100600;                 /* anon inode: eventfd, epoll */
+        return 0;
+    }
+}
+
 static int sys_mkdir_kernel_path(const char *path);
 static int sys_unlink_kernel_path(const char *path);
 static void io_wait_sleep(uint32_t max_ticks);
@@ -630,6 +674,21 @@ static void sys_exit(registers_t *regs) {
 #define CLONE_SETTLS         0x00080000
 #define CLONE_CHILD_SETTID   0x01000000
 
+/* /proc/<pid>/{cmdline,environ,auxv,exe} describe the ADDRESS SPACE on Linux,
+ * so a child reads the same as its creator — a forked one until it execs and
+ * replaces them, a thread for as long as it lives.  Neither path used to carry
+ * them: before allocproc() started clearing the slot, a new task reported
+ * whatever the slot's previous occupant had left there. */
+static void proc_copy_image_ids(struct proc *child, struct proc *parent) {
+    __builtin_memcpy(child->cmdline, parent->cmdline, sizeof(child->cmdline));
+    child->cmdline_len = parent->cmdline_len;
+    __builtin_memcpy(child->environ, parent->environ, sizeof(child->environ));
+    child->environ_len = parent->environ_len;
+    __builtin_memcpy(child->auxv_data, parent->auxv_data, sizeof(child->auxv_data));
+    child->auxv_bytes = parent->auxv_bytes;
+    __builtin_memcpy(child->exe, parent->exe, sizeof(child->exe));
+}
+
 /* Core fork.  child_stack==0 → child shares the parent's stack pointer (classic
  * fork).  child_stack!=0 → child runs on that user stack instead (clone without
  * CLONE_VM but WITH a stack — e.g. Google Breakpad's crash dumper, which clones
@@ -656,6 +715,7 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
      * thread of the parent may wait for it and its SIGCHLD goes to the process. */
     child->parent = proc_group_leader(parent);
     __builtin_memcpy(child->name, parent->name, sizeof(parent->name));
+    proc_copy_image_ids(child, parent);
 
     /* Inherit a private COPY of the handler table (Linux copy_sighand without
      * CLONE_SIGHAND); clear pending signals in child, keep the blocked mask. */
@@ -664,10 +724,14 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
                          sizeof(child->sighand->handlers));
         __builtin_memcpy(child->sighand->flags, parent->sighand->flags,
                          sizeof(child->sighand->flags));
+        __builtin_memcpy(child->sighand->mask, parent->sighand->mask,
+                         sizeof(child->sighand->mask));
     }
     child->pending_sigs  = 0;
     child->blocked_sigs  = parent->blocked_sigs;
     child->sigframe_addr = 0;
+    child->sas_sp        = parent->sas_sp;
+    child->sas_size      = parent->sas_size;
 
     /* Inherit working directory, heap break, umask, mmap state, and pgrp.
      * heap_end/mmap_next live on the thread-group LEADER, so when a non-leader
@@ -1921,10 +1985,17 @@ static int sys_exec(registers_t *regs) {
                          sizeof(current_proc->sighand->handlers));
         __builtin_memset(current_proc->sighand->flags, 0,
                          sizeof(current_proc->sighand->flags));
+        __builtin_memset(current_proc->sighand->mask, 0,
+                         sizeof(current_proc->sighand->mask));
     }
     current_proc->pending_sigs   = 0;
     current_proc->sigframe_addr  = 0;
     current_proc->restore_sigmask = 0;   /* no sigsuspend mask survives exec */
+    current_proc->fault_sig      = 0;
+    /* The alternate signal stack belonged to the old image (fs/exec.c
+     * begin_new_exec: sas_ss_sp = sas_ss_size = 0). */
+    current_proc->sas_sp         = 0;
+    current_proc->sas_size       = 0;
 
     /* Update trapframe to run new program */
     registers_t *tf = current_proc->tf;
@@ -4210,26 +4281,9 @@ static int sys_fstat64(registers_t *regs) {
     struct kstat64 *st = (struct kstat64 *)(uintptr_t)regs->ecx;
     if (!access_ok(st, sizeof(*st))) return -14;
 
-    if (fd < 0 || fd >= MAX_FD) return -9;
-    proc_file_t *f = &current_proc->ofile[fd];
-
-    if (f->type == FD_NONE) {
-        if (fd <= 2) {
-            struct kstat64 kst;
-            __builtin_memset(&kst, 0, sizeof(kst));
-            kst.st_mode = 0020666;
-            return copy_to_user(st, &kst, sizeof(kst));
-        }
-        return -9;
-    }
-    if (f->type == FD_PIPE_R || f->type == FD_PIPE_W) {
-        struct kstat64 kst;
-        __builtin_memset(&kst, 0, sizeof(kst));
-        kst.st_mode = 0010666;
-        return copy_to_user(st, &kst, sizeof(kst));
-    }
     struct kstat64 kst;
-    fill_kstat64(&kst, f->node);
+    int r = fd_kstat64(fd, &kst);
+    if (r < 0) return r;
     return copy_to_user(st, &kst, sizeof(kst));
 }
 
@@ -4328,21 +4382,17 @@ static int sys_statx(registers_t *regs) {
     void *ubuf = (void *)(uintptr_t)regs->edi;
     if (!access_ok(ubuf, sizeof(struct kstatx))) return -14;
 
-    vfs_node_t *n;
-    if (path[0] == '/' || path[0] == '\0') {
-        /* empty path + AT_EMPTY_PATH(0x1000) → stat dirfd itself */
-        if (path[0] == '\0' && dirfd >= 0 && dirfd < MAX_FD &&
-            current_proc->ofile[dirfd].type == FD_FILE)
-            n = current_proc->ofile[dirfd].node;
-        else
-            n = vfs_open_at(path);
-    } else {
-        n = vfs_open_at(path);
-    }
-    if (!n) return -2;
-
     struct kstat64 kst;
-    fill_kstat64(&kst, n);
+    /* empty path + AT_EMPTY_PATH(0x1000) → stat dirfd itself, whatever kind of
+     * descriptor it is (musl 1.2 implements fstat() as exactly this call). */
+    if (path[0] == '\0' && dirfd >= 0) {
+        int r = fd_kstat64(dirfd, &kst);
+        if (r < 0) return r;
+    } else {
+        vfs_node_t *n = vfs_open_at(path);
+        if (!n) return -2;
+        fill_kstat64(&kst, n);
+    }
 
     struct kstatx sx;
     __builtin_memset(&sx, 0, sizeof(sx));
@@ -4391,12 +4441,14 @@ static int sys_rt_sigaction(registers_t *regs) {
     struct sighand *sh = current_proc->sighand;
     sighandler_t old_handler = sh->handlers[sig];
     uint32_t     old_flags   = sh->flags[sig];
+    uint32_t     old_mask    = sh->mask[sig];
 
     if (oact) {
         uint32_t koact[8];
         __builtin_memset(koact, 0, sizeof(koact));
         koact[0] = (uint32_t)(uintptr_t)old_handler;
         koact[1] = old_flags;
+        koact[3] = sigset_to_user(old_mask);   /* sa_mask[0] */
         int cr = copy_to_user(oact, koact, sizeof(koact));
         if (cr < 0) return cr;
     }
@@ -4406,6 +4458,11 @@ static int sys_rt_sigaction(registers_t *regs) {
         if (cr < 0) return cr;
         sh->handlers[sig] = (sighandler_t)(uintptr_t)kact[0];
         sh->flags[sig]    = kact[1];  /* sa_flags (SA_RESTART etc.) */
+        /* sa_mask: blocked for the duration of the handler.  SIGKILL and
+         * SIGSTOP are dropped from it (Linux do_sigaction:
+         * sigdelsetmask(&act->sa.sa_mask, sigmask(SIGKILL)|sigmask(SIGSTOP))). */
+        sh->mask[sig] = sigset_from_user(kact[3]) &
+                        ~((1u << SIGKILL) | (1u << SIGSTOP));
         /* Linux do_sigaction: setting SIG_IGN (or SIG_DFL for a default-ignored
          * signal) discards matching signals already pending on every thread. */
         sighandler_t nh = sh->handlers[sig];
@@ -4418,12 +4475,9 @@ static int sys_rt_sigaction(registers_t *regs) {
 }
 
 /* ── sys_rt_sigprocmask(how, set, oset, sigsetsize) — EAX=175 ────────────── */
-/* The user sigset_t numbers bit (sig - 1) for signal sig (Linux sigmask(sig) =
- * 1UL << ((sig) - 1), include/linux/signal.h), whereas the kernel's pending_sigs
- * and blocked_sigs use bit sig.  Convert at the boundary; only the first word
- * (signals 1..32) is honoured. */
-static uint32_t sigset_from_user(uint32_t uset) { return uset << 1; }
-static uint32_t sigset_to_user(uint32_t kset)   { return kset >> 1; }
+/* sigset_from_user()/sigset_to_user() (proc/signal.h) convert between the user
+ * sigset_t, which numbers bit (sig - 1), and the kernel's bit-sig masks.  Only
+ * the first word (signals 1..32) is honoured. */
 
 static int sys_rt_sigprocmask(registers_t *regs) {
     int       how  = (int)regs->ebx;
@@ -4965,6 +5019,10 @@ static int sys_poll(registers_t *regs) {
                 if ((events & POLLOUT) && fd_write_ready(fd)) rev |= POLLOUT;
                 if (f->type == FD_PIPE_R && f->pipe->nwriters == 0) rev |= POLLHUP;
                 if (f->type == FD_PIPE_W && f->pipe->nreaders == 0) rev |= POLLERR;
+                /* A closed AF_UNIX peer is a hangup, reported whether or not
+                 * the caller asked for it (net/unix/af_unix.c unix_poll:
+                 * EPOLLHUP once sk_shutdown is SHUTDOWN_MASK). */
+                if (f->type == FD_USOCKET && usocket_hup(f->usock)) rev |= POLLHUP;
             }
             kfds[i * 2 + 1] = (kfds[i * 2 + 1] & 0xffff) | ((uint32_t)(uint16_t)rev << 16);
             if (rev) ready++;
@@ -5256,9 +5314,44 @@ static int sys_prctl(registers_t *regs) {
     return 0;
 }
 
-/* ── sys_sigaltstack(ss, oss) — EAX=186 (stub) ──────────────────────────── */
+/* ── sys_sigaltstack(ss, oss) — EAX=186 ─────────────────────────────────────
+ * stack_t on i386 is { void *ss_sp; int ss_flags; size_t ss_size; }.  A handler
+ * installed with SA_ONSTACK runs on this stack instead of the interrupted one,
+ * which is how a program survives a SIGSEGV caused by its own stack overflow
+ * (and how glibc/SpiderMonkey handle theirs).  Linux do_sigaltstack:
+ * SS_DISABLE removes it, any other unknown flag is EINVAL, a stack smaller than
+ * MINSIGSTKSZ is ENOMEM, and it may not be changed while running on it. */
+#define MINSIGSTKSZ_K 2048
 static int sys_sigaltstack(registers_t *regs) {
-    (void)regs;
+    uint32_t uss  = regs->ebx;
+    uint32_t uoss = regs->ecx;
+    uint32_t sp   = regs->useresp;
+    int on = current_proc->sas_size &&
+             sp >= current_proc->sas_sp &&
+             sp <  current_proc->sas_sp + current_proc->sas_size;
+
+    if (uoss) {
+        uint32_t old[3];
+        old[0] = current_proc->sas_sp;
+        old[1] = (uint32_t)(on ? SS_ONSTACK
+                               : (current_proc->sas_size ? 0 : SS_DISABLE));
+        old[2] = current_proc->sas_size;
+        if (copy_to_user((void *)(uintptr_t)uoss, old, sizeof(old)) < 0) return -14;
+    }
+    if (uss) {
+        uint32_t ns[3];
+        if (copy_from_user(ns, (void *)(uintptr_t)uss, sizeof(ns)) < 0) return -14;
+        if (on) return -1;                       /* -EPERM while running on it */
+        if (ns[1] & SS_DISABLE) {
+            current_proc->sas_sp = current_proc->sas_size = 0;
+            return 0;
+        }
+        if (ns[1] & ~(uint32_t)SS_ONSTACK) return -22;     /* -EINVAL */
+        if (ns[2] < MINSIGSTKSZ_K) return -12;             /* -ENOMEM */
+        if (!access_ok((void *)(uintptr_t)ns[0], ns[2])) return -14;
+        current_proc->sas_sp   = ns[0];
+        current_proc->sas_size = ns[2];
+    }
     return 0;
 }
 
@@ -5407,11 +5500,16 @@ static int sys_fstatat64(registers_t *regs) {
     char path[256], resolved[256];
     int r = copy_user_str(upath, path, sizeof(path));
     if (r < 0) return r;
+    struct kstat64 kst;
+    if (path[0] == '\0' && dirfd >= 0) {  /* AT_EMPTY_PATH: stat dirfd itself */
+        r = fd_kstat64(dirfd, &kst);
+        if (r < 0) return r;
+        return copy_to_user(st, &kst, sizeof(kst));
+    }
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
     vfs_node_t *n = vfs_open(resolved);
     if (!n) return -2;
-    struct kstat64 kst;
     fill_kstat64(&kst, n);
     return copy_to_user(st, &kst, sizeof(kst));
 }
@@ -6437,9 +6535,26 @@ static int sys_clone(registers_t *regs) {
     child->tf->useresp = child_stack;
 
     __builtin_memcpy(child->name, parent->name, sizeof(parent->name));
+    proc_copy_image_ids(child, parent);
     child->pending_sigs  = 0;
     child->blocked_sigs  = parent->blocked_sigs;
     child->sigframe_addr = 0;
+    /* The alternate signal stack is per TASK and must not be shared with one
+     * that shares the address space: both would build their SA_ONSTACK frames
+     * at the same address, and the second to arrive would overwrite the saved
+     * registers, ucontext and trampoline of a handler already running there.
+     * Linux clears it on exactly this condition (kernel/fork.c copy_process:
+     * sas_ss_reset(p) when (clone_flags & (CLONE_VM|CLONE_VFORK)) == CLONE_VM).
+     * A vfork child keeps it: the parent is suspended until the child execs —
+     * which clears it — or exits, so there is never a second user.  (A real
+     * fork inherits it; that is do_fork's copy, not this one.) */
+    if (flags & CLONE_VFORK) {
+        child->sas_sp   = parent->sas_sp;
+        child->sas_size = parent->sas_size;
+    } else {
+        child->sas_sp   = 0;
+        child->sas_size = 0;
+    }
     if (flags & CLONE_SIGHAND) {
         /* One handler table for the group (Linux copy_sighand: refcount++). */
         sighand_put(child->sighand);
@@ -6450,6 +6565,8 @@ static int sys_clone(registers_t *regs) {
                          sizeof(child->sighand->handlers));
         __builtin_memcpy(child->sighand->flags, parent->sighand->flags,
                          sizeof(child->sighand->flags));
+        __builtin_memcpy(child->sighand->mask, parent->sighand->mask,
+                         sizeof(child->sighand->mask));
     }
     __builtin_memcpy(child->cwd, parent->cwd, sizeof(parent->cwd));
     child->heap_end  = parent->heap_end;
@@ -6613,6 +6730,33 @@ static int socket_arg_count(int call) {
  * Shared by socketcall(102) and the direct i386 socket syscalls (359-373). */
 #define SOCK_CLOEXEC_K   0x80000
 #define SOCK_NONBLOCK_K  0x800
+
+/* recv/send MSG_* bits this layer honours (include/linux/socket.h). */
+#define MSG_PEEK_K          0x0002
+#define MSG_DONTWAIT_K      0x0040
+#define MSG_NOSIGNAL_K      0x4000
+#define MSG_CTRUNC_K        0x0008
+#define MSG_CMSG_CLOEXEC_K  0x40000000
+
+/* Per-call MSG_* flags + the descriptor's O_NONBLOCK, as usocket_read()/
+ * usocket_write() want them. */
+static int usock_flags(uint32_t msgflags, int nb) {
+    int f = (nb || (msgflags & MSG_DONTWAIT_K)) ? USOCK_NONBLOCK : 0;
+    if (msgflags & MSG_PEEK_K)     f |= USOCK_PEEK;
+    if (msgflags & MSG_NOSIGNAL_K) f |= USOCK_NOSIGNAL;
+    return f;
+}
+
+/* Undo a queued SCM_RIGHTS batch whose sendmsg is not going to carry it after
+ * all (no data written, or the call is failing).  The batch may already have
+ * been delivered — a concurrent reader can have taken it — in which case the
+ * refs are no longer ours to close. */
+static void scm_abort(usocket_t *us, uint32_t id, proc_file_t *pass, int npass) {
+    if (npass <= 0 || !id) return;
+    if (usocket_cancel_fds(us, id))
+        for (int k = 0; k < npass; k++) fd_release(&pass[k]);
+}
+
 static int socketcall_core(int call, uint32_t *kargs) {
     /* accept4(fd, addr, addrlen, flags) is socketcall index 18 (Linux
      * SYS_ACCEPT4).  Its SOCK_CLOEXEC/SOCK_NONBLOCK apply to the NEW
@@ -6753,13 +6897,13 @@ static int socketcall_core(int call, uint32_t *kargs) {
             const void *buf = (const void *)(uintptr_t)kargs[1];
             uint32_t len = kargs[2];
             if (!access_ok(buf, len)) return -14;
-            return usocket_write(us, buf, (int)len, nb);
+            return usocket_write(us, buf, (int)len, usock_flags(kargs[3], nb));
         }
         if (call == 10 || call == 12) {      /* recv / recvfrom */
             void *buf = (void *)(uintptr_t)kargs[1];
             uint32_t len = kargs[2];
             if (!access_ok(buf, len)) return -14;
-            return usocket_read(us, buf, (int)len, nb);
+            return usocket_read(us, buf, (int)len, usock_flags(kargs[3], nb));
         }
         if (call == 16 || call == 17) {      /* sendmsg / recvmsg */
             /* struct msghdr { name,namelen,iov,iovlen,control,controllen,flags }.
@@ -6773,6 +6917,13 @@ static int socketcall_core(int call, uint32_t *kargs) {
             uint32_t iov = mh[2], iovlen = mh[3];
             uint32_t uctrl = mh[4], uctrllen = mh[5];
             if (iovlen > 1024) return -22;
+            /* Only a control buffer big enough for a cmsg header can name
+             * received fds; a recvmsg without one still collects them here
+             * (rather than letting the read drop them silently) so that it can
+             * close them and report MSG_CTRUNC, as scm_recv does. */
+            int wantfds = (call == 17 && uctrl && uctrllen >= 12);
+            int mflags  = usock_flags(kargs[2], nb);
+            if (call == 17) mflags |= USOCK_WANTFDS;
 
             /* sendmsg: parse SCM_RIGHTS cmsg(s), retain the named fds. */
             proc_file_t pass[SCM_MAX_FDS];
@@ -6805,68 +6956,99 @@ static int socketcall_core(int call, uint32_t *kargs) {
                 }
             }
 
+            /* Linux attaches the fds to the FIRST skb of the message
+             * (unix_stream_sendmsg), so the batch goes in BEFORE the bytes it
+             * rides with: a reader draining concurrently can then never pass
+             * the batch's position while the batch is still invisible to it —
+             * which would hand the fds to the next message's bytes, or lose
+             * them to a plain read().  If the data cannot be written at all,
+             * scm_abort() takes the batch back out. */
+            uint32_t scm_id = 0;
+            if (call == 16 && npass > 0 &&
+                usocket_send_fds(us, pass, npass, &scm_id) < 0) {
+                for (int k = 0; k < npass; k++) fd_release(&pass[k]);
+                npass = 0;                  /* the data still goes out */
+            }
+
             int total = 0, eagain = 0;
             for (uint32_t i = 0; i < iovlen; i++) {
                 uint32_t iv[2];
                 if (copy_from_user(iv, (void *)(uintptr_t)(iov + i * 8),
                                    sizeof(iv)) < 0) {
                     if (total) break;
-                    for (int k = 0; k < npass; k++) fd_release(&pass[k]);
+                    scm_abort(us, scm_id, pass, npass);
                     return -14;
                 }
                 int len = (int)iv[1];
                 if (len <= 0) continue;
                 if (!access_ok((void *)(uintptr_t)iv[0], (size_t)len)) {
                     if (total) break;
-                    for (int k = 0; k < npass; k++) fd_release(&pass[k]);
+                    scm_abort(us, scm_id, pass, npass);
                     return -14;
                 }
                 int n = (call == 16)
-                    ? usocket_write(us, (void *)(uintptr_t)iv[0], len, nb)
-                    : usocket_read(us, (void *)(uintptr_t)iv[0], len, nb);
+                    ? usocket_write(us, (void *)(uintptr_t)iv[0], len, mflags)
+                    : usocket_read(us, (void *)(uintptr_t)iv[0], len, mflags);
                 if (n < 0) {
                     if (total) break;
                     if (call == 16) {
-                        for (int k = 0; k < npass; k++) fd_release(&pass[k]);
+                        scm_abort(us, scm_id, pass, npass);
                         return n;
                     }
-                    /* recvmsg with no data: maybe fds are still deliverable */
                     if (n == -11) { eagain = 1; break; }
                     return n;
                 }
                 total += n;
                 if (n < len) break;          /* short read/write — stop */
+                if (mflags & USOCK_PEEK) break;   /* peek does not advance */
+                /* One message's ancillary data per recvmsg: stop rather than
+                 * read into a second batch whose fds this call cannot also
+                 * deliver (Linux breaks its loop on !unix_skb_scm_eq). */
+                if (call == 17 && usocket_fds_ready(us)) break;
             }
 
-            /* sendmsg: enqueue the retained fds, tagged after the data. */
-            if (call == 16 && npass > 0) {
-                if (usocket_send_fds(us, pass, npass) < 0)
-                    for (int k = 0; k < npass; k++) fd_release(&pass[k]);
-            }
+            /* A sendmsg that put no bytes on the stream sends no fds either:
+             * unix_stream_sendmsg never enters its loop for a zero-length
+             * message, so no skb carries them and scm_destroy closes them. */
+            if (call == 16 && total == 0)
+                scm_abort(us, scm_id, pass, npass);
 
-            /* recvmsg: deliver any ready fds + build the control buffer. */
+            /* recvmsg: deliver the ready fds.  An fd is installed only once
+             * there is room for it BOTH in the caller's control buffer and in
+             * the fd table; any that does not fit is closed and MSG_CTRUNC is
+             * reported, so nothing can end up installed but unnameable — an
+             * unclosable leak in the receiving process (Linux
+             * scm_detach_fds + __scm_destroy). */
             if (call == 17) {
-                uint32_t ctrl_used = 0;
+                uint32_t ctrl_used = 0, out_flags = 0;
                 proc_file_t got[SCM_MAX_FDS];
-                int ngot = (uctrl && uctrllen >= 12)
-                         ? usocket_recv_fds(us, got, SCM_MAX_FDS) : 0;
+                int ngot = usocket_recv_fds(us, got, SCM_MAX_FDS);
+                int room = wantfds ? (int)((uctrllen - 12) / 4) : 0;
+                if (room > SCM_MAX_FDS) room = SCM_MAX_FDS;
                 if (ngot > 0) {
-                    int cloex = (kargs[2] & 0x40000000) ? 1 : 0; /* MSG_CMSG_CLOEXEC */
+                    int cloex = (kargs[2] & MSG_CMSG_CLOEXEC_K) ? 1 : 0;
                     int newfds[SCM_MAX_FDS]; int ninst = 0;
                     for (int k = 0; k < ngot; k++) {
                         int slot = -1;
-                        for (int j = 0; j < MAX_FD; j++)
-                            if (current_proc->ofile[j].type == FD_NONE) { slot = j; break; }
-                        if (slot < 0) { printk("[scm] fd table FULL on recv (pid %d)\n",
-                                               current_proc ? current_proc->pid : -1);
-                                        fd_release(&got[k]); continue; }
+                        if (ninst < room) {         /* the cmsg can name it */
+                            for (int j = 0; j < MAX_FD; j++)
+                                if (current_proc->ofile[j].type == FD_NONE) { slot = j; break; }
+                            if (slot < 0)
+                                printk("[scm] fd table FULL on recv (pid %d)\n",
+                                       current_proc ? current_proc->pid : -1);
+                        }
+                        if (slot < 0) {             /* no room: close, truncate */
+                            fd_release(&got[k]);
+                            out_flags |= MSG_CTRUNC_K;
+                            continue;
+                        }
                         current_proc->ofile[slot] = got[k];
                         current_proc->ofile[slot].cloexec = (uint8_t)cloex;
                         newfds[ninst++] = slot;
                     }
-                    uint32_t clen = 12 + (uint32_t)ninst * 4;
-                    if (ninst > 0 && uctrllen >= clen) {
+                    if (ninst > 0) {
                         uint8_t cbuf[256];
+                        uint32_t clen = 12 + (uint32_t)ninst * 4;
                         uint32_t lvl = 1, typ = 1;       /* SOL_SOCKET, SCM_RIGHTS */
                         __builtin_memcpy(cbuf + 0, &clen, 4);
                         __builtin_memcpy(cbuf + 4, &lvl, 4);
@@ -6878,9 +7060,8 @@ static int socketcall_core(int call, uint32_t *kargs) {
                     }
                 }
                 copy_to_user((void *)(uintptr_t)(umsg + 20), &ctrl_used, 4);
-                uint32_t zero = 0;
-                copy_to_user((void *)(uintptr_t)(umsg + 24), &zero, 4);
-                if (total == 0 && ngot == 0 && eagain) return -11;
+                copy_to_user((void *)(uintptr_t)(umsg + 24), &out_flags, 4);
+                if (total == 0 && eagain) return -11;
             }
             return total;
         }
