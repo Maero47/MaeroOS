@@ -50,7 +50,7 @@ all: $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
 	     $(TESTFILES)/polltest $(TESTFILES)/ptytest $(TESTFILES)/cttytest \
 	     $(TESTFILES)/desktop $(TESTFILES)/wmctl $(TESTFILES)/gui_demo \
 	     $(TESTFILES)/wmevtest $(TESTFILES)/uidemo $(TESTFILES)/files \
-	     $(TESTFILES)/dmesg $(TESTFILES)/shmprobe $(TESTFILES)/memprobe $(TESTFILES)/threadprobe $(TESTFILES)/term $(TESTFILES)/browse \
+	     $(TESTFILES)/dmesg $(TESTFILES)/shmprobe $(TESTFILES)/memprobe $(TESTFILES)/credprobe $(TESTFILES)/threadprobe $(TESTFILES)/term $(TESTFILES)/browse \
      $(TESTFILES)/raceprobe $(TESTFILES)/extprobe $(TESTFILES)/store $(TESTFILES)/pkg $(TESTFILES)/wavplay $(TESTFILES)/statprobe $(TESTFILES)/edit $(TESTFILES)/calc $(TESTFILES)/taskmgr $(TESTFILES)/view $(TESTFILES)/settings \
      $(TESTFILES)/reboot $(TESTFILES)/shutdown $(TESTFILES)/poweroff $(TESTFILES)/halt \
      $(TESTFILES)/sudo $(TESTFILES)/whoami $(TESTFILES)/uname $(TESTFILES)/clear $(TESTFILES)/hostname \
@@ -645,6 +645,13 @@ memprobe/memprobe.o: memprobe/memprobe.c
 
 $(TESTFILES)/memprobe: $(CRT0_OBJ) memprobe/memprobe.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) memprobe/memprobe.o libc/libc.a
+
+# credprobe
+credprobe/credprobe.o: credprobe/credprobe.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TESTFILES)/credprobe: $(CRT0_OBJ) credprobe/credprobe.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) credprobe/credprobe.o libc/libc.a
 
 # term (GUI terminal)
 term/term.o: term/term.c include/gui.h include/draw.h
