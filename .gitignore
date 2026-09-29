@@ -118,6 +118,8 @@ testfiles/awk
 /testfiles/settings
 /testfiles/shell
 /testfiles/shmprobe
+/testfiles/memprobe
+/testfiles/credprobe
 /testfiles/shutdown
 /testfiles/sleep
 /testfiles/sockprobe

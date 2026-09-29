@@ -49,7 +49,23 @@ void _exit(int status) { exit(status); }
 int vfork(void) { return fork(); }
 int setuid(int uid) { return chkerr(syscall1(213, uid)); }  /* setuid32 */
 int setgid(int gid) { return chkerr(syscall1(214, gid)); }  /* setgid32 */
-int seteuid(int uid) { return chkerr(syscall1(138, uid)); }
+/* seteuid(u) is setresuid(-1, u, -1), as in musl; 138 is setfsuid. */
+int seteuid(int uid) { return chkerr(syscall3(208, -1, uid, -1)); }  /* setresuid32 */
+int setegid(int gid) { return chkerr(syscall3(210, -1, gid, -1)); }  /* setresgid32 */
+int setreuid(int ruid, int euid) { return chkerr(syscall2(203, ruid, euid)); }
+int setregid(int rgid, int egid) { return chkerr(syscall2(204, rgid, egid)); }
+int setresuid(int ruid, int euid, int suid) {
+    return chkerr(syscall3(208, ruid, euid, suid));
+}
+int setresgid(int rgid, int egid, int sgid) {
+    return chkerr(syscall3(210, rgid, egid, sgid));
+}
+int getresuid(int *ruid, int *euid, int *suid) {
+    return chkerr(syscall3(209, (int)ruid, (int)euid, (int)suid));
+}
+int getresgid(int *rgid, int *egid, int *sgid) {
+    return chkerr(syscall3(211, (int)rgid, (int)egid, (int)sgid));
+}
 int chroot(const char *path) { (void)path; return nosys(); }
 int link(const char *oldpath, const char *newpath) { (void)oldpath; (void)newpath; return nosys(); }
 int fsync(int fd) { (void)fd; return 0; }

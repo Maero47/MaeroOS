@@ -154,6 +154,123 @@ int access_ok(const void *ptr, size_t len) {
 }
 
 /*
+ * Bounce buffers for user data handed to code outside proc/.  vfs_read(),
+ * vfs_write() and the network stack move data with plain memcpy, and they can
+ * sleep before doing it (a pty or tcp read waits for input), so no check made
+ * beforehand can hold: a sibling thread may mprotect() or munmap() the buffer
+ * in the meantime, and a plain ring-0 store into it faults outside __ex_table
+ * — a panic.  So they never see a user pointer: the data goes through a
+ * kernel buffer, and only copy_to_user()/copy_from_user() touch user memory.
+ */
+#define BOUNCE_MAX (64U * 1024U)   /* one call's worth; also covers any UDP datagram */
+
+static uint8_t *bounce_alloc(uint32_t want, uint32_t *size) {
+    uint32_t n = want < BOUNCE_MAX ? want : BOUNCE_MAX;
+    if (n == 0) n = 1;
+    uint8_t *b = (uint8_t *)kmalloc(n);
+    if (!b && n > PAGE_SIZE) {                 /* heap tight: settle for a page */
+        n = PAGE_SIZE;
+        b = (uint8_t *)kmalloc(n);
+    }
+    *size = n;
+    return b;
+}
+
+/* Only a regular file can be read in several chunks: its read never blocks
+ * and consumes nothing.  A device, pty or socket gets one call, whose data is
+ * gone once read, so it is never asked for more than can be delivered. */
+static int node_is_regular(vfs_node_t *n) {
+    return (n->flags & 0x7U) == VFS_FLAG_FILE;
+}
+
+/* vfs_read() at `off` into user `ubuf`.  Returns bytes delivered, or a
+ * negative errno if none were.  A fault copying out after a device read
+ * loses that data, as on Linux; for a regular file nothing is lost — the
+ * caller advances the offset only by what was delivered. */
+static int vfs_read_user(vfs_node_t *n, uint32_t off, char *ubuf, uint32_t len) {
+    if (len == 0) return 0;
+    uint32_t bsz;
+    uint8_t *kbuf = bounce_alloc(len, &bsz);
+    if (!kbuf) return -12;                                 /* -ENOMEM */
+    int regular = node_is_regular(n);
+    uint32_t done = 0;
+    int err = 0;
+    while (done < len) {
+        uint32_t want = len - done < bsz ? len - done : bsz;
+        int32_t  got  = (int32_t)vfs_read(n, off + done, want, kbuf);
+        if (got < 0)  { err = got; break; }
+        if (got == 0) break;
+        if ((uint32_t)got > want) got = (int32_t)want;
+        if (copy_to_user(ubuf + done, kbuf, (uint32_t)got) < 0) { err = -14; break; }
+        done += (uint32_t)got;
+        if (!regular || (uint32_t)got < want) break;
+    }
+    kfree(kbuf);
+    return done ? (int)done : err;
+}
+
+/* vfs_write() of user `ubuf` at `off`, chunk by chunk, stopping at the first
+ * short write.  Returns bytes written, or a negative errno if none were. */
+static int vfs_write_user(vfs_node_t *n, uint32_t off, const char *ubuf, uint32_t len) {
+    if (len == 0) return 0;
+    uint32_t bsz;
+    uint8_t *kbuf = bounce_alloc(len, &bsz);
+    if (!kbuf) return -12;
+    uint32_t done = 0;
+    int err = 0;
+    while (done < len) {
+        uint32_t want = len - done < bsz ? len - done : bsz;
+        if (copy_from_user(kbuf, ubuf + done, want) < 0) { err = -14; break; }
+        uint32_t w = vfs_write(n, off + done, want, kbuf);
+        /* Out of kernel memory for the file body.  Linux tmpfs returns ENOMEM
+         * from shmem_alloc_and_acct_folio for exactly this; returning 0 would
+         * spin any libc write loop. */
+        if (w == VFS_WRITE_ENOMEM) { err = -12; break; }
+        if ((int32_t)w < 0)        { err = (int32_t)w; break; }
+        if (w > want) w = want;
+        done += w;
+        if (w < want) break;
+    }
+    kfree(kbuf);
+    return done ? (int)done : err;
+}
+
+/* One net_socket_recvfrom() into user `ubuf` (a datagram must arrive whole,
+ * and a stream read may block, so exactly one call). */
+static int sock_recv_user(net_socket_t *s, void *ubuf, uint32_t len,
+                          net_sockaddr_in_t *addr) {
+    uint32_t bsz;
+    uint8_t *kbuf = bounce_alloc(len, &bsz);
+    if (!kbuf) return -12;
+    int r = net_socket_recvfrom(s, kbuf, len < bsz ? len : bsz, addr);
+    if (r > 0 && copy_to_user(ubuf, kbuf, (uint32_t)r) < 0) r = -14;
+    kfree(kbuf);
+    return r;
+}
+
+/* net_socket_sendto() of user `ubuf`, in chunks (any valid datagram fits in
+ * the first), stopping at a short send. */
+static int sock_send_user(net_socket_t *s, const void *ubuf, uint32_t len,
+                          const net_sockaddr_in_t *addr) {
+    uint32_t bsz;
+    uint8_t *kbuf = bounce_alloc(len, &bsz);
+    if (!kbuf) return -12;
+    uint32_t done = 0;
+    int err = 0;
+    do {
+        uint32_t want = len - done < bsz ? len - done : bsz;
+        if (copy_from_user(kbuf, (const uint8_t *)ubuf + done, want) < 0) { err = -14; break; }
+        int r = net_socket_sendto(s, kbuf, want, addr);
+        if (r < 0) { err = r; break; }
+        if ((uint32_t)r > want) r = (int)want;
+        done += (uint32_t)r;
+        if ((uint32_t)r < want) break;
+    } while (done < len);
+    kfree(kbuf);
+    return done ? (int)done : err;
+}
+
+/*
  * SMP-safe user copies.  access_ok() validates the range, but under -smp 2 the
  * mapping can change between the check and the copy (a sibling CPU tearing the
  * address space down when the process is killed mid-syscall, or a COW double-
@@ -449,6 +566,9 @@ static void fill_kstat(struct kstat *st, vfs_node_t *n) {
     st->st_ino     = n->inode;
     st->st_mode    = (uint16_t)vnode_mode(n);
     st->st_nlink   = 1;
+    /* Legacy 16-bit ids: anything wider reads as overflowuid (65534). */
+    st->st_uid     = n->uid > 0xFFFFU ? 65534U : (uint16_t)n->uid;
+    st->st_gid     = n->gid > 0xFFFFU ? 65534U : (uint16_t)n->gid;
     st->st_size    = n->size;
     st->st_blksize = 4096;
     st->st_blocks  = (n->size + 511) / 512;
@@ -463,6 +583,8 @@ static void fill_kstat64(struct kstat64 *st, vfs_node_t *n) {
     st->__st_ino   = n->inode;
     st->st_mode    = vnode_mode(n);
     st->st_nlink   = 1;
+    st->st_uid     = n->uid;     /* the owner the permission checks use */
+    st->st_gid     = n->gid;
     st->st_size    = (int64_t)n->size;
     st->st_blksize = 4096;
     st->st_blocks  = (n->size + 511) / 512;
@@ -538,10 +660,11 @@ static int eventfd_read(struct eventfd_obj *e, char *buf, int len, int nonblock)
         if (signal_interrupt_pending(current_proc)) return -4;  /* -EINTR */
         sleep_on(e);
     }
-    uint64_t out;
-    if (e->flags & EFD_SEMAPHORE) { out = 1; e->count -= 1; }
-    else                          { out = e->count; e->count = 0; }
-    __builtin_memcpy(buf, &out, 8);
+    /* Copy the value out before consuming it: buf is a user pointer, and a
+     * bad one must fail with -EFAULT and leave the counter as it was. */
+    uint64_t out = (e->flags & EFD_SEMAPHORE) ? 1 : e->count;
+    if (copy_to_user(buf, &out, 8) < 0) return -14;
+    e->count -= out;
     wake_up(e);                                    /* wake blocked writers */
     io_wake();                                     /* wake pollers (space avail) */
     return 8;
@@ -550,7 +673,7 @@ static int eventfd_read(struct eventfd_obj *e, char *buf, int len, int nonblock)
 static int eventfd_write(struct eventfd_obj *e, const char *buf, int len, int nonblock) {
     if (len < 8) return -22;                        /* -EINVAL */
     uint64_t add;
-    __builtin_memcpy(&add, buf, 8);
+    if (copy_from_user(&add, buf, 8) < 0) return -14;
     if (add == 0xFFFFFFFFFFFFFFFFULL) return -22;   /* -EINVAL: ~0 is reserved */
     /* Block while the add would push the counter past its max (0xFFFF…FFFE). */
     while (e->count + add < e->count ||
@@ -582,6 +705,18 @@ static int sys_eventfd(unsigned int initval, int flags) {
     current_proc->ofile[fd].flags   = (flags & 0x800) ? O_NONBLOCK : 0;  /* EFD_NONBLOCK */
     current_proc->ofile[fd].cloexec = (flags & 0x80000) ? 1 : 0;          /* EFD_CLOEXEC */
     return fd;
+}
+
+/* The descriptor's access mode (Linux FMODE_READ/FMODE_WRITE).  f->flags also
+ * carries status flags (O_APPEND, O_NONBLOCK via F_SETFL), so the mode must be
+ * masked out — comparing the whole word against O_RDONLY let a read-only
+ * descriptor write once any status flag was set. */
+static inline int fd_readable(const proc_file_t *f) {
+    return (f->flags & O_ACCMODE) != O_WRONLY;
+}
+static inline int fd_writable(const proc_file_t *f) {
+    uint32_t m = f->flags & O_ACCMODE;
+    return m == O_WRONLY || m == O_RDWR;
 }
 
 void fd_retain(proc_file_t *f) {
@@ -748,6 +883,7 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
     child->umask     = parent->umask;
     child->uid = parent->uid; child->gid = parent->gid;
     child->euid = parent->euid; child->egid = parent->egid;
+    child->suid = parent->suid; child->sgid = parent->sgid;
     child->mmap_next = fowner->mmap_next;
     child->pgrp      = parent->pgrp;
     child->sid       = parent->sid;
@@ -766,9 +902,12 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
      * written by the parent, set_child_tid by the child in schedule_tail,
      * clear_child_tid at exit).  glibc's fork passes &THREAD_SELF->tid as
      * ctid so the child's descriptor holds ITS pid, not the parent's. */
-    if ((clone_flags & CLONE_PARENT_SETTID) && uptid &&
-        access_ok((void *)(uintptr_t)uptid, 4))
-        *(uint32_t *)(uintptr_t)uptid = (uint32_t)child->pid;
+    if ((clone_flags & CLONE_PARENT_SETTID) && uptid) {
+        /* Best effort, like Linux put_user() here: a bad pointer is ignored,
+         * never stored through raw (a read-only page would fault in ring 0). */
+        uint32_t tid = (uint32_t)child->pid;
+        (void)copy_to_user((void *)(uintptr_t)uptid, &tid, sizeof(tid));
+    }
     child->set_child_tid   = (clone_flags & CLONE_CHILD_SETTID)   ? uctid : 0;
     child->clear_child_tid = (clone_flags & CLONE_CHILD_CLEARTID) ? uctid : 0;
 
@@ -926,8 +1065,9 @@ static int sys_read(registers_t *regs) {
 
     /* VFS file read */
     if (f->type == FD_FILE) {
-        int n = (int)vfs_read(f->node, f->offset, (uint32_t)len, (uint8_t *)buf);
-        f->offset += (uint32_t)n;
+        if (!fd_readable(f)) return -9;    /* opened write-only */
+        int n = vfs_read_user(f->node, f->offset, buf, (uint32_t)len);
+        if (n > 0) f->offset += (uint32_t)n;
         return n;
     }
 
@@ -947,14 +1087,15 @@ static int sys_read(registers_t *regs) {
                 if (n > 0) { n--; }
                 continue;
             }
-            buf[n++] = c;
+            if (copy_to_user(buf + n, &c, 1) < 0) return n ? n : -14;
+            n++;
             if (c == '\n') break;
         }
         return n;
     }
 
     if (f->type == FD_SOCKET)
-        return net_socket_recvfrom(f->socket, buf, (uint32_t)len, NULL);
+        return sock_recv_user(f->socket, buf, (uint32_t)len, NULL);
 
     if (f->type == FD_USOCKET)
         return usocket_read(f->usock, buf, len, (f->flags & O_NONBLOCK) != 0);
@@ -986,29 +1127,26 @@ static int sys_write(registers_t *regs) {
 
     /* VFS file write (includes /dev/tty) */
     if (f->type == FD_FILE && f->node) {
-        if (f->flags == O_RDONLY) return -9;   /* opened read-only */
+        if (!fd_writable(f)) return -9;        /* opened read-only */
         if (!f->node->write_fn)   return -9;   /* node not writable */
-        uint32_t written = vfs_write(f->node, f->offset,
-                                     (uint32_t)len, (const uint8_t *)buf);
-        /* Out of kernel memory for the file body.  Linux tmpfs returns ENOMEM
-         * from shmem_alloc_and_acct_folio for exactly this; returning 0 would
-         * spin any libc write loop. */
-        if (written == VFS_WRITE_ENOMEM) return -12;   /* -ENOMEM */
-        f->offset += written;
-        return (int)written;
+        int written = vfs_write_user(f->node, f->offset, buf, (uint32_t)len);
+        if (written > 0) f->offset += (uint32_t)written;
+        return written;
     }
 
     /* Fallback: fd=1/2 with no entry → serial+VGA stdout */
     if (f->type == FD_NONE && (fd == 1 || fd == 2)) {
         for (int i = 0; i < len; i++) {
-            serial_putc(buf[i]);
-            vga_putchar(buf[i]);
+            char c;
+            if (copy_from_user(&c, buf + i, 1) < 0) return i ? i : -14;
+            serial_putc(c);
+            vga_putchar(c);
         }
         return len;
     }
 
     if (f->type == FD_SOCKET)
-        return net_socket_sendto(f->socket, buf, (uint32_t)len, NULL);
+        return sock_send_user(f->socket, buf, (uint32_t)len, NULL);
 
     if (f->type == FD_USOCKET)
         return usocket_write(f->usock, buf, len, (f->flags & O_NONBLOCK) != 0);
@@ -1113,6 +1251,15 @@ void reap_orphan_zombies(void) {
 }
 
 static int sys_open_kernel_path(const char *path, int flags) {
+    /* O_CREAT|O_EXCL: the name must not exist in any form — not even as a
+     * dangling symlink, which is why the final component is not followed
+     * (Linux open(2); mkstemp and lock files rely on this). */
+    if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
+        char abspath[256];
+        if (canonicalize_path_at_cwd(path, abspath, sizeof(abspath)) == 0 &&
+            vfs_open_nofollow(abspath))
+            return -17;   /* -EEXIST */
+    }
     vfs_node_t *node = vfs_open_at(path);
     if (!node) {
         /* O_CREAT: create the file if missing */
@@ -1132,14 +1279,17 @@ static int sys_open_kernel_path(const char *path, int flags) {
                              VFS_WANT_W | VFS_WANT_X) < 0)
             return -13;
 
-        if (dir->create_fn(dir, base, VFS_FLAG_FILE) < 0)
-            return -12;   /* -ENOMEM */
+        int cr = dir->create_fn(dir, base, VFS_FLAG_FILE);
+        if (cr < 0)
+            return cr == -1 ? -12 : cr;   /* -EEXIST etc. pass through */
 
         node = vfs_open_at(path);
         if (!node) return -2;
-        /* Stamp the creator as owner with 0666 & ~umask. */
+        /* Stamp the creator as owner with 0666 & ~umask.  The owner is the
+         * EFFECTIVE id (Linux fsuid/fsgid): a set-uid-root program creates
+         * root-owned files, not files owned by whoever ran it. */
         vfs_setattr(node, (0666 & ~current_proc->umask) & 07777,
-                    current_proc->uid, current_proc->gid);
+                    current_proc->euid, current_proc->egid);
     } else {
         /* Existing node: check requested access mode. */
         int rw = flags & 3;
@@ -1264,6 +1414,8 @@ static int sys_getpid(registers_t *regs) {
     return current_proc ? current_proc->tgid : 0;
 }
 
+static void unmap_pages(uint32_t start, uint32_t end);
+
 /* ── sys_brk(void *addr) — EAX=45 ───────────────────────────────────────── */
 static int sys_brk(registers_t *regs) {
     uint32_t new_brk = (uint32_t)regs->ebx;
@@ -1306,17 +1458,13 @@ static int sys_brk(registers_t *regs) {
             __builtin_memset((void *)va, 0, PAGE_SIZE);
         }
     } else if (new_brk < old_brk) {
-        /* Shrink heap: unmap and free pages from new_brk up to old_brk */
+        /* Shrink heap: unmap and free pages from new_brk up to old_brk.  The
+         * frames are released only after the TLB shootdown (unmap_pages): a
+         * sibling thread on another CPU may still hold a stale entry for them,
+         * and freeing first let it write into a frame already reallocated. */
         uint32_t va  = (new_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
         uint32_t end = (old_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-        for (; va < end; va += PAGE_SIZE) {
-            if (!(*paging_get_pde(va) & PAGE_PRESENT)) continue;
-            uint32_t *pte = paging_get_pte(va);
-            if (!(*pte & PAGE_PRESENT)) continue;
-            uint32_t phys = *pte & ~0xFFFU;
-            paging_unmap(va);
-            pmm_frame_decref(phys);
-        }
+        if (va < end) unmap_pages(va, end);
     }
 
     current_proc->heap_end = new_brk;
@@ -1575,27 +1723,33 @@ static int sys_exec(registers_t *regs) {
         EXEC_FAIL(-2);   /* -ENOENT */
     }
 
-    /* Need execute permission on the binary. */
-    if (vfs_access_check(node, current_proc->euid, current_proc->egid,
-                         VFS_WANT_X) < 0) {
-        printk("[execfail] '%s' pid=%d EACCES (uid=%d gid=%d mode=%o)\n",
-               path, current_proc->pid, (int)current_proc->euid,
-               (int)current_proc->egid, (unsigned)node->mask);
-        EXEC_FAIL(-13);   /* -EACCES */
-    }
+    /* Linux search_binary_handler(): a "#!" script names an interpreter that
+     * is itself exec'd — and may be a script in turn — up to
+     * BINPRM_MAX_RECURSION (4) levels deep before -ELOOP.  Every file in the
+     * chain has to be a regular file the caller may execute, and the set-ID
+     * bits that count are the ones on the file finally loaded: a set-uid
+     * script is run by its interpreter with the caller's own ids. */
+    for (int depth = 0; ; depth++) {
+        if (node->flags != VFS_FLAG_FILE) {
+            printk("[execfail] '%s' pid=%d EACCES (not a regular file)\n",
+                   path, current_proc->pid);
+            EXEC_FAIL(-13);   /* -EACCES */
+        }
+        if (vfs_access_check(node, current_proc->euid, current_proc->egid,
+                             VFS_WANT_X) < 0) {
+            printk("[execfail] '%s' pid=%d EACCES (uid=%d gid=%d mode=%o)\n",
+                   path, current_proc->pid, (int)current_proc->euid,
+                   (int)current_proc->egid, (unsigned)node->mask);
+            EXEC_FAIL(-13);   /* -EACCES */
+        }
 
-    /* set-user-ID bit: run with the file owner's effective uid (e.g. doas,
-     * passwd are owned by root mode 04755).  Real uid is unchanged. */
-    uint32_t new_euid = current_proc->euid;
-    uint32_t new_egid = current_proc->egid;
-    if (node->mask & 04000) new_euid = node->uid;
-    if (node->mask & 02000) new_egid = node->gid;
+        char shebang_line[512];
+        uint32_t shebang_read = vfs_read(node, 0, sizeof(shebang_line) - 1,
+                                         (uint8_t *)shebang_line);
+        shebang_line[shebang_read] = '\0';
+        if (shebang_read < 2 || shebang_line[0] != '#' || shebang_line[1] != '!')
+            break;                                 /* not a script: load it */
 
-    /* Shebang (#!) interpreter detection */
-    char shebang_line[512];
-    uint32_t shebang_read = vfs_read(node, 0, sizeof(shebang_line) - 1, (uint8_t *)shebang_line);
-    shebang_line[shebang_read] = '\0';
-    if (shebang_read >= 2 && shebang_line[0] == '#' && shebang_line[1] == '!') {
         const char *lp = shebang_line + 2;
         /* skip leading spaces */
         while (*lp == ' ') lp++;
@@ -1605,6 +1759,8 @@ static int sys_exec(registers_t *regs) {
         while (*lp && *lp != '\n' && *lp != ' ' && *lp != '\r' && ii < 255)
             interp[ii++] = *lp++;
         interp[ii] = '\0';
+        if (ii == 0) EXEC_FAIL(-8);                 /* -ENOEXEC: "#!" alone */
+        if (depth >= 4) EXEC_FAIL(-40);             /* -ELOOP */
         /* extract optional interpreter argument */
         while (*lp == ' ') lp++;
         char interp_arg[256];
@@ -1613,26 +1769,37 @@ static int sys_exec(registers_t *regs) {
             interp_arg[ai++] = *lp++;
         interp_arg[ai] = '\0';
 
-        if (ii > 0) {
-            /* Rebuild argv: [interp, interp_arg?, script_path, orig_argv[1..]] */
-            struct exec_strings nv;
-            es_init(&nv, &shebang_budget);
-            int rc = es_push(&nv, interp, (uint32_t)ii);
-            if (rc == 0 && ai > 0) rc = es_push(&nv, interp_arg, (uint32_t)ai);
-            if (rc == 0) rc = es_push(&nv, path, (uint32_t)__builtin_strlen(path));
-            for (int i = 1; rc == 0 && i < argc; i++)
-                rc = es_push(&nv, KARGV(i), (uint32_t)__builtin_strlen(KARGV(i)));
-            if (rc < 0) { es_free(&nv); EXEC_FAIL(rc); }
-            es_free(&av);
-            av   = nv;
-            argc = (int)av.n;
+        /* Rebuild argv: [interp, interp_arg?, script_path, orig_argv[1..]].
+         * From the second level on, `av` is itself a rebuilt vector charged to
+         * shebang_budget; its charge is returned once it has been freed. */
+        uint32_t prev_charge = depth ? shebang_budget : 0;
+        struct exec_strings nv;
+        es_init(&nv, &shebang_budget);
+        int rc = es_push(&nv, interp, (uint32_t)ii);
+        if (rc == 0 && ai > 0) rc = es_push(&nv, interp_arg, (uint32_t)ai);
+        if (rc == 0) rc = es_push(&nv, path, (uint32_t)__builtin_strlen(path));
+        for (int i = 1; rc == 0 && i < argc; i++)
+            rc = es_push(&nv, KARGV(i), (uint32_t)__builtin_strlen(KARGV(i)));
+        if (rc < 0) { es_free(&nv); EXEC_FAIL(rc); }
+        es_free(&av);
+        av   = nv;
+        argc = (int)av.n;
+        shebang_budget -= prev_charge;
 
-            /* Re-resolve to interpreter */
-            __builtin_memcpy(path, interp, (size_t)ii + 1);
-            node = vfs_open_at(path);
-            if (!node) EXEC_FAIL(-2);
-        }
+        /* Re-resolve to interpreter */
+        __builtin_memcpy(path, interp, (size_t)ii + 1);
+        node = vfs_open_at(path);
+        if (!node) EXEC_FAIL(-2);
     }
+
+    /* set-user-ID / set-group-ID bit of the file being loaded: run with the
+     * file owner's effective id (e.g. doas, passwd are owned by root mode
+     * 04755).  The real id is unchanged; the saved id follows the new
+     * effective id below, as Linux commit_creds() leaves it after exec. */
+    uint32_t new_euid = current_proc->euid;
+    uint32_t new_egid = current_proc->egid;
+    if (node->mask & 04000) new_euid = node->uid;
+    if (node->mask & 02000) new_egid = node->gid;
 
     /* Create new address space */
     uint32_t new_pgdir = pgdir_create();
@@ -1918,6 +2085,9 @@ static int sys_exec(registers_t *regs) {
     vma_clear(current_proc);     /* drop the old address space's anon VMAs */
     current_proc->euid       = new_euid;   /* honour any set-uid/gid bit */
     current_proc->egid       = new_egid;
+    current_proc->suid       = new_euid;
+    current_proc->sgid       = new_egid;
+    current_proc->did_exec   = 1;
     current_proc->tgid       = current_proc->pid;  /* exec → new thread-group leader */
     current_proc->vm_owner   = NULL;               /* own address space from here */
     /* Linux begin_new_exec(): the new image inherits none of the old thread's
@@ -2025,6 +2195,47 @@ static int sys_exec(registers_t *regs) {
     return 0;  /* trapret irets to entry */
 }
 
+/* Linux check_kill_permission(): may the caller signal `t`?  Always within
+ * its own thread group and always as root; otherwise the sender's real or
+ * effective uid has to match the target's real or saved uid, except that
+ * SIGCONT may be sent anywhere in the sender's session (job control). */
+static int kill_permitted(struct proc *t, int sig) {
+    struct proc *me = current_proc;
+    if (!me || t->tgid == me->tgid) return 1;
+    if (me->euid == 0) return 1;
+    if (me->euid == t->suid || me->euid == t->uid ||
+        me->uid  == t->suid || me->uid  == t->uid)
+        return 1;
+    if (sig == SIGCONT && t->sid == me->sid) return 1;
+    return 0;
+}
+
+/* Signal every process (one per thread group) that `match` selects.  Linux
+ * __kill_pgrp_info()/kill_something_info(-1): success if at least one was
+ * signalled; otherwise -EPERM if some were refused, -ESRCH if none matched. */
+#define KILL_PGRP 0
+#define KILL_ALL  1
+static int kill_many(int how, int pg, int sig) {
+    int matched = 0, sent = 0;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (q->state == PROC_UNUSED) continue;
+        if (q->pid != q->tgid) continue;                   /* one per process */
+        if (how == KILL_PGRP && q->pgrp != pg) continue;
+        if (how == KILL_ALL &&
+            (q->pid == 1 || q->tgid == current_proc->tgid)) continue;
+        if (!q->pgdir_phys) continue;                      /* kernel thread */
+        matched++;
+        if (!kill_permitted(q, sig)) continue;
+        /* An unreaped zombie is still a member (Linux: signalling it succeeds
+         * and does nothing). */
+        if (sig && q->state != PROC_ZOMBIE) signal_send_group(q, sig);
+        sent++;
+    }
+    if (sent) return 0;
+    return matched ? -1 : -3;                              /* -EPERM : -ESRCH */
+}
+
 /* ── sys_kill(pid_t pid, int sig) — EAX=37 ──────────────────────────────── */
 static int sys_kill(registers_t *regs) {
     int pid = (int)regs->ebx;
@@ -2032,18 +2243,17 @@ static int sys_kill(registers_t *regs) {
 
     if (sig < 0 || sig >= NSIGS) return -22;  /* -EINVAL */
 
-    /* pid=0 -> current process group; pid<0 -> process group -pid.  One
+    /* pid=0 -> current process group; pid=-1 -> every process the caller may
+     * signal except init and itself; pid<-1 -> process group -pid.  One
      * signal per PROCESS (Linux __kill_pgrp_info -> group_send_sig_info for
-     * each process in the group), delivered to a thread that does not block it. */
-    if (pid == 0) {
-        int pg = current_proc ? current_proc->pgrp : 0;
-        if (sig) signal_send_pgrp(pg, sig);
-        return 0;
-    }
-    if (pid < 0) {
-        int sent = sig ? signal_send_pgrp(-pid, sig) : 1;
-        return sent ? 0 : -3;
-    }
+     * each process in the group), delivered to a thread that does not block
+     * it.  sig 0 performs the same existence and permission checks. */
+    if (pid == 0)
+        return kill_many(KILL_PGRP, current_proc ? current_proc->pgrp : 0, sig);
+    if (pid == -1)
+        return kill_many(KILL_ALL, 0, sig);
+    if (pid < 0)
+        return kill_many(KILL_PGRP, -pid, sig);
 
     /* kill(pid): pid may name any thread of a process (Linux kill_pid_info
      * uses the thread group of the task with that pid).  The signal is
@@ -2051,6 +2261,7 @@ static int sys_kill(registers_t *regs) {
      * it; a fatal default disposition then ends the whole group at delivery. */
     for (int i = 0; i < MAX_PROCS; i++) {
         if (ptable[i].pid == pid && ptable[i].state != PROC_UNUSED) {
+            if (!kill_permitted(&ptable[i], sig)) return -1;   /* -EPERM */
             if (sig == 0) return 0;               /* existence check */
             if (sig == SIGKILL) {
                 /* Kill the thread group AND the entire process subtree.  The
@@ -2059,7 +2270,10 @@ static int sys_kill(registers_t *regs) {
                  * misbehaving multiprocess application does not leak its
                  * forked children into the 128-slot process table.  Marking is
                  * done before any victim runs (signal_send only sets a pending
-                 * bit), so parent links are still intact for the walk. */
+                 * bit), so parent links are still intact for the walk.  Each
+                 * descendant must itself be one the caller may signal: the walk
+                 * stops at a child that changed credentials (a set-uid program
+                 * started by the target), exactly where kill(2) would refuse. */
                 int tg = ptable[i].tgid;
                 for (int j = 0; j < MAX_PROCS; j++)
                     if (ptable[j].state != PROC_UNUSED && ptable[j].tgid == tg)
@@ -2071,7 +2285,8 @@ static int sys_kill(registers_t *regs) {
                         struct proc *p = &ptable[j];
                         if (p->state == PROC_UNUSED) continue;
                         if (p->pending_sigs & (1u << SIGKILL)) continue;  /* already */
-                        if (p->parent && (p->parent->pending_sigs & (1u << SIGKILL))) {
+                        if (p->parent && (p->parent->pending_sigs & (1u << SIGKILL)) &&
+                            kill_permitted(p, SIGKILL)) {
                             signal_send(p, SIGKILL);
                             changed = 1;
                         }
@@ -2235,34 +2450,145 @@ static int sys_getgid(registers_t *regs)  { (void)regs; return (int)current_proc
 static int sys_geteuid(registers_t *regs) { (void)regs; return (int)current_proc->euid; }
 static int sys_getegid(registers_t *regs) { (void)regs; return (int)current_proc->egid; }
 
-/* setuid(uid): root sets all three (real/eff/saved); a non-root process may
- * only set its (e)uid back to its real uid.  Returns 0 or -EPERM. */
-static int sys_setuid(registers_t *regs) {
-    uint32_t u = (uint32_t)regs->ebx;
-    if (current_proc->euid == 0) {
-        current_proc->uid = current_proc->euid = u;
-        return 0;
-    }
-    if (u == current_proc->uid) { current_proc->euid = u; return 0; }
-    return -1; /* -EPERM */
+/* Linux kernel/sys.c credential rules.  "Privileged" is euid 0 (CAP_SETUID /
+ * CAP_SETGID); an unprivileged caller may only move each id among its current
+ * real, effective and saved values.  An id of -1 (0xFFFFFFFF) means "leave
+ * unchanged" where the call allows it.  The 16-bit legacy entry points widen
+ * their 0xFFFF to -1 first (low2highuid). */
+#define ID_KEEP 0xFFFFFFFFU
+
+static uint32_t id16(uint32_t v) {
+    v &= 0xFFFFU;
+    return v == 0xFFFFU ? ID_KEEP : v;
 }
-static int sys_setgid(registers_t *regs) {
-    uint32_t g = (uint32_t)regs->ebx;
-    if (current_proc->euid == 0) {
-        current_proc->gid = current_proc->egid = g;
-        return 0;
-    }
-    if (g == current_proc->gid) { current_proc->egid = g; return 0; }
-    return -1; /* -EPERM */
+
+static int uid_is_ours(uint32_t u) {
+    struct proc *p = current_proc;
+    return u == p->uid || u == p->euid || u == p->suid;
 }
-static int sys_seteuid(registers_t *regs) {
-    uint32_t u = (uint32_t)regs->ebx;
-    if (current_proc->euid == 0 || u == current_proc->uid) {
-        current_proc->euid = u;
+
+static int gid_is_ours(uint32_t g) {
+    struct proc *p = current_proc;
+    return g == p->gid || g == p->egid || g == p->sgid;
+}
+
+/* setuid(uid): privileged sets real, effective and saved; otherwise only the
+ * effective id may change, and only to the real or saved uid. */
+static int do_setuid(uint32_t u) {
+    struct proc *p = current_proc;
+    if (u == ID_KEEP) return -22;                  /* -EINVAL */
+    if (p->euid == 0) {
+        p->uid = p->euid = p->suid = u;
         return 0;
     }
+    if (u == p->uid || u == p->suid) { p->euid = u; return 0; }
+    return -1;                                      /* -EPERM */
+}
+
+static int do_setgid(uint32_t g) {
+    struct proc *p = current_proc;
+    if (g == ID_KEEP) return -22;
+    if (p->euid == 0) {
+        p->gid = p->egid = p->sgid = g;
+        return 0;
+    }
+    if (g == p->gid || g == p->sgid) { p->egid = g; return 0; }
     return -1;
 }
+
+/* setreuid(ruid, euid): an unprivileged ruid must be the current real or
+ * effective uid; euid any of real/effective/saved.  Setting the real id, or
+ * the effective id to something other than the old real id, also saves the
+ * new effective id (so the caller cannot switch back through it). */
+static int do_setreuid(uint32_t r, uint32_t e) {
+    struct proc *p = current_proc;
+    int priv = (p->euid == 0);
+    if (r != ID_KEEP && !priv && r != p->uid && r != p->euid) return -1;
+    if (e != ID_KEEP && !priv && !uid_is_ours(e)) return -1;
+    uint32_t old_ruid = p->uid;
+    if (r != ID_KEEP) p->uid = r;
+    if (e != ID_KEEP) p->euid = e;
+    if (r != ID_KEEP || (e != ID_KEEP && e != old_ruid)) p->suid = p->euid;
+    return 0;
+}
+
+static int do_setregid(uint32_t r, uint32_t e) {
+    struct proc *p = current_proc;
+    int priv = (p->euid == 0);
+    if (r != ID_KEEP && !priv && r != p->gid && r != p->egid) return -1;
+    if (e != ID_KEEP && !priv && !gid_is_ours(e)) return -1;
+    uint32_t old_rgid = p->gid;
+    if (r != ID_KEEP) p->gid = r;
+    if (e != ID_KEEP) p->egid = e;
+    if (r != ID_KEEP || (e != ID_KEEP && e != old_rgid)) p->sgid = p->egid;
+    return 0;
+}
+
+/* setresuid(ruid, euid, suid): unprivileged, each new id must already be one
+ * of the caller's real/effective/saved ids.  Checked in full before anything
+ * changes, so a refused call leaves every id as it was. */
+static int do_setresuid(uint32_t r, uint32_t e, uint32_t sv) {
+    struct proc *p = current_proc;
+    if (p->euid != 0) {
+        if (r  != ID_KEEP && !uid_is_ours(r))  return -1;
+        if (e  != ID_KEEP && !uid_is_ours(e))  return -1;
+        if (sv != ID_KEEP && !uid_is_ours(sv)) return -1;
+    }
+    if (r  != ID_KEEP) p->uid  = r;
+    if (e  != ID_KEEP) p->euid = e;
+    if (sv != ID_KEEP) p->suid = sv;
+    return 0;
+}
+
+static int do_setresgid(uint32_t r, uint32_t e, uint32_t sv) {
+    struct proc *p = current_proc;
+    if (p->euid != 0) {
+        if (r  != ID_KEEP && !gid_is_ours(r))  return -1;
+        if (e  != ID_KEEP && !gid_is_ours(e))  return -1;
+        if (sv != ID_KEEP && !gid_is_ours(sv)) return -1;
+    }
+    if (r  != ID_KEEP) p->gid  = r;
+    if (e  != ID_KEEP) p->egid = e;
+    if (sv != ID_KEEP) p->sgid = sv;
+    return 0;
+}
+
+static int sys_setuid(registers_t *regs)   { return do_setuid((uint32_t)regs->ebx); }
+static int sys_setgid(registers_t *regs)   { return do_setgid((uint32_t)regs->ebx); }
+static int sys_setuid16(registers_t *regs) { return do_setuid(id16(regs->ebx)); }
+static int sys_setgid16(registers_t *regs) { return do_setgid(id16(regs->ebx)); }
+static int sys_setreuid(registers_t *regs) {
+    return do_setreuid((uint32_t)regs->ebx, (uint32_t)regs->ecx);
+}
+static int sys_setregid(registers_t *regs) {
+    return do_setregid((uint32_t)regs->ebx, (uint32_t)regs->ecx);
+}
+static int sys_setreuid16(registers_t *regs) {
+    return do_setreuid(id16(regs->ebx), id16(regs->ecx));
+}
+static int sys_setregid16(registers_t *regs) {
+    return do_setregid(id16(regs->ebx), id16(regs->ecx));
+}
+static int sys_setresuid(registers_t *regs) {
+    return do_setresuid((uint32_t)regs->ebx, (uint32_t)regs->ecx,
+                        (uint32_t)regs->edx);
+}
+static int sys_setresgid(registers_t *regs) {
+    return do_setresgid((uint32_t)regs->ebx, (uint32_t)regs->ecx,
+                        (uint32_t)regs->edx);
+}
+static int sys_setresuid16(registers_t *regs) {
+    return do_setresuid(id16(regs->ebx), id16(regs->ecx), id16(regs->edx));
+}
+static int sys_setresgid16(registers_t *regs) {
+    return do_setresgid(id16(regs->ebx), id16(regs->ecx), id16(regs->edx));
+}
+
+/* setfsuid/setfsgid: there is no separate filesystem id here (fsuid always
+ * follows euid, as it does on Linux unless these are called), so report the
+ * current one and change nothing — what Linux returns for a refused change. */
+static int sys_setfsuid(registers_t *regs) { (void)regs; return (int)current_proc->euid; }
+static int sys_setfsgid(registers_t *regs) { (void)regs; return (int)current_proc->egid; }
 
 /* ── sys_mkdir(path, mode) — EAX=39 ─────────────────────────────────────── */
 static int sys_mkdir(registers_t *regs) {
@@ -2289,6 +2615,40 @@ static int sys_times(registers_t *regs) {
     return (int)pit_ticks();
 }
 
+/* How a device ioctl's third argument is passed: IOA_VAL is a plain value the
+ * driver never dereferences; IOA_IN/IOA_OUT/IOA_INOUT point at `len` bytes the
+ * driver reads, writes, or both. */
+enum { IOA_VAL, IOA_IN, IOA_OUT, IOA_INOUT };
+
+/* Every request a device ioctl_fn (tty, pty, console VT, fbdev) understands,
+ * with the shape of its argument.  Anything not listed is ENOTTY without the
+ * driver ever being called, so a driver can never be handed a user pointer
+ * this table did not account for. */
+static int ioctl_arg_shape(uint32_t req, uint32_t *len) {
+    switch (req) {
+    case FBIOGET_FSCREENINFO: *len = sizeof(fb_fix_screeninfo_t); return IOA_OUT;
+    case FBIOGET_VSCREENINFO: *len = sizeof(fb_var_screeninfo_t); return IOA_OUT;
+    case 0x4601:              *len = sizeof(fb_var_screeninfo_t); return IOA_IN;  /* FBIOPUT_VSCREENINFO */
+    case 0x80045430U:         *len = sizeof(int);   return IOA_OUT;   /* TIOCGPTN */
+    case 0x40045431U:         *len = sizeof(int);   return IOA_IN;    /* TIOCSPTLCK */
+    case 0x5401:              *len = 36;            return IOA_OUT;   /* TCGETS: i386 struct termios */
+    case 0x5402: case 0x5403: case 0x5404:
+                              *len = 36;            return IOA_IN;    /* TCSETS/W/F */
+    case 0x5413:              *len = 8;             return IOA_OUT;   /* TIOCGWINSZ */
+    case 0x5414:              *len = sizeof(int);   return IOA_OUT;   /* TIOCGPGRP (this ABI) */
+    case 0x5415:              *len = sizeof(int);   return IOA_IN;    /* TIOCSPGRP (this ABI) */
+    case 0x5601:              *len = 8;             return IOA_OUT;   /* VT_GETMODE: struct vt_mode */
+    case 0x5602:              *len = 8;             return IOA_IN;    /* VT_SETMODE */
+    case 0x5603:              *len = 6;             return IOA_OUT;   /* VT_GETSTATE: struct vt_stat */
+    case 0x4B3B: case 0x4B44: *len = sizeof(int);   return IOA_OUT;   /* KDGETMODE, KDGKBMODE */
+    case 0x540E:                                      /* TIOCSCTTY (int steal flag) */
+    case 0x5605: case 0x5606: case 0x5607:            /* VT_RELDISP/ACTIVATE/WAITACTIVE */
+    case 0x4B3A: case 0x4B45: case 0x4B32: case 0x4B46: /* KDSETMODE/SKBMODE/SETLED/GKBMETA */
+                              *len = 0;             return IOA_VAL;
+    }
+    return -1;
+}
+
 /* ── sys_ioctl(fd, request, arg) — EAX=54 ───────────────────────────────── */
 static int sys_ioctl(registers_t *regs) {
     int fd  = (int)regs->ebx;
@@ -2297,20 +2657,27 @@ static int sys_ioctl(registers_t *regs) {
     if (fd < 0 || fd >= MAX_FD) return -9;
     proc_file_t *f = &current_proc->ofile[fd];
     if (f->type == FD_FILE && f->node && f->node->ioctl_fn) {
-        void *arg = (void *)(uintptr_t)regs->edx;
-        size_t arg_len = 1;
-        if (req == FBIOGET_FSCREENINFO) arg_len = sizeof(fb_fix_screeninfo_t);
-        if (req == FBIOGET_VSCREENINFO) arg_len = sizeof(fb_var_screeninfo_t);
-        if ((uint32_t)req == 0x80045430U || (uint32_t)req == 0x40045431U)
-            arg_len = sizeof(int);
-        if (req == 0x5401 || req == 0x5402 || req == 0x5403 || req == 0x5404)
-            arg_len = 36;
-        if (req == 0x5413)
-            arg_len = sizeof(uint16_t) * 4;
-        if (req == 0x5414 || req == 0x5415 || req == 0x540E)
-            arg_len = sizeof(int);
-        if (arg && !access_ok(arg, arg_len)) return -14;
-        return f->node->ioctl_fn(f->node, (uint32_t)req, arg);
+        /* Drivers read and write their argument with plain loads and stores,
+         * which fault (and panic, not being in __ex_table) on a read-only or
+         * unmapped user page.  So a pointer argument never reaches them: it is
+         * bounced through a kernel buffer, copied in before the call and back
+         * out after it, and a bad user pointer is -EFAULT here instead. */
+        void    *uarg = (void *)(uintptr_t)regs->edx;
+        uint32_t len  = 0;
+        int      dir  = ioctl_arg_shape((uint32_t)req, &len);
+        if (dir < 0) return -25;                          /* -ENOTTY */
+        if (dir == IOA_VAL)
+            return f->node->ioctl_fn(f->node, (uint32_t)req, uarg);
+        if (!uarg) return -14;
+        uint8_t kbuf[sizeof(fb_var_screeninfo_t) > 64 ? sizeof(fb_var_screeninfo_t) : 64];
+        _Static_assert(sizeof(fb_fix_screeninfo_t) <= sizeof(kbuf),
+                       "ioctl bounce buffer too small for fb_fix_screeninfo");
+        __builtin_memset(kbuf, 0, sizeof(kbuf));
+        if (dir != IOA_OUT && copy_from_user(kbuf, uarg, len) < 0) return -14;
+        int rc = f->node->ioctl_fn(f->node, (uint32_t)req, kbuf);
+        if (rc >= 0 && dir != IOA_IN && copy_to_user(uarg, kbuf, len) < 0)
+            return -14;
+        return rc;
     }
 
     /* TCGETS = 0x5401, TCSETS = 0x5402, TIOCGWINSZ = 0x5413 */
@@ -2423,16 +2790,26 @@ static int sys_fcntl(registers_t *regs) {
               * Firefox is) issues the *64* variants (12/13/14), not 5/6/7 — so
               * these MUST be handled or nsProfileLock fails and Firefox declares
               * its profile "missing or inaccessible" (a modal that hangs). */
-        if (!arg || !access_ok((void *)(uintptr_t)arg, sizeof(short) * 2))
-            return -14;
-        *(short *)(uintptr_t)arg = 2;   /* F_UNLCK */
+        {
+            /* Written with copy_to_user: access_ok() says nothing about
+             * writability, and a plain store into a read-only page would be
+             * a ring-0 fault. */
+            short unlck = 2;               /* F_UNLCK */
+            if (!arg || copy_to_user((void *)(uintptr_t)arg, &unlck, sizeof(unlck)) < 0)
+                return -14;
+        }
         return 0;
     case 6:   /* F_SETLK    */
     case 7:   /* F_SETLKW   */
     case 13:  /* F_SETLK64  */
     case 14:  /* F_SETLKW64 */
-        if (!arg || !access_ok((void *)(uintptr_t)arg, sizeof(short) * 2))
-            return -14;
+        {
+            /* Nothing is enforced, but the lock description must be readable
+             * (Linux copies it in first and fails with -EFAULT). */
+            short type;
+            if (!arg || copy_from_user(&type, (void *)(uintptr_t)arg, sizeof(type)) < 0)
+                return -14;
+        }
         return 0;
     case 1033: /* F_ADD_SEALS — memfd sealing.  We don't enforce seals, but
                 * accept them so Firefox's freezeable shared memory "freezes"
@@ -2963,6 +3340,9 @@ struct vma {
  * are shared with children instead of COW'd, and MADV_DONTNEED leaves them
  * alone because there is no per-VMA re-population path for shared frames. */
 #define VMA_F_SHARED   0x1U
+/* A MAP_SHARED file mapping whose descriptor was not opened O_RDWR (Linux
+ * !VM_MAYWRITE): it may never become writable, not even by mprotect later. */
+#define VMA_F_NOWRITE  0x2U
 
 #define PROT_READ_K    0x1
 #define PROT_WRITE_K   0x2
@@ -3696,7 +4076,19 @@ static int sys_mmap2(registers_t *regs) {
             !current_proc->ofile[fd].node)
             return -9;
         fnode = current_proc->ofile[fd].node;
+        /* Linux do_mmap(): every file mapping needs a descriptor open for
+         * reading; a shared writable one needs it open read-write, or a
+         * read-only descriptor would write the file through the mapping. */
+        const proc_file_t *mf = &current_proc->ofile[fd];
+        if (!fd_readable(mf)) return -13;                         /* -EACCES */
+        if (shared && (prot & PROT_WRITE_K) &&
+            (mf->flags & O_ACCMODE) != O_RDWR)
+            return -13;                                           /* -EACCES */
     }
+    /* Shared file mappings the descriptor cannot write through stay so. */
+    uint32_t nowrite = (fnode && shared &&
+                        (current_proc->ofile[fd].flags & O_ACCMODE) != O_RDWR)
+                       ? VMA_F_NOWRITE : 0;
 
     /* ── Choose the target VA ──
      * MAP_FIXED places exactly at `addr`, replacing whatever is there (ld.so
@@ -3745,7 +4137,7 @@ static int sys_mmap2(registers_t *regs) {
         if (length > ((fb_len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1)))
             length = (fb_len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
         end = va + length;
-        if (!vma_add(va, end, prot, VMA_F_SHARED, NULL, 0)) return -12;
+        if (!vma_add(va, end, prot, VMA_F_SHARED | nowrite, NULL, 0)) return -12;
         /* SHARED: no COW on fork; bit 4 is PCD. */
         for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
             if (paging_map(va + i, fb_phys + i,
@@ -3768,7 +4160,7 @@ static int sys_mmap2(registers_t *regs) {
     if (shared && fnode) {
         struct shmap_entry *e = shmap_get(fnode);
         if (!e) return -12;
-        struct vma *v = vma_add(va, end, prot, VMA_F_SHARED, NULL, 0);
+        struct vma *v = vma_add(va, end, prot, VMA_F_SHARED | nowrite, NULL, 0);
         if (!v) return -12;
         for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
             uint32_t phys = shmap_frame(e, fnode, pgoff + i / PAGE_SIZE);
@@ -3922,6 +4314,15 @@ static int sys_mprotect(registers_t *regs) {
     prot &= 0x7U;
     uint32_t end = addr + ((len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1));
     if (end < addr || end > 0xC0000000U) return -22;
+
+    /* Linux mprotect_fixup(): write access cannot be added to a shared file
+     * mapping whose descriptor was read-only (-EACCES), checked for the whole
+     * range before anything changes. */
+    if (prot & PROT_WRITE_K) {
+        struct proc *o = mmap_owner();
+        for (struct vma *v = o ? o->vmas : NULL; v && v->start < end; v = v->next)
+            if (v->end > addr && (v->flags & VMA_F_NOWRITE)) return -13;
+    }
 
     /* Record the new prot on the VMAs covering this range, so pages that fault
      * in LATER get the right permissions.  Gaps are tolerated (Linux returns
@@ -4548,6 +4949,14 @@ static int sys_getppid(registers_t *regs) {
 static int sys_setsid(registers_t *regs) {
     (void)regs;
     if (!current_proc) return 1;
+    /* Linux ksys_setsid(): -EPERM when a process group with the caller's id
+     * already exists — in particular when the caller is a group leader — so a
+     * new session can never capture another process's group. */
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (q->state == PROC_UNUSED) continue;         /* zombies still count */
+        if (q->pgrp == current_proc->tgid) return -1;   /* -EPERM */
+    }
     if (current_proc->ctty) {
         vfs_close(current_proc->ctty);
         current_proc->ctty = NULL;
@@ -4584,7 +4993,18 @@ static int do_mknod(const char *path, uint32_t mode) {
     else if (fmt == 0)       vfs_flag = VFS_FLAG_FILE;    /* mode 0 = regular file */
     else return -22;  /* -EINVAL: unsupported type */
 
-    return dir->create_fn(dir, base, vfs_flag);
+    /* Like every other create: write+search on the parent directory, and the
+     * new node belongs to the caller's effective ids with mode & ~umask. */
+    if (vfs_access_check(dir, current_proc->euid, current_proc->egid,
+                         VFS_WANT_W | VFS_WANT_X) < 0)
+        return -13;
+    int r = dir->create_fn(dir, base, vfs_flag);
+    if (r < 0) return r;
+    vfs_node_t *node = vfs_open_nofollow(path);
+    if (node)
+        vfs_setattr(node, (mode & ~current_proc->umask) & 07777,
+                    current_proc->euid, current_proc->egid);
+    return r;
 }
 
 /* ── sys_mknod(const char *path, mode_t mode, dev_t dev) — EAX=14 ────────── */
@@ -4707,17 +5127,26 @@ static int sys_symlink(registers_t *regs) {
     char target[512], linkpath[512];
     if (copy_user_str((const char *)(uintptr_t)regs->ebx, target, 512) < 0) return -14;
     if (copy_user_str((const char *)(uintptr_t)regs->ecx, linkpath, 512) < 0) return -14;
-    /* Resolve linkpath relative to cwd */
-    char abspath[512];
-    if (linkpath[0] != '/') {
-        uint32_t cwdlen = (uint32_t)__builtin_strlen(current_proc->cwd);
-        __builtin_memcpy(abspath, current_proc->cwd, cwdlen);
-        if (cwdlen > 1) abspath[cwdlen++] = '/';
-        __builtin_memcpy(abspath + cwdlen, linkpath, __builtin_strlen(linkpath) + 1);
-    } else {
-        __builtin_memcpy(abspath, linkpath, __builtin_strlen(linkpath) + 1);
+    /* Resolve linkpath relative to cwd (bounded: cwd + a 511-byte user path
+     * used to be joined into a 512-byte stack buffer unchecked). */
+    char abspath[256];
+    int rc = resolve_path_at_fd(AT_FDCWD, linkpath, abspath, sizeof(abspath));
+    if (rc < 0) return rc;
+    /* Creating the link needs write+search on its directory, and the link is
+     * the caller's (effective ids). */
+    char dir_path[256], base[256];
+    if (path_split(abspath, dir_path, base) < 0 || base[0] == '\0') return -22;
+    vfs_node_t *dir = vfs_open_parent_at(abspath, dir_path);
+    if (!dir) return -2;
+    if (vfs_access_check(dir, current_proc->euid, current_proc->egid,
+                         VFS_WANT_W | VFS_WANT_X) < 0)
+        return -13;
+    rc = vfs_symlink(target, abspath);
+    if (rc == 0) {
+        vfs_node_t *link = vfs_open_nofollow(abspath);
+        if (link)
+            vfs_setattr(link, 0777, current_proc->euid, current_proc->egid);
     }
-    int rc = vfs_symlink(target, abspath);
     return rc;
 }
 
@@ -4762,6 +5191,14 @@ static int sys_truncate(registers_t *regs) {
     uint32_t len = (uint32_t)regs->ecx;
     vfs_node_t *n = vfs_open_at(path);
     if (!n) return -2;
+    /* Linux do_sys_truncate(): a directory is -EISDIR, anything else that is
+     * not a regular file -EINVAL, and the caller needs write permission on
+     * the file itself. */
+    if (n->flags == VFS_FLAG_DIR) return -21;              /* -EISDIR */
+    if (n->flags != VFS_FLAG_FILE) return -22;             /* -EINVAL */
+    if (vfs_access_check(n, current_proc->euid, current_proc->egid,
+                         VFS_WANT_W) < 0)
+        return -13;                                        /* -EACCES */
     return vfs_truncate(n, len);
 }
 
@@ -4771,6 +5208,9 @@ static int sys_ftruncate(registers_t *regs) {
     if (fd < 0 || fd >= MAX_FD) return -9;
     proc_file_t *f = &current_proc->ofile[fd];
     if (f->type != FD_FILE || !f->node) return -9;
+    /* Linux do_sys_ftruncate(): -EINVAL unless the descriptor was opened for
+     * writing (the permission was checked when it was opened). */
+    if (!fd_writable(f)) return -22;
     return vfs_truncate(f->node, (uint32_t)regs->ecx);
 }
 
@@ -4803,6 +5243,7 @@ static int sys_fallocate(registers_t *regs) {
     if (fd < 0 || fd >= MAX_FD) return -9;
     proc_file_t *f = &current_proc->ofile[fd];
     if (f->type != FD_FILE || !f->node) return -9;
+    if (!fd_writable(f)) return -9;                /* Linux vfs_fallocate: -EBADF */
     uint32_t want = offset + len;
     if (want < offset) return -22;                 /* -EINVAL: overflow */
     if (want > f->node->size)
@@ -5367,8 +5808,9 @@ static int sys_pread64(registers_t *regs) {
 
     proc_file_t *f = &current_proc->ofile[fd];
     if (f->type != FD_FILE || !f->node) return -9;
+    if (!fd_readable(f)) return -9;
 
-    return (int)vfs_read(f->node, off, (uint32_t)len, (uint8_t *)buf);
+    return vfs_read_user(f->node, off, buf, (uint32_t)len);
 }
 
 /* ── sys_pwrite64(fd, buf, count, offset) — EAX=181 ─────────────────────── */
@@ -5383,11 +5825,9 @@ static int sys_pwrite64(registers_t *regs) {
 
     proc_file_t *f = &current_proc->ofile[fd];
     if (f->type != FD_FILE || !f->node) return -9;
-    if (f->flags == O_RDONLY || !f->node->write_fn) return -9;
+    if (!fd_writable(f) || !f->node->write_fn) return -9;
 
-    uint32_t wrote = vfs_write(f->node, off, (uint32_t)len, (const uint8_t *)buf);
-    if (wrote == VFS_WRITE_ENOMEM) return -12;        /* -ENOMEM */
-    return (int)wrote;
+    return vfs_write_user(f->node, off, buf, (uint32_t)len);
 }
 
 /* ── sys_openat(dirfd, path, flags, mode) — EAX=295 ─────────────────────── */
@@ -5424,11 +5864,28 @@ static int sys_mkdir_kernel_path(const char *path) {
     vfs_node_t *node = vfs_open_at(path);
     if (node)
         vfs_setattr(node, (0777 & ~current_proc->umask) & 07777,
-                    current_proc->uid, current_proc->gid);
+                    current_proc->euid, current_proc->egid);
     return r;
 }
 
-static int sys_unlink_kernel_path(const char *path) {
+/* Linux may_delete(): removing (or renaming away, or replacing) the entry
+ * `victim` of `dir` needs write and search permission on the directory
+ * (-EACCES).  In a sticky directory (/tmp) the caller must in addition own the
+ * entry or the directory, or be root (-EPERM). */
+static int may_delete(vfs_node_t *dir, vfs_node_t *victim) {
+    struct proc *p = current_proc;
+    if (vfs_access_check(dir, p->euid, p->egid, VFS_WANT_W | VFS_WANT_X) < 0)
+        return -13;                                      /* -EACCES */
+    if ((dir->mask & 01000) && p->euid != 0 &&
+        p->euid != victim->uid && p->euid != dir->uid)
+        return -1;                                       /* -EPERM */
+    return 0;
+}
+
+/* unlink() and rmdir() of an already-resolved absolute path.  The entry is
+ * looked up without following a final symlink: unlink removes the link, and
+ * rmdir of a link to a directory is -ENOTDIR, as on Linux. */
+static int remove_kernel_path(const char *path, int want_dir) {
     char dir_path[256], base[256];
     if (path_split(path, dir_path, base) < 0)
         return -2;
@@ -5436,23 +5893,31 @@ static int sys_unlink_kernel_path(const char *path) {
 
     vfs_node_t *dir = vfs_open_parent_at(path, dir_path);
     if (!dir) return -2;
+    vfs_node_t *victim = vfs_finddir(dir, base);
+    if (!victim) return -2;                              /* -ENOENT */
+    if (want_dir && victim->flags != VFS_FLAG_DIR) return -20;   /* -ENOTDIR */
+    int r = may_delete(dir, victim);
+    if (r < 0) return r;
+    if (want_dir) {
+        /* Remove an empty directory (Linux fs/namei.c do_rmdir): -ENOTEMPTY
+         * while it still has entries. */
+        vfs_dirent_t de;
+        for (uint32_t i = 0; i < 65536 && vfs_readdir(victim, i, &de) == 0; i++) {
+            if (de.name[0] == '.' &&
+                (de.name[1] == '\0' || (de.name[1] == '.' && de.name[2] == '\0')))
+                continue;                                /* "." and ".." */
+            return -39;                                  /* -ENOTEMPTY */
+        }
+    }
     return vfs_unlink(dir, base);
 }
 
-/* Remove an empty directory (Linux fs/namei.c do_rmdir): -ENOTDIR when the
- * target is not a directory, -ENOTEMPTY while it still has entries. */
+static int sys_unlink_kernel_path(const char *path) {
+    return remove_kernel_path(path, 0);
+}
+
 static int sys_rmdir_kernel_path(const char *path) {
-    vfs_node_t *n = vfs_open(path);
-    if (!n) return -2;
-    if ((n->flags & 0x7U) != VFS_FLAG_DIR) return -20;   /* -ENOTDIR */
-    vfs_dirent_t de;
-    for (uint32_t i = 0; i < 65536 && vfs_readdir(n, i, &de) == 0; i++) {
-        if (de.name[0] == '.' &&
-            (de.name[1] == '\0' || (de.name[1] == '.' && de.name[2] == '\0')))
-            continue;                                    /* "." and ".." */
-        return -39;                                      /* -ENOTEMPTY */
-    }
-    return sys_unlink_kernel_path(path);
+    return remove_kernel_path(path, 1);
 }
 
 /* ── sys_rmdir(path) — EAX=40 ───────────────────────────────────────────── */
@@ -5627,28 +6092,40 @@ static int sys_clock_nanosleep_time64(registers_t *regs) {
     return r;
 }
 
-/* ── sys_getresuid32 / sys_getresgid32 — EAX=209/211 ────────────────────────
- * Firefox/glibc query these during privilege checks.  Report all three ids
- * equal to the effective id (we don't track a separate saved id). */
-static int sys_getresuid32(registers_t *regs) {
-    uint32_t *r = (uint32_t *)(uintptr_t)regs->ebx;   /* ruid */
-    uint32_t *e = (uint32_t *)(uintptr_t)regs->ecx;   /* euid */
-    uint32_t *s = (uint32_t *)(uintptr_t)regs->edx;   /* suid */
-    uint32_t ru = current_proc->uid, eu = current_proc->euid;
-    if (r && access_ok(r, 4) && copy_to_user(r, &ru, 4) < 0) return -14;
-    if (e && access_ok(e, 4) && copy_to_user(e, &eu, 4) < 0) return -14;
-    if (s && access_ok(s, 4) && copy_to_user(s, &eu, 4) < 0) return -14;
+/* ── getresuid / getresgid — EAX=165/171 (16-bit), 209/211 (32-bit) ───────
+ * Report real, effective and saved ids.  `wide` is the id size in bytes. */
+static int put_res_ids(registers_t *regs, uint32_t r, uint32_t e, uint32_t sv,
+                       uint32_t wide) {
+    uint32_t ids[3] = { r, e, sv };
+    uint32_t ptrs[3] = { regs->ebx, regs->ecx, regs->edx };
+    for (int i = 0; i < 3; i++) {
+        void *up = (void *)(uintptr_t)ptrs[i];
+        int cr;
+        if (wide == 4) {
+            cr = copy_to_user(up, &ids[i], 4);
+        } else {
+            uint16_t v = ids[i] > 0xFFFFU ? 65534U : (uint16_t)ids[i];  /* overflowuid */
+            cr = copy_to_user(up, &v, 2);
+        }
+        if (cr < 0) return -14;
+    }
     return 0;
 }
+static int sys_getresuid32(registers_t *regs) {
+    struct proc *p = current_proc;
+    return put_res_ids(regs, p->uid, p->euid, p->suid, 4);
+}
 static int sys_getresgid32(registers_t *regs) {
-    uint32_t *r = (uint32_t *)(uintptr_t)regs->ebx;
-    uint32_t *e = (uint32_t *)(uintptr_t)regs->ecx;
-    uint32_t *s = (uint32_t *)(uintptr_t)regs->edx;
-    uint32_t rg = current_proc->gid, eg = current_proc->egid;
-    if (r && access_ok(r, 4) && copy_to_user(r, &rg, 4) < 0) return -14;
-    if (e && access_ok(e, 4) && copy_to_user(e, &eg, 4) < 0) return -14;
-    if (s && access_ok(s, 4) && copy_to_user(s, &eg, 4) < 0) return -14;
-    return 0;
+    struct proc *p = current_proc;
+    return put_res_ids(regs, p->gid, p->egid, p->sgid, 4);
+}
+static int sys_getresuid16(registers_t *regs) {
+    struct proc *p = current_proc;
+    return put_res_ids(regs, p->uid, p->euid, p->suid, 2);
+}
+static int sys_getresgid16(registers_t *regs) {
+    struct proc *p = current_proc;
+    return put_res_ids(regs, p->gid, p->egid, p->sgid, 2);
 }
 
 /* ── sys_sched_getaffinity(pid, len, mask*) — EAX=242 ───────────────────────
@@ -5842,13 +6319,42 @@ static struct proc *proc_find_by_pid(int pid) {
 }
 
 /* ── sys_setpgid(pid, pgid) — EAX=57 ─────────────────────────────────────── */
+/* Linux kernel/sys.c setpgid(): the target is the caller or one of its
+ * children (else -ESRCH); a child must still be in the caller's session
+ * (-EPERM) and must not have exec'd yet (-EACCES); a session leader cannot
+ * move (-EPERM); and joining a group other than its own pid requires that
+ * group to exist in the caller's session (-EPERM). */
 static int sys_setpgid(registers_t *regs) {
     int pid  = (int)regs->ebx;
     int pgid = (int)regs->ecx;
+    struct proc *me = current_proc;
     if (pgid < 0) return -22;   /* -EINVAL */
-    struct proc *p = (pid == 0) ? current_proc : proc_find_by_pid(pid);
+    struct proc *p = (pid == 0) ? me : proc_find_by_pid(pid);
+    if (p) p = proc_group_leader(p);
     if (!p) return -3;           /* -ESRCH */
-    p->pgrp = (pgid == 0) ? p->pid : pgid;
+    if (p->tgid != me->tgid) {
+        if (!p->parent || p->parent->tgid != me->tgid) return -3;  /* -ESRCH */
+        if (p->sid != me->sid) return -1;                          /* -EPERM */
+        if (p->did_exec) return -13;                               /* -EACCES */
+    }
+    if (p->sid == p->tgid) return -1;          /* session leader: -EPERM */
+    if (pgid == 0) pgid = p->tgid;
+    if (pgid != p->tgid) {
+        int found = 0;
+        /* A zombie is still a member until it is reaped (Linux keeps its
+         * pid attached): a pipeline's later stages join the group of a first
+         * stage that may already have exited. */
+        for (int i = 0; i < MAX_PROCS && !found; i++) {
+            struct proc *q = &ptable[i];
+            if (q->state == PROC_UNUSED) continue;
+            if (q->pgrp == pgid && q->sid == me->sid) found = 1;
+        }
+        if (!found) return -1;                 /* -EPERM */
+    }
+    /* Every thread of the process carries the process's group. */
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (ptable[i].state != PROC_UNUSED && ptable[i].tgid == p->tgid)
+            ptable[i].pgrp = pgid;
     return 0;
 }
 
@@ -5879,6 +6385,7 @@ static int do_tkill(int tgid, int tid, int sig) {
         if (p->state == PROC_UNUSED || p->state == PROC_ZOMBIE) continue;
         if (p->pid != tid) continue;
         if (tgid > 0 && p->tgid != tgid) return -3;   /* -ESRCH */
+        if (!kill_permitted(p, sig)) return -1;       /* -EPERM */
         if (sig) signal_send(p, sig);
         return 0;
     }
@@ -6231,7 +6738,16 @@ static int sys_getrandom(registers_t *regs) {
     return (int)buflen;
 }
 
-/* ── sys_rename(oldpath, newpath) — EAX=38 ──────────────────────────────── */
+/* ── sys_rename(oldpath, newpath) — EAX=38 ────────────────────────────────
+ * Linux vfs_rename(): the source must be removable from its directory and
+ * the target name creatable (or, when it exists, removable) in the new one,
+ * both under the sticky rule; a directory moving to a new parent also needs
+ * write permission on itself (its ".." changes).  The move itself is the
+ * filesystem's rename_fn, which replaces an existing target atomically and
+ * keeps the source's inode — its mode, owner and contents — so passwd's
+ * write-temp-then-rename of /etc/shadow can never leave the file missing,
+ * half-written or owned by someone else.  Across filesystems it is -EXDEV
+ * (mv copies in that case). */
 static int sys_rename_kernel_path(const char *oldpath, const char *newpath) {
     char old_dir[256], old_base[256];
     char new_dir[256], new_base[256];
@@ -6242,53 +6758,35 @@ static int sys_rename_kernel_path(const char *oldpath, const char *newpath) {
     vfs_node_t *src_dir = vfs_open_parent_at(oldpath, old_dir);
     vfs_node_t *dst_dir = vfs_open_parent_at(newpath, new_dir);
     if (!src_dir || !dst_dir) return -2;
+    if (src_dir->flags != VFS_FLAG_DIR || dst_dir->flags != VFS_FLAG_DIR)
+        return -20;                                      /* -ENOTDIR */
 
-    /* Find the source node.  Only its flags survive the unlink/create below:
-     * a vfs_node is not reference counted, and tmpfs_unlink() kfree()s the node
-     * it removes, so a pointer obtained before a directory is mutated must not
-     * be dereferenced after it.  Re-resolve instead. */
     vfs_node_t *src = vfs_finddir(src_dir, old_base);
-    if (!src) return -2;
-    uint32_t src_flags = src->flags;
+    if (!src) return -2;                                 /* -ENOENT */
+    int src_is_dir = (src->flags == VFS_FLAG_DIR);
 
-    /* If the target already exists, unlink it */
-    vfs_unlink(dst_dir, new_base);
+    /* A directory cannot become its own descendant. */
+    uint32_t olen = (uint32_t)__builtin_strlen(oldpath);
+    if (src_is_dir && __builtin_strncmp(newpath, oldpath, olen) == 0 &&
+        newpath[olen] == '/')
+        return -22;                                      /* -EINVAL */
 
-    /* Copy data into a new node then unlink the old */
-    if (!dst_dir->create_fn) return -1;
-    if (dst_dir->create_fn(dst_dir, new_base, src_flags) < 0) return -1;
+    struct proc *p = current_proc;
+    int r = may_delete(src_dir, src);
+    if (r < 0) return r;
     vfs_node_t *dst = vfs_finddir(dst_dir, new_base);
-    if (!dst) return -1;
-    src = vfs_finddir(src_dir, old_base);      /* may have moved/been freed */
-    if (!src) return -2;
-
-    if (!(src->flags & VFS_FLAG_DIR) && src->size > 0 && src->read_fn && dst->write_fn) {
-        /* Copy file contents in 4 KiB chunks.  The buffer is heap-allocated, not
-         * a local: with it on the stack this function's frame was 5164 bytes,
-         * and a syscall that recurses into the filesystem (and can take an IRQ
-         * on the way) has no business eating a sixth of a KSTACKSIZE stack. */
-        uint8_t *tmp_buf = (uint8_t *)kmalloc(4096);
-        if (!tmp_buf) return -12;                  /* -ENOMEM */
-        uint32_t copied = 0;
-        while (copied < src->size) {
-            uint32_t chunk = src->size - copied;
-            if (chunk > 4096) chunk = 4096;
-            uint32_t got = vfs_read(src, copied, chunk, tmp_buf);
-            if (!got) break;
-            if (vfs_write(dst, copied, got, tmp_buf) == VFS_WRITE_ENOMEM) {
-                kfree(tmp_buf);
-                vfs_unlink(dst_dir, new_base);   /* no half-copied destination */
-                return -12;                      /* -ENOMEM */
-            }
-            copied += got;
-        }
-        kfree(tmp_buf);
-        if (dst->truncate_fn) dst->truncate_fn(dst, src->size);
+    if (dst) {
+        r = may_delete(dst_dir, dst);
+        if (r < 0) return r;
+    } else if (vfs_access_check(dst_dir, p->euid, p->egid,
+                                VFS_WANT_W | VFS_WANT_X) < 0) {
+        return -13;                                      /* -EACCES */
     }
+    if (src_is_dir && __builtin_strcmp(old_dir, new_dir) != 0 &&
+        vfs_access_check(src, p->euid, p->egid, VFS_WANT_W) < 0)
+        return -13;
 
-    /* Remove old entry */
-    vfs_unlink(src_dir, old_base);
-    return 0;
+    return vfs_rename(src_dir, old_base, dst_dir, new_base);
 }
 
 static int sys_rename(registers_t *regs) {
@@ -6573,6 +7071,7 @@ static int sys_clone(registers_t *regs) {
     child->umask     = parent->umask;
     child->uid = parent->uid; child->gid = parent->gid;
     child->euid = parent->euid; child->egid = parent->egid;
+    child->suid = parent->suid; child->sgid = parent->sgid;
     child->mmap_next = parent->mmap_next;
     child->pgrp      = parent->pgrp;
     child->sid       = parent->sid;
@@ -6609,14 +7108,17 @@ static int sys_clone(registers_t *regs) {
     }
 
     /* tid notifications — we share the address space, so the current CR3 maps
-     * both the parent's and child's view; write the user words directly. */
+     * both the parent's and child's view.  The words are stored with
+     * copy_to_user, best effort like Linux's put_user() here: a pointer into a
+     * read-only page is ignored, not a ring-0 fault. */
     child->clear_child_tid = (flags & CLONE_CHILD_CLEARTID) ? uctid : 0;
-    if ((flags & CLONE_PARENT_SETTID) && uptid &&
-        access_ok((void *)(uintptr_t)uptid, 4))
-        *(uint32_t *)(uintptr_t)uptid = (uint32_t)child->pid;
-    if ((flags & CLONE_CHILD_SETTID) && uctid &&
-        access_ok((void *)(uintptr_t)uctid, 4))
-        *(uint32_t *)(uintptr_t)uctid = (uint32_t)child->pid;
+    {
+        uint32_t tid = (uint32_t)child->pid;
+        if ((flags & CLONE_PARENT_SETTID) && uptid)
+            (void)copy_to_user((void *)(uintptr_t)uptid, &tid, sizeof(tid));
+        if ((flags & CLONE_CHILD_SETTID) && uctid)
+            (void)copy_to_user((void *)(uintptr_t)uctid, &tid, sizeof(tid));
+    }
 
     if (flags & CLONE_FILES) {
         /* Share the parent's fd table (Linux CLONE_FILES) — an fd opened by any
@@ -7113,7 +7615,7 @@ static int socketcall_core(int call, uint32_t *kargs) {
         uint32_t len = kargs[2];
         if (!access_ok(buf, len))
             return -14;
-        return net_socket_sendto(f->socket, buf, len, NULL);
+        return sock_send_user(f->socket, buf, len, NULL);
     }
 
     if (call == 10) { /* recv(fd, buf, len, flags) */
@@ -7121,7 +7623,7 @@ static int socketcall_core(int call, uint32_t *kargs) {
         uint32_t len = kargs[2];
         if (!access_ok(buf, len))
             return -14;
-        return net_socket_recvfrom(f->socket, buf, len, NULL);
+        return sock_recv_user(f->socket, buf, len, NULL);
     }
 
     if (call == 11) { /* sendto */
@@ -7132,14 +7634,14 @@ static int socketcall_core(int call, uint32_t *kargs) {
         if (!access_ok(buf, len))
             return -14;
         if (!uaddr)
-            return net_socket_sendto(f->socket, buf, len, NULL);
+            return sock_send_user(f->socket, buf, len, NULL);
         if (addrlen < sizeof(net_sockaddr_in_t) ||
             !access_ok(uaddr, sizeof(net_sockaddr_in_t)))
             return -14;
         net_sockaddr_in_t kaddr;
         if (copy_from_user(&kaddr, uaddr, sizeof(kaddr)) < 0)
             return -14;
-        return net_socket_sendto(f->socket, buf, len, &kaddr);
+        return sock_send_user(f->socket, buf, len, &kaddr);
     }
 
     if (call == 12) { /* recvfrom */
@@ -7157,8 +7659,7 @@ static int socketcall_core(int call, uint32_t *kargs) {
                 !access_ok(uaddr, sizeof(net_sockaddr_in_t)))
                 return -14;
         }
-        int ret = net_socket_recvfrom(f->socket, buf, len,
-                                      uaddr ? &kaddr : NULL);
+        int ret = sock_recv_user(f->socket, buf, len, uaddr ? &kaddr : NULL);
         if (ret >= 0 && uaddr) {
             uint32_t klen = sizeof(net_sockaddr_in_t);
             int cr = copy_to_user(uaddr, &kaddr, sizeof(kaddr));
@@ -7285,11 +7786,21 @@ void syscall_dispatch(registers_t *regs) {
     case 48:  ret = sys_signal(regs);          break;
     case 49:  ret = sys_geteuid(regs);         break;  /* geteuid */
     case 50:  ret = sys_getegid(regs);         break;  /* getegid */
-    case 23:  ret = sys_setuid(regs);          break;  /* setuid16 */
-    case 46:  ret = sys_setgid(regs);          break;  /* setgid16 */
+    case 23:  ret = sys_setuid16(regs);        break;  /* setuid16 */
+    case 46:  ret = sys_setgid16(regs);        break;  /* setgid16 */
+    case 70:  ret = sys_setreuid16(regs);      break;  /* setreuid16 */
+    case 71:  ret = sys_setregid16(regs);      break;  /* setregid16 */
+    case 164: ret = sys_setresuid16(regs);     break;  /* setresuid16 */
+    case 165: ret = sys_getresuid16(regs);     break;  /* getresuid16 */
+    case 170: ret = sys_setresgid16(regs);     break;  /* setresgid16 */
+    case 171: ret = sys_getresgid16(regs);     break;  /* getresgid16 */
+    case 203: ret = sys_setreuid(regs);        break;  /* setreuid32 */
+    case 204: ret = sys_setregid(regs);        break;  /* setregid32 */
+    case 210: ret = sys_setresgid(regs);       break;  /* setresgid32 */
+    case 139: case 216: ret = sys_setfsgid(regs); break;  /* setfsgid{16,32} */
     case 213: ret = sys_setuid(regs);          break;  /* setuid32 (musl) */
     case 214: ret = sys_setgid(regs);          break;  /* setgid32 (musl) */
-    case 138: ret = sys_seteuid(regs);         break;  /* seteuid helper */
+    case 138: case 215: ret = sys_setfsuid(regs); break;  /* setfsuid{16,32} */
     case 54:  ret = sys_ioctl(regs);           break;
     case 55:  ret = sys_fcntl(regs);           break;
     case 57:  ret = sys_setpgid(regs);         break;
@@ -7404,7 +7915,7 @@ void syscall_dispatch(registers_t *regs) {
     case 200: ret = sys_getgid(regs);          break;  /* getgid32 */
     case 201: ret = sys_geteuid(regs);         break;  /* geteuid32 */
     case 202: ret = sys_getegid(regs);         break;  /* getegid32 */
-    case 208: ret = sys_setuid(regs);          break;  /* setresuid32≈setuid */
+    case 208: ret = sys_setresuid(regs);       break;  /* setresuid32 */
     case 221: ret = sys_fcntl(regs);           break;  /* fcntl64 → fcntl */
     case 340: ret = sys_prlimit64(regs);       break;  /* prlimit64 */
     case 140: ret = sys_llseek(regs);          break;

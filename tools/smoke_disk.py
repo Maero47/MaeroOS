@@ -181,6 +181,9 @@ def main():
             ("cat /etc/services\n", "respawn heartbeat enabled /disk/respawnprobe"),
             ("cat /disk/hello.txt\n", "Hello from MaeroOS initrd!"),
             ("diskprobe\n", "diskprobe ok"),
+            # Credentials, permissions and descriptor modes: credprobe is
+            # set-uid root on the disk and re-runs itself as uid 1000.
+            ("credprobe\n", "credprobe ok", "FAILED"),
             ("randprobe\n", "randprobe getrandom ok"),
             ("randprobe\n", "randprobe urandom ok"),
             ("cat /disk/hello.txt\n", "DISK"),

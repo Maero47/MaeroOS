@@ -26,7 +26,9 @@ typedef enum {
 #define O_RDONLY   0
 #define O_WRONLY   1
 #define O_RDWR     2
+#define O_ACCMODE  3
 #define O_CREAT    0x040
+#define O_EXCL     0x080
 #define O_TRUNC    0x200
 #define O_APPEND   0x400
 #define O_NONBLOCK 0x800
@@ -268,8 +270,14 @@ struct proc {
     uint32_t         umask;
 
     /* User/group credentials (0 = root).  euid/egid drive permission
-     * checks; uid/gid are the real ids.  Inherited across fork/clone. */
-    uint32_t         uid, gid, euid, egid;
+     * checks; uid/gid are the real ids; suid/sgid are the saved set-IDs (Linux
+     * cred->suid/sgid): exec copies the new euid/egid into them, and an
+     * unprivileged setuid()/setresuid() may only move among real, effective
+     * and saved.  Inherited across fork/clone. */
+    uint32_t         uid, gid, euid, egid, suid, sgid;
+    /* Set by execve, clear in a fresh fork (Linux !PF_FORKNOEXEC): a parent
+     * may no longer setpgid() a child that has exec'd (-EACCES). */
+    int              did_exec;
 
     /* Process group and session IDs */
     int              pgrp;   /* process group ID */

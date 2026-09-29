@@ -279,6 +279,25 @@ static int mnt_symlink(vfs_node_t *self, const char *name, const char *target) {
     return fs_root->symlink_fn(fs_root, name, target);
 }
 
+/* ── Rename ───────────────────────────────────────────────────────────────── */
+
+/* The directory a mount-point shim stands for (the shim itself otherwise). */
+static vfs_node_t *mnt_resolve(vfs_node_t *dir) {
+    while (dir && dir->finddir_fn == mnt_finddir && dir->private)
+        dir = (vfs_node_t *)dir->private;
+    return dir;
+}
+
+int vfs_rename(vfs_node_t *old_dir, const char *old_name,
+               vfs_node_t *new_dir, const char *new_name) {
+    old_dir = mnt_resolve(old_dir);
+    new_dir = mnt_resolve(new_dir);
+    if (!old_dir || !new_dir) return -2;               /* -ENOENT */
+    if (!old_dir->rename_fn) return -1;                /* -EPERM */
+    if (new_dir->rename_fn != old_dir->rename_fn) return -18;   /* -EXDEV */
+    return old_dir->rename_fn(old_dir, old_name, new_dir, new_name);
+}
+
 /* ── Symlink creation ─────────────────────────────────────────────────────── */
 
 int vfs_symlink(const char *target, const char *path) {

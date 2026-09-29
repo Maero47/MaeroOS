@@ -1,6 +1,7 @@
 #include "../include/stdio.h"
 #include "../include/string.h"
 #include "../include/unistd.h"
+#include "../include/fcntl.h"
 #include "../auth/auth.h"
 
 #define LINE_MAX 256
@@ -62,6 +63,24 @@ static int valid_password(const char *password) {
     return 1;
 }
 
+/* The new shadow file is renamed over /etc/shadow, and rename keeps the
+ * renamed file's own owner and mode, so it has to be created fresh by us
+ * (O_EXCL: never a file somebody else left there) and be 0600 before any
+ * hash is written into it. */
+static FILE *open_shadow_tmp(const char *path) {
+    unlink(path);
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) return (FILE *)0;
+    if (fchmod(fd, 0600) != 0) {
+        close(fd);
+        unlink(path);
+        return (FILE *)0;
+    }
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); unlink(path); }
+    return f;
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 4) {
         printf("passwd: usage: passwd USER OLD NEW\n");
@@ -85,9 +104,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    FILE *out = fopen("/etc/shadow.tmp", "w");
+    FILE *out = open_shadow_tmp("/etc/shadow.tmp");
     if (!out && access("/disk/etc", W_OK) == 0)
-        out = fopen("/disk/etc/shadow.tmp", "w");
+        out = open_shadow_tmp("/disk/etc/shadow.tmp");
     if (!out) {
         fclose(in);
         printf("passwd: cannot write /etc/shadow.tmp\n");

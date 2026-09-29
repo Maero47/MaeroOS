@@ -29,6 +29,11 @@ typedef struct tmpfs_node {
     uint32_t            capacity;   /* allocated bytes */
     /* directory children */
     struct tmpfs_node  *first_child;/* singly-linked list (youngest first) */
+    /* The directory this node is linked in (NULL for a root, or once
+     * unlinked).  Only directories' ancestry is ever walked: rename uses it
+     * to refuse moving a directory below itself.  A directory can only be
+     * unlinked while empty, so no child ever points at a freed parent. */
+    struct tmpfs_node  *parent;
 } tmpfs_node_t;
 
 /* ── Forward declarations ──────────────────────────────────────────────────── */
@@ -41,6 +46,8 @@ static vfs_node_t *      tmpfs_finddir (vfs_node_t *, const char *);
 static int               tmpfs_create  (vfs_node_t *, const char *, uint32_t);
 static int               tmpfs_unlink  (vfs_node_t *, const char *);
 static int               tmpfs_symlink (vfs_node_t *, const char *, const char *);
+static int               tmpfs_rename  (vfs_node_t *, const char *,
+                                        vfs_node_t *, const char *);
 static void              tmpfs_retain  (vfs_node_t *);
 static void              tmpfs_release (vfs_node_t *);
 
@@ -76,6 +83,7 @@ static tmpfs_node_t *alloc_tmpfs_node(const char *name, uint32_t flags) {
         tn->vnode.create_fn  = tmpfs_create;
         tn->vnode.unlink_fn  = tmpfs_unlink;
         tn->vnode.symlink_fn = tmpfs_symlink;
+        tn->vnode.rename_fn  = tmpfs_rename;
     }
     return tn;
 }
@@ -214,6 +222,7 @@ static int tmpfs_create(vfs_node_t *dir_node, const char *name, uint32_t flags) 
     /* Prepend to children list using vnode.next as link */
     child->vnode.next = (vfs_node_t *)dir->first_child;
     dir->first_child  = child;
+    child->parent     = dir;
     return 0;
 }
 
@@ -233,6 +242,7 @@ static int tmpfs_unlink(vfs_node_t *dir_node, const char *name) {
             else
                 dir->first_child = (tmpfs_node_t *)c->vnode.next;
             c->vnode.next = NULL;
+            c->parent = NULL;
             tmpfs_release(&c->vnode);
             return 0;
         }
@@ -241,11 +251,64 @@ static int tmpfs_unlink(vfs_node_t *dir_node, const char *name) {
     return -2;  /* -ENOENT */
 }
 
+/* Unlink `c` from dir's child list (it must be there). */
+static void tmpfs_detach(tmpfs_node_t *dir, tmpfs_node_t *c) {
+    tmpfs_node_t **pp = &dir->first_child;
+    while (*pp && *pp != c) pp = (tmpfs_node_t **)&(*pp)->vnode.next;
+    if (*pp) *pp = (tmpfs_node_t *)c->vnode.next;
+    c->vnode.next = NULL;
+    c->parent = NULL;
+}
+
+/* rename_fn.  The whole move happens without sleeping, so no other thread can
+ * ever look up new_name and find nothing: the old target leaves the list in
+ * the same step that the source takes its place.  The source node itself is
+ * moved, keeping its mode, owner, data and every open descriptor. */
+static int tmpfs_rename(vfs_node_t *old_dir_node, const char *old_name,
+                        vfs_node_t *new_dir_node, const char *new_name) {
+    tmpfs_node_t *odir = (tmpfs_node_t *)old_dir_node;
+    tmpfs_node_t *ndir = (tmpfs_node_t *)new_dir_node;
+    tmpfs_node_t *src = (tmpfs_node_t *)tmpfs_finddir(old_dir_node, old_name);
+    if (!src) return -2;                                    /* -ENOENT */
+    if (strlen(new_name) > 255) return -36;                 /* -ENAMETOOLONG */
+    tmpfs_node_t *dst = (tmpfs_node_t *)tmpfs_finddir(new_dir_node, new_name);
+    if (dst == src) return 0;                               /* same entry */
+    int src_dir = (src->vnode.flags == VFS_FLAG_DIR);
+    if (dst) {
+        int dst_dir = (dst->vnode.flags == VFS_FLAG_DIR);
+        if (src_dir && !dst_dir) return -20;                /* -ENOTDIR */
+        if (!src_dir && dst_dir) return -21;                /* -EISDIR */
+        if (dst_dir && dst->first_child) return -39;        /* -ENOTEMPTY */
+    }
+    /* A directory may not move into its own subtree.  Checked on the nodes,
+     * by walking up from the new parent: the caller's path comparison cannot
+     * see through a symlink ("/tmp/l/x" with l -> /tmp/a/b), and a directory
+     * linked under its own descendant would be an unreachable cycle. */
+    if (src_dir)
+        for (tmpfs_node_t *a = ndir; a; a = a->parent)
+            if (a == src) return -22;                        /* -EINVAL */
+
+    tmpfs_detach(odir, src);
+    if (dst) {
+        tmpfs_detach(ndir, dst);
+        tmpfs_release(&dst->vnode);         /* the directory's link to it */
+    }
+    strncpy(src->vnode.name, new_name, 255);
+    src->vnode.name[255] = '\0';
+    src->vnode.next  = (vfs_node_t *)ndir->first_child;
+    ndir->first_child = src;
+    src->parent       = ndir;
+    return 0;
+}
+
 /* ── Public API ────────────────────────────────────────────────────────────── */
 
 vfs_node_t *tmpfs_mount(void) {
     tmpfs_node_t *root = alloc_tmpfs_node("/", VFS_FLAG_DIR);
     if (!root) return NULL;
+    /* Like Linux /tmp and /dev/shm: world-writable with the sticky bit, so a
+     * user can remove or replace only their own entries. */
+    root->vnode.mask = 01777;
     return &root->vnode;
 }
 
@@ -268,5 +331,6 @@ static int tmpfs_symlink(vfs_node_t *dir, const char *name, const char *target) 
     tmpfs_node_t *tdir = (tmpfs_node_t *)dir;
     tn->vnode.next = (vfs_node_t *)tdir->first_child;
     tdir->first_child = tn;
+    tn->parent = tdir;
     return 0;
 }

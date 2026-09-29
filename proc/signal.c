@@ -2,6 +2,7 @@
 #include "process.h"
 #include "scheduler.h"
 #include "../arch/i686/mm/paging.h"   /* paging_get_pde/pte for sigframe prefault */
+#include "syscall.h"                   /* copy_to_user / copy_from_user */
 
 #include "../kernel/printk.h"
 #include <registers.h>
@@ -386,6 +387,15 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
     }
     const uint32_t sp_floor = onstack ? current_proc->sas_sp : 0x08000000U;
 
+    /* The interrupted esp (and the sigaltstack, which may have been unmapped
+     * since sigaltstack() checked it) is whatever the process put there: it can
+     * name the kernel half.  Nothing below may assume otherwise — every store
+     * into the frame goes through copy_to_user(), which rejects any address at
+     * or above 0xC0000000 and turns a fault on a read-only or unmapped page into
+     * an error instead of a ring-0 panic.  An esp that is not even a plausible
+     * user address is refused before anything is computed from it. */
+    if (sp > 0xC0000000U || sp <= sp_floor) goto fatal;
+
     /* The mask to put back when the handler returns: the interrupted mask, or
      * the one sigsuspend stashed if it is waiting for its restore (Linux
      * sigmask_to_save()).  It is carried in the frame, so nested handlers each
@@ -396,9 +406,9 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
     /* Pre-fault the user-stack pages the signal frame will occupy.  Thread
      * stacks are demand-paged (large anon VMAs), so the pages just BELOW the
      * interrupted esp — where the frame is built — are often not present yet.
-     * The frame is written with raw kernel memcpy, which PANICS on a not-present
-     * user page (observed: [SIG] delivery → write to 0xbf7fffa0 → kernel page
-     * fault → System halted).  Fault them in via the demand-pager first; if a
+     * copy_to_user() would demand-fault them too, but doing it here means a
+     * page that cannot be backed is reported as the stack overflow it is.
+     * Fault them in via the demand-pager first; if a
      * page can't be made present (real stack overflow / not in any VMA), fall
      * through to `fatal` (kill the process with SIGSEGV — Linux behaviour — not a
      * kernel panic).  Worst-case frame (SA_SIGINFO: tramp+regs+ucontext+siginfo+
@@ -444,12 +454,15 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
      * carry a uc_sigmask, and sigreturn_restore() reads it back from there. */
     sp -= 4;
     if (sp < sp_floor) goto fatal;
-    *(uint32_t *)sp = sigset_to_user(save_mask);
+    {
+        uint32_t um = sigset_to_user(save_mask);
+        if (copy_to_user((void *)(uintptr_t)sp, &um, sizeof(um)) < 0) goto fatal;
+    }
     sp -= sizeof(registers_t);
     uint32_t saved_addr = sp;
     if (sp < sp_floor) goto fatal;
-    __builtin_memcpy((void *)sp, &saved_regs, sizeof(registers_t));
-    current_proc->sigframe_addr = saved_addr;
+    if (copy_to_user((void *)(uintptr_t)sp, &saved_regs, sizeof(registers_t)) < 0)
+        goto fatal;
 
     if (sflags & SA_SIGINFO) {
         /* Build a real ucontext_t on the user stack so SA_SIGINFO handlers that
@@ -496,7 +509,7 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
                         sp <  current_proc->sas_sp + current_proc->sas_size)
                            ? SS_ONSTACK : 0)
                     : SS_DISABLE;
-        __builtin_memcpy((void *)sp, &uc, sizeof(uc));
+        if (copy_to_user((void *)(uintptr_t)sp, &uc, sizeof(uc)) < 0) goto fatal;
 
         /* Build siginfo_t on user stack */
         sp -= sizeof(siginfo_t);
@@ -507,7 +520,7 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
         si.si_signo = sig;
         si.si_code  = si_code;
         si._u._sigfault.si_addr = si_addr;
-        __builtin_memcpy((void *)sp, &si, sizeof(si));
+        if (copy_to_user((void *)(uintptr_t)sp, &si, sizeof(si)) < 0) goto fatal;
 
         /* Push frame: retaddr, signo, &siginfo, &ucontext.  The i386 SysV ABI
          * requires the stack 16-byte aligned at the call site, so the handler's
@@ -516,16 +529,18 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
          * #GPs on a misaligned frame.  Round the 4-dword arg block down to that. */
         sp = ((sp - 16) & ~0xFU) - 4;
         if (sp < sp_floor) goto fatal;
-        ((uint32_t *)sp)[0] = tramp_addr;              /* retaddr */
-        ((uint32_t *)sp)[1] = (uint32_t)sig;           /* signo */
-        ((uint32_t *)sp)[2] = siginfo_addr;            /* &siginfo */
-        ((uint32_t *)sp)[3] = uctx_addr;               /* &ucontext */
+        uint32_t args[4] = { tramp_addr,               /* retaddr */
+                             (uint32_t)sig,            /* signo */
+                             siginfo_addr,             /* &siginfo */
+                             uctx_addr };              /* &ucontext */
+        if (copy_to_user((void *)(uintptr_t)sp, args, sizeof(args)) < 0) goto fatal;
     } else {
         /* Simple one-arg frame: retaddr, signo — same 16-byte alignment rule. */
         sp = ((sp - 16) & ~0xFU) - 4;
         if (sp < sp_floor) goto fatal;
-        ((uint32_t *)sp)[0] = tramp_addr;              /* retaddr */
-        ((uint32_t *)sp)[1] = (uint32_t)sig;           /* signo */
+        uint32_t args[2] = { tramp_addr,               /* retaddr */
+                             (uint32_t)sig };          /* signo */
+        if (copy_to_user((void *)(uintptr_t)sp, args, sizeof(args)) < 0) goto fatal;
     }
 
     /* Write the sigreturn trampoline.  It loads the restore-frame ADDRESS into
@@ -549,8 +564,9 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
                            0x90, 0x90 };        /* pad                        */
         tr[6]=restore_addr; tr[7]=restore_addr>>8; tr[8]=restore_addr>>16; tr[9]=restore_addr>>24;
         tr[11]=marker; tr[12]=marker>>8; tr[13]=marker>>16; tr[14]=marker>>24;
-        __builtin_memcpy((void *)tramp_addr, tr, 20);
+        if (copy_to_user((void *)(uintptr_t)tramp_addr, tr, 20) < 0) goto fatal;
     }
+    current_proc->sigframe_addr = saved_addr;
 
     /* The frame now carries the mask to restore, so sigsuspend's stash has done
      * its job: drop the flag WITHOUT reinstating the mask here (Linux
@@ -574,8 +590,30 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
     return;
 
 fatal:
-    printk("[SIG] pid=%d: stack overflow in signal delivery\n", current_proc->pid);
-    proc_group_exit(SIGSEGV);
+    /* The frame could not be written: stack overflow, an esp that is not a user
+     * address, or a read-only/unmapped page under it.  Linux force_sigsegv():
+     * if this WAS the SIGSEGV, nothing more can be done and the group dies of
+     * it.  Otherwise the interrupted syscall ends as if the handler had run,
+     * and a SIGSEGV that can be neither blocked nor ignored is delivered in its
+     * place — to a SIGSEGV handler on a usable (alternate) stack if there is
+     * one, else by the default action.  The recursion is bounded: each round
+     * consumes one pending signal, and a failing SIGSEGV frame kills. */
+    printk("[SIG] pid=%d: cannot build frame for signal %d at esp=%08x\n",
+           current_proc->pid, sig, (unsigned)regs->useresp);
+    if (sig == SIGSEGV)
+        proc_group_exit(SIGSEGV);
+    if (restartable) {
+        if (ret == -4 && (sflags & SA_RESTART)) syscall_restart(regs, syscall_nr);
+        else                                     regs->eax = (uint32_t)-4;
+    }
+    if (current_proc->blocked_sigs & (1u << SIGSEGV)) {
+        current_proc->blocked_sigs &= ~(1u << SIGSEGV);
+        if (sh) sh->handlers[SIGSEGV] = SIG_DFL;
+    } else if (sh && sh->handlers[SIGSEGV] == SIG_IGN) {
+        sh->handlers[SIGSEGV] = SIG_DFL;
+    }
+    signal_send_fault(current_proc, SIGSEGV, SI_KERNEL, 0);
+    signal_return_to_user(regs, -1);
 }
 
 /* Selectors a frame may name for FS/GS: the null selector, the user data
@@ -617,38 +655,46 @@ static void user_frame_sanitise(registers_t *regs, uint32_t eflags,
  *              without SA_SIGINFO), with the mask parked above it.
  * Both frames sit on the user stack and both addresses come from user-supplied
  * registers, so BOTH go through user_frame_sanitise() above.
- * Returns 0 on success, -1 if `addr` is not a valid user range (caller kills). */
+ * Returns 0 on success, -1 if the frame cannot be read — not a user range, or
+ * unmapped — so the caller kills with SIGSEGV instead of the kernel faulting. */
 int sigreturn_restore(registers_t *regs, uint32_t addr, uint32_t marker) {
+    /* The whole frame is copied in before anything is applied, so a frame that
+     * is only partly readable changes neither the mask nor the registers. */
+    union {
+        struct k_ucontext uc;
+        struct { registers_t r; uint32_t mask; } plain;   /* mask directly above */
+    } f;
+    _Static_assert(sizeof(f.plain) == sizeof(registers_t) + 4,
+                   "plain sigframe: mask must sit right after registers_t");
     uint32_t need = (marker == 1) ? (uint32_t)sizeof(struct k_ucontext)
                                   : (uint32_t)(sizeof(registers_t) + 4);
     if (addr < 0x08000000U || addr + need < addr || addr + need > 0xC0000000U)
+        return -1;
+    if (copy_from_user(&f, (const void *)(uintptr_t)addr, need) < 0)
         return -1;
     /* Put back the mask this frame was entered with (Linux restore_sigcontext:
      * set_current_blocked(&uc->uc_sigmask)), honouring a handler that edited
      * it.  SIGKILL/SIGSTOP can never end up blocked. */
     if (current_proc) {
-        uint32_t um = (marker == 1)
-            ? *(uint32_t *)(uintptr_t)(addr + __builtin_offsetof(struct k_ucontext,
-                                                                 uc_sigmask))
-            : *(uint32_t *)(uintptr_t)(addr + sizeof(registers_t));
+        uint32_t um;
+        if (marker == 1) __builtin_memcpy(&um, f.uc.uc_sigmask, sizeof(um));
+        else             um = f.plain.mask;
         current_proc->blocked_sigs =
             sigset_from_user(um) & ~((1u << SIGKILL) | (1u << SIGSTOP));
     }
     if (marker == 1) {
-        struct k_ucontext   *uc = (struct k_ucontext *)(uintptr_t)addr;
-        struct k_sigcontext *m  = &uc->uc_mcontext;
+        struct k_sigcontext *m = &f.uc.uc_mcontext;
         regs->edi = m->edi; regs->esi = m->esi; regs->ebp = m->ebp;
         regs->ebx = m->ebx; regs->edx = m->edx; regs->ecx = m->ecx;
         regs->eax = m->eax; regs->eip = m->eip; regs->useresp = m->esp;
         user_frame_sanitise(regs, m->eflags, m->fs, m->gs);
     } else {
-        registers_t f;
-        __builtin_memcpy(&f, (void *)(uintptr_t)addr, sizeof(f));
+        registers_t *fr = &f.plain.r;
         uint32_t fs = regs->fs, gs = regs->gs;   /* interrupted context's */
-        *regs = f;                               /* GPRs, EIP, ESP */
+        *regs = *fr;                             /* GPRs, EIP, ESP */
         regs->fs = fs; regs->gs = gs;            /* kept unless the frame's
                                                   * are selectors we hand out */
-        user_frame_sanitise(regs, f.eflags, f.fs, f.gs);
+        user_frame_sanitise(regs, fr->eflags, fr->fs, fr->gs);
     }
     return 0;
 }
