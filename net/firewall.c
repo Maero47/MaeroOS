@@ -233,5 +233,8 @@ uint32_t firewall_dump(char *buf, uint32_t cap) {
                       rules[i].port_lo, rules[i].port_hi, rules[i].hits);
         if (n > 0) off += (uint32_t)n;
     }
+    /* snprintf returns the untruncated length; report only what fit (it
+     * NUL-terminates at cap-1), or callers index/copy past buf. */
+    if (cap && off >= cap) off = cap - 1;
     return off;
 }

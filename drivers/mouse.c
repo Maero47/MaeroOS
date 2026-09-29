@@ -139,8 +139,10 @@ static void mouse_irq(registers_t *regs) {
     (void)regs;
     while (inb(PS2_STATUS_PORT) & PS2_STATUS_OUT) {
         uint8_t status = inb(PS2_STATUS_PORT);
+        /* A keyboard byte belongs to keyboard_irq (IRQ1 is already raised
+         * for it); reading it here would silently drop a keystroke. */
+        if ((status & PS2_STATUS_AUX) == 0) break;
         uint8_t data = inb(PS2_DATA_PORT);
-        if ((status & PS2_STATUS_AUX) == 0) continue;
 
         if (packet_pos == 0 && (data & 0x08) == 0) continue;
         packet[packet_pos++] = data;
@@ -201,6 +203,10 @@ void mouse_init(void) {
            packet_size == 4 ? " (wheel)" : "");
 }
 
+int mouse_present(void) {
+    return present;
+}
+
 int mouse_has_events(void) {
     return head != tail;
 }
@@ -210,9 +216,21 @@ uint32_t mouse_read_events(uint32_t len, uint8_t *buf) {
     uint32_t copied = 0;
     (void)present;
 
-    while (len >= event_size && tail != head) {
-        input_event_t ev = ring[tail];
+    while (len >= event_size) {
+        input_event_t ev;
+        uint32_t fl;
+        /* mouse_irq advances tail itself when the ring is full; take the
+         * event and move tail with IRQs off so the two cannot interleave
+         * (one lost update empties the whole ring).  The copy to the user
+         * buffer, which may fault, stays outside. */
+        __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+        if (tail == head) {
+            if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
+            break;
+        }
+        ev = ring[tail];
         tail = (tail + 1) % MOUSE_RING_SIZE;
+        if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
         __builtin_memcpy(buf + copied, &ev, event_size);
         copied += event_size;
         len -= event_size;

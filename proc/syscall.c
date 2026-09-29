@@ -3716,6 +3716,7 @@ static struct shmap_entry {
     vfs_node_t *node;      /* keyed by vfs node (memfd/tmpfs file) */
     uint32_t   *frames;    /* phys frame per page; 0 = not yet allocated */
     uint32_t    npages;    /* length of frames[] */
+    int         may_write; /* some mapping could store into the frames */
 } shmaps[SHMAP_MAX];
 
 /* Return the existing shmap entry for a node, or NULL (no allocation). */
@@ -3753,18 +3754,46 @@ static int shmap_node_has_open_fd(vfs_node_t *node) {
     return 0;
 }
 
-static int shmap_try_reclaim(struct shmap_entry *e) {
-    if (shmap_node_has_open_fd(e->node)) return 0;   /* live fd → data must persist */
+static int shmap_unmapped(struct shmap_entry *e) {
     for (uint32_t p = 0; p < e->npages; p++)
         if (e->frames && e->frames[p] && pmm_frame_refcount(e->frames[p]) > 1)
-            return 0;   /* still mapped by a live process — keep it */
+            return 0;   /* still mapped by a live process */
+    return 1;
+}
+
+static void shmap_release(struct shmap_entry *e) {
     for (uint32_t p = 0; p < e->npages; p++)
         if (e->frames && e->frames[p]) pmm_frame_decref(e->frames[p]);
     if (e->frames) kfree(e->frames);
     e->frames = NULL; e->npages = 0;
     vfs_close(e->node);                 /* drop the registry's reference */
     e->node = NULL;
+    e->may_write = 0;
+}
+
+static int shmap_try_reclaim(struct shmap_entry *e) {
+    if (shmap_node_has_open_fd(e->node)) return 0;   /* live fd → data must persist */
+    if (!shmap_unmapped(e)) return 0;                /* still mapped — keep it */
+    shmap_release(e);
     return 1;
+}
+
+/* For an ordinary file (ext2, tmpfs) the entry is only a copy of the file taken
+ * when it was first mapped: write() and truncate() never update it.  Once no
+ * mapping uses it, it is stale, and serving it would give every later mapping
+ * (shared or private) the old bytes while read() returns the new ones; ext2
+ * hands every open of an inode the same node, so the stale key always matches.
+ * Drop it instead, unless some mapping could have stored into it: nothing
+ * writes those frames back, so they are then the only copy of the stores.
+ * memfd (shmem) entries ARE the file and are never stale. */
+static int node_is_shmem(vfs_node_t *n);
+static struct shmap_entry *shmap_lookup_fresh(vfs_node_t *node) {
+    struct shmap_entry *e = shmap_lookup(node);
+    if (e && !node_is_shmem(node) && !e->may_write && shmap_unmapped(e)) {
+        shmap_release(e);
+        return NULL;
+    }
+    return e;
 }
 
 /* The registry keys on the node pointer and outlives every mapping of it, so it
@@ -3773,8 +3802,9 @@ static int shmap_try_reclaim(struct shmap_entry *e) {
  * one.  shmap_try_reclaim() drops the reference when it retires an entry. */
 static struct shmap_entry *shmap_get(vfs_node_t *node) {
     struct shmap_entry *free_e = NULL;
+    struct shmap_entry *cur = shmap_lookup_fresh(node);
+    if (cur) return cur;
     for (int i = 0; i < SHMAP_MAX; i++) {
-        if (shmaps[i].node == node) return &shmaps[i];
         if (!shmaps[i].node && !free_e) free_e = &shmaps[i];
     }
     if (!free_e) {                       /* table full — reclaim dead entries */
@@ -3786,6 +3816,7 @@ static struct shmap_entry *shmap_get(vfs_node_t *node) {
     free_e->node   = node;
     free_e->frames = NULL;
     free_e->npages = 0;
+    free_e->may_write = 0;
     return free_e;
 }
 
@@ -3946,6 +3977,9 @@ static int vma_populate_page(struct vma *v, uint32_t addr) {
     pmm_frame_incref(phys);
 
     kprof_count(v->file ? KPE_PF_FILE : KPE_PF_ANON);
+    /* Before the preempt-off fill: retiring a stale entry can drop a file
+     * reference, and the last one of an unlinked ext2 file does disk I/O. */
+    struct shmap_entry *se = v->file ? shmap_lookup_fresh(v->file) : NULL;
     preempt_disable();
     uint64_t kp_z = kprof_probe_begin();
     uint8_t *kva = (uint8_t *)paging_temp_map(phys);
@@ -3953,7 +3987,6 @@ static int vma_populate_page(struct vma *v, uint32_t addr) {
     kprof_probe_end(KPP_FAULT_ZERO, kp_z);
     if (v->file) {
         uint32_t foff = v->file_off + (addr - v->start);
-        struct shmap_entry *se = shmap_lookup(v->file);
         uint32_t sf = se ? shmap_peek(se, foff / PAGE_SIZE) : 0;
         if (sf) {
             /* copy from the shared frame (temp slot 2), not the stale tmpfs buffer */
@@ -4160,6 +4193,10 @@ static int sys_mmap2(registers_t *regs) {
     if (shared && fnode) {
         struct shmap_entry *e = shmap_get(fnode);
         if (!e) return -12;
+        /* mprotect can add PROT_WRITE later unless the descriptor cannot
+         * write through the mapping (VMA_F_NOWRITE). */
+        if ((prot & PROT_WRITE_K) || !nowrite)
+            e->may_write = 1;
         struct vma *v = vma_add(va, end, prot, VMA_F_SHARED | nowrite, NULL, 0);
         if (!v) return -12;
         for (uint32_t i = 0; i < length; i += PAGE_SIZE) {

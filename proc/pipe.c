@@ -14,6 +14,7 @@ pipe_buf_t *pipe_alloc(void) {
     p->count    = 0;
     p->nreaders = 1;
     p->nwriters = 1;
+    p->fifo     = 0;
     return p;
 }
 
@@ -94,6 +95,13 @@ int pipe_write(pipe_buf_t *p, const char *buf, int len, int nonblock) {
 static void pipe_try_free(pipe_buf_t *p) {
     if (p->nreaders <= 0 && p->nwriters <= 0) {
         wake_up(p);  /* wake anyone still sleeping on it */
+        if (p->fifo) {
+            /* The FIFO's node still points at this buffer and the next open
+             * reuses it; like Linux, data nobody read is dropped here. */
+            p->head  = 0;
+            p->count = 0;
+            return;
+        }
         kfree(p);
     }
 }
@@ -113,4 +121,19 @@ void pipe_close_write(pipe_buf_t *p) {
                        * this pipe, so wake_up(p) alone would not rouse them until
                        * their poll-timeout re-check. */
     pipe_try_free(p);
+}
+
+pipe_buf_t *pipe_fifo_alloc(void) {
+    pipe_buf_t *p = pipe_alloc();
+    if (!p) return NULL;
+    p->nreaders = 0;
+    p->nwriters = 0;
+    p->fifo     = 1;
+    return p;
+}
+
+void pipe_fifo_free(pipe_buf_t *p) {
+    if (!p) return;
+    wake_up(p);
+    kfree(p);
 }

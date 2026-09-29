@@ -2,6 +2,7 @@
 #include "vfs.h"
 #include "../mm/heap.h"
 #include "../lib/string.h"
+#include "../proc/pipe.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -62,6 +63,11 @@ static tmpfs_node_t *alloc_tmpfs_node(const char *name, uint32_t flags) {
     tn->vnode.name[255] = '\0';
     tn->vnode.flags = flags;
     tn->refs = 1;                    /* the link in the parent directory */
+    /* Distinct inode numbers: stat() reports (st_dev 0, st_ino), and with every
+     * tmpfs node at 0 cp/ln/ld.so took any two /tmp files for the same file.
+     * Numbered well above initrd's and the disk's. */
+    static uint32_t tmpfs_next_ino = 0x40000000U;
+    tn->vnode.inode = tmpfs_next_ino++;
     tn->vnode.retain_fn = tmpfs_retain;
     tn->vnode.close_fn  = tmpfs_release;
     /* /tmp is world-writable (like Unix 01777); created files get the
@@ -76,6 +82,13 @@ static tmpfs_node_t *alloc_tmpfs_node(const char *name, uint32_t flags) {
         if (flags == VFS_FLAG_FILE) {
             tn->vnode.write_fn    = tmpfs_write;
             tn->vnode.truncate_fn = tmpfs_truncate;
+        }
+        /* A FIFO's pipe buffer lives exactly as long as the node, so every
+         * open of the name shares it and no close can free it under the
+         * node (the open path reuses node->private). */
+        if (flags == VFS_FLAG_FIFO) {
+            tn->vnode.private = pipe_fifo_alloc();
+            if (!tn->vnode.private) { kfree(tn); return NULL; }
         }
     } else {
         tn->vnode.readdir_fn = tmpfs_readdir;
@@ -103,6 +116,7 @@ static void tmpfs_release(vfs_node_t *node) {
     tmpfs_node_t *tn = (tmpfs_node_t *)node;
     if (--tn->refs > 0) return;
     if (tn->data) { kfree(tn->data); tn->data = NULL; }
+    if (node->flags == VFS_FLAG_FIFO) pipe_fifo_free((pipe_buf_t *)node->private);
     kfree(tn);
 }
 
@@ -112,33 +126,50 @@ static uint32_t tmpfs_read(vfs_node_t *node, uint32_t off, uint32_t len,
                             uint8_t *buf) {
     tmpfs_node_t *tn = (tmpfs_node_t *)node;
     if (!tn->data || off >= node->size) return 0;
-    if (off + len > node->size) len = node->size - off;
+    if (len > node->size - off) len = node->size - off;
     memcpy(buf, tn->data + off, len);
     return len;
+}
+
+/* Largest file tmpfs holds.  Every byte of a tmpfs file lives in the kernel
+ * heap, whose whole window is 256 MiB (HEAP_START..HEAP_MAX), so nothing
+ * bigger could ever be backed.  The cap also keeps every size computation
+ * below far from 32-bit wrap. */
+#define TMPFS_MAX_FILE  0x10000000U
+
+/* Make the body at least `want` (<= TMPFS_MAX_FILE) bytes.  Bytes between the
+ * file size and the capacity are kept zero, so a later write past EOF or an
+ * extending truncate never exposes stale heap contents. */
+static int tmpfs_reserve(tmpfs_node_t *tn, uint32_t want) {
+    if (want <= tn->capacity) return 0;
+    uint32_t newcap = tn->capacity ? tn->capacity : 64;
+    while (newcap < want)
+        newcap = newcap > TMPFS_MAX_FILE / 2 ? TMPFS_MAX_FILE : newcap * 2;
+    uint8_t *newbuf = (uint8_t *)kmalloc(newcap);
+    if (!newbuf) return -12;                        /* -ENOMEM */
+    uint32_t keep = tn->data ? tn->vnode.size : 0;
+    if (keep) memcpy(newbuf, tn->data, keep);
+    memset(newbuf + keep, 0, newcap - keep);
+    if (tn->data) kfree(tn->data);
+    tn->data     = newbuf;
+    tn->capacity = newcap;
+    return 0;
 }
 
 static uint32_t tmpfs_write(vfs_node_t *node, uint32_t off, uint32_t len,
                               const uint8_t *buf) {
     tmpfs_node_t *tn = (tmpfs_node_t *)node;
+
+    /* Past the size cap nothing can be written.  vfs_write() has no way to say
+     * EFBIG, and 0 would spin a libc write loop, so this reports "no memory"
+     * (write(2) gets -ENOMEM).  A write that straddles the cap is shortened,
+     * as Linux does at s_maxbytes. */
+    if (off >= TMPFS_MAX_FILE) return VFS_WRITE_ENOMEM;
+    if (len > TMPFS_MAX_FILE - off) len = TMPFS_MAX_FILE - off;
     uint32_t end = off + len;
 
-    /* Grow buffer if needed */
-    if (end > tn->capacity) {
-        uint32_t newcap = tn->capacity ? tn->capacity : 64;
-        while (newcap < end) newcap *= 2;
-        uint8_t *newbuf = (uint8_t *)kmalloc(newcap);
-        if (!newbuf) return VFS_WRITE_ENOMEM;   /* → write() gets -ENOMEM */
-        if (tn->data) {
-            memcpy(newbuf, tn->data, tn->capacity);
-            kfree(tn->data);
-        }
-        /* zero the gap between old size and the write start */
-        if (off > (tn->capacity)) {
-            memset(newbuf + tn->capacity, 0, off - tn->capacity);
-        }
-        tn->data     = newbuf;
-        tn->capacity = newcap;
-    }
+    if (tmpfs_reserve(tn, end) < 0)
+        return VFS_WRITE_ENOMEM;                    /* → write() gets -ENOMEM */
 
     memcpy(tn->data + off, buf, len);
     if (end > node->size) node->size = end;
@@ -163,19 +194,9 @@ static int tmpfs_truncate(vfs_node_t *node, uint32_t new_size) {
     }
 
     /* Extend: ensure capacity */
-    if (new_size > tn->capacity) {
-        uint32_t newcap = tn->capacity ? tn->capacity : 64;
-        while (newcap < new_size) newcap *= 2;
-        uint8_t *newbuf = (uint8_t *)kmalloc(newcap);
-        if (!newbuf) return -12;        /* -ENOMEM, see sys_ftruncate */
-        if (tn->data) {
-            memcpy(newbuf, tn->data, node->size);
-            kfree(tn->data);
-        }
-        memset(newbuf + node->size, 0, newcap - node->size);
-        tn->data     = newbuf;
-        tn->capacity = newcap;
-    }
+    if (new_size > TMPFS_MAX_FILE) return -27;      /* -EFBIG */
+    int r = tmpfs_reserve(tn, new_size);
+    if (r < 0) return r;                            /* -ENOMEM, see sys_ftruncate */
     node->size = new_size;
     return 0;
 }

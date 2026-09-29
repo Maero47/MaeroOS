@@ -100,6 +100,14 @@ void vfs_init(void);
  */
 vfs_node_t *vfs_open(const char *path);
 
+/*
+ * vfs_lookup — the resolver behind vfs_open/vfs_open_nofollow.  Follows at
+ * most 40 symlinks in total (absolute and relative targets); on failure
+ * returns NULL and, if `err` is non-NULL, stores -ENOENT, -ELOOP or
+ * -ENAMETOOLONG there.
+ */
+vfs_node_t *vfs_lookup(const char *path, int follow_final, int *err);
+
 /* Read up to `size` bytes at `offset` from a file node */
 uint32_t vfs_read(vfs_node_t *node, uint32_t offset, uint32_t size,
                   uint8_t *buf);

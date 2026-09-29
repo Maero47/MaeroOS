@@ -313,16 +313,24 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr) {
         s->tcp_state = TCP_STATE_ERROR;
         return -101;
     }
+    /* Pin across the sleeping wait (see net_socket_recvfrom). */
+    net_socket_retain(s);
+    int r = -110;
     uint32_t start = pit_ticks();
     while ((uint32_t)(pit_ticks() - start) < 300U) {
         net_poll_all();
-        if (s->tcp_state == TCP_STATE_CONNECTED)
-            return 0;
-        if (s->tcp_state == TCP_STATE_ERROR)
-            return s->tcp_error ? s->tcp_error : -101;
+        if (s->tcp_state == TCP_STATE_CONNECTED) {
+            r = 0;
+            break;
+        }
+        if (s->tcp_state == TCP_STATE_ERROR) {
+            r = s->tcp_error ? s->tcp_error : -101;
+            break;
+        }
         net_io_sleep(2);
     }
-    return -110;
+    net_socket_release(s);
+    return r;
 }
 
 static int socket_sendto_locked(net_socket_t *s, const void *buf, uint32_t len,
@@ -336,15 +344,18 @@ static int socket_sendto_locked(net_socket_t *s, const void *buf, uint32_t len,
         const uint8_t *p = (const uint8_t *)buf;
         uint32_t sent = 0;
         while (left > 0) {
-            uint16_t chunk = (uint16_t)left;
-            uint16_t avail = tcp_sndbuf(s->tcp);
+            /* Clamp in 32 bits: a (uint16_t) cast of left would turn a
+             * multiple of 64 KiB into a 0-byte write that tcp_write() accepts,
+             * spinning here forever with preemption off. */
+            uint32_t chunk = left;
+            uint32_t avail = tcp_sndbuf(s->tcp);
             if (avail == 0)
                 break;
             if (chunk > avail)
                 chunk = avail;
             if (chunk > 1460)
                 chunk = 1460;
-            err_t e = tcp_write(s->tcp, p, chunk, TCP_WRITE_FLAG_COPY);
+            err_t e = tcp_write(s->tcp, p, (u16_t)chunk, TCP_WRITE_FLAG_COPY);
             if (e != ERR_OK)
                 break;
             tcp_output(s->tcp);
@@ -512,15 +523,26 @@ int net_socket_recvfrom(net_socket_t *s, void *buf, uint32_t len,
      * io_activity sleep wakes instantly on NIC interrupts.  UDP stays
      * non-blocking (-EAGAIN): existing probes and the DNS resolver use
      * retry loops and some intentionally test for EAGAIN. */
+    /* Pin the socket while we may sleep: a sibling thread sharing the fd
+     * table can close() it meanwhile, and without our ref the slot would be
+     * wiped and possibly reused by an unrelated socket under us. */
+    preempt_disable();
+    int pinned = s && s->used;
+    if (pinned) s->refs++;
+    preempt_enable();
+    if (!pinned) return -9;
+
     int idle_polls = 0;
+    int r;
     for (;;) {
-        int r;
         preempt_disable();
         r = socket_recvfrom_locked(s, buf, len, addr);
         preempt_enable();
-        if (r != -11 || s->type != SOCK_STREAM_K) return r;
-        if (current_proc && signal_interrupt_pending(current_proc))
-            return -4;   /* -EINTR */
+        if (r != -11 || s->type != SOCK_STREAM_K) break;
+        if (current_proc && signal_interrupt_pending(current_proc)) {
+            r = -4;      /* -EINTR */
+            break;
+        }
         /* Ring empty and still connected: periodically re-advertise our
          * (open) receive window with a forced ACK.  TCP window-update ACKs
          * are not retransmitted, so if one is dropped the peer can stall
@@ -536,6 +558,8 @@ int net_socket_recvfrom(net_socket_t *s, void *buf, uint32_t len,
         }
         net_io_sleep(2);
     }
+    net_socket_release(s);
+    return r;
 }
 
 int net_socket_shutdown(net_socket_t *s, int how) {

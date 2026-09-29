@@ -64,6 +64,7 @@ testfiles/awk
 /testfiles/diff
 /testfiles/dirname
 /testfiles/diskprobe
+/testfiles/fsprobe
 /testfiles/dmesg
 /testfiles/doas
 /testfiles/du

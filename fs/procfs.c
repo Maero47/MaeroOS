@@ -111,6 +111,7 @@ static int procfs_parse_pid(const char *name) {
     if (!name || *name < '0' || *name > '9') return -1;
     while (*name) {
         if (*name < '0' || *name > '9') return -1;
+        if (pid > 1000000) return -1;          /* no such pid; and no overflow */
         pid = pid * 10 + (*name - '0');
         name++;
     }
@@ -292,44 +293,53 @@ static void maps_line(char *b, uint32_t *pos, uint32_t cap,
 static uint32_t procfs_maps_read(vfs_node_t *n, uint32_t off, uint32_t len,
                                   uint8_t *buf) {
     (void)n;
-    static char content[32768];   /* the VMA registry lists every mapping now */
-    static uint32_t content_len = 0;
+    /* The VMA registry lists every mapping, so this is big; it is built per
+     * read for the reading process.  A shared static buffer rebuilt only at
+     * off == 0 let a read at off > 0 return whichever process had read last. */
+    enum { MAPS_CAP = 32768 };
+    char *content = (char *)kmalloc(MAPS_CAP);
+    uint32_t content_len;
+    if (!content) return 0;
 
-    if (off == 0) {
+    {
         uint32_t pos = 0;
         struct proc *p = current_proc;
         if (p) {
             /* Executable image (r-x). */
             if (p->image_end > p->image_start)
-                maps_line(content, &pos, sizeof(content),
+                maps_line(content, &pos, MAPS_CAP,
                           p->image_start, p->image_end, 1 | 4, p->exe);
             /* Heap (rw-), grows up from brk_base to heap_end. */
             if (p->heap_end > p->brk_base)
-                maps_line(content, &pos, sizeof(content),
+                maps_line(content, &pos, MAPS_CAP,
                           p->brk_base, p->heap_end, 1 | 2, "[heap]");
             /* Every mmap()ed region, in address order, from the VMA registry
              * (anonymous, file-backed, shared); the backing file's name for
              * file mappings, 's' for MAP_SHARED. */
             uint32_t vs, ve, vp; int vsh; const char *vname;
             for (int i = 0; proc_vma_iter_ex(p, i, &vs, &ve, &vp, &vsh, &vname) == 0; i++) {
-                if (pos > sizeof(content) - 128) break;  /* leave room for [stack] */
-                maps_line(content, &pos, sizeof(content), vs, ve,
+                if (pos > MAPS_CAP - 128) break;  /* leave room for [stack] */
+                maps_line(content, &pos, MAPS_CAP, vs, ve,
                           vp | (vsh ? 8 : 0), vname);
             }
         }
         /* The main-thread stack — the line glibc/SpiderMonkey read for stack
          * bounds.  Report the REAL eagerly-mapped range, not a fake 8 KiB. */
-        maps_line(content, &pos, sizeof(content),
+        maps_line(content, &pos, MAPS_CAP,
                   (uint32_t)USER_STACK_BASE, (uint32_t)USER_STACK_TOP,
                   1 | 2, "[stack]");
-        content[pos < sizeof(content) ? pos : sizeof(content) - 1] = '\0';
+        if (pos >= MAPS_CAP) pos = MAPS_CAP - 1;
+        content[pos] = '\0';
         content_len = pos;
     }
 
-    if (off >= content_len) return 0;
-    uint32_t avail = content_len - off;
-    if (avail > len) avail = len;
-    __builtin_memcpy(buf, content + off, avail);
+    uint32_t avail = 0;
+    if (off < content_len) {
+        avail = content_len - off;
+        if (avail > len) avail = len;
+        __builtin_memcpy(buf, content + off, avail);
+    }
+    kfree(content);
     return avail;
 }
 
@@ -390,9 +400,11 @@ static uint32_t procfs_auxv_read(vfs_node_t *n, uint32_t off, uint32_t len,
 static uint32_t procfs_statm_read(vfs_node_t *n, uint32_t off, uint32_t len,
                                   uint8_t *buf) {
     (void)n;
-    static char content[128];
-    static uint32_t content_len = 0;
-    if (off == 0) {
+    /* Built on every read, for the reader: a static buffer filled at off == 0
+     * handed one process another's numbers when their reads interleaved. */
+    char content[128];
+    uint32_t content_len;
+    {
         uint32_t pos = 0;
         struct proc *p = current_proc;
         uint32_t img = (p && p->image_end > p->image_start)
@@ -461,6 +473,7 @@ static vfs_node_t *procfs_fd_finddir(vfs_node_t *node, const char *name) {
     const char *p = name;
     if (*p == '\0') return NULL;
     while (*p >= '0' && *p <= '9') {
+        if (fd >= MAX_FD) return NULL;   /* stop before the multiply can wrap */
         fd = fd * 10 + (*p - '0');
         p++;
     }

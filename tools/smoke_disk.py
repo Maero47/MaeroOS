@@ -184,6 +184,7 @@ def main():
             # Credentials, permissions and descriptor modes: credprobe is
             # set-uid root on the disk and re-runs itself as uid 1000.
             ("credprobe\n", "credprobe ok", "FAILED"),
+            ("fsprobe\n", "fsprobe ok", "fsprobe FAIL"),
             ("randprobe\n", "randprobe getrandom ok"),
             ("randprobe\n", "randprobe urandom ok"),
             ("cat /disk/hello.txt\n", "DISK"),

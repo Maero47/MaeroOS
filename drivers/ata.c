@@ -260,8 +260,11 @@ int ata_write(uint32_t lba, uint8_t count, const void *buf) {
         ata_settle();
     }
 
-    /* Flush write cache */
+    /* Flush write cache.  The drive goes BSY committing the last sector, and
+     * a command written while BSY is set is ignored, so wait it out first. */
+    ata_wait_bsy();
     outb(ATA_CMD, ATA_CMD_FLUSH);
+    ata_delay();
     ata_wait_bsy();
     ata_irq_restore(irq);
     kprof_switch(kp_old);

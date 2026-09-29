@@ -477,7 +477,13 @@ static int pty_background_current(pty_pair_t *p) {
 
 static void pty_echo(pty_pair_t *p, const char *s, uint32_t len) {
     if (!(p->termios.c_lflag & TERMIOS_ECHO)) return;
-    (void)pty_buf_write(p, 0, len, (const uint8_t *)s);
+    /* Echo runs inside the master's write() and goes to the ring only the
+     * master drains, so it must never wait for room: blocking here (a full
+     * s2m, then ^C) hung the terminal for good, with the SIGINT unsent.
+     * Echo that does not fit is dropped. */
+    uint32_t room = PTY_BUF_SIZE - p->s2m_count;
+    if (len > room) len = room;
+    if (len) (void)pty_buf_write(p, 0, len, (const uint8_t *)s);
 }
 
 static void pty_commit_canon(pty_pair_t *p) {
@@ -494,14 +500,14 @@ static uint32_t pty_master_write_input(pty_pair_t *p,
             c = '\n';
 
         if ((p->termios.c_lflag & TERMIOS_ISIG) &&
-            c == p->termios.c_cc[VINTR_IDX]) {
+            p->termios.c_cc[VINTR_IDX] && c == p->termios.c_cc[VINTR_IDX]) {
             p->canon_count = 0;
             pty_echo(p, "^C\n", 3);
             pty_send_pgrp_signal(p, SIGINT);
             continue;
         }
         if ((p->termios.c_lflag & TERMIOS_ISIG) &&
-            c == p->termios.c_cc[VSUSP_IDX]) {
+            p->termios.c_cc[VSUSP_IDX] && c == p->termios.c_cc[VSUSP_IDX]) {
             p->canon_count = 0;
             pty_echo(p, "^Z\n", 3);
             pty_send_pgrp_signal(p, SIGTSTP);
@@ -514,7 +520,7 @@ static uint32_t pty_master_write_input(pty_pair_t *p,
             continue;
         }
 
-        if (c == p->termios.c_cc[VEOF_IDX]) {
+        if (p->termios.c_cc[VEOF_IDX] && c == p->termios.c_cc[VEOF_IDX]) {
             if (p->canon_count)
                 pty_commit_canon(p);
             else {
@@ -523,14 +529,15 @@ static uint32_t pty_master_write_input(pty_pair_t *p,
             }
             continue;
         }
-        if (c == '\b' || c == 127 || c == p->termios.c_cc[VERASE_IDX]) {
+        if (c == '\b' || c == 127 ||
+            (p->termios.c_cc[VERASE_IDX] && c == p->termios.c_cc[VERASE_IDX])) {
             if (p->canon_count) {
                 p->canon_count--;
                 pty_echo(p, "\b \b", 3);
             }
             continue;
         }
-        if (c == p->termios.c_cc[VKILL_IDX]) {
+        if (p->termios.c_cc[VKILL_IDX] && c == p->termios.c_cc[VKILL_IDX]) {
             while (p->canon_count) {
                 p->canon_count--;
                 pty_echo(p, "\b \b", 3);
@@ -624,6 +631,7 @@ static int pty_ioctl(vfs_node_t *n, uint32_t req, void *arg) {
     pty_pair_t *p = (pty_pair_t *)n->private;
     if (!p) return -22;
     if (req == TIOCGPTN) {
+        if (!arg) return -14;                   /* -EFAULT */
         *(int *)arg = p->id;
         return 0;
     }
@@ -845,7 +853,7 @@ static int devdir_readdir(vfs_node_t *node, uint32_t idx, vfs_dirent_t *out) {
                                     "stdin", "stdout", "stderr" };
     uint32_t out_idx = 0;
     for (uint32_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-        if (i == 4 && !framebuffer_available()) continue;
+        if (i == 5 && !framebuffer_available()) continue;   /* "fb0" */
         if (out_idx == idx) {
             out->ino  = (uint32_t)(idx + 1);
             out->type = (strcmp(names[i], "input") == 0 ||
