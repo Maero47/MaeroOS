@@ -181,6 +181,7 @@ def main():
             ("cat /etc/services\n", "respawn heartbeat enabled /disk/respawnprobe"),
             ("cat /disk/hello.txt\n", "Hello from MaeroOS initrd!"),
             ("diskprobe\n", "diskprobe ok"),
+            ("fsprobe\n", "fsprobe ok", "fsprobe FAIL"),
             ("randprobe\n", "randprobe getrandom ok"),
             ("randprobe\n", "randprobe urandom ok"),
             ("cat /disk/hello.txt\n", "DISK"),

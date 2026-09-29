@@ -43,7 +43,7 @@ all: $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
 	     $(TESTFILES)/diff $(TESTFILES)/tar \
 	     $(TESTFILES)/mkfifo $(TESTFILES)/ln $(TESTFILES)/readlink \
 	     $(TESTFILES)/sysprobe $(TESTFILES)/fcprobe $(TESTFILES)/lspci $(TESTFILES)/ifconfig \
-	     $(TESTFILES)/diskprobe $(TESTFILES)/respawnprobe \
+	     $(TESTFILES)/diskprobe $(TESTFILES)/fsprobe $(TESTFILES)/respawnprobe \
 	     $(TESTFILES)/sockprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget \
 	     $(TESTFILES)/randprobe \
 	     $(TESTFILES)/fbtest $(TESTFILES)/evtest $(TESTFILES)/mousetest \
@@ -366,6 +366,13 @@ diskprobe/diskprobe.o: diskprobe/diskprobe.c
 $(TESTFILES)/diskprobe: $(CRT0_OBJ) diskprobe/diskprobe.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) diskprobe/diskprobe.o libc/libc.a
 
+# fsprobe
+fsprobe/fsprobe.o: fsprobe/fsprobe.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TESTFILES)/fsprobe: $(CRT0_OBJ) fsprobe/fsprobe.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) fsprobe/fsprobe.o libc/libc.a
+
 # respawnprobe
 respawnprobe/respawnprobe.o: respawnprobe/respawnprobe.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -665,7 +672,7 @@ clean:
 	      ps/ps.o svc/svc.o session/session.o auth/auth.o login/login.o passwd/passwd.o getty/getty.o xargs_cmd/xargs.o diff/diff.o tar_cmd/tar.o \
 	      mkfifo_cmd/mkfifo.o ln_cmd/ln.o readlink_cmd/readlink.o \
 	      sysprobe/sysprobe.o lspci/lspci.o ifconfig/ifconfig.o \
-	      diskprobe/diskprobe.o respawnprobe/respawnprobe.o \
+	      diskprobe/diskprobe.o fsprobe/fsprobe.o respawnprobe/respawnprobe.o \
 	      sockprobe/sockprobe.o netprobe/netprobe.o httpget/httpget.o randprobe/randprobe.o \
 	      fbtest/fbtest.o evtest/evtest.o mousetest/mousetest.o \
 	      polltest/polltest.o ptytest/ptytest.o cttytest/cttytest.o \
@@ -687,7 +694,7 @@ clean:
 	      $(TESTFILES)/diff $(TESTFILES)/tar \
 	      $(TESTFILES)/mkfifo $(TESTFILES)/ln $(TESTFILES)/readlink \
 	      $(TESTFILES)/sysprobe $(TESTFILES)/lspci $(TESTFILES)/ifconfig \
-	      $(TESTFILES)/diskprobe $(TESTFILES)/respawnprobe \
+	      $(TESTFILES)/diskprobe $(TESTFILES)/fsprobe $(TESTFILES)/respawnprobe \
 	      $(TESTFILES)/sockprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget $(TESTFILES)/randprobe \
 	      $(TESTFILES)/fbtest $(TESTFILES)/evtest $(TESTFILES)/mousetest \
 	      $(TESTFILES)/polltest $(TESTFILES)/ptytest $(TESTFILES)/cttytest \
