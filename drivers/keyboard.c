@@ -1,4 +1,5 @@
 #include "keyboard.h"
+#include "mouse.h"
 #include "../arch/i686/cpu/irq.h"
 #include "../arch/i686/cpu/pic.h"
 #include "../arch/i686/cpu/pit.h"
@@ -13,6 +14,7 @@
 #define KBD_DATA_PORT   0x60
 #define KBD_STATUS_PORT 0x64
 #define KBD_STATUS_OUT  0x01
+#define KBD_STATUS_AUX  0x20
 #define KBD_RING_SIZE   128
 
 /* Linux input-event key codes for common Set 1 scancodes. */
@@ -195,7 +197,16 @@ static void push_event(uint16_t type, uint16_t code, int32_t value) {
 
 static void keyboard_irq(registers_t *regs) {
     (void)regs;
-    while (inb(KBD_STATUS_PORT) & KBD_STATUS_OUT) {
+    uint8_t st;
+    while ((st = inb(KBD_STATUS_PORT)) & KBD_STATUS_OUT) {
+        /* A mouse byte belongs to mouse_irq; consuming it here turned mouse
+         * packets into phantom keystrokes and desynced the mouse.  Only
+         * drain it when no mouse handler exists to do so. */
+        if (st & KBD_STATUS_AUX) {
+            if (mouse_present()) break;
+            (void)inb(KBD_DATA_PORT);
+            continue;
+        }
         uint8_t sc = inb(KBD_DATA_PORT);
         if (sc == 0xe0) {
             got_e0 = 1;
@@ -254,9 +265,21 @@ uint32_t keyboard_read_events(uint32_t len, uint8_t *buf) {
     uint32_t event_size = sizeof(input_event_t);
     uint32_t copied = 0;
 
-    while (len >= event_size && tail != head) {
-        input_event_t ev = ring[tail];
+    while (len >= event_size) {
+        input_event_t ev;
+        uint32_t fl;
+        /* keyboard_irq advances tail itself when the ring is full (and pushes
+         * two events per key); take the event and move tail with IRQs off so
+         * the two cannot interleave (one lost update empties the whole ring).
+         * The copy to the user buffer, which may fault, stays outside. */
+        __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+        if (tail == head) {
+            if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
+            break;
+        }
+        ev = ring[tail];
         tail = (tail + 1) % KBD_RING_SIZE;
+        if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
         __builtin_memcpy(buf + copied, &ev, event_size);
         copied += event_size;
         len -= event_size;

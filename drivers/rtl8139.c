@@ -47,7 +47,12 @@
 
 static rtl8139_info_t info;
 #define RX_RING 32768U
-static uint8_t rx_buffer[RX_RING + 16 + 1500] __attribute__((aligned(16)));
+/* RCR.WRAP is set, so a frame that crosses the end of the ring is written
+ * linearly past it rather than wrapped to the start: the ring needs room for
+ * one whole maximum frame (4-byte header + frame + CRC, VLAN-tagged included)
+ * beyond RX_RING. */
+#define RX_SLACK 2048U
+static uint8_t rx_buffer[RX_RING + RX_SLACK] __attribute__((aligned(16)));
 static uint8_t tx_buffer[RTL_TX_DESC_COUNT][1792] __attribute__((aligned(16)));
 static netif_t *rtl_netif;
 
@@ -133,15 +138,19 @@ int rtl8139_poll(void) {
             break;
         }
 
-        uint32_t data_off = (off + 4U) % RX_RING;
+        uint32_t data_off = off + 4U;
         uint8_t packet[1600];
         uint32_t payload_len = (uint32_t)len - 4U; /* RTL includes CRC */
-        if (payload_len > sizeof(packet)) {
+        /* With RCR.WRAP the frame is contiguous from data_off even when it
+         * runs past RX_RING (into the slack), so it must be read linearly —
+         * wrapping the read to the ring start picked up stale bytes for every
+         * frame that straddled the end of the ring. */
+        if (payload_len > sizeof(packet) ||
+            data_off + payload_len > sizeof(rx_buffer)) {
             if (rtl_netif)
                 rtl_netif->rx_dropped++;
         } else {
-            for (uint32_t i = 0; i < payload_len; i++)
-                packet[i] = rx_buffer[(data_off + i) % RX_RING];
+            memcpy(packet, rx_buffer + data_off, payload_len);
             net_receive_ethernet(rtl_netif, packet, payload_len);
             packets++;
         }

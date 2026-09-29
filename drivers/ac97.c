@@ -250,8 +250,12 @@ void ac97_init(void) {
         while ((inb((uint16_t)(nabm_base + PO_CR)) & CR_RR) && --spin) {}
     }
 
-    irq_install_handler((int)dev->irq_line, (void *)ac97_irq);
-    pic_unmask(dev->irq_line);
+    /* Interrupt Line is 0xFF when firmware routed no IRQ; unmasking it would
+     * shift by 247 (undefined) — polling via ksoundd's safety tick still runs. */
+    if (dev->irq_line >= 1 && dev->irq_line <= 15) {
+        irq_install_handler((int)dev->irq_line, (void *)ac97_irq);
+        pic_unmask(dev->irq_line);
+    }
 
     present = 1;
     printk("[AC97] up: nam=0x%x nabm=0x%x irq=%u\n",
