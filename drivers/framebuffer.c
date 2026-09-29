@@ -8,7 +8,12 @@
 #include <stddef.h>
 #include <kernel/kprof.h>
 
-#define FB_VIRT_BASE 0xE0000000U
+/* The framebuffer window: from the end of the kernel heap (HEAP_MAX) up to
+ * where the identity-mapped local APIC page (0xFEE00000) and the recursive
+ * page tables (0xFFC00000) begin.  256 MiB holds any real mode many times
+ * over; a framebuffer claiming more than that is not one we can map. */
+#define FB_VIRT_BASE  0xE0000000U
+#define FB_VIRT_LIMIT 0xF0000000U
 
 typedef struct {
     uint32_t phys;
@@ -51,13 +56,30 @@ void framebuffer_init(const multiboot_info_t *mbi) {
         return;
     }
 
+    /* The geometry comes straight from the bootloader.  pitch * height is
+     * what gets mapped at FB_VIRT_BASE, so check it in 64 bits against the
+     * window before trusting it: a wrapped or oversized product would map
+     * over the APIC page or the recursive page tables, or leave the tail
+     * that the console writes to unmapped. */
+    uint64_t size64 = (uint64_t)mbi->framebuffer_pitch * mbi->framebuffer_height;
+    uint64_t row64 = ((uint64_t)mbi->framebuffer_width * mbi->framebuffer_bpp + 7) / 8;
+    uint32_t page_off0 = (uint32_t)mbi->framebuffer_addr & 0xFFFU;
+    if (mbi->framebuffer_bpp > 32 || row64 > mbi->framebuffer_pitch ||
+        size64 + page_off0 > (uint64_t)(FB_VIRT_LIMIT - FB_VIRT_BASE) ||
+        mbi->framebuffer_addr + size64 > 0x100000000ULL) {
+        printk("[FB]   implausible framebuffer %ux%u@%u pitch=%u; VGA text fallback only\n",
+               (unsigned)mbi->framebuffer_width, (unsigned)mbi->framebuffer_height,
+               (unsigned)mbi->framebuffer_bpp, (unsigned)mbi->framebuffer_pitch);
+        return;
+    }
+
     fb.phys = (uint32_t)mbi->framebuffer_addr;
     fb.virt = FB_VIRT_BASE;
     fb.pitch = mbi->framebuffer_pitch;
     fb.width = mbi->framebuffer_width;
     fb.height = mbi->framebuffer_height;
     fb.bpp = mbi->framebuffer_bpp;
-    fb.size = fb.pitch * fb.height;
+    fb.size = (uint32_t)size64;
 
     /*
      * Multiboot places RGB channel metadata immediately after

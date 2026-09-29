@@ -109,17 +109,55 @@ int rtl8139_send(const void *data, uint32_t len) {
     rtl_outl(tsad, rtl_virt_to_phys(tx_buffer[desc]));
     rtl_outl(tsd, len);
 
+    /* The chip walks the four descriptors round-robin and moves on to the
+     * next one once this one is handed over, whether the frame goes out,
+     * aborts or is still pending when we stop waiting.  The next send has to
+     * follow it there, or it writes a descriptor the chip is not looking at
+     * and transmit stalls for good. */
+    info.tx_index = (desc + 1) % RTL_TX_DESC_COUNT;
+
     for (int i = 0; i < 100000; i++) {
         uint32_t st = rtl_inl(tsd);
-        if (st & RTL_TX_OK) {
-            info.tx_index = (desc + 1) % RTL_TX_DESC_COUNT;
+        if (st & RTL_TX_OK)
             return (int)len;
-        }
         if (st & RTL_TX_ABORT)
             return -5;
     }
 
     return -11;
+}
+
+/*
+ * Reset the chip and program it for receive and transmit from a clean ring:
+ * rx_offset 0, CAPR just behind it, tx_index 0.  A software reset is what puts
+ * the chip's own ring pointers back to the start (toggling CMD.RE alone does
+ * not on every implementation, QEMU's included), so it is also how a receiver
+ * that has lost its place in the ring is recovered.
+ */
+static void rtl_hw_start(void) {
+    rtl_outb(RTL_REG_CMD, RTL_CMD_RESET);
+    for (int i = 0; i < 100000; i++) {
+        if (!(rtl_inb(RTL_REG_CMD) & RTL_CMD_RESET))
+            break;
+    }
+
+    rtl_outl(RTL_REG_RBSTART, rtl_virt_to_phys(rx_buffer));
+    /* RX OK + RX error interrupts; the handler just acks and wakes I/O
+     * sleepers (polling remains the data path). */
+    rtl_outw(RTL_REG_IMR, 0x0005);
+    rtl_outw(RTL_REG_ISR, 0xFFFF);
+
+    /* Transmit and receive must be enabled before RCR/TCR take effect. */
+    rtl_outb(RTL_REG_CMD, RTL_CMD_RE | RTL_CMD_TE);
+    uint32_t rcr = RTL_RCR_MXDMA_UNL | RTL_RCR_RBLEN_32K |
+                   RTL_RCR_AB | RTL_RCR_AM | RTL_RCR_APM | RTL_RCR_WRAP;
+    rtl_outl(RTL_REG_RCR, rcr);
+
+    info.rx_offset = 0;
+    info.tx_index = 0;
+    rtl_outw(RTL_REG_CAPR, (uint16_t)(RX_RING - 16U));
+    info.rx_config = rtl_inl(RTL_REG_RCR);
+    info.tx_config = rtl_inl(RTL_REG_TCR);
 }
 
 int rtl8139_poll(void) {
@@ -132,9 +170,20 @@ int rtl8139_poll(void) {
         uint16_t status = rx_buffer[off] | ((uint16_t)rx_buffer[off + 1] << 8);
         uint16_t len = rx_buffer[off + 2] | ((uint16_t)rx_buffer[off + 3] << 8);
 
-        if (len < 4 || len > 8192) {
+        /* 0xFFF0 marks a frame the chip is still copying in (early RX):
+         * not an error, it is complete on the next poll. */
+        if (len == 0xFFF0U)
+            break;
+
+        /* A header that is not a sane, good frame means we have lost our
+         * place in the ring: there is no next header to step to, and just
+         * stopping here left RX dead until reboot.  Start the ring over. */
+        if (!(status & 0x0001U) || len < 8 || len > RX_SLACK) {
             if (rtl_netif)
                 rtl_netif->rx_dropped++;
+            printk("[RTL8139] bad rx header status=0x%04x len=%u at %u, resetting\n",
+                   (unsigned)status, (unsigned)len, (unsigned)off);
+            rtl_hw_start();
             break;
         }
 
@@ -165,9 +214,6 @@ int rtl8139_poll(void) {
          * the real 32 KB ring; the -16 is the RTL8139's fixed read offset. */
         rtl_outw(RTL_REG_CAPR,
                  (uint16_t)((info.rx_offset + RX_RING - 16U) % RX_RING));
-
-        if (!(status & 0x0001U) && rtl_netif)
-            rtl_netif->rx_dropped++;
     }
 
     return packets;
@@ -215,31 +261,11 @@ void rtl8139_init(void) {
     pci_write_config32(dev->bus, dev->slot, dev->func, 0x04, cmd);
 
     rtl_outb(RTL_REG_CONFIG1, 0x00); /* power on */
-    rtl_outb(RTL_REG_CMD, RTL_CMD_RESET);
-    for (int i = 0; i < 100000; i++) {
-        if (!(rtl_inb(RTL_REG_CMD) & RTL_CMD_RESET))
-            break;
-    }
+    rtl_hw_start();
 
     for (int i = 0; i < 6; i++)
         info.mac[i] = rtl_inb((uint8_t)(RTL_REG_MAC0 + i));
 
-    uint32_t rx_phys = rtl_virt_to_phys(rx_buffer);
-    rtl_outl(RTL_REG_RBSTART, rx_phys);
-    /* RX OK + RX error interrupts; the handler just acks and wakes I/O
-     * sleepers (polling remains the data path). */
-    rtl_outw(RTL_REG_IMR, 0x0005);
-    rtl_outw(RTL_REG_ISR, 0xFFFF);
-
-    uint32_t rcr = RTL_RCR_MXDMA_UNL | RTL_RCR_RBLEN_32K |
-                   RTL_RCR_AB | RTL_RCR_AM | RTL_RCR_APM | RTL_RCR_WRAP;
-    rtl_outl(RTL_REG_RCR, rcr);
-    rtl_outb(RTL_REG_CMD, RTL_CMD_RE | RTL_CMD_TE);
-
-    info.rx_config = rtl_inl(RTL_REG_RCR);
-    info.tx_config = rtl_inl(RTL_REG_TCR);
-    info.rx_offset = 0;
-    info.tx_index = 0;
     info.present = 1;
 
     rtl_netif = net_register("eth0", info.mac, NET_MTU_ETHERNET, &info,

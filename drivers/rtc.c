@@ -21,6 +21,15 @@ static int update_in_progress(void) {
     return cmos_read(0x0A) & 0x80;
 }
 
+/* An update cycle lasts under 2 ms; a UIP bit that never clears means there
+ * is no CMOS behind the ports (a floating bus reads 0xFF, UIP included). */
+static int wait_update_done(void) {
+    for (int i = 0; i < 1000000; i++)
+        if (!update_in_progress())
+            return 0;
+    return -1;
+}
+
 static uint8_t bcd_to_bin(uint8_t v) {
     return (uint8_t)((v & 0x0F) + (v >> 4) * 10);
 }
@@ -42,24 +51,33 @@ void rtc_init(void) {
     uint8_t sec, min, hour, day, mon, year, century, regb;
     uint8_t s2, m2, h2, d2, mo2, y2;
 
-    /* Read twice until stable (avoids racing the RTC update cycle). */
-    do {
-        while (update_in_progress()) {}
+    /* Read twice until stable (avoids racing the RTC update cycle).  Both the
+     * UIP waits and the retries are bounded: without a working CMOS, wall
+     * time is left at the epoch instead of hanging the boot. */
+    for (int tries = 0; ; tries++) {
+        if (tries == 8 || wait_update_done() < 0) {
+            boot_epoch = 0;
+            printk("[RTC] CMOS clock not responding; wall clock starts at the epoch\n");
+            return;
+        }
         sec  = cmos_read(0x00);
         min  = cmos_read(0x02);
         hour = cmos_read(0x04);
         day  = cmos_read(0x07);
         mon  = cmos_read(0x08);
         year = cmos_read(0x09);
-        while (update_in_progress()) {}
+        if (wait_update_done() < 0)
+            continue;               /* counted against the retries */
         s2  = cmos_read(0x00);
         m2  = cmos_read(0x02);
         h2  = cmos_read(0x04);
         d2  = cmos_read(0x07);
         mo2 = cmos_read(0x08);
         y2  = cmos_read(0x09);
-    } while (sec != s2 || min != m2 || hour != h2 ||
-             day != d2 || mon != mo2 || year != y2);
+        if (sec == s2 && min == m2 && hour == h2 &&
+            day == d2 && mon == mo2 && year == y2)
+            break;
+    }
 
     century = cmos_read(0x32);   /* QEMU provides the century register */
     regb = cmos_read(0x0B);

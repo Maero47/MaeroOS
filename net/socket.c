@@ -340,6 +340,8 @@ static int socket_sendto_locked(net_socket_t *s, const void *buf, uint32_t len,
     if (s->type == SOCK_STREAM_K) {
         if (!s->connected || !s->tcp)
             return -107;
+        if (len == 0)
+            return 0;
         uint32_t left = len;
         const uint8_t *p = (const uint8_t *)buf;
         uint32_t sent = 0;
@@ -511,10 +513,45 @@ int net_socket_bind(net_socket_t *s, const net_sockaddr_in_t *addr) {
 
 int net_socket_sendto(net_socket_t *s, const void *buf, uint32_t len,
                       const net_sockaddr_in_t *addr) {
+    /* TCP send BLOCKS while the send buffer is full, like recv and like a
+     * blocking Linux socket: it returns once all of buf is queued, or with
+     * the partial count when a signal or a connection error cuts it short.
+     * Returning -EAGAIN on a full buffer made a blocking writer that pushes
+     * faster than the peer acks see a spurious error mid-stream.  UDP never
+     * waits (a datagram is sent or dropped whole). */
     preempt_disable();
-    int r = socket_sendto_locked(s, buf, len, addr);
+    int pinned = s && s->used;
+    if (pinned) s->refs++;   /* pinned across the sleep, as in recvfrom */
     preempt_enable();
-    return r;
+    if (!pinned) return -9;
+
+    const uint8_t *p = (const uint8_t *)buf;
+    uint32_t done = 0;
+    int r;
+    for (;;) {
+        preempt_disable();
+        r = socket_sendto_locked(s, p ? p + done : p, len - done, addr);
+        preempt_enable();
+        if (s->type != SOCK_STREAM_K)
+            break;
+        if (r > 0) {
+            done += (uint32_t)r;
+            if (done >= len)
+                break;
+            continue;
+        }
+        if (r != -11)
+            break;           /* error: reported unless something went out */
+        if (current_proc && signal_interrupt_pending(current_proc)) {
+            r = -4;          /* -EINTR */
+            break;
+        }
+        /* The buffer drains as the peer acks, which arrives with a NIC
+         * interrupt and wakes this sleep. */
+        net_io_sleep(2);
+    }
+    net_socket_release(s);
+    return done ? (int)done : r;
 }
 
 int net_socket_recvfrom(net_socket_t *s, void *buf, uint32_t len,
