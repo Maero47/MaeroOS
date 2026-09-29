@@ -385,22 +385,34 @@ static int path_split(const char *path, char *dir_out, char *base_out) {
 }
 
 /*
- * vfs_open_at — like vfs_open() but handles relative paths by prepending cwd.
- * Requires current_proc to be set.
+ * vfs_lookup_at — vfs_lookup() for a path that may be relative to the cwd.
+ * cwd + '/' + path is joined with a length check (-ENAMETOOLONG past the VFS
+ * path limit) and, on failure, *err (if given) says why: -ENOENT, -ELOOP or
+ * -ENAMETOOLONG, so callers can report the real error instead of -ENOENT.
  */
-static vfs_node_t *vfs_open_at(const char *path) {
+#define LOOKUP_PATH_MAX 512
+static vfs_node_t *vfs_lookup_at(const char *path, int follow, int *err) {
+    if (err) *err = -2;                                       /* -ENOENT */
     if (!path) return NULL;
-    if (path[0] == '/') return vfs_open(path);
+    if (path[0] == '/') return vfs_lookup(path, follow, err);
     if (!current_proc) return NULL;
-    /* Relative: prepend cwd */
-    char abspath[512];
+    char abspath[LOOKUP_PATH_MAX];
     uint32_t cwdlen = (uint32_t)__builtin_strlen(current_proc->cwd);
+    uint32_t pathlen = (uint32_t)__builtin_strlen(path);
+    if (cwdlen + 1 + pathlen >= sizeof(abspath)) {
+        if (err) *err = -36;                                  /* -ENAMETOOLONG */
+        return NULL;
+    }
     __builtin_memcpy(abspath, current_proc->cwd, cwdlen);
     if (cwdlen > 1) abspath[cwdlen++] = '/';
-    uint32_t pathlen = (uint32_t)__builtin_strlen(path);
-    if (cwdlen + pathlen >= 512) return NULL;
     __builtin_memcpy(abspath + cwdlen, path, pathlen + 1);
-    return vfs_open(abspath);
+    return vfs_lookup(abspath, follow, err);
+}
+
+/* vfs_open_at — like vfs_open() but handles relative paths by prepending cwd.
+ * Requires current_proc to be set. */
+static vfs_node_t *vfs_open_at(const char *path) {
+    return vfs_lookup_at(path, 1, NULL);
 }
 
 static int path_is_root(const char *path) {
@@ -5114,18 +5126,9 @@ static int sys_lstat(registers_t *regs) {
     struct kstat *st = (struct kstat *)(uintptr_t)regs->ecx;
     if (!access_ok(st, sizeof(*st))) return -14;
     /* lstat does NOT follow the final symlink */
-    vfs_node_t *n;
-    char abspath[256];
-    if (path[0] == '/') {
-        n = vfs_open_nofollow(path);
-    } else {
-        uint32_t cwdlen = (uint32_t)__builtin_strlen(current_proc->cwd);
-        __builtin_memcpy(abspath, current_proc->cwd, cwdlen);
-        if (cwdlen > 1) abspath[cwdlen++] = '/';
-        __builtin_memcpy(abspath + cwdlen, path, __builtin_strlen(path) + 1);
-        n = vfs_open_nofollow(abspath);
-    }
-    if (!n) return -2;
+    int err;
+    vfs_node_t *n = vfs_lookup_at(path, 0, &err);
+    if (!n) return err;
     struct kstat kst;
     fill_kstat(&kst, n);
     /* For symlinks, st_mode should be S_IFLNK */
@@ -5140,18 +5143,9 @@ static int sys_lstat64_real(registers_t *regs) {
     if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0) return -14;
     struct kstat64 *st = (struct kstat64 *)(uintptr_t)regs->ecx;
     if (!access_ok(st, sizeof(*st))) return -14;
-    vfs_node_t *n;
-    char abspath[256];
-    if (path[0] == '/') {
-        n = vfs_open_nofollow(path);
-    } else {
-        uint32_t cwdlen = (uint32_t)__builtin_strlen(current_proc->cwd);
-        __builtin_memcpy(abspath, current_proc->cwd, cwdlen);
-        if (cwdlen > 1) abspath[cwdlen++] = '/';
-        __builtin_memcpy(abspath + cwdlen, path, __builtin_strlen(path) + 1);
-        n = vfs_open_nofollow(abspath);
-    }
-    if (!n) return -2;
+    int err;
+    vfs_node_t *n = vfs_lookup_at(path, 0, &err);
+    if (!n) return err;
     struct kstat64 kst;
     fill_kstat64(&kst, n);
     if (n->flags == VFS_FLAG_SYMLINK)
@@ -5196,18 +5190,9 @@ static int sys_readlink(registers_t *regs) {
     if (bufsiz <= 0 || !access_ok(ubuf, (uint32_t)bufsiz)) return -14;
 
     /* Resolve without following final symlink */
-    vfs_node_t *n;
-    if (path[0] == '/') {
-        n = vfs_open_nofollow(path);
-    } else {
-        char abspath[512];
-        uint32_t cwdlen = (uint32_t)__builtin_strlen(current_proc->cwd);
-        __builtin_memcpy(abspath, current_proc->cwd, cwdlen);
-        if (cwdlen > 1) abspath[cwdlen++] = '/';
-        __builtin_memcpy(abspath + cwdlen, path, __builtin_strlen(path) + 1);
-        n = vfs_open_nofollow(abspath);
-    }
-    if (!n) return -2;
+    int err;
+    vfs_node_t *n = vfs_lookup_at(path, 0, &err);
+    if (!n) return err;
     if (n->flags != VFS_FLAG_SYMLINK) return -22;   /* -EINVAL: not a symlink */
 
     /* Read target from the symlink node */
