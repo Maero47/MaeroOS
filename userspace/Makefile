@@ -55,7 +55,8 @@ all: $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
      $(TESTFILES)/reboot $(TESTFILES)/shutdown $(TESTFILES)/poweroff $(TESTFILES)/halt \
      $(TESTFILES)/sudo $(TESTFILES)/whoami $(TESTFILES)/uname $(TESTFILES)/clear $(TESTFILES)/hostname \
      $(TESTFILES)/which $(TESTFILES)/free $(TESTFILES)/uptime $(TESTFILES)/du $(TESTFILES)/df $(TESTFILES)/top $(TESTFILES)/wget $(TESTFILES)/bbwrap \
-     $(TESTFILES)/maerox $(TESTFILES)/ff
+     $(TESTFILES)/maerox $(TESTFILES)/ff \
+     $(TESTFILES)/kwprobe
 
 # Compile C → .o
 %.o: %.c
@@ -447,6 +448,13 @@ httpget/httpget.o: httpget/httpget.c
 $(TESTFILES)/httpget: $(CRT0_OBJ) httpget/httpget.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) httpget/httpget.o libc/libc.a
 
+# kwprobe (user write to kernel memory -> SIGSEGV; int3 -> SIGTRAP)
+kwprobe/kwprobe.o: kwprobe/kwprobe.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TESTFILES)/kwprobe: $(CRT0_OBJ) kwprobe/kwprobe.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) kwprobe/kwprobe.o libc/libc.a
+
 # randprobe
 randprobe/randprobe.o: randprobe/randprobe.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -666,7 +674,7 @@ clean:
 	      mkfifo_cmd/mkfifo.o ln_cmd/ln.o readlink_cmd/readlink.o \
 	      sysprobe/sysprobe.o lspci/lspci.o ifconfig/ifconfig.o \
 	      diskprobe/diskprobe.o respawnprobe/respawnprobe.o \
-	      sockprobe/sockprobe.o netprobe/netprobe.o httpget/httpget.o randprobe/randprobe.o \
+	      sockprobe/sockprobe.o netprobe/netprobe.o httpget/httpget.o randprobe/randprobe.o kwprobe/kwprobe.o \
 	      fbtest/fbtest.o evtest/evtest.o mousetest/mousetest.o \
 	      polltest/polltest.o ptytest/ptytest.o cttytest/cttytest.o \
 	      desktop/desktop.o wmctl/wmctl.o gui_demo/gui_demo.o wmevtest/wmevtest.o uidemo/uidemo.o files/files.o \
@@ -688,7 +696,7 @@ clean:
 	      $(TESTFILES)/mkfifo $(TESTFILES)/ln $(TESTFILES)/readlink \
 	      $(TESTFILES)/sysprobe $(TESTFILES)/lspci $(TESTFILES)/ifconfig \
 	      $(TESTFILES)/diskprobe $(TESTFILES)/respawnprobe \
-	      $(TESTFILES)/sockprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget $(TESTFILES)/randprobe \
+	      $(TESTFILES)/sockprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget $(TESTFILES)/randprobe $(TESTFILES)/kwprobe \
 	      $(TESTFILES)/fbtest $(TESTFILES)/evtest $(TESTFILES)/mousetest \
 	      $(TESTFILES)/polltest $(TESTFILES)/ptytest $(TESTFILES)/cttytest \
 	      $(TESTFILES)/desktop $(TESTFILES)/wmctl $(TESTFILES)/gui_demo \

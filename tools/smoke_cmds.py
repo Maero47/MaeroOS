@@ -4,6 +4,12 @@
 Boots MaeroOS (initrd) and exercises the native coreutils-style commands:
 uname, whoami, hostname, free, df, uptime, which, clear.  reboot is checked
 last because it powers the machine off.
+
+Runs kwprobe first (a user write to kernel memory must die of SIGSEGV, a user
+int3 of SIGTRAP); the commands after it show the system kept running.
+
+SMOKE_SMP=N boots the same machine as `make run` with -smp N (the kernel and
+initrd must already be built, as `make smoke-cmds` does).
 """
 import os
 import selectors
@@ -40,8 +46,17 @@ def send(proc, text):
 
 
 def main():
+    smp = os.environ.get("SMOKE_SMP")
+    if smp:
+        # Same flags as the Makefile's `run` target, plus -smp.
+        cmd = ["qemu-system-i386", "-kernel", "kernel.elf",
+               "-initrd", "initrd.tar", "-serial", "stdio", "-m", "512M",
+               "-no-reboot", "-no-shutdown", "-display", "none",
+               "-smp", str(int(smp))]
+    else:
+        cmd = ["make", "run"]
     proc = subprocess.Popen(
-        ["make", "run"],
+        cmd,
         cwd=ROOT,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -55,6 +70,7 @@ def main():
     try:
         wait_for(proc, sel, PROMPT, log)
         checks = [
+            ("kwprobe\n", "kwprobe ok"),
             ("uname\n", "MaeroOS"),
             ("uname -a\n", "i686"),
             ("uname -m\n", "i686"),
