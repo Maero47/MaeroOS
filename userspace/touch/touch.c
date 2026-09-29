@@ -10,7 +10,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     for (int i = 1; i < argc; i++) {
-        int fd = open(argv[i], O_WRONLY | O_CREAT);
+        int fd = open(argv[i], O_WRONLY | O_CREAT, 0666);
         if (fd < 0) {
             printf("touch: cannot create '%s'\n", argv[i]);
         } else {

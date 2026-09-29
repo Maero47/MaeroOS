@@ -10,7 +10,7 @@
 
 int main(void) {
     static unsigned char buf[CHUNK], rd[CHUNK];
-    int fd = open("/disk/extprobe.bin", O_WRONLY | O_CREAT | O_TRUNC);
+    int fd = open("/disk/extprobe.bin", O_WRONLY | O_CREAT | O_TRUNC, 0666);
     unsigned off = 0;
 
     if (fd < 0) { printf("extprobe: cannot create\n"); return 1; }

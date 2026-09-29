@@ -21,7 +21,7 @@ static void make_long_name(char *out, int n) {
 static int check_large_file(void) {
     const int total = 14000;
     char buf[257];
-    int fd = open("/disk/dp-large.bin", O_CREAT | O_TRUNC | O_RDWR);
+    int fd = open("/disk/dp-large.bin", O_CREAT | O_TRUNC | O_RDWR, 0666);
     if (fd < 0) {
         puts("diskprobe: large open failed");
         return 1;
@@ -96,7 +96,7 @@ static int check_large_dir(void) {
 
     for (int i = 0; i < 70; i++) {
         make_long_name(name, i);
-        int fd = open(name, O_CREAT | O_TRUNC | O_RDWR);
+        int fd = open(name, O_CREAT | O_TRUNC | O_RDWR, 0666);
         if (fd < 0) {
             puts("diskprobe: large dir create failed");
             return 1;

@@ -10,6 +10,8 @@
 #include <dirent.h>
 #include <time.h>
 #include <unistd.h>
+#include "sha256.h"
+#include "tarx.h"
 
 /*
  * pkg — the MaeroOS package manager.
@@ -21,6 +23,10 @@
  *
  * Repo: http://<server>/index.txt + tars.  Server defaults to 10.0.2.2:8000
  * (the QEMU host); override in /disk/etc/pkg.conf with repo=host:port.
+ *
+ * Every index line carries the tarball's SHA-256 (tools/mkrepo.py); install
+ * refuses a package whose download does not match it, and extraction only
+ * accepts flat archives of regular files (see tarx.c).
  */
 
 #define INDEX_CACHE "/disk/etc/pkg-index.txt"
@@ -58,22 +64,43 @@ static void load_repo_conf(void) {
     }
 }
 
-/* HTTP GET path → malloc'd body (caller frees); returns bytes or -1.
- * Downloading to RAM keeps slow ext2 writes off the TCP critical path. */
+/* HTTP GET path → malloc'd body in fetch_buf (caller frees); returns bytes
+ * or -1.  Downloading to RAM keeps slow ext2 writes off the TCP critical path. */
+#define MAX_DOWNLOAD (64 * 1024 * 1024)
+
 static char *fetch_buf;
 static int net_unreachable;   /* set when the repo server can't be reached */
+
+static void fetch_fail(int fd) {
+    if (fd >= 0) close(fd);
+    free(fetch_buf);
+    fetch_buf = 0;
+}
+
+/* "HTTP/1.x 200 ..." — look at the status code only, not at any "200" that
+ * happens to appear in a header value. */
+static int status_ok(const char *hdr) {
+    const char *sp;
+    if (strncmp(hdr, "HTTP/", 5)) return 0;
+    sp = strchr(hdr, ' ');
+    return sp && !strncmp(sp + 1, "200", 3) && (sp[4] == ' ' || sp[4] == '\r');
+}
 
 static int http_fetch_mem(const char *path, int expect, int show_progress) {
     struct sockaddr_in addr;
     char req[256];
     static char buf[16384];
-    int fd, n, total = 0, body = 0, idle = 0;
+    static char hdr[4096];
+    int fd, n, total = 0, body = 0, idle = 0, hlen = 0;
     int cap = expect > 0 ? expect + 4096 : 256 * 1024;
-    unsigned ip = resolve_a(repo_host);
+    unsigned ip;
 
-    fetch_buf = (char *)malloc((size_t)cap);
-    if (!fetch_buf) return -1;
-
+    fetch_buf = 0;
+    if (expect < 0 || expect > MAX_DOWNLOAD) {
+        printf("pkg: bad size %d for /%s\n", expect, path);
+        return -1;
+    }
+    ip = resolve_a(repo_host);
     if (!ip) {
         printf("pkg: cannot resolve %s\n", repo_host);
         net_unreachable = 1;
@@ -92,6 +119,8 @@ static int http_fetch_mem(const char *path, int expect, int show_progress) {
         close(fd);
         return -1;
     }
+    fetch_buf = (char *)malloc((size_t)cap);
+    if (!fetch_buf) { close(fd); return -1; }
     snprintf(req, sizeof(req),
              "GET /%s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
              path, repo_host);
@@ -100,34 +129,52 @@ static int http_fetch_mem(const char *path, int expect, int show_progress) {
     while (1) {
         n = recv(fd, buf, sizeof(buf), 0);
         if (n > 0) {
-            int off = 0;
+            const char *data = buf;
+            int len = n;
             idle = 0;
             if (!body) {
-                /* find the end of headers (may span reads — keep simple:
-                 * headers always fit the first read from python http) */
-                char *b = NULL;
-                buf[n > 0 ? n : 0] = 0;
-                b = strstr(buf, "\r\n\r\n");
-                if (!b) continue;
-                if (!strstr(buf, "200")) {
-                    printf("pkg: server error for /%s\n", path);
-                    close(fd);
+                /* Collect headers (they may span reads) up to the blank line;
+                 * whatever follows it in this read is the start of the body. */
+                int before = hlen, take = n;
+                char *e;
+                if (take > (int)sizeof(hdr) - 1 - hlen) take = (int)sizeof(hdr) - 1 - hlen;
+                memcpy(hdr + hlen, buf, (size_t)take);
+                hlen += take;
+                hdr[hlen] = 0;
+                e = strstr(hdr, "\r\n\r\n");
+                if (!e) {
+                    if (hlen >= (int)sizeof(hdr) - 1) {
+                        printf("pkg: bad response for /%s\n", path);
+                        fetch_fail(fd);
+                        return -1;
+                    }
+                    continue;
+                }
+                if (!status_ok(hdr)) {
+                    printf("pkg: server refused /%s\n", path);
+                    fetch_fail(fd);
                     return -1;
                 }
-                off = (int)(b - buf) + 4;
                 body = 1;
+                data = buf + ((int)(e - hdr) + 4 - before);
+                len = n - (int)(data - buf);
             }
-            if (total + (n - off) > cap) {       /* grow if index etc */
-                int ncap = cap * 2;
-                char *nb = (char *)malloc((size_t)ncap);
-                if (!nb) { free(fetch_buf); fetch_buf = 0; close(fd); return -1; }
-                memcpy(nb, fetch_buf, (size_t)total);
-                free(fetch_buf);
-                fetch_buf = nb;
-                cap = ncap;
+            if (len > 0) {
+                if (len > MAX_DOWNLOAD - total) {
+                    printf("pkg: /%s is too large\n", path);
+                    fetch_fail(fd);
+                    return -1;
+                }
+                if (total + len > cap) {
+                    char *nb;
+                    while (total + len > cap) cap *= 2;
+                    nb = (char *)realloc(fetch_buf, (size_t)cap);
+                    if (!nb) { fetch_fail(fd); return -1; }
+                    fetch_buf = nb;
+                }
+                memcpy(fetch_buf + total, data, (size_t)len);
+                total += len;
             }
-            memcpy(fetch_buf + total, buf + off, (size_t)(n - off));
-            total += n - off;
             if (show_progress && (total & 0x3FFFF) < 16384)
                 printf("\r  %d KB", total / 1024);
             continue;
@@ -138,11 +185,10 @@ static int http_fetch_mem(const char *path, int expect, int show_progress) {
     }
     close(fd);
     if (show_progress) printf("\r  %d KB received\n", total / 1024);
-    if (expect > 0 && total != expect) {
+    if (!body || (expect > 0 && total != expect)) {
         printf("pkg: short download (%d of %d bytes) — try again\n",
                total, expect);
-        free(fetch_buf);
-        fetch_buf = 0;
+        fetch_fail(-1);
         return -1;
     }
     return total;
@@ -152,6 +198,7 @@ static int http_fetch_mem(const char *path, int expect, int show_progress) {
 
 typedef struct {
     char name[32], version[16], tar[48], caption[96], exec[96], args[96];
+    char sha256[65];
     int size, fullscreen, rawinput;
 } pkg_t;
 
@@ -171,14 +218,15 @@ static void parse_index(void) {
     buf[n] = 0;
     line = buf;
     while (line && *line && pkg_count < 32) {
-        char *f[9] = {0};
+        char *f[10] = {0};
         int nf = 0;
         next = strchr(line, '\n');
         if (next) *next++ = 0;
         f[nf++] = line;
-        for (char *p = line; *p && nf < 9; p++)
+        for (char *p = line; *p && nf < 10; p++)
             if (*p == '|') { *p = 0; f[nf++] = p + 1; }
-        if (nf >= 6) {
+        /* Names end up in paths and URLs: skip lines that could escape. */
+        if (nf >= 6 && pkg_name_ok(f[0]) && pkg_file_ok(f[3])) {
             pkg_t *pk = &pkgs[pkg_count++];
             strncpy(pk->name, f[0], sizeof(pk->name) - 1);
             strncpy(pk->version, f[1], sizeof(pk->version) - 1);
@@ -189,6 +237,9 @@ static void parse_index(void) {
             pk->fullscreen = nf > 6 ? atoi(f[6]) : 0;
             if (nf > 7) strncpy(pk->args, f[7], sizeof(pk->args) - 1);
             pk->rawinput = nf > 8 ? atoi(f[8]) : 0;
+            pk->sha256[0] = 0;
+            if (nf > 9 && strlen(f[9]) == 64)
+                strcpy(pk->sha256, f[9]);
         }
         line = next;
     }
@@ -206,83 +257,48 @@ static int installed(const char *name) {
     return access(path, 0) == 0;
 }
 
-/* ── ustar extraction ───────────────────────────────────────────────────── */
+/* Delete the files of an installed package, then its directory. */
+static void remove_dir(const char *dir) {
+    char path[192];
+    DIR *d = opendir(dir);
+    struct dirent *e;
 
-static unsigned octal(const char *s, int len) {
-    unsigned v = 0;
-    for (int i = 0; i < len && s[i] >= '0' && s[i] <= '7'; i++)
-        v = v * 8 + (unsigned)(s[i] - '0');
-    return v;
+    if (!d) return;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+        unlink(path);
+    }
+    closedir(d);
+    rmdir(dir);
 }
 
-static int untar(const char *tar_path, const char *dest_dir) {
-    static char hdr[512], buf[8192];
-    int fd = open(tar_path, O_RDONLY);
-    int files = 0;
-
+/* Write all of buf to a new file; 0 on success. */
+static int write_file(const char *path, const char *buf, int n) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644), off = 0;
     if (fd < 0) return -1;
-    while (read(fd, hdr, 512) == 512) {
-        char *name = hdr;
-        unsigned size, mode;
-        char out_path[160];
-        int out;
-
-        if (!name[0]) break;
-        if (memcmp(hdr + 257, "ustar", 5)) break;
-        size = octal(hdr + 124, 12);
-        mode = octal(hdr + 100, 8) & 0777;   /* ustar mode field */
-        if (hdr[156] != '0' && hdr[156] != 0) {   /* skip non-files */
-            unsigned skip = (size + 511) & ~511U;
-            lseek(fd, (int)skip, SEEK_CUR);
-            continue;
-        }
-        /* strip leading ./ */
-        if (name[0] == '.' && name[1] == '/') name += 2;
-        snprintf(out_path, sizeof(out_path), "%s/%s", dest_dir, name);
-        out = open(out_path, O_WRONLY | O_CREAT | O_TRUNC);
-        if (out < 0) {
-            printf("pkg: cannot write %s\n", out_path);
-            close(fd);
-            return -1;
-        }
-        {
-            unsigned left = size;
-            while (left > 0) {
-                int want = left > sizeof(buf) ? (int)sizeof(buf) : (int)left;
-                int n = read(fd, buf, want);
-                if (n <= 0) break;
-                write(out, buf, n);
-                left -= (unsigned)n;
-            }
-        }
-        close(out);
-        /* Honour the tar entry's permission bits so executables stay
-         * executable (open(O_CREAT) alone yields 0644 → exec denied). */
-        if (mode & 0111)
-            chmod(out_path, mode ? mode : 0755);
-        files++;
-        /* advance to the next 512 boundary */
-        if (size % 512)
-            lseek(fd, (int)(512 - size % 512), SEEK_CUR);
+    while (off < n) {
+        int w = write(fd, buf + off, n - off);
+        if (w <= 0) { close(fd); return -1; }
+        off += w;
     }
-    close(fd);
-    return files;
+    return close(fd);
 }
 
 /* ── commands ───────────────────────────────────────────────────────────── */
 
 static int cmd_update(void) {
-    int fd;
-
     int n;
 
     mkdir("/disk/etc", 0755);
     n = http_fetch_mem("index.txt", 0, 0);
     if (n < 0) return net_unreachable ? 2 : 1;
-    fd = open(INDEX_CACHE, O_WRONLY | O_CREAT | O_TRUNC);
-    if (fd < 0) { printf("pkg: cannot write index cache\n"); free(fetch_buf); return 1; }
-    write(fd, fetch_buf, n);
-    close(fd);
+    if (write_file(INDEX_CACHE, fetch_buf, n)) {
+        printf("pkg: cannot write index cache\n");
+        free(fetch_buf);
+        fetch_buf = 0;
+        return 1;
+    }
     free(fetch_buf);
     fetch_buf = 0;
     parse_index();
@@ -305,82 +321,81 @@ static int cmd_list(void) {
 
 static int cmd_install(const char *name) {
     pkg_t *pk;
-    char tar_path[128], dir[128], mpath[140];
-    int fd, files;
+    char dir[128], mpath[140], sum[65], m[320];
+    const char *why;
+    int n, files;
 
+    if (!pkg_name_ok(name)) {
+        printf("pkg: invalid package name '%s'\n", name);
+        return 1;
+    }
     parse_index();
     pk = find_pkg(name);
     if (!pk) {
         printf("pkg: unknown package '%s' (run `pkg update`)\n", name);
         return 1;
     }
+    if (!pk->sha256[0] || pk->size <= 0) {
+        printf("pkg: index has no checksum for %s — run `pkg update`\n", name);
+        return 1;
+    }
     printf("Installing %s %s (%d KB)...\n", pk->name, pk->version,
            pk->size / 1024);
+
+    n = http_fetch_mem(pk->tar, pk->size, 1);
+    if (n < 0) return net_unreachable ? 2 : 1;
+    sha256_hex(fetch_buf, (size_t)n, sum);
+    for (char *p = pk->sha256; *p; p++)
+        if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a');
+    if (strcmp(sum, pk->sha256)) {
+        printf("pkg: checksum mismatch for %s — download rejected\n", name);
+        free(fetch_buf);
+        fetch_buf = 0;
+        return 1;
+    }
+
     mkdir(APPS_DIR, 0755);
     snprintf(dir, sizeof(dir), APPS_DIR "/%s", pk->name);
     mkdir(dir, 0755);
-    snprintf(tar_path, sizeof(tar_path), "%s/.download.tar", dir);
-
-    {
-        int n = http_fetch_mem(pk->tar, pk->size, 1);
-        if (n < 0) return net_unreachable ? 2 : 1;
-        printf("Writing %d KB to disk...\n", n / 1024);
-        fd = open(tar_path, O_WRONLY | O_CREAT | O_TRUNC);
-        if (fd < 0) {
-            printf("pkg: cannot write to %s\n", dir);
-            free(fetch_buf);
-            fetch_buf = 0;
-            return 1;
-        }
-        {
-            int off = 0;
-            while (off < n) {
-                int w = write(fd, fetch_buf + off, n - off);
-                if (w <= 0) break;
-                off += w;
-            }
-        }
-        close(fd);
-        free(fetch_buf);
-        fetch_buf = 0;
+    printf("Writing %d KB to disk...\n", n / 1024);
+    files = untar_mem(fetch_buf, n, dir, &why);
+    free(fetch_buf);
+    fetch_buf = 0;
+    if (files <= 0) {
+        printf("pkg: extraction failed: %s\n", why);
+        remove_dir(dir);
+        return 1;
     }
-
-    files = untar(tar_path, dir);
-    unlink(tar_path);
-    if (files <= 0) { printf("pkg: extraction failed\n"); return 1; }
 
     /* manifest drives the desktop launcher */
     snprintf(mpath, sizeof(mpath), "%s/manifest", dir);
-    fd = open(mpath, O_WRONLY | O_CREAT | O_TRUNC);
-    if (fd >= 0) {
-        char m[320];
-        int n = snprintf(m, sizeof(m),
-                         "name=%s\nversion=%s\nexec=%s\nfullscreen=%d\n"
-                         "args=%s\nrawinput=%d\n",
-                         pk->name, pk->version, pk->exec, pk->fullscreen,
-                         pk->args, pk->rawinput);
-        write(fd, m, n);
-        close(fd);
+    n = snprintf(m, sizeof(m),
+                 "name=%s\nversion=%s\nexec=%s\nfullscreen=%d\n"
+                 "args=%s\nrawinput=%d\n",
+                 pk->name, pk->version, pk->exec, pk->fullscreen,
+                 pk->args, pk->rawinput);
+    if (n >= (int)sizeof(m) || write_file(mpath, m, n)) {
+        printf("pkg: cannot write %s\n", mpath);
+        remove_dir(dir);
+        return 1;
     }
     printf("Installed %s (%d files) → %s\n", pk->name, files, dir);
     return 0;
 }
 
 static int cmd_remove(const char *name) {
-    char dir[128], path[192];
+    char dir[128];
     DIR *d;
-    struct dirent *e;
 
+    if (!pkg_name_ok(name)) {
+        printf("pkg: invalid package name '%s'\n", name);
+        return 1;
+    }
     snprintf(dir, sizeof(dir), APPS_DIR "/%s", name);
     d = opendir(dir);
     if (!d) { printf("pkg: '%s' is not installed\n", name); return 1; }
-    while ((e = readdir(d))) {
-        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-        snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
-        unlink(path);
-    }
     closedir(d);
-    rmdir(dir);
+    remove_dir(dir);
     printf("Removed %s\n", name);
     return 0;
 }

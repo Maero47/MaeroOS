@@ -113,7 +113,7 @@ int main(int argc, char **argv) {
            n_blocks, n_blocks, passes);
 
     /* Lay the file down, every block at generation 0. */
-    int fd = open(PATH, O_RDWR | O_CREAT | O_TRUNC);
+    int fd = open(PATH, O_RDWR | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) { printf("raceprobe: FAIL cannot create %s\n", PATH); return 1; }
     for (i = 0; i < n_blocks; i++) {
         stamp(buf, i, 0);

@@ -36,4 +36,4 @@ struct flock {
 };
 
 /* These alias to open() for now */
-#define creat(path, mode)  open((path), O_WRONLY | O_CREAT | O_TRUNC)
+#define creat(path, mode)  open((path), O_WRONLY | O_CREAT | O_TRUNC, (mode))

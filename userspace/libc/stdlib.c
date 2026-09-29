@@ -1,6 +1,7 @@
 #include "../include/stdlib.h"
 #include "../include/unistd.h"
 #include "../include/string.h"
+#include "../include/errno.h"
 
 /* environ is defined in crt0.asm as a .bss word, exported as a global symbol */
 extern char **environ;
@@ -27,6 +28,10 @@ static blk_t *heap_head = (void *)0;
 
 void *malloc(size_t size) {
     if (!size) return (void *)0;
+
+    /* sbrk() takes an int: anything that cannot be aligned and given a header
+     * without passing INT_MAX would wrap to a tiny (or negative) request. */
+    if (size > 0x7fffffffU - sizeof(blk_t) - 7) { errno = ENOMEM; return (void *)0; }
 
     /* Align to 8 bytes */
     size = (size + 7) & ~(size_t)7;
@@ -128,6 +133,7 @@ void *realloc(void *ptr, size_t size) {
 }
 
 void *calloc(size_t nmemb, size_t size) {
+    if (size && nmemb > (size_t)-1 / size) { errno = ENOMEM; return (void *)0; }
     size_t total = nmemb * size;
     void *p = malloc(total);
     if (p) memset(p, 0, total);
