@@ -18,6 +18,10 @@
 
 #define HEAP_MAGIC  0xDEADBEEFU
 #define ALIGN8(n)   (((n) + 7U) & ~7U)
+/* Largest request whose ALIGN8 + header arithmetic cannot wrap a size_t.
+ * Anything bigger could never fit the heap window anyway; without the bound
+ * ALIGN8 wraps to 0 and first_fit(0) hands back a live 0-byte block. */
+#define HEAP_MAX_REQ ((size_t)-1 - 7U - sizeof(block_header_t) - PAGE_SIZE)
 #define MIN_SPLIT   (sizeof(block_header_t) + 8)
 
 /*
@@ -143,7 +147,7 @@ static size_t expand_pages_for(size_t size) {
 }
 
 void *kmalloc_try(size_t size) {
-    if (!size) return NULL;
+    if (!size || size > HEAP_MAX_REQ) return NULL;
     uint32_t irq = heap_irq_save();
     size_t asz = ALIGN8(size);
     void *r = NULL;
@@ -207,7 +211,7 @@ static void heap_absorb(block_header_t *tail, uint32_t old_end) {
 }
 
 static void *kmalloc_nolock(size_t size) {
-    if (!size) return NULL;
+    if (!size || size > HEAP_MAX_REQ) return NULL;
     size = ALIGN8(size);
 
     block_header_t *b = first_fit(size);
@@ -268,7 +272,8 @@ void kfree(void *ptr) {
 }
 
 void *kcalloc(size_t count, size_t size) {
-    size_t total = count * size;
+    size_t total;
+    if (__builtin_mul_overflow(count, size, &total)) return NULL;
     void *ptr = kmalloc(total);
     if (ptr) {
         uint8_t *p = (uint8_t *)ptr;
