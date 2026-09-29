@@ -111,7 +111,7 @@ void pmm_init(multiboot_info_t *mbi) {
     pmm_bitmap_size = (pmm_bitmap_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
     /* Mark everything as used initially */
-    for (uint32_t i = 0; i < pmm_total / 32 + 1; i++)
+    for (uint32_t i = 0; i < (pmm_total + 31) / 32; i++)
         pmm_bitmap[i] = 0xFFFFFFFF;
     pmm_used = pmm_total;
 
@@ -144,8 +144,12 @@ void pmm_init(multiboot_info_t *mbi) {
     /* Re-mark as used: the bitmap storage */
     pmm_used_region(pmm_bitmap_phys, pmm_bitmap_size);
 
-    /* Re-mark as used: multiboot info struct itself */
-    pmm_used_region((uint32_t)(mbi->mmap_addr), mbi->mmap_length);
+    /* Re-mark as used: the multiboot info struct (kernel_main still reads it
+     * after allocations start — framebuffer_init) and, when present, the
+     * memory map it points at.  Without the flag the mmap fields are garbage. */
+    pmm_used_region((uint32_t)(uintptr_t)mbi - KERNEL_VMA, sizeof(*mbi));
+    if (mbi->flags & MULTIBOOT_FLAG_MMAP)
+        pmm_used_region((uint32_t)(mbi->mmap_addr), mbi->mmap_length);
 
     printk("[PMM] %u MiB total (%u frames), %u free (%u MiB)\n",
            (unsigned)(pmm_total / 256),

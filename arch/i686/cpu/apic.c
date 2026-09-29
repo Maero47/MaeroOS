@@ -1,5 +1,6 @@
 #include "apic.h"
 #include "pit.h"
+#include "percpu.h"
 #include "../mm/paging.h"
 #include "../../../kernel/printk.h"
 #include "../../../kernel/panic.h"
@@ -99,6 +100,15 @@ void apic_init(void) {
     apic_write(LAPIC_REG_TPR, 0);
     lapic_setup_lvts(is_bsp);
     apic_write(LAPIC_REG_SVR, LAPIC_SVR_ENABLE | LAPIC_SPURIOUS_VEC);
+
+    /* The BSP is logical CPU 0 whatever its APIC id: gdt_init/tss_init ran
+     * before the LAPIC was up and built slot 0, and this_cpu_id() must keep
+     * naming that slot once it starts asking the hardware.  (APs are mapped
+     * by smp_boot_aps before they are started.) */
+    if (is_bsp) {
+        percpu_map_apic(apic_id(), 0);
+        cpus[0].online = 1;
+    }
 
     g_apic_ok = 1;
 }

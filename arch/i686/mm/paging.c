@@ -239,7 +239,8 @@ int paging_map(uint32_t virt, uint32_t phys, uint32_t flags) {
 }
 
 static void map_higher_half_physical_memory(void) {
-    uint32_t total_phys = pmm_total_frames() * PAGE_SIZE;
+    /* 64-bit: 4 GiB of frames * PAGE_SIZE would wrap a uint32_t to 0. */
+    uint64_t total_phys = (uint64_t)pmm_total_frames() * PAGE_SIZE;
 
     /*
      * boot.asm already maps the first 4 MiB at KERNEL_VMA.  Extend that direct
@@ -260,7 +261,7 @@ static void map_higher_half_physical_memory(void) {
      * mapping helpers.
      */
     uint32_t direct_max = HEAP_START - KERNEL_VMA;   /* 256 MiB window */
-    uint32_t map_limit  = total_phys < direct_max ? total_phys : direct_max;
+    uint32_t map_limit  = total_phys < direct_max ? (uint32_t)total_phys : direct_max;
 
     /* FATAL by design (audit category (c)): the direct map is built once from
      * paging_init, before the heap and before any process; the kernel cannot
@@ -280,7 +281,7 @@ static void map_higher_half_physical_memory(void) {
 
     printk("[VMM]  RAM: %u MiB total; higher-half direct map covers %u MiB "
            "(rest is high memory via temp maps).\n",
-           (unsigned)(total_phys / (1024U * 1024U)),
+           (unsigned)(total_phys >> 20),
            (unsigned)(map_limit / (1024U * 1024U)));
 }
 
@@ -545,7 +546,15 @@ static void page_fault_handler(registers_t *regs) {
          * flush this CPU's stale entry and retry.  Without this the write would
          * fall through to SIGSEGV (the spurious crash that surfaced once the
          * fill-before-map fix let true thread parallelism run further). */
-        if ((*pte & PAGE_PRESENT) && (*pte & PAGE_WRITABLE) && !(*pte & PAGE_COW)) {
+        /* Only for an access that the entry actually permits: a USER write to
+         * a supervisor page (kernel .data, the recursive page-table window)
+         * is present+writable too, but it is refused by the U/S bit, not by a
+         * stale entry — retrying it would fault forever.  Let it fall through
+         * to SIGSEGV (SEGV_ACCERR). */
+        int user_ok = !(err & 0x4U) ||
+                      ((*pte & PAGE_USER) && (*paging_get_pde(cr2) & PAGE_USER));
+        if (user_ok && (*pte & PAGE_PRESENT) && (*pte & PAGE_WRITABLE) &&
+            !(*pte & PAGE_COW)) {
             tlb_flush_single(cr2 & ~0xFFFU);
             return;
         }

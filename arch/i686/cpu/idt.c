@@ -42,8 +42,10 @@ void idt_init(void) {
     idt_set_gate( 0, (uint32_t)isr0,  0x08, 0x8F);  /* #DE Divide-by-zero */
     idt_set_gate( 1, (uint32_t)isr1,  0x08, 0x8F);  /* #DB Debug */
     idt_set_gate( 2, (uint32_t)isr2,  0x08, 0x8F);  /* NMI */
-    idt_set_gate( 3, (uint32_t)isr3,  0x08, 0x8F);  /* #BP Breakpoint */
-    idt_set_gate( 4, (uint32_t)isr4,  0x08, 0x8F);  /* #OF Overflow */
+    /* #BP and #OF are raised by INT3/INTO, which are checked against the gate
+     * DPL: DPL=3 (as Linux) so a user int3 is a breakpoint (SIGTRAP), not #GP. */
+    idt_set_gate( 3, (uint32_t)isr3,  0x08, 0xEF);  /* #BP Breakpoint */
+    idt_set_gate( 4, (uint32_t)isr4,  0x08, 0xEF);  /* #OF Overflow */
     idt_set_gate( 5, (uint32_t)isr5,  0x08, 0x8F);  /* #BR Bound range exceeded */
     idt_set_gate( 6, (uint32_t)isr6,  0x08, 0x8F);  /* #UD Invalid opcode */
     idt_set_gate( 7, (uint32_t)isr7,  0x08, 0x8F);  /* #NM Device not available */
@@ -108,6 +110,10 @@ void idt_init(void) {
     /* TLB shootdown IPI (vector 0xFD): bare handler, flushes this CPU's TLB. */
     extern void tlb_ipi_isr(void);
     idt_set_gate(0xFD, (uint32_t)tlb_ipi_isr, 0x08, 0x8E);
+
+    /* LAPIC spurious vector (SVR = 0xFF): bare iret, no EOI. */
+    extern void spurious_isr(void);
+    idt_set_gate(0xFF, (uint32_t)spurious_isr, 0x08, 0x8E);
 
     __asm__ volatile("lidt (%0)" :: "r"(&idt_ptr));
 }

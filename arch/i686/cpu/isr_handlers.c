@@ -19,6 +19,7 @@ extern int user_fault_signal(registers_t *regs, int sig);  /* 1=handled, 0=panic
 #define _SIGFPE  8
 #define _SIGSEGV 11
 #define _SIGBUS  7
+#define _SIGTRAP 5
 
 /* Handler table for exceptions 0-31 (filled by isr_install_handler) */
 static isr_handler_t exception_handlers[32];
@@ -83,6 +84,7 @@ void isr_handler(registers_t *regs) {
         int sig;
         switch (regs->int_no) {
             case 0:  case 16: case 19: sig = _SIGFPE;  break; /* div0, x87, SIMD */
+            case 3:                    sig = _SIGTRAP; break; /* int3 breakpoint */
             case 6:                    sig = _SIGILL;  break; /* invalid opcode  */
             case 17:                   sig = _SIGBUS;  break; /* alignment check */
             default:                   sig = _SIGSEGV; break; /* #GP, #SS, #NP … */
