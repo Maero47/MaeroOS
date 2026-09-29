@@ -173,7 +173,9 @@ DISK_SIZE_MB ?= 384
 DISK_IMG     ?= disk.img
 DISK_PRUNE   ?= -path 'testfiles/firefox' -o -path 'testfiles/fflib'
 
-disk: userspace
+# toybox too: testfiles/toybox goes on the disk, and under -j debugfs must not
+# read it while the toybox recipe is still copying it.
+disk: userspace toybox
 	@echo "[DISK]  Building ext2 disk image ($(DISK_SIZE_MB) MiB) -> $(DISK_IMG)..."
 	dd if=/dev/zero bs=1M count=$(DISK_SIZE_MB) 2>/dev/null | tr '\000' '\000' > $(DISK_IMG)
 	$(MKE2FS) -t ext2 -b 1024 -F $(DISK_IMG) 2>/dev/null
@@ -213,7 +215,10 @@ disk: userspace
 testfiles/firefox/firefox-bin:
 	sh ports/firefox/fetch-runtime.sh
 
-disk-ff: testfiles/firefox/firefox-bin
+# userspace/toybox are built here, before the recursive make, so under -j the
+# sub-make's own `disk: userspace toybox` finds them done instead of racing the
+# iso -> initrd branch for the same objects.
+disk-ff: testfiles/firefox/firefox-bin userspace toybox
 	$(MAKE) disk DISK_SIZE_MB=1024 DISK_IMG=disk-ff.img DISK_PRUNE="-path testfiles/nonexistent"
 
 # -accel kvm when this user can open /dev/kvm (native speed, real CPU), else TCG.
@@ -309,6 +314,11 @@ abiprobes:
 # The disk is a dependency because p26_unlink_frees_space measures real ext2
 # free space; every other probe runs out of the initrd alone.
 smoke-abi: $(TARGET) abiprobes initrd disk
+
+# initrd and disk pack testfiles/abiprobes/, so under -j they must wait for it.
+ifneq ($(filter smoke-abi,$(MAKECMDGOALS)),)
+initrd disk: | abiprobes
+endif
 	python3 tools/smoke_abi.py
 
 # Does Firefox 115 paint a window on the desktop?  Boots the ISO with the
@@ -406,6 +416,7 @@ stop-iso:
 
 # Generate a bootable ISO (requires grub-mkrescue or i686-elf-grub-mkrescue + xorriso)
 iso: $(TARGET) initrd
+	@test -n "$(GRUB_MKRESCUE)" || { echo "iso: need grub-mkrescue (grub-common grub-pc-bin xorriso mtools)"; exit 1; }
 	mkdir -p isodir/boot/grub
 	cp $(TARGET) isodir/boot/
 	cp initrd.tar isodir/boot/
@@ -416,9 +427,9 @@ iso: $(TARGET) initrd
 clean:
 	find kernel arch/i686 mm fs drivers proc lib net third_party/lwip/src \
 		\( -name "*.o" -o -name "*.d" \) -delete 2>/dev/null || true
-	rm -f $(TARGET) maeros.iso initrd.tar disk.img $(QEMU_ISO_PID)
+	rm -f $(TARGET) maeros.iso initrd.tar disk.img disk-ff.img $(QEMU_ISO_PID)
 	rm -rf isodir
 	$(MAKE) -C userspace clean
 
 # Pull in auto-generated dependency files (silence errors if none exist yet)
--include $(C_OBJS:.o=.d)
+-include $(C_OBJS:.o=.d) $(LWIP_OBJS:.o=.d)
