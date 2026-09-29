@@ -117,6 +117,7 @@ testfiles/awk
 /testfiles/settings
 /testfiles/shell
 /testfiles/shmprobe
+/testfiles/memprobe
 /testfiles/shutdown
 /testfiles/sleep
 /testfiles/sockprobe
