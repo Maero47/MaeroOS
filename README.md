@@ -288,7 +288,9 @@ not installed, downloads exactly those with `apt-get download`, which checks eac
 against the signed archive index, unpacks them with `dpkg-deb -x` into `~/opt/hostpkgs`,
 and writes wrapper scripts into `~/opt/bin` that add what the relocated binaries need:
 the library path, `-L` firmware directories and `QEMU_MODULE_DIR` for QEMU,
-`-d ~/opt/hostpkgs/usr/lib/grub/i386-pc` for `grub-mkrescue`, `M4=` for bison and flex,
+`-d ~/opt/hostpkgs/usr/lib/grub/i386-pc` for `grub-mkrescue` and `grub-mkimage` (also
+written around the system binary when `grub-common` is installed without `grub-pc-bin`,
+which otherwise builds an EFI-only ISO that QEMU cannot boot), `M4=` for bison and flex,
 `PERL5LIB` for `makeinfo`. If the host has no C/C++ compiler, the self-contained musl.cc
 `x86_64-linux-musl-native` toolchain is fetched into `~/opt` and exposed as `cc`/`c++`
 wrappers that link statically (its dynamic loader is not installed on the host); the
@@ -306,8 +308,10 @@ system tool of the same name if one exists, a wrapper that a package supersedes 
 rewritten as a plain hand-off on the next `--no-sudo` run, and `--sudo` or `--apt`
 deletes those files outright. GRUB is the one exception: its wrappers keep precedence
 until the system GRUB also has its BIOS modules in `/usr/lib/grub/i386-pc`, because
-without them it cannot build the ISO. `--check` lists which tools come from wrappers and
-which of those are already superseded.
+without them it cannot build the ISO; `--check` fails while the `grub-mkrescue` on `PATH`
+cannot reach BIOS modules. `make iso` passes the relocated modules with `-d` itself when
+`~/opt/bin` is not on `PATH`, and stops with the fix when there are none. `--check` lists
+which tools come from wrappers and which of those are already superseded.
 
 `make initrd` also builds toybox from `third_party/toybox/.config.maeros`, the applet set
 that compiles and links against the MaeroOS libc (about 100 applets; the rest need

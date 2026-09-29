@@ -88,6 +88,7 @@ SED     = $(shell command -v gsed 2>/dev/null || echo sed)
 GCC_INCLUDE := $(shell $(CC) -print-file-name=include 2>/dev/null)
 TOYBOX_DIR := third_party/toybox
 GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null)
+GRUB_BIOS_MODULES := $(HOME)/opt/hostpkgs/usr/lib/grub/i386-pc
 TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 	-nostdlib -nostdinc -static -ffreestanding -fno-builtin \
 	-fno-pic -fno-pie -mno-sse -mno-mmx -mno-sse2 \
@@ -422,7 +423,23 @@ iso: $(TARGET) initrd
 	cp initrd.tar isodir/boot/
 	printf 'serial --unit=0 --speed=115200\nterminal_input serial console\nterminal_output serial console\nset timeout=1\nset gfxpayload=1920x1080x32\nmenuentry "MaeroOS" {\n    multiboot /boot/kernel.elf\n    module /boot/initrd.tar\n    boot\n}\n' \
 		> isodir/boot/grub/grub.cfg
-	$(GRUB_MKRESCUE) -o maeros.iso isodir
+	@# A distro grub-mkrescue without grub-pc-bin makes an EFI-only ISO that
+	@# SeaBIOS cannot boot.  Point it at tools/setup-linux.sh --no-sudo's
+	@# relocated BIOS modules, or stop.  Scripts (its wrappers) and Homebrew's
+	@# i686-elf-grub-mkrescue already know where their modules are.
+	@g="$(GRUB_MKRESCUE)"; d=""; \
+	if [ "$${g##*/}" = grub-mkrescue ] && [ "$$(head -c 2 "$$g")" != '#!' ]; then \
+		r=$$(readlink -f "$$g" 2>/dev/null || echo "$$g"); \
+		if [ ! -d "$${r%/bin/*}/lib/grub/i386-pc" ]; then \
+			if [ -d "$(GRUB_BIOS_MODULES)" ]; then d="$(GRUB_BIOS_MODULES)"; else \
+				echo "iso: $$g has no BIOS modules ($${r%/bin/*}/lib/grub/i386-pc); the ISO would not boot in QEMU."; \
+				echo "iso: fix with 'sudo apt install grub-pc-bin' or 'tools/setup-linux.sh --no-sudo'"; \
+				exit 1; \
+			fi; \
+		fi; \
+	fi; \
+	echo "$$g $${d:+-d $$d }-o maeros.iso isodir"; \
+	"$$g" $${d:+-d "$$d"} -o maeros.iso isodir
 
 clean:
 	find kernel arch/i686 mm fs drivers proc lib net third_party/lwip/src \
