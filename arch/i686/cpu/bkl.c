@@ -27,20 +27,34 @@ static uint32_t g_solo_id;
 static int      g_solo_valid;
 static volatile int g_multi_cpu;
 
+/* Local APIC id -> logical CPU index.  0xFF = never started by us. */
+static uint8_t g_apic_to_cpu[256] = { [0 ... 255] = 0xFF };
+
 void smp_percpu_go_multi(void) { g_multi_cpu = 1; }
+
+void percpu_map_apic(uint32_t apicid, uint32_t idx) {
+    if (apicid > 255 || idx >= MAX_CPUS) return;
+    cpus[idx].apicid = apicid;
+    g_apic_to_cpu[apicid] = (uint8_t)idx;
+}
+
+static inline uint32_t apic_to_cpu(uint32_t apicid) {
+    uint8_t idx = g_apic_to_cpu[apicid & 0xFF];
+    /* Only CPUs we started execute kernel code, and each is mapped before it
+     * starts, so an unmapped id cannot occur; 0 keeps the old fallback. */
+    return idx < MAX_CPUS ? idx : 0;
+}
 
 uint32_t this_cpu_id(void) {
     if (!apic_available()) return 0;
     if (!g_multi_cpu) {
         if (!g_solo_valid) {
-            uint32_t boot = apic_id();
-            g_solo_id    = boot < MAX_CPUS ? boot : 0;
+            g_solo_id    = apic_to_cpu(apic_id());
             g_solo_valid = 1;
         }
         return g_solo_id;
     }
-    uint32_t id = apic_id();
-    return id < MAX_CPUS ? id : 0;
+    return apic_to_cpu(apic_id());
 }
 
 /*

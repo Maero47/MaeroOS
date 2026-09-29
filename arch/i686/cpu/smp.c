@@ -29,9 +29,7 @@ extern uint32_t kernel_pgdir_phys;
 #define TRAMP_PHYS   0x8000U
 #define TRAMP_VIRT   (0xC0000000U + TRAMP_PHYS)   /* direct map of phys 0x8000 */
 #define AP_STACK_SZ  (16U * 1024U)
-#define MAX_CPUS     8
 
-static volatile int      g_ap_alive = 0;     /* set by the AP that just booted  */
 static volatile uint32_t g_cpu_count = 1;    /* BSP only, until APs come online  */
 
 /* The BSP sets this once the process table is fully populated (init created) and
@@ -50,14 +48,24 @@ static inline void flush_local_tlb(void) {
     __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
 }
 
-/* Called from the bare TLB IPI stub (no BKL) and from spin loops. */
+/* Called from the bare TLB IPI stub (no BKL), at every trap entry and from
+ * spin loops.  Sample the request generation BEFORE flushing and ack exactly
+ * that sample: every request posted before the sample is covered by the flush
+ * that follows it, and a request posted after it stays unacked until the next
+ * serve.  Interrupts are held off so a nested IPI cannot ack a newer
+ * generation and then have this frame overwrite it with the older one. */
 void tlb_serve_pending(void) {
+    uint32_t fl;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
     struct cpu *c = &cpus[this_cpu_id()];
-    if (c->tlb_pending) {
-        flush_local_tlb();
-        c->tlb_pending = 0;
+    uint32_t req = c->tlb_req_gen;
+    if (req != c->tlb_ack_gen) {
         __sync_synchronize();
+        flush_local_tlb();
+        __sync_synchronize();
+        c->tlb_ack_gen = req;
     }
+    if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
 }
 
 /* C half of the TLB IPI (called from tlb_ipi_isr; must NOT take the BKL — the
@@ -67,61 +75,63 @@ void tlb_ipi_handler(void) {
     apic_eoi();
 }
 
-/* DEBUG counters: confirm shootdowns are delivered + acked, not timing out. */
+/* DEBUG counters: shootdowns sent, IPIs re-sent to a slow target, acks. */
 volatile uint32_t g_tlb_sends = 0, g_tlb_timeouts = 0, g_tlb_acks = 0;
 
-/* Force every other online CPU to flush its TLB before we return.  Holds while
- * spinning: a target either takes the IPI (running user, IF=1) or clears its
- * flag via tlb_serve_pending() in its bkl/idle spin (IF=0) — deadlock-free. */
+static void tlb_ipi_to(uint32_t apicid) {
+    /* Fixed delivery, physical destination, edge, assert. */
+    apic_write(LAPIC_REG_ICR_HI, apicid << 24);
+    apic_write(LAPIC_REG_ICR_LO, TLB_IPI_VECTOR | (1U << 14));
+}
+
+/* Force every other online CPU to flush its TLB before we return.
+ *
+ * CRITICAL FOR CORRECTNESS: the caller is about to free/reuse the flushed
+ * frames, so this never returns before every target has acked a generation at
+ * least as new as the one posted here — giving up on a laggard is a
+ * use-after-free.  A target always gets there: running user code (IF=1) it
+ * takes the IPI; in the kernel it is either spinning for the BKL we hold or
+ * idling, and both loops call tlb_serve_pending(); every trap entry serves as
+ * well.  The LAPIC coalesces a same-vector edge IPI that arrives while one is
+ * still pending, so a slow target is re-sent the IPI periodically instead. */
 void tlb_shootdown(void) {
     if (!apic_available() || g_cpu_count < 2) return;
     uint32_t self = this_cpu_id();
+    uint32_t want[MAX_CPUS];
+    int      target[MAX_CPUS];
     g_tlb_sends++;
 
-    for (uint32_t id = 0; id < g_cpu_count && id < MAX_CPUS; id++)
-        if (id != self) cpus[id].tlb_pending = 1;
-    __sync_synchronize();
+    for (uint32_t id = 0; id < MAX_CPUS; id++) {
+        target[id] = id != self && cpus[id].online;
+        if (target[id])
+            want[id] = __sync_add_and_fetch(&cpus[id].tlb_req_gen, 1);
+    }
 
     /* IPI all-excluding-self, fixed delivery, edge, vector TLB_IPI_VECTOR. */
     apic_write(LAPIC_REG_ICR_HI, 0);
     apic_write(LAPIC_REG_ICR_LO, TLB_IPI_VECTOR | (1U << 14) | (3U << 18));
 
-    /* Wait for every other CPU to acknowledge.  CRITICAL FOR CORRECTNESS: the
-     * caller is about to free/reuse the flushed frames, so we must NOT proceed
-     * until the target has actually flushed — giving up on a stale entry is a
-     * use-after-free (memory corruption).  The LAPIC coalesces rapid same-vector
-     * edge IPIs, so a target running in user mode can miss the edge and never
-     * flush; therefore RE-SEND the IPI periodically to any laggard instead of
-     * timing out.  Deadlock-free: targets spinning in the kernel (IF=0) clear
-     * their flag via tlb_serve_pending() in their bkl/idle spins. */
-    for (uint32_t id = 0; id < g_cpu_count && id < MAX_CPUS; id++) {
-        if (id == self) continue;
-        uint32_t s = 0, resends = 0;
-        while (cpus[id].tlb_pending) {
-            /* One quick re-send early (handles a coalesced/missed edge IPI to a
-             * user-mode target) then bounded wait — re-sending repeatedly here
-             * holds the BKL too long and explodes stall latency, and the residual
-             * corruption is NOT from shootdown timeouts anyway. */
-            if (s == 0x40000 && resends == 0) {
-                resends = 1; g_tlb_timeouts++;
-                apic_write(LAPIC_REG_ICR_HI, 0);
-                apic_write(LAPIC_REG_ICR_LO,
-                           TLB_IPI_VECTOR | (1U << 14) | (3U << 18));
+    for (uint32_t id = 0; id < MAX_CPUS; id++) {
+        if (!target[id]) continue;
+        uint32_t s = 0;
+        int warned = 0;
+        while ((int32_t)(cpus[id].tlb_ack_gen - want[id]) < 0) {
+            /* A concurrent sender (none today: callers hold the BKL) would be
+             * waiting on us; serving our own requests keeps that deadlock-free. */
+            tlb_serve_pending();
+            if ((++s & 0x3FFFFU) == 0) {
+                g_tlb_timeouts++;
+                tlb_ipi_to(cpus[id].apicid);
+                if (s >= 0x10000000U && !warned) {
+                    warned = 1;
+                    printk("[SMP]  TLB shootdown: CPU %u slow to ack (gen %u/%u), still waiting\n",
+                           (unsigned)id, (unsigned)cpus[id].tlb_ack_gen,
+                           (unsigned)want[id]);
+                }
             }
-            /* Give up the active wait after a bounded spin — but DO NOT clear
-             * tlb_pending.  Leaving it set means the target CPU will flush this
-             * request itself the next time it serves pending: in any kernel spin
-             * (bkl/idle) AND now at every trap entry (tlb_serve_pending in the
-             * ISR stubs), i.e. by its next timer tick (≤10 ms) at the latest, and
-             * GUARANTEED (the flag persists until serviced).  Previously we
-             * cleared the flag here, so a target that missed the IPI never
-             * flushed until its next CR3 reload (a context switch, up to a full
-             * timeslice later) → long-lived stale TLB → the residual corruption.
-             * Backstop heals it fast without holding the BKL longer (no stalls). */
-            if (++s >= 2000000U) break;
             __asm__ volatile("pause");
         }
-        if (!cpus[id].tlb_pending) g_tlb_acks++; else g_tlb_timeouts++;
+        g_tlb_acks++;
     }
 }
 
@@ -157,7 +167,12 @@ void ap_entry(void) {
     fpu_init();                  /* CR0/CR4 are per-CPU: enable SSE+OSFXSR   *
                                   * here too, else user SSE #UDs on the AP.  */
 
-    g_ap_alive = 1;              /* tell the BSP we made it                  */
+    /* Tell the BSP we made it — unless it already gave up on us.  An AP the
+     * BSP has written off is not counted online, so no TLB shootdown would
+     * ever reach it: it must never run threads.  Park it for good. */
+    struct cpu *me = &cpus[this_cpu_id()];
+    if (__sync_val_compare_and_swap(&me->boot_state, 0, 1) != 0)
+        for (;;) __asm__ volatile("cli; hlt");
 
     /* Wait until the BSP has finished building the process table and is about
      * to enter the scheduler — only then is it safe to scan ptable.  Spin
@@ -174,6 +189,16 @@ void ap_entry(void) {
     /* Enter the scheduler holding the BKL, exactly like the BSP does.  From
      * here on this CPU runs kernel code only under the BKL and user code
      * concurrently.  scheduler_start never returns. */
+    /* Only now does this CPU become a TLB-shootdown target.  Until here it ran
+     * on the kernel pgdir alone, so it cannot hold a stale user translation,
+     * and it spun with interrupts off (calibrating against the PIT) where it
+     * could not ack: counting it earlier let a shootdown on the BSP wait for
+     * it with the BKL held and IF=0 — no PIT tick, so no calibration, so no
+     * ack, forever.  A sender that snapshotted its targets just before this
+     * store is still safe: we acquire the BKL (which it holds) before our
+     * first user CR3 load, and that load starts us with a clean TLB. */
+    me->online = 1;
+    __sync_synchronize();
     bkl_acquire();
     __asm__ volatile("sti");     /* allow this CPU's own exceptions/syscalls */
     scheduler_start();
@@ -181,7 +206,7 @@ void ap_entry(void) {
 }
 
 /* ── bring up one AP via INIT-SIPI-SIPI ─────────────────────────────────── */
-static int boot_one_ap(uint8_t apicid) {
+static int boot_one_ap(uint8_t apicid, uint32_t idx) {
     /* Stage the trampoline at physical 0x8000 (reached via the direct map). */
     uint32_t len = (uint32_t)(ap_trampoline_end - ap_trampoline_start);
     for (uint32_t i = 0; i < len; i++)
@@ -208,7 +233,10 @@ static int boot_one_ap(uint8_t apicid) {
         return 0;                  /* this AP stays offline; the BSP runs on */
     }
 
-    g_ap_alive = 0;
+    /* Give the AP its logical slot before it runs any kernel code: its first
+     * this_cpu_id() (gdt_init_ap) must already name it. */
+    cpus[idx].boot_state = 0;
+    percpu_map_apic(apicid, idx);
 
     /* INIT (assert), wait 10 ms, then two STARTUP IPIs with the vector = the
      * trampoline page number (0x8000 >> 12 = 0x08). */
@@ -219,9 +247,13 @@ static int boot_one_ap(uint8_t apicid) {
     send_ipi(apicid, 0x00004600U | (TRAMP_PHYS >> 12));   /* STARTUP #2       */
 
     /* Wait up to ~200 ms for the AP to signal alive. */
-    for (int i = 0; i < 20 && !g_ap_alive; i++) delay_ms(10);
+    for (int i = 0; i < 20 && cpus[idx].boot_state != 1; i++) delay_ms(10);
 
-    if (!g_ap_alive) { kfree(stack); return 0; }
+    /* Give up — atomically, so an AP arriving right now either made it (1) or
+     * will see 2 and park itself.  An abandoned AP may still be running on its
+     * stack, so that is deliberately leaked, and its slot is never reused. */
+    if (__sync_val_compare_and_swap(&cpus[idx].boot_state, 0, 2) != 1)
+        return 0;
     return 1;
 }
 
@@ -233,15 +265,17 @@ uint32_t smp_boot_aps(void) {
     uint32_t bsp = apic_id();
 
     /* APIC IDs for QEMU -smp N are 0..N-1; probe every id except the BSP's. */
-    for (uint32_t id = 0; id < hint; id++) {
+    uint32_t next_idx = 1;              /* logical slot 0 is the BSP */
+    for (uint32_t id = 0; id < hint && next_idx < MAX_CPUS; id++) {
         if (id == bsp) continue;
         /* From here a second CPU may execute kernel code, so this_cpu_id() must
          * go back to asking the hardware.  Before the AP is started, not after:
          * the AP's very first kernel code calls it. */
         smp_percpu_go_multi();
-        if (boot_one_ap((uint8_t)id)) {
-            g_cpu_count++;
-            printk("[SMP]  CPU %u (apic id %u) online\n", (unsigned)g_cpu_count - 1, (unsigned)id);
+        uint32_t idx = next_idx++;
+        if (boot_one_ap((uint8_t)id, idx)) {
+            g_cpu_count++;           /* it marks itself online (ap_entry) */
+            printk("[SMP]  CPU %u (apic id %u) online\n", (unsigned)idx, (unsigned)id);
         } else {
             printk("[SMP]  CPU apic id %u did NOT come up\n", (unsigned)id);
         }
