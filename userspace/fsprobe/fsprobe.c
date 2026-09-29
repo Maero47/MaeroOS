@@ -8,6 +8,9 @@
  *   - FIFO: open/close/reopen must keep using a live buffer (the buffer used to
  *     be freed on the last close while the node still pointed at it).
  *   - ext2: repeated lookups of one file must not grow the kernel heap.
+ *   - mmap: after a MAP_SHARED mapping is gone and the file is rewritten with
+ *     write(), a new mapping must see the new bytes (the shared-frame registry
+ *     used to keep serving its first copy).
  *
  * Prints "fsprobe ok" when everything holds, "fsprobe FAIL: ..." otherwise.
  */
@@ -16,6 +19,7 @@
 #include "../include/stdio.h"
 #include "../include/string.h"
 #include "../include/syscall.h"
+#include "../include/sys/mman.h"
 #include "../include/sys/stat.h"
 #include "../include/unistd.h"
 
@@ -29,6 +33,13 @@ static void fail(const char *what) {
 /* Raw pwrite64 (EAX=181): the libc here has no wrapper.  Returns -errno. */
 static int raw_pwrite(int fd, const void *buf, unsigned len, unsigned off) {
     return syscall4(181, fd, (int)buf, (int)len, (int)off);
+}
+
+/* Old-style mmap (EAX=90, argument block); the libc mmap is a malloc stub. */
+static void *raw_mmap(unsigned len, int prot, int flags, int fd) {
+    unsigned a[6] = { 0, len, (unsigned)prot, (unsigned)flags, (unsigned)fd, 0 };
+    int r = syscall1(90, (int)a);
+    return (r < 0 && r > -4096) ? (void *)0 : (void *)r;
 }
 
 static void check_tmpfs(void) {
@@ -186,11 +197,57 @@ static void check_ext2_lookup_leak(void) {
     if (grew > 1024) fail("ext2 lookups leak kernel memory");
 }
 
+static void check_mmap_after_write(const char *path) {
+    int fd = open(path, O_CREAT | O_TRUNC | O_RDWR);
+    if (fd < 0) { printf("fsprobe FAIL: open %s\n", path); fails++; return; }
+    if (write(fd, "old-bytes", 9) != 9) fail("mmap test write old");
+    close(fd);
+
+    int pid = fork();
+    if (pid == 0) {
+        int cfd = open(path, O_RDONLY);
+        char *m = cfd >= 0 ? (char *)raw_mmap(4096, PROT_READ, MAP_SHARED, cfd) : 0;
+        int ok = m && memcmp(m, "old-bytes", 9) == 0;
+        if (m) syscall2(91, (int)m, 4096);
+        _exit(ok ? 0 : 1);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    if (st != 0) { printf("fsprobe FAIL: shared map of %s\n", path); fails++; }
+
+    fd = open(path, O_CREAT | O_TRUNC | O_RDWR);
+    if (fd < 0 || write(fd, "new-bytes", 9) != 9) fail("mmap test write new");
+    if (fd >= 0) close(fd);
+
+    char rd[16];
+    memset(rd, 0, sizeof(rd));
+    fd = open(path, O_RDONLY);
+    if (fd < 0) { fail("mmap test reopen"); return; }
+    if (read(fd, rd, 9) != 9) fail("mmap test read");
+    char *m = (char *)raw_mmap(4096, PROT_READ, MAP_PRIVATE, fd);
+    if (!m) fail("mmap test private map");
+    else {
+        if (memcmp(m, rd, 9) != 0 || memcmp(rd, "new-bytes", 9) != 0) {
+            printf("fsprobe FAIL: %s mapping shows '%.9s', read() shows '%.9s'\n",
+                   path, m, rd);
+            fails++;
+        } else {
+            printf("fsprobe mmap after rewrite of %s sees new bytes\n", path);
+        }
+        syscall2(91, (int)m, 4096);
+    }
+    close(fd);
+    unlink(path);
+}
+
 int main(void) {
     check_tmpfs();
     check_symlinks();
     check_fifo();
     check_ext2_lookup_leak();
+    check_mmap_after_write("/tmp/fsp.map");
+    struct stat st;
+    if (stat("/disk", &st) == 0) check_mmap_after_write("/disk/fsp.map");
     unlink("/tmp/fsp.bin");
     if (fails) {
         printf("fsprobe FAIL (%d)\n", fails);
