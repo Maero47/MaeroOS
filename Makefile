@@ -88,6 +88,7 @@ SED     = $(shell command -v gsed 2>/dev/null || echo sed)
 GCC_INCLUDE := $(shell $(CC) -print-file-name=include 2>/dev/null)
 TOYBOX_DIR := third_party/toybox
 GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null)
+GRUB_BIOS_MODULES := $(HOME)/opt/hostpkgs/usr/lib/grub/i386-pc
 TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 	-nostdlib -nostdinc -static -ffreestanding -fno-builtin \
 	-fno-pic -fno-pie -mno-sse -mno-mmx -mno-sse2 \
@@ -124,8 +125,11 @@ toybox: userspace
 	# Fresh checkout: generated/ (gitignored) is created here, which would make
 	# the committed .config.maeros look stale and trigger silentoldconfig, whose
 	# kconfig/conf sources are not in the tree.  Generate first, then re-date the
-	# config so the main build never tries to reconfigure.
-	$(MAKE) -C $(TOYBOX_DIR) generated/Config.in generated/Config.probed generated/unstripped/kconfig SED=$(SED) HOSTCC=cc && touch $(TOYBOX_DIR)/.config.maeros
+	# config so the main build never tries to reconfigure.  Only ask for
+	# generated/Config.in: scripts/genconfig.sh writes Config.probed and
+	# unstripped/kconfig as side effects, and toybox has no rule for kconfig, so
+	# naming it as a goal fails under -j before genconfig has run.
+	$(MAKE) -C $(TOYBOX_DIR) generated/Config.in SED=$(SED) HOSTCC=cc && touch $(TOYBOX_DIR)/.config.maeros
 	$(MAKE) -C $(TOYBOX_DIR) toybox \
 		KCONFIG_CONFIG=.config.maeros \
 		SED=$(SED) \
@@ -170,7 +174,9 @@ DISK_SIZE_MB ?= 384
 DISK_IMG     ?= disk.img
 DISK_PRUNE   ?= -path 'testfiles/firefox' -o -path 'testfiles/fflib'
 
-disk: userspace
+# toybox too: testfiles/toybox goes on the disk, and under -j debugfs must not
+# read it while the toybox recipe is still copying it.
+disk: userspace toybox
 	@echo "[DISK]  Building ext2 disk image ($(DISK_SIZE_MB) MiB) -> $(DISK_IMG)..."
 	dd if=/dev/zero bs=1M count=$(DISK_SIZE_MB) 2>/dev/null | tr '\000' '\000' > $(DISK_IMG)
 	$(MKE2FS) -t ext2 -b 1024 -F $(DISK_IMG) 2>/dev/null
@@ -210,7 +216,10 @@ disk: userspace
 testfiles/firefox/firefox-bin:
 	sh ports/firefox/fetch-runtime.sh
 
-disk-ff: testfiles/firefox/firefox-bin
+# userspace/toybox are built here, before the recursive make, so under -j the
+# sub-make's own `disk: userspace toybox` finds them done instead of racing the
+# iso -> initrd branch for the same objects.
+disk-ff: testfiles/firefox/firefox-bin userspace toybox
 	$(MAKE) disk DISK_SIZE_MB=1024 DISK_IMG=disk-ff.img DISK_PRUNE="-path testfiles/nonexistent"
 
 # -accel kvm when this user can open /dev/kvm (native speed, real CPU), else TCG.
@@ -308,6 +317,11 @@ abiprobes:
 smoke-abi: $(TARGET) abiprobes initrd disk
 	python3 tools/smoke_abi.py
 
+# initrd and disk pack testfiles/abiprobes/, so under -j they must wait for it.
+ifneq ($(filter smoke-abi,$(MAKECMDGOALS)),)
+initrd disk: | abiprobes
+endif
+
 # Does Firefox 115 paint a window on the desktop?  Boots the ISO with the
 # Firefox disk headless (KVM when available), lets the desktop launch ff, and
 # judges PASS/FAIL from the serial console.  Artifacts (serial log, screendump,
@@ -403,19 +417,36 @@ stop-iso:
 
 # Generate a bootable ISO (requires grub-mkrescue or i686-elf-grub-mkrescue + xorriso)
 iso: $(TARGET) initrd
+	@test -n "$(GRUB_MKRESCUE)" || { echo "iso: need grub-mkrescue (grub-common grub-pc-bin xorriso mtools)"; exit 1; }
 	mkdir -p isodir/boot/grub
 	cp $(TARGET) isodir/boot/
 	cp initrd.tar isodir/boot/
 	printf 'serial --unit=0 --speed=115200\nterminal_input serial console\nterminal_output serial console\nset timeout=1\nset gfxpayload=1920x1080x32\nmenuentry "MaeroOS" {\n    multiboot /boot/kernel.elf\n    module /boot/initrd.tar\n    boot\n}\n' \
 		> isodir/boot/grub/grub.cfg
-	$(GRUB_MKRESCUE) -o maeros.iso isodir
+	@# A distro grub-mkrescue without grub-pc-bin makes an EFI-only ISO that
+	@# SeaBIOS cannot boot.  Point it at tools/setup-linux.sh --no-sudo's
+	@# relocated BIOS modules, or stop.  Scripts (its wrappers) and Homebrew's
+	@# i686-elf-grub-mkrescue already know where their modules are.
+	@g="$(GRUB_MKRESCUE)"; d=""; \
+	if [ "$${g##*/}" = grub-mkrescue ] && [ "$$(head -c 2 "$$g")" != '#!' ]; then \
+		r=$$(readlink -f "$$g" 2>/dev/null || echo "$$g"); \
+		if [ ! -d "$${r%/bin/*}/lib/grub/i386-pc" ]; then \
+			if [ -d "$(GRUB_BIOS_MODULES)" ]; then d="$(GRUB_BIOS_MODULES)"; else \
+				echo "iso: $$g has no BIOS modules ($${r%/bin/*}/lib/grub/i386-pc); the ISO would not boot in QEMU."; \
+				echo "iso: fix with 'sudo apt install grub-pc-bin' or 'tools/setup-linux.sh --no-sudo'"; \
+				exit 1; \
+			fi; \
+		fi; \
+	fi; \
+	echo "$$g $${d:+-d $$d }-o maeros.iso isodir"; \
+	"$$g" $${d:+-d "$$d"} -o maeros.iso isodir
 
 clean:
 	find kernel arch/i686 mm fs drivers proc lib net third_party/lwip/src \
 		\( -name "*.o" -o -name "*.d" \) -delete 2>/dev/null || true
-	rm -f $(TARGET) maeros.iso initrd.tar disk.img $(QEMU_ISO_PID)
+	rm -f $(TARGET) maeros.iso initrd.tar disk.img disk-ff.img $(QEMU_ISO_PID)
 	rm -rf isodir
 	$(MAKE) -C userspace clean
 
 # Pull in auto-generated dependency files (silence errors if none exist yet)
--include $(C_OBJS:.o=.d)
+-include $(C_OBJS:.o=.d) $(LWIP_OBJS:.o=.d)

@@ -38,7 +38,36 @@ def send(proc, text):
     proc.stdin.flush()
 
 
+# Probes this suite runs, the port script(s) whose static libraries each one is
+# linked against (the source is ports/gtk/<name>.c).  glibprobe is committed; the other three are
+# gitignored (tens of MB each) and no script in the tree links them — they are
+# built by hand inside the maeros-gtkbuild container (ports/gtk/Dockerfile.gtk*)
+# against /sysroot after the build-*.sh scripts below have filled it.
+PROBES = [
+    ("glibprobe", "ports/gtk/build-glib.sh"),
+    ("cairoprobe", "ports/gtk/build-glib.sh + build-cairo.sh"),
+    ("pangoprobe", "ports/gtk/build-glib.sh + build-cairo.sh + build-pango.sh"),
+    ("gtkprobe", "ports/gtk/build-glib.sh + build-cairo.sh + build-pango.sh + build-gtk.sh"),
+]
+
+
+def check_probes():
+    missing = [(name, deps) for name, deps in PROBES
+               if not os.path.isfile(os.path.join(ROOT, "testfiles", name))]
+    if not missing:
+        return
+    lines = ["missing GTK-stack probe binaries (not in git; nothing was run):"]
+    for name, deps in missing:
+        lines.append(f"  testfiles/{name}: link ports/gtk/{name}.c against the "
+                     f"libraries {deps} installs into /sysroot")
+    lines.append("  build them inside the maeros-gtkbuild container "
+                 "(ports/gtk/Dockerfile.gtk*), copy them into testfiles/, "
+                 "then rerun make smoke-gtk")
+    raise FileNotFoundError("\n".join(lines))
+
+
 def main():
+    check_probes()
     # The GTK-stack probes are large and live on the ext2 DISK (not the initrd,
     # which sits in RAM).  Boot with the disk attached and run them from /disk.
     subprocess.run(["make", "initrd", "disk"], cwd=ROOT, check=True,

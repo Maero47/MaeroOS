@@ -293,6 +293,12 @@ native_ok() { [ -x "$NATIVE_DIR/bin/gcc" ] && [ -x "$NATIVE_DIR/bin/g++" ]; }
 host_compiler_ok() {
     { host_has gcc && host_has g++; } || { host_has cc && host_has c++; }
 }
+# The grub-mkrescue on $BUILD_PATH is our wrapper and hands the relocated
+# modules to it with -d.
+grub_wrapper_ok() {
+    gm=$(PATH="$BUILD_PATH" command -v grub-mkrescue 2>/dev/null) || return 1
+    [ "$gm" = "$BIN_DIR/grub-mkrescue" ] && grep -q -- "-d \"$HOSTPKGS_DIR/usr/lib/grub/i386-pc\"" "$gm"
+}
 grub_modules_dir() {
     for d in /usr/lib/grub/i386-pc "$HOSTPKGS_DIR/usr/lib/grub/i386-pc"; do
         [ -d "$d" ] && { echo "$d"; return 0; }
@@ -467,6 +473,12 @@ write_wrapper() {
     for d in usr/bin usr/sbin bin sbin; do
         [ -x "$HOSTPKGS_DIR/$d/$name" ] && { real="$HOSTPKGS_DIR/$d/$name"; break; }
     done
+    # A system grub-common without grub-pc-bin: apt had no reason to unpack
+    # grub-mkrescue, only the modules, so wrap the system binary itself and
+    # point it at the relocated modules.
+    if [ -z "$real" ] && [ -n "$extra" ]; then
+        case "$name" in grub-*) real=$(PATH="$SYS_PATH" command -v "$name" 2>/dev/null) || real="" ;; esac
+    fi
     [ -n "$real" ] || return 0
     libs=""
     if ldd "$real" 2>/dev/null | grep -q 'not found'; then
@@ -520,7 +532,7 @@ export BISON_PKGDATADIR=\"$HOSTPKGS_DIR/usr/share/bison\""
     for name in $(printf '%s' "$NOSUDO_WRAP" | tr '\n' ' '); do
         case "$name" in
         qemu-system-*)      write_wrapper "$name" "$qemu_env" "$qemu_l" ;;
-        grub-mkrescue)      write_wrapper "$name" "" "$grub_d" ;;
+        grub-mkrescue|grub-mkimage) write_wrapper "$name" "" "$grub_d" ;;
         bison)              write_wrapper "$name" "$bison_env" "" ;;
         flex)               write_wrapper "$name" "$m4_env" "" ;;
         makeinfo|texi2any)  write_wrapper "$name" "$perl_env" "" ;;
@@ -672,7 +684,12 @@ verify() {
     check_tool shellcheck        0 "apt: shellcheck, or --no-sudo (lint tools/*.sh)"
 
     if gdir=$(grub_modules_dir); then
-        printf '  [ ok ]   %-24s %s\n' "grub i386-pc modules" "$gdir"
+        if [ "$gdir" = /usr/lib/grub/i386-pc ] || grub_wrapper_ok; then
+            printf '  [ ok ]   %-24s %s\n' "grub i386-pc modules" "$gdir"
+        else
+            printf '  [MISSING] %-23s %s\n' "grub i386-pc modules" "$gdir is unused: no $BIN_DIR/grub-mkrescue passes -d; re-run --no-sudo, or apt: grub-pc-bin"
+            MISSING_REQUIRED=1
+        fi
     else
         printf '  [MISSING] %-23s %s\n' "grub i386-pc modules" "apt: grub-pc-bin, or --no-sudo (grub-mkrescue needs them for a BIOS ISO)"
         MISSING_REQUIRED=1

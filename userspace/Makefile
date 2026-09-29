@@ -772,15 +772,18 @@ $(TESTFILES)/wget: $(CRT0_OBJ) wget_cmd/wget.o libc/libc.a
 
 # BusyBox applet wrappers: one tiny launcher copied to each applet name in
 # /disk/bin so `vi`, `less`, `ping`, etc. resolve on PATH and run busybox.
+# The copies are build outputs (gitignored), not tracked files.
 BB_APPLETS := vi vim more less ping mount umount nano seq yes expr cmp \
               gzip gunzip md5sum tar wget2 watch
+BB_WRAPPERS := $(addprefix $(TESTFILES)/bin/,$(BB_APPLETS))
+all: $(BB_WRAPPERS)
 bbwrap_cmd/bbwrap.o: bbwrap_cmd/bbwrap.c
 	$(CC) $(CFLAGS) -c $< -o $@
 $(TESTFILES)/bbwrap: $(CRT0_OBJ) bbwrap_cmd/bbwrap.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) bbwrap_cmd/bbwrap.o libc/libc.a
+$(BB_WRAPPERS): $(TESTFILES)/bin/%: $(TESTFILES)/bbwrap
 	@mkdir -p $(TESTFILES)/bin
-	@for a in $(BB_APPLETS); do cp $@ $(TESTFILES)/bin/$$a; done
-	@echo "bbwrap: installed applet wrappers ($(BB_APPLETS))"
+	cp $< $@
 
 # ff — one-command Firefox launcher (starts maeroX + Firefox)
 ff/ff.o: ff/ff.c

@@ -50,8 +50,6 @@ What is proven by the automated QEMU tests in `tools/`:
   startup before rendering a page. Much of the Firefox-specific tracing left in
   `proc/syscall.c`, `proc/scheduler.c` and `proc/usocket.c` exists to chase that stall.
   This is the current frontier of the project, not a finished feature.
-- **More than 512 MiB of RAM hangs at boot.** The physical and virtual memory managers
-  need work before the 1 to 2 GiB that Gecko wants is usable. See `README-BROWSER.md`.
 - **No W^X.** ELF segments are mapped writable; `proc/elf.c` does not yet enforce
   per-segment protection.
 - **inotify is deliberately absent.** Numbers 291, 292, 293 and 332 return `-ENOSYS`
@@ -87,6 +85,9 @@ What is proven by the automated QEMU tests in `tools/`:
 - `arch/i686/mm/paging.c`: recursive page-directory self-map at PDE 1023, copy-on-write
   fork, demand-paged anonymous VMAs, and an exception table (`__start___ex_table`) so a
   faulting `copy_from_user` returns `-EFAULT` instead of panicking.
+- RAM above 512 MiB boots: the higher-half direct map stops at 256 MiB (the heap window
+  at `0xD0000000`) and frames above it are reached through temporary maps, so the kernel
+  reaches the shell with `-m 1024M` and `-m 2048M` (`run-firefox` uses 2 GiB).
 - `mm/heap.c`: free-list allocator whose block headers carry a `0xDEADBEEF` magic that is
   checked on every access.
 
@@ -287,7 +288,9 @@ not installed, downloads exactly those with `apt-get download`, which checks eac
 against the signed archive index, unpacks them with `dpkg-deb -x` into `~/opt/hostpkgs`,
 and writes wrapper scripts into `~/opt/bin` that add what the relocated binaries need:
 the library path, `-L` firmware directories and `QEMU_MODULE_DIR` for QEMU,
-`-d ~/opt/hostpkgs/usr/lib/grub/i386-pc` for `grub-mkrescue`, `M4=` for bison and flex,
+`-d ~/opt/hostpkgs/usr/lib/grub/i386-pc` for `grub-mkrescue` and `grub-mkimage` (also
+written around the system binary when `grub-common` is installed without `grub-pc-bin`,
+which otherwise builds an EFI-only ISO that QEMU cannot boot), `M4=` for bison and flex,
 `PERL5LIB` for `makeinfo`. If the host has no C/C++ compiler, the self-contained musl.cc
 `x86_64-linux-musl-native` toolchain is fetched into `~/opt` and exposed as `cc`/`c++`
 wrappers that link statically (its dynamic loader is not installed on the host); the
@@ -305,8 +308,10 @@ system tool of the same name if one exists, a wrapper that a package supersedes 
 rewritten as a plain hand-off on the next `--no-sudo` run, and `--sudo` or `--apt`
 deletes those files outright. GRUB is the one exception: its wrappers keep precedence
 until the system GRUB also has its BIOS modules in `/usr/lib/grub/i386-pc`, because
-without them it cannot build the ISO. `--check` lists which tools come from wrappers and
-which of those are already superseded.
+without them it cannot build the ISO; `--check` fails while the `grub-mkrescue` on `PATH`
+cannot reach BIOS modules. `make iso` passes the relocated modules with `-d` itself when
+`~/opt/bin` is not on `PATH`, and stops with the fix when there are none. `--check` lists
+which tools come from wrappers and which of those are already superseded.
 
 `make initrd` also builds toybox from `third_party/toybox/.config.maeros`, the applet set
 that compiles and links against the MaeroOS libc (about 100 applets; the rest need
