@@ -20,6 +20,8 @@
 #include "../include/signal.h"
 #include "../include/sys/mman.h"
 #include "../include/sys/wait.h"
+#include "../include/sys/ioctl.h"
+#include "../include/pthread.h"
 
 #define NR_READ         3
 #define NR_KILL         37
@@ -33,6 +35,9 @@
 #define NR_RT_SIGACTION 174
 #define NR_SIGALTSTACK  186
 #define NR_SET_TID_ADDR 258
+#define NR_NANOSLEEP    162
+#define TIOCGPTN        0x80045430U
+#define TIOCSPTLCK      0x40045431U
 
 #define EFAULT          14
 #define SA_ONSTACK      0x08000000
@@ -154,6 +159,53 @@ static void child_ro_clear_tid(void) {
     syscall1(NR_SET_TID_ADDR, (int)ro);   /* zeroed + futex-woken at exit */
 }
 
+/* The race a check-then-use cannot close: thread A blocks in read() on a pty
+ * slave with buffer X; while it sleeps, this thread makes X read-only (or
+ * unmaps it) and only then writes to the master.  The kernel must store the
+ * data through a fault-safe copy when A wakes: A gets -EFAULT, the kernel
+ * keeps running. */
+struct racer { int fd; char *buf; volatile int started; volatile int ret; };
+
+static void *race_reader(void *arg) {
+    struct racer *r = arg;
+    r->started = 1;
+    r->ret = syscall3(NR_READ, r->fd, (int)r->buf, 64);
+    return 0;
+}
+
+static void nap_ms(int ms) {
+    int ts[2] = { 0, ms * 1000000 };
+    syscall2(NR_NANOSLEEP, (int)ts, 0);
+}
+
+static int open_pty(int *master, int *slave) {
+    char path[16];
+    int unlock = 0, n = -1;
+    *master = open("/dev/ptmx", O_RDWR);
+    if (*master < 0) return -1;
+    if (ioctl(*master, TIOCSPTLCK, &unlock) < 0 || ioctl(*master, TIOCGPTN, &n) < 0) return -1;
+    sprintf(path, "/dev/pts/%d", n);
+    *slave = open(path, O_RDWR);
+    return *slave < 0 ? -1 : 0;
+}
+
+/* Returns the reader's result, or 999 when the setup failed. */
+static int read_race(int unmap_it) {
+    int master, slave;
+    if (open_pty(&master, &slave) < 0) return 999;
+    struct racer r = { slave, map_anon(4096), 0, 12345 };
+    pthread_t t;
+    if (pthread_create(&t, 0, race_reader, &r) != 0) return 999;
+    while (!r.started) nap_ms(5);
+    nap_ms(100);                             /* let it block in the read */
+    if (unmap_it) unmap(r.buf, 4096);
+    else          syscall3(NR_MPROTECT, (int)r.buf, 4096, PROT_READ);
+    write(master, "race\n", 5);
+    pthread_join(t, 0);
+    close(slave); close(master);
+    return r.ret;
+}
+
 int main(void) {
     char *ro_fresh = ro_page(0), *ro_touched = ro_page(1);
     int r;
@@ -213,6 +265,11 @@ int main(void) {
     /* A clear_child_tid in a read-only page is stored at exit. */
     r = in_child(child_ro_clear_tid);
     check("exit with read-only clear_child_tid", r == 0, r);
+
+    r = read_race(0);
+    check("pty read, buffer made read-only while blocked", r == -EFAULT, r);
+    r = read_race(1);
+    check("pty read, buffer unmapped while blocked", r == -EFAULT, r);
 
     if (failures) { printf("memprobe: %d failures\n", failures); return 1; }
     printf("memprobe ok\n");
