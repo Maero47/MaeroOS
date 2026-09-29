@@ -93,6 +93,18 @@ static void irq_handler_body(registers_t *regs) {
         }
     }
 
+    /* IRQ0 (PIT) drives scheduler_tick, which may yield() and switch to
+     * another thread from inside the handler.  Acknowledge it FIRST, exactly
+     * like the LAPIC timer above: the 8259 runs fully nested (no auto-EOI), so
+     * an EOI left until after the handler would keep IRQ0 — and with it every
+     * lower-priority IRQ — in service for as long as the next thread runs
+     * without passing back through here (a fresh child via trapret, a thread
+     * woken from sleep).  The tick counter would freeze and no timeout would
+     * ever expire.  IRQ0 is edge-triggered and the gate keeps IF=0, so the
+     * early EOI cannot re-enter this handler. */
+    if (irq == 0)
+        outb(0x20, 0x20);
+
     /* Dispatch to every chained handler (shared PCI lines) */
     if (irq < 16) {
         for (int i = 0; i < IRQ_CHAIN; i++)
@@ -100,10 +112,11 @@ static void irq_handler_body(registers_t *regs) {
                 irq_handlers[irq][i](regs);
     }
 
-    /* Send EOI */
+    /* Send EOI (IRQ0 was acknowledged before dispatch) */
     if (irq >= 8)
         outb(0xA0, 0x20);   /* Slave EOI */
-    outb(0x20, 0x20);       /* Master EOI (always) */
+    if (irq != 0)
+        outb(0x20, 0x20);   /* Master EOI */
 
     irq_return_signals(regs);
 }
