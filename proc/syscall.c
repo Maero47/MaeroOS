@@ -154,37 +154,120 @@ int access_ok(const void *ptr, size_t len) {
 }
 
 /*
- * access_ok() for a range the kernel is about to STORE into through a plain
- * pointer — i.e. a user buffer handed down to code outside proc/ (vfs_read, a
- * driver, the network stack) that writes it with memcpy rather than
- * copy_to_user().  With CR0.WP set such a store into a read-only page is a
- * ring-0 fault outside __ex_table, which is a panic; so here every page must
- * actually take a write: present and writable, a COW page the fault handler
- * will break (same test as page_fault_handler), or not yet populated in a VMA
- * that allows PROT_WRITE.  Paths inside proc/ use copy_to_user() instead and
- * need only access_ok().
+ * Bounce buffers for user data handed to code outside proc/.  vfs_read(),
+ * vfs_write() and the network stack move data with plain memcpy, and they can
+ * sleep before doing it (a pty or tcp read waits for input), so no check made
+ * beforehand can hold: a sibling thread may mprotect() or munmap() the buffer
+ * in the meantime, and a plain ring-0 store into it faults outside __ex_table
+ * — a panic.  So they never see a user pointer: the data goes through a
+ * kernel buffer, and only copy_to_user()/copy_from_user() touch user memory.
  */
-int access_ok_write(void *ptr, size_t len) {
-    if (!access_ok(ptr, len)) return 0;
-    if (len == 0) return 1;
-    uintptr_t page = (uintptr_t)ptr & ~(uintptr_t)(PAGE_SIZE - 1);
-    uintptr_t last = ((uintptr_t)ptr + len - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
-    for (;;) {
-        uint32_t pte = (*paging_get_pde((uint32_t)page) & PAGE_PRESENT)
-                     ? *paging_get_pte((uint32_t)page) : 0;
-        int vprot = vma_prot_lookup((uint32_t)page);
-        if ((pte & PAGE_PRESENT) && (pte & PAGE_USER)) {
-            if (!(pte & PAGE_WRITABLE)) {
-                if (!(pte & PAGE_COW) || (pte & PAGE_WRPROT)) return 0;
-                if (vprot >= 0 && !(vprot & 0x2)) return 0;
-            }
-        } else if (vprot < 0 || !(vprot & 0x2)) {
-            return 0;
-        }
-        if (page == last) break;
-        page += PAGE_SIZE;
+#define BOUNCE_MAX (64U * 1024U)   /* one call's worth; also covers any UDP datagram */
+
+static uint8_t *bounce_alloc(uint32_t want, uint32_t *size) {
+    uint32_t n = want < BOUNCE_MAX ? want : BOUNCE_MAX;
+    if (n == 0) n = 1;
+    uint8_t *b = (uint8_t *)kmalloc(n);
+    if (!b && n > PAGE_SIZE) {                 /* heap tight: settle for a page */
+        n = PAGE_SIZE;
+        b = (uint8_t *)kmalloc(n);
     }
-    return 1;
+    *size = n;
+    return b;
+}
+
+/* Only a regular file can be read in several chunks: its read never blocks
+ * and consumes nothing.  A device, pty or socket gets one call, whose data is
+ * gone once read, so it is never asked for more than can be delivered. */
+static int node_is_regular(vfs_node_t *n) {
+    return (n->flags & 0x7U) == VFS_FLAG_FILE;
+}
+
+/* vfs_read() at `off` into user `ubuf`.  Returns bytes delivered, or a
+ * negative errno if none were.  A fault copying out after a device read
+ * loses that data, as on Linux; for a regular file nothing is lost — the
+ * caller advances the offset only by what was delivered. */
+static int vfs_read_user(vfs_node_t *n, uint32_t off, char *ubuf, uint32_t len) {
+    if (len == 0) return 0;
+    uint32_t bsz;
+    uint8_t *kbuf = bounce_alloc(len, &bsz);
+    if (!kbuf) return -12;                                 /* -ENOMEM */
+    int regular = node_is_regular(n);
+    uint32_t done = 0;
+    int err = 0;
+    while (done < len) {
+        uint32_t want = len - done < bsz ? len - done : bsz;
+        int32_t  got  = (int32_t)vfs_read(n, off + done, want, kbuf);
+        if (got < 0)  { err = got; break; }
+        if (got == 0) break;
+        if ((uint32_t)got > want) got = (int32_t)want;
+        if (copy_to_user(ubuf + done, kbuf, (uint32_t)got) < 0) { err = -14; break; }
+        done += (uint32_t)got;
+        if (!regular || (uint32_t)got < want) break;
+    }
+    kfree(kbuf);
+    return done ? (int)done : err;
+}
+
+/* vfs_write() of user `ubuf` at `off`, chunk by chunk, stopping at the first
+ * short write.  Returns bytes written, or a negative errno if none were. */
+static int vfs_write_user(vfs_node_t *n, uint32_t off, const char *ubuf, uint32_t len) {
+    if (len == 0) return 0;
+    uint32_t bsz;
+    uint8_t *kbuf = bounce_alloc(len, &bsz);
+    if (!kbuf) return -12;
+    uint32_t done = 0;
+    int err = 0;
+    while (done < len) {
+        uint32_t want = len - done < bsz ? len - done : bsz;
+        if (copy_from_user(kbuf, ubuf + done, want) < 0) { err = -14; break; }
+        uint32_t w = vfs_write(n, off + done, want, kbuf);
+        /* Out of kernel memory for the file body.  Linux tmpfs returns ENOMEM
+         * from shmem_alloc_and_acct_folio for exactly this; returning 0 would
+         * spin any libc write loop. */
+        if (w == VFS_WRITE_ENOMEM) { err = -12; break; }
+        if ((int32_t)w < 0)        { err = (int32_t)w; break; }
+        if (w > want) w = want;
+        done += w;
+        if (w < want) break;
+    }
+    kfree(kbuf);
+    return done ? (int)done : err;
+}
+
+/* One net_socket_recvfrom() into user `ubuf` (a datagram must arrive whole,
+ * and a stream read may block, so exactly one call). */
+static int sock_recv_user(net_socket_t *s, void *ubuf, uint32_t len,
+                          net_sockaddr_in_t *addr) {
+    uint32_t bsz;
+    uint8_t *kbuf = bounce_alloc(len, &bsz);
+    if (!kbuf) return -12;
+    int r = net_socket_recvfrom(s, kbuf, len < bsz ? len : bsz, addr);
+    if (r > 0 && copy_to_user(ubuf, kbuf, (uint32_t)r) < 0) r = -14;
+    kfree(kbuf);
+    return r;
+}
+
+/* net_socket_sendto() of user `ubuf`, in chunks (any valid datagram fits in
+ * the first), stopping at a short send. */
+static int sock_send_user(net_socket_t *s, const void *ubuf, uint32_t len,
+                          const net_sockaddr_in_t *addr) {
+    uint32_t bsz;
+    uint8_t *kbuf = bounce_alloc(len, &bsz);
+    if (!kbuf) return -12;
+    uint32_t done = 0;
+    int err = 0;
+    do {
+        uint32_t want = len - done < bsz ? len - done : bsz;
+        if (copy_from_user(kbuf, (const uint8_t *)ubuf + done, want) < 0) { err = -14; break; }
+        int r = net_socket_sendto(s, kbuf, want, addr);
+        if (r < 0) { err = r; break; }
+        if ((uint32_t)r > want) r = (int)want;
+        done += (uint32_t)r;
+        if ((uint32_t)r < want) break;
+    } while (done < len);
+    kfree(kbuf);
+    return done ? (int)done : err;
 }
 
 /*
@@ -964,10 +1047,8 @@ static int sys_read(registers_t *regs) {
 
     /* VFS file read */
     if (f->type == FD_FILE) {
-        /* vfs_read stores into buf with plain memcpy (see access_ok_write) */
-        if (!access_ok_write(buf, (size_t)len)) return -14;
-        int n = (int)vfs_read(f->node, f->offset, (uint32_t)len, (uint8_t *)buf);
-        f->offset += (uint32_t)n;
+        int n = vfs_read_user(f->node, f->offset, buf, (uint32_t)len);
+        if (n > 0) f->offset += (uint32_t)n;
         return n;
     }
 
@@ -994,11 +1075,8 @@ static int sys_read(registers_t *regs) {
         return n;
     }
 
-    if (f->type == FD_SOCKET) {
-        /* the network stack stores into buf with plain memcpy */
-        if (!access_ok_write(buf, (size_t)len)) return -14;
-        return net_socket_recvfrom(f->socket, buf, (uint32_t)len, NULL);
-    }
+    if (f->type == FD_SOCKET)
+        return sock_recv_user(f->socket, buf, (uint32_t)len, NULL);
 
     if (f->type == FD_USOCKET)
         return usocket_read(f->usock, buf, len, (f->flags & O_NONBLOCK) != 0);
@@ -1032,14 +1110,9 @@ static int sys_write(registers_t *regs) {
     if (f->type == FD_FILE && f->node) {
         if (f->flags == O_RDONLY) return -9;   /* opened read-only */
         if (!f->node->write_fn)   return -9;   /* node not writable */
-        uint32_t written = vfs_write(f->node, f->offset,
-                                     (uint32_t)len, (const uint8_t *)buf);
-        /* Out of kernel memory for the file body.  Linux tmpfs returns ENOMEM
-         * from shmem_alloc_and_acct_folio for exactly this; returning 0 would
-         * spin any libc write loop. */
-        if (written == VFS_WRITE_ENOMEM) return -12;   /* -ENOMEM */
-        f->offset += written;
-        return (int)written;
+        int written = vfs_write_user(f->node, f->offset, buf, (uint32_t)len);
+        if (written > 0) f->offset += (uint32_t)written;
+        return written;
     }
 
     /* Fallback: fd=1/2 with no entry → serial+VGA stdout */
@@ -1054,7 +1127,7 @@ static int sys_write(registers_t *regs) {
     }
 
     if (f->type == FD_SOCKET)
-        return net_socket_sendto(f->socket, buf, (uint32_t)len, NULL);
+        return sock_send_user(f->socket, buf, (uint32_t)len, NULL);
 
     if (f->type == FD_USOCKET)
         return usocket_write(f->usock, buf, len, (f->flags & O_NONBLOCK) != 0);
@@ -5464,9 +5537,8 @@ static int sys_pread64(registers_t *regs) {
 
     proc_file_t *f = &current_proc->ofile[fd];
     if (f->type != FD_FILE || !f->node) return -9;
-    if (!access_ok_write(buf, (size_t)len)) return -14;   /* plain-memcpy target */
 
-    return (int)vfs_read(f->node, off, (uint32_t)len, (uint8_t *)buf);
+    return vfs_read_user(f->node, off, buf, (uint32_t)len);
 }
 
 /* ── sys_pwrite64(fd, buf, count, offset) — EAX=181 ─────────────────────── */
@@ -5483,9 +5555,7 @@ static int sys_pwrite64(registers_t *regs) {
     if (f->type != FD_FILE || !f->node) return -9;
     if (f->flags == O_RDONLY || !f->node->write_fn) return -9;
 
-    uint32_t wrote = vfs_write(f->node, off, (uint32_t)len, (const uint8_t *)buf);
-    if (wrote == VFS_WRITE_ENOMEM) return -12;        /* -ENOMEM */
-    return (int)wrote;
+    return vfs_write_user(f->node, off, buf, (uint32_t)len);
 }
 
 /* ── sys_openat(dirfd, path, flags, mode) — EAX=295 ─────────────────────── */
@@ -7214,15 +7284,15 @@ static int socketcall_core(int call, uint32_t *kargs) {
         uint32_t len = kargs[2];
         if (!access_ok(buf, len))
             return -14;
-        return net_socket_sendto(f->socket, buf, len, NULL);
+        return sock_send_user(f->socket, buf, len, NULL);
     }
 
     if (call == 10) { /* recv(fd, buf, len, flags) */
         void *buf = (void *)(uintptr_t)kargs[1];
         uint32_t len = kargs[2];
-        if (!access_ok_write(buf, len))   /* the stack memcpy()s into it */
+        if (!access_ok(buf, len))
             return -14;
-        return net_socket_recvfrom(f->socket, buf, len, NULL);
+        return sock_recv_user(f->socket, buf, len, NULL);
     }
 
     if (call == 11) { /* sendto */
@@ -7233,14 +7303,14 @@ static int socketcall_core(int call, uint32_t *kargs) {
         if (!access_ok(buf, len))
             return -14;
         if (!uaddr)
-            return net_socket_sendto(f->socket, buf, len, NULL);
+            return sock_send_user(f->socket, buf, len, NULL);
         if (addrlen < sizeof(net_sockaddr_in_t) ||
             !access_ok(uaddr, sizeof(net_sockaddr_in_t)))
             return -14;
         net_sockaddr_in_t kaddr;
         if (copy_from_user(&kaddr, uaddr, sizeof(kaddr)) < 0)
             return -14;
-        return net_socket_sendto(f->socket, buf, len, &kaddr);
+        return sock_send_user(f->socket, buf, len, &kaddr);
     }
 
     if (call == 12) { /* recvfrom */
@@ -7249,7 +7319,7 @@ static int socketcall_core(int call, uint32_t *kargs) {
         net_sockaddr_in_t *uaddr = (net_sockaddr_in_t *)(uintptr_t)kargs[4];
         uint32_t *ulen = (uint32_t *)(uintptr_t)kargs[5];
         net_sockaddr_in_t kaddr;
-        if (!access_ok_write(buf, len))   /* the stack memcpy()s into it */
+        if (!access_ok(buf, len))
             return -14;
         if (uaddr) {
             uint32_t klen = 0;
@@ -7258,8 +7328,7 @@ static int socketcall_core(int call, uint32_t *kargs) {
                 !access_ok(uaddr, sizeof(net_sockaddr_in_t)))
                 return -14;
         }
-        int ret = net_socket_recvfrom(f->socket, buf, len,
-                                      uaddr ? &kaddr : NULL);
+        int ret = sock_recv_user(f->socket, buf, len, uaddr ? &kaddr : NULL);
         if (ret >= 0 && uaddr) {
             uint32_t klen = sizeof(net_sockaddr_in_t);
             int cr = copy_to_user(uaddr, &kaddr, sizeof(kaddr));
