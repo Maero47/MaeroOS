@@ -44,6 +44,7 @@
 #define NR_GETRESUID32  209
 #define NR_SETRESGID32  210
 #define NR_SETUID32     213
+#define NR_SYMLINK      83
 #define NR_FALLOCATE    324
 
 #define K_O_RDONLY   0
@@ -190,6 +191,22 @@ static void root_checks(void) {
     int r = syscall2(NR_RENAME, (int)"/tmp/cp_xdev", (int)"/home/cp_xdev");
     check("rename across filesystems is EXDEV", r == -EXDEV, r);
     syscall1(NR_UNLINK, (int)"/tmp/cp_xdev");
+
+    /* The same through a symlink: /tmp/cp_l -> /tmp/cp_a/b, so
+     * "/tmp/cp_l/x" is inside /tmp/cp_a although the path does not say so.
+     * Letting it through would link cp_a below its own child. */
+    mkdir("/tmp/cp_a", 0755);
+    mkdir("/tmp/cp_a/b", 0755);
+    syscall2(NR_SYMLINK, (int)"/tmp/cp_a/b", (int)"/tmp/cp_l");
+    r = syscall2(NR_RENAME, (int)"/tmp/cp_a", (int)"/tmp/cp_l/x");
+    check("rename dir under itself via symlink is EINVAL", r == -EINVAL, r);
+    struct stat ast;
+    check("dir still in place after refused rename",
+          stat("/tmp/cp_a/b", &ast) == 0 && S_ISDIR(ast.st_mode), 0);
+    syscall1(NR_UNLINK, (int)"/tmp/cp_l");
+    rmdir("/tmp/cp_a/x");
+    rmdir("/tmp/cp_a/b");
+    rmdir("/tmp/cp_a");
 
     mkdir("/tmp/cp_loopdir", 0755);
     r = syscall2(NR_RENAME, (int)"/tmp/cp_loopdir", (int)"/tmp/cp_loopdir/sub");
@@ -339,6 +356,22 @@ static void user_checks(void) {
     check("setpgid on parent is ESRCH", r == -ESRCH, r);
     r = syscall2(NR_SETPGID, 1, 1);
     check("setpgid on init is ESRCH", r == -ESRCH, r);
+
+    /* A pipeline: the first stage leads the job's group and may have exited
+     * (unreaped) before the next stage joins it.  The zombie leader still
+     * holds the group, so the join must work. */
+    int first = fork();
+    if (first == 0) { syscall2(NR_SETPGID, 0, 0); _exit(0); }
+    usleep(300000);                          /* let it exit; do not reap */
+    int second = fork();
+    if (second == 0) { usleep(5000000); _exit(0); }
+    r = syscall2(NR_SETPGID, second, first);
+    check("setpgid into a zombie leader's group", r == 0, r);
+    r = syscall2(NR_KILL, -first, SIGKILL);
+    check("kill that group", r == 0, r);
+    int pst = 0;
+    waitpid(first, &pst, 0);
+    waitpid(second, &pst, 0);
 
     /* ...while one's own children are still fair game. */
     int child = fork();

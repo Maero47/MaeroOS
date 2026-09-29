@@ -2219,7 +2219,7 @@ static int kill_many(int how, int pg, int sig) {
     int matched = 0, sent = 0;
     for (int i = 0; i < MAX_PROCS; i++) {
         struct proc *q = &ptable[i];
-        if (q->state == PROC_UNUSED || q->state == PROC_ZOMBIE) continue;
+        if (q->state == PROC_UNUSED) continue;
         if (q->pid != q->tgid) continue;                   /* one per process */
         if (how == KILL_PGRP && q->pgrp != pg) continue;
         if (how == KILL_ALL &&
@@ -2227,7 +2227,9 @@ static int kill_many(int how, int pg, int sig) {
         if (!q->pgdir_phys) continue;                      /* kernel thread */
         matched++;
         if (!kill_permitted(q, sig)) continue;
-        if (sig) signal_send_group(q, sig);
+        /* An unreaped zombie is still a member (Linux: signalling it succeeds
+         * and does nothing). */
+        if (sig && q->state != PROC_ZOMBIE) signal_send_group(q, sig);
         sent++;
     }
     if (sent) return 0;
@@ -4952,7 +4954,7 @@ static int sys_setsid(registers_t *regs) {
      * new session can never capture another process's group. */
     for (int i = 0; i < MAX_PROCS; i++) {
         struct proc *q = &ptable[i];
-        if (q->state == PROC_UNUSED || q->state == PROC_ZOMBIE) continue;
+        if (q->state == PROC_UNUSED) continue;         /* zombies still count */
         if (q->pgrp == current_proc->tgid) return -1;   /* -EPERM */
     }
     if (current_proc->ctty) {
@@ -6339,9 +6341,12 @@ static int sys_setpgid(registers_t *regs) {
     if (pgid == 0) pgid = p->tgid;
     if (pgid != p->tgid) {
         int found = 0;
+        /* A zombie is still a member until it is reaped (Linux keeps its
+         * pid attached): a pipeline's later stages join the group of a first
+         * stage that may already have exited. */
         for (int i = 0; i < MAX_PROCS && !found; i++) {
             struct proc *q = &ptable[i];
-            if (q->state == PROC_UNUSED || q->state == PROC_ZOMBIE) continue;
+            if (q->state == PROC_UNUSED) continue;
             if (q->pgrp == pgid && q->sid == me->sid) found = 1;
         }
         if (!found) return -1;                 /* -EPERM */
