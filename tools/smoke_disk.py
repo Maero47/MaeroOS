@@ -143,6 +143,13 @@ def main():
             ("busybox ls -ln /etc/shadow.tmp\n", "No such file", "-rw"),
             # The previous shadow is kept as a root-only backup.
             ("busybox ls -ln /etc/shadow-\n", re.compile(r"-rw------- +1 +0 +0 ")),
+            # A caller's lax umask must not loosen what passwd creates.
+            ("busybox sh -c 'umask 0; /disk/passwd root root umask0'\n", "passwd: password updated for root"),
+            ("busybox ls -ln /etc/shadow\n", re.compile(r"-rw------- +1 +0 +0 ")),
+            ("busybox ls -ln /etc/shadow-\n", re.compile(r"-rw------- +1 +0 +0 ")),
+            ("busybox sh -c 'umask 0; /disk/passwd root umask0 root'\n", "passwd: password updated for root"),
+            ("busybox ls -ln /etc/shadow\n", re.compile(r"-rw------- +1 +0 +0 ")),
+            ("login --check root root\n", "login: root password ok"),
             # The shipped default user password is hashed, and the documented
             # login (user/user) still works.
             ("cat /etc/shadow\n", "user:$maero-pbkdf2-sha256$100000$"),

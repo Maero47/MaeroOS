@@ -11,10 +11,13 @@
  * contents compared.  If PATH is missing or holds anything else, OLD_DATA
  * is written back.  TMP is only removed once PATH is known to be good.
  *
- * Every file is chowned/chmodded before any data is written to it, so
- * nothing this writes is readable beyond MODE -- except, on a kernel whose
- * rename() recreates the target with a default mode, for the moment between
- * rename() and the re-check.
+ * The umask is set to 077 first, so every file this creates is 0600 from
+ * the moment it exists; it is then chowned/chmodded to root:MODE before any
+ * data is written, so no other user can ever open it.  One gap remains and
+ * is the kernel's to close: this kernel's rename() recreates PATH with a
+ * default 0644 mode and copies into it, so the new contents are readable
+ * from the rename until maero_replace_file() re-locks PATH (init also
+ * re-locks /etc/shadow at boot).  An atomic, mode-preserving rename removes it.
  *
  * Returns MAERO_REPLACED, MAERO_UNCHANGED (failed, PATH holds OLD_DATA), or
  * MAERO_LOST (failed and PATH could not be restored; TMP and BACKUP kept).
@@ -26,6 +29,10 @@
 int maero_replace_file(const char *path, const char *tmp, const char *backup,
                        const char *old_data, int old_len,
                        const char *new_data, int new_len, int mode);
+
+/* Set the process umask to 077 via the raw syscall (libc umask() is a
+ * stub).  Call before creating anything that must stay private. */
+void maero_strict_umask(void);
 
 /* Force root:root MODE on an open file.  Returns 1 on success. */
 int maero_lock_down(int fd, int mode);

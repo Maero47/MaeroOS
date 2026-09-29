@@ -132,6 +132,10 @@ int main(int argc, char *argv[]) {
     }
     user = argv[1];
 
+    /* Before anything is created: a umask inherited from the caller (say
+     * `umask 0`) must not make a shadow copy world-readable, even briefly. */
+    maero_strict_umask();
+
     /* Run as root through and through, so nothing below (in particular the
      * temp file, which the kernel stamps with the real uid) is ever owned
      * by the caller. */

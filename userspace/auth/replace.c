@@ -3,6 +3,12 @@
 #include "../include/stdlib.h"
 #include "../include/string.h"
 #include "../include/unistd.h"
+#include "../include/syscall.h"
+
+void maero_strict_umask(void) {
+    /* libc umask() is a no-op stub, so go to the syscall (umask = 60). */
+    syscall1(60, 077);
+}
 
 int maero_lock_down(int fd, int mode) {
     return fchown(fd, 0, 0) == 0 && fchmod(fd, mode) == 0;
@@ -48,7 +54,10 @@ static int write_verified(const char *path, const char *data, int len, int mode)
     int fd, ok;
 
     unlink(path);
-    fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC);
+    /* With umask 077 the kernel creates this 0600 -- nobody else can open
+     * it before the fchown/fchmod below.  The mode argument is for a libc
+     * and kernel that honour it. */
+    fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC, 0600);
     if (fd < 0)
         return 0;
     ok = maero_lock_down(fd, mode) && write_all(fd, data, len) && fsync(fd) == 0;
@@ -72,6 +81,7 @@ static int check_target(const char *path, int mode, const char *data, int len) {
 int maero_replace_file(const char *path, const char *tmp, const char *backup,
                        const char *old_data, int old_len,
                        const char *new_data, int new_len, int mode) {
+    maero_strict_umask();
     if (backup && !write_verified(backup, old_data, old_len, mode))
         return MAERO_UNCHANGED;
     if (!write_verified(tmp, new_data, new_len, mode)) {

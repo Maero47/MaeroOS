@@ -383,6 +383,9 @@ static int rewrite_service_state(const char *name, int enabled) {
 }
 
 int main(int argc, char *argv[]) {
+    /* svc rewrites /etc/services; never create files with a caller's lax umask. */
+    maero_strict_umask();
+
     if (argc == 3 &&
         (strcmp(argv[1], "start") == 0 ||
          strcmp(argv[1], "stop") == 0 ||
