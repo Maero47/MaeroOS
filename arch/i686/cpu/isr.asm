@@ -142,6 +142,16 @@ tlb_ipi_isr:
     popa
     iret
 
+; ─── LAPIC spurious-interrupt stub (vector 0xFF, SVR) ────────────────────────
+; The LAPIC raises its spurious vector when an interrupt it was about to
+; deliver is withdrawn (e.g. an ExtINT via LINT0 or an IPI that vanished).
+; Nothing is in service, so per the Intel SDM there is NO EOI: just return.
+; Without a present gate here the CPU would take #NP instead and kill
+; whatever user process happened to be running (or panic in the kernel).
+global spurious_isr
+spurious_isr:
+    iret
+
 ; ─── NMI stub (vector 2) ─────────────────────────────────────────────────────
 ; Bare handler: the NMI is the way into a guest that has stopped, and the most
 ; likely reason it has stopped is that this CPU is holding the Big Kernel Lock
