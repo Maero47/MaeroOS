@@ -1837,7 +1837,7 @@ static uint32_t ext2_dir_lookup(ext2_inode_t *dir_inode, const char *name,
         if (ext2_read_block(blk_num, blk_buf) < 0) break;
         for (uint32_t off = 0; off < g_state.block_size; ) {
             ext2_dirent_t *de = (ext2_dirent_t *)(blk_buf + off);
-            if (de->rec_len == 0) break;
+            if (!ext2_de_ok(blk_buf, off, g_state.block_size)) break;
             if (de->inode && de->name_len == (uint8_t)name_len &&
                 memcmp(de->name, name, name_len) == 0) {
                 found = de->inode;
@@ -1867,7 +1867,7 @@ static int ext2_set_dirent(ext2_inode_t *dir_inode, const char *name,
         if (ext2_read_block(blk_num, blk_buf) < 0) break;
         for (uint32_t off = 0; off < g_state.block_size; ) {
             ext2_dirent_t *de = (ext2_dirent_t *)(blk_buf + off);
-            if (de->rec_len == 0) break;
+            if (!ext2_de_ok(blk_buf, off, g_state.block_size)) break;
             if (de->inode && de->name_len == (uint8_t)name_len &&
                 memcmp(de->name, name, name_len) == 0) {
                 de->inode = ino;
