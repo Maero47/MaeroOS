@@ -37,9 +37,17 @@ static uint32_t octal_str(const char *s, int flen) {
 
 void initrd_init(uint32_t mod_phys_start, uint32_t mod_phys_end) {
     /*
-     * boot_page_table1 maps physical 0x0-0x3FF000 at KERNEL_VMA.
-     * All GRUB modules land in that range, so we can access them directly.
+     * The image is read in place through the higher-half direct map
+     * (phys + KERNEL_VMA), which paging_init builds only for physical memory
+     * below HEAP_START - KERNEL_VMA = 256 MiB (arch/i686/mm/paging.c).  File
+     * nodes point straight into it, so an image reaching past that window
+     * would fault on the first read of an arbitrary file much later; refuse
+     * it here with a message that says why.
      */
+    if (mod_phys_end < mod_phys_start ||
+        mod_phys_end > (uint32_t)(HEAP_START - KERNEL_VMA))
+        panic("initrd_init: initrd must lie below 256 MiB physical "
+              "(the kernel direct map)", NULL);
     const uint8_t *tar  = (const uint8_t *)(mod_phys_start + KERNEL_VMA);
     uint32_t        size = mod_phys_end - mod_phys_start;
 
@@ -79,12 +87,34 @@ void initrd_init(uint32_t mod_phys_start, uint32_t mod_phys_end) {
         }
 
         uint32_t file_size = octal_str(hdr->size, 11);
+        /* The entry's data must lie inside the image (offset + 512 <= size
+         * holds here).  This also keeps the advance below from wrapping to 0
+         * and re-parsing the same header forever. */
+        if (file_size > size - offset - 512) {
+            printk("[INITRD] Warning: entry at offset %u overruns the image, "
+                   "stopping.\n", (unsigned)offset);
+            break;
+        }
 
         /* Process regular files ('0'/NUL) and directories ('5'). */
         if (hdr->typeflag == '0' || hdr->typeflag == '\0' ||
             hdr->typeflag == '5') {
+            /* name[] is NUL-terminated only when shorter than 100 bytes;
+             * a POSIX ustar header ("ustar\0") keeps the directory part of a
+             * longer path in prefix[] at offset 345. */
+            char full[257];
+            uint32_t fl = 0;
+            if (hdr->magic[5] == '\0') {
+                const char *pfx = (const char *)hdr + 345;
+                for (uint32_t k = 0; k < 155 && pfx[k]; k++) full[fl++] = pfx[k];
+                if (fl) full[fl++] = '/';
+            }
+            for (uint32_t k = 0; k < 100 && hdr->name[k]; k++)
+                full[fl++] = hdr->name[k];
+            full[fl] = '\0';
+
             /* Strip leading "./" or "/" from the stored name */
-            const char *name = hdr->name;
+            const char *name = full;
             if (name[0] == '.' && name[1] == '/') name += 2;
             else if (name[0] == '/')               name += 1;
 

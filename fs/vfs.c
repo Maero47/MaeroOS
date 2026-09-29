@@ -160,16 +160,31 @@ vfs_node_t *vfs_get_root_overlay(void) {
     return vfs_root_overlay;
 }
 
-static vfs_node_t *vfs_open_from(vfs_node_t *root, const char *path,
-                                 int follow_final) {
-    if (!path || path[0] != '/' || !root) return NULL;
+/* Linux's MAXSYMLINKS: symlinks one lookup may follow before -ELOOP. */
+#define VFS_MAXSYMLINKS  40
+#define VFS_PATH_MAX     512
 
+enum { WALK_FOUND, WALK_MISS, WALK_RESTART };
+
+/*
+ * Walk `path` from `root`.  Symlinks are never followed by recursing: on one,
+ * the walk writes the path to resolve instead into `alt` (the link target,
+ * prefixed with the directory holding the link when the target is relative,
+ * followed by the components not yet walked) and returns WALK_RESTART.  The
+ * caller then starts over on `alt`, so a lookup costs one stack frame however
+ * many links it crosses, and one budget bounds all of them: with `may_follow`
+ * clear, a link that would have to be followed fails the walk with -ELOOP.
+ *
+ * While walking, `alt` holds the textual path of the directory reached so far;
+ * that is the prefix a relative target is resolved against.
+ */
+static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
+                    int may_follow, char *alt, vfs_node_t **out, int *err) {
     const char *p = path + 1;
-    if (*p == '\0') return root;
-
     vfs_node_t *cur = root;
     vfs_node_t *parents[64];
     uint32_t depth = 0;
+    int alen = 0;                /* length of the prefix in alt; -1: too long */
     char component[256];
 
     while (*p) {
@@ -182,6 +197,8 @@ static vfs_node_t *vfs_open_from(vfs_node_t *root, const char *path,
         while (*p && *p != '/' && len < 255)
             component[len++] = *p++;
         component[len] = '\0';
+        /* A name over 255 bytes is an error, not two components. */
+        if (*p && *p != '/') { *err = -36; return WALK_MISS; } /* -ENAMETOOLONG */
         const char *after_component = p;
         while (*after_component == '/') after_component++;
         int is_final = (*after_component == '\0');
@@ -195,56 +212,98 @@ static vfs_node_t *vfs_open_from(vfs_node_t *root, const char *path,
                 cur = parents[--depth];
             else
                 cur = root;
+            if (alen > 0) {
+                while (alen > 0 && alt[alen - 1] != '/') alen--;
+                if (alen > 0) alen--;
+            }
             continue;
         }
 
         vfs_node_t *parent = cur;
         cur = vfs_finddir(cur, component);
-        if (!cur) return NULL;
-        if (depth < (sizeof(parents) / sizeof(parents[0])))
-            parents[depth++] = parent;
+        if (!cur) { *err = -2; return WALK_MISS; }            /* -ENOENT */
 
-        /* Follow symlinks (up to 8 levels deep) */
-        int sym_loops = 0;
-        while ((!is_final || follow_final) &&
-               cur && cur->flags == VFS_FLAG_SYMLINK && sym_loops < 8) {
+        if (cur->flags == VFS_FLAG_SYMLINK && (!is_final || follow_final)) {
+            if (!may_follow) { *err = -40; return WALK_MISS; } /* -ELOOP */
             char target[256];
             uint32_t tlen = vfs_read(cur, 0, sizeof(target) - 1,
                                      (uint8_t *)target);
             target[tlen] = '\0';
-            if (target[0] == '/') {
-                cur = vfs_open(target);
-            } else {
-                /* Relative: can't easily resolve without parent; skip */
-                break;
+            if (tlen == 0) { *err = -2; return WALK_MISS; }
+            if (target[0] == '/') alen = 0;
+            uint32_t rlen = (uint32_t)strlen(after_component);
+            /* prefix + '/' + target + '/' + rest + NUL */
+            if (alen < 0 ||
+                (uint32_t)alen + 1 + tlen + 1 + rlen + 1 > VFS_PATH_MAX) {
+                *err = -36;                                   /* -ENAMETOOLONG */
+                return WALK_MISS;
             }
-            sym_loops++;
+            if (target[0] != '/') alt[alen++] = '/';
+            memcpy(alt + alen, target, tlen);
+            alen += (int)tlen;
+            if (rlen) {
+                alt[alen++] = '/';
+                memcpy(alt + alen, after_component, rlen);
+                alen += (int)rlen;
+            }
+            alt[alen] = '\0';
+            return WALK_RESTART;
         }
-        if (!cur) return NULL;
-    }
 
-    /* Resolve final node if it's a symlink */
-    int sym_loops2 = 0;
-    while (follow_final && cur && cur->flags == VFS_FLAG_SYMLINK && sym_loops2 < 8) {
-        char target[256];
-        uint32_t tlen = vfs_read(cur, 0, sizeof(target) - 1, (uint8_t *)target);
-        target[tlen] = '\0';
-        if (target[0] == '/') cur = vfs_open(target);
-        else break;
-        sym_loops2++;
+        if (depth < (sizeof(parents) / sizeof(parents[0])))
+            parents[depth++] = parent;
+        if (alen >= 0 && alen + 1 + len < VFS_PATH_MAX) {
+            alt[alen++] = '/';
+            memcpy(alt + alen, component, (uint32_t)len);
+            alen += len;
+        } else {
+            alen = -1;
+        }
     }
-    return cur;
+    *out = cur;
+    return WALK_FOUND;
+}
+
+/*
+ * Resolve an absolute path.  Paths outside the reserved mount points are tried
+ * on the root overlay (the mounted disk) first and on vfs_root otherwise.  On
+ * failure NULL is returned and *err (if given) says why: -ENOENT, -ELOOP past
+ * VFS_MAXSYMLINKS links, or -ENAMETOOLONG.
+ */
+vfs_node_t *vfs_lookup(const char *path, int follow_final, int *err) {
+    char bufs[2][VFS_PATH_MAX];
+    if (err) *err = -2;                                       /* -ENOENT */
+    if (!path || path[0] != '/' || !vfs_root) return NULL;
+    uint32_t plen = (uint32_t)strlen(path);
+    if (plen >= VFS_PATH_MAX) { if (err) *err = -36; return NULL; }
+    memcpy(bufs[0], path, plen + 1);
+
+    int cur = 0, links = 0;
+    for (;;) {
+        char *pth = bufs[cur], *alt = bufs[cur ^ 1];
+        int may_follow = links < VFS_MAXSYMLINKS;
+        vfs_node_t *node = NULL;
+        int r = WALK_MISS, e = -2, e2 = -2;
+        if (vfs_root_overlay && vfs_path_uses_root_overlay(pth))
+            r = vfs_walk(vfs_root_overlay, pth, follow_final, may_follow,
+                         alt, &node, &e);
+        if (r == WALK_MISS) {
+            r = vfs_walk(vfs_root, pth, follow_final, may_follow,
+                         alt, &node, &e2);
+            if (e == -2) e = e2;         /* report a loop over a plain miss */
+        }
+        if (r == WALK_FOUND) return node;
+        if (r == WALK_MISS) {
+            if (err) *err = e;
+            return NULL;
+        }
+        links++;
+        cur ^= 1;
+    }
 }
 
 vfs_node_t *vfs_open(const char *path) {
-    if (!path || path[0] != '/' || !vfs_root) return NULL;
-
-    if (vfs_path_uses_root_overlay(path)) {
-        vfs_node_t *node = vfs_open_from(vfs_root_overlay, path, 1);
-        if (node) return node;
-    }
-
-    return vfs_open_from(vfs_root, path, 1);
+    return vfs_lookup(path, 1, NULL);
 }
 
 /* ── Mount ────────────────────────────────────────────────────────────────── */
@@ -295,9 +354,11 @@ int vfs_symlink(const char *target, const char *path) {
     if (slash == 0) {
         dir_path[0] = '/'; dir_path[1] = '\0';
     } else {
-        int dl = slash < 255 ? slash : 255;
-        memcpy(dir_path, path, (uint32_t)dl);
-        dir_path[dl] = '\0';
+        /* Truncating would create the link in whatever directory the cut
+         * prefix happens to name. */
+        if (slash > 255) return -36;                          /* -ENAMETOOLONG */
+        memcpy(dir_path, path, (uint32_t)slash);
+        dir_path[slash] = '\0';
     }
     int blen = plen - slash - 1;
     if (blen <= 0 || blen > 255) return -22;
@@ -314,14 +375,7 @@ int vfs_symlink(const char *target, const char *path) {
 /* ── No-follow path resolution ────────────────────────────────────────────── */
 
 vfs_node_t *vfs_open_nofollow(const char *path) {
-    if (!path || path[0] != '/' || !vfs_root) return NULL;
-
-    if (vfs_path_uses_root_overlay(path)) {
-        vfs_node_t *node = vfs_open_from(vfs_root_overlay, path, 0);
-        if (node) return node;
-    }
-
-    return vfs_open_from(vfs_root, path, 0);
+    return vfs_lookup(path, 0, NULL);
 }
 
 /* ── Mount ────────────────────────────────────────────────────────────────── */
