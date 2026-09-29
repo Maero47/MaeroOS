@@ -4,6 +4,7 @@
 #include "scheduler.h"
 #include "../mm/heap.h"
 #include "../kernel/printk.h"
+#include "syscall.h"       /* copy_to_user / copy_from_user */
 #include <stddef.h>
 
 pipe_buf_t *pipe_alloc(void) {
@@ -37,17 +38,22 @@ int pipe_read(pipe_buf_t *p, char *buf, int len, int nonblock) {
         if (pipe_signal_pending()) return -4; /* -EINTR */
         sleep_on(p);
     }
-    int n = 0;
     int take = len;
     if ((uint32_t)take > p->count) take = (int)p->count;
-    for (int i = 0; i < take; i++) {
-        buf[n++] = p->data[p->head];
-        p->head  = (p->head + 1) % PIPE_BUF_SIZE;
-    }
+    /* buf is the caller's user buffer: fault-safe copies, in at most two runs
+     * (the ring may wrap).  The bytes are consumed only once they have landed,
+     * so a read into a bad buffer fails with -EFAULT and loses nothing. */
+    int first = (int)(PIPE_BUF_SIZE - p->head);
+    if (first > take) first = take;
+    if (copy_to_user(buf, &p->data[p->head], (size_t)first) < 0)
+        return -14;
+    if (take > first && copy_to_user(buf + first, &p->data[0], (size_t)(take - first)) < 0)
+        return -14;
+    p->head   = (p->head + (uint32_t)take) % PIPE_BUF_SIZE;
     p->count -= (uint32_t)take;
     wake_up(p);   /* wake any blocked writers */
     io_wake();
-    return n;
+    return take;
 }
 
 int pipe_write(pipe_buf_t *p, const char *buf, int len, int nonblock) {
@@ -67,11 +73,18 @@ int pipe_write(pipe_buf_t *p, const char *buf, int len, int nonblock) {
         int space = (int)(PIPE_BUF_SIZE - p->count);
         int put   = len - n;
         if (put > space) put = space;
-        for (int i = 0; i < put; i++) {
-            uint32_t tail   = (p->head + p->count) % PIPE_BUF_SIZE;
-            p->data[tail]   = buf[n++];
-            p->count++;
-        }
+        /* Fault-safe copies from the caller's user buffer, in at most two
+         * runs around the ring end; a bad buffer ends the write with -EFAULT
+         * (or the count already written). */
+        uint32_t tail = (p->head + p->count) % PIPE_BUF_SIZE;
+        int first = (int)(PIPE_BUF_SIZE - tail);
+        if (first > put) first = put;
+        if (copy_from_user(&p->data[tail], buf + n, (size_t)first) < 0 ||
+            (put > first &&
+             copy_from_user(&p->data[0], buf + n + first, (size_t)(put - first)) < 0))
+            return n ? n : -14;
+        n        += put;
+        p->count += (uint32_t)put;
         wake_up(p);   /* wake any blocked readers */
         io_wake();
     }

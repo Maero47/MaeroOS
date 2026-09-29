@@ -154,6 +154,40 @@ int access_ok(const void *ptr, size_t len) {
 }
 
 /*
+ * access_ok() for a range the kernel is about to STORE into through a plain
+ * pointer — i.e. a user buffer handed down to code outside proc/ (vfs_read, a
+ * driver, the network stack) that writes it with memcpy rather than
+ * copy_to_user().  With CR0.WP set such a store into a read-only page is a
+ * ring-0 fault outside __ex_table, which is a panic; so here every page must
+ * actually take a write: present and writable, a COW page the fault handler
+ * will break (same test as page_fault_handler), or not yet populated in a VMA
+ * that allows PROT_WRITE.  Paths inside proc/ use copy_to_user() instead and
+ * need only access_ok().
+ */
+int access_ok_write(void *ptr, size_t len) {
+    if (!access_ok(ptr, len)) return 0;
+    if (len == 0) return 1;
+    uintptr_t page = (uintptr_t)ptr & ~(uintptr_t)(PAGE_SIZE - 1);
+    uintptr_t last = ((uintptr_t)ptr + len - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
+    for (;;) {
+        uint32_t pte = (*paging_get_pde((uint32_t)page) & PAGE_PRESENT)
+                     ? *paging_get_pte((uint32_t)page) : 0;
+        int vprot = vma_prot_lookup((uint32_t)page);
+        if ((pte & PAGE_PRESENT) && (pte & PAGE_USER)) {
+            if (!(pte & PAGE_WRITABLE)) {
+                if (!(pte & PAGE_COW) || (pte & PAGE_WRPROT)) return 0;
+                if (vprot >= 0 && !(vprot & 0x2)) return 0;
+            }
+        } else if (vprot < 0 || !(vprot & 0x2)) {
+            return 0;
+        }
+        if (page == last) break;
+        page += PAGE_SIZE;
+    }
+    return 1;
+}
+
+/*
  * SMP-safe user copies.  access_ok() validates the range, but under -smp 2 the
  * mapping can change between the check and the copy (a sibling CPU tearing the
  * address space down when the process is killed mid-syscall, or a COW double-
@@ -538,10 +572,11 @@ static int eventfd_read(struct eventfd_obj *e, char *buf, int len, int nonblock)
         if (signal_interrupt_pending(current_proc)) return -4;  /* -EINTR */
         sleep_on(e);
     }
-    uint64_t out;
-    if (e->flags & EFD_SEMAPHORE) { out = 1; e->count -= 1; }
-    else                          { out = e->count; e->count = 0; }
-    __builtin_memcpy(buf, &out, 8);
+    /* Copy the value out before consuming it: buf is a user pointer, and a
+     * bad one must fail with -EFAULT and leave the counter as it was. */
+    uint64_t out = (e->flags & EFD_SEMAPHORE) ? 1 : e->count;
+    if (copy_to_user(buf, &out, 8) < 0) return -14;
+    e->count -= out;
     wake_up(e);                                    /* wake blocked writers */
     io_wake();                                     /* wake pollers (space avail) */
     return 8;
@@ -550,7 +585,7 @@ static int eventfd_read(struct eventfd_obj *e, char *buf, int len, int nonblock)
 static int eventfd_write(struct eventfd_obj *e, const char *buf, int len, int nonblock) {
     if (len < 8) return -22;                        /* -EINVAL */
     uint64_t add;
-    __builtin_memcpy(&add, buf, 8);
+    if (copy_from_user(&add, buf, 8) < 0) return -14;
     if (add == 0xFFFFFFFFFFFFFFFFULL) return -22;   /* -EINVAL: ~0 is reserved */
     /* Block while the add would push the counter past its max (0xFFFF…FFFE). */
     while (e->count + add < e->count ||
@@ -766,9 +801,12 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
      * written by the parent, set_child_tid by the child in schedule_tail,
      * clear_child_tid at exit).  glibc's fork passes &THREAD_SELF->tid as
      * ctid so the child's descriptor holds ITS pid, not the parent's. */
-    if ((clone_flags & CLONE_PARENT_SETTID) && uptid &&
-        access_ok((void *)(uintptr_t)uptid, 4))
-        *(uint32_t *)(uintptr_t)uptid = (uint32_t)child->pid;
+    if ((clone_flags & CLONE_PARENT_SETTID) && uptid) {
+        /* Best effort, like Linux put_user() here: a bad pointer is ignored,
+         * never stored through raw (a read-only page would fault in ring 0). */
+        uint32_t tid = (uint32_t)child->pid;
+        (void)copy_to_user((void *)(uintptr_t)uptid, &tid, sizeof(tid));
+    }
     child->set_child_tid   = (clone_flags & CLONE_CHILD_SETTID)   ? uctid : 0;
     child->clear_child_tid = (clone_flags & CLONE_CHILD_CLEARTID) ? uctid : 0;
 
@@ -926,6 +964,8 @@ static int sys_read(registers_t *regs) {
 
     /* VFS file read */
     if (f->type == FD_FILE) {
+        /* vfs_read stores into buf with plain memcpy (see access_ok_write) */
+        if (!access_ok_write(buf, (size_t)len)) return -14;
         int n = (int)vfs_read(f->node, f->offset, (uint32_t)len, (uint8_t *)buf);
         f->offset += (uint32_t)n;
         return n;
@@ -947,14 +987,18 @@ static int sys_read(registers_t *regs) {
                 if (n > 0) { n--; }
                 continue;
             }
-            buf[n++] = c;
+            if (copy_to_user(buf + n, &c, 1) < 0) return n ? n : -14;
+            n++;
             if (c == '\n') break;
         }
         return n;
     }
 
-    if (f->type == FD_SOCKET)
+    if (f->type == FD_SOCKET) {
+        /* the network stack stores into buf with plain memcpy */
+        if (!access_ok_write(buf, (size_t)len)) return -14;
         return net_socket_recvfrom(f->socket, buf, (uint32_t)len, NULL);
+    }
 
     if (f->type == FD_USOCKET)
         return usocket_read(f->usock, buf, len, (f->flags & O_NONBLOCK) != 0);
@@ -1001,8 +1045,10 @@ static int sys_write(registers_t *regs) {
     /* Fallback: fd=1/2 with no entry → serial+VGA stdout */
     if (f->type == FD_NONE && (fd == 1 || fd == 2)) {
         for (int i = 0; i < len; i++) {
-            serial_putc(buf[i]);
-            vga_putchar(buf[i]);
+            char c;
+            if (copy_from_user(&c, buf + i, 1) < 0) return i ? i : -14;
+            serial_putc(c);
+            vga_putchar(c);
         }
         return len;
     }
@@ -2289,6 +2335,40 @@ static int sys_times(registers_t *regs) {
     return (int)pit_ticks();
 }
 
+/* How a device ioctl's third argument is passed: IOA_VAL is a plain value the
+ * driver never dereferences; IOA_IN/IOA_OUT/IOA_INOUT point at `len` bytes the
+ * driver reads, writes, or both. */
+enum { IOA_VAL, IOA_IN, IOA_OUT, IOA_INOUT };
+
+/* Every request a device ioctl_fn (tty, pty, console VT, fbdev) understands,
+ * with the shape of its argument.  Anything not listed is ENOTTY without the
+ * driver ever being called, so a driver can never be handed a user pointer
+ * this table did not account for. */
+static int ioctl_arg_shape(uint32_t req, uint32_t *len) {
+    switch (req) {
+    case FBIOGET_FSCREENINFO: *len = sizeof(fb_fix_screeninfo_t); return IOA_OUT;
+    case FBIOGET_VSCREENINFO: *len = sizeof(fb_var_screeninfo_t); return IOA_OUT;
+    case 0x4601:              *len = sizeof(fb_var_screeninfo_t); return IOA_IN;  /* FBIOPUT_VSCREENINFO */
+    case 0x80045430U:         *len = sizeof(int);   return IOA_OUT;   /* TIOCGPTN */
+    case 0x40045431U:         *len = sizeof(int);   return IOA_IN;    /* TIOCSPTLCK */
+    case 0x5401:              *len = 36;            return IOA_OUT;   /* TCGETS: i386 struct termios */
+    case 0x5402: case 0x5403: case 0x5404:
+                              *len = 36;            return IOA_IN;    /* TCSETS/W/F */
+    case 0x5413:              *len = 8;             return IOA_OUT;   /* TIOCGWINSZ */
+    case 0x5414:              *len = sizeof(int);   return IOA_OUT;   /* TIOCGPGRP (this ABI) */
+    case 0x5415:              *len = sizeof(int);   return IOA_IN;    /* TIOCSPGRP (this ABI) */
+    case 0x5601:              *len = 8;             return IOA_OUT;   /* VT_GETMODE: struct vt_mode */
+    case 0x5602:              *len = 8;             return IOA_IN;    /* VT_SETMODE */
+    case 0x5603:              *len = 6;             return IOA_OUT;   /* VT_GETSTATE: struct vt_stat */
+    case 0x4B3B: case 0x4B44: *len = sizeof(int);   return IOA_OUT;   /* KDGETMODE, KDGKBMODE */
+    case 0x540E:                                      /* TIOCSCTTY (int steal flag) */
+    case 0x5605: case 0x5606: case 0x5607:            /* VT_RELDISP/ACTIVATE/WAITACTIVE */
+    case 0x4B3A: case 0x4B45: case 0x4B32: case 0x4B46: /* KDSETMODE/SKBMODE/SETLED/GKBMETA */
+                              *len = 0;             return IOA_VAL;
+    }
+    return -1;
+}
+
 /* ── sys_ioctl(fd, request, arg) — EAX=54 ───────────────────────────────── */
 static int sys_ioctl(registers_t *regs) {
     int fd  = (int)regs->ebx;
@@ -2297,20 +2377,27 @@ static int sys_ioctl(registers_t *regs) {
     if (fd < 0 || fd >= MAX_FD) return -9;
     proc_file_t *f = &current_proc->ofile[fd];
     if (f->type == FD_FILE && f->node && f->node->ioctl_fn) {
-        void *arg = (void *)(uintptr_t)regs->edx;
-        size_t arg_len = 1;
-        if (req == FBIOGET_FSCREENINFO) arg_len = sizeof(fb_fix_screeninfo_t);
-        if (req == FBIOGET_VSCREENINFO) arg_len = sizeof(fb_var_screeninfo_t);
-        if ((uint32_t)req == 0x80045430U || (uint32_t)req == 0x40045431U)
-            arg_len = sizeof(int);
-        if (req == 0x5401 || req == 0x5402 || req == 0x5403 || req == 0x5404)
-            arg_len = 36;
-        if (req == 0x5413)
-            arg_len = sizeof(uint16_t) * 4;
-        if (req == 0x5414 || req == 0x5415 || req == 0x540E)
-            arg_len = sizeof(int);
-        if (arg && !access_ok(arg, arg_len)) return -14;
-        return f->node->ioctl_fn(f->node, (uint32_t)req, arg);
+        /* Drivers read and write their argument with plain loads and stores,
+         * which fault (and panic, not being in __ex_table) on a read-only or
+         * unmapped user page.  So a pointer argument never reaches them: it is
+         * bounced through a kernel buffer, copied in before the call and back
+         * out after it, and a bad user pointer is -EFAULT here instead. */
+        void    *uarg = (void *)(uintptr_t)regs->edx;
+        uint32_t len  = 0;
+        int      dir  = ioctl_arg_shape((uint32_t)req, &len);
+        if (dir < 0) return -25;                          /* -ENOTTY */
+        if (dir == IOA_VAL)
+            return f->node->ioctl_fn(f->node, (uint32_t)req, uarg);
+        if (!uarg) return -14;
+        uint8_t kbuf[sizeof(fb_var_screeninfo_t) > 64 ? sizeof(fb_var_screeninfo_t) : 64];
+        _Static_assert(sizeof(fb_fix_screeninfo_t) <= sizeof(kbuf),
+                       "ioctl bounce buffer too small for fb_fix_screeninfo");
+        __builtin_memset(kbuf, 0, sizeof(kbuf));
+        if (dir != IOA_OUT && copy_from_user(kbuf, uarg, len) < 0) return -14;
+        int rc = f->node->ioctl_fn(f->node, (uint32_t)req, kbuf);
+        if (rc >= 0 && dir != IOA_IN && copy_to_user(uarg, kbuf, len) < 0)
+            return -14;
+        return rc;
     }
 
     /* TCGETS = 0x5401, TCSETS = 0x5402, TIOCGWINSZ = 0x5413 */
@@ -2423,16 +2510,26 @@ static int sys_fcntl(registers_t *regs) {
               * Firefox is) issues the *64* variants (12/13/14), not 5/6/7 — so
               * these MUST be handled or nsProfileLock fails and Firefox declares
               * its profile "missing or inaccessible" (a modal that hangs). */
-        if (!arg || !access_ok((void *)(uintptr_t)arg, sizeof(short) * 2))
-            return -14;
-        *(short *)(uintptr_t)arg = 2;   /* F_UNLCK */
+        {
+            /* Written with copy_to_user: access_ok() says nothing about
+             * writability, and a plain store into a read-only page would be
+             * a ring-0 fault. */
+            short unlck = 2;               /* F_UNLCK */
+            if (!arg || copy_to_user((void *)(uintptr_t)arg, &unlck, sizeof(unlck)) < 0)
+                return -14;
+        }
         return 0;
     case 6:   /* F_SETLK    */
     case 7:   /* F_SETLKW   */
     case 13:  /* F_SETLK64  */
     case 14:  /* F_SETLKW64 */
-        if (!arg || !access_ok((void *)(uintptr_t)arg, sizeof(short) * 2))
-            return -14;
+        {
+            /* Nothing is enforced, but the lock description must be readable
+             * (Linux copies it in first and fails with -EFAULT). */
+            short type;
+            if (!arg || copy_from_user(&type, (void *)(uintptr_t)arg, sizeof(type)) < 0)
+                return -14;
+        }
         return 0;
     case 1033: /* F_ADD_SEALS — memfd sealing.  We don't enforce seals, but
                 * accept them so Firefox's freezeable shared memory "freezes"
@@ -5367,6 +5464,7 @@ static int sys_pread64(registers_t *regs) {
 
     proc_file_t *f = &current_proc->ofile[fd];
     if (f->type != FD_FILE || !f->node) return -9;
+    if (!access_ok_write(buf, (size_t)len)) return -14;   /* plain-memcpy target */
 
     return (int)vfs_read(f->node, off, (uint32_t)len, (uint8_t *)buf);
 }
@@ -6609,14 +6707,17 @@ static int sys_clone(registers_t *regs) {
     }
 
     /* tid notifications — we share the address space, so the current CR3 maps
-     * both the parent's and child's view; write the user words directly. */
+     * both the parent's and child's view.  The words are stored with
+     * copy_to_user, best effort like Linux's put_user() here: a pointer into a
+     * read-only page is ignored, not a ring-0 fault. */
     child->clear_child_tid = (flags & CLONE_CHILD_CLEARTID) ? uctid : 0;
-    if ((flags & CLONE_PARENT_SETTID) && uptid &&
-        access_ok((void *)(uintptr_t)uptid, 4))
-        *(uint32_t *)(uintptr_t)uptid = (uint32_t)child->pid;
-    if ((flags & CLONE_CHILD_SETTID) && uctid &&
-        access_ok((void *)(uintptr_t)uctid, 4))
-        *(uint32_t *)(uintptr_t)uctid = (uint32_t)child->pid;
+    {
+        uint32_t tid = (uint32_t)child->pid;
+        if ((flags & CLONE_PARENT_SETTID) && uptid)
+            (void)copy_to_user((void *)(uintptr_t)uptid, &tid, sizeof(tid));
+        if ((flags & CLONE_CHILD_SETTID) && uctid)
+            (void)copy_to_user((void *)(uintptr_t)uctid, &tid, sizeof(tid));
+    }
 
     if (flags & CLONE_FILES) {
         /* Share the parent's fd table (Linux CLONE_FILES) — an fd opened by any
@@ -7119,7 +7220,7 @@ static int socketcall_core(int call, uint32_t *kargs) {
     if (call == 10) { /* recv(fd, buf, len, flags) */
         void *buf = (void *)(uintptr_t)kargs[1];
         uint32_t len = kargs[2];
-        if (!access_ok(buf, len))
+        if (!access_ok_write(buf, len))   /* the stack memcpy()s into it */
             return -14;
         return net_socket_recvfrom(f->socket, buf, len, NULL);
     }
@@ -7148,7 +7249,7 @@ static int socketcall_core(int call, uint32_t *kargs) {
         net_sockaddr_in_t *uaddr = (net_sockaddr_in_t *)(uintptr_t)kargs[4];
         uint32_t *ulen = (uint32_t *)(uintptr_t)kargs[5];
         net_sockaddr_in_t kaddr;
-        if (!access_ok(buf, len))
+        if (!access_ok_write(buf, len))   /* the stack memcpy()s into it */
             return -14;
         if (uaddr) {
             uint32_t klen = 0;

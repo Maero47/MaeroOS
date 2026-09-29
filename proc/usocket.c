@@ -5,6 +5,7 @@
 #include "../mm/heap.h"
 #include "../lib/string.h"
 #include "../kernel/printk.h"
+#include "syscall.h"       /* copy_to_user / copy_from_user */
 #include <stddef.h>
 
 #define UBUF_SIZE  65536    /* per-direction stream ring */
@@ -233,12 +234,18 @@ int usocket_read(usocket_t *s, void *buf, int len, int flags) {
             if ((uint32_t)take > until) take = (int)until;
             break;
         }
+    /* buf is the caller's user buffer: fault-safe copies, in at most two runs
+     * (the ring may wrap).  Nothing is consumed until the bytes have landed,
+     * so a bad buffer is -EFAULT with the stream intact. */
     uint32_t head = b->head;
     uint8_t *p = (uint8_t *)buf;
-    for (int i = 0; i < take; i++) {
-        p[i] = b->data[head];
-        head = (head + 1) % UBUF_SIZE;
-    }
+    int first = (int)(UBUF_SIZE - head);
+    if (first > take) first = take;
+    if (copy_to_user(p, &b->data[head], (size_t)first) < 0)
+        return -14;
+    if (take > first && copy_to_user(p + first, &b->data[0], (size_t)(take - first)) < 0)
+        return -14;
+    head = (head + (uint32_t)take) % UBUF_SIZE;
     if (flags & USOCK_PEEK)
         return take;               /* MSG_PEEK: data (and fds) stay queued */
     b->head = head;
@@ -277,11 +284,18 @@ int usocket_write(usocket_t *s, const void *buf, int len, int flags) {
         int space = (int)(UBUF_SIZE - b->count);
         int put   = len - n;
         if (put > space) put = space;
-        for (int i = 0; i < put; i++) {
-            uint32_t tail = (b->head + b->count) % UBUF_SIZE;
-            b->data[tail] = p[n++];
-            b->count++;
-        }
+        /* Fault-safe copies from the caller's user buffer, in at most two runs
+         * around the ring end; a bad buffer ends the write with -EFAULT (or
+         * the count already written). */
+        uint32_t tail = (b->head + b->count) % UBUF_SIZE;
+        int first = (int)(UBUF_SIZE - tail);
+        if (first > put) first = put;
+        if (copy_from_user(&b->data[tail], p + n, (size_t)first) < 0 ||
+            (put > first &&
+             copy_from_user(&b->data[0], p + n + first, (size_t)(put - first)) < 0))
+            return n ? n : -14;
+        n        += put;
+        b->count += (uint32_t)put;
         b->total_in += (uint32_t)put;
         wake_up(b);                                    /* wake blocked readers */
         io_wake();

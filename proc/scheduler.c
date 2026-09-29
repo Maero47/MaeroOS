@@ -6,6 +6,7 @@ extern void vma_clear(struct proc *p);   /* free demand-paged VMAs (syscall.c) *
 #include "pipe.h"
 #include "usocket.h"
 #include "shm.h"
+#include "syscall.h"       /* copy_to_user / copy_from_user */
 #include "../fs/devfs.h"
 #include "../fs/vfs.h"
 #include "../net/socket.h"
@@ -355,6 +356,21 @@ static int user_word_present(uint32_t a) {
     return 1;
 }
 
+/* One robust-futex word at exit: if the dying thread `tid` owns it, mark it
+ * FUTEX_OWNER_DIED (keeping FUTEX_WAITERS) and wake a waiter.  The word is
+ * user memory, so it is read and written with the fault-safe copies. */
+static void robust_owner_died(uint32_t fa, uint32_t tid) {
+    uint32_t fv;
+    if (fa >= 0xC0000000U || !user_word_present(fa)) return;
+    if (copy_from_user(&fv, (void *)(uintptr_t)fa, sizeof(fv)) < 0) return;
+    if ((fv & 0x3FFFFFFFU) != tid) return;
+    uint32_t nv = (fv & 0x80000000U) | 0x40000000U;   /* keep WAITERS, set OWNER_DIED */
+    if (copy_to_user((void *)(uintptr_t)fa, &nv, sizeof(nv)) < 0) return;
+    /* tgid-scoped: robust-mutex waiters share our address space */
+    if (fv & 0x80000000U)
+        wake_up_n_tgid((void *)(uintptr_t)fa, 1, current_proc->tgid);
+}
+
 void proc_exit(int status) {
     __asm__ volatile("cli");
     if (!current_proc) for (;;) __asm__ volatile("hlt");
@@ -376,11 +392,14 @@ void proc_exit(int status) {
      * whole process tree, a thread can reach proc_exit after its own TLS/robust
      * pages are already unmapped (teardown races) — a raw deref then faults in
      * KERNEL mode and PANICS the box.  Gate every user deref on the page being
-     * present (checks the dying proc's live pgdir via the recursive mapping). */
+     * present (checks the dying proc's live pgdir via the recursive mapping),
+     * and store through copy_to_user(): present is not writable, and a tid
+     * pointer into a read-only page must not fault in ring 0 either. */
     if (current_proc->clear_child_tid) {
         uint32_t *ctid = (uint32_t *)(uintptr_t)current_proc->clear_child_tid;
-        if ((uintptr_t)ctid < 0xC0000000U && user_word_present((uint32_t)(uintptr_t)ctid)) {
-            *ctid = 0;
+        uint32_t zero = 0;
+        if ((uintptr_t)ctid < 0xC0000000U && user_word_present((uint32_t)(uintptr_t)ctid) &&
+            copy_to_user(ctid, &zero, sizeof(zero)) == 0) {
             /* Scope to OUR thread group: pthread_join waits are intra-process,
              * and an unscoped wake on this user vaddr mis-wakes same-vaddr
              * futex waiters in other processes (ASLR off → same layout). */
@@ -393,44 +412,30 @@ void proc_exit(int status) {
      * robust mutexes this thread currently holds.  If the thread exits while
      * holding one, the kernel must mark that futex FUTEX_OWNER_DIED and wake a
      * waiter, or every other thread blocking on it deadlocks forever.  The
-     * address space is still mapped here, so we walk it directly. */
+     * address space is still mapped here, so we walk it — every word through
+     * copy_from_user/copy_to_user, since the list is entirely user-controlled
+     * and a present page may still be read-only (a ring-0 store would panic). */
     if (current_proc->robust_list_head &&
         current_proc->robust_list_head < 0xC0000000U &&
         user_word_present(current_proc->robust_list_head) &&
         user_word_present(current_proc->robust_list_head + 8)) {
         uint32_t headp = current_proc->robust_list_head;
-        uint32_t list   = *(volatile uint32_t *)(uintptr_t)headp;        /* head->list */
-        int32_t  offset = *(volatile int32_t  *)(uintptr_t)(headp + 4);  /* futex_offset */
-        uint32_t pend   = *(volatile uint32_t *)(uintptr_t)(headp + 8);  /* op_pending */
-        uint32_t tid    = (uint32_t)current_proc->pid & 0x3FFFFFFFU;
-        uint32_t cur    = list;
-        int limit       = 2048;
-        while (cur && cur != headp && cur < 0xC0000000U && limit-- > 0) {
-            uint32_t fa = cur + (uint32_t)offset;     /* offset may be negative */
-            if (fa < 0xC0000000U && user_word_present(fa)) {
-                uint32_t fv = *(volatile uint32_t *)(uintptr_t)fa;
-                if ((fv & 0x3FFFFFFFU) == tid) {
-                    *(volatile uint32_t *)(uintptr_t)fa =
-                        (fv & 0x80000000U) | 0x40000000U;  /* keep WAITERS, set OWNER_DIED */
-                    /* tgid-scoped: robust-mutex waiters share our address space */
-                    if (fv & 0x80000000U)
-                        wake_up_n_tgid((void *)(uintptr_t)fa, 1, current_proc->tgid);
-                }
+        uint32_t hdr[3];                           /* list, futex_offset, op_pending */
+        if (copy_from_user(hdr, (void *)(uintptr_t)headp, sizeof(hdr)) == 0) {
+            uint32_t list   = hdr[0];
+            int32_t  offset = (int32_t)hdr[1];
+            uint32_t pend   = hdr[2];
+            uint32_t tid    = (uint32_t)current_proc->pid & 0x3FFFFFFFU;
+            uint32_t cur    = list;
+            int limit       = 2048;
+            while (cur && cur != headp && cur < 0xC0000000U && limit-- > 0) {
+                robust_owner_died((uint32_t)(cur + (uint32_t)offset), tid);  /* offset may be negative */
+                if (!user_word_present(cur)) break;       /* teardown race */
+                if (copy_from_user(&cur, (void *)(uintptr_t)cur, sizeof(cur)) < 0)
+                    break;                                /* → next entry */
             }
-            if (!user_word_present(cur)) break;           /* teardown race */
-            cur = *(volatile uint32_t *)(uintptr_t)cur;   /* → next entry */
-        }
-        if (pend && pend < 0xC0000000U) {
-            uint32_t fa = pend + (uint32_t)offset;
-            if (fa < 0xC0000000U && user_word_present(fa)) {
-                uint32_t fv = *(volatile uint32_t *)(uintptr_t)fa;
-                if ((fv & 0x3FFFFFFFU) == tid) {
-                    *(volatile uint32_t *)(uintptr_t)fa =
-                        (fv & 0x80000000U) | 0x40000000U;
-                    if (fv & 0x80000000U)
-                        wake_up_n_tgid((void *)(uintptr_t)fa, 1, current_proc->tgid);
-                }
-            }
+            if (pend && pend < 0xC0000000U)
+                robust_owner_died((uint32_t)(pend + (uint32_t)offset), tid);
         }
         current_proc->robust_list_head = 0;
     }
