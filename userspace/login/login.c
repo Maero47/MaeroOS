@@ -1,9 +1,9 @@
 #include "../include/stdio.h"
 #include "../include/string.h"
 #include "../include/unistd.h"
+#include "../include/grp.h"
 #include "../auth/auth.h"
 
-#define LINE_MAX 256
 #define FIELD_MAX 192
 
 static char username[FIELD_MAX];
@@ -45,6 +45,9 @@ static char *envp[] = {
     (char *)0
 };
 
+static int user_uid = -1;
+static int user_gid = -1;
+
 static void copy_field(char *dst, int cap, const char *src) {
     int i = 0;
     while (src && src[i] && i < cap - 1) {
@@ -54,27 +57,24 @@ static void copy_field(char *dst, int cap, const char *src) {
     dst[i] = '\0';
 }
 
+/* name:passwd:uid:gid:gecos:home:shell -- exactly seven fields, any of
+ * which (gecos in particular) may be empty. */
 static int parse_passwd_line(char *line, const char *want_user) {
-    char *save = (char *)0;
-    char *name = strtok_r(line, ":", &save);
-    char *passwd = strtok_r((char *)0, ":", &save);
-    char *uid = strtok_r((char *)0, ":", &save);
-    char *gid = strtok_r((char *)0, ":", &save);
-    char *gecos = strtok_r((char *)0, ":", &save);
-    char *dir = strtok_r((char *)0, ":", &save);
-    char *sh = strtok_r((char *)0, ":\n\r", &save);
+    char *f[MAERO_PASSWD_FIELDS];
+    int uid, gid;
 
-    (void)uid;
-    (void)gid;
-    (void)gecos;
+    if (maero_split_fields(line, f, MAERO_PASSWD_FIELDS) != MAERO_PASSWD_FIELDS)
+        return 0;
+    if (strcmp(f[0], want_user) != 0) return 0;
+    if (!maero_parse_id(f[2], &uid) || !maero_parse_id(f[3], &gid)) return 0;
+    if (!f[5][0] || !f[6][0]) return 0;
 
-    if (!name || !dir || !sh) return 0;
-    if (strcmp(name, want_user) != 0) return 0;
-
-    copy_field(username, sizeof(username), name);
-    copy_field(passwd_field, sizeof(passwd_field), passwd ? passwd : "");
-    copy_field(home, sizeof(home), dir);
-    copy_field(shell, sizeof(shell), sh);
+    copy_field(username, sizeof(username), f[0]);
+    copy_field(passwd_field, sizeof(passwd_field), f[1]);
+    copy_field(home, sizeof(home), f[5]);
+    copy_field(shell, sizeof(shell), f[6]);
+    user_uid = uid;
+    user_gid = gid;
     return 1;
 }
 
@@ -84,8 +84,8 @@ static int load_user(const char *name) {
         f = fopen("/disk/etc/passwd", "r");
     if (!f) return 0;
 
-    char line[LINE_MAX];
-    while (fgets(line, sizeof(line), f)) {
+    char line[MAERO_LINE_MAX];
+    while (maero_read_line(f, line, sizeof(line))) {
         if (parse_passwd_line(line, name)) {
             fclose(f);
             return 1;
@@ -96,43 +96,38 @@ static int load_user(const char *name) {
     return 0;
 }
 
-static int load_shadow_password(const char *name, char *out, int out_cap) {
-    FILE *f = fopen("/etc/shadow", "r");
-    if (!f && access("/disk/etc/shadow", R_OK) == 0)
-        f = fopen("/disk/etc/shadow", "r");
-    if (!f) return 0;
-
-    char line[LINE_MAX];
-    while (fgets(line, sizeof(line), f)) {
-        char *save = (char *)0;
-        char *shadow_name = strtok_r(line, ":", &save);
-        char *shadow_pass = strtok_r((char *)0, ":\n\r", &save);
-        if (!shadow_name || !shadow_pass) continue;
-        if (strcmp(shadow_name, name) == 0) {
-            copy_field(out, out_cap, shadow_pass);
-            fclose(f);
-            return 1;
-        }
-    }
-
-    fclose(f);
-    return 0;
-}
-
 static int check_password(const char *name, const char *password) {
-    char expected[FIELD_MAX];
+    char expected[MAERO_HASH_MAX];
+    int ok;
 
     if (!load_user(name))
         return -1;
 
     if (strcmp(passwd_field, "x") == 0) {
-        if (!load_shadow_password(name, expected, sizeof(expected)))
+        if (!maero_shadow_hash(name, expected, sizeof(expected)))
             return 0;
     } else {
         copy_field(expected, sizeof(expected), passwd_field);
     }
 
-    return maero_password_verify(expected, password);
+    ok = maero_password_verify(expected, password);
+    maero_wipe(expected, sizeof(expected));
+    return ok;
+}
+
+/* Become the target user: group first (it needs root), then uid.  Every
+ * step is checked and a failure aborts the login -- continuing would hand
+ * out a shell with the caller's (usually root's) privileges. */
+static int drop_privileges(void) {
+    if (user_uid < 0 || user_gid < 0) return 0;
+    if (setgid(user_gid) != 0) return 0;
+    if (initgroups(username, user_gid) != 0) return 0;
+    if (setuid(user_uid) != 0) return 0;
+    if (getuid() != user_uid || geteuid() != user_uid) return 0;
+    if (getgid() != user_gid || getegid() != user_gid) return 0;
+    /* A non-root user must not be able to get root back. */
+    if (user_uid != 0 && setuid(0) == 0) return 0;
+    return 1;
 }
 
 static void select_shell_path(void) {
@@ -159,6 +154,7 @@ static void build_env(void) {
 int main(int argc, char *argv[]) {
     int forced = 0;
     const char *name = "root";
+    char password[128];
 
     if (argc > 1 && strcmp(argv[1], "--check") == 0) {
         if (argc < 4) {
@@ -179,6 +175,11 @@ int main(int argc, char *argv[]) {
     }
 
     if (argc > 1 && strcmp(argv[1], "-f") == 0) {
+        /* Pre-authenticated login is for getty/init only. */
+        if (getuid() != 0) {
+            printf("login: -f requires root\n");
+            return 1;
+        }
         forced = 1;
         name = argc > 2 ? argv[2] : "root";
     } else if (argc > 1) {
@@ -191,11 +192,20 @@ int main(int argc, char *argv[]) {
     }
 
     if (!forced) {
-        if (argc < 3) {
+        int ok;
+
+        /* Prefer the prompt: a password in argv is visible to every
+         * process via /proc/<pid>/cmdline.  The argv form is kept for
+         * scripts. */
+        if (argc >= 3) {
+            copy_field(password, sizeof(password), argv[2]);
+        } else if (!maero_read_password("Password: ", password, sizeof(password))) {
             printf("login: password required\n");
             return 1;
         }
-        if (check_password(name, argv[2]) <= 0) {
+        ok = check_password(name, password);
+        maero_wipe(password, sizeof(password));
+        if (ok <= 0) {
             printf("login: authentication failed\n");
             return 1;
         }
@@ -203,6 +213,15 @@ int main(int argc, char *argv[]) {
 
     select_shell_path();
     build_env();
+
+    if (!drop_privileges()) {
+        printf("login: cannot drop privileges to %s\n", username);
+        return 1;
+    }
+    if (chdir(home) != 0) {
+        printf("login: no home directory %s, using /\n", home);
+        chdir("/");
+    }
 
     printf("login: %s accepted\n", username);
 

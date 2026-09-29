@@ -4,6 +4,7 @@
 #include "../include/string.h"
 #include "../include/sys/types.h"
 #include "../include/unistd.h"
+#include "../include/termios.h"
 
 #define PBKDF2_ITERS 100000
 #define SHA256_BLOCK 64
@@ -295,10 +296,13 @@ int maero_password_verify(const char *stored, const char *password) {
     if (!stored || !password)
         return 0;
 
+    /* Only recognised hash formats can match.  Anything else -- an empty
+     * field, a lock marker such as "!" or "*", or a plaintext value -- is a
+     * locked account, never a password to compare against. */
     if (strncmp(stored, "$maero-pbkdf2-sha256$", 21) != 0) {
         if (strncmp(stored, "$maero$", 7) == 0)
             return legacy_fnv_verify(stored, password);
-        return strcmp(stored, password) == 0;
+        return 0;
     }
 
     if ((int)strlen(stored) >= (int)sizeof(copy))
@@ -324,25 +328,123 @@ int maero_password_verify(const char *stored, const char *password) {
 }
 
 int maero_password_make_salt(const char *user, char *out, int out_cap) {
-    struct timeval tv;
-    char seed[96];
     uint8_t salt[16];
-    uint8_t digest[SHA256_DIGEST];
-    sha256_ctx ctx;
 
     if (!user || !out || out_cap < 33)
         return 0;
 
-    if (getrandom(salt, sizeof(salt), 0) == (int)sizeof(salt)) {
-        hex_encode(salt, sizeof(salt), out, out_cap);
-        return 1;
-    }
-
-    gettimeofday(&tv, (void *)0);
-    snprintf(seed, sizeof(seed), "%s:%d:%ld:%ld", user, getpid(), tv.tv_sec, tv.tv_usec);
-    sha256_init(&ctx);
-    sha256_update(&ctx, seed, strlen(seed));
-    sha256_final(&ctx, digest);
-    hex_encode(digest, 16, out, out_cap);
+    /* No weak fallback: a salt derived from the time and pid is guessable,
+     * so refuse to hash rather than silently use one. */
+    if (getrandom(salt, sizeof(salt), 0) != (int)sizeof(salt))
+        return 0;
+    hex_encode(salt, sizeof(salt), out, out_cap);
+    maero_wipe(salt, sizeof(salt));
     return 1;
+}
+
+void maero_wipe(void *p, int n) {
+    volatile unsigned char *v = (volatile unsigned char *)p;
+    while (n-- > 0)
+        *v++ = 0;
+}
+
+int maero_split_fields(char *line, char **fields, int max) {
+    int n = 0;
+    char *p = line;
+    char *end = line + strlen(line);
+
+    while (end > line && (end[-1] == '\n' || end[-1] == '\r'))
+        *--end = '\0';
+
+    for (;;) {
+        char *colon = strchr(p, ':');
+        if (n == max)
+            return -1;
+        fields[n++] = p;
+        if (!colon)
+            return n;
+        *colon = '\0';
+        p = colon + 1;
+    }
+}
+
+int maero_parse_id(const char *s, int *out) {
+    int v = 0;
+    if (!s || !s[0])
+        return 0;
+    for (int i = 0; s[i]; i++) {
+        if (s[i] < '0' || s[i] > '9' || i >= 9)
+            return 0;
+        v = v * 10 + (s[i] - '0');
+    }
+    *out = v;
+    return 1;
+}
+
+int maero_read_line(FILE *fp, char *buf, int cap) {
+    while (fgets(buf, cap, fp)) {
+        int len = strlen(buf);
+        int c;
+
+        if (len > 0 && buf[len - 1] == '\n')
+            return 1;
+        if (len < cap - 1)
+            return 1;               /* last line without a newline */
+        /* Overlong line: drop all of it so the tail is never parsed as a
+         * line of its own. */
+        while ((c = fgetc(fp)) != EOF && c != '\n')
+            ;
+    }
+    return 0;
+}
+
+int maero_shadow_hash(const char *user, char *out, int out_cap) {
+    char line[MAERO_LINE_MAX];
+    char *f[MAERO_SHADOW_FIELDS];
+    int found = 0;
+    FILE *fp = fopen("/etc/shadow", "r");
+
+    if (!fp && access("/disk/etc/shadow", R_OK) == 0)
+        fp = fopen("/disk/etc/shadow", "r");
+    if (!fp)
+        return 0;
+    while (!found && maero_read_line(fp, line, sizeof(line))) {
+        int n = maero_split_fields(line, f, MAERO_SHADOW_FIELDS);
+        if (n < 2 || strcmp(f[0], user) != 0)
+            continue;
+        if ((int)strlen(f[1]) >= out_cap)
+            break;
+        strcpy(out, f[1]);
+        found = 1;
+    }
+    maero_wipe(line, sizeof(line));
+    fclose(fp);
+    return found;
+}
+
+int maero_read_password(const char *prompt, char *buf, int cap) {
+    struct termios t, saved;
+    int have_tty = (tcgetattr(0, &t) == 0);
+    int n = 0;
+    int got = 0;
+    char c;
+
+    printf("%s", prompt);
+    fflush(stdout);
+    if (have_tty) {
+        saved = t;
+        t.c_lflag &= ~ECHO;
+        tcsetattr(0, TCSANOW, &t);
+    }
+    while (n < cap - 1 && read(0, &c, 1) == 1) {
+        got = 1;
+        if (c == '\n' || c == '\r') break;
+        if (c == 127 || c == 8) { if (n) n--; continue; }
+        buf[n++] = c;
+    }
+    buf[n] = 0;
+    c = 0;
+    if (have_tty) tcsetattr(0, TCSANOW, &saved);
+    printf("\n");
+    return got;
 }

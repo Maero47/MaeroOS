@@ -5,7 +5,6 @@
 #include "../include/unistd.h"
 
 #define MAX_PROCS 64
-#define MAX_SERVICE_LINES 32
 #define LINE_MAX_LEN 256
 #define SERVICE_NAME_MAX 32
 #define SERVICE_CMD_MAX 180
@@ -284,10 +283,26 @@ static int send_control(const char *cmd, const char *name) {
     return 0;
 }
 
+static int write_all(int fd, const char *buf, int len) {
+    while (len > 0) {
+        int n = write(fd, buf, len);
+        if (n <= 0)
+            return 0;
+        buf += n;
+        len -= n;
+    }
+    return 1;
+}
+
+/* Copy /etc/services to a temp file line by line (no line limit), changing
+ * the boot state of NAME, then rename the result into place.  A short write
+ * or any other failure leaves the original file untouched. */
 static int rewrite_service_state(const char *name, int enabled) {
-    char lines[MAX_SERVICE_LINES][LINE_MAX_LEN];
-    int count = 0;
+    static const char tmp[] = "/etc/services.tmp";
+    char line[LINE_MAX_LEN];
     int changed = 0;
+    int at_line_start = 1;
+    int ok = 1;
 
     FILE *f = fopen("/etc/services", "r");
     if (!f) {
@@ -295,40 +310,60 @@ static int rewrite_service_state(const char *name, int enabled) {
         return 1;
     }
 
-    while (count < MAX_SERVICE_LINES && fgets(lines[count], sizeof(lines[count]), f))
-        count++;
-    fclose(f);
-
-    for (int i = 0; i < count; i++) {
-        char copy[LINE_MAX_LEN];
-        strncpy(copy, lines[i], sizeof(copy) - 1);
-        copy[sizeof(copy) - 1] = '\0';
-        trim_line(copy);
-
-        service_entry_t svc;
-        if (!parse_service_line(copy, &svc)) continue;
-        if (!svc.respawn || strcmp(svc.name, name) != 0) continue;
-
-        sprintf(lines[i], "%s %s %s %s\n",
-                svc.type, svc.name, enabled ? "enabled" : "disabled", svc.command);
-        changed = 1;
-        break;
-    }
-
-    if (!changed) {
-        printf("svc: unknown respawn service %s\n", name);
-        return 1;
-    }
-
-    int fd = open("/etc/services", O_WRONLY | O_TRUNC);
+    unlink(tmp);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC);
     if (fd < 0) {
+        fclose(f);
         puts("svc: cannot update /etc/services");
         return 1;
     }
 
-    for (int i = 0; i < count; i++)
-        write(fd, lines[i], strlen(lines[i]));
-    close(fd);
+    while (ok && fgets(line, sizeof(line), f)) {
+        int len = strlen(line);
+        int whole = at_line_start;
+        at_line_start = len > 0 && line[len - 1] == '\n';
+
+        /* Only a complete line is a candidate; the pieces of an overlong
+         * line are copied through untouched. */
+        if (whole && at_line_start && !changed) {
+            char copy[LINE_MAX_LEN];
+            service_entry_t svc;
+            strcpy(copy, line);
+            trim_line(copy);
+            if (parse_service_line(copy, &svc) && svc.respawn &&
+                strcmp(svc.name, name) == 0) {
+                char out[LINE_MAX_LEN + 16];
+                int n = snprintf(out, sizeof(out), "%s %s %s %s\n", svc.type, svc.name,
+                                 enabled ? "enabled" : "disabled", svc.command);
+                ok = n > 0 && n < (int)sizeof(out) && write_all(fd, out, n);
+                changed = 1;
+                continue;
+            }
+        }
+        ok = write_all(fd, line, len);
+    }
+    fclose(f);
+
+    if (fsync(fd) != 0)
+        ok = 0;
+    if (close(fd) != 0)
+        ok = 0;
+
+    if (!changed) {
+        unlink(tmp);
+        printf("svc: unknown respawn service %s\n", name);
+        return 1;
+    }
+    if (!ok) {
+        unlink(tmp);
+        puts("svc: cannot update /etc/services");
+        return 1;
+    }
+    if (rename(tmp, "/etc/services") != 0) {
+        unlink(tmp);
+        puts("svc: cannot update /etc/services");
+        return 1;
+    }
 
     return send_control(enabled ? "start" : "stop", name);
 }

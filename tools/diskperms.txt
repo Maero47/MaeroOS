@@ -7,13 +7,17 @@
 etc/shadow              0     0     0100600
 etc/passwd              0     0     0100644
 etc/group               0     0     0100644
-etc                     0     100   040775
+# /disk/etc holds shadow, doas.conf, rc, services and inittab, which root
+# trusts: only root may add, remove or rename entries in it.  The few
+# user-editable files are pre-created below and owned by the user.
+etc                     0     0     040755
 apps                    0     100   040775
 home                    0     0     040755
 home/user               1000  100   040755
 home/user/README.txt    1000  100   0100644
 etc/desktop.conf        1000  100   0100644
 etc/notes.txt           1000  100   0100644
+etc/pkg-index.txt       1000  100   0100644
 etc/doas.conf           0     0     0100644
 doas                    0     0     0104755
 passwd                  0     0     0104755
