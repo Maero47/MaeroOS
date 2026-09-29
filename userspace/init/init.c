@@ -131,6 +131,20 @@ static int start_program_as_user(char *path, char **argv, char **envp) {
     return pid;
 }
 
+/* The kernel's rename() currently recreates its target root 0644, so a
+ * crash between passwd's rename and its re-check could leave /etc/shadow
+ * world-readable.  Close that at every boot, before any user runs. */
+static void secure_shadow_files(void) {
+    static const char *const paths[] = { "/etc/shadow", "/etc/shadow-", 0 };
+    for (int i = 0; paths[i]; i++) {
+        int fd = open(paths[i], O_RDONLY);
+        if (fd < 0) continue;
+        if (fchown(fd, 0, 0) != 0 || fchmod(fd, 0600) != 0)
+            printf("[init] WARNING: cannot restrict %s to 0600\n", paths[i]);
+        close(fd);
+    }
+}
+
 static int device_available(const char *path, int flags) {
     int fd = open(path, flags);
     if (fd < 0) return 0;
@@ -687,6 +701,8 @@ int main(void) {
     }
 
     disk_logging = disk_userland;
+    if (disk_userland)
+        secure_shadow_files();
     init_log("=== MaeroOS init boot ===");
 
     if (disk_userland && file_available("/etc/rc")) {

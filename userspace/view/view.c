@@ -131,14 +131,23 @@ static int ends_with(const char *s, const char *suf) {
     return sl >= fl && !strcmp(s + sl - fl, suf);
 }
 
+/* A per-user file for the decoded image: /disk/etc is root-only, and a fixed
+ * name in the shared /tmp could be pre-planted by another user. */
+static void user_cache_path(char *out, int cap, const char *name) {
+    const char *home = getenv("HOME");
+    if (home && home[0] == '/')
+        snprintf(out, cap, "%s/.%s", home, name);
+    else
+        snprintf(out, cap, "/tmp/%s-%d", name, getuid());
+}
+
 /* For PNG/JPEG/GIF, decode to a temp PPM via imgconv and load that. */
 static const char *decode_path(const char *p) {
-    static char cache[80];
+    static char cache[256];
     if (ends_with(p, ".ppm") || ends_with(p, ".bmp")) return p;
     const char *conv = access("/disk/bin/imgconv", 1) == 0 ?
                        "/disk/bin/imgconv" : "/bin/imgconv";
-    mkdir("/disk/etc", 0755);
-    snprintf(cache, sizeof(cache), "/disk/etc/view-cache.ppm");
+    user_cache_path(cache, sizeof(cache), "view-cache.ppm");
     int pid = fork();
     if (pid == 0) {
         char *argv[] = { (char *)conv, (char *)p, cache, 0 };

@@ -3,6 +3,7 @@
 #include "../include/stdlib.h"
 #include "../include/string.h"
 #include "../include/unistd.h"
+#include "../auth/replace.h"
 
 #define MAX_PROCS 64
 #define LINE_MAX_LEN 256
@@ -283,85 +284,98 @@ static int send_control(const char *cmd, const char *name) {
     return 0;
 }
 
-static int write_all(int fd, const char *buf, int len) {
-    while (len > 0) {
-        int n = write(fd, buf, len);
-        if (n <= 0)
-            return 0;
-        buf += n;
-        len -= n;
+/* Read all of PATH into a malloc'd, NUL-terminated buffer. */
+static char *slurp(const char *path, int *out_len) {
+    int fd = open(path, O_RDONLY);
+    int cap = 1024, len = 0, n;
+    char *buf;
+
+    if (fd < 0)
+        return (char *)0;
+    buf = (char *)malloc(cap);
+    while (buf) {
+        if (len == cap - 1) {
+            char *bigger = (char *)realloc(buf, cap * 2);
+            if (!bigger) { free(buf); buf = (char *)0; break; }
+            buf = bigger;
+            cap *= 2;
+        }
+        n = read(fd, buf + len, cap - 1 - len);
+        if (n < 0) { free(buf); buf = (char *)0; break; }
+        if (n == 0) break;
+        len += n;
     }
-    return 1;
+    close(fd);
+    if (buf) {
+        buf[len] = '\0';
+        *out_len = len;
+    }
+    return buf;
 }
 
-/* Copy /etc/services to a temp file line by line (no line limit), changing
- * the boot state of NAME, then rename the result into place.  A short write
- * or any other failure leaves the original file untouched. */
+/* Rewrite /etc/services (any length) with NAME's boot state changed, and
+ * install it with maero_replace_file(), which never leaves the file missing
+ * or partial even if the rename goes wrong. */
 static int rewrite_service_state(const char *name, int enabled) {
-    static const char tmp[] = "/etc/services.tmp";
-    char line[LINE_MAX_LEN];
-    int changed = 0;
-    int at_line_start = 1;
-    int ok = 1;
+    int old_len = 0, new_len = 0, changed = 0, r;
+    char *old = slurp("/etc/services", &old_len);
+    char *out;
+    char *line;
 
-    FILE *f = fopen("/etc/services", "r");
-    if (!f) {
+    if (!old) {
         puts("svc: no /etc/services");
         return 1;
     }
-
-    unlink(tmp);
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC);
-    if (fd < 0) {
-        fclose(f);
-        puts("svc: cannot update /etc/services");
+    /* The new line may be longer than the old one by at most this much. */
+    out = (char *)malloc(old_len + LINE_MAX_LEN + 16);
+    if (!out) {
+        free(old);
+        puts("svc: out of memory");
         return 1;
     }
 
-    while (ok && fgets(line, sizeof(line), f)) {
-        int len = strlen(line);
-        int whole = at_line_start;
-        at_line_start = len > 0 && line[len - 1] == '\n';
+    line = old;
+    while (*line) {
+        char *eol = strchr(line, '\n');
+        int line_len = eol ? (int)(eol - line) + 1 : (int)strlen(line);
 
-        /* Only a complete line is a candidate; the pieces of an overlong
-         * line are copied through untouched. */
-        if (whole && at_line_start && !changed) {
+        if (!changed && line_len < LINE_MAX_LEN) {
             char copy[LINE_MAX_LEN];
             service_entry_t svc;
-            strcpy(copy, line);
+            memcpy(copy, line, line_len);
+            copy[line_len] = '\0';
             trim_line(copy);
             if (parse_service_line(copy, &svc) && svc.respawn &&
                 strcmp(svc.name, name) == 0) {
-                char out[LINE_MAX_LEN + 16];
-                int n = snprintf(out, sizeof(out), "%s %s %s %s\n", svc.type, svc.name,
-                                 enabled ? "enabled" : "disabled", svc.command);
-                ok = n > 0 && n < (int)sizeof(out) && write_all(fd, out, n);
+                new_len += snprintf(out + new_len, LINE_MAX_LEN + 16, "%s %s %s %s\n",
+                                    svc.type, svc.name,
+                                    enabled ? "enabled" : "disabled", svc.command);
                 changed = 1;
+                line += line_len;
                 continue;
             }
         }
-        ok = write_all(fd, line, len);
+        memcpy(out + new_len, line, line_len);
+        new_len += line_len;
+        line += line_len;
     }
-    fclose(f);
-
-    if (fsync(fd) != 0)
-        ok = 0;
-    if (close(fd) != 0)
-        ok = 0;
 
     if (!changed) {
-        unlink(tmp);
+        free(old);
+        free(out);
         printf("svc: unknown respawn service %s\n", name);
         return 1;
     }
-    if (!ok) {
-        unlink(tmp);
-        puts("svc: cannot update /etc/services");
-        return 1;
-    }
-    if (rename(tmp, "/etc/services") != 0) {
-        unlink(tmp);
-        puts("svc: cannot update /etc/services");
+
+    r = maero_replace_file("/etc/services", "/etc/services.tmp", (char *)0,
+                           old, old_len, out, new_len, 0644);
+    free(old);
+    free(out);
+    if (r != MAERO_REPLACED) {
+        if (r == MAERO_LOST)
+            puts("svc: ERROR: /etc/services could not be restored; see /etc/services.tmp");
+        else
+            puts("svc: cannot update /etc/services");
         return 1;
     }
 

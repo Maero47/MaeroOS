@@ -60,16 +60,26 @@ static void scan_walls(void) {
     closedir(d);
 }
 
+/* A per-user file for the decoded wallpaper, which desktop.conf points
+ * at so it must persist: /disk/etc is root-only, and a fixed
+ * name in the shared /tmp could be pre-planted by another user. */
+static void user_cache_path(char *out, int cap, const char *name) {
+    const char *home = getenv("HOME");
+    if (home && home[0] == '/')
+        snprintf(out, cap, "%s/.%s", home, name);
+    else
+        snprintf(out, cap, "/tmp/%s-%d", name, getuid());
+}
+
 /* PPM loads directly; any other format (PNG/JPG/GIF/BMP) is decoded to a
  * cached PPM by the imgconv helper.  Returns the path the desktop should use. */
 static const char *resolve_wallpaper(const char *path) {
-    static char cache[80];
+    static char cache[256];
     if (ends_with(path, ".ppm")) return path;
 
     const char *conv = access("/disk/bin/imgconv", 1) == 0 ?
                        "/disk/bin/imgconv" : "/bin/imgconv";
-    snprintf(cache, sizeof(cache), "/disk/etc/wallpaper-cache.ppm");
-    mkdir("/disk/etc", 0755);
+    user_cache_path(cache, sizeof(cache), "wallpaper-cache.ppm");
     int pid = fork();
     if (pid == 0) {
         char *argv[] = { (char *)conv, (char *)path, cache, 0 };

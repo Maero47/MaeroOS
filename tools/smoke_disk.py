@@ -141,6 +141,8 @@ def main():
             # passwd must leave shadow root:root 0600 (it used to become 0644).
             ("busybox ls -ln /etc/shadow\n", re.compile(r"-rw------- +1 +0 +0 ")),
             ("busybox ls -ln /etc/shadow.tmp\n", "No such file", "-rw"),
+            # The previous shadow is kept as a root-only backup.
+            ("busybox ls -ln /etc/shadow-\n", re.compile(r"-rw------- +1 +0 +0 ")),
             # The shipped default user password is hashed, and the documented
             # login (user/user) still works.
             ("cat /etc/shadow\n", "user:$maero-pbkdf2-sha256$100000$"),
@@ -160,6 +162,7 @@ def main():
             ("id\n", "uid=1000 gid=100"),
             ("pwd\n", "/home/user"),
             ("cat /etc/shadow\n", "cat: cannot open file", "$maero"),
+            ("cat /etc/shadow-\n", "cat: cannot open file", "$maero"),
             # /disk/etc is root-only: the user cannot add files to it.
             ("printf pwned > /etc/owned\n", "MaeroOS$ "),
             ("cat /etc/owned\n", "cat: cannot open file", "pwned"),
@@ -227,6 +230,7 @@ def main():
             ("cat /etc/services\n", "respawn heartbeat disabled /disk/respawnprobe"),
             ("svc enable heartbeat\n", "started heartbeat"),
             ("cat /etc/services\n", "# svc-tail-marker"),
+            ("busybox ls /etc/services.tmp\n", "No such file"),
             ("cat /etc/services\n", "respawn heartbeat enabled /disk/respawnprobe"),
             ("cat /disk/hello.txt\n", "Hello from MaeroOS initrd!"),
             ("diskprobe\n", "diskprobe ok"),
