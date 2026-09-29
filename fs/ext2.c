@@ -231,6 +231,8 @@ static int ext2_truncate(vfs_node_t *node, uint32_t new_size);
 static int ext2_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid,
                         uint32_t gid);
 static int ext2_unlink(vfs_node_t *dir, const char *name);
+static int ext2_rename(vfs_node_t *old_dir, const char *old_name,
+                       vfs_node_t *new_dir, const char *new_name);
 static int ext2_free_block(uint32_t blk);
 
 /* ── Block I/O ────────────────────────────────────────────────────────────── */
@@ -1574,6 +1576,7 @@ static vfs_node_t *ext2_make_node(uint32_t ino_num, const char *name,
         node->readdir_fn = ext2_readdir;
         node->create_fn  = ext2_create;
         node->unlink_fn  = ext2_unlink;
+        node->rename_fn  = ext2_rename;
     } else {
         node->flags    = VFS_FLAG_FILE;
         node->read_fn  = ext2_read_node;
@@ -1660,6 +1663,28 @@ static int ext2_create(vfs_node_t *dir, const char *name, uint32_t flags) {
     return 0;
 }
 
+/* The last name of `ino` is gone (victim->i_links_count is 0).  Free it now,
+ * or — while a descriptor or a mapping still holds it — mark it orphaned so
+ * ext2_close_node() frees it when the last one closes. */
+static void ext2_put_unlinked(uint32_t ino, ext2_inode_t *victim, uint32_t now) {
+    preempt_disable();
+    ext2_open_t *e = ext2_open_find(ino);
+    int in_use = (e && e->refs > 0);
+    if (in_use) e->orphan = 1;
+    preempt_enable();
+
+    if (in_use) {
+        /* Name gone, data still reachable through the open descriptors. */
+        ext2_write_inode(ino, victim);
+    } else {
+        ext2_free_inode_blocks(victim);
+        victim->i_dtime = now;
+        victim->i_size = 0;
+        ext2_write_inode(ino, victim);
+        ext2_free_inode(ino);
+    }
+}
+
 static int ext2_unlink(vfs_node_t *dir, const char *name) {
     if (!g_mounted || !dir || !dir->private || !name) return -1;
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return -1;
@@ -1696,27 +1721,10 @@ static int ext2_unlink(vfs_node_t *dir, const char *name) {
     if (victim.i_links_count > 0) victim.i_links_count--;
     victim.i_ctime = now;
 
-    if (victim.i_links_count > 0) {          /* another name still refers to it */
+    if (victim.i_links_count > 0)            /* another name still refers to it */
         ext2_write_inode(victim_ino, &victim);
-    } else {
-        preempt_disable();
-        ext2_open_t *e = ext2_open_find(victim_ino);
-        int in_use = (e && e->refs > 0);
-        if (in_use) e->orphan = 1;
-        preempt_enable();
-
-        if (in_use) {
-            /* Name gone, data still reachable through the open descriptors.
-             * ext2_close_node() releases it when the last one closes. */
-            ext2_write_inode(victim_ino, &victim);
-        } else {
-            ext2_free_inode_blocks(&victim);
-            victim.i_dtime = now;
-            victim.i_size = 0;
-            ext2_write_inode(victim_ino, &victim);
-            ext2_free_inode(victim_ino);
-        }
-    }
+    else
+        ext2_put_unlinked(victim_ino, &victim, now);
 
     dir_inode.i_mtime = now;
     dir_inode.i_ctime = now;
@@ -1724,6 +1732,177 @@ static int ext2_unlink(vfs_node_t *dir, const char *name) {
         dir_inode.i_links_count--;
     }
     ext2_write_inode(dpriv->ino, &dir_inode);
+    return 0;
+}
+
+/* Look `name` up in a directory inode: its inode number (0 if absent) and,
+ * through *ftype, the entry's file-type byte. */
+static uint32_t ext2_dir_lookup(ext2_inode_t *dir_inode, const char *name,
+                                uint8_t *ftype) {
+    uint32_t name_len = strlen(name);
+    if (name_len == 0 || name_len > 255) return 0;
+    uint8_t *blk_buf = (uint8_t *)kmalloc(g_state.block_size);
+    if (!blk_buf) return 0;
+    uint32_t found = 0;
+    for (uint32_t pos = 0; pos < dir_inode->i_size && !found;
+         pos += g_state.block_size) {
+        uint32_t blk_num = ext2_file_blk(dir_inode, pos / g_state.block_size);
+        if (!blk_num) continue;
+        if (ext2_read_block(blk_num, blk_buf) < 0) break;
+        for (uint32_t off = 0; off < g_state.block_size; ) {
+            ext2_dirent_t *de = (ext2_dirent_t *)(blk_buf + off);
+            if (de->rec_len == 0) break;
+            if (de->inode && de->name_len == (uint8_t)name_len &&
+                memcmp(de->name, name, name_len) == 0) {
+                found = de->inode;
+                if (ftype) *ftype = de->file_type;
+                break;
+            }
+            off += de->rec_len;
+        }
+    }
+    kfree(blk_buf);
+    return found;
+}
+
+/* Point the existing entry `name` at inode `ino` (type byte `ftype`).  The
+ * entry is rewritten in place with a single block write, which is what makes
+ * replacing a rename target atomic: the name refers to the old inode before
+ * the write and to the new one after it, and never to nothing. */
+static int ext2_set_dirent(ext2_inode_t *dir_inode, const char *name,
+                           uint32_t ino, uint8_t ftype) {
+    uint32_t name_len = strlen(name);
+    if (name_len == 0 || name_len > 255) return -1;
+    uint8_t *blk_buf = (uint8_t *)kmalloc(g_state.block_size);
+    if (!blk_buf) return -1;
+    for (uint32_t pos = 0; pos < dir_inode->i_size; pos += g_state.block_size) {
+        uint32_t blk_num = ext2_file_blk(dir_inode, pos / g_state.block_size);
+        if (!blk_num) continue;
+        if (ext2_read_block(blk_num, blk_buf) < 0) break;
+        for (uint32_t off = 0; off < g_state.block_size; ) {
+            ext2_dirent_t *de = (ext2_dirent_t *)(blk_buf + off);
+            if (de->rec_len == 0) break;
+            if (de->inode && de->name_len == (uint8_t)name_len &&
+                memcmp(de->name, name, name_len) == 0) {
+                de->inode = ino;
+                de->file_type = ftype;
+                int r = ext2_write_block(blk_num, blk_buf);
+                kfree(blk_buf);
+                return r;
+            }
+            off += de->rec_len;
+        }
+    }
+    kfree(blk_buf);
+    return -1;
+}
+
+/* rename_fn (Linux ext2_rename).  Order of the on-disk updates:
+ *   1. new_name → source inode (rewritten in place if it exists, else added),
+ *   2. old_name removed,
+ *   3. a moved directory's ".." and the parents' link counts fixed,
+ *   4. the replaced inode loses its link (freed, or orphaned while open).
+ * A crash between 1 and 2 leaves the object under both names, never under
+ * neither.  The source inode is not touched beyond its ctime, so it keeps its
+ * mode, owner and data. */
+static int ext2_rename(vfs_node_t *old_dir, const char *old_name,
+                       vfs_node_t *new_dir, const char *new_name) {
+    if (!g_mounted || !old_dir || !new_dir || !old_dir->private ||
+        !new_dir->private || !old_name || !new_name)
+        return -1;
+    if (strcmp(old_name, ".") == 0 || strcmp(old_name, "..") == 0 ||
+        strcmp(new_name, ".") == 0 || strcmp(new_name, "..") == 0)
+        return -22;                                          /* -EINVAL */
+    if (strlen(new_name) > 255) return -36;                  /* -ENAMETOOLONG */
+
+    uint32_t o_ino = ((ext2_priv_t *)old_dir->private)->ino;
+    uint32_t n_ino = ((ext2_priv_t *)new_dir->private)->ino;
+    int same_dir = (o_ino == n_ino);
+    ext2_inode_t odir, ndir_store;
+    ext2_inode_t *ndir = same_dir ? &odir : &ndir_store;
+    if (ext2_read_inode(o_ino, &odir) < 0) return -5;       /* -EIO */
+    if (!same_dir && ext2_read_inode(n_ino, ndir) < 0) return -5;
+    if ((odir.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR ||
+        (ndir->i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR)
+        return -20;                                          /* -ENOTDIR */
+
+    uint8_t src_ft = 0, dst_ft = 0;
+    uint32_t src_ino = ext2_dir_lookup(&odir, old_name, &src_ft);
+    if (!src_ino) return -2;                                 /* -ENOENT */
+    uint32_t dst_ino = ext2_dir_lookup(ndir, new_name, &dst_ft);
+    if (dst_ino == src_ino) return 0;        /* same object: nothing to do */
+
+    ext2_inode_t src, dst;
+    if (ext2_read_inode(src_ino, &src) < 0) return -5;
+    int src_is_dir = ((src.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR);
+    int dst_is_dir = 0;
+    if (dst_ino) {
+        if (ext2_read_inode(dst_ino, &dst) < 0) return -5;
+        dst_is_dir = ((dst.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR);
+        if (src_is_dir && !dst_is_dir) return -20;           /* -ENOTDIR */
+        if (!src_is_dir && dst_is_dir) return -21;           /* -EISDIR */
+        if (dst_is_dir && !ext2_dir_is_empty(&dst)) return -39;  /* -ENOTEMPTY */
+    }
+
+    /* A directory cannot move below itself: walk up from the new parent. */
+    if (src_is_dir && !same_dir) {
+        uint32_t cur = n_ino;
+        for (int depth = 0; depth < 256 && cur != 2; depth++) {
+            if (cur == src_ino) return -22;                  /* -EINVAL */
+            ext2_inode_t ci;
+            if (ext2_read_inode(cur, &ci) < 0) return -5;
+            uint32_t up = ext2_dir_lookup(&ci, "..", (uint8_t *)0);
+            if (!up || up == cur) break;
+            cur = up;
+        }
+    }
+
+    /* 1. The new name. */
+    if (dst_ino) {
+        if (ext2_set_dirent(ndir, new_name, src_ino, src_ft) < 0) return -5;
+    } else {
+        if (ext2_add_dirent(n_ino, ndir, src_ino, new_name, src_ft) < 0)
+            return -28;                                      /* -ENOSPC */
+    }
+
+    /* 2. The old name.  In the same directory this re-reads nothing: odir is
+     * the only copy of the inode and add_dirent kept it current. */
+    if (ext2_remove_dirent(&odir, old_name, (uint32_t *)0) < 0)
+        printk("[ext2] rename: '%s' vanished from its directory\n", old_name);
+
+    uint32_t now = ext2_now();
+
+    /* 3. A directory that changed parent: its ".." and both link counts. */
+    if (src_is_dir && !same_dir) {
+        ext2_set_dirent(&src, "..", n_ino, 2);
+        if (odir.i_links_count > 0) odir.i_links_count--;
+        ndir->i_links_count++;
+    }
+    src.i_ctime = now;
+    ext2_write_inode(src_ino, &src);
+
+    /* 4. The replaced object.  An (empty) directory loses both its names — the
+     * entry and its own "." — and its ".." no longer counts on the parent. */
+    if (dst_ino) {
+        if (dst_is_dir) {
+            dst.i_links_count = 0;
+            if (ndir->i_links_count > 0) ndir->i_links_count--;
+        } else if (dst.i_links_count > 0) {
+            dst.i_links_count--;
+        }
+        dst.i_ctime = now;
+        if (dst.i_links_count > 0)
+            ext2_write_inode(dst_ino, &dst);
+        else
+            ext2_put_unlinked(dst_ino, &dst, now);
+    }
+
+    odir.i_mtime = odir.i_ctime = now;
+    ext2_write_inode(o_ino, &odir);
+    if (!same_dir) {
+        ndir->i_mtime = ndir->i_ctime = now;
+        ext2_write_inode(n_ino, ndir);
+    }
     return 0;
 }
 

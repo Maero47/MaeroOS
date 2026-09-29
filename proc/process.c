@@ -74,6 +74,8 @@ struct proc *allocproc(void) {
     p->mmap_next     = 0x40000000U;
     p->umask         = 022;
     p->uid = p->gid = p->euid = p->egid = 0;   /* root until setuid drops */
+    p->suid = p->sgid = 0;
+    p->did_exec      = 0;
     p->pgrp          = p->pid;
     p->sid           = p->pid;
     p->ctty          = NULL;
@@ -428,17 +430,17 @@ struct proc *proc_create_from_elf(vfs_node_t *node, const char *name) {
             p->ofile[0].type   = FD_FILE;
             p->ofile[0].node   = tty;
             p->ofile[0].offset = 0;
-            p->ofile[0].flags  = O_RDONLY;
+            p->ofile[0].flags  = O_RDWR;
 
             p->ofile[1].type   = FD_FILE;
             p->ofile[1].node   = tty;
             p->ofile[1].offset = 0;
-            p->ofile[1].flags  = O_WRONLY;
+            p->ofile[1].flags  = O_RDWR;
 
             p->ofile[2].type   = FD_FILE;
             p->ofile[2].node   = tty;
             p->ofile[2].offset = 0;
-            p->ofile[2].flags  = O_WRONLY;
+            p->ofile[2].flags  = O_RDWR;
         }
     }
 

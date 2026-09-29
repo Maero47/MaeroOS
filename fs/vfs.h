@@ -69,6 +69,14 @@ typedef struct vfs_node {
     /* Persist mode/uid/gid changes (chmod/chown); NULL = in-memory only. */
     int               (*setattr_fn)(struct vfs_node *, uint32_t mode,
                                     uint32_t uid, uint32_t gid);
+    /* Move the entry `old_name` of this directory to `new_name` in `new_dir`
+     * (a directory of the same filesystem), replacing any entry already there
+     * in one step: `new_name` names either the old or the new object at every
+     * point, never nothing.  The moved object keeps its inode, and with it its
+     * mode, owner and contents.  Returns 0 or a negative errno.  Called only
+     * through vfs_rename(), after the permission checks. */
+    int               (*rename_fn) (struct vfs_node *old_dir, const char *old_name,
+                                    struct vfs_node *new_dir, const char *new_name);
 
     /* ── initrd in-memory backing ────────────────────────────────────── */
     const uint8_t   *data;       /* file: pointer into initrd memory */
@@ -121,6 +129,12 @@ int vfs_truncate(vfs_node_t *node, uint32_t new_size);
 
 /* Remove file named `name` from directory `dir`; returns 0 or -errno */
 int vfs_unlink(vfs_node_t *dir, const char *name);
+
+/* Rename old_dir/old_name to new_dir/new_name atomically (see rename_fn).
+ * Mount-point shims are looked through.  -EXDEV (-18) across filesystems,
+ * -EPERM (-1) when the filesystem cannot rename. */
+int vfs_rename(vfs_node_t *old_dir, const char *old_name,
+               vfs_node_t *new_dir, const char *new_name);
 
 /* Fill `out` with entry `index` of directory `dir`; returns 0 or -1 */
 int vfs_readdir(vfs_node_t *dir, uint32_t index, vfs_dirent_t *out);

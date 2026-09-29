@@ -41,6 +41,8 @@ static vfs_node_t *      tmpfs_finddir (vfs_node_t *, const char *);
 static int               tmpfs_create  (vfs_node_t *, const char *, uint32_t);
 static int               tmpfs_unlink  (vfs_node_t *, const char *);
 static int               tmpfs_symlink (vfs_node_t *, const char *, const char *);
+static int               tmpfs_rename  (vfs_node_t *, const char *,
+                                        vfs_node_t *, const char *);
 static void              tmpfs_retain  (vfs_node_t *);
 static void              tmpfs_release (vfs_node_t *);
 
@@ -76,6 +78,7 @@ static tmpfs_node_t *alloc_tmpfs_node(const char *name, uint32_t flags) {
         tn->vnode.create_fn  = tmpfs_create;
         tn->vnode.unlink_fn  = tmpfs_unlink;
         tn->vnode.symlink_fn = tmpfs_symlink;
+        tn->vnode.rename_fn  = tmpfs_rename;
     }
     return tn;
 }
@@ -241,11 +244,58 @@ static int tmpfs_unlink(vfs_node_t *dir_node, const char *name) {
     return -2;  /* -ENOENT */
 }
 
+/* Unlink `c` from dir's child list (it must be there). */
+static void tmpfs_detach(tmpfs_node_t *dir, tmpfs_node_t *c) {
+    tmpfs_node_t **pp = &dir->first_child;
+    while (*pp && *pp != c) pp = (tmpfs_node_t **)&(*pp)->vnode.next;
+    if (*pp) *pp = (tmpfs_node_t *)c->vnode.next;
+    c->vnode.next = NULL;
+}
+
+/* rename_fn.  The whole move happens without sleeping, so no other thread can
+ * ever look up new_name and find nothing: the old target leaves the list in
+ * the same step that the source takes its place.  The source node itself is
+ * moved, keeping its mode, owner, data and every open descriptor. */
+static int tmpfs_rename(vfs_node_t *old_dir_node, const char *old_name,
+                        vfs_node_t *new_dir_node, const char *new_name) {
+    tmpfs_node_t *odir = (tmpfs_node_t *)old_dir_node;
+    tmpfs_node_t *ndir = (tmpfs_node_t *)new_dir_node;
+    tmpfs_node_t *src = (tmpfs_node_t *)tmpfs_finddir(old_dir_node, old_name);
+    if (!src) return -2;                                    /* -ENOENT */
+    if (strlen(new_name) > 255) return -36;                 /* -ENAMETOOLONG */
+    tmpfs_node_t *dst = (tmpfs_node_t *)tmpfs_finddir(new_dir_node, new_name);
+    if (dst == src) return 0;                               /* same entry */
+    int src_dir = (src->vnode.flags == VFS_FLAG_DIR);
+    if (dst) {
+        int dst_dir = (dst->vnode.flags == VFS_FLAG_DIR);
+        if (src_dir && !dst_dir) return -20;                /* -ENOTDIR */
+        if (!src_dir && dst_dir) return -21;                /* -EISDIR */
+        if (dst_dir && dst->first_child) return -39;        /* -ENOTEMPTY */
+    }
+    /* A directory may not move into its own subtree (the caller has checked
+     * the paths; this also covers new_dir == src). */
+    if (src_dir && ndir == src) return -22;                 /* -EINVAL */
+
+    tmpfs_detach(odir, src);
+    if (dst) {
+        tmpfs_detach(ndir, dst);
+        tmpfs_release(&dst->vnode);         /* the directory's link to it */
+    }
+    strncpy(src->vnode.name, new_name, 255);
+    src->vnode.name[255] = '\0';
+    src->vnode.next  = (vfs_node_t *)ndir->first_child;
+    ndir->first_child = src;
+    return 0;
+}
+
 /* ── Public API ────────────────────────────────────────────────────────────── */
 
 vfs_node_t *tmpfs_mount(void) {
     tmpfs_node_t *root = alloc_tmpfs_node("/", VFS_FLAG_DIR);
     if (!root) return NULL;
+    /* Like Linux /tmp and /dev/shm: world-writable with the sticky bit, so a
+     * user can remove or replace only their own entries. */
+    root->vnode.mask = 01777;
     return &root->vnode;
 }
 
