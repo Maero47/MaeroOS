@@ -150,6 +150,26 @@ testfiles/awk
 /testfiles/wmctl
 /testfiles/wmevtest
 /testfiles/xargs
+# bbwrap applet wrappers (userspace/Makefile BB_APPLETS); bin/busybox and
+# bin/imgconv are real port binaries and stay tracked
+/testfiles/bin/cmp
+/testfiles/bin/expr
+/testfiles/bin/gunzip
+/testfiles/bin/gzip
+/testfiles/bin/less
+/testfiles/bin/md5sum
+/testfiles/bin/more
+/testfiles/bin/mount
+/testfiles/bin/nano
+/testfiles/bin/ping
+/testfiles/bin/seq
+/testfiles/bin/tar
+/testfiles/bin/umount
+/testfiles/bin/vi
+/testfiles/bin/vim
+/testfiles/bin/watch
+/testfiles/bin/wget2
+/testfiles/bin/yes
 
 # Upstream fbDOOM clone metadata kept aside (rename back to .git to use it)
 ports/fbDOOM/.git-upstream/

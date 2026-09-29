@@ -124,8 +124,11 @@ toybox: userspace
 	# Fresh checkout: generated/ (gitignored) is created here, which would make
 	# the committed .config.maeros look stale and trigger silentoldconfig, whose
 	# kconfig/conf sources are not in the tree.  Generate first, then re-date the
-	# config so the main build never tries to reconfigure.
-	$(MAKE) -C $(TOYBOX_DIR) generated/Config.in generated/Config.probed generated/unstripped/kconfig SED=$(SED) HOSTCC=cc && touch $(TOYBOX_DIR)/.config.maeros
+	# config so the main build never tries to reconfigure.  Only ask for
+	# generated/Config.in: scripts/genconfig.sh writes Config.probed and
+	# unstripped/kconfig as side effects, and toybox has no rule for kconfig, so
+	# naming it as a goal fails under -j before genconfig has run.
+	$(MAKE) -C $(TOYBOX_DIR) generated/Config.in SED=$(SED) HOSTCC=cc && touch $(TOYBOX_DIR)/.config.maeros
 	$(MAKE) -C $(TOYBOX_DIR) toybox \
 		KCONFIG_CONFIG=.config.maeros \
 		SED=$(SED) \

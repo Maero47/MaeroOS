@@ -36,6 +36,8 @@ it reused its own image). Phase 31 makes the loader handle **arbitrary external
   `ports/build-dynlib.sh`.
 - **RAM**: default `make run` bumped 128M → **512M**. Full 1–2 GB (needed by
   GTK/Firefox) requires PMM/VMM work for >512 MB and is a Phase 32 item.
+  *(Since fixed: the direct map is capped at 256 MiB and the rest is high memory,
+  so 1 GiB and 2 GiB boot to the shell; `run-firefox` uses 2 GiB.)*
 
 ## ✅ Phase 32a — real pthreads (rung 3 cleared)
 
@@ -121,8 +123,8 @@ real and proven.
    fontconfig + HarfBuzz, built in the maeros-cross container and loaded via the
    Phase-31 loader.
 4. **Firefox ESR (i686)** — Gecko + SpiderMonkey JIT, content processes,
-   NSS/NSPR; a roughly month-scale build needing 1–2 GB RAM (and >512 MB RAM
-   still hangs at boot — a PMM/VMM fix that gates this step).
+   NSS/NSPR; a roughly month-scale build needing 1–2 GB RAM (the >512 MB boot
+   hang that gated this step has since been fixed in `arch/i686/mm/paging.c`).
 
 Each of these is its own phase, built and tested incrementally.  The foundation
 is now in place; the climb continues build-by-build.
