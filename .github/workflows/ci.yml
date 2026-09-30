@@ -74,5 +74,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: smoke-logs-${{ github.run_id }}-${{ github.run_attempt }}
-          path: build/check/
+          path: |
+            build/check/
+            build/smoke-gui/*.png
+            build/smoke-gui/serial.log
           if-no-files-found: ignore

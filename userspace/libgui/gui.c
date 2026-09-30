@@ -1,13 +1,10 @@
 #include <gui.h>
 #include <linux/input.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <syscall.h>
-
-/* Window body origin relative to the window: 1px frame, 28px title bar.
- * Events arrive window-relative; widgets live in surface coordinates. */
-#define GUI_BODY_X 1
-#define GUI_BODY_Y 28
+#include <unistd.h>
 
 /* MaeroOS shared-memory syscalls */
 #define SYS_SHM_CREATE 500
@@ -71,6 +68,21 @@ static int gui_make_surface(gui_window_t *gui) {
     if (old_id >= 0)
         syscall1(SYS_SHM_UNMAP, old_id);
     return 0;
+}
+
+void gui_trace(const char *tag, const char *fmt, ...) {
+    char buf[200];
+    int n;
+    va_list ap;
+
+    n = snprintf(buf, sizeof(buf) - 1, "[%s] ", tag);
+    if (n < 0 || n >= (int)sizeof(buf) - 1) return;
+    va_start(ap, fmt);
+    n += vsnprintf(buf + n, sizeof(buf) - (size_t)n - 1, fmt, ap);
+    va_end(ap);
+    if (n > (int)sizeof(buf) - 2) n = (int)sizeof(buf) - 2;
+    buf[n++] = '\n';
+    write(1, buf, (size_t)n);
 }
 
 int gui_open(gui_window_t *gui, int slot, const char *title,

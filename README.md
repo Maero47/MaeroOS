@@ -43,6 +43,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | Dynamic linker | `DYNPROBE_OK` from a PIE loaded through musl `ld.so`; `WXPIE_OK` (the PIE's text and RELRO, libc's text and a `PROT_READ\|PROT_EXEC` library mapping are read-only) | `make smoke-dyn` |
 | External shared libraries and pthreads | `GREET_OK sum=42`, `ZLIB_OK ver=1.3`, `THREADS_OK count=200000`, `UNIX_SOCK_OK` | `make smoke-dynlib` |
 | X11 server | `XHANDSHAKE_OK`, `XDRAW_OK` (`w=320 h=200` from `GetGeometry`), `XEVENT_OK`, and `XREAL_PAINTED` from a client linked against the cross-built libX11 | `make smoke-x` |
+| Desktop and its apps | driven with QMP mouse and keyboard input on the ISO: the launcher opens the terminal, a command typed into it runs, the image viewer shows `/disk/wallpaper.ppm`, Files enters a directory by double-click, Settings applies an accent (the desktop reloads, `desktop.conf` changes), the Store shows its verified list or the "run pkg update" state, the Task Manager lists the desktop and the Store, windows close by button, Esc and Alt-Tab; every window must also show up in a screendump | `make smoke-gui` |
 | GLib, Cairo, Pango, GTK3 | `GLIB_OK` (v2.78), `CAIRO_OK rect_px=0xe69919`, `PANGO_OK`, `GTK_OK init`, `GTK_WINDOW_SHOWN`, `GTK_DRAWN` (needs probe binaries a fresh clone lacks, see Testing) | `make smoke-gtk` |
 | Firefox 115.15.0esr | `ff: Firefox painted` (the browser window, about 5 s after `firefox-bin` starts); with `--web`, a page served from the host (HTML, a CSS rule, a PNG) requested and its image on screen about 3 s after Enter (needs the Firefox tree, see `ports/firefox/`) | `make smoke-firefox`, `make smoke-firefox-web` |
 
@@ -448,6 +449,7 @@ make smoke-dyn      # PIE through the musl dynamic linker
 make smoke-dynlib   # external .so files, zlib, pthreads, AF_UNIX
 make smoke-x        # maeroX handshake, drawing and input events
 make smoke-gtk      # GLib, Cairo, Pango and a real GTK3 window
+make smoke-gui      # the desktop, driven by mouse and keyboard (needs the ISO)
 make smoke-abi      # Linux-ABI probes (ports/abiprobes/README.md), needs i686-linux-musl-gcc
 make smoke-firefox  # does Firefox paint? (README-BROWSER.md)
 make smoke-firefox-web  # ...and load a page served from the host over the network
@@ -464,12 +466,42 @@ rebuilds the kernel objects.
 Each script exits non-zero and prints the failing expectation, for example
 `command 'threadprobe' did not produce 'threadprobe ok'`.
 
+### GUI smoke test
+
+`make smoke-gui` (`tools/smoke_gui.py`, about 30 s) boots `maeros.iso` with a copy of
+`disk.img` (minus the `ffauto`/`gtkauto` autostart markers), `-vga std` and
+`-display none`, and drives the PS/2 mouse and keyboard with QMP `input-send-event`.
+The desktop and the apps print one line per state change to the serial console
+(`gui_trace()` in libgui, `trace()` in `desktop.c`), for example
+
+```
+[desktop] launcher open settings=325,542
+[desktop] window opened: Files slot=3 x=436 y=116 w=430 h=390 close=837,126
+[files] dir proc at 55,120
+[files] cwd /proc entries=17
+[desktop] window closed: Files slot=3
+```
+
+and the test waits on those lines. They also carry the positions of the controls the
+test clicks (the orb, the close button, a directory row, the Apply button), so the test
+does not copy layout constants, and the desktop traces every click's position, which
+the test compares with where it aimed. Side effects are checked from a root shell on the
+serial getty (the file the terminal command wrote, `/disk/etc/desktop.conf`), and each
+window must change its area of a screendump when it opens. Screendumps (`NN-step.png`)
+and `serial.log` go to `build/smoke-gui/`; a failure adds `fail.png`. It uses KVM when
+`/dev/kvm` is usable and TCG otherwise (`SMOKE_GUI_ACCEL=tcg` forces it); both take
+about the same time.
+
+A new app becomes testable by calling `gui_trace("app", ...)` where its state changes,
+with click targets as window-relative points (surface point + `GUI_BODY_X`/`GUI_BODY_Y`).
+
 ### Continuous integration
 
 `make check` runs the suites that need nothing beyond a fresh clone: `smoke`,
 `smoke-cmds`, `smoke-toybox`, `smoke-disk`, `smoke-net`, `smoke-fw`, `smoke-dyn`,
-`smoke-dynlib`, `smoke-x` and `smoke-pkg` (which first builds `repo/` and, on a host
-without one, a repo signing key). It runs them one after another, writes each suite's
+`smoke-dynlib`, `smoke-x`, `smoke-pkg` (which first builds `repo/` and, on a host
+without one, a repo signing key) and `smoke-gui` (which needs the ISO, so `check` builds
+it). It runs them one after another, writes each suite's
 console to `build/check/<suite>.log`, prints the tail of the log for any suite that
 fails, carries on with the rest and exits non-zero at the end. `CHECK_SUITES="smoke
 smoke-x" make check` runs a subset.
@@ -489,8 +521,10 @@ The smoke suites start QEMU with `-display none`, so they need no display (ssh, 
 The built `~/opt/cross` toolchain is cached, keyed on the binutils/gcc versions, digests
 and configure flags in `tools/setup-linux.sh` and on the runner's Ubuntu release, so only
 the first run and version bumps pay for the gcc build. When `make check` fails, the
-`build/check/` logs are uploaded as a `smoke-logs-*` artifact of the run. Neither the
-smoke suites nor CI use KVM: `make run` boots QEMU with its default TCG accelerator.
+`build/check/` logs, and the `smoke-gui` screendumps and serial log, are uploaded as a
+`smoke-logs-*` artifact of the run. The smoke suites do not use KVM (`make run` boots
+QEMU with its default TCG accelerator), except `smoke-gui`, which uses it when
+`/dev/kvm` is usable.
 
 ### Diagnosing a hang
 

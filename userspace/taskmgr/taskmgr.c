@@ -216,6 +216,15 @@ int main(int argc, char *argv[]) {
     refresh();
     refresh();   /* second sample primes the CPU deltas */
     render();
+    {
+        char names[160];
+        int n = 0;
+        names[0] = 0;
+        for (int i = 0; i < task_count && n < (int)sizeof(names) - 20; i++)
+            n += snprintf(names + n, sizeof(names) - (size_t)n, "%s%s",
+                          i ? "," : "", tasks[i].name);
+        gui_trace("taskmgr", "listed %d processes: %s", task_count, names);
+    }
     while (!gui.closed) {
         int events = gui_poll(&gui);
         if (++ticks >= 25) {            /* ~1s refresh */
