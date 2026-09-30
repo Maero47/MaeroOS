@@ -10,6 +10,7 @@ disk-ff.img
 isodir/
 repo/
 .qemu-iso.pid
+.ktrace-stamp
 
 # ── OS / editor noise ──────────────────────────────────────────────────────
 .DS_Store

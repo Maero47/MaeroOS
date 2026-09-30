@@ -6,6 +6,7 @@
 
 #include "../kernel/printk.h"
 #include <registers.h>
+#include <kernel/config.h>
 #include <stdint.h>
 
 /*
@@ -603,7 +604,7 @@ fatal:
      * place — to a SIGSEGV handler on a usable (alternate) stack if there is
      * one, else by the default action.  The recursion is bounded: each round
      * consumes one pending signal, and a failing SIGSEGV frame kills. */
-    printk("[SIG] pid=%d: cannot build frame for signal %d at esp=%08x\n",
+    ktrace("[SIG] pid=%d: cannot build frame for signal %d at esp=%08x\n",
            current_proc->pid, sig, (unsigned)regs->useresp);
     if (sig == SIGSEGV)
         proc_group_exit(SIGSEGV);

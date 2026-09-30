@@ -21,6 +21,7 @@
  * docs/perf/firefox-startup.md was taken with -smp 1.
  */
 #include <stdint.h>
+#include <kernel/config.h>
 
 #define KPB_USER      0   /* ring 3                                          */
 #define KPB_IDLE      1   /* halted in the scheduler, nothing runnable       */
@@ -119,9 +120,15 @@ uint64_t kprof_sleep_begin(void);
 void     kprof_sleep_end(uint64_t token, int syscall_nr);
 
 /* Probe timing.  kprof_probe_begin() is a bare rdtsc; the end call charges the
- * delta to `id`.  Cheap enough to leave in place (two rdtsc per span). */
+ * delta to `id`.  Built only with KTRACE=1: the spans sit around every syscall
+ * phase and context switch, so a normal build compiles them to nothing. */
+#if KTRACE
 uint64_t kprof_probe_begin(void);
 void     kprof_probe_end(int id, uint64_t t0);
+#else
+static inline uint64_t kprof_probe_begin(void) { return 0; }
+static inline void kprof_probe_end(int id, uint64_t t0) { (void)id; (void)t0; }
+#endif
 
 void kprof_dump(const char *tag);
 void kprof_reset(void);

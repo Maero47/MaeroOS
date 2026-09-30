@@ -59,11 +59,13 @@ int kprof_switch(int bucket) {
 }
 
 
+#if KTRACE
 uint64_t kprof_probe_begin(void) { return rdtsc64(); }
 void kprof_probe_end(int id, uint64_t t0) {
     g_probe_cyc[id] += rdtsc64() - t0;
     g_probe_cnt[id]++;
 }
+#endif
 void kprof_syscall_enter(uint32_t nr) {
     g_syscnt[nr < KPROF_NSYS ? nr : KPROF_NSYS - 1]++;
 }
@@ -221,6 +223,7 @@ void kprof_dump(const char *tag) {
 }
 
 void kprof_tick(void) {
+    if (!KTRACE) return;                      /* periodic dump: KTRACE=1 only */
     static uint32_t last = 0;
     uint32_t now = pit_ticks();
     if (now - last < 1000) return;            /* every 10 s of tick time */

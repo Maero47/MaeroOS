@@ -1127,7 +1127,7 @@ static int sys_write(registers_t *regs) {
     int         len = (int)(uint32_t)regs->edx;
 
     if (len < 0 || !access_ok(buf, (size_t)len)) {
-        printk("[SYSCALL] sys_write: bad user ptr 0x%08x\n", (unsigned)regs->ecx);
+        ktrace("[SYSCALL] sys_write: bad user ptr 0x%08x\n", (unsigned)regs->ecx);
         return -14;   /* -EFAULT */
     }
     if (fd < 0 || fd >= MAX_FD) return -9;
@@ -1756,7 +1756,7 @@ static int sys_exec(registers_t *regs) {
 
     vfs_node_t *node = vfs_open_at(path);
     if (!node) {
-        printk("[execfail] '%s' pid=%d ENOENT (open failed)\n", path, current_proc->pid);
+        ktrace("[execfail] '%s' pid=%d ENOENT (open failed)\n", path, current_proc->pid);
         EXEC_FAIL(-2);   /* -ENOENT */
     }
 
@@ -1768,13 +1768,13 @@ static int sys_exec(registers_t *regs) {
      * script is run by its interpreter with the caller's own ids. */
     for (int depth = 0; ; depth++) {
         if (node->flags != VFS_FLAG_FILE) {
-            printk("[execfail] '%s' pid=%d EACCES (not a regular file)\n",
+            ktrace("[execfail] '%s' pid=%d EACCES (not a regular file)\n",
                    path, current_proc->pid);
             EXEC_FAIL(-13);   /* -EACCES */
         }
         if (vfs_access_check(node, current_proc->euid, current_proc->egid,
                              VFS_WANT_X) < 0) {
-            printk("[execfail] '%s' pid=%d EACCES (uid=%d gid=%d mode=%o)\n",
+            ktrace("[execfail] '%s' pid=%d EACCES (uid=%d gid=%d mode=%o)\n",
                    path, current_proc->pid, (int)current_proc->euid,
                    (int)current_proc->egid, (unsigned)node->mask);
             EXEC_FAIL(-13);   /* -EACCES */

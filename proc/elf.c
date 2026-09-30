@@ -240,7 +240,7 @@ int elf_load_bias(vfs_node_t *node, uint32_t pgdir_phys, uint32_t want_bias,
     info->entry    = bias + ehdr->e_entry;
     info->heap_end = heap_end;
 
-    printk("[ELF]  Loaded '%s': type=%s bias=0x%08x entry=0x%08x top=0x%08x%s\n",
+    ktrace("[ELF]  Loaded '%s': type=%s bias=0x%08x entry=0x%08x top=0x%08x%s\n",
            node->name, ehdr->e_type == ET_DYN ? "DYN" : "EXEC",
            (unsigned)bias, (unsigned)info->entry, (unsigned)heap_end,
            info->has_interp ? " (needs ld.so)" : "");
