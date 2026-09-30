@@ -91,6 +91,8 @@ enum {
     KPP_SCHED_FPUSAVE,  /* fxsave per switch                                 */
     KPP_DUMP,           /* the profiler's own periodic dump (printk to serial) */
     KPP_CALIB,          /* an empty span: the cost of a probe pair itself      */
+    KPP_KMALLOC,        /* kmalloc/kmalloc_try, interrupts-off part            */
+    KPP_KFREE,          /* kfree, interrupts-off part                          */
     KPP_MAX
 };
 

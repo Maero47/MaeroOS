@@ -26,7 +26,7 @@ static const char *const g_probe_name[KPP_MAX] = {
     "fault_read", "fault_zero", "ata<=4", "ata>4",
     "e2_alloc", "e2_inode", "e2_bmap", "e2_copy",
     "sys_body", "sys_resched", "disp_tss", "disp_cr3", "disp_fpu", "sch_kcr3", "sch_fpusave",
-    "kdump", "calib",
+    "kdump", "calib", "kmalloc", "kfree",
 };
 
 static int      g_cur = KPB_USER;

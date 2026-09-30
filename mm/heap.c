@@ -391,8 +391,10 @@ void *kmalloc(size_t size) {
     if (!size || size > HEAP_MAX_REQ) return NULL;
     size = ALIGN8(size);
     uint32_t irq = heap_irq_save();
+    uint64_t t0 = kprof_probe_begin();
     kprof_count(KPE_KMALLOC);
     void *r = kmalloc_nolock(size);
+    kprof_probe_end(KPP_KMALLOC, t0);
     heap_irq_restore(irq);
     return r;
 }
@@ -401,6 +403,7 @@ void *kmalloc_try(size_t size) {
     if (!size || size > HEAP_MAX_REQ) return NULL;
     size_t asz = ALIGN8(size);
     uint32_t irq = heap_irq_save();
+    uint64_t t0 = kprof_probe_begin();
     kprof_count(KPE_KMALLOC);
     void *r = NULL;
 
@@ -420,6 +423,7 @@ void *kmalloc_try(size_t size) {
             pages <= (size_t)pmm_free_frames())
             r = kmalloc_nolock(asz);
     }
+    kprof_probe_end(KPP_KMALLOC, t0);
     heap_irq_restore(irq);
     return r;
 }
@@ -429,6 +433,7 @@ void *kmalloc_try(size_t size) {
 void kfree(void *ptr) {
     if (!ptr) return;
     uint32_t irq = heap_irq_save();
+    uint64_t t0 = kprof_probe_begin();
     kprof_count(KPE_KFREE);
 
     block_header_t *b = (block_header_t *)((uint8_t *)ptr - HDR);
@@ -476,6 +481,7 @@ void kfree(void *ptr) {
     if (n) n->prev_phys = b;
     poison(b);
     list_insert(b);
+    kprof_probe_end(KPP_KFREE, t0);
     heap_irq_restore(irq);
 }
 
