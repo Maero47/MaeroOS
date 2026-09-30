@@ -32,9 +32,10 @@ What is proven by the automated QEMU tests in `tools/`:
 | Area | Proof | Target |
 |---|---|---|
 | Boot, shell, procfs, PTYs, threads, shm, RNG, bad user pointers | `ls`, `cat`, `sysprobe ok`, `shmprobe ok`, `threadprobe ok`, `ptytest ok`, `cttytest ok`, `memprobe ok`, `wxprobe ok` (read-only text/rodata/mprotect'ed pages refuse writes, also after fork), `/proc/self/status` | `make smoke` |
-| toybox 0.8.13, syscall edge cases, libc, `pkg` archive checks | `TOYBOX_OK` plus applet checks, `sysmiscprobe ok`, `LIBCTEST PASS`, `pkg` refusing `../etc`, and the host-side `tools/test_pkg_tarx.py` | `make smoke-toybox` |
+| toybox 0.8.13, syscall edge cases, libc, `pkg` archive checks | `TOYBOX_OK` plus applet checks, `sysmiscprobe ok`, `LIBCTEST PASS`, `pkg` refusing `../etc`, and the host-side `tools/test_pkg_tarx.py` and `tools/test_pkg_sign.py` | `make smoke-toybox` |
 | Native coreutils-style commands, user faults | `kwprobe ok` (a user write to kernel memory dies of SIGSEGV, a user `int3` of SIGTRAP), then `uname`, `whoami`, `hostname`, `free`, `df`, `uptime`, `which` | `make smoke-cmds` |
 | ext2 disk, login/passwd/doas, permissions, init services, sessions | 152 checks including `passwd` keeping `/etc/shadow` root-only 0600, `login` dropping to `uid=1000`, `doas` ignoring a planted `./ls`, `credprobe ok`, `fsprobe ok` and `svc` state transitions | `make smoke-disk` |
+| `pkg` and the signed repo index | `tools/test_pkg_sign.py` runs the RFC 8032 vectors through the Python signer and the C verifier and rejects altered, unsigned and foreign-key indexes; in the guest, `pkg update` rejects unsigned, tampered and rolled-back indexes, installs and runs busybox, and `install` rejects a tarball whose SHA-256 does not match | `make smoke-pkg` |
 | TCP/IP over lwIP and RTL8139 | `MAEROS_HTTP_OK` fetched from a host HTTP server; `sockprobe` checks that `send` after `shutdown(SHUT_WR)` fails with `EPIPE`, a two-step shutdown ends in a FIN and no RST, and closing TIME_WAIT sockets keeps TCP working | `make smoke-net` |
 | Kernel firewall | after `fwctl enable` plus a drop rule the same fetch fails, `fwctl list` reports the firewall `enabled` with the `drop out tcp` rule, malformed rules (`/33`, an overflowing prefix, port 70000, `tcpp`) are rejected under `policy out drop`, and `fwctl flush` restores the fetch | `make smoke-fw` |
 | Dynamic linker | `DYNPROBE_OK` from a PIE loaded through musl `ld.so`; `WXPIE_OK` (the PIE's text and RELRO, libc's text and a `PROT_READ\|PROT_EXEC` library mapping are read-only) | `make smoke-dyn` |
@@ -66,8 +67,12 @@ What is proven by the automated QEMU tests in `tools/`:
   it walks through; AF_INET sockets have no `listen`/`accept` (`-EOPNOTSUPP`), a
   blocking UDP `recv` returns `EAGAIN` instead of waiting, and `sendmsg`/`recvmsg` work
   on AF_UNIX sockets only.
-- **`pkg` trusts its index.** Each tarball is checked against the SHA-256 in
-  `index.txt`, but the index itself is fetched over plain HTTP and is not signed.
+- **One repo signing key per build host.** `index.txt` is Ed25519-signed and `pkg`
+  checks it, but the key is created per host (`~/.config/maeros/repo-signing.key`) and
+  its public half is compiled into `pkg`: a repo and a `pkg` built on different hosts,
+  or across a key change, do not work together. There is no key rotation or revocation,
+  and the rollback check is only as strong as the cached index, which the desktop user
+  owns.
 - **No console login during the desktop session.** While the graphical session runs,
   no getty is offered on the serial/VGA console.
 - **No SMP scaling.** One Big Kernel Lock serialises all kernel execution
@@ -260,7 +265,14 @@ bitmaps.
 `store` and `pkg` install packages from a repository built by `tools/mkrepo.py` out of
 `ports/packages/*/pkg.conf`. `pkg update`, `list`, `install` and `remove` fetch
 `index.txt` and per-package ustar archives over HTTP into `/disk/apps/<name>/`, defaulting
-to the QEMU host at `10.0.2.2:8000` and overridable in `/disk/etc/pkg.conf`. `pkg`
+to the QEMU host at `10.0.2.2:8000` and overridable in `/disk/etc/pkg.conf`. The index
+is signed with Ed25519: `make repo` creates the signing key on first use in
+`~/.config/maeros/repo-signing.key` (or `$MAEROS_REPO_KEY`), outside the tree, and the
+userspace build compiles its public half into `pkg` (`userspace/pkg/repo_pubkey.h`,
+generated). `pkg` (verifying with TweetNaCl, `third_party/tweetnacl`) refuses an index
+that is unsigned, altered or signed by another key, and one whose serial (the build
+time) is lower than the cached index's, and re-checks the cached index before every
+`list` and `install`. `pkg`
 refuses a tarball whose SHA-256 does not match the index, package names that are paths,
 and archives with anything but regular files under flat, plain names, checking every
 header before it writes; `store` is
@@ -412,6 +424,7 @@ make smoke-cmds     # native uname/whoami/hostname/free/df/uptime/which
 make smoke-toybox   # toybox as a static guest binary
 make smoke-disk     # ext2, login/passwd, init sessions, service supervision, overlay
 make smoke-net      # DHCP, TCP, HTTP GET from the host
+make smoke-pkg      # pkg against a host repo: signed index, install, rollback
 make smoke-fw       # firewall rule blocks and unblocks that GET
 make smoke-dyn      # PIE through the musl dynamic linker
 make smoke-dynlib   # external .so files, zlib, pthreads, AF_UNIX

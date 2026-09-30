@@ -186,3 +186,8 @@ ports/fbDOOM/.git-upstream/
 # ── smoke-firefox / ff_boot_loop artifacts (logs, screendumps, verdicts);
 #    both take --out, so ignore all of build/ ──────────────────────────────
 /build/
+
+# Generated from the repo signing key (tools/mkrepo.py --pubkey-header);
+# the private key itself lives outside the tree (~/.config/maeros/)
+userspace/pkg/repo_pubkey.h
+__pycache__/

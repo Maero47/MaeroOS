@@ -126,6 +126,8 @@ def main():
         index = os.path.join(ROOT, "repo", "index.txt")
         if os.path.exists(index):
             for line in open(index).read().splitlines():
+                if line.startswith("#"):   # signature header/trailer
+                    continue
                 f = line.split("|")
                 tar = os.path.join(ROOT, "repo", f[3])
                 check(len(f) == 10 and run(tool, "sha", tar)[1] == f[9],

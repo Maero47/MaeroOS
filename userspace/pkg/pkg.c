@@ -10,6 +10,8 @@
 #include <dirent.h>
 #include <time.h>
 #include <unistd.h>
+#include "indexsig.h"
+#include "repo_pubkey.h"
 #include "sha256.h"
 #include "tarx.h"
 
@@ -24,9 +26,13 @@
  * Repo: http://<server>/index.txt + tars.  Server defaults to 10.0.2.2:8000
  * (the QEMU host); override in /disk/etc/pkg.conf with repo=host:port.
  *
- * Every index line carries the tarball's SHA-256 (tools/mkrepo.py); install
- * refuses a package whose download does not match it, and extraction only
- * accepts flat archives of regular files (see tarx.c).
+ * The index is signed with the repo's Ed25519 key (tools/mkrepo.py; the
+ * public half is compiled in as repo_pubkey.h), and pkg ignores any index,
+ * fetched or cached, whose signature does not verify (indexsig.c).  `pkg
+ * update` also refuses an index whose serial is lower than the cached one.
+ * Every index line carries the tarball's SHA-256; install refuses a package
+ * whose download does not match it, and extraction only accepts flat
+ * archives of regular files (see tarx.c).
  */
 
 #define INDEX_CACHE "/disk/etc/pkg-index.txt"
@@ -205,23 +211,43 @@ typedef struct {
 static pkg_t pkgs[32];
 static int pkg_count;
 
+/* The index lives in a fixed buffer; pkg update refuses larger ones. */
+#define INDEX_MAX 8191
+
+static const char *index_error;   /* why the cached index was not trusted */
+
+/* Read the cached index into buf (NUL-terminated); returns bytes or -1. */
+static int read_cache(char *buf) {
+    int fd = open(INDEX_CACHE, O_RDONLY), n = 0, r;
+
+    if (fd < 0) return -1;
+    while (n < INDEX_MAX && (r = read(fd, buf + n, INDEX_MAX - n)) > 0)
+        n += r;
+    close(fd);
+    buf[n] = 0;
+    return n;
+}
+
 static void parse_index(void) {
-    static char buf[8192];
-    int fd = open(INDEX_CACHE, O_RDONLY), n;
+    static char buf[INDEX_MAX + 1];
+    unsigned long serial;
+    int n, len;
     char *line, *next;
 
     pkg_count = 0;
-    if (fd < 0) return;
-    n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
+    index_error = 0;
+    n = read_cache(buf);
     if (n <= 0) return;
-    buf[n] = 0;
+    if (index_verify(buf, n, repo_pubkey, &serial, &len, &index_error))
+        return;
+    buf[len] = 0;   /* parse only what the signature covers */
     line = buf;
     while (line && *line && pkg_count < 32) {
         char *f[10] = {0};
         int nf = 0;
         next = strchr(line, '\n');
         if (next) *next++ = 0;
+        if (*line == '#') { line = next; continue; }
         f[nf++] = line;
         for (char *p = line; *p && nf < 10; p++)
             if (*p == '|') { *p = 0; f[nf++] = p + 1; }
@@ -287,12 +313,44 @@ static int write_file(const char *path, const char *buf, int n) {
 
 /* ── commands ───────────────────────────────────────────────────────────── */
 
+/* Check a freshly fetched index: signed by the repo key, and not older than
+ * the cached one (a replayed old index could hide security updates).
+ * Returns 0 if it may replace the cache. */
+static int index_acceptable(const char *buf, int n) {
+    static char old[INDEX_MAX + 1];
+    unsigned long serial, old_serial;
+    const char *why;
+    int len, on;
+
+    if (n > INDEX_MAX) {
+        printf("pkg: index is too large — index rejected\n");
+        return -1;
+    }
+    if (index_verify(buf, n, repo_pubkey, &serial, &len, &why)) {
+        printf("pkg: %s — index rejected\n", why);
+        return -1;
+    }
+    on = read_cache(old);
+    if (on > 0 && !index_verify(old, on, repo_pubkey, &old_serial, &len, &why)
+        && serial < old_serial) {
+        printf("pkg: index serial %lu is older than the cached %lu — "
+               "refusing rollback\n", serial, old_serial);
+        return -1;
+    }
+    return 0;
+}
+
 static int cmd_update(void) {
     int n;
 
     mkdir("/disk/etc", 0755);
     n = http_fetch_mem("index.txt", 0, 0);
     if (n < 0) return net_unreachable ? 2 : 1;
+    if (index_acceptable(fetch_buf, n)) {
+        free(fetch_buf);
+        fetch_buf = 0;
+        return 1;
+    }
     if (write_file(INDEX_CACHE, fetch_buf, n)) {
         printf("pkg: cannot write index cache\n");
         free(fetch_buf);
@@ -308,6 +366,11 @@ static int cmd_update(void) {
 
 static int cmd_list(void) {
     parse_index();
+    if (index_error) {
+        printf("pkg: cached index not trusted: %s — run `pkg update`\n",
+               index_error);
+        return 1;
+    }
     if (!pkg_count) {
         printf("pkg: no index — run `pkg update` first\n");
         return 1;
@@ -330,6 +393,11 @@ static int cmd_install(const char *name) {
         return 1;
     }
     parse_index();
+    if (index_error) {
+        printf("pkg: cached index not trusted: %s — run `pkg update`\n",
+               index_error);
+        return 1;
+    }
     pk = find_pkg(name);
     if (!pk) {
         printf("pkg: unknown package '%s' (run `pkg update`)\n", name);

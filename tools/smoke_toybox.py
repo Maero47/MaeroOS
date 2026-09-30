@@ -34,10 +34,12 @@ def send(proc, text):
 
 
 def main():
-    # pkg's tar/name checks are plain C: exercise them on the host first.
-    if subprocess.run([sys.executable,
-                       os.path.join(ROOT, "tools", "test_pkg_tarx.py")]).returncode:
-        raise AssertionError("tools/test_pkg_tarx.py failed")
+    # pkg's tar/name and index-signature checks are plain C: exercise them on
+    # the host first.
+    for test in ("test_pkg_tarx.py", "test_pkg_sign.py"):
+        if subprocess.run([sys.executable,
+                           os.path.join(ROOT, "tools", test)]).returncode:
+            raise AssertionError(f"tools/{test} failed")
 
     proc = subprocess.Popen(
         ["make", "run"],

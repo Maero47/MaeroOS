@@ -108,7 +108,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk abiprobes smoke-abi smoke-firefox repo repo-serve start resolutions icons
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk abiprobes smoke-abi smoke-firefox repo repo-serve start resolutions icons
 
 all: $(TARGET)
 
@@ -299,6 +299,10 @@ smoke-fw: $(TARGET) initrd
 smoke-disk: $(TARGET) initrd disk
 	python3 tools/smoke_disk.py
 
+# pkg against a host HTTP repo: signed-index checks, install, rollback.
+smoke-pkg: $(TARGET) initrd disk repo
+	python3 tools/smoke_pkg.py
+
 smoke-toybox: $(TARGET) initrd
 	python3 tools/smoke_toybox.py
 
@@ -370,7 +374,7 @@ gdb: $(TARGET)
 # with display + sound + network.  The repo server is stopped when the
 # QEMU window closes.
 
-repo: $(wildcard ports/packages/*/*)
+repo: $(wildcard ports/packages/*/*) tools/mkrepo.py tools/ed25519.py
 	python3 tools/mkrepo.py
 
 repo-serve: repo
