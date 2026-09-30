@@ -2687,8 +2687,8 @@ static int ioctl_arg_shape(uint32_t req, uint32_t *len) {
     case 0x5402: case 0x5403: case 0x5404:
                               *len = 36;            return IOA_IN;    /* TCSETS/W/F */
     case 0x5413:              *len = 8;             return IOA_OUT;   /* TIOCGWINSZ */
-    case 0x5414:              *len = sizeof(int);   return IOA_OUT;   /* TIOCGPGRP (this ABI) */
-    case 0x5415:              *len = sizeof(int);   return IOA_IN;    /* TIOCSPGRP (this ABI) */
+    case 0x540F:              *len = sizeof(int);   return IOA_OUT;   /* TIOCGPGRP */
+    case 0x5410:              *len = sizeof(int);   return IOA_IN;    /* TIOCSPGRP */
     case 0x5601:              *len = 8;             return IOA_OUT;   /* VT_GETMODE: struct vt_mode */
     case 0x5602:              *len = 8;             return IOA_IN;    /* VT_SETMODE */
     case 0x5603:              *len = 6;             return IOA_OUT;   /* VT_GETSTATE: struct vt_stat */
@@ -2765,7 +2765,7 @@ static int sys_ioctl(registers_t *regs) {
         }
         return 0;
     }
-    if (req == 0x5410) {  /* TIOCGSID: return the session ID (use pgrp of shell) */
+    if (req == 0x5429) {  /* TIOCGSID: return the session ID (use pgrp of shell) */
         int *out = (int *)(uintptr_t)regs->edx;
         int sid = current_proc ? current_proc->pgrp : 1;
         if (out) {
@@ -2774,7 +2774,7 @@ static int sys_ioctl(registers_t *regs) {
         }
         return sid;
     }
-    if (req == 0x5414) {  /* TIOCGPGRP: get foreground pgrp */
+    if (req == 0x540F) {  /* TIOCGPGRP: get foreground pgrp */
         int *out = (int *)(uintptr_t)regs->edx;
         int fg = tty_fg_pgrp ? tty_fg_pgrp : (current_proc ? current_proc->pgrp : 1);
         if (out) {
@@ -2783,7 +2783,7 @@ static int sys_ioctl(registers_t *regs) {
         }
         return fg;
     }
-    if (req == 0x5415) {  /* TIOCSPGRP: set foreground pgrp */
+    if (req == 0x5410) {  /* TIOCSPGRP: set foreground pgrp */
         const int *inp = (const int *)(uintptr_t)regs->edx;
         if (inp) {
             int fg = 0;

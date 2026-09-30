@@ -312,7 +312,7 @@ struct proc {
 extern struct proc ptable[];
 
 /* SMP: `current_proc` is PER-CPU — the process running on the calling CPU.  It
- * expands to that CPU's slot in cpus[] (keyed by Local APIC id), so reads and
+ * expands to that CPU's slot in cpus[] (indexed by logical CPU id), so reads and
  * assignments (`current_proc = p`, `current_proc->field`, `&current_proc->field`)
  * all act on the running CPU's process with no global to race.  Before the LAPIC
  * is up this_cpu_id() is 0, matching the old single-`current_proc` behaviour. */
