@@ -82,8 +82,8 @@ struct ktimer {
     int      signo;
     int      tid;          /* SIGEV_THREAD_ID: the thread it signals */
     uint64_t deadline;     /* REAL/POSIX: monotonic ns of the next expiry;
-                            * VIRTUAL/PROF: ns of CPU time still to run */
-    uint32_t dl_tick;      /* REAL/POSIX: first tick at/after deadline */
+                            * VIRTUAL/PROF: ns of CPU time still to run.
+                            * Saturates at KT_NS_MAX, which never expires. */
     uint64_t interval;     /* reload in ns; 0 = one-shot */
     uint8_t  queued;       /* POSIX: its signal was queued and may be pending */
     uint32_t overrun;      /* expiries while that signal was still pending */
@@ -112,12 +112,20 @@ static uint64_t udivmod64(uint64_t n, uint64_t d, uint64_t *rem) {
     return q;
 }
 
-static uint32_t ns_to_tick(uint64_t ns) {
-    uint64_t t = udivmod64(ns + TICK_NS - 1, TICK_NS, (uint64_t *)0);
-    return t > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (uint32_t)t;
+/* Every time value is kept in 64-bit nanoseconds, saturated at KT_NS_MAX
+ * (Linux KTIME_MAX): a timer that far out never expires.  Deadlines are
+ * compared in 64 bits too — a 32-bit tick difference wraps after ~248 days
+ * and would make a far-future timer look already due. */
+#define KT_NS_MAX  0x7FFFFFFFFFFFFFFFULL
+
+static uint64_t ns_add(uint64_t a, uint64_t b) {
+    return (a >= KT_NS_MAX || b >= KT_NS_MAX - a) ? KT_NS_MAX : a + b;
 }
 
-static int tick_reached(uint32_t now, uint32_t t) { return (int32_t)(now - t) >= 0; }
+/* Monotonic time at the start of tick `now` (clock_mono() is tick * 10 ms plus
+ * the TSC offset into the tick), so deadline <= this means the tick has
+ * reached it: never early, at most one tick late. */
+static uint64_t tick_ns(uint32_t now) { return (uint64_t)now * TICK_NS; }
 
 static struct ktimer *kt_find(int tgid, int kind, int id) {
     for (int i = 0; i < KT_MAX; i++) {
@@ -162,7 +170,6 @@ static struct proc *group_member(int tgid) {
 /* Arm a wall-clock timer to expire at monotonic instant `dl`. */
 static void kt_arm_at(struct ktimer *t, uint64_t dl) {
     t->deadline = dl;
-    t->dl_tick  = ns_to_tick(dl);
     t->armed    = 1;
 }
 
@@ -246,15 +253,15 @@ void ktimer_tick(int user_mode) {
             /* Wall-clock timers run off the BSP's PIT tick only: that is the
              * tick that advances the clock, and one CPU doing it means one
              * expiry per deadline. */
-            if (!bsp || !tick_reached(now, t->dl_tick)) continue;
+            if (!bsp || t->deadline > tick_ns(now)) continue;
             if (!kt_fire(t)) { kt_free(t); continue; }
             if (!t->interval) { t->armed = 0; continue; }
             /* Periodic: the next expiry is a whole interval after the one
              * that just passed (hrtimer_forward), not after "now"; periods
              * missed entirely are overruns, not extra signals. */
-            uint64_t dl = t->deadline + t->interval;
+            uint64_t dl = ns_add(t->deadline, t->interval);
             uint64_t mono = clock_mono_ns();
-            if (dl <= mono) {
+            if (dl <= mono) {             /* mono < KT_NS_MAX, so dl is finite */
                 uint64_t missed = udivmod64(mono - dl, t->interval, (uint64_t *)0) + 1;
                 dl += missed * t->interval;
                 if (t->kind == KT_POSIX) t->overrun += (uint32_t)missed;
@@ -295,9 +302,14 @@ struct kits32 { struct kts32 interval, value; };
 struct kts64 { int64_t sec, nsec; };
 struct kits64 { struct kts64 interval, value; };
 
+/* sec/nsec (already validated non-negative, nsec < 1e9) to saturated ns. */
 static uint64_t ns_of(int64_t sec, int64_t nsec) {
-    return (uint64_t)sec * NSEC_PER_SEC + (uint64_t)nsec;
+    if ((uint64_t)sec >= KT_NS_MAX / NSEC_PER_SEC) return KT_NS_MAX;
+    return ns_add((uint64_t)sec * NSEC_PER_SEC, (uint64_t)nsec);
 }
+
+/* 64-bit seconds into a 32-bit time field: clamp rather than wrap. */
+static int32_t sec32(int64_t s) { return s > 0x7fffffffLL ? 0x7fffffff : (int32_t)s; }
 static void split_ns(uint64_t ns, int64_t *sec, int64_t *nsec) {
     uint64_t r;
     *sec  = (int64_t)udivmod64(ns, NSEC_PER_SEC, &r);
@@ -339,7 +351,7 @@ static int itimer_set(int which, uint64_t value, uint64_t interval,
     t->interval = interval;
     t->overrun = t->overrun_last = 0;
     if (which == ITIMER_REAL_K) {
-        kt_arm_at(t, clock_mono_ns() + value);
+        kt_arm_at(t, ns_add(clock_mono_ns(), value));
     } else {
         /* CPU time is charged a whole tick at a time; the timer fires on the
          * tick that uses up the budget. */
@@ -353,6 +365,8 @@ static int itimer_set(int which, uint64_t value, uint64_t interval,
 
 int sys_alarm(registers_t *regs) {
     uint32_t secs = regs->ebx;
+    /* Linux alarm_setitimer on 32-bit: a timeval holds at most INT_MAX s. */
+    if (secs > 0x7fffffffU) secs = 0x7fffffffU;
     uint64_t oval, oint;
     int r = itimer_set(ITIMER_REAL_K, (uint64_t)secs * NSEC_PER_SEC, 0, &oval, &oint);
     if (r < 0) return r;
@@ -374,7 +388,7 @@ static int tv_to_ns(const struct ktv32 *tv, uint64_t *ns) {
 static void ns_to_tv(uint64_t ns, struct ktv32 *tv) {
     int64_t s, n;
     split_ns(ns, &s, &n);
-    tv->sec  = (int32_t)s;
+    tv->sec  = sec32(s);
     tv->usec = (int32_t)((uint32_t)n / 1000);
     if (ns && !tv->sec && !tv->usec) tv->usec = 1;   /* armed: never 0 */
 }
@@ -498,13 +512,13 @@ static int timer_settime_ns(int id, int flags, int64_t vs, int64_t vn,
          * absolute wall-clock time maps onto a fixed monotonic instant. */
         if (t->clock == CLK_REALTIME_K) {
             uint64_t epoch = (uint64_t)rtc_boot_epoch() * NSEC_PER_SEC;
-            dl = val > epoch ? val - epoch : 0;
+            dl = val >= KT_NS_MAX ? KT_NS_MAX : val > epoch ? val - epoch : 0;
         } else {
             dl = val;
         }
         if (dl < mono) dl = mono;      /* already past: expires on the next tick */
     } else {
-        dl = mono + val;
+        dl = ns_add(mono, val);
     }
     kt_arm_at(t, dl);
     return 0;
@@ -520,8 +534,8 @@ int sys_timer_settime(registers_t *regs) {
     if (r < 0 || !uold) return r;
     struct kits32 ov;
     int64_t s, n;
-    split_ns(oval, &s, &n); ov.value.sec = (int32_t)s;    ov.value.nsec = (int32_t)n;
-    split_ns(oint, &s, &n); ov.interval.sec = (int32_t)s; ov.interval.nsec = (int32_t)n;
+    split_ns(oval, &s, &n); ov.value.sec = sec32(s);    ov.value.nsec = (int32_t)n;
+    split_ns(oint, &s, &n); ov.interval.sec = sec32(s); ov.interval.nsec = (int32_t)n;
     return copy_to_user(uold, &ov, sizeof(ov)) < 0 ? -EFAULT_K : 0;
 }
 
@@ -546,8 +560,8 @@ int sys_timer_gettime(registers_t *regs) {
     kt_read(t, &val, &iv);
     struct kits32 cv;
     int64_t s, n;
-    split_ns(val, &s, &n); cv.value.sec = (int32_t)s;    cv.value.nsec = (int32_t)n;
-    split_ns(iv, &s, &n);  cv.interval.sec = (int32_t)s; cv.interval.nsec = (int32_t)n;
+    split_ns(val, &s, &n); cv.value.sec = sec32(s);    cv.value.nsec = (int32_t)n;
+    split_ns(iv, &s, &n);  cv.interval.sec = sec32(s); cv.interval.nsec = (int32_t)n;
     return copy_to_user((void *)(uintptr_t)regs->ecx, &cv, sizeof(cv)) < 0 ? -EFAULT_K : 0;
 }
 

@@ -17,6 +17,11 @@
  *   exec       alarm survives execve, POSIX timers do not
  *   posix      timer_create/settime/gettime/getoverrun/delete, TIMER_ABSTIME,
  *              SIGEV_NONE
+ *   far        timers hundreds of days to centuries out (alarm(UINT_MAX),
+ *              setitimer INT_MAX s, timer_settime64 1e11 s (saturates at
+ *              KTIME_MAX), a far TIMER_ABSTIME)
+ *              do not fire and report a large remainder; out-of-range values
+ *              are EINVAL
  *
  * "timerprobe connect" (needs a NIC, so not part of the default run): alarm(1)
  * interrupts a blocking TCP connect to a silent address with EINTR.
@@ -34,6 +39,7 @@
 #include "../include/time.h"
 #include "../include/sys/time.h"
 #include "../include/sys/wait.h"
+#include "../include/syscall.h"
 #include "../include/sys/socket.h"
 #include "../include/netinet/in.h"
 
@@ -385,6 +391,115 @@ static void posix_case(void) {
     case_done("posix");
 }
 
+/* ── far-future timers and invalid values ───────────────────────────────── */
+struct ts64 { long long sec, nsec; };
+struct its64 { struct ts64 interval, value; };
+#define NR_TIMER_GETTIME64 408
+#define NR_TIMER_SETTIME64 409
+
+static void far_case(void) {
+    handle(SIGALRM, on_sig, SA_RESTART);
+    handle(SIGUSR1, on_sig, SA_RESTART);
+    g_hits = 0;
+
+    /* ~347 days: past the 2^31-tick (~248 days) wrap of a 32-bit tick diff. */
+    alarm(0);
+    alarm(30000000);
+    unsigned r = alarm(0xFFFFFFFFu);
+    check("far: alarm(30000000) remainder", r == 30000000u);
+    struct itimerval big, old;
+    memset(&big, 0, sizeof(big));
+    big.it_value.tv_sec = 0x7fffffff;
+    check("far: setitimer INT_MAX s", setitimer(ITIMER_REAL, &big, &old) == 0);
+    /* alarm(UINT_MAX) is INT_MAX s on 32-bit Linux. */
+    check("far: alarm(UINT_MAX) clamped to INT_MAX s",
+          old.it_value.tv_sec >= 0x7fffffff - 2);
+
+    struct sigevent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.sigev_notify = SIGEV_SIGNAL;
+    ev.sigev_signo = SIGUSR1;
+    timer_t rel = -1, absr = -1, absm = -1;
+    timer_create(CLOCK_MONOTONIC, &ev, &rel);
+    timer_create(CLOCK_REALTIME, &ev, &absr);
+    timer_create(CLOCK_MONOTONIC, &ev, &absm);
+    struct its64 v;
+    memset(&v, 0, sizeof(v));
+    v.value.sec = 100000000000LL;                 /* 1e11 s relative */
+    check("far: timer_settime64 1e11 s",
+          syscall4(NR_TIMER_SETTIME64, rel, 0, (int)&v, 0) == 0);
+    struct itimerspec its;
+    memset(&its, 0, sizeof(its));
+    its.it_value.tv_sec = 0x7fffffff;             /* 2038-01-19 wall clock */
+    check("far: TIMER_ABSTIME REALTIME 2038",
+          timer_settime(absr, TIMER_ABSTIME, &its, 0) == 0);
+    v.value.sec = 0x7fffffffffffffffLL / 1000000000LL + 5;   /* overflows ns */
+    check("far: TIMER_ABSTIME MONOTONIC beyond KTIME_MAX",
+          syscall4(NR_TIMER_SETTIME64, absm, 1, (int)&v, 0) == 0);
+
+    long t0 = now_ms();
+    while (now_ms() - t0 < 2000) { }
+    check("far: nothing fired within 2 s", g_hits == 0);
+    if (g_hits) printf("timerprobe: far: %d unexpected expiries\n", g_hits);
+
+    struct itimerval cur;
+    getitimer(ITIMER_REAL, &cur);
+    check("far: getitimer reports ~INT_MAX s", cur.it_value.tv_sec >= 0x7fffffff - 5);
+    r = alarm(0);
+    check("far: alarm(0) reports ~INT_MAX s", r >= 0x7fffffffu - 5);
+    struct its64 g;
+    memset(&g, 0, sizeof(g));
+    int gr = syscall2(NR_TIMER_GETTIME64, rel, (int)&g);
+    /* 1e11 s is past KTIME_MAX (2^63 ns, ~9.22e9 s): Linux saturates the
+     * expiry there, so the remainder is KTIME_MAX less the uptime. */
+    int g_ok = gr == 0 && g.value.sec > 9223372036LL - 1000000 &&
+               g.value.sec <= 9223372036LL;
+    check("far: timer_gettime64 1e11 s saturates at KTIME_MAX", g_ok);
+    if (!g_ok)
+        printf("timerprobe: far: gettime64 r=%d sec=%u:%u nsec=%u\n", gr,
+               (unsigned)(g.value.sec >> 32), (unsigned)g.value.sec, (unsigned)g.value.nsec);
+    check("far: 32-bit timer_gettime clamps to INT_MAX s",
+          timer_gettime(rel, &its) == 0 && its.it_value.tv_sec == 0x7fffffff);
+    check("far: abstime 2038 still pending",
+          timer_gettime(absr, &its) == 0 && its.it_value.tv_sec > 100000);
+
+    /* Out-of-range values: EINVAL, nothing armed. */
+    struct itimerval bad;
+    memset(&bad, 0, sizeof(bad));
+    bad.it_value.tv_usec = 1000000;
+    errno = 0;
+    check("far: setitimer usec 1e6 -> EINVAL",
+          setitimer(ITIMER_REAL, &bad, 0) == -1 && errno == EINVAL);
+    bad.it_value.tv_usec = 0;
+    bad.it_value.tv_sec = -1;
+    errno = 0;
+    check("far: setitimer negative -> EINVAL",
+          setitimer(ITIMER_REAL, &bad, 0) == -1 && errno == EINVAL);
+    memset(&its, 0, sizeof(its));
+    its.it_value.tv_nsec = 1000000000L;
+    errno = 0;
+    check("far: timer_settime nsec 1e9 -> EINVAL",
+          timer_settime(rel, 0, &its, 0) == -1 && errno == EINVAL);
+    its.it_value.tv_nsec = 0;
+    its.it_value.tv_sec = -1;
+    errno = 0;
+    check("far: timer_settime negative -> EINVAL",
+          timer_settime(rel, 0, &its, 0) == -1 && errno == EINVAL);
+    memset(&v, 0, sizeof(v));
+    v.value.sec = -5;
+    check("far: timer_settime64 negative -> EINVAL",
+          syscall4(NR_TIMER_SETTIME64, rel, 0, (int)&v, 0) == -EINVAL);
+    v.value.sec = 1;
+    v.interval.nsec = -1;
+    check("far: timer_settime64 negative interval -> EINVAL",
+          syscall4(NR_TIMER_SETTIME64, rel, 0, (int)&v, 0) == -EINVAL);
+
+    timer_delete(rel);
+    timer_delete(absr);
+    timer_delete(absm);
+    case_done("far");
+}
+
 /* ── connect (manual: make run-net) ─────────────────────────────────────── */
 static int connect_case(void) {
     handle(SIGALRM, on_sig, 0);
@@ -419,6 +534,7 @@ int main(int argc, char **argv) {
     cpu_case(ITIMER_PROF, SIGPROF, "prof");
     fork_exec_case();
     posix_case();
+    far_case();
     alarm(0);
 
     if (failures) {
