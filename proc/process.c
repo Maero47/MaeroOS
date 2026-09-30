@@ -147,8 +147,6 @@ struct proc *allocproc(void) {
      * with the shared group table — see sys_clone). */
     fdtable_attach(p, fdtable_alloc());
     if (!p->fdt) { sighand_put(p->sighand); p->sighand = NULL; p->state = PROC_UNUSED; return NULL; }
-    for (int i = 0; i < SHM_PROC_MAPS; i++)
-        p->shm_maps[i].id = -1;
 
     /* Allocate kernel stack */
     p->kstack = kstack_alloc();
@@ -259,8 +257,6 @@ struct proc *proc_create_kthread(void (*fn)(void), const char *name) {
     p->pgrp        = p->pid;
     p->sid         = p->pid;
 
-    for (int i = 0; i < SHM_PROC_MAPS; i++)
-        p->shm_maps[i].id = -1;
     p->utime_ticks = 0;
     p->sched_count = 0;
     p->no_preempt  = 0;

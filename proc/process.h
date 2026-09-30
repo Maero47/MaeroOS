@@ -105,16 +105,6 @@ typedef enum {
     PROC_ZOMBIE,
 } proc_state_t;
 
-/* ── Shared memory mappings held by a process ───────────────────────────── */
-
-#define SHM_PROC_MAPS 8
-
-typedef struct {
-    int      id;       /* shm object id, -1 = slot free */
-    uint32_t addr;     /* mapped virtual address */
-    uint32_t npages;
-} shm_map_t;
-
 /* Supplementary groups a process may hold.  Linux allows NGROUPS_MAX (65536);
  * setgroups() with more than this is -EINVAL here. */
 #define PROC_NGROUPS_MAX 32
@@ -222,9 +212,6 @@ struct proc {
      * allocated lazily on first fault instead of eagerly at mmap time — this
      * makes 8 MiB thread stacks cost only what they touch. */
     struct vma      *vmas;
-
-    /* Shared-memory mappings (see proc/shm.c) */
-    shm_map_t        shm_maps[SHM_PROC_MAPS];
 
     /* CPU accounting */
     uint32_t         utime_ticks;   /* PIT ticks spent running */

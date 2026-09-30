@@ -91,6 +91,8 @@ typedef struct {
 #define EXT2_S_IFREG  0x8000
 #define EXT2_S_IFDIR  0x4000
 #define EXT2_S_IFLNK  0xA000
+#define EXT2_S_IFSOCK 0xC000
+#define EXT2_FT_SOCK  6       /* dirent file_type of a socket */
 
 /* ── Filesystem state ─────────────────────────────────────────────────────── */
 
@@ -1616,15 +1618,17 @@ static void ext2_fill_node(vfs_node_t *node, const ext2_inode_t *inode) {
         node->retain_fn   = NULL;
         node->close_fn    = NULL;
     } else {
-        node->flags       = VFS_FLAG_FILE;
+        /* A socket inode (bind()) has no data: nothing to read or write. */
+        int sock = (type == EXT2_S_IFSOCK);
+        node->flags       = sock ? VFS_FLAG_SOCK : VFS_FLAG_FILE;
         node->finddir_fn  = NULL;
         node->readdir_fn  = NULL;
         node->create_fn   = NULL;
         node->unlink_fn   = NULL;
         node->rename_fn   = NULL;
-        node->read_fn     = ext2_read_node;
-        node->write_fn    = ext2_write_node;
-        node->truncate_fn = ext2_truncate;
+        node->read_fn     = sock ? NULL : ext2_read_node;
+        node->write_fn    = sock ? NULL : ext2_write_node;
+        node->truncate_fn = sock ? NULL : ext2_truncate;
         /* Reference tracking so unlink can defer the release; see the
          * open-inode table above. */
         node->retain_fn   = ext2_retain_node;
@@ -1681,7 +1685,8 @@ static vfs_node_t *ext2_make_node(uint32_t ino_num, const char *name,
 
 static int ext2_create(vfs_node_t *dir, const char *name, uint32_t flags) {
     if (!g_mounted || !dir || !dir->private || !name) return -1;
-    if (flags != VFS_FLAG_FILE && flags != VFS_FLAG_DIR) return -22;   /* -EINVAL */
+    if (flags != VFS_FLAG_FILE && flags != VFS_FLAG_DIR && flags != VFS_FLAG_SOCK)
+        return -22;                                                     /* -EINVAL */
     if (ext2_finddir(dir, name)) return -17;   /* -EEXIST (callers treat EEXIST as
                                                 * "already there" = OK; other errno
                                                 * is fatal — see tmpfs_create note) */
@@ -1720,7 +1725,7 @@ static int ext2_create(vfs_node_t *dir, const char *name, uint32_t flags) {
         inode.i_blocks = g_state.sectors_per_block;
         inode.i_block[0] = blk;
     } else {
-        inode.i_mode = EXT2_S_IFREG | 0644;
+        inode.i_mode = (flags == VFS_FLAG_SOCK ? EXT2_S_IFSOCK : EXT2_S_IFREG) | 0644;
         inode.i_size = 0;
         inode.i_links_count = 1;
         inode.i_blocks = 0;
@@ -1732,7 +1737,8 @@ static int ext2_create(vfs_node_t *dir, const char *name, uint32_t flags) {
         return -1;
     }
 
-    uint8_t ftype = (flags == VFS_FLAG_DIR) ? 2 : 1;
+    uint8_t ftype = (flags == VFS_FLAG_DIR) ? 2
+                  : (flags == VFS_FLAG_SOCK) ? EXT2_FT_SOCK : 1;
     if (ext2_add_dirent(dpriv->ino, &dir_inode, ino, name, ftype) < 0) {
         ext2_free_inode_blocks(&inode);
         memset(&inode, 0, sizeof(inode));
@@ -1791,7 +1797,7 @@ static int ext2_unlink(vfs_node_t *dir, const char *name) {
     if (type == EXT2_S_IFDIR && !ext2_dir_is_empty(&victim))
         return -1;
 
-    if (type != EXT2_S_IFREG && type != EXT2_S_IFDIR)
+    if (type != EXT2_S_IFREG && type != EXT2_S_IFDIR && type != EXT2_S_IFSOCK)
         return -1;
 
     if (ext2_remove_dirent(&dir_inode, name, NULL) < 0) return -1;
@@ -2131,7 +2137,9 @@ static int ext2_readdir(vfs_node_t *dir, uint32_t req_idx,
             if (de->inode) {
                 if (cur_idx == req_idx) {
                     out->ino  = de->inode;
-                    out->type = (de->file_type == 2) ? VFS_FLAG_DIR : VFS_FLAG_FILE;
+                    out->type = (de->file_type == 2) ? VFS_FLAG_DIR
+                              : (de->file_type == EXT2_FT_SOCK) ? VFS_FLAG_SOCK
+                              : VFS_FLAG_FILE;
                     memcpy(out->name, de->name, de->name_len);
                     out->name[de->name_len] = '\0';
                     kfree(blk_buf);

@@ -469,9 +469,10 @@ void proc_exit(int status) {
     sighand_put(current_proc->sighand);
     current_proc->sighand = (struct sighand *)0;
 
-    /* Drop shared-memory bookkeeping (frame refs released when the pgdir is
-     * torn down at reap time). */
-    shm_proc_cleanup(current_proc);
+    /* Drop the address space's shm attachments if this was the last thread
+     * running in it (frame refs are released when the pgdir is torn down at
+     * reap time). */
+    shm_proc_exit(current_proc);
 
     /* Linux exit_notify(): children belong to the PROCESS, and the parent is
      * told about the PROCESS.  A non-leader thread exiting says nothing to
