@@ -110,9 +110,53 @@ static int tcptw(int port, int n) {
     return 0;
 }
 
+/* sockprobe shutrd <port> <nbytes>: the host server greets on connect; leave
+ * the greeting unread, shutdown(SHUT_RD), send nbytes, then shutdown(SHUT_WR).
+ * The second shutdown completes a two-step close and must still be orderly:
+ * the host must receive all nbytes and then a FIN.  With unread data in the
+ * ring, closing the pcb without sending the FIN first was lwIP's abortive
+ * close (RST, queued data purged).  The host side checks the byte count. */
+static int shutrd(int port, int nbytes) {
+    int fd = http_connect(port);
+    if (fd < 0) {
+        printf("sockprobe: connect failed errno=%d\n", errno);
+        return 1;
+    }
+    usleep(1000000);                /* let the greeting arrive, unread */
+    if (shutdown(fd, SHUT_RD) < 0) {
+        printf("sockprobe: shutdown(SHUT_RD) failed errno=%d\n", errno);
+        close(fd);
+        return 1;
+    }
+    static char chunk[1024];
+    for (int i = 0; i < (int)sizeof(chunk); i++)
+        chunk[i] = (char)('a' + i % 26);
+    int sent = 0;
+    while (sent < nbytes) {
+        int n = nbytes - sent < (int)sizeof(chunk) ? nbytes - sent : (int)sizeof(chunk);
+        int r = (int)send(fd, chunk, (size_t)n, 0);
+        if (r <= 0) {
+            printf("sockprobe: send failed at %d errno=%d\n", sent, errno);
+            close(fd);
+            return 1;
+        }
+        sent += r;
+    }
+    if (shutdown(fd, SHUT_WR) < 0) {
+        printf("sockprobe: shutdown(SHUT_WR) failed errno=%d\n", errno);
+        close(fd);
+        return 1;
+    }
+    close(fd);
+    printf("sockprobe shutrd sent %d\n", sent);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "tcpshut") == 0)
         return tcpshut(atoi(argv[2]));
+    if (argc == 4 && strcmp(argv[1], "shutrd") == 0)
+        return shutrd(atoi(argv[2]), atoi(argv[3]));
     if (argc == 4 && strcmp(argv[1], "tcptw") == 0)
         return tcptw(atoi(argv[2]), atoi(argv[3]));
 

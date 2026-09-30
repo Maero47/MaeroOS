@@ -534,7 +534,18 @@ static int socket_shutdown_locked(net_socket_t *s, int how) {
          * API that is tcp_close: the pcb may be freed on the spot, or later
          * without an err callback (see socket_detach_pcb), so it must not be
          * referenced again.  Keeping s->tcp made a later close() tcp_close
-         * it a second time. */
+         * it a second time.
+         *
+         * Send the FIN first when the write side is still open.  tcp_close
+         * from ESTABLISHED or CLOSE_WAIT with bytes the application never
+         * read (they sit in our ring, so rcv_wnd is short) is lwIP's
+         * abortive close: an RST, with the unsent and unacked data purged,
+         * and the peer loses the reply it was sent.  shutdown() is an
+         * orderly close on Linux; that is close()'s behaviour, not this.
+         * Once the FIN is queued the pcb is in FIN_WAIT_1 or LAST_ACK, where
+         * tcp_close only marks the receive side closed. */
+        if (!s->tx_shut)
+            tcp_shutdown(s->tcp, 0, 1);
         socket_detach_pcb(s, 0);
         s->tcp_state = TCP_STATE_CLOSED;
         s->rx_shut = s->tx_shut = 1;
