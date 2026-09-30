@@ -231,18 +231,22 @@ static uint32_t procfs_version_read(vfs_node_t *n, uint32_t off, uint32_t len,
 static uint32_t procfs_kmsg_read(vfs_node_t *n, uint32_t off, uint32_t len,
                                  uint8_t *buf) {
     (void)n;
-    /* Snapshot the kernel ring buffer once per read pass (at off==0), then
-     * serve the linear copy by offset — same pattern as /proc/pci. */
-    static char content[65536];
-    static uint32_t content_len = 0;
+    /* Snapshot the kernel ring buffer into a per-read buffer and serve the
+     * requested window of it.  A shared static snapshot, refreshed only at
+     * off == 0, let two concurrent readers overwrite each other's copy
+     * mid-pass and return torn output (same fix as /proc/<pid>/maps). */
+    enum { KMSG_CAP = 65536 };
+    char *content = (char *)kmalloc(KMSG_CAP);
+    if (!content) return 0;
+    uint32_t content_len = klog_snapshot(content, KMSG_CAP);
 
-    if (off == 0)
-        content_len = klog_snapshot(content, sizeof(content));
-
-    if (off >= content_len) return 0;
-    uint32_t avail = content_len - off;
-    if (avail > len) avail = len;
-    __builtin_memcpy(buf, content + off, avail);
+    uint32_t avail = 0;
+    if (off < content_len) {
+        avail = content_len - off;
+        if (avail > len) avail = len;
+        __builtin_memcpy(buf, content + off, avail);
+    }
+    kfree(content);
     return avail;
 }
 
@@ -750,47 +754,50 @@ static uint32_t procfs_cpuinfo_read(vfs_node_t *n, uint32_t off, uint32_t len,
 static uint32_t procfs_pci_read(vfs_node_t *n, uint32_t off, uint32_t len,
                                 uint8_t *buf) {
     (void)n;
-    static char content[4096];
-    static uint32_t content_len = 0;
+    /* Built per read (see /proc/kmsg): no shared buffer to tear. */
+    enum { PCI_CAP = 4096 };
+    char *content = (char *)kmalloc(PCI_CAP);
+    uint32_t content_len;
+    if (!content) return 0;
 
-    if (off == 0) {
+    {
         uint32_t pos = 0;
         int count = pci_device_count();
         for (int i = 0; i < count; i++) {
             const pci_device_t *d = pci_get_device(i);
             if (!d) continue;
 
-            pappend_hex(content, &pos, sizeof(content), d->bus, 2);
-            pappend(content, &pos, sizeof(content), ":");
-            pappend_hex(content, &pos, sizeof(content), d->slot, 2);
-            pappend(content, &pos, sizeof(content), ".");
-            pappend_hex(content, &pos, sizeof(content), d->func, 1);
-            pappend(content, &pos, sizeof(content), " ");
-            pappend_hex(content, &pos, sizeof(content), d->vendor_id, 4);
-            pappend(content, &pos, sizeof(content), ":");
-            pappend_hex(content, &pos, sizeof(content), d->device_id, 4);
-            pappend(content, &pos, sizeof(content), " class=");
-            pappend_hex(content, &pos, sizeof(content), d->class_code, 2);
-            pappend(content, &pos, sizeof(content), ":");
-            pappend_hex(content, &pos, sizeof(content), d->subclass, 2);
-            pappend(content, &pos, sizeof(content), " prog=");
-            pappend_hex(content, &pos, sizeof(content), d->prog_if, 2);
-            pappend(content, &pos, sizeof(content), " irq=");
-            pappend_int(content, &pos, sizeof(content), d->irq_line);
-            pappend(content, &pos, sizeof(content), " bar0=");
-            pappend_hex(content, &pos, sizeof(content), d->bar[0], 8);
-            pappend(content, &pos, sizeof(content), "\n");
+            pappend_hex(content, &pos, PCI_CAP, d->bus, 2);
+            pappend(content, &pos, PCI_CAP, ":");
+            pappend_hex(content, &pos, PCI_CAP, d->slot, 2);
+            pappend(content, &pos, PCI_CAP, ".");
+            pappend_hex(content, &pos, PCI_CAP, d->func, 1);
+            pappend(content, &pos, PCI_CAP, " ");
+            pappend_hex(content, &pos, PCI_CAP, d->vendor_id, 4);
+            pappend(content, &pos, PCI_CAP, ":");
+            pappend_hex(content, &pos, PCI_CAP, d->device_id, 4);
+            pappend(content, &pos, PCI_CAP, " class=");
+            pappend_hex(content, &pos, PCI_CAP, d->class_code, 2);
+            pappend(content, &pos, PCI_CAP, ":");
+            pappend_hex(content, &pos, PCI_CAP, d->subclass, 2);
+            pappend(content, &pos, PCI_CAP, " prog=");
+            pappend_hex(content, &pos, PCI_CAP, d->prog_if, 2);
+            pappend(content, &pos, PCI_CAP, " irq=");
+            pappend_int(content, &pos, PCI_CAP, d->irq_line);
+            pappend(content, &pos, PCI_CAP, " bar0=");
+            pappend_hex(content, &pos, PCI_CAP, d->bar[0], 8);
+            pappend(content, &pos, PCI_CAP, "\n");
         }
         if (count == 0)
-            pappend(content, &pos, sizeof(content), "no pci devices\n");
+            pappend(content, &pos, PCI_CAP, "no pci devices\n");
+        if (pos >= PCI_CAP) pos = PCI_CAP - 1;
         content[pos] = '\0';
         content_len = pos;
     }
 
-    if (off >= content_len) return 0;
-    uint32_t avail = content_len - off;
-    if (avail > len) avail = len;
-    __builtin_memcpy(buf, content + off, avail);
+    uint32_t avail = procfs_copy_blob((const uint8_t *)content, content_len,
+                                      off, len, buf);
+    kfree(content);
     return avail;
 }
 
@@ -870,34 +877,36 @@ static uint32_t procfs_netif_write(vfs_node_t *n, uint32_t off, uint32_t len,
 static uint32_t procfs_firewall_read(vfs_node_t *n, uint32_t off, uint32_t len,
                                      uint8_t *buf) {
     (void)n;
-    static char content[2048];
-    uint32_t pos = firewall_dump(content, sizeof(content) - 1);
-    content[pos] = '\0';
-    if (off >= pos) return 0;
-    uint32_t avail = pos - off;
-    if (avail > len) avail = len;
-    __builtin_memcpy(buf, content + off, avail);
+    enum { FW_CAP = 4096 };
+    char *content = (char *)kmalloc(FW_CAP);
+    if (!content) return 0;
+    uint32_t pos = firewall_dump(content, FW_CAP);
+    uint32_t avail = procfs_copy_blob((const uint8_t *)content, pos, off, len, buf);
+    kfree(content);
     return avail;
 }
 
-/* Each write is one or more newline-separated control lines (fwctl). */
+/* Each write is one or more newline-separated control lines (fwctl).  A line
+ * the firewall rejects fails the write with EINVAL, so fwctl (and a config
+ * reload) can tell a bad rule from one that is now in force. */
 static uint32_t procfs_firewall_write(vfs_node_t *n, uint32_t off, uint32_t len,
                                       const uint8_t *buf) {
     (void)n; (void)off;
     char line[256];
     uint32_t i = 0, l = 0;
+    int bad = 0;
     while (i < len) {
         char c = (char)buf[i++];
         if (c == '\n' || l >= sizeof(line) - 1) {
             line[l] = '\0';
-            if (l) firewall_ctl_line(line);
+            if (l && firewall_ctl_line(line) < 0) bad = 1;
             l = 0;
             continue;
         }
         line[l++] = c;
     }
-    if (l) { line[l] = '\0'; firewall_ctl_line(line); }
-    return len;
+    if (l) { line[l] = '\0'; if (firewall_ctl_line(line) < 0) bad = 1; }
+    return bad ? (uint32_t)-22 : len;   /* -EINVAL */
 }
 
 /* ── /proc/processes ─────────────────────────────────────────────────────── */
@@ -905,48 +914,51 @@ static uint32_t procfs_firewall_write(vfs_node_t *n, uint32_t off, uint32_t len,
 static uint32_t procfs_processes_read(vfs_node_t *n, uint32_t off,
                                       uint32_t len, uint8_t *buf) {
     (void)n;
-    static char content[4096];
-    static uint32_t content_len = 0;
+    /* Built per read (see /proc/kmsg): no shared buffer to tear. */
+    enum { PROCS_CAP = 8192 };
+    char *content = (char *)kmalloc(PROCS_CAP);
+    uint32_t content_len;
+    if (!content) return 0;
 
-    if (off == 0) {
+    {
         uint32_t pos = 0;
-        pappend(content, &pos, sizeof(content),
+        pappend(content, &pos, PROCS_CAP,
                 "PID PPID PGRP SID STATE TTY TIME NAME\n");
         for (int i = 0; i < MAX_PROCS; i++) {
             struct proc *p = &ptable[i];
             if (p->state == PROC_UNUSED) continue;
             int ppid = p->parent ? p->parent->pid : 0;
 
-            pappend_int(content, &pos, sizeof(content), p->pid);
-            pappend(content, &pos, sizeof(content), " ");
-            pappend_int(content, &pos, sizeof(content), ppid);
-            pappend(content, &pos, sizeof(content), " ");
-            pappend_int(content, &pos, sizeof(content), p->pgrp);
-            pappend(content, &pos, sizeof(content), " ");
-            pappend_int(content, &pos, sizeof(content), p->sid);
-            pappend(content, &pos, sizeof(content), " ");
-            pappend(content, &pos, sizeof(content), proc_state_short(p->state));
-            pappend(content, &pos, sizeof(content), " ");
-            pappend_tty(content, &pos, sizeof(content), p);
-            pappend(content, &pos, sizeof(content), " ");
+            pappend_int(content, &pos, PROCS_CAP, p->pid);
+            pappend(content, &pos, PROCS_CAP, " ");
+            pappend_int(content, &pos, PROCS_CAP, ppid);
+            pappend(content, &pos, PROCS_CAP, " ");
+            pappend_int(content, &pos, PROCS_CAP, p->pgrp);
+            pappend(content, &pos, PROCS_CAP, " ");
+            pappend_int(content, &pos, PROCS_CAP, p->sid);
+            pappend(content, &pos, PROCS_CAP, " ");
+            pappend(content, &pos, PROCS_CAP, proc_state_short(p->state));
+            pappend(content, &pos, PROCS_CAP, " ");
+            pappend_tty(content, &pos, PROCS_CAP, p);
+            pappend(content, &pos, PROCS_CAP, " ");
             /* CPU time consumed, in 1/100ths of a second (PIT ticks) */
-            pappend_int(content, &pos, sizeof(content),
+            pappend_int(content, &pos, PROCS_CAP,
                         (int)(p->utime_ticks / 100));
-            pappend(content, &pos, sizeof(content), ".");
-            pappend_int(content, &pos, sizeof(content),
+            pappend(content, &pos, PROCS_CAP, ".");
+            pappend_int(content, &pos, PROCS_CAP,
                         (int)(p->utime_ticks % 100));
-            pappend(content, &pos, sizeof(content), " ");
-            pappend(content, &pos, sizeof(content), p->name);
-            pappend(content, &pos, sizeof(content), "\n");
+            pappend(content, &pos, PROCS_CAP, " ");
+            pappend(content, &pos, PROCS_CAP, p->name);
+            pappend(content, &pos, PROCS_CAP, "\n");
         }
+        if (pos >= PROCS_CAP) pos = PROCS_CAP - 1;
         content[pos] = '\0';
         content_len = pos;
     }
 
-    if (off >= content_len) return 0;
-    uint32_t avail = content_len - off;
-    if (avail > len) avail = len;
-    __builtin_memcpy(buf, content + off, avail);
+    uint32_t avail = procfs_copy_blob((const uint8_t *)content, content_len,
+                                      off, len, buf);
+    kfree(content);
     return avail;
 }
 

@@ -24,7 +24,8 @@ typedef struct {
     uint8_t  proto;      /* FW_TCP / FW_UDP / FW_ICMP / FW_ANYPROTO */
     uint32_t ip;         /* remote address, network order; 0 = any */
     uint32_t mask;       /* network mask, network order; 0 = any */
-    uint16_t port_lo;    /* 0 = any */
+    uint8_t  any_port;   /* no port given: every port matches */
+    uint16_t port_lo;    /* inclusive range; 0 is a port like any other */
     uint16_t port_hi;
     uint32_t hits;
 } fw_rule_t;
@@ -42,7 +43,7 @@ static int rule_matches(const fw_rule_t *r, int dir, int proto,
     if (r->dir != FW_ANYDIR && r->dir != dir) return 0;
     if (r->proto != FW_ANYPROTO && r->proto != proto) return 0;
     if (r->mask && (ip & r->mask) != (r->ip & r->mask)) return 0;
-    if (r->port_lo && (port < r->port_lo || port > r->port_hi)) return 0;
+    if (!r->any_port && (port < r->port_lo || port > r->port_hi)) return 0;
     return 1;
 }
 
@@ -105,21 +106,43 @@ int firewall_ip4_input_hook(struct pbuf *p, struct netif *inp) {
 
 /* ── control plane ──────────────────────────────────────────────────────── */
 
-static uint32_t parse_u32(const char **pp) {
+/*
+ * The control-plane parsers are strict: a rule that does not parse exactly is
+ * rejected, never widened.  A mask or port that silently fell back to "any"
+ * (an overflowing /bits wrapping to /0, a range starting at port 0, a typo in
+ * the protocol word) turned an intended narrow allow into allow-everything.
+ */
+
+/* Decimal number no larger than `max`; -1 when there are no digits or it is
+ * too big.  Advances *pp past the digits. */
+static int parse_num(const char **pp, uint32_t max, uint32_t *out) {
     const char *p = *pp;
     uint32_t v = 0;
-    while (*p >= '0' && *p <= '9') { v = v * 10 + (uint32_t)(*p - '0'); p++; }
+    if (*p < '0' || *p > '9') return -1;
+    while (*p >= '0' && *p <= '9') {
+        v = v * 10 + (uint32_t)(*p - '0');
+        if (v > max) return -1;
+        p++;
+    }
     *pp = p;
-    return v;
+    *out = v;
+    return 0;
 }
 
-/* "a.b.c.d" → network-order u32; advances *pp. */
-static uint32_t parse_ip(const char **pp) {
-    uint32_t b0 = parse_u32(pp); if (**pp == '.') (*pp)++;
-    uint32_t b1 = parse_u32(pp); if (**pp == '.') (*pp)++;
-    uint32_t b2 = parse_u32(pp); if (**pp == '.') (*pp)++;
-    uint32_t b3 = parse_u32(pp);
-    return (b0) | (b1 << 8) | (b2 << 16) | (b3 << 24);  /* network order */
+/* "a.b.c.d" → network-order u32; advances *pp.  -1 unless it is exactly four
+ * dotted octets. */
+static int parse_ip(const char **pp, uint32_t *out) {
+    uint32_t b[4];
+    for (int i = 0; i < 4; i++) {
+        if (i && *(*pp)++ != '.') return -1;
+        if (parse_num(pp, 255, &b[i]) < 0) return -1;
+    }
+    *out = b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24);  /* network order */
+    return 0;
+}
+
+static int at_token_end(const char *p) {
+    return *p == ' ' || *p == '\t' || *p == '\0' || *p == '\n';
 }
 
 static const char *skip_ws(const char *p) {
@@ -139,7 +162,7 @@ static int word_is(const char **pp, const char *w) {
 }
 
 static int add_rule(int action, int dir, int proto, uint32_t ip,
-                    uint32_t mask, uint16_t lo, uint16_t hi) {
+                    uint32_t mask, int any_port, uint16_t lo, uint16_t hi) {
     for (int i = 0; i < FW_MAX_RULES; i++) {
         if (!rules[i].in_use) {
             rules[i].in_use = 1;
@@ -147,6 +170,7 @@ static int add_rule(int action, int dir, int proto, uint32_t ip,
             rules[i].dir = (uint8_t)dir;
             rules[i].proto = (uint8_t)proto;
             rules[i].ip = ip; rules[i].mask = mask;
+            rules[i].any_port = (uint8_t)any_port;
             rules[i].port_lo = lo; rules[i].port_hi = hi;
             rules[i].hits = 0;
             return 0;
@@ -178,6 +202,8 @@ int firewall_ctl_line(const char *line) {
         int act = word_is(&p, "allow") ? FW_ALLOW
                 : word_is(&p, "drop") ? FW_DROP : -1;
         if (act < 0) return -1;
+        /* Direction and protocol words are optional (default any), but
+         * anything else in their place is an error, not a default. */
         int dir = word_is(&p, "in") ? FW_IN
                 : word_is(&p, "out") ? FW_OUT
                 : word_is(&p, "any") ? FW_ANYDIR : FW_ANYDIR;
@@ -187,22 +213,34 @@ int firewall_ctl_line(const char *line) {
                   : word_is(&p, "any") ? FW_ANYPROTO : FW_ANYPROTO;
         p = skip_ws(p);
         uint32_t ip = 0, mask = 0;
-        uint16_t lo = 0, hi = 0;
+        uint32_t lo = 0, hi = 0;
+        int any_port = 1;
         if (*p >= '0' && *p <= '9') {
-            ip = parse_ip(&p);
-            int bits = 32;
-            if (*p == '/') { p++; bits = (int)parse_u32(&p); }
-            mask = bits >= 32 ? 0xFFFFFFFFU
-                 : bits <= 0  ? 0
+            uint32_t bits = 32;
+            if (parse_ip(&p, &ip) < 0) return -1;
+            if (*p == '/') {
+                p++;
+                if (parse_num(&p, 32, &bits) < 0) return -1;
+            }
+            if (!at_token_end(p)) return -1;
+            mask = bits == 32 ? 0xFFFFFFFFU
+                 : bits == 0  ? 0
                  : __builtin_bswap32(0xFFFFFFFFU << (32 - bits));
         }
         p = skip_ws(p);
         if (*p >= '0' && *p <= '9') {
-            lo = (uint16_t)parse_u32(&p);
+            if (parse_num(&p, 65535, &lo) < 0) return -1;
             hi = lo;
-            if (*p == '-') { p++; hi = (uint16_t)parse_u32(&p); }
+            if (*p == '-') {
+                p++;
+                if (parse_num(&p, 65535, &hi) < 0 || hi < lo) return -1;
+            }
+            any_port = 0;
         }
-        return add_rule(act, dir, proto, ip, mask, lo, hi);
+        p = skip_ws(p);
+        if (*p != '\0' && *p != '\n') return -1;   /* trailing junk */
+        return add_rule(act, dir, proto, ip, mask, any_port,
+                        (uint16_t)lo, (uint16_t)hi);
     }
     return -1;
 }
@@ -220,8 +258,17 @@ uint32_t firewall_dump(char *buf, uint32_t cap) {
     for (int i = 0; i < FW_MAX_RULES && off < cap; i++) {
         if (!rules[i].in_use) continue;
         uint32_t ip = rules[i].ip;
+        uint32_t m = __builtin_bswap32(rules[i].mask);
+        int bits = 0;
+        while (m & 0x80000000U) { bits++; m <<= 1; }
+        char ports[16];
+        if (rules[i].any_port)
+            snprintf(ports, sizeof(ports), "any");
+        else
+            snprintf(ports, sizeof(ports), "%u-%u",
+                     rules[i].port_lo, rules[i].port_hi);
         n = snprintf(buf + off, cap - off,
-                      "  %s %s %s %u.%u.%u.%u port %u-%u  hits=%u\n",
+                      "  %s %s %s %u.%u.%u.%u/%d port %s  hits=%u\n",
                       rules[i].action == FW_DROP ? "drop" : "allow",
                       rules[i].dir == FW_IN ? "in" :
                       rules[i].dir == FW_OUT ? "out" : "any",
@@ -229,8 +276,7 @@ uint32_t firewall_dump(char *buf, uint32_t cap) {
                       rules[i].proto == FW_UDP ? "udp" :
                       rules[i].proto == FW_ICMP ? "icmp" : "any",
                       ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF,
-                      (ip >> 24) & 0xFF,
-                      rules[i].port_lo, rules[i].port_hi, rules[i].hits);
+                      (ip >> 24) & 0xFF, bits, ports, rules[i].hits);
         if (n > 0) off += (uint32_t)n;
     }
     /* snprintf returns the untruncated length; report only what fit (it

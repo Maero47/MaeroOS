@@ -67,6 +67,11 @@ static uint8_t dma_buf[NUM_BUFS][BUF_BYTES] __attribute__((aligned(4)));
 static uint8_t ring[RING_BYTES];
 static volatile uint32_t ring_head, ring_tail;   /* head=write, tail=read */
 static int ring_waiters;                          /* writer sleep channel */
+/* One /dev/dsp write at a time.  ring_head has a single producer by design:
+ * two writers preempted between reading it and advancing it copied over each
+ * other's samples and lost a head update.  Holding this across the whole
+ * write also keeps each write()'s PCM contiguous in the stream. */
+static int writer_busy;
 
 static uint16_t nam_base, nabm_base;
 static int present;
@@ -198,12 +203,24 @@ int ac97_write(const uint8_t *data, uint32_t len) {
     uint32_t written = 0;
 
     if (!present) return -19;   /* -ENODEV */
+    for (;;) {
+        preempt_disable();
+        int got = !writer_busy;
+        if (got) writer_busy = 1;
+        preempt_enable();
+        if (got) break;
+        if (signal_interrupt_pending(current_proc))
+            return -4;
+        current_proc->wake_tick = pit_ticks() + 5;
+        sleep_on(&writer_busy);
+    }
+
     while (written < len) {
         uint32_t space = RING_BYTES - ring_used();
 
         if (space == 0) {
             if (signal_interrupt_pending(current_proc))
-                return written ? (int)written : -4;
+                break;
             ring_waiters = 1;
             current_proc->wake_tick = pit_ticks() + 5;
             sleep_on(&ring_waiters);
@@ -220,7 +237,10 @@ int ac97_write(const uint8_t *data, uint32_t len) {
         }
         io_wake();             /* kick ksoundd to start/refill */
     }
-    return (int)written;
+
+    writer_busy = 0;
+    wake_up(&writer_busy);
+    return written ? (int)written : (len ? -4 : 0);
 }
 
 void ac97_init(void) {

@@ -5,7 +5,10 @@ Boots run-net, serves a host HTTP file, then:
   1. baseline httpget → MAEROS_HTTP_OK
   2. fwctl enable + drop out tcp 10.0.2.2/32 <port> → httpget now fails
   3. /proc/firewall shows the rule with a non-zero hit count
-  4. fwctl flush → httpget succeeds again
+  4. with policy out drop, malformed allow rules (overflowing /bits, /33,
+     port > 65535, a misspelt protocol) are rejected and a 0-1 port range
+     stays narrow → httpget stays blocked
+  5. fwctl flush → httpget succeeds again
 """
 import os
 import selectors
@@ -41,6 +44,14 @@ def wait_for(proc, sel, needle, log, timeout=20.0, start=0):
 def send(proc, line):
     proc.stdin.write((line + "\n").encode("latin1"))
     proc.stdin.flush()
+
+
+def run(proc, sel, log, line, timeout=8.0):
+    """Send one shell line, wait for the next prompt, return its output."""
+    before = len("".join(log))
+    send(proc, line)
+    wait_for(proc, sel, PROMPT, log, timeout=timeout, start=before)
+    return "".join(log)[before:]
 
 
 def main():
@@ -93,7 +104,35 @@ def main():
         if "enabled" not in listing or "drop out tcp" not in listing:
             raise AssertionError("firewall rule not listed")
 
-        # 4. flush restores connectivity
+        # 4. malformed rules fail closed.  With outbound policy drop, a narrow
+        #    allow that the kernel misparses as "any" would let the fetch
+        #    through: an overflowing /bits used to wrap to /0 (any address),
+        #    and a port range starting at 0 used to mean any port.  Each must
+        #    be rejected (or kept narrow) so the fetch stays blocked.
+        run(proc, sel, log, "fwctl flush")
+        run(proc, sel, log, "fwctl policy out drop")
+        for bad in ("fwctl allow out tcp 10.0.2.3/4294967296",
+                    "fwctl allow out tcp 10.0.2.2/33",
+                    "fwctl allow out tcp 10.0.2.2/32 70000",
+                    "fwctl allow out tcpp 10.0.2.2/32"):
+            out = run(proc, sel, log, bad + "; echo FWRC=$?")
+            if "FWRC=0" in out or "FWRC=" not in out:
+                raise AssertionError(f"malformed rule accepted: {bad!r}")
+        out = run(proc, sel, log, "fwctl allow out tcp 10.0.2.2/32 0-1; echo FWRC=$?")
+        if "FWRC=0" not in out:
+            raise AssertionError("valid rule with a port range from 0 rejected")
+        listing = run(proc, sel, log, "fwctl list")
+        if "allow out tcp" not in listing or "port 0-1" not in listing:
+            raise AssertionError("port-0 range rule not listed as 0-1")
+        if listing.count("  allow ") != 1:
+            raise AssertionError("a malformed rule made it into the ruleset")
+        out = run(proc, sel, log, f"httpget 10.0.2.2 {port} /index.html",
+                  timeout=15.0)
+        if "MAEROS_HTTP_OK" in out:
+            raise AssertionError("malformed/narrow allow rule failed open")
+        run(proc, sel, log, "fwctl policy out allow")
+
+        # 5. flush restores connectivity
         before = len("".join(log))
         send(proc, "fwctl flush")
         wait_for(proc, sel, PROMPT, log, timeout=8.0, start=before)

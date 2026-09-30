@@ -57,6 +57,8 @@ struct net_socket {
     struct udp_pcb *udp;
     struct tcp_pcb *tcp;
     int connected;
+    int tx_shut;        /* shutdown(SHUT_WR/SHUT_RDWR) done: send is EPIPE */
+    int rx_shut;        /* shutdown(SHUT_RD/SHUT_RDWR) done */
     int tcp_state;
     int tcp_error;
     uint8_t tcp_rx[TCP_RX_SIZE];
@@ -141,6 +143,38 @@ static err_t tcp_connected_cb(void *arg, struct tcp_pcb *pcb, err_t err) {
     return ERR_OK;
 }
 
+/*
+ * Give the pcb to lwIP for good: no callbacks back into s, tcp_close to let
+ * it finish the TCP close on its own, and s->tcp = NULL.  Every path that may
+ * outlive the pcb must go through here, because lwIP frees pcbs in states
+ * where it never calls the err callback:
+ *   - TIME_WAIT (after our FIN, then the peer's): freed by tcp_slowtmr after
+ *     2*MSL, or at once by tcp_kill_timewait when a new pcb is needed;
+ *   - LAST_ACK completing with TF_RXCLOSED set (tcp_input skips errf when
+ *     the application already shut the receive side).
+ * A socket still holding the pointer then reached into freed memp memory on
+ * close(), possibly a pcb since reused for another connection.
+ *
+ * In the states this is used from, tcp_close only marks the receive side
+ * closed and, from ESTABLISHED/CLOSE_WAIT, sends the FIN; it never fails
+ * there, but tcp_abort is kept as the fallback the release path always had.
+ * `in_input` is set when called from an lwIP callback inside tcp_input, where
+ * aborting the pcb is not allowed.
+ */
+static void socket_detach_pcb(net_socket_t *s, int in_input) {
+    struct tcp_pcb *pcb = s->tcp;
+    if (!pcb)
+        return;
+    tcp_arg(pcb, NULL);
+    tcp_recv(pcb, NULL);
+    tcp_err(pcb, NULL);
+    tcp_poll(pcb, NULL, 0);
+    if (tcp_close(pcb) != ERR_OK && !in_input)
+        tcp_abort(pcb);
+    s->tcp = NULL;
+    s->connected = 0;
+}
+
 static err_t tcp_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p,
                          err_t err) {
     net_socket_t *s = (net_socket_t *)arg;
@@ -149,6 +183,12 @@ static err_t tcp_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p,
     if (!p) {
         s->tcp_state = TCP_STATE_CLOSED;
         s->connected = 0;
+        /* The peer's FIN after ours (shutdown(SHUT_WR)) takes the pcb to
+         * CLOSING or TIME_WAIT, from which lwIP frees it without telling
+         * us.  Nothing is left to send or receive on it: let go now.  Data
+         * already in the ring is still served by recv, then EOF. */
+        if (s->tx_shut)
+            socket_detach_pcb(s, 1);
         return ERR_OK;
     }
     if (err != ERR_OK) {
@@ -178,6 +218,10 @@ static void tcp_err_cb(void *arg, err_t err) {
         return;
     s->tcp = NULL;
     s->connected = 0;
+    /* ERR_CLSD after the peer's FIN is an orderly close (LAST_ACK acked):
+     * recv keeps reporting EOF instead of turning it into an error. */
+    if (err == ERR_CLSD && s->tcp_state == TCP_STATE_CLOSED)
+        return;
     s->tcp_state = TCP_STATE_ERROR;
     s->tcp_error = (err == ERR_ABRT) ? -104 : -101;
 }
@@ -256,14 +300,7 @@ static void socket_release_locked(net_socket_t *s) {
         return;
     if (s->udp)
         udp_remove(s->udp);
-    if (s->tcp) {
-        tcp_arg(s->tcp, NULL);
-        tcp_recv(s->tcp, NULL);
-        tcp_err(s->tcp, NULL);
-        tcp_poll(s->tcp, NULL, 0);
-        if (tcp_close(s->tcp) != ERR_OK)
-            tcp_abort(s->tcp);
-    }
+    socket_detach_pcb(s, 0);
     memset(s, 0, sizeof(*s));
 }
 
@@ -338,11 +375,16 @@ static int socket_sendto_locked(net_socket_t *s, const void *buf, uint32_t len,
     if (!s || !s->used || !buf)
         return -9;
     if (s->type == SOCK_STREAM_K) {
+        if (s->tx_shut)
+            return -32;   /* -EPIPE, as Linux after SHUT_WR */
         if (!s->connected || !s->tcp)
             return -107;
+        if (len == 0)
+            return 0;
         uint32_t left = len;
         const uint8_t *p = (const uint8_t *)buf;
         uint32_t sent = 0;
+        int err = -11;
         while (left > 0) {
             /* Clamp in 32 bits: a (uint16_t) cast of left would turn a
              * multiple of 64 KiB into a 0-byte write that tcp_write() accepts,
@@ -356,15 +398,23 @@ static int socket_sendto_locked(net_socket_t *s, const void *buf, uint32_t len,
             if (chunk > 1460)
                 chunk = 1460;
             err_t e = tcp_write(s->tcp, p, (u16_t)chunk, TCP_WRITE_FLAG_COPY);
-            if (e != ERR_OK)
+            /* Only ERR_MEM (send buffer or segment queue full) is worth
+             * waiting on; the blocking caller sleeps and retries on -EAGAIN.
+             * Anything else (ERR_CONN once the pcb is past ESTABLISHED/
+             * CLOSE_WAIT, e.g. after a FIN went out) never clears, and
+             * reporting it as -EAGAIN left a blocking send asleep forever. */
+            if (e != ERR_OK) {
+                if (e != ERR_MEM)
+                    err = -32;   /* -EPIPE */
                 break;
+            }
             tcp_output(s->tcp);
             p += chunk;
             left -= chunk;
             sent += chunk;
             net_poll_all();
         }
-        return sent ? (int)sent : -11;
+        return sent ? (int)sent : err;
     }
     if (len > UDP_PACKET_MAX)
         return -90;
@@ -479,8 +529,36 @@ static int socket_shutdown_locked(net_socket_t *s, int how) {
         return -107;
     int shut_rx = (how == 0 || how == 2);
     int shut_tx = (how == 1 || how == 2);
+    if ((shut_rx || s->rx_shut) && (shut_tx || s->tx_shut)) {
+        /* Both directions now shut, in this call or across two.  For the raw
+         * API that is tcp_close: the pcb may be freed on the spot, or later
+         * without an err callback (see socket_detach_pcb), so it must not be
+         * referenced again.  Keeping s->tcp made a later close() tcp_close
+         * it a second time.
+         *
+         * Send the FIN first when the write side is still open.  tcp_close
+         * from ESTABLISHED or CLOSE_WAIT with bytes the application never
+         * read (they sit in our ring, so rcv_wnd is short) is lwIP's
+         * abortive close: an RST, with the unsent and unacked data purged,
+         * and the peer loses the reply it was sent.  shutdown() is an
+         * orderly close on Linux; that is close()'s behaviour, not this.
+         * Once the FIN is queued the pcb is in FIN_WAIT_1 or LAST_ACK, where
+         * tcp_close only marks the receive side closed. */
+        if (!s->tx_shut)
+            tcp_shutdown(s->tcp, 0, 1);
+        socket_detach_pcb(s, 0);
+        s->tcp_state = TCP_STATE_CLOSED;
+        s->rx_shut = s->tx_shut = 1;
+        return 0;
+    }
     err_t e = tcp_shutdown(s->tcp, shut_rx, shut_tx);
-    return e == ERR_OK ? 0 : -107;
+    if (e != ERR_OK)
+        return -107;
+    if (shut_rx)
+        s->rx_shut = 1;
+    if (shut_tx)
+        s->tx_shut = 1;
+    return 0;
 }
 
 /*
@@ -511,10 +589,45 @@ int net_socket_bind(net_socket_t *s, const net_sockaddr_in_t *addr) {
 
 int net_socket_sendto(net_socket_t *s, const void *buf, uint32_t len,
                       const net_sockaddr_in_t *addr) {
+    /* TCP send BLOCKS while the send buffer is full, like recv and like a
+     * blocking Linux socket: it returns once all of buf is queued, or with
+     * the partial count when a signal or a connection error cuts it short.
+     * Returning -EAGAIN on a full buffer made a blocking writer that pushes
+     * faster than the peer acks see a spurious error mid-stream.  UDP never
+     * waits (a datagram is sent or dropped whole). */
     preempt_disable();
-    int r = socket_sendto_locked(s, buf, len, addr);
+    int pinned = s && s->used;
+    if (pinned) s->refs++;   /* pinned across the sleep, as in recvfrom */
     preempt_enable();
-    return r;
+    if (!pinned) return -9;
+
+    const uint8_t *p = (const uint8_t *)buf;
+    uint32_t done = 0;
+    int r;
+    for (;;) {
+        preempt_disable();
+        r = socket_sendto_locked(s, p ? p + done : p, len - done, addr);
+        preempt_enable();
+        if (s->type != SOCK_STREAM_K)
+            break;
+        if (r > 0) {
+            done += (uint32_t)r;
+            if (done >= len)
+                break;
+            continue;
+        }
+        if (r != -11)
+            break;           /* error: reported unless something went out */
+        if (current_proc && signal_interrupt_pending(current_proc)) {
+            r = -4;          /* -EINTR */
+            break;
+        }
+        /* The buffer drains as the peer acks, which arrives with a NIC
+         * interrupt and wakes this sleep. */
+        net_io_sleep(2);
+    }
+    net_socket_release(s);
+    return done ? (int)done : r;
 }
 
 int net_socket_recvfrom(net_socket_t *s, void *buf, uint32_t len,
