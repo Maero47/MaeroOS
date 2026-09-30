@@ -98,7 +98,7 @@ struct linux_dirent {
     uint32_t d_ino;
     uint32_t d_off;
     uint16_t d_reclen;
-    char     d_name[1];   /* variable; d_type byte sits after the NUL */
+    char     d_name[1];   /* variable; d_type is the record's last byte */
 } __attribute__((packed));
 
 /* linux_dirent64 — sys_getdents64(220) */
@@ -3216,8 +3216,19 @@ static int sys_nanosleep(registers_t *regs) {
     return r;
 }
 
-/* ── sys_getdents(fd, buf, count) — EAX=141 ─────────────────────────────── */
-static int sys_getdents(registers_t *regs) {
+/*
+ * getdents/getdents64 — records in the exact Linux i386 layouts (musl's
+ * readdir walks them by d_reclen):
+ *   linux_dirent:   ino(4) off(4) reclen(2) name NUL [pad] type, where the
+ *                   type is the LAST byte: reclen = ALIGN(10 + namlen + 2, 4)
+ *   linux_dirent64: ino(8) off(8) reclen(2) type(1) name NUL [pad]:
+ *                   reclen = ALIGN(19 + namlen + 1, 8)
+ * d_off is the directory position after the entry (what lseek on the
+ * directory takes back, so telldir/seekdir work).  The position only advances
+ * past entries actually copied out: an entry that does not fit is returned by
+ * the next call, and if not even the first one fits the call is -EINVAL.
+ */
+static int getdents_common(registers_t *regs, int is64) {
     int       fd    = (int)regs->ebx;
     char     *buf   = (char *)(uintptr_t)regs->ecx;
     uint32_t  count = (uint32_t)regs->edx;
@@ -3226,75 +3237,55 @@ static int sys_getdents(registers_t *regs) {
     if (fd < 0 || fd >= MAX_FD) return -9;
 
     proc_file_t *f = &current_proc->ofile[fd];
-    if (f->type != FD_FILE || !(f->node->flags & VFS_FLAG_DIR)) return -20;
+    if (f->type != FD_FILE || !f->node) return -9;
+    if (!(f->node->flags & VFS_FLAG_DIR)) return -20;
 
     uint32_t written = 0;
     vfs_dirent_t de;
+    uint8_t rec[512];
 
-    for (;;) {
-        if (vfs_readdir(f->node, f->offset, &de) < 0) break;
-        f->offset++;
-
-        uint32_t nlen    = __builtin_strlen(de.name);
-        uint32_t reclen  = (9 + nlen + 1 + 1 + 3) & ~3U; /* 8B hdr + name + type + NUL */
-        if (written + reclen > count) break;
-        if (reclen > 512) return written ? (int)written : -22;
-
-        uint8_t rec[512];
+    while (vfs_readdir(f->node, f->offset, &de) >= 0) {
+        uint32_t nlen = 0;
+        while (nlen < sizeof(de.name) - 1 && de.name[nlen]) nlen++;
+        uint32_t reclen = is64 ? (19 + nlen + 1 + 7) & ~7U
+                               : (10 + nlen + 2 + 3) & ~3U;
+        if (reclen > sizeof(rec)) return written ? (int)written : -22;
+        if (written + reclen > count) {
+            if (!written) return -22;            /* -EINVAL: buffer too small */
+            break;
+        }
         __builtin_memset(rec, 0, reclen);
-        struct linux_dirent *d = (struct linux_dirent *)rec;
-        d->d_ino    = de.ino;
-        d->d_off    = (uint32_t)(written + reclen);
-        d->d_reclen = (uint16_t)reclen;
-        __builtin_memcpy(d->d_name, de.name, nlen);
-        /* d_type goes at d_name[reclen - 9] */
-        rec[reclen - 1] = vfs_type_to_dt(de.type);
-        rec[8 + nlen]   = '\0';
+        if (is64) {
+            struct linux_dirent64 *d = (struct linux_dirent64 *)rec;
+            d->d_ino    = de.ino;
+            d->d_off    = (int64_t)(f->offset + 1);
+            d->d_reclen = (uint16_t)reclen;
+            d->d_type   = vfs_type_to_dt(de.type);
+            __builtin_memcpy(d->d_name, de.name, nlen);   /* NUL: memset */
+        } else {
+            struct linux_dirent *d = (struct linux_dirent *)rec;
+            d->d_ino    = de.ino;
+            d->d_off    = f->offset + 1;
+            d->d_reclen = (uint16_t)reclen;
+            __builtin_memcpy(d->d_name, de.name, nlen);   /* NUL: memset */
+            rec[reclen - 1] = vfs_type_to_dt(de.type);
+        }
         int cr = copy_to_user(buf + written, rec, reclen);
-        if (cr < 0) return cr;
+        if (cr < 0) return written ? (int)written : cr;
         written += reclen;
+        f->offset++;
     }
     return (int)written;
 }
 
+/* ── sys_getdents(fd, buf, count) — EAX=141 ─────────────────────────────── */
+static int sys_getdents(registers_t *regs) {
+    return getdents_common(regs, 0);
+}
+
 /* ── sys_getdents64(fd, buf, count) — EAX=220 ───────────────────────────── */
 static int sys_getdents64(registers_t *regs) {
-    int       fd    = (int)regs->ebx;
-    char     *buf   = (char *)(uintptr_t)regs->ecx;
-    uint32_t  count = (uint32_t)regs->edx;
-
-    if (!access_ok(buf, count)) return -14;
-    if (fd < 0 || fd >= MAX_FD) return -9;
-
-    proc_file_t *f = &current_proc->ofile[fd];
-    if (f->type != FD_FILE || !(f->node->flags & VFS_FLAG_DIR)) return -20;
-
-    uint32_t written = 0;
-    vfs_dirent_t de;
-
-    for (;;) {
-        if (vfs_readdir(f->node, f->offset, &de) < 0) break;
-        f->offset++;
-
-        uint32_t nlen   = __builtin_strlen(de.name);
-        uint32_t reclen = (19 + nlen + 1 + 7) & ~7U; /* 19B hdr + name + NUL */
-        if (written + reclen > count) break;
-        if (reclen > 512) return written ? (int)written : -22;
-
-        uint8_t rec[512];
-        __builtin_memset(rec, 0, reclen);
-        struct linux_dirent64 *d = (struct linux_dirent64 *)rec;
-        d->d_ino    = de.ino;
-        d->d_off    = (int64_t)(written + reclen);
-        d->d_reclen = (uint16_t)reclen;
-        d->d_type   = vfs_type_to_dt(de.type);
-        __builtin_memcpy(d->d_name, de.name, nlen);
-        d->d_name[nlen] = '\0';
-        int cr = copy_to_user(buf + written, rec, reclen);
-        if (cr < 0) return cr;
-        written += reclen;
-    }
-    return (int)written;
+    return getdents_common(regs, 1);
 }
 
 /* ── sys_getcwd(buf, size) — EAX=183 ────────────────────────────────────── */
