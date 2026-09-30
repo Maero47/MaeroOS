@@ -62,6 +62,7 @@ struct timezone { int tz_minuteswest; int tz_dsttime; };
 int  nanosleep(const struct timespec *req, struct timespec *rem);
 int  gettimeofday(struct timeval *tv, void *tz);
 int  usleep(unsigned int usec);
+unsigned int alarm(unsigned int seconds);
 int  getrandom(void *buf, unsigned int buflen, unsigned int flags);
 int  getentropy(void *buf, size_t buflen);
 int  symlink(const char *target, const char *path);

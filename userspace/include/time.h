@@ -20,6 +20,17 @@ struct tm {
 #define UTIME_OMIT 1073741822L
 
 typedef int clockid_t;
+typedef int timer_t;
+
+#define CLOCK_BOOTTIME 7
+#define TIMER_ABSTIME  1
+
+struct itimerspec {
+    struct timespec it_interval;
+    struct timespec it_value;
+};
+
+struct sigevent;
 
 time_t time(time_t *tloc);
 struct tm *localtime(const time_t *timep);
@@ -36,3 +47,9 @@ int clock_gettime(clockid_t clk_id, struct timespec *tp);
 int utimensat(int dirfd, const char *path, const struct timespec times[2],
               int flags);
 int futimens(int fd, const struct timespec times[2]);
+int timer_create(clockid_t clockid, struct sigevent *sevp, timer_t *timerid);
+int timer_settime(timer_t timerid, int flags, const struct itimerspec *new_value,
+                  struct itimerspec *old_value);
+int timer_gettime(timer_t timerid, struct itimerspec *curr_value);
+int timer_getoverrun(timer_t timerid);
+int timer_delete(timer_t timerid);

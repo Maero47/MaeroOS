@@ -1,6 +1,7 @@
 #include "scheduler.h"
 #include "process.h"
 #include "signal.h"
+#include "ktimer.h"
 
 extern void vma_clear(struct proc *p);   /* free demand-paged VMAs (syscall.c) */
 #include "pipe.h"
@@ -145,6 +146,9 @@ void scheduler_tick(int user_mode) {
             p->state = PROC_RUNNABLE;
         }
     }
+
+    /* Expire alarm/setitimer/POSIX timers: queues their signals only. */
+    ktimer_tick(user_mode);
 
     if (!current_proc) return;
     current_proc->utime_ticks++;
@@ -489,6 +493,10 @@ void proc_exit(int status) {
     } else if (leader && leader != current_proc && leader->state == PROC_ZOMBIE) {
         notify = proc_group_empty(leader);
     }
+
+    /* The process is gone once its last thread is: so are its timers. */
+    if (notify && leader)
+        ktimer_group_exit(leader->tgid);
 
     if (notify && leader) {
         /* The process is gone: reparent its children to init (PID 1) and free

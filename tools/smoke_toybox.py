@@ -72,6 +72,10 @@ def main():
             # and pending signals survive exec, handlers reset
             # (userspace/sigexecprobe).
             ("sigexecprobe\n", "sigexecprobe ok"),
+            # alarm/setitimer/POSIX timers deliver signals that interrupt
+            # blocking calls (EINTR / SA_RESTART); fork clears, exec keeps
+            # (userspace/timerprobe).
+            ("timerprobe\n", "timerprobe ok"),
             ("whoami\n", "root"),
             # libc regression checks (userspace/libctest)
             ("libctest\n", "LIBCTEST PASS"),

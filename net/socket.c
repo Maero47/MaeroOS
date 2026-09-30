@@ -394,7 +394,14 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
     int st = s->tcp_state, have_pcb = (s->tcp != NULL), was = s->was_connected;
     int pending = (st == TCP_STATE_ERROR && !was) ? take_error_locked(s) : 0;
     preempt_enable();
-    if (st == TCP_STATE_CONNECTING) return -114;          /* -EALREADY */
+    /* A blocking connect re-issued while the handshake is still under way
+     * (the SA_RESTART restart of one a signal interrupted) waits for it again,
+     * as Linux __inet_stream_connect does; only a non-blocking one is told
+     * -EALREADY. */
+    if (st == TCP_STATE_CONNECTING) {
+        if (nonblock) return -114;                        /* -EALREADY */
+        goto wait;
+    }
     if (was) return -106;                                 /* -EISCONN */
     /* A failed non-blocking attempt not yet collected with SO_ERROR reports
      * its error here (inet_stream_connect -> sock_error). */
@@ -415,6 +422,7 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
      * socket writable when it ends, and SO_ERROR says how. */
     if (nonblock)
         return -115;                                      /* -EINPROGRESS */
+wait:
     /* Pin across the sleeping wait (see net_socket_recvfrom). */
     net_socket_retain(s);
     int r = -110;
@@ -430,6 +438,12 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
             r = take_error_locked(s);
             preempt_enable();
             if (!r) r = -101;
+            break;
+        }
+        /* A signal ends the wait (Linux inet_wait_for_connect ->
+         * sock_intr_errno); the handshake carries on in the background. */
+        if (current_proc && signal_interrupt_pending(current_proc)) {
+            r = -4;          /* -EINTR, restarted under SA_RESTART */
             break;
         }
         net_io_sleep(2);

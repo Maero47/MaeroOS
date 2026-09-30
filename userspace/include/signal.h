@@ -101,6 +101,24 @@ typedef struct {
 #define SIGSYS   31
 #define NSIG     32
 
+/* struct sigevent, Linux i386 layout (64 bytes).  The kernel handles
+ * SIGEV_SIGNAL, SIGEV_NONE and SIGEV_THREAD_ID; this libc has no SIGEV_THREAD. */
+union sigval { int sival_int; void *sival_ptr; };
+struct sigevent {
+    union sigval sigev_value;
+    int sigev_signo;
+    int sigev_notify;
+    union {
+        int  __pad[13];
+        int  __tid;
+    } __sev_fields;
+};
+#define sigev_notify_thread_id __sev_fields.__tid
+#define SIGEV_SIGNAL    0
+#define SIGEV_NONE      1
+#define SIGEV_THREAD    2
+#define SIGEV_THREAD_ID 4
+
 #define SIG_BLOCK   0
 #define SIG_UNBLOCK 1
 #define SIG_SETMASK 2

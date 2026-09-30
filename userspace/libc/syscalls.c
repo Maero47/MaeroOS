@@ -5,6 +5,8 @@
 #include "../include/signal.h"
 #include "../include/sys/stat.h"
 #include "../include/sys/utsname.h"
+#include "../include/sys/time.h"
+#include "../include/time.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -188,6 +190,40 @@ int openat(int dirfd, const char *path, int flags, ...) {
 
 int nanosleep(const struct timespec *req, struct timespec *rem) {
     return __chkerr(syscall2(162, (int)req, (int)rem));
+}
+
+unsigned int alarm(unsigned int seconds) {
+    return (unsigned int)syscall1(27, (int)seconds);
+}
+
+int setitimer(int which, const struct itimerval *new_value,
+              struct itimerval *old_value) {
+    return __chkerr(syscall3(104, which, (int)new_value, (int)old_value));
+}
+
+int getitimer(int which, struct itimerval *curr_value) {
+    return __chkerr(syscall2(105, which, (int)curr_value));
+}
+
+int timer_create(clockid_t clockid, struct sigevent *sevp, timer_t *timerid) {
+    return __chkerr(syscall3(259, clockid, (int)sevp, (int)timerid));
+}
+
+int timer_settime(timer_t timerid, int flags, const struct itimerspec *new_value,
+                  struct itimerspec *old_value) {
+    return __chkerr(syscall4(260, timerid, flags, (int)new_value, (int)old_value));
+}
+
+int timer_gettime(timer_t timerid, struct itimerspec *curr_value) {
+    return __chkerr(syscall2(261, timerid, (int)curr_value));
+}
+
+int timer_getoverrun(timer_t timerid) {
+    return __chkerr(syscall1(262, timerid));
+}
+
+int timer_delete(timer_t timerid) {
+    return __chkerr(syscall1(263, timerid));
 }
 
 int ioctl(int fd, unsigned long req, ...) {
