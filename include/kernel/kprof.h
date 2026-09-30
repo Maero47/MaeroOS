@@ -109,9 +109,8 @@ static inline void kprof_add(int ev, uint32_t n) { kprof_ev[ev] += n; }
 void kprof_syscall_enter(uint32_t nr);
 
 /* Invocations of one syscall so far.  The watchdog subtracts sched_yield from
- * the total: two respawnprobe services sit in `while (1) sched_yield()` for the
- * whole life of the machine, so the raw syscall count keeps climbing at ~800k/s
- * even when nothing else is alive, and is therefore not a progress signal. */
+ * the total: a thread spinning on it keeps the raw syscall count climbing
+ * even when nothing else is alive, so it is not a progress signal. */
 uint32_t kprof_syscall_count(uint32_t nr);
 
 /* Blocked (not runnable) wall time, attributed to the syscall that blocked.
