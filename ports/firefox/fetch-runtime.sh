@@ -11,6 +11,11 @@
 #                                 with /disk/firefox/pixbuf-loaders/ paths
 #     + libGL.so.1 libEGL.so.1 libGLESv2.so.2 libpci.so.3 libdrm.so.2
 #                                 empty stubs for Firefox's glxtest GPU probe
+#     + share/fonts/dejavu/       DejaVu Sans / Serif / Sans Mono, regular,
+#                                 bold, italic and bold italic (12 faces) from
+#                                 the pinned fonts-dejavu-* .debs; fontconfig
+#                                 finds them as /disk/firefox/share/fonts
+#                                 (testfiles/etc/fonts/fonts.conf)
 #   testfiles/lib/                glibc runtime (ld-linux.so.2, libc.so.6, ...)
 #                                 + libgcc_s / libstdc++ from the same suite
 #
@@ -74,8 +79,9 @@ FF_SHA256_PINNED=9a8b03f993049e75418e4753aedfe661016557c708cd6099eb2949b306d6f69
 SNAPSHOT_MIRROR=${SNAPSHOT_MIRROR:-https://snapshot.debian.org/archive/debian}
 
 # Pinned Debian packages: everything that ends up in testfiles/lib, which is
-# committed.  All other packages float with the suite index (their files are
-# gitignored).  Columns: suite package version pool-filename sha256
+# committed, and the fonts, so the faces (and so the text layout) in the image
+# are exactly these.  All other packages float with the suite index (their
+# files are gitignored).  Columns: suite package version pool-filename sha256
 # snapshot-timestamp.  The .deb is fetched from $DEBIAN_MIRROR/<filename>
 # while the pool still carries it, else from
 # $SNAPSHOT_MIRROR/<timestamp>/<filename>, and must match the sha256 here.
@@ -86,10 +92,15 @@ SNAPSHOT_MIRROR=${SNAPSHOT_MIRROR:-https://snapshot.debian.org/archive/debian}
 # copy of 20260601T000000Z for libc6, the live index for gcc-14), and the
 # libraries extracted from each .deb are byte-identical to the committed
 # testfiles/lib files.  To bump: see "Bumping the pinned glibc" in README.md.
+# The fonts-dejavu-* sha256s are the live trixie index's, and the
+# snapshot.debian.org copies at 20260601T000000Z hash the same.
 DEBIAN_PINS="
 trixie libc6      2.41-12+deb13u3 pool/main/g/glibc/libc6_2.41-12+deb13u3_i386.deb    410dae774925cb89a959a595bb9c9766f910df9ce3fdba334544fd7f0cb04b7e 20260601T000000Z
 trixie libgcc-s1  14.2.0-19       pool/main/g/gcc-14/libgcc-s1_14.2.0-19_i386.deb    a4c71fd856d2a48a7505a087b4186e3cca23f94603c05e3fb7c799b27e72f761 20260601T000000Z
 trixie libstdc++6 14.2.0-19       pool/main/g/gcc-14/libstdc++6_14.2.0-19_i386.deb   b6020260b92a97ac33ae58a73b16f3ab31fed7632e9b861f7cd5fc393facd6ed 20260601T000000Z
+trixie fonts-dejavu-core  2.37-8  pool/main/f/fonts-dejavu/fonts-dejavu-core_2.37-8_all.deb  86635b3d25b3655fc11cb3ecc3af59f0bf19643b02b94f2de48bd10253cdba12 20260601T000000Z
+trixie fonts-dejavu-extra 2.37-8  pool/main/f/fonts-dejavu/fonts-dejavu-extra_2.37-8_all.deb 83128d00e5d7db412fe5a7a4e2ee32aebbf8d9ed560ad611202fb43078f80323 20260601T000000Z
+trixie fonts-dejavu-mono  2.37-8  pool/main/f/fonts-dejavu/fonts-dejavu-mono_2.37-8_all.deb  3003e98a5debfdeadc7040a7f715fe9fe6fb67f68deacf6049b54e30f07fc014 20260601T000000Z
 "
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -124,6 +135,28 @@ PIXBUF_LOADER_SKIP="tiff svg"
 
 # Stubs for the glxtest GPU probe (see build-glstubs.sh for the rationale).
 GL_STUBS="libGL.so.1 libEGL.so.1 libGLESv2.so.2 libpci.so.3 libdrm.so.2"
+
+# Font faces installed under $FFDIR/$FONT_SUBDIR: package + file.  Sans, Serif
+# and Sans Mono in the four styles CSS asks for, so fontconfig's aliases
+# (testfiles/etc/fonts/fonts.conf) give sans-serif, serif and monospace their
+# own face and bold/italic are real faces, not synthesized.  Condensed,
+# ExtraLight and the math font are left out.  The set covers Latin, Greek,
+# Cyrillic and a wide range of symbols; about 5.3 MB.
+FONT_SUBDIR=share/fonts/dejavu
+FONT_FILES="
+fonts-dejavu-core  DejaVuSans.ttf
+fonts-dejavu-core  DejaVuSans-Bold.ttf
+fonts-dejavu-extra DejaVuSans-Oblique.ttf
+fonts-dejavu-extra DejaVuSans-BoldOblique.ttf
+fonts-dejavu-core  DejaVuSerif.ttf
+fonts-dejavu-core  DejaVuSerif-Bold.ttf
+fonts-dejavu-extra DejaVuSerif-Italic.ttf
+fonts-dejavu-extra DejaVuSerif-BoldItalic.ttf
+fonts-dejavu-mono  DejaVuSansMono.ttf
+fonts-dejavu-mono  DejaVuSansMono-Bold.ttf
+fonts-dejavu-mono  DejaVuSansMono-Oblique.ttf
+fonts-dejavu-mono  DejaVuSansMono-BoldOblique.ttf
+"
 
 log()  { printf '[fetch-runtime] %s\n' "$*"; }
 warn() { printf '[fetch-runtime] WARNING: %s\n' "$*" >&2; }
@@ -447,6 +480,9 @@ if [ -f "$MANIFEST" ]; then
     [ $nprev -gt 0 ] && log "removed $nprev files installed by the previous run (manifest)"
 fi
 : > "$MANIFEST"
+# The font directory is this script's alone (the tarball has no share/), so
+# drop it whole: a face removed from FONT_FILES must not linger in the image.
+rm -rf "${FFDIR:?}/share"
 mkdir -p "$FFDIR/pixbuf-loaders"
 nstale=0
 find "$FFDIR" -maxdepth 2 -type f \( -name '*.so' -o -name '*.so.*' \) | sort | while IFS= read -r f; do
@@ -578,8 +614,26 @@ nbad=$(grep '^"[^"]*\.so"$' "$CACHEFILE" | grep -vc "^\"$DISK_PIXBUF_DIR/" || tr
 log "loaders.cache lists $nmod modules under $DISK_PIXBUF_DIR"
 
 # ---------------------------------------------------------------------------
-# 10. Fonts (DejaVu Sans is committed; refetch it only if it went missing)
+# 10. Fonts: the pinned DejaVu faces -> $FFDIR/$FONT_SUBDIR, and DejaVu Sans
+#     in testfiles/usr/share/fonts (committed, on the initrd for the GTK
+#     probes; refetched only if it went missing)
 # ---------------------------------------------------------------------------
+mkdir -p "$FFDIR/$FONT_SUBDIR"
+for pkg in $(printf '%s\n' "$FONT_FILES" | awk 'NF { print $1 }' | sort -u); do
+    [ -n "$(pin_lookup "$pkg")" ] || die "font package $pkg has no pin in DEBIAN_PINS for $SUITE"
+    fetch_pkg "$pkg"
+done
+nfont=0
+printf '%s\n' "$FONT_FILES" | awk 'NF' > "$SUITEDIR/fonts.txt"
+while read -r pkg file; do
+    src="$UNPACK/$pkg/usr/share/fonts/truetype/dejavu/$file"
+    [ -f "$src" ] || die "$file not found in $pkg"
+    install_ff "$src" "$FONT_SUBDIR/$file"
+    nfont=$((nfont + 1))
+done < "$SUITEDIR/fonts.txt"
+rm -f "$SUITEDIR/fonts.txt"
+log "$nfont DejaVu faces ($(du -sk "$FFDIR/$FONT_SUBDIR" | cut -f1) KiB) installed in ${FFDIR#"$ROOT"/}/$FONT_SUBDIR"
+
 if [ ! -f "$FONTDIR/DejaVuSans.ttf" ]; then
     log "DejaVuSans.ttf missing; fetching fonts-dejavu-core"
     fetch_pkg fonts-dejavu-core

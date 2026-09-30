@@ -249,9 +249,33 @@ Every run writes `build/ff-smoke/<timestamp>-<accel>-smpN/` (gitignored):
 rtl8139 on QEMU user networking, and after the paint the harness serves a
 page from a thread (HTML, a CSS rule, a 96x96 pure-red PNG), types `http://10.0.2.2:PORT/` into the address bar
 through QEMU `sendkey`, and PASSes only when the image is requested **and**
-its red block shows up in a screendump. `summary.txt` gets `web` lines with
-every request and the time from Enter to it, and `screen-web.png` is the
-frame the block was found in. On the current tree a load takes 1-3 s.
+its red block shows up in a screendump **and** the page's text checks pass.
+`summary.txt` gets `web` lines with every request and the time from Enter to
+it, and `screen-web.png` is the frame the block was found in, taken again
+once the text is drawn. On the current tree a load takes 1-3 s.
+
+The same page carries a font test: one row per family (`sans-serif`,
+`serif`, `monospace`, `system-ui`, example.com's `-apple-system ... Arial,
+sans-serif` stack, `Times New Roman`, `Courier New`), each with Latin,
+`äöüçşğ ÄÖÜÇŞĞİı`, Greek, Cyrillic and bold / italic / bold italic. A script
+in the page measures every character on a canvas and compares its advance
+and ink box with those of an unassigned code point, i.e. Firefox's
+missing-glyph hex box in that family; a match is a box. It also checks that
+serif, sans and monospace are different faces, that monospace is fixed
+width, that bold and italic change the rendering and that serif italic is a
+real italic face (its `f` has a descender), plus a negative control: U+A000,
+which no installed font has, must be seen as a box. The page POSTs the result
+to the harness (`fonts.json` in the artifacts, `web ... fonts:` lines in
+`summary.txt`) and shows it as its title (`FONTS OK` / `FONTS FAIL n`).
+
+The fonts are DejaVu Sans, Serif and Sans Mono in four styles each, from the
+pinned `fonts-dejavu-*` 2.37-8 packages (`ports/firefox/fetch-runtime.sh`
+puts them in `/disk/firefox/share/fonts/dejavu`, 5.3 MB), and
+`testfiles/etc/fonts/fonts.conf` maps the CSS generics, `system-ui` and the
+usual named families (Arial, Helvetica, Segoe UI, Times New Roman, Courier
+New, ...) onto them. They cover Latin, Greek and Cyrillic; CJK, Arabic
+shaping beyond DejaVu's, Indic scripts etc. still come out as boxes (colour
+emoji come from Firefox's own Twemoji).
 
 `--net` alone attaches the NIC, so any address can be tried by hand, the
 real network included (QEMU's slirp routes it):
