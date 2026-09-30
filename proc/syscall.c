@@ -98,7 +98,7 @@ struct linux_dirent {
     uint32_t d_ino;
     uint32_t d_off;
     uint16_t d_reclen;
-    char     d_name[1];   /* variable; d_type byte sits after the NUL */
+    char     d_name[1];   /* variable; d_type is the record's last byte */
 } __attribute__((packed));
 
 /* linux_dirent64 — sys_getdents64(220) */
@@ -213,6 +213,10 @@ static int vfs_read_user(vfs_node_t *n, uint32_t off, char *ubuf, uint32_t len) 
  * short write.  Returns bytes written, or a negative errno if none were. */
 static int vfs_write_user(vfs_node_t *n, uint32_t off, const char *ubuf, uint32_t len) {
     if (len == 0) return 0;
+    /* File offsets are 32-bit: nothing can be written at or past 4 GiB, and a
+     * write straddling it is shortened rather than wrapping to offset 0. */
+    if (off == 0xFFFFFFFFU) return -27;                    /* -EFBIG */
+    if (len > 0xFFFFFFFFU - off) len = 0xFFFFFFFFU - off;
     uint32_t bsz;
     uint8_t *kbuf = bounce_alloc(len, &bsz);
     if (!kbuf) return -12;
@@ -226,6 +230,7 @@ static int vfs_write_user(vfs_node_t *n, uint32_t off, const char *ubuf, uint32_
          * from shmem_alloc_and_acct_folio for exactly this; returning 0 would
          * spin any libc write loop. */
         if (w == VFS_WRITE_ENOMEM) { err = -12; break; }
+        if (w == VFS_WRITE_EFBIG)  { err = -27; break; }
         if ((int32_t)w < 0)        { err = (int32_t)w; break; }
         if (w > want) w = want;
         done += w;
@@ -385,22 +390,34 @@ static int path_split(const char *path, char *dir_out, char *base_out) {
 }
 
 /*
- * vfs_open_at — like vfs_open() but handles relative paths by prepending cwd.
- * Requires current_proc to be set.
+ * vfs_lookup_at — vfs_lookup() for a path that may be relative to the cwd.
+ * cwd + '/' + path is joined with a length check (-ENAMETOOLONG past the VFS
+ * path limit) and, on failure, *err (if given) says why: -ENOENT, -ELOOP or
+ * -ENAMETOOLONG, so callers can report the real error instead of -ENOENT.
  */
-static vfs_node_t *vfs_open_at(const char *path) {
+#define LOOKUP_PATH_MAX 512
+static vfs_node_t *vfs_lookup_at(const char *path, int follow, int *err) {
+    if (err) *err = -2;                                       /* -ENOENT */
     if (!path) return NULL;
-    if (path[0] == '/') return vfs_open(path);
+    if (path[0] == '/') return vfs_lookup(path, follow, err);
     if (!current_proc) return NULL;
-    /* Relative: prepend cwd */
-    char abspath[512];
+    char abspath[LOOKUP_PATH_MAX];
     uint32_t cwdlen = (uint32_t)__builtin_strlen(current_proc->cwd);
+    uint32_t pathlen = (uint32_t)__builtin_strlen(path);
+    if (cwdlen + 1 + pathlen >= sizeof(abspath)) {
+        if (err) *err = -36;                                  /* -ENAMETOOLONG */
+        return NULL;
+    }
     __builtin_memcpy(abspath, current_proc->cwd, cwdlen);
     if (cwdlen > 1) abspath[cwdlen++] = '/';
-    uint32_t pathlen = (uint32_t)__builtin_strlen(path);
-    if (cwdlen + pathlen >= 512) return NULL;
     __builtin_memcpy(abspath + cwdlen, path, pathlen + 1);
-    return vfs_open(abspath);
+    return vfs_lookup(abspath, follow, err);
+}
+
+/* vfs_open_at — like vfs_open() but handles relative paths by prepending cwd.
+ * Requires current_proc to be set. */
+static vfs_node_t *vfs_open_at(const char *path) {
+    return vfs_lookup_at(path, 1, NULL);
 }
 
 static int path_is_root(const char *path) {
@@ -1110,7 +1127,7 @@ static int sys_write(registers_t *regs) {
     int         len = (int)(uint32_t)regs->edx;
 
     if (len < 0 || !access_ok(buf, (size_t)len)) {
-        printk("[SYSCALL] sys_write: bad user ptr 0x%08x\n", (unsigned)regs->ecx);
+        ktrace("[SYSCALL] sys_write: bad user ptr 0x%08x\n", (unsigned)regs->ecx);
         return -14;   /* -EFAULT */
     }
     if (fd < 0 || fd >= MAX_FD) return -9;
@@ -1203,13 +1220,18 @@ static int sys_waitpid(registers_t *regs) {
                 return child_pid;
             }
 
-            /* WUNTRACED: also report stopped children */
-            if ((options & WUNTRACED) && p->state == PROC_STOPPED) {
+            /* WUNTRACED: also report a stopped child — once per stop, with
+             * the signal that stopped it (Linux wait_task_stopped clears the
+             * group's stop code as it reports it). */
+            if ((options & WUNTRACED) && p->state == PROC_STOPPED &&
+                !p->stop_reported) {
                 if (status_ptr) {
-                    int status = (SIGTSTP << 8) | 0x7f;
+                    int sig = p->stop_sig ? p->stop_sig : SIGSTOP;
+                    int status = ((sig & 0xff) << 8) | 0x7f;
                     int cr = copy_to_user(status_ptr, &status, sizeof(status));
                     if (cr < 0) return cr;
                 }
+                p->stop_reported = 1;
                 return p->pid;
             }
         }
@@ -1260,11 +1282,13 @@ static int sys_open_kernel_path(const char *path, int flags) {
             vfs_open_nofollow(abspath))
             return -17;   /* -EEXIST */
     }
-    vfs_node_t *node = vfs_open_at(path);
+    int lerr;
+    vfs_node_t *node = vfs_lookup_at(path, 1, &lerr);
     if (!node) {
-        /* O_CREAT: create the file if missing */
-        if (!(flags & O_CREAT))
-            return -2;   /* -ENOENT */
+        /* O_CREAT: create the file if missing — only when it is missing,
+         * not when the lookup hit a symlink loop or an over-long path. */
+        if (!(flags & O_CREAT) || lerr != -2)
+            return lerr;
 
         char dir_path[256], base[256];
         if (path_split(path, dir_path, base) < 0)
@@ -1570,31 +1594,44 @@ static int es_push(struct exec_strings *v, const char *str, uint32_t len) {
 
 /* Append a NUL-terminated USER string.  Copied in page-bounded chunks (a
  * string may run right up to the end of a mapped page but never past it), not
- * byte by byte — the strings Linux allows are up to 128 KiB. */
+ * byte by byte — the strings Linux allows are up to 128 KiB.  Each chunk is
+ * clamped to what is left of the budget, so a short string near ARG_MAX is not
+ * refused for the page-sized chunk it was read in, and every exit that does
+ * not keep the string refunds all it charged. */
 static int es_push_user(struct exec_strings *v, const char *up) {
-    uint32_t start = v->used, got = 0;
+    uint32_t start = v->used, got = 0, charged = 0;
+    int rc;
     for (;;) {
         uint32_t chunk = PAGE_SIZE - (((uint32_t)(uintptr_t)up + got) & (PAGE_SIZE - 1));
+        uint32_t left  = EXEC_ARG_MAX - *v->total;
+        if (chunk > left) chunk = left;
         /* Charge FIRST: the budget has to stop us before the allocation, not
          * after the whole vector has been copied. */
-        if (es_charge(v, chunk) < 0) { v->used = start; return -7; }    /* -E2BIG */
-        v->used = start + got;
-        if (es_reserve(v, chunk) < 0) { v->used = start; return -12; }
+        if (chunk == 0 || es_charge(v, chunk) < 0) { rc = -7; break; }  /* -E2BIG */
+        charged += chunk;
+        if (es_reserve(v, chunk) < 0) { rc = -12; break; }
         if (copy_from_user(v->buf + start + got, up + got, chunk) < 0) {
-            v->used = start;
-            return -14;
+            rc = -14;
+            break;
         }
         for (uint32_t i = 0; i < chunk; i++)
             if (v->buf[start + got + i] == '\0') {
-                *v->total -= chunk - (i + 1);   /* refund the unused tail */
-                v->used = start + got + i + 1;
-                int rc = es_index(v, start);
-                if (rc < 0) v->used = start;
-                return rc;
+                uint32_t len = got + i + 1;
+                *v->total -= charged - len;   /* refund the unused tail */
+                charged = len;
+                v->used = start + len;
+                rc = es_index(v, start);
+                if (rc == 0) return 0;
+                goto fail;
             }
         got += chunk;
-        if (got > EXEC_MAX_ARG_STRLEN) { v->used = start; return -7; }  /* -E2BIG */
+        v->used = start + got;             /* es_reserve() appends after used */
+        if (got > EXEC_MAX_ARG_STRLEN) { rc = -7; break; }     /* -E2BIG */
     }
+fail:
+    *v->total -= charged;
+    v->used = start;
+    return rc;
 }
 
 /* Copy a whole NULL-terminated user vector (argv or envp). */
@@ -1719,7 +1756,7 @@ static int sys_exec(registers_t *regs) {
 
     vfs_node_t *node = vfs_open_at(path);
     if (!node) {
-        printk("[execfail] '%s' pid=%d ENOENT (open failed)\n", path, current_proc->pid);
+        ktrace("[execfail] '%s' pid=%d ENOENT (open failed)\n", path, current_proc->pid);
         EXEC_FAIL(-2);   /* -ENOENT */
     }
 
@@ -1731,13 +1768,13 @@ static int sys_exec(registers_t *regs) {
      * script is run by its interpreter with the caller's own ids. */
     for (int depth = 0; ; depth++) {
         if (node->flags != VFS_FLAG_FILE) {
-            printk("[execfail] '%s' pid=%d EACCES (not a regular file)\n",
+            ktrace("[execfail] '%s' pid=%d EACCES (not a regular file)\n",
                    path, current_proc->pid);
             EXEC_FAIL(-13);   /* -EACCES */
         }
         if (vfs_access_check(node, current_proc->euid, current_proc->egid,
                              VFS_WANT_X) < 0) {
-            printk("[execfail] '%s' pid=%d EACCES (uid=%d gid=%d mode=%o)\n",
+            ktrace("[execfail] '%s' pid=%d EACCES (uid=%d gid=%d mode=%o)\n",
                    path, current_proc->pid, (int)current_proc->euid,
                    (int)current_proc->egid, (unsigned)node->mask);
             EXEC_FAIL(-13);   /* -EACCES */
@@ -2411,8 +2448,9 @@ static int sys_chdir(registers_t *regs) {
     char path[256];
     if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0)
         return -14;
-    vfs_node_t *n = vfs_open_at(path);
-    if (!n) return -2;
+    int lerr;
+    vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
+    if (!n) return lerr;
     if (!(n->flags & VFS_FLAG_DIR)) return -20;  /* ENOTDIR */
     char canonical[256];
     int cr = canonicalize_path_at_cwd(path, canonical, sizeof(canonical));
@@ -2422,6 +2460,23 @@ static int sys_chdir(registers_t *regs) {
 }
 
 /* ── sys_lseek(fd, offset, whence) — EAX=19 ─────────────────────────────── */
+/* The offset lseek/_llseek would move `f` to, computed in 64 bits: Linux
+ * vfs_setpos() refuses a negative result or one past the largest file (here
+ * 4 GiB - 1) with -EINVAL, leaving the position unchanged. */
+static int seek_target(proc_file_t *f, int64_t off, int whence, uint32_t *out) {
+    int64_t base;
+    switch (whence) {
+    case 0: base = 0; break;                                   /* SEEK_SET */
+    case 1: base = (int64_t)f->offset; break;                  /* SEEK_CUR */
+    case 2: base = f->node ? (int64_t)f->node->size : 0; break; /* SEEK_END */
+    default: return -22;
+    }
+    int64_t pos = base + off;
+    if (pos < 0 || pos > 0xFFFFFFFFLL) return -22;             /* -EINVAL */
+    *out = (uint32_t)pos;
+    return 0;
+}
+
 static int sys_lseek(registers_t *regs) {
     int fd     = (int)regs->ebx;
     int off    = (int)regs->ecx;   /* signed */
@@ -2433,13 +2488,10 @@ static int sys_lseek(registers_t *regs) {
     if (f->type == FD_PIPE_R || f->type == FD_PIPE_W) return -29;  /* ESPIPE */
 
     uint32_t new_off;
-    uint32_t fsize = f->node ? f->node->size : 0;
-    switch (whence) {
-    case 0: new_off = (uint32_t)off; break;
-    case 1: new_off = f->offset + (uint32_t)off; break;
-    case 2: new_off = fsize + (uint32_t)off; break;
-    default: return -22;
-    }
+    int r = seek_target(f, off, whence, &new_off);
+    if (r < 0) return r;
+    /* A 32-bit off_t cannot carry the result (Linux: -EOVERFLOW). */
+    if (new_off > 0x7FFFFFFFU) return -75;
     f->offset = new_off;
     return (int)new_off;
 }
@@ -2635,8 +2687,8 @@ static int ioctl_arg_shape(uint32_t req, uint32_t *len) {
     case 0x5402: case 0x5403: case 0x5404:
                               *len = 36;            return IOA_IN;    /* TCSETS/W/F */
     case 0x5413:              *len = 8;             return IOA_OUT;   /* TIOCGWINSZ */
-    case 0x5414:              *len = sizeof(int);   return IOA_OUT;   /* TIOCGPGRP (this ABI) */
-    case 0x5415:              *len = sizeof(int);   return IOA_IN;    /* TIOCSPGRP (this ABI) */
+    case 0x540F:              *len = sizeof(int);   return IOA_OUT;   /* TIOCGPGRP */
+    case 0x5410:              *len = sizeof(int);   return IOA_IN;    /* TIOCSPGRP */
     case 0x5601:              *len = 8;             return IOA_OUT;   /* VT_GETMODE: struct vt_mode */
     case 0x5602:              *len = 8;             return IOA_IN;    /* VT_SETMODE */
     case 0x5603:              *len = 6;             return IOA_OUT;   /* VT_GETSTATE: struct vt_stat */
@@ -2713,7 +2765,7 @@ static int sys_ioctl(registers_t *regs) {
         }
         return 0;
     }
-    if (req == 0x5410) {  /* TIOCGSID: return the session ID (use pgrp of shell) */
+    if (req == 0x5429) {  /* TIOCGSID: return the session ID (use pgrp of shell) */
         int *out = (int *)(uintptr_t)regs->edx;
         int sid = current_proc ? current_proc->pgrp : 1;
         if (out) {
@@ -2722,7 +2774,7 @@ static int sys_ioctl(registers_t *regs) {
         }
         return sid;
     }
-    if (req == 0x5414) {  /* TIOCGPGRP: get foreground pgrp */
+    if (req == 0x540F) {  /* TIOCGPGRP: get foreground pgrp */
         int *out = (int *)(uintptr_t)regs->edx;
         int fg = tty_fg_pgrp ? tty_fg_pgrp : (current_proc ? current_proc->pgrp : 1);
         if (out) {
@@ -2731,7 +2783,7 @@ static int sys_ioctl(registers_t *regs) {
         }
         return fg;
     }
-    if (req == 0x5415) {  /* TIOCSPGRP: set foreground pgrp */
+    if (req == 0x5410) {  /* TIOCSPGRP: set foreground pgrp */
         const int *inp = (const int *)(uintptr_t)regs->edx;
         if (inp) {
             int fg = 0;
@@ -3086,8 +3138,9 @@ static int sys_stat(registers_t *regs) {
     struct kstat *st = (struct kstat *)(uintptr_t)regs->ecx;
     if (!access_ok(st, sizeof(*st))) return -14;
 
-    vfs_node_t *n = vfs_open_at(path);
-    if (!n) return -2;
+    int lerr;
+    vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
+    if (!n) return lerr;
     struct kstat kst;
     fill_kstat(&kst, n);
     return copy_to_user(st, &kst, sizeof(kst));
@@ -3181,8 +3234,19 @@ static int sys_nanosleep(registers_t *regs) {
     return r;
 }
 
-/* ── sys_getdents(fd, buf, count) — EAX=141 ─────────────────────────────── */
-static int sys_getdents(registers_t *regs) {
+/*
+ * getdents/getdents64 — records in the exact Linux i386 layouts (musl's
+ * readdir walks them by d_reclen):
+ *   linux_dirent:   ino(4) off(4) reclen(2) name NUL [pad] type, where the
+ *                   type is the LAST byte: reclen = ALIGN(10 + namlen + 2, 4)
+ *   linux_dirent64: ino(8) off(8) reclen(2) type(1) name NUL [pad]:
+ *                   reclen = ALIGN(19 + namlen + 1, 8)
+ * d_off is the directory position after the entry (what lseek on the
+ * directory takes back, so telldir/seekdir work).  The position only advances
+ * past entries actually copied out: an entry that does not fit is returned by
+ * the next call, and if not even the first one fits the call is -EINVAL.
+ */
+static int getdents_common(registers_t *regs, int is64) {
     int       fd    = (int)regs->ebx;
     char     *buf   = (char *)(uintptr_t)regs->ecx;
     uint32_t  count = (uint32_t)regs->edx;
@@ -3191,75 +3255,55 @@ static int sys_getdents(registers_t *regs) {
     if (fd < 0 || fd >= MAX_FD) return -9;
 
     proc_file_t *f = &current_proc->ofile[fd];
-    if (f->type != FD_FILE || !(f->node->flags & VFS_FLAG_DIR)) return -20;
+    if (f->type != FD_FILE || !f->node) return -9;
+    if (!(f->node->flags & VFS_FLAG_DIR)) return -20;
 
     uint32_t written = 0;
     vfs_dirent_t de;
+    uint8_t rec[512];
 
-    for (;;) {
-        if (vfs_readdir(f->node, f->offset, &de) < 0) break;
-        f->offset++;
-
-        uint32_t nlen    = __builtin_strlen(de.name);
-        uint32_t reclen  = (9 + nlen + 1 + 1 + 3) & ~3U; /* 8B hdr + name + type + NUL */
-        if (written + reclen > count) break;
-        if (reclen > 512) return written ? (int)written : -22;
-
-        uint8_t rec[512];
+    while (vfs_readdir(f->node, f->offset, &de) >= 0) {
+        uint32_t nlen = 0;
+        while (nlen < sizeof(de.name) - 1 && de.name[nlen]) nlen++;
+        uint32_t reclen = is64 ? (19 + nlen + 1 + 7) & ~7U
+                               : (10 + nlen + 2 + 3) & ~3U;
+        if (reclen > sizeof(rec)) return written ? (int)written : -22;
+        if (written + reclen > count) {
+            if (!written) return -22;            /* -EINVAL: buffer too small */
+            break;
+        }
         __builtin_memset(rec, 0, reclen);
-        struct linux_dirent *d = (struct linux_dirent *)rec;
-        d->d_ino    = de.ino;
-        d->d_off    = (uint32_t)(written + reclen);
-        d->d_reclen = (uint16_t)reclen;
-        __builtin_memcpy(d->d_name, de.name, nlen);
-        /* d_type goes at d_name[reclen - 9] */
-        rec[reclen - 1] = vfs_type_to_dt(de.type);
-        rec[8 + nlen]   = '\0';
+        if (is64) {
+            struct linux_dirent64 *d = (struct linux_dirent64 *)rec;
+            d->d_ino    = de.ino;
+            d->d_off    = (int64_t)(f->offset + 1);
+            d->d_reclen = (uint16_t)reclen;
+            d->d_type   = vfs_type_to_dt(de.type);
+            __builtin_memcpy(d->d_name, de.name, nlen);   /* NUL: memset */
+        } else {
+            struct linux_dirent *d = (struct linux_dirent *)rec;
+            d->d_ino    = de.ino;
+            d->d_off    = f->offset + 1;
+            d->d_reclen = (uint16_t)reclen;
+            __builtin_memcpy(d->d_name, de.name, nlen);   /* NUL: memset */
+            rec[reclen - 1] = vfs_type_to_dt(de.type);
+        }
         int cr = copy_to_user(buf + written, rec, reclen);
-        if (cr < 0) return cr;
+        if (cr < 0) return written ? (int)written : cr;
         written += reclen;
+        f->offset++;
     }
     return (int)written;
 }
 
+/* ── sys_getdents(fd, buf, count) — EAX=141 ─────────────────────────────── */
+static int sys_getdents(registers_t *regs) {
+    return getdents_common(regs, 0);
+}
+
 /* ── sys_getdents64(fd, buf, count) — EAX=220 ───────────────────────────── */
 static int sys_getdents64(registers_t *regs) {
-    int       fd    = (int)regs->ebx;
-    char     *buf   = (char *)(uintptr_t)regs->ecx;
-    uint32_t  count = (uint32_t)regs->edx;
-
-    if (!access_ok(buf, count)) return -14;
-    if (fd < 0 || fd >= MAX_FD) return -9;
-
-    proc_file_t *f = &current_proc->ofile[fd];
-    if (f->type != FD_FILE || !(f->node->flags & VFS_FLAG_DIR)) return -20;
-
-    uint32_t written = 0;
-    vfs_dirent_t de;
-
-    for (;;) {
-        if (vfs_readdir(f->node, f->offset, &de) < 0) break;
-        f->offset++;
-
-        uint32_t nlen   = __builtin_strlen(de.name);
-        uint32_t reclen = (19 + nlen + 1 + 7) & ~7U; /* 19B hdr + name + NUL */
-        if (written + reclen > count) break;
-        if (reclen > 512) return written ? (int)written : -22;
-
-        uint8_t rec[512];
-        __builtin_memset(rec, 0, reclen);
-        struct linux_dirent64 *d = (struct linux_dirent64 *)rec;
-        d->d_ino    = de.ino;
-        d->d_off    = (int64_t)(written + reclen);
-        d->d_reclen = (uint16_t)reclen;
-        d->d_type   = vfs_type_to_dt(de.type);
-        __builtin_memcpy(d->d_name, de.name, nlen);
-        d->d_name[nlen] = '\0';
-        int cr = copy_to_user(buf + written, rec, reclen);
-        if (cr < 0) return cr;
-        written += reclen;
-    }
-    return (int)written;
+    return getdents_common(regs, 1);
 }
 
 /* ── sys_getcwd(buf, size) — EAX=183 ────────────────────────────────────── */
@@ -3912,8 +3956,11 @@ static uint32_t shmem_read(vfs_node_t *node, uint32_t off, uint32_t len,
 
 static uint32_t shmem_write(vfs_node_t *node, uint32_t off, uint32_t len,
                             const uint8_t *buf) {
+    /* off + len must not wrap past 4 GiB onto page 0. */
+    if (off == 0xFFFFFFFFU) return VFS_WRITE_EFBIG;
+    if (len > 0xFFFFFFFFU - off) len = 0xFFFFFFFFU - off;
     struct shmap_entry *e = shmap_get(node);
-    if (!e) return 0;
+    if (!e) return VFS_WRITE_ENOMEM;
     uint32_t done = 0;
     while (done < len) {
         uint32_t pos = off + done;
@@ -3925,6 +3972,7 @@ static uint32_t shmem_write(vfs_node_t *node, uint32_t off, uint32_t len,
         shmem_bounce(phys, in, (uint8_t *)(uintptr_t)(buf + done), n, 1);
         done += n;
     }
+    if (done == 0 && len) return VFS_WRITE_ENOMEM;  /* 0 would spin write loops */
     if (off + done > node->size) node->size = off + done;
     return done;
 }
@@ -4698,8 +4746,9 @@ static int sys_stat64(registers_t *regs) {
     struct kstat64 *st = (struct kstat64 *)(uintptr_t)regs->ecx;
     if (!access_ok(st, sizeof(*st))) return -14;
 
-    vfs_node_t *n = vfs_open_at(path);
-    if (!n) return -2;
+    int lerr;
+    vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
+    if (!n) return lerr;
     struct kstat64 kst;
     fill_kstat64(&kst, n);
     return copy_to_user(st, &kst, sizeof(kst));
@@ -4827,8 +4876,9 @@ static int sys_statx(registers_t *regs) {
         int r = fd_kstat64(dirfd, &kst);
         if (r < 0) return r;
     } else {
-        vfs_node_t *n = vfs_open_at(path);
-        if (!n) return -2;
+        int lerr;
+        vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
+        if (!n) return lerr;
         fill_kstat64(&kst, n);
     }
 
@@ -4952,9 +5002,9 @@ static int sys_access(registers_t *regs) {
     if (mode & ~7) return -22;
     if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0)
         return -14;
-    vfs_node_t *n = vfs_open_at(path);
-    int rc = n ? 0 : -2;  /* 0=exists, -ENOENT=not found */
-    return rc;
+    int lerr;
+    vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
+    return n ? 0 : lerr;  /* 0=exists, else -ENOENT/-ELOOP/-ENAMETOOLONG */
 }
 
 /* ── sys_dup(int oldfd) — EAX=41 ────────────────────────────────────────── */
@@ -5114,18 +5164,9 @@ static int sys_lstat(registers_t *regs) {
     struct kstat *st = (struct kstat *)(uintptr_t)regs->ecx;
     if (!access_ok(st, sizeof(*st))) return -14;
     /* lstat does NOT follow the final symlink */
-    vfs_node_t *n;
-    char abspath[256];
-    if (path[0] == '/') {
-        n = vfs_open_nofollow(path);
-    } else {
-        uint32_t cwdlen = (uint32_t)__builtin_strlen(current_proc->cwd);
-        __builtin_memcpy(abspath, current_proc->cwd, cwdlen);
-        if (cwdlen > 1) abspath[cwdlen++] = '/';
-        __builtin_memcpy(abspath + cwdlen, path, __builtin_strlen(path) + 1);
-        n = vfs_open_nofollow(abspath);
-    }
-    if (!n) return -2;
+    int err;
+    vfs_node_t *n = vfs_lookup_at(path, 0, &err);
+    if (!n) return err;
     struct kstat kst;
     fill_kstat(&kst, n);
     /* For symlinks, st_mode should be S_IFLNK */
@@ -5140,18 +5181,9 @@ static int sys_lstat64_real(registers_t *regs) {
     if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0) return -14;
     struct kstat64 *st = (struct kstat64 *)(uintptr_t)regs->ecx;
     if (!access_ok(st, sizeof(*st))) return -14;
-    vfs_node_t *n;
-    char abspath[256];
-    if (path[0] == '/') {
-        n = vfs_open_nofollow(path);
-    } else {
-        uint32_t cwdlen = (uint32_t)__builtin_strlen(current_proc->cwd);
-        __builtin_memcpy(abspath, current_proc->cwd, cwdlen);
-        if (cwdlen > 1) abspath[cwdlen++] = '/';
-        __builtin_memcpy(abspath + cwdlen, path, __builtin_strlen(path) + 1);
-        n = vfs_open_nofollow(abspath);
-    }
-    if (!n) return -2;
+    int err;
+    vfs_node_t *n = vfs_lookup_at(path, 0, &err);
+    if (!n) return err;
     struct kstat64 kst;
     fill_kstat64(&kst, n);
     if (n->flags == VFS_FLAG_SYMLINK)
@@ -5196,18 +5228,9 @@ static int sys_readlink(registers_t *regs) {
     if (bufsiz <= 0 || !access_ok(ubuf, (uint32_t)bufsiz)) return -14;
 
     /* Resolve without following final symlink */
-    vfs_node_t *n;
-    if (path[0] == '/') {
-        n = vfs_open_nofollow(path);
-    } else {
-        char abspath[512];
-        uint32_t cwdlen = (uint32_t)__builtin_strlen(current_proc->cwd);
-        __builtin_memcpy(abspath, current_proc->cwd, cwdlen);
-        if (cwdlen > 1) abspath[cwdlen++] = '/';
-        __builtin_memcpy(abspath + cwdlen, path, __builtin_strlen(path) + 1);
-        n = vfs_open_nofollow(abspath);
-    }
-    if (!n) return -2;
+    int err;
+    vfs_node_t *n = vfs_lookup_at(path, 0, &err);
+    if (!n) return err;
     if (n->flags != VFS_FLAG_SYMLINK) return -22;   /* -EINVAL: not a symlink */
 
     /* Read target from the symlink node */
@@ -5226,8 +5249,10 @@ static int sys_truncate(registers_t *regs) {
     if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0)
         return -14;
     uint32_t len = (uint32_t)regs->ecx;
-    vfs_node_t *n = vfs_open_at(path);
-    if (!n) return -2;
+    if ((int32_t)len < 0 && regs->eax == 92) return -22;   /* -EINVAL */
+    int lerr;
+    vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
+    if (!n) return lerr;
     /* Linux do_sys_truncate(): a directory is -EISDIR, anything else that is
      * not a regular file -EINVAL, and the caller needs write permission on
      * the file itself. */
@@ -5248,6 +5273,9 @@ static int sys_ftruncate(registers_t *regs) {
     /* Linux do_sys_ftruncate(): -EINVAL unless the descriptor was opened for
      * writing (the permission was checked when it was opened). */
     if (!fd_writable(f)) return -22;
+    /* A negative length is -EINVAL (93 takes a signed 32-bit off_t; 194
+     * reaches here with the non-negative low word of a 64-bit one). */
+    if ((int32_t)regs->ecx < 0 && regs->eax == 93) return -22;
     return vfs_truncate(f->node, (uint32_t)regs->ecx);
 }
 
@@ -5258,11 +5286,13 @@ static int sys_ftruncate(registers_t *regs) {
  * as the __SYSCALL_LL_O register pair ECX:EDX).  Our files are below 4 GiB, so
  * a nonzero high word is -EFBIG, exactly what Linux reports past s_maxbytes. */
 static int sys_truncate64(registers_t *regs) {
+    if ((int32_t)regs->edx < 0) return -22;        /* -EINVAL: negative */
     if (regs->edx) return -27;                     /* -EFBIG */
     return sys_truncate(regs);                     /* ECX already holds the low word */
 }
 
 static int sys_ftruncate64(registers_t *regs) {
+    if ((int32_t)regs->edx < 0) return -22;        /* -EINVAL: negative */
     if (regs->edx) return -27;                     /* -EFBIG */
     return sys_ftruncate(regs);
 }
@@ -5838,7 +5868,7 @@ static int sys_pread64(registers_t *regs) {
     int      fd  = (int)regs->ebx;
     char    *buf = (char *)(uintptr_t)regs->ecx;
     int      len = (int)(uint32_t)regs->edx;
-    uint32_t off = regs->esi;  /* offset low 32 bits (high 32 bits in edi = 0) */
+    uint32_t off = regs->esi;  /* offset low 32 bits (high 32 bits in edi) */
 
     if (len < 0 || !access_ok(buf, (size_t)len)) return -14;
     if (fd < 0 || fd >= MAX_FD) return -9;
@@ -5846,6 +5876,8 @@ static int sys_pread64(registers_t *regs) {
     proc_file_t *f = &current_proc->ofile[fd];
     if (f->type != FD_FILE || !f->node) return -9;
     if (!fd_readable(f)) return -9;
+    if ((int32_t)regs->edi < 0) return -22;                /* -EINVAL */
+    if (regs->edi) return 0;                /* past the largest file: EOF */
 
     return vfs_read_user(f->node, off, buf, (uint32_t)len);
 }
@@ -5863,6 +5895,9 @@ static int sys_pwrite64(registers_t *regs) {
     proc_file_t *f = &current_proc->ofile[fd];
     if (f->type != FD_FILE || !f->node) return -9;
     if (!fd_writable(f) || !f->node->write_fn) return -9;
+    /* The offset is 64-bit (esi:edi); files here are at most 4 GiB. */
+    if ((int32_t)regs->edi < 0) return -22;                /* -EINVAL */
+    if (regs->edi) return len ? -27 : 0;                   /* -EFBIG */
 
     return vfs_write_user(f->node, off, buf, (uint32_t)len);
 }
@@ -6010,8 +6045,9 @@ static int sys_fstatat64(registers_t *regs) {
     }
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
-    vfs_node_t *n = vfs_open(resolved);
-    if (!n) return -2;
+    int lerr;
+    vfs_node_t *n = vfs_lookup(resolved, 1, &lerr);
+    if (!n) return lerr;
     fill_kstat64(&kst, n);
     return copy_to_user(st, &kst, sizeof(kst));
 }
@@ -6026,8 +6062,8 @@ static int sys_faccessat(registers_t *regs) {
     if (r < 0) return r;
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
-    int rc = vfs_open(resolved) ? 0 : -2;
-    return rc;
+    int lerr;
+    return vfs_lookup(resolved, 1, &lerr) ? 0 : lerr;
 }
 
 static int sys_readlinkat(registers_t *regs) {
@@ -6041,8 +6077,9 @@ static int sys_readlinkat(registers_t *regs) {
     if (r < 0) return r;
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
-    vfs_node_t *n = vfs_open_nofollow(resolved);
-    if (!n) return -2;
+    int lerr;
+    vfs_node_t *n = vfs_lookup(resolved, 0, &lerr);
+    if (!n) return lerr;
     if (n->flags != VFS_FLAG_SYMLINK) return -22;
     char target[512];
     uint32_t len = vfs_read(n, 0, sizeof(target), (uint8_t *)target);
@@ -6510,8 +6547,7 @@ static int sys_flock(registers_t *regs) {
 /* ── sys__llseek(fd, off_high, off_low, loff_t *result, whence) — EAX=140 ─ */
 static int sys_llseek(registers_t *regs) {
     int      fd       = (int)regs->ebx;
-    /* off_high in ecx, off_low in edx; we only support 32-bit offsets */
-    uint32_t off_low  = regs->edx;
+    int64_t  off      = (int64_t)(((uint64_t)regs->ecx << 32) | regs->edx);
     uint64_t *result  = (uint64_t *)(uintptr_t)regs->esi;
     int       whence  = (int)regs->edi;
 
@@ -6520,14 +6556,9 @@ static int sys_llseek(registers_t *regs) {
     if (f->type == FD_NONE) return -9;
     if (f->type == FD_PIPE_R || f->type == FD_PIPE_W) return -29;
 
-    uint32_t fsize = f->node ? f->node->size : 0;
     uint32_t new_off;
-    switch (whence) {
-    case 0: new_off = off_low; break;
-    case 1: new_off = f->offset + off_low; break;
-    case 2: new_off = fsize + off_low; break;
-    default: return -22;
-    }
+    int r = seek_target(f, off, whence, &new_off);
+    if (r < 0) return r;
     f->offset = new_off;
     if (result) {
         uint64_t kres = (uint64_t)new_off;
@@ -6760,7 +6791,13 @@ static int sys_getrandom(registers_t *regs) {
     uint32_t flags  = regs->edx;
     uint8_t tmp[64];
 
-    if (flags & ~7U) return -22;   /* allow GRND_NONBLOCK|GRND_RANDOM|GRND_INSECURE */
+    /* Linux: GRND_NONBLOCK(1)|GRND_RANDOM(2)|GRND_INSECURE(4), but INSECURE
+     * and RANDOM together are -EINVAL.  The pool is always initialised here,
+     * so none of them changes what is returned. */
+    if (flags & ~7U) return -22;
+    if ((flags & 6U) == 6U) return -22;
+    /* Linux caps one call at MAX_RW_COUNT, so the count fits the return. */
+    if (buflen > 0x7FFFF000U) buflen = 0x7FFFF000U;
     if (!access_ok(buf, buflen)) return -14;
 
     uint32_t done = 0;
@@ -6769,10 +6806,11 @@ static int sys_getrandom(registers_t *regs) {
         if (chunk > sizeof(tmp)) chunk = sizeof(tmp);
         random_get_bytes(tmp, chunk);
         int cr = copy_to_user(buf + done, tmp, chunk);
-        if (cr < 0) return cr;
+        __builtin_memset(tmp, 0, sizeof(tmp));
+        if (cr < 0) return done ? (int)done : cr;     /* partial: bytes so far */
         done += chunk;
     }
-    return (int)buflen;
+    return (int)done;
 }
 
 /* ── sys_rename(oldpath, newpath) — EAX=38 ────────────────────────────────

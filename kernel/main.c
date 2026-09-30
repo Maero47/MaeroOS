@@ -39,7 +39,13 @@
 #include "../net/lwip_glue.h"
 #include <stdint.h>
 
+void stack_chk_seed(void);   /* kernel/stack_chk.c */
+
 void kernel_main(u32 mb_magic, u32 mb_phys) {
+    /* First, before any protected frame is live that will return: see
+     * stack_chk_seed().  kernel_main itself never returns. */
+    stack_chk_seed();
+
     /* ── M2: Serial first ─────────────────────────────────────────────────── */
     serial_init();
     serial_puts("[BOOT] Serial up.\r\n");

@@ -126,6 +126,8 @@ struct proc {
     registers_t     *tf;          /* trapframe pointer (for user processes) */
     struct proc     *parent;      /* parent process */
     int              exit_status;
+    int              stop_sig;      /* signal that last stopped this process */
+    int              stop_reported; /* waitpid(WUNTRACED) already saw this stop */
     int              time_slice;
     int              last_syscall;            /* diagnostic: last syscall number */
     int              kprof_bucket;            /* kprof: bucket in effect when this
@@ -310,7 +312,7 @@ struct proc {
 extern struct proc ptable[];
 
 /* SMP: `current_proc` is PER-CPU — the process running on the calling CPU.  It
- * expands to that CPU's slot in cpus[] (keyed by Local APIC id), so reads and
+ * expands to that CPU's slot in cpus[] (indexed by logical CPU id), so reads and
  * assignments (`current_proc = p`, `current_proc->field`, `&current_proc->field`)
  * all act on the running CPU's process with no global to race.  Before the LAPIC
  * is up this_cpu_id() is 0, matching the old single-`current_proc` behaviour. */

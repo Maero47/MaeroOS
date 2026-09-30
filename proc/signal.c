@@ -6,6 +6,7 @@
 
 #include "../kernel/printk.h"
 #include <registers.h>
+#include <kernel/config.h>
 #include <stdint.h>
 
 /*
@@ -324,9 +325,14 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
             restore_saved_sigmask();
             return;  /* default: ignore */
         case 2:
-            /* Wake parent so waitpid(WUNTRACED) returns */
+            /* Record the stop for waitpid(WUNTRACED) — reported once per
+             * stop — and wake the parent where waitpid sleeps: on its group
+             * leader (the kernel is BKL-serialised, so the parent cannot look
+             * before proc_stop_self below has marked us stopped). */
+            current_proc->stop_sig      = sig;
+            current_proc->stop_reported = 0;
             if (current_proc->parent)
-                wake_up(current_proc->parent);
+                wake_up(proc_group_leader(current_proc->parent));
             /* Stop and yield — won't return until SIGCONT makes us RUNNABLE.
              * The interrupted syscall is then restarted (no handler ran). */
             proc_stop_self();
@@ -598,7 +604,7 @@ fatal:
      * place — to a SIGSEGV handler on a usable (alternate) stack if there is
      * one, else by the default action.  The recursion is bounded: each round
      * consumes one pending signal, and a failing SIGSEGV frame kills. */
-    printk("[SIG] pid=%d: cannot build frame for signal %d at esp=%08x\n",
+    ktrace("[SIG] pid=%d: cannot build frame for signal %d at esp=%08x\n",
            current_proc->pid, sig, (unsigned)regs->useresp);
     if (sig == SIGSEGV)
         proc_group_exit(SIGSEGV);

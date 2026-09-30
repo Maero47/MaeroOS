@@ -67,6 +67,9 @@ def main():
             ("toybox uname\n", "Linux"),
             ("toybox whoami\n", "root"),
             ("toybox id\n", "uid=0"),
+            # Syscall-layer regressions: long relative paths, symlink loops,
+            # offsets, getdents layouts, waitpid(WUNTRACED).
+            ("sysmiscprobe\n", "sysmiscprobe ok"),
         ]
         for command, expected in checks:
             before = len("".join(log))
@@ -76,6 +79,8 @@ def main():
             body = recent.split("\n", 1)[1] if "\n" in recent else recent
             if "error" in body.lower():
                 raise AssertionError(f"command {command.strip()!r} reported an error")
+            if "FAIL:" in body:
+                raise AssertionError(f"command {command.strip()!r} reported a failure")
             if expected not in body:
                 raise AssertionError(
                     f"command {command.strip()!r} did not produce {expected!r}"

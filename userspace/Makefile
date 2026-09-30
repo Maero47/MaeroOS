@@ -45,7 +45,7 @@ all: $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
 	     $(TESTFILES)/sysprobe $(TESTFILES)/fcprobe $(TESTFILES)/lspci $(TESTFILES)/ifconfig \
 	     $(TESTFILES)/diskprobe $(TESTFILES)/fsprobe $(TESTFILES)/respawnprobe \
 	     $(TESTFILES)/sockprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget \
-	     $(TESTFILES)/randprobe \
+	     $(TESTFILES)/randprobe $(TESTFILES)/sysmiscprobe \
 	     $(TESTFILES)/fbtest $(TESTFILES)/evtest $(TESTFILES)/mousetest \
 	     $(TESTFILES)/polltest $(TESTFILES)/ptytest $(TESTFILES)/cttytest \
 	     $(TESTFILES)/desktop $(TESTFILES)/wmctl $(TESTFILES)/gui_demo \
@@ -469,6 +469,13 @@ randprobe/randprobe.o: randprobe/randprobe.c
 $(TESTFILES)/randprobe: $(CRT0_OBJ) randprobe/randprobe.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) randprobe/randprobe.o libc/libc.a
 
+# sysmiscprobe
+sysmiscprobe/sysmiscprobe.o: sysmiscprobe/sysmiscprobe.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TESTFILES)/sysmiscprobe: $(CRT0_OBJ) sysmiscprobe/sysmiscprobe.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) sysmiscprobe/sysmiscprobe.o libc/libc.a
+
 # fbtest
 fbtest/fbtest.o: fbtest/fbtest.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -695,7 +702,7 @@ clean:
 	      mkfifo_cmd/mkfifo.o ln_cmd/ln.o readlink_cmd/readlink.o \
 	      sysprobe/sysprobe.o lspci/lspci.o ifconfig/ifconfig.o \
 	      diskprobe/diskprobe.o fsprobe/fsprobe.o respawnprobe/respawnprobe.o \
-	      sockprobe/sockprobe.o netprobe/netprobe.o httpget/httpget.o randprobe/randprobe.o kwprobe/kwprobe.o \
+	      sockprobe/sockprobe.o netprobe/netprobe.o httpget/httpget.o randprobe/randprobe.o sysmiscprobe/sysmiscprobe.o kwprobe/kwprobe.o \
 	      fbtest/fbtest.o evtest/evtest.o mousetest/mousetest.o \
 	      polltest/polltest.o ptytest/ptytest.o cttytest/cttytest.o \
 	      desktop/desktop.o wmctl/wmctl.o gui_demo/gui_demo.o wmevtest/wmevtest.o uidemo/uidemo.o files/files.o \
@@ -717,7 +724,7 @@ clean:
 	      $(TESTFILES)/mkfifo $(TESTFILES)/ln $(TESTFILES)/readlink \
 	      $(TESTFILES)/sysprobe $(TESTFILES)/lspci $(TESTFILES)/ifconfig \
 	      $(TESTFILES)/diskprobe $(TESTFILES)/fsprobe $(TESTFILES)/respawnprobe \
-	      $(TESTFILES)/sockprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget $(TESTFILES)/randprobe $(TESTFILES)/kwprobe \
+	      $(TESTFILES)/sockprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget $(TESTFILES)/randprobe $(TESTFILES)/sysmiscprobe $(TESTFILES)/kwprobe \
 	      $(TESTFILES)/fbtest $(TESTFILES)/evtest $(TESTFILES)/mousetest \
 	      $(TESTFILES)/polltest $(TESTFILES)/ptytest $(TESTFILES)/cttytest \
 	      $(TESTFILES)/desktop $(TESTFILES)/wmctl $(TESTFILES)/gui_demo \

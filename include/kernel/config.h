@@ -1,5 +1,15 @@
 #pragma once
 
+/* Hot-path debug tracing: per-exec/per-signal/per-fault printks (ktrace()) and
+ * kprof's probe spans and periodic dump.  Off by default so normal runs are
+ * neither slowed nor spammed; `make KTRACE=1` builds them in.  Boot-time and
+ * one-shot messages stay plain printk. */
+#ifndef KTRACE
+#define KTRACE 0
+#endif
+/* printk() only in a KTRACE build; the arguments are still type-checked. */
+#define ktrace(...) do { if (KTRACE) printk(__VA_ARGS__); } while (0)
+
 #define KERNEL_VMA      0xC0000000UL
 #define KERNEL_PHYS     0x00100000UL
 #define KSTACKSIZE      32768

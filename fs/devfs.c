@@ -66,8 +66,8 @@ static uint32_t zero_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *bu
 #define TCSETSW         0x5403
 #define TCSETSF         0x5404
 #define TIOCGWINSZ      0x5413
-#define TIOCGPGRP       0x5414
-#define TIOCSPGRP       0x5415
+#define TIOCGPGRP       0x540F   /* Linux asm-generic/ioctls.h numbers */
+#define TIOCSPGRP       0x5410
 #define TIOCSCTTY       0x540E
 #define VINTR_IDX       0
 #define VERASE_IDX      2

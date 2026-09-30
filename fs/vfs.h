@@ -124,8 +124,12 @@ uint32_t vfs_read(vfs_node_t *node, uint32_t offset, uint32_t size,
  */
 #define VFS_WRITE_ENOMEM  0xFFFFFFFFU
 
+/* Likewise, VFS_WRITE_EFBIG says "`offset` is at or past the largest file this
+ * filesystem can hold" (write(2) gets -EFBIG, as at Linux's s_maxbytes). */
+#define VFS_WRITE_EFBIG   0xFFFFFFFEU
+
 /* Write up to `size` bytes at `offset` to a file node; returns bytes written,
- * or VFS_WRITE_ENOMEM. */
+ * VFS_WRITE_ENOMEM or VFS_WRITE_EFBIG. */
 uint32_t vfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
                    const uint8_t *buf);
 

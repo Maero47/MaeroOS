@@ -10,6 +10,7 @@ disk-ff.img
 isodir/
 repo/
 .qemu-iso.pid
+.ktrace-stamp
 
 # ── OS / editor noise ──────────────────────────────────────────────────────
 .DS_Store
@@ -109,6 +110,7 @@ testfiles/awk
 /testfiles/ptytest
 /testfiles/raceprobe
 /testfiles/randprobe
+/testfiles/sysmiscprobe
 /testfiles/kwprobe
 /testfiles/readlink
 /testfiles/reboot

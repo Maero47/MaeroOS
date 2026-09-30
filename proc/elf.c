@@ -240,10 +240,14 @@ int elf_load_bias(vfs_node_t *node, uint32_t pgdir_phys, uint32_t want_bias,
     info->entry    = bias + ehdr->e_entry;
     info->heap_end = heap_end;
 
-    printk("[ELF]  Loaded '%s': type=%s bias=0x%08x entry=0x%08x top=0x%08x%s\n",
-           node->name, ehdr->e_type == ET_DYN ? "DYN" : "EXEC",
-           (unsigned)bias, (unsigned)info->entry, (unsigned)heap_end,
-           info->has_interp ? " (needs ld.so)" : "");
+    /* Static executables are the bulk of loads and only traced with KTRACE=1;
+     * dynamic ones (and ld.so itself) stay visible: tools/smoke_dyn.py checks
+     * for the "needs ld.so" and ld-musl lines. */
+    if (KTRACE || info->has_interp || ehdr->e_type == ET_DYN)
+        printk("[ELF]  Loaded '%s': type=%s bias=0x%08x entry=0x%08x top=0x%08x%s\n",
+               node->name, ehdr->e_type == ET_DYN ? "DYN" : "EXEC",
+               (unsigned)bias, (unsigned)info->entry, (unsigned)heap_end,
+               info->has_interp ? " (needs ld.so)" : "");
     if (owned_hdr) kfree(owned_hdr);
     if (bounce) kfree(bounce);
     return 0;

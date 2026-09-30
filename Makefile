@@ -15,6 +15,16 @@ CFLAGS  := -std=gnu99 -ffreestanding -nostdlib -fno-builtin \
            -I./net/lwip_port \
            -I./third_party/lwip/src/include
 
+# Hot-path debug tracing (per-exec/per-signal printks, kprof probe spans and
+# periodic dump): `make KTRACE=1`.  Off by default.  The stamp file records the
+# last setting so flipping it rebuilds the kernel objects.
+KTRACE ?= 0
+ifeq ($(KTRACE),1)
+CFLAGS  += -DKTRACE=1
+endif
+KTRACE_STAMP := .ktrace-stamp
+$(shell [ "$$(cat $(KTRACE_STAMP) 2>/dev/null)" = "$(KTRACE)" ] || echo "$(KTRACE)" > $(KTRACE_STAMP))
+
 ASFLAGS := -f elf32 -g
 
 LDFLAGS := -ffreestanding -nostdlib -lgcc \
@@ -104,6 +114,8 @@ all: $(TARGET)
 
 $(TARGET): $(ALL_OBJS)
 	$(LD) $(LDFLAGS) -o $@ $^
+
+$(C_OBJS): $(KTRACE_STAMP)
 
 # C compilation with automatic dependency generation
 %.o: %.c
@@ -444,7 +456,7 @@ iso: $(TARGET) initrd
 clean:
 	find kernel arch/i686 mm fs drivers proc lib net third_party/lwip/src \
 		\( -name "*.o" -o -name "*.d" \) -delete 2>/dev/null || true
-	rm -f $(TARGET) maeros.iso initrd.tar disk.img disk-ff.img $(QEMU_ISO_PID)
+	rm -f $(TARGET) maeros.iso initrd.tar disk.img disk-ff.img $(QEMU_ISO_PID) $(KTRACE_STAMP)
 	rm -rf isodir
 	$(MAKE) -C userspace clean
 
