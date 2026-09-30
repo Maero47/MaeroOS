@@ -160,11 +160,10 @@ static uint32_t tmpfs_write(vfs_node_t *node, uint32_t off, uint32_t len,
                               const uint8_t *buf) {
     tmpfs_node_t *tn = (tmpfs_node_t *)node;
 
-    /* Past the size cap nothing can be written.  vfs_write() has no way to say
-     * EFBIG, and 0 would spin a libc write loop, so this reports "no memory"
-     * (write(2) gets -ENOMEM).  A write that straddles the cap is shortened,
+    /* Past the size cap nothing can be written (write(2) gets -EFBIG; 0 would
+     * spin a libc write loop).  A write that straddles the cap is shortened,
      * as Linux does at s_maxbytes. */
-    if (off >= TMPFS_MAX_FILE) return VFS_WRITE_ENOMEM;
+    if (off >= TMPFS_MAX_FILE) return VFS_WRITE_EFBIG;
     if (len > TMPFS_MAX_FILE - off) len = TMPFS_MAX_FILE - off;
     uint32_t end = off + len;
 

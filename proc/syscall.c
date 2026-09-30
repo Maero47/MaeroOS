@@ -213,6 +213,10 @@ static int vfs_read_user(vfs_node_t *n, uint32_t off, char *ubuf, uint32_t len) 
  * short write.  Returns bytes written, or a negative errno if none were. */
 static int vfs_write_user(vfs_node_t *n, uint32_t off, const char *ubuf, uint32_t len) {
     if (len == 0) return 0;
+    /* File offsets are 32-bit: nothing can be written at or past 4 GiB, and a
+     * write straddling it is shortened rather than wrapping to offset 0. */
+    if (off == 0xFFFFFFFFU) return -27;                    /* -EFBIG */
+    if (len > 0xFFFFFFFFU - off) len = 0xFFFFFFFFU - off;
     uint32_t bsz;
     uint8_t *kbuf = bounce_alloc(len, &bsz);
     if (!kbuf) return -12;
@@ -226,6 +230,7 @@ static int vfs_write_user(vfs_node_t *n, uint32_t off, const char *ubuf, uint32_
          * from shmem_alloc_and_acct_folio for exactly this; returning 0 would
          * spin any libc write loop. */
         if (w == VFS_WRITE_ENOMEM) { err = -12; break; }
+        if (w == VFS_WRITE_EFBIG)  { err = -27; break; }
         if ((int32_t)w < 0)        { err = (int32_t)w; break; }
         if (w > want) w = want;
         done += w;
@@ -2437,6 +2442,23 @@ static int sys_chdir(registers_t *regs) {
 }
 
 /* ── sys_lseek(fd, offset, whence) — EAX=19 ─────────────────────────────── */
+/* The offset lseek/_llseek would move `f` to, computed in 64 bits: Linux
+ * vfs_setpos() refuses a negative result or one past the largest file (here
+ * 4 GiB - 1) with -EINVAL, leaving the position unchanged. */
+static int seek_target(proc_file_t *f, int64_t off, int whence, uint32_t *out) {
+    int64_t base;
+    switch (whence) {
+    case 0: base = 0; break;                                   /* SEEK_SET */
+    case 1: base = (int64_t)f->offset; break;                  /* SEEK_CUR */
+    case 2: base = f->node ? (int64_t)f->node->size : 0; break; /* SEEK_END */
+    default: return -22;
+    }
+    int64_t pos = base + off;
+    if (pos < 0 || pos > 0xFFFFFFFFLL) return -22;             /* -EINVAL */
+    *out = (uint32_t)pos;
+    return 0;
+}
+
 static int sys_lseek(registers_t *regs) {
     int fd     = (int)regs->ebx;
     int off    = (int)regs->ecx;   /* signed */
@@ -2448,13 +2470,10 @@ static int sys_lseek(registers_t *regs) {
     if (f->type == FD_PIPE_R || f->type == FD_PIPE_W) return -29;  /* ESPIPE */
 
     uint32_t new_off;
-    uint32_t fsize = f->node ? f->node->size : 0;
-    switch (whence) {
-    case 0: new_off = (uint32_t)off; break;
-    case 1: new_off = f->offset + (uint32_t)off; break;
-    case 2: new_off = fsize + (uint32_t)off; break;
-    default: return -22;
-    }
+    int r = seek_target(f, off, whence, &new_off);
+    if (r < 0) return r;
+    /* A 32-bit off_t cannot carry the result (Linux: -EOVERFLOW). */
+    if (new_off > 0x7FFFFFFFU) return -75;
     f->offset = new_off;
     return (int)new_off;
 }
@@ -3928,8 +3947,11 @@ static uint32_t shmem_read(vfs_node_t *node, uint32_t off, uint32_t len,
 
 static uint32_t shmem_write(vfs_node_t *node, uint32_t off, uint32_t len,
                             const uint8_t *buf) {
+    /* off + len must not wrap past 4 GiB onto page 0. */
+    if (off == 0xFFFFFFFFU) return VFS_WRITE_EFBIG;
+    if (len > 0xFFFFFFFFU - off) len = 0xFFFFFFFFU - off;
     struct shmap_entry *e = shmap_get(node);
-    if (!e) return 0;
+    if (!e) return VFS_WRITE_ENOMEM;
     uint32_t done = 0;
     while (done < len) {
         uint32_t pos = off + done;
@@ -3941,6 +3963,7 @@ static uint32_t shmem_write(vfs_node_t *node, uint32_t off, uint32_t len,
         shmem_bounce(phys, in, (uint8_t *)(uintptr_t)(buf + done), n, 1);
         done += n;
     }
+    if (done == 0 && len) return VFS_WRITE_ENOMEM;  /* 0 would spin write loops */
     if (off + done > node->size) node->size = off + done;
     return done;
 }
@@ -5217,6 +5240,7 @@ static int sys_truncate(registers_t *regs) {
     if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0)
         return -14;
     uint32_t len = (uint32_t)regs->ecx;
+    if ((int32_t)len < 0 && regs->eax == 92) return -22;   /* -EINVAL */
     int lerr;
     vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
     if (!n) return lerr;
@@ -5240,6 +5264,9 @@ static int sys_ftruncate(registers_t *regs) {
     /* Linux do_sys_ftruncate(): -EINVAL unless the descriptor was opened for
      * writing (the permission was checked when it was opened). */
     if (!fd_writable(f)) return -22;
+    /* A negative length is -EINVAL (93 takes a signed 32-bit off_t; 194
+     * reaches here with the non-negative low word of a 64-bit one). */
+    if ((int32_t)regs->ecx < 0 && regs->eax == 93) return -22;
     return vfs_truncate(f->node, (uint32_t)regs->ecx);
 }
 
@@ -5250,11 +5277,13 @@ static int sys_ftruncate(registers_t *regs) {
  * as the __SYSCALL_LL_O register pair ECX:EDX).  Our files are below 4 GiB, so
  * a nonzero high word is -EFBIG, exactly what Linux reports past s_maxbytes. */
 static int sys_truncate64(registers_t *regs) {
+    if ((int32_t)regs->edx < 0) return -22;        /* -EINVAL: negative */
     if (regs->edx) return -27;                     /* -EFBIG */
     return sys_truncate(regs);                     /* ECX already holds the low word */
 }
 
 static int sys_ftruncate64(registers_t *regs) {
+    if ((int32_t)regs->edx < 0) return -22;        /* -EINVAL: negative */
     if (regs->edx) return -27;                     /* -EFBIG */
     return sys_ftruncate(regs);
 }
@@ -5830,7 +5859,7 @@ static int sys_pread64(registers_t *regs) {
     int      fd  = (int)regs->ebx;
     char    *buf = (char *)(uintptr_t)regs->ecx;
     int      len = (int)(uint32_t)regs->edx;
-    uint32_t off = regs->esi;  /* offset low 32 bits (high 32 bits in edi = 0) */
+    uint32_t off = regs->esi;  /* offset low 32 bits (high 32 bits in edi) */
 
     if (len < 0 || !access_ok(buf, (size_t)len)) return -14;
     if (fd < 0 || fd >= MAX_FD) return -9;
@@ -5838,6 +5867,8 @@ static int sys_pread64(registers_t *regs) {
     proc_file_t *f = &current_proc->ofile[fd];
     if (f->type != FD_FILE || !f->node) return -9;
     if (!fd_readable(f)) return -9;
+    if ((int32_t)regs->edi < 0) return -22;                /* -EINVAL */
+    if (regs->edi) return 0;                /* past the largest file: EOF */
 
     return vfs_read_user(f->node, off, buf, (uint32_t)len);
 }
@@ -5855,6 +5886,9 @@ static int sys_pwrite64(registers_t *regs) {
     proc_file_t *f = &current_proc->ofile[fd];
     if (f->type != FD_FILE || !f->node) return -9;
     if (!fd_writable(f) || !f->node->write_fn) return -9;
+    /* The offset is 64-bit (esi:edi); files here are at most 4 GiB. */
+    if ((int32_t)regs->edi < 0) return -22;                /* -EINVAL */
+    if (regs->edi) return len ? -27 : 0;                   /* -EFBIG */
 
     return vfs_write_user(f->node, off, buf, (uint32_t)len);
 }
@@ -6504,8 +6538,7 @@ static int sys_flock(registers_t *regs) {
 /* ── sys__llseek(fd, off_high, off_low, loff_t *result, whence) — EAX=140 ─ */
 static int sys_llseek(registers_t *regs) {
     int      fd       = (int)regs->ebx;
-    /* off_high in ecx, off_low in edx; we only support 32-bit offsets */
-    uint32_t off_low  = regs->edx;
+    int64_t  off      = (int64_t)(((uint64_t)regs->ecx << 32) | regs->edx);
     uint64_t *result  = (uint64_t *)(uintptr_t)regs->esi;
     int       whence  = (int)regs->edi;
 
@@ -6514,14 +6547,9 @@ static int sys_llseek(registers_t *regs) {
     if (f->type == FD_NONE) return -9;
     if (f->type == FD_PIPE_R || f->type == FD_PIPE_W) return -29;
 
-    uint32_t fsize = f->node ? f->node->size : 0;
     uint32_t new_off;
-    switch (whence) {
-    case 0: new_off = off_low; break;
-    case 1: new_off = f->offset + off_low; break;
-    case 2: new_off = fsize + off_low; break;
-    default: return -22;
-    }
+    int r = seek_target(f, off, whence, &new_off);
+    if (r < 0) return r;
     f->offset = new_off;
     if (result) {
         uint64_t kres = (uint64_t)new_off;
