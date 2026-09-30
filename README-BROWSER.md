@@ -191,7 +191,7 @@ took ~4 years to first-paint a modern web engine — with a team.
 - **X layer**: Xvfb-style in-process server speaking our shm surfaces;
   then GTK2-era apps (Dillo!, gFTP, Leafpad) run.
 
-## How to test: does Firefox paint yet?
+## How to test: does Firefox paint, and load a page?
 
 `make smoke-firefox` is the one number that matters for the summit. It
 boots the GRUB ISO (the only boot path with a framebuffer) plus
@@ -242,6 +242,28 @@ Every run writes `build/ff-smoke/<timestamp>-<accel>-smpN/` (gitignored):
   `[SIG] pid=N killed by signal S` line, the last 40 kernel trace lines and
   the `moz.log` tail that `ff` dumps on a stall.
 - `qemu-cmdline.txt` — the exact QEMU command.
+
+### Loading a page
+
+`make smoke-firefox-web` (`--web`) goes one step further. The guest gets an
+rtl8139 on QEMU user networking, and after the paint the harness serves a
+page from a thread (HTML, a CSS rule, a 96x96 pure-red PNG), types `http://10.0.2.2:PORT/` into the address bar
+through QEMU `sendkey`, and PASSes only when the image is requested **and**
+its red block shows up in a screendump. `summary.txt` gets `web` lines with
+every request and the time from Enter to it, and `screen-web.png` is the
+frame the block was found in. On the current tree a load takes 1-3 s.
+
+`--net` alone attaches the NIC, so any address can be tried by hand, the
+real network included (QEMU's slirp routes it):
+
+```sh
+python3 tools/smoke_firefox.py --net --type $'https://example.com/\n' --type-settle 60
+```
+
+`/disk/ffcfg/ffmozlogfile` (one line, e.g. `/disk/ffout/moz.log`) moves
+Firefox's MOZ_LOG onto the ext2 disk, where it survives the run; read it
+back from the image with `debugfs -R "dump ffout/moz.log.moz_log out.log"`.
+`/disk/ffcfg/ffmozlog` still picks the modules.
 
 `make run-firefox` boots the same ISO + disk with a window (and KVM when
 available) for watching by hand. `make disk-ff` fetches the Firefox runtime
