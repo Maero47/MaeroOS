@@ -1272,11 +1272,13 @@ static int sys_open_kernel_path(const char *path, int flags) {
             vfs_open_nofollow(abspath))
             return -17;   /* -EEXIST */
     }
-    vfs_node_t *node = vfs_open_at(path);
+    int lerr;
+    vfs_node_t *node = vfs_lookup_at(path, 1, &lerr);
     if (!node) {
-        /* O_CREAT: create the file if missing */
-        if (!(flags & O_CREAT))
-            return -2;   /* -ENOENT */
+        /* O_CREAT: create the file if missing — only when it is missing,
+         * not when the lookup hit a symlink loop or an over-long path. */
+        if (!(flags & O_CREAT) || lerr != -2)
+            return lerr;
 
         char dir_path[256], base[256];
         if (path_split(path, dir_path, base) < 0)
@@ -2423,8 +2425,9 @@ static int sys_chdir(registers_t *regs) {
     char path[256];
     if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0)
         return -14;
-    vfs_node_t *n = vfs_open_at(path);
-    if (!n) return -2;
+    int lerr;
+    vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
+    if (!n) return lerr;
     if (!(n->flags & VFS_FLAG_DIR)) return -20;  /* ENOTDIR */
     char canonical[256];
     int cr = canonicalize_path_at_cwd(path, canonical, sizeof(canonical));
@@ -3098,8 +3101,9 @@ static int sys_stat(registers_t *regs) {
     struct kstat *st = (struct kstat *)(uintptr_t)regs->ecx;
     if (!access_ok(st, sizeof(*st))) return -14;
 
-    vfs_node_t *n = vfs_open_at(path);
-    if (!n) return -2;
+    int lerr;
+    vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
+    if (!n) return lerr;
     struct kstat kst;
     fill_kstat(&kst, n);
     return copy_to_user(st, &kst, sizeof(kst));
@@ -4710,8 +4714,9 @@ static int sys_stat64(registers_t *regs) {
     struct kstat64 *st = (struct kstat64 *)(uintptr_t)regs->ecx;
     if (!access_ok(st, sizeof(*st))) return -14;
 
-    vfs_node_t *n = vfs_open_at(path);
-    if (!n) return -2;
+    int lerr;
+    vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
+    if (!n) return lerr;
     struct kstat64 kst;
     fill_kstat64(&kst, n);
     return copy_to_user(st, &kst, sizeof(kst));
@@ -4839,8 +4844,9 @@ static int sys_statx(registers_t *regs) {
         int r = fd_kstat64(dirfd, &kst);
         if (r < 0) return r;
     } else {
-        vfs_node_t *n = vfs_open_at(path);
-        if (!n) return -2;
+        int lerr;
+        vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
+        if (!n) return lerr;
         fill_kstat64(&kst, n);
     }
 
@@ -4964,9 +4970,9 @@ static int sys_access(registers_t *regs) {
     if (mode & ~7) return -22;
     if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0)
         return -14;
-    vfs_node_t *n = vfs_open_at(path);
-    int rc = n ? 0 : -2;  /* 0=exists, -ENOENT=not found */
-    return rc;
+    int lerr;
+    vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
+    return n ? 0 : lerr;  /* 0=exists, else -ENOENT/-ELOOP/-ENAMETOOLONG */
 }
 
 /* ── sys_dup(int oldfd) — EAX=41 ────────────────────────────────────────── */
@@ -5211,8 +5217,9 @@ static int sys_truncate(registers_t *regs) {
     if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0)
         return -14;
     uint32_t len = (uint32_t)regs->ecx;
-    vfs_node_t *n = vfs_open_at(path);
-    if (!n) return -2;
+    int lerr;
+    vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
+    if (!n) return lerr;
     /* Linux do_sys_truncate(): a directory is -EISDIR, anything else that is
      * not a regular file -EINVAL, and the caller needs write permission on
      * the file itself. */
@@ -5995,8 +6002,9 @@ static int sys_fstatat64(registers_t *regs) {
     }
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
-    vfs_node_t *n = vfs_open(resolved);
-    if (!n) return -2;
+    int lerr;
+    vfs_node_t *n = vfs_lookup(resolved, 1, &lerr);
+    if (!n) return lerr;
     fill_kstat64(&kst, n);
     return copy_to_user(st, &kst, sizeof(kst));
 }
@@ -6011,8 +6019,8 @@ static int sys_faccessat(registers_t *regs) {
     if (r < 0) return r;
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
-    int rc = vfs_open(resolved) ? 0 : -2;
-    return rc;
+    int lerr;
+    return vfs_lookup(resolved, 1, &lerr) ? 0 : lerr;
 }
 
 static int sys_readlinkat(registers_t *regs) {
@@ -6026,8 +6034,9 @@ static int sys_readlinkat(registers_t *regs) {
     if (r < 0) return r;
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
-    vfs_node_t *n = vfs_open_nofollow(resolved);
-    if (!n) return -2;
+    int lerr;
+    vfs_node_t *n = vfs_lookup(resolved, 0, &lerr);
+    if (!n) return lerr;
     if (n->flags != VFS_FLAG_SYMLINK) return -22;
     char target[512];
     uint32_t len = vfs_read(n, 0, sizeof(target), (uint8_t *)target);
