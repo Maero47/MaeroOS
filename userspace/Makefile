@@ -382,11 +382,11 @@ $(TESTFILES)/respawnprobe: $(CRT0_OBJ) respawnprobe/respawnprobe.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) respawnprobe/respawnprobe.o libc/libc.a
 
 # svc
-svc/svc.o: svc/svc.c
+svc/svc.o: svc/svc.c auth/replace.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(TESTFILES)/svc: $(CRT0_OBJ) svc/svc.o libc/libc.a
-	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) svc/svc.o libc/libc.a
+$(TESTFILES)/svc: $(CRT0_OBJ) svc/svc.o auth/replace.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) svc/svc.o auth/replace.o libc/libc.a
 
 # session
 session/session.o: session/session.c
@@ -398,6 +398,10 @@ $(TESTFILES)/session: $(CRT0_OBJ) session/session.o libc/libc.a
 # auth helper
 auth/auth.o: auth/auth.c auth/auth.h
 	$(CC) $(CFLAGS) -c auth/auth.c -o $@
+
+# safe replacement of root-owned config files (passwd, svc)
+auth/replace.o: auth/replace.c auth/replace.h
+	$(CC) $(CFLAGS) -c auth/replace.c -o $@
 
 # getty
 getty/getty.o: getty/getty.c
@@ -414,11 +418,11 @@ $(TESTFILES)/login: $(CRT0_OBJ) login/login.o auth/auth.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) login/login.o auth/auth.o libc/libc.a
 
 # passwd
-passwd/passwd.o: passwd/passwd.c auth/auth.h
+passwd/passwd.o: passwd/passwd.c auth/auth.h auth/replace.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(TESTFILES)/passwd: $(CRT0_OBJ) passwd/passwd.o auth/auth.o libc/libc.a
-	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) passwd/passwd.o auth/auth.o libc/libc.a
+$(TESTFILES)/passwd: $(CRT0_OBJ) passwd/passwd.o auth/auth.o auth/replace.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) passwd/passwd.o auth/auth.o auth/replace.o libc/libc.a
 
 # doas (set-uid root privilege tool)
 doas/doas.o: doas/doas.c auth/auth.h
@@ -704,7 +708,7 @@ clean:
 	      env/env.o tee/tee.o tr/tr.o false_cmd/false.o true_cmd/true.o \
 	      basename_cmd/basename.o dirname_cmd/dirname.o \
 	      sed/sed.o awk/awk.o find_cmd/find.o date_cmd/date.o id_cmd/id.o \
-	      ps/ps.o svc/svc.o session/session.o auth/auth.o login/login.o passwd/passwd.o getty/getty.o xargs_cmd/xargs.o diff/diff.o tar_cmd/tar.o \
+	      ps/ps.o svc/svc.o session/session.o auth/auth.o auth/replace.o login/login.o passwd/passwd.o getty/getty.o xargs_cmd/xargs.o diff/diff.o tar_cmd/tar.o \
 	      mkfifo_cmd/mkfifo.o ln_cmd/ln.o readlink_cmd/readlink.o \
 	      sysprobe/sysprobe.o lspci/lspci.o ifconfig/ifconfig.o \
 	      diskprobe/diskprobe.o fsprobe/fsprobe.o respawnprobe/respawnprobe.o \

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import re
 import selectors
 import subprocess
 import sys
@@ -120,7 +121,9 @@ def main():
             ("env\n", "SHELL=/disk/shell"),
             ("cat /etc/passwd\n", "root:x:0:0:root:/home/root:/shell"),
             ("cat /etc/shadow\n", "root:$maero-pbkdf2-sha256$100000$626f6f74303030303030303030303030$8597f18637a4f16874d11a49d32b710d48a6764b6f341819f7eec4dd655b5e2b:0:0:99999:7:::"),
-            ("login\n", "login: password required"),
+            # Bare `login` prompts on the tty (echo off) instead of wanting
+            # the password in argv; an empty answer is rejected.
+            ("login\n", "login: authentication failed", None, ("Password: ", "\n")),
             ("login --check root root\n", "login: root password ok"),
             ("login --check root wrong\n", "login: authentication failed"),
             ("login --check missing root\n", "login: unknown user missing"),
@@ -135,6 +138,53 @@ def main():
             ("login --check root root\n", "login: root password ok"),
             ("cat /etc/shadow\n", "root:$maero-pbkdf2-sha256$100000$"),
             ("cat /etc/shadow\n", ":0:0:99999:7:::"),
+            # passwd must leave shadow root:root 0600 (it used to become 0644).
+            ("busybox ls -ln /etc/shadow\n", re.compile(r"-rw------- +1 +0 +0 ")),
+            ("busybox ls -ln /etc/shadow.tmp\n", "No such file", "-rw"),
+            # The previous shadow is kept as a root-only backup.
+            ("busybox ls -ln /etc/shadow-\n", re.compile(r"-rw------- +1 +0 +0 ")),
+            # A caller's lax umask must not loosen what passwd creates.
+            ("busybox sh -c 'umask 0; /disk/passwd root root umask0'\n", "passwd: password updated for root"),
+            ("busybox ls -ln /etc/shadow\n", re.compile(r"-rw------- +1 +0 +0 ")),
+            ("busybox ls -ln /etc/shadow-\n", re.compile(r"-rw------- +1 +0 +0 ")),
+            ("busybox sh -c 'umask 0; /disk/passwd root umask0 root'\n", "passwd: password updated for root"),
+            ("busybox ls -ln /etc/shadow\n", re.compile(r"-rw------- +1 +0 +0 ")),
+            ("login --check root root\n", "login: root password ok"),
+            # The shipped default user password is hashed, and the documented
+            # login (user/user) still works.
+            ("cat /etc/shadow\n", "user:$maero-pbkdf2-sha256$100000$"),
+            ("cat /etc/shadow\n", "MaeroOS$ ", "user:user:"),
+            ("login --check user user\n", "login: user password ok"),
+            # Locked ("!") and empty-hash accounts, one with an empty GECOS
+            # field: neither the lock marker nor the next shadow field is
+            # accepted as a plaintext password.
+            ("printf 'locked:x:1001:100::/home/user:/disk/shell\\nempty:x:1002:100::/home/user:/disk/shell\\n' >> /etc/passwd\n", "MaeroOS$ "),
+            ("printf 'locked:!:0:0:99999:7:::\\nempty::0:0:99999:7:::\\n' >> /etc/shadow\n", "MaeroOS$ "),
+            ("login --check locked !\n", "login: authentication failed"),
+            ("login --check locked x\n", "login: authentication failed"),
+            ("login locked !\n", "login: authentication failed", "accepted"),
+            ("login --check empty 0\n", "login: authentication failed"),
+            # login drops to the target user before starting the shell.
+            ("login user user\n", "login: user accepted"),
+            ("id\n", "uid=1000 gid=100"),
+            ("pwd\n", "/home/user"),
+            ("cat /etc/shadow\n", "cat: cannot open file", "$maero"),
+            ("cat /etc/shadow-\n", "cat: cannot open file", "$maero"),
+            # /disk/etc is root-only: the user cannot add files to it.
+            ("printf pwned > /etc/owned\n", "MaeroOS$ "),
+            ("cat /etc/owned\n", "cat: cannot open file", "pwned"),
+            # doas never runs a same-named program from the cwd: plant an
+            # executable ./ls (a copy of id) and check doas runs the real ls.
+            ("cp /disk/id /home/user/ls\n", "MaeroOS$ "),
+            ("busybox chmod 755 /home/user/ls\n", "MaeroOS$ "),
+            ("./ls\n", "uid=1000 gid=100"),
+            ("doas ls\n", "README.txt", "uid=", ("password for user", "user\n")),
+            # doas becomes root in both uid and gid.
+            ("doas id\n", "uid=0 gid=0", None, ("password for user", "user\n")),
+            ("doas id\n", "doas: authentication failed", "uid=0", ("password for user", "wrong\n")),
+            ("rm /home/user/ls\n", "MaeroOS$ "),
+            ("exit\n", "MaeroOS$ "),
+            ("id\n", "uid=0 gid=0"),
             ("cat /etc/inittab\n", "tty0 respawn /disk/getty tty0"),
             ("cat /tmp/sessions.status\n", "ID ACTION PID STATE COMMAND"),
             ("cat /tmp/sessions.status\n", "tty0 respawn"),
@@ -178,6 +228,16 @@ def main():
             ("svc enable heartbeat\n", "started heartbeat"),
             ("svc\n", "heartbeat respawn enabled"),
             ("svc\n", "running /disk/respawnprobe"),
+            ("cat /etc/services\n", "respawn heartbeat enabled /disk/respawnprobe"),
+            # svc enable/disable must keep every line of a long /etc/services
+            # (it used to drop everything after line 32).
+            ("printf '" + "#\\n" * 40 + "# svc-tail-marker\\n' >> /etc/services\n", "MaeroOS$ "),
+            ("svc disable heartbeat\n", "stopped heartbeat"),
+            ("cat /etc/services\n", "# svc-tail-marker"),
+            ("cat /etc/services\n", "respawn heartbeat disabled /disk/respawnprobe"),
+            ("svc enable heartbeat\n", "started heartbeat"),
+            ("cat /etc/services\n", "# svc-tail-marker"),
+            ("busybox ls /etc/services.tmp\n", "No such file"),
             ("cat /etc/services\n", "respawn heartbeat enabled /disk/respawnprobe"),
             ("cat /disk/hello.txt\n", "Hello from MaeroOS initrd!"),
             ("diskprobe\n", "diskprobe ok"),
@@ -237,11 +297,21 @@ def main():
         for check in checks:
             command, expected = check[0], check[1]
             forbidden = check[2] if len(check) > 2 else None
+            reply = check[3] if len(check) > 3 else None
             before = len("".join(log))
             send(proc, command)
+            if reply:
+                # Interactive step: answer a prompt (e.g. a password).
+                wait_for(proc, sel, reply[0], log, start=before)
+                send(proc, reply[1])
             wait_for(proc, sel, PROMPT, log, start=before)
             recent = "".join(log)[before:]
-            if expected not in recent:
+            if isinstance(expected, re.Pattern):
+                if not expected.search(recent):
+                    raise AssertionError(
+                        f"command {command.strip()!r} did not match {expected.pattern!r}"
+                    )
+            elif expected not in recent:
                 raise AssertionError(
                     f"command {command.strip()!r} did not produce {expected!r}"
                 )

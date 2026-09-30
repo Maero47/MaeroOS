@@ -104,19 +104,44 @@ static int file_available(const char *path) {
     return access(path, X_OK) == 0;
 }
 
-/* Like run_program() but drops to the unprivileged session user first. */
-static void run_program_as_user(char *path, char **argv, char **envp) {
+/* pid of the graphical session while it runs; the console sessions wait
+ * for it to end so the desktop keeps the keyboard/screen to itself. */
+static int desktop_pid = -1;
+
+/* Fork PATH as the unprivileged session user and return its pid without
+ * waiting: init must keep reaping, respawning services and serving
+ * /tmp/initctl while the desktop runs. */
+static int start_program_as_user(char *path, char **argv, char **envp) {
     int pid = fork();
     if (pid == 0) {
-        setgid(SESSION_GID);
-        setuid(SESSION_UID);       /* irreversible: euid leaves 0 */
+        /* gid before uid (setgid needs root); every step checked.  If any
+         * of it fails, do not start the session at all rather than run the
+         * desktop and everything it launches as root. */
+        if (setgid(SESSION_GID) != 0 || setuid(SESSION_UID) != 0 ||
+            getuid() != SESSION_UID || geteuid() != SESSION_UID ||
+            getgid() != SESSION_GID || getegid() != SESSION_GID ||
+            setuid(0) == 0) {
+            printf("[init] cannot drop privileges; not starting %s\n", path);
+            _exit(1);
+        }
         execve(path, argv, (char *const *)envp);
         printf("[init] Failed to exec %s as user\n", path);
-        exit(1);
+        _exit(1);
     }
-    if (pid > 0) {
-        int status, got;
-        do { got = waitpid(pid, &status, 0); } while (got > 0 && got != pid);
+    return pid;
+}
+
+/* The kernel's rename() currently recreates its target root 0644, so a
+ * crash between passwd's rename and its re-check could leave /etc/shadow
+ * world-readable.  Close that at every boot, before any user runs. */
+static void secure_shadow_files(void) {
+    static const char *const paths[] = { "/etc/shadow", "/etc/shadow-", 0 };
+    for (int i = 0; paths[i]; i++) {
+        int fd = open(paths[i], O_RDONLY);
+        if (fd < 0) continue;
+        if (fchown(fd, 0, 0) != 0 || fchmod(fd, 0600) != 0)
+            printf("[init] WARNING: cannot restrict %s to 0600\n", paths[i]);
+        close(fd);
     }
 }
 
@@ -592,18 +617,32 @@ static void start_sessions(char **envp) {
 }
 
 static void monitor_children(char *command_shell_path, char **envp) {
-    start_sessions(envp);
+    if (desktop_pid <= 0)
+        start_sessions(envp);
 
     while (1) {
         int status;
         int pid = waitpid(-1, &status, WNOHANG);
         if (pid <= 0) {
             poll_initctl(command_shell_path, envp);
+            if (desktop_pid > 0) {
+                /* Nothing to do but wait; do not spin against the desktop. */
+                usleep(20000);
+                continue;
+            }
             for (int i = 0; i < session_count; i++) {
                 if (sessions[i].pid <= 0 && !sessions[i].disabled)
                     start_session(&sessions[i], envp);
             }
             sched_yield();
+            continue;
+        }
+
+        if (pid == desktop_pid) {
+            desktop_pid = -1;
+            printf("[init] Graphical session ended; starting shell\n");
+            init_log("graphical session ended");
+            start_sessions(envp);
             continue;
         }
 
@@ -662,6 +701,8 @@ int main(void) {
     }
 
     disk_logging = disk_userland;
+    if (disk_userland)
+        secure_shadow_files();
     init_log("=== MaeroOS init boot ===");
 
     if (disk_userland && file_available("/etc/rc")) {
@@ -700,9 +741,7 @@ int main(void) {
         }
         /* Run the desktop as the unprivileged user (root keeps the
          * console).  envp carries USER=user / HOME=/home/user. */
-        (void)envp;
-        run_program_as_user(desktop_path, desktop_argv, user_envp);
-        printf("[init] Graphical session ended; starting shell\n");
+        desktop_pid = start_program_as_user(desktop_path, desktop_argv, user_envp);
     } else {
         printf("[init] Graphics unavailable; starting shell\n");
     }
