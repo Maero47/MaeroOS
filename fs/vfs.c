@@ -235,6 +235,8 @@ static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
         if (cur->flags == VFS_FLAG_SYMLINK && (!is_final || follow_final)) {
             if (!may_follow) { *err = -40; return WALK_MISS; } /* -ELOOP */
             char target[256];
+            /* A target that does not fit would be followed truncated. */
+            if (cur->size >= sizeof(target)) { *err = -36; return WALK_MISS; }
             uint32_t tlen = vfs_read(cur, 0, sizeof(target) - 1,
                                      (uint8_t *)target);
             target[tlen] = '\0';

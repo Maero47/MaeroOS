@@ -53,7 +53,7 @@ USER_BINS := $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
 	     $(TESTFILES)/sysprobe $(TESTFILES)/fcprobe $(TESTFILES)/lspci $(TESTFILES)/ifconfig \
 	     $(TESTFILES)/diskprobe $(TESTFILES)/fsprobe $(TESTFILES)/respawnprobe \
 	     $(TESTFILES)/sockprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget \
-	     $(TESTFILES)/randprobe $(TESTFILES)/sysmiscprobe $(TESTFILES)/abi2probe $(TESTFILES)/sigexecprobe \
+	     $(TESTFILES)/randprobe $(TESTFILES)/sysmiscprobe $(TESTFILES)/abi2probe $(TESTFILES)/sigexecprobe $(TESTFILES)/symprobe \
 	     $(TESTFILES)/fbtest $(TESTFILES)/evtest $(TESTFILES)/mousetest \
 	     $(TESTFILES)/polltest $(TESTFILES)/ptytest $(TESTFILES)/cttytest \
 	     $(TESTFILES)/desktop $(TESTFILES)/wmctl $(TESTFILES)/gui_demo \
@@ -379,6 +379,13 @@ diskprobe/diskprobe.o: diskprobe/diskprobe.c
 
 $(TESTFILES)/diskprobe: $(CRT0_OBJ) diskprobe/diskprobe.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) diskprobe/diskprobe.o libc/libc.a
+
+# symprobe
+symprobe/symprobe.o: symprobe/symprobe.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TESTFILES)/symprobe: $(CRT0_OBJ) symprobe/symprobe.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) symprobe/symprobe.o libc/libc.a
 
 # fsprobe
 fsprobe/fsprobe.o: fsprobe/fsprobe.c
