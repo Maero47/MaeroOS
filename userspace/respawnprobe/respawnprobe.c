@@ -9,8 +9,12 @@ static void write_file(const char *path, const char *text) {
 }
 
 int main(void) {
+    /* Respawned: stay alive for svc/smoke-disk to see, asleep.  This used to
+     * spin on sched_yield, which in every desktop boot put a runnable thread
+     * next to the real work: ~420k context switches a second and no idle
+     * time, which kprof then charged to "sched" and blamed on Firefox. */
     if (access("/home/root/respawn-alive", F_OK) == 0) {
-        while (1) sched_yield();
+        while (1) usleep(1000000);
     }
 
     write_file("/home/root/respawn-first", "first");
