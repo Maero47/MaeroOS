@@ -98,6 +98,15 @@ def main():
         recent = "".join(log)[before:]
         if "sockprobe tcpshut ok" not in recent:
             raise AssertionError("send after shutdown(SHUT_WR) did not fail with EPIPE")
+        # 16 half-closed fetches kept open fill the pcb pool with TIME_WAIT
+        # pcbs; the next connection recycles one.  Closing the old fds while
+        # it is live must not tear it down.
+        before = len("".join(log))
+        send(proc, f"sockprobe tcptw {http_port} 16")
+        wait_for(proc, sel, PROMPT, log, timeout=30.0, start=before)
+        recent = "".join(log)[before:]
+        if "sockprobe tcptw ok" not in recent:
+            raise AssertionError("closing sockets whose pcbs were in TIME_WAIT broke TCP")
         before = len("".join(log))
         send(proc, f"httpget 10.0.2.2 {http_port} /index.html")
         wait_for(proc, sel, PROMPT, log, timeout=15.0, start=before)

@@ -58,6 +58,7 @@ struct net_socket {
     struct tcp_pcb *tcp;
     int connected;
     int tx_shut;        /* shutdown(SHUT_WR/SHUT_RDWR) done: send is EPIPE */
+    int rx_shut;        /* shutdown(SHUT_RD/SHUT_RDWR) done */
     int tcp_state;
     int tcp_error;
     uint8_t tcp_rx[TCP_RX_SIZE];
@@ -142,6 +143,38 @@ static err_t tcp_connected_cb(void *arg, struct tcp_pcb *pcb, err_t err) {
     return ERR_OK;
 }
 
+/*
+ * Give the pcb to lwIP for good: no callbacks back into s, tcp_close to let
+ * it finish the TCP close on its own, and s->tcp = NULL.  Every path that may
+ * outlive the pcb must go through here, because lwIP frees pcbs in states
+ * where it never calls the err callback:
+ *   - TIME_WAIT (after our FIN, then the peer's): freed by tcp_slowtmr after
+ *     2*MSL, or at once by tcp_kill_timewait when a new pcb is needed;
+ *   - LAST_ACK completing with TF_RXCLOSED set (tcp_input skips errf when
+ *     the application already shut the receive side).
+ * A socket still holding the pointer then reached into freed memp memory on
+ * close(), possibly a pcb since reused for another connection.
+ *
+ * In the states this is used from, tcp_close only marks the receive side
+ * closed and, from ESTABLISHED/CLOSE_WAIT, sends the FIN; it never fails
+ * there, but tcp_abort is kept as the fallback the release path always had.
+ * `in_input` is set when called from an lwIP callback inside tcp_input, where
+ * aborting the pcb is not allowed.
+ */
+static void socket_detach_pcb(net_socket_t *s, int in_input) {
+    struct tcp_pcb *pcb = s->tcp;
+    if (!pcb)
+        return;
+    tcp_arg(pcb, NULL);
+    tcp_recv(pcb, NULL);
+    tcp_err(pcb, NULL);
+    tcp_poll(pcb, NULL, 0);
+    if (tcp_close(pcb) != ERR_OK && !in_input)
+        tcp_abort(pcb);
+    s->tcp = NULL;
+    s->connected = 0;
+}
+
 static err_t tcp_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p,
                          err_t err) {
     net_socket_t *s = (net_socket_t *)arg;
@@ -150,6 +183,12 @@ static err_t tcp_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p,
     if (!p) {
         s->tcp_state = TCP_STATE_CLOSED;
         s->connected = 0;
+        /* The peer's FIN after ours (shutdown(SHUT_WR)) takes the pcb to
+         * CLOSING or TIME_WAIT, from which lwIP frees it without telling
+         * us.  Nothing is left to send or receive on it: let go now.  Data
+         * already in the ring is still served by recv, then EOF. */
+        if (s->tx_shut)
+            socket_detach_pcb(s, 1);
         return ERR_OK;
     }
     if (err != ERR_OK) {
@@ -179,6 +218,10 @@ static void tcp_err_cb(void *arg, err_t err) {
         return;
     s->tcp = NULL;
     s->connected = 0;
+    /* ERR_CLSD after the peer's FIN is an orderly close (LAST_ACK acked):
+     * recv keeps reporting EOF instead of turning it into an error. */
+    if (err == ERR_CLSD && s->tcp_state == TCP_STATE_CLOSED)
+        return;
     s->tcp_state = TCP_STATE_ERROR;
     s->tcp_error = (err == ERR_ABRT) ? -104 : -101;
 }
@@ -257,14 +300,7 @@ static void socket_release_locked(net_socket_t *s) {
         return;
     if (s->udp)
         udp_remove(s->udp);
-    if (s->tcp) {
-        tcp_arg(s->tcp, NULL);
-        tcp_recv(s->tcp, NULL);
-        tcp_err(s->tcp, NULL);
-        tcp_poll(s->tcp, NULL, 0);
-        if (tcp_close(s->tcp) != ERR_OK)
-            tcp_abort(s->tcp);
-    }
+    socket_detach_pcb(s, 0);
     memset(s, 0, sizeof(*s));
 }
 
@@ -493,26 +529,22 @@ static int socket_shutdown_locked(net_socket_t *s, int how) {
         return -107;
     int shut_rx = (how == 0 || how == 2);
     int shut_tx = (how == 1 || how == 2);
-    if (shut_rx && shut_tx) {
-        /* For the raw API, shutting down both directions IS tcp_close: the
-         * pcb may be freed on the spot and must not be referenced again.
-         * Keeping s->tcp made a later close() tcp_close it a second time.
-         * Detach and close exactly as the release path does. */
-        tcp_arg(s->tcp, NULL);
-        tcp_recv(s->tcp, NULL);
-        tcp_err(s->tcp, NULL);
-        tcp_poll(s->tcp, NULL, 0);
-        if (tcp_close(s->tcp) != ERR_OK)
-            tcp_abort(s->tcp);
-        s->tcp = NULL;
-        s->connected = 0;
+    if ((shut_rx || s->rx_shut) && (shut_tx || s->tx_shut)) {
+        /* Both directions now shut, in this call or across two.  For the raw
+         * API that is tcp_close: the pcb may be freed on the spot, or later
+         * without an err callback (see socket_detach_pcb), so it must not be
+         * referenced again.  Keeping s->tcp made a later close() tcp_close
+         * it a second time. */
+        socket_detach_pcb(s, 0);
         s->tcp_state = TCP_STATE_CLOSED;
-        s->tx_shut = 1;
+        s->rx_shut = s->tx_shut = 1;
         return 0;
     }
     err_t e = tcp_shutdown(s->tcp, shut_rx, shut_tx);
     if (e != ERR_OK)
         return -107;
+    if (shut_rx)
+        s->rx_shut = 1;
     if (shut_tx)
         s->tx_shut = 1;
     return 0;
