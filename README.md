@@ -41,7 +41,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | External shared libraries and pthreads | `GREET_OK sum=42`, `ZLIB_OK ver=1.3`, `THREADS_OK count=200000`, `UNIX_SOCK_OK` | `make smoke-dynlib` |
 | X11 server | `XHANDSHAKE_OK`, `XDRAW_OK` (`w=320 h=200` from `GetGeometry`), `XEVENT_OK`, and `XREAL_PAINTED` from a client linked against the cross-built libX11 | `make smoke-x` |
 | GLib, Cairo, Pango, GTK3 | `GLIB_OK` (v2.78), `CAIRO_OK rect_px=0xe69919`, `PANGO_OK`, `GTK_OK init`, `GTK_WINDOW_SHOWN`, `GTK_DRAWN` (needs probe binaries a fresh clone lacks, see Testing) | `make smoke-gtk` |
-| Firefox 115.15.0esr | `ff: Firefox painted` (the browser window, about 9 s after `firefox-bin` starts); with `--web`, a page served from the host (HTML, a CSS rule, a PNG) requested and its image on screen about 3 s after Enter (needs the Firefox tree, see `ports/firefox/`) | `make smoke-firefox`, `make smoke-firefox-web` |
+| Firefox 115.15.0esr | `ff: Firefox painted` (the browser window, about 5 s after `firefox-bin` starts); with `--web`, a page served from the host (HTML, a CSS rule, a PNG) requested and its image on screen about 3 s after Enter (needs the Firefox tree, see `ports/firefox/`) | `make smoke-firefox`, `make smoke-firefox-web` |
 
 ### What does not work
 
@@ -50,7 +50,7 @@ What is proven by the automated QEMU tests in `tools/`:
   through QEMU's user network, DNS and TLS included), but: text in scripts the disk has
   no font for (it ships DejaVu Sans and Twemoji) is drawn as missing-glyph boxes; the
   content sandbox is off (`MOZ_DISABLE_CONTENT_SANDBOX`, `security.sandbox.content.level
-  0`); startup still takes about 9 s after `firefox-bin` starts; and `ff` has to bring
+  0`); startup still takes about 5 s after `firefox-bin` starts; and `ff` has to bring
   its own profile (`testfiles/ffprofile`) that turns off first-run dialogs, telemetry
   and add-on scans. Firefox-specific diagnostics left in `proc/syscall.c`,
   `proc/scheduler.c` and `proc/usocket.c` are compiled in only with `make KTRACE=1`.
