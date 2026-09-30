@@ -14,7 +14,6 @@
 
 #define LMAX   4096
 #define FMAX   256   /* max fields */
-#define VMAX   64    /* max variables */
 
 static char g_fs = ' ';   /* field separator */
 static long  g_nr = 0;    /* Number of Records */
@@ -22,38 +21,6 @@ static char  g_line[LMAX];
 static char *g_fields[FMAX];
 static int   g_nf;
 static char  g_field_bufs[FMAX][256];
-
-/* Simple variable store */
-static char  var_names[VMAX][64];
-static long  var_inum[VMAX];
-static char  var_sval[VMAX][256];
-static int   var_n = 0;
-
-static long var_get_n(const char *name) {
-    for (int i = 0; i < var_n; i++)
-        if (strcmp(var_names[i], name) == 0) return var_inum[i];
-    return 0;
-}
-static const char *var_get_s(const char *name) {
-    for (int i = 0; i < var_n; i++)
-        if (strcmp(var_names[i], name) == 0) return var_sval[i];
-    return "";
-}
-static void var_set(const char *name, long n, const char *s) {
-    for (int i = 0; i < var_n; i++) {
-        if (strcmp(var_names[i], name) == 0) {
-            var_inum[i] = n;
-            strncpy(var_sval[i], s ? s : "", 255);
-            return;
-        }
-    }
-    if (var_n < VMAX) {
-        strncpy(var_names[var_n], name, 63);
-        var_inum[var_n] = n;
-        strncpy(var_sval[var_n], s ? s : "", 255);
-        var_n++;
-    }
-}
 
 /* Split line into fields */
 static void split_fields(void) {
@@ -114,7 +81,7 @@ static const char *get_field(const char *name) {
         sprintf(buf, "%d", g_nf);
         return buf;
     }
-    return var_get_s(name);
+    return "";          /* user variables are not supported */
 }
 
 /* Evaluate a simple expression token — returns string value */

@@ -21,7 +21,8 @@ static void test_cachedir(const char *d) {
     char tag[256], tmp[256], done[256];
     int n = 0; while (d[n]) n++;
     /* CACHEDIR.TAG */
-    for (int i=0;i<=n;i++) tag[i]=d[i]; tag[n]=0;
+    for (int i=0;i<=n;i++) tag[i]=d[i];
+    tag[n]=0;
     printf("  (after mkdir) access(W_OK)=%d\n", access(d, W_OK));
     /* atomic write probe: create temp, write, rename */
     int i=0; for(;d[i];i++) tmp[i]=d[i]; const char *t="/probe.tmp"; for(int j=0;t[j];j++) tmp[i++]=t[j]; tmp[i]=0;

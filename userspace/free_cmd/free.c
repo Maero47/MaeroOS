@@ -19,7 +19,8 @@ int main(void) {
     int fd = open("/proc/meminfo", O_RDONLY);
     if (fd < 0) { printf("free: /proc/meminfo unavailable\n"); return 1; }
     int n = read(fd, buf, sizeof(buf)-1); close(fd);
-    if (n < 0) n = 0; buf[n] = 0;
+    if (n < 0) n = 0;
+    buf[n] = 0;
     long total = field(buf, "MemTotal");
     long freem = field(buf, "MemFree");
     long avail = field(buf, "MemAvailable");

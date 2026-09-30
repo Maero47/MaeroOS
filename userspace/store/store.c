@@ -8,12 +8,22 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include "../pkg/indexsig.h"
+#include "../pkg/repo_pubkey.h"
 
 /*
  * store — the MaeroOS Store.  Lists repo packages (via the pkg CLI),
  * installs/removes with a click, shows progress; tells the desktop to
  * rescan apps afterwards.
+ *
+ * The package list comes from pkg's index cache, which is only shown after
+ * its Ed25519 signature verifies against the repo key compiled into pkg
+ * (pkg/indexsig.c, pkg/repo_pubkey.h).  An unsigned, tampered or foreign
+ * cache is not displayed; the user is told to refresh it with `pkg update`.
  */
+
+#define INDEX_CACHE "/disk/etc/pkg-index.txt"
+#define INDEX_MAX   8191        /* as pkg.c */
 
 #define MAX_PKGS 32
 
@@ -29,6 +39,8 @@ static int entry_count;
 static int sel = -1;
 static int dirty = 1;
 static char status[96] = "Loading package list...";
+/* Why the cached index was not shown (NULL: shown, or there is none). */
+static const char *index_error;
 
 /* worker-thread op: 0 idle, 1 update, 2 install, 3 remove */
 static volatile int op_busy, op_done;
@@ -70,22 +82,28 @@ static int run_pkg(const char *verb, const char *arg) {
 }
 
 static void load_index(void) {
-    static char buf[8192];
-    int fd = open("/disk/etc/pkg-index.txt", O_RDONLY), n;
+    static char buf[INDEX_MAX + 1];
+    unsigned long serial;
+    int fd = open(INDEX_CACHE, O_RDONLY), n = 0, r, len;
     char *line, *next;
 
     entry_count = 0;
+    index_error = 0;
     if (fd < 0) return;
-    n = read(fd, buf, sizeof(buf) - 1);
+    while (n < INDEX_MAX && (r = read(fd, buf + n, INDEX_MAX - n)) > 0)
+        n += r;
     close(fd);
     if (n <= 0) return;
-    buf[n] = 0;
+    if (index_verify(buf, n, repo_pubkey, &serial, &len, &index_error))
+        return;
+    buf[len] = 0;   /* show only what the signature covers */
     line = buf;
     while (line && *line && entry_count < MAX_PKGS) {
         char *f[8] = {0};
         int nf = 0;
         next = strchr(line, '\n');
         if (next) *next++ = 0;
+        if (*line == '#') { line = next; continue; }
         f[nf++] = line;
         for (char *p = line; *p && nf < 8; p++)
             if (*p == '|') { *p = 0; f[nf++] = p + 1; }
@@ -147,9 +165,17 @@ static void render(void) {
                                                       &draw_font_ui)) / 2,
                  13, "Refresh", draw_rgb(245, 248, 250), &draw_font_ui);
 
-    if (!entry_count)
+    if (!entry_count && index_error) {
+        draw_text_aa(s, 14, 60, "The package list could not be verified:",
+                     draw_rgb(180, 76, 66), &draw_font_ui);
+        draw_text_aa(s, 14, 82, index_error, draw_rgb(110, 116, 122),
+                     &draw_font_ui);
+        draw_text_aa(s, 14, 112, "Run pkg update (click Refresh) to fetch a "
+                     "signed list.", draw_rgb(110, 116, 122), &draw_font_ui);
+    } else if (!entry_count) {
         draw_text_aa(s, 14, 60, "No packages. Click Refresh (server: host:8000).",
                      draw_rgb(110, 116, 122), &draw_font_ui);
+    }
 
     for (int i = 0; i < entry_count; i++) {
         int ry = 54 + i * 64;

@@ -818,13 +818,6 @@ static void fill_rect(xres_t *d, int x, int y, int w, int h, uint32_t color) {
  * glyph compositing.  Without it cairo can't create a renderable surface and the
  * window never paints.  We implement the subset cairo actually issues. */
 
-/* Resolve the drawable (window/pixmap) a picture renders into. */
-static xres_t *pic_target(xclient_t *c, uint32_t picid) {
-    xres_t *p = res_find(c, picid);
-    if (!p || p->kind != R_PICTURE || p->pic_solid) return NULL;
-    return res_find(c, p->pic_drawable);
-}
-
 /* Premultiplied "Over": dst = src + dst*(1-alpha).  src is ARGB premultiplied. */
 static uint32_t blend_over(uint32_t s, uint32_t d) {
     uint32_t a = (s >> 24) & 0xff;
@@ -1116,8 +1109,10 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
         w->parent = r32(q + 8);
         w->x = rs16(q + 12); w->y = rs16(q + 14);
         w->w = (int)r16(q + 16); w->h = (int)r16(q + 18);
-        if (w->w < 1) w->w = 1; if (w->h < 1) w->h = 1;
-        if (w->w > 4096) w->w = 4096; if (w->h > 4096) w->h = 4096;
+        if (w->w < 1) w->w = 1;
+        if (w->h < 1) w->h = 1;
+        if (w->w > 4096) w->w = 4096;
+        if (w->h > 4096) w->h = 4096;
         w->px = (uint32_t *)malloc((size_t)w->w * w->h * 4);
         if (w->px) for (int i = 0; i < w->w * w->h; i++) w->px[i] = 0x00202830;
         printf("maerox: CreateWindow xid=0x%x %dx%d @%d,%d\n",
@@ -1163,8 +1158,10 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
             if (mask & 0x02) { ny = rs16(q + off); off += 4; }   /* y */
             if (mask & 0x04) { nw = (int)r16(q + off); off += 4; }/* width */
             if (mask & 0x08) { nh = (int)r16(q + off); off += 4; }/* height */
-            if (nw < 1) nw = 1; if (nh < 1) nh = 1;
-            if (nw > 4096) nw = 4096; if (nh > 4096) nh = 4096;
+            if (nw < 1) nw = 1;
+            if (nh < 1) nh = 1;
+            if (nw > 4096) nw = 4096;
+            if (nh > 4096) nh = 4096;
             w->x = nx; w->y = ny;
             if (nw != w->w || nh != w->h) {   /* reallocate the backing buffer */
                 uint32_t *np = (uint32_t *)malloc((size_t)nw * nh * 4);
@@ -1236,8 +1233,10 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
         xres_t *p = res_new(c, pid, R_PIXMAP);
         if (!p) return;
         p->w = (int)r16(q + 12); p->h = (int)r16(q + 14);
-        if (p->w < 1) p->w = 1; if (p->h < 1) p->h = 1;
-        if (p->w > 4096) p->w = 4096; if (p->h > 4096) p->h = 4096;
+        if (p->w < 1) p->w = 1;
+        if (p->h < 1) p->h = 1;
+        if (p->w > 4096) p->w = 4096;
+        if (p->h > 4096) p->h = 4096;
         p->px = (uint32_t *)malloc((size_t)p->w * p->h * 4);
         if (p->px) memset(p->px, 0, (size_t)p->w * p->h * 4);
         break;

@@ -1144,14 +1144,6 @@ static void round_fill_on_row(unsigned y, int x, int ry, int w, int h,
     fill_rect_on_row(y, x + ins, (int)y, w - 2 * ins, 1, color);
 }
 
-/* Alpha-blended rounded-rect fill on the current scanline. */
-static void round_blend_on_row(unsigned y, int x, int ry, int w, int h,
-                               uint32_t color, unsigned alpha) {
-    int ins = card_row_inset(y, ry, h);
-    if (ins < 0) return;
-    blend_rect_on_row(y, x + ins, (int)y, w - 2 * ins, 1, color, alpha);
-}
-
 /* Frosted-glass rounded card (keeps the sheen of glass_rect_on_row). */
 static void round_glass_on_row(unsigned y, int x, int ry, int w, int h,
                                uint32_t tint, unsigned alpha) {
@@ -4574,12 +4566,14 @@ static void load_wallpaper(void) {
             long oy = (sy_num - crop_h) / 2;
             for (unsigned dy = 0; dy < fb_h; dy++) {
                 long syc = oy + (long)dy * scale / 1000;
-                if (syc < 0) syc = 0; if (syc >= h) syc = h - 1;
+                if (syc < 0) syc = 0;
+                if (syc >= h) syc = h - 1;
                 uint32_t *srow = wallpaper + (size_t)syc * w;
                 uint32_t *drow = dst + (size_t)dy * fb_w;
                 for (unsigned dx = 0; dx < fb_w; dx++) {
                     long sxc = ox + (long)dx * scale / 1000;
-                    if (sxc < 0) sxc = 0; if (sxc >= w) sxc = w - 1;
+                    if (sxc < 0) sxc = 0;
+                    if (sxc >= w) sxc = w - 1;
                     drow[dx] = srow[sxc];
                 }
             }
