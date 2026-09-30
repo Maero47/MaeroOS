@@ -176,6 +176,32 @@ static void differential(void) {
     if (bad) fails++;
 }
 
+/* regexec with nmatch = 10: rc `want`, and on a match the first `ngrp`
+ * (so, eo) pairs equal `grp`; under 50 ms. */
+static void lines(const char *re, int fl, const char *s, int want, const long *grp, int ngrp) {
+    regex_t r;
+    regmatch_t m[10];
+    struct timespec a, b;
+    cases++;
+    if (regcomp(&r, re, fl)) { printf("FAIL comp %s\n", re); fails++; return; }
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    int x = regexec(&r, s, 10, m, 0);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    double ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
+    int ok = x == want && ms < 50;
+    for (int i = 0; ok && !x && i < ngrp; i++)
+        ok = m[i].rm_so == grp[2 * i] && m[i].rm_eo == grp[2 * i + 1];
+    printf("time /%s/ on %zu bytes, nmatch 10: %.2f ms, result %d\n", re, strlen(s), ms, x);
+    if (!ok) {
+        printf("FAIL /%s/ on %zu bytes: result %d want %d, %.2f ms\n", re, strlen(s), x, want, ms);
+        for (int i = 0; !x && i < ngrp; i++)
+            printf("    %d: %ld,%ld want %ld,%ld\n", i, (long)m[i].rm_so, (long)m[i].rm_eo,
+                   grp[2 * i], grp[2 * i + 1]);
+        fails++;
+    }
+    regfree(&r);
+}
+
 int main(void) {
     int E = REG_EXTENDED;
     t("abc", 0, "xxabcxx", 2, 5);
@@ -252,24 +278,46 @@ int main(void) {
     slow("(x+x+)+y", E, 'x', 100, "", REG_NOMATCH);
     slow("(a|aa)*b", E, 'a', 32, "b", 0);
     slow("(a*)*b", E, 'a', 4000, "b", 0);
-    /* Submatches wanted: no memo (loops make them path-dependent), so the
-     * step cap stops it instead, still quickly. */
+    /* Submatches wanted: the memoised first pass still decides there is no
+     * match, quickly. */
     {
-        char a32[40];
-        regex_t r;
-        regmatch_t m[4];
-        struct timespec x, y;
+        static char a32[40];
         memset(a32, 'a', 32);
-        a32[32] = 0;
-        cases++;
-        regcomp(&r, "(a|aa)*b", E);
-        clock_gettime(CLOCK_MONOTONIC, &x);
-        int got = regexec(&r, a32, 4, m, 0);
-        clock_gettime(CLOCK_MONOTONIC, &y);
-        double ms = (y.tv_sec - x.tv_sec) * 1e3 + (y.tv_nsec - x.tv_nsec) / 1e6;
-        printf("time /(a|aa)*b/ on 32 x 'a' with submatches: %.2f ms, result %d\n", ms, got);
-        if (got != REG_ESPACE || ms >= 50) { printf("FAIL capped submatch search\n"); fails++; }
-        regfree(&r);
+        long no[] = { -1, -1 };
+        lines("(a|aa)*b", E, a32, REG_NOMATCH, no, 1);
+    }
+    /* Ordinary patterns on long lines with nmatch = 10 (what toybox sed
+     * passes): O(n^2) over all start positions without the memo, so a
+     * step cap alone returned REG_ESPACE from about 1.5 KB. */
+    {
+        static const int sizes[] = { 1500, 4096, 16384 };
+        static char buf[3 * 16384 + 8];
+        long no[] = { -1, -1 };
+        for (int k = 0; k < 3; k++) {
+            int n = sizes[k];
+            memset(buf, 'x', n); buf[n] = 0;
+            lines(".*foo", E, buf, REG_NOMATCH, no, 1);
+            lines("\\(.*\\),\\(.*\\)", 0, buf, REG_NOMATCH, no, 1);
+            memset(buf, 'a', n); buf[n] = 0;
+            lines("a*b", E, buf, REG_NOMATCH, no, 1);
+            memset(buf, ' ', n); buf[n] = 'x'; buf[n + 1] = 0;
+            long sp[] = { n + 1, n + 1 };
+            lines(" *$", E, buf, 0, sp, 1);
+            /* ...and when they match, the submatches come from the second
+             * (unpruned) pass. */
+            memset(buf, 'x', n); strcpy(buf + n, "foo");
+            long foo[] = { 0, n + 3 };
+            lines(".*foo", E, buf, 0, foo, 1);
+            memset(buf, 'x', n); buf[n] = ','; memset(buf + n + 1, 'y', n); buf[2 * n + 1] = 0;
+            long comma[] = { 0, 2 * n + 1, 0, n, n + 1, 2 * n + 1 };
+            lines("\\(.*\\),\\(.*\\)", 0, buf, 0, comma, 3);
+            memset(buf, 'a', n); strcpy(buf + n, "b");
+            long ab[] = { 0, n + 1, 0, n };
+            lines("(a*)b", E, buf, 0, ab, 2);
+            memset(buf, 'z', n); memset(buf + n, ' ', n); buf[2 * n] = 0;
+            long tail[] = { n, 2 * n, n, 2 * n };
+            lines("( *)$", E, buf, 0, tail, 2);
+        }
     }
     /* With a back-reference there is no memo: the step cap stops it. */
     slow("\\(a*\\)*\\1b", 0, 'a', 30, "", REG_ESPACE);

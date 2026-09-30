@@ -61,6 +61,15 @@ def main():
             # float printf, sscanf, time, *at() calls, rlimits, statfs...).
             ("toybox echo hello | toybox sed s/l/L/g\n", "heLLo"),
             ("toybox grep -c Hello hello.txt\n", "1"),
+            # 4 KB lines through sed (it always asks regexec for submatches,
+            # and takes any error as "no match").  4095 spaces, x, a space:
+            # the only match of ' *$' is the last space, after 4 K failing
+            # start positions, which used to exhaust the step cap.
+            ("toybox printf \"%4096s \\n\" x > /tmp/sxs; toybox sed 's/ *$/_OK/;s/x/SED_TRIM/' /tmp/sxs | toybox tr -d ' '\n",
+             "SED_TRIM_OK"),
+            ("toybox printf \"%4096s\\n\" x > /tmp/sx; toybox sed 's/ *$//;s/.*foo/Y/;s/x$/SED_LONG_/;s/_$/_OK/' /tmp/sx | toybox tr -d ' '\n",
+             "SED_LONG_OK"),
+            ("toybox printf \"%4096sfoo!\\n\" x | toybox sed 's/.*foo/SED_/;s/!/FOO_OK/'\n", "SED_FOO_OK"),
             ("toybox egrep -o \"M[a-z]+OS\" hello.txt\n", "MaeroOS"),
             ("toybox fgrep -x \"Hello from MaeroOS initrd!\" hello.txt\n", "Hello from MaeroOS"),
             ("toybox find /etc -name \"pass*\" -type f\n", "/etc/passwd"),

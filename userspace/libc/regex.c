@@ -12,13 +12,17 @@
  * and never explores one twice: nested loops like (a*)*b stay
  * O(len * pattern) instead of going exponential.  The bitmap is shared by
  * every start position (a state that failed from one start fails from all).
- * The whole match is unaffected, but which path reaches it first is not: a
- * loop's CHK reads its MARK register, so with loops the submatches can differ
- * from an unpruned search.  Memoisation is therefore used only when the
- * caller wants no submatches or the pattern has no loops.  Otherwise (and
- * with back-references, or when the bitmap would be too large) a per-call
+ * With back-references, or when the bitmap would be too large, a per-call
  * step cap applies instead, and a search that exceeds it returns REG_ESPACE
- * (or the longest match found so far). */
+ * (or the longest match found so far).
+ *
+ * Pruning keeps the whole match (leftmost start, longest end) exact, but not
+ * which path reaches it first: a loop's CHK reads its MARK register, so the
+ * submatches could differ from an unpruned search.  So when the memo was used
+ * and the caller wants submatches, a second pass reruns the unpruned matcher
+ * from the known start, accepting only the known end: the first path to reach
+ * it carries the same submatches the unpruned search would have reported.
+ * That pass has its own cap, scaled by the match length. */
 #include "../include/regex.h"
 #include "../include/fnmatch.h"
 #include "../include/ctype.h"
@@ -446,7 +450,7 @@ typedef struct {
     unsigned char *seen;    /* visited SPLIT states, or 0 */
     int *split_ix;          /* pc -> SPLIT number */
     int memo;               /* 1: may use `seen`; 0: never; -1: over step cap */
-    int subs;               /* the caller wants submatches */
+    long want_end;          /* >= 0: second pass, accept only this end */
     long cap_steps;
 } matcher_t;
 
@@ -465,7 +469,7 @@ static int memo_init(matcher_t *m) {
     struct re_prog *g = m->g;
     long nsplit = 0, span = m->end - m->start + 1;
     for (int i = 0; i < g->len; i++) {
-        if (g->code[i].op == OP_BREF || (g->code[i].op == OP_CHK && m->subs)) return 0;
+        if (g->code[i].op == OP_BREF) return 0;
         if (g->code[i].op == OP_SPLIT) nsplit++;
     }
     if (!nsplit || nsplit > MEMO_MAX_BITS / span) return 0;
@@ -569,6 +573,12 @@ static int run(matcher_t *m, long pos) {
             break;
         }
         case OP_MATCH:
+            if (m->want_end >= 0) {
+                if (pos != m->want_end) { ok = 0; break; }
+                memcpy(m->best, m->regs, 2 * (g->nsub + 1) * sizeof(long));
+                m->best[1] = pos;
+                return m->have_best = 1;
+            }
             if (!m->have_best || pos > m->best[1]) {
                 memcpy(m->best, m->regs, 2 * (g->nsub + 1) * sizeof(long));
                 m->best[1] = pos;
@@ -592,6 +602,11 @@ static int run(matcher_t *m, long pos) {
     return m->have_best;
 }
 
+/* Steps a search over `pairs` positions may take without the memo. */
+static long step_cap(long pairs, int len) {
+    return pairs > (LONG_MAX / 32) / len ? LONG_MAX : STEP_CAP + 16 * pairs * len;
+}
+
 int regexec(const regex_t *preg, const char *string, unsigned long nmatch,
             regmatch_t pmatch[], int eflags) {
     struct re_prog *g = preg->__prog;
@@ -604,13 +619,12 @@ int regexec(const regex_t *preg, const char *string, unsigned long nmatch,
     m.g = g;
     m.eflags = eflags;
     m.memo = 1;
-    m.subs = nmatch > 1 && pmatch && !(g->cflags & REG_NOSUB);
+    m.want_end = -1;
     if ((eflags & REG_STARTEND) && pmatch) {
         m.start = pmatch[0].rm_so;
         m.end = pmatch[0].rm_eo;
     } else m.end = (long)strlen(string);
-    long pairs = m.end - m.start + 1;
-    m.cap_steps = pairs > (LONG_MAX / 32) / g->len ? LONG_MAX : STEP_CAP + 16 * pairs * g->len;
+    m.cap_steps = step_cap(m.end - m.start + 1, g->len);
     int nslots = 2 * (g->nsub + 1) + g->nmarks;
     m.regs = malloc(nslots * sizeof(long));
     m.best = malloc(2 * (g->nsub + 1) * sizeof(long));
@@ -627,6 +641,19 @@ int regexec(const regex_t *preg, const char *string, unsigned long nmatch,
         int got = run(&m, pos);
         if (got < 0) { r = REG_ESPACE; break; }
         if (!got && m.memo < 0) { r = REG_ESPACE; break; }
+        if (got && m.seen && nmatch > 1 && pmatch && !(g->cflags & REG_NOSUB)) {
+            /* Second pass for the submatches: unpruned, from `pos`, and
+             * ending exactly where the pruned search found the match. */
+            long end = m.best[1];
+            free(m.seen);
+            m.seen = 0;
+            m.memo = 0;
+            m.want_end = end;
+            m.steps = 0;
+            m.cap_steps = step_cap(end - pos + 1, g->len);
+            got = run(&m, pos);
+            if (got <= 0) { r = REG_ESPACE; break; }
+        }
         if (got) {
             r = 0;
             if (!(g->cflags & REG_NOSUB) && pmatch) {
