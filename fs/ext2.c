@@ -135,6 +135,13 @@ static int g_mounted = 0;
  * transaction.  128 KiB is 256 sectors, past what one command can express;
  * 64 blocks keeps a transaction's interrupts-off window near 100 us. */
 #define EXT2_READ_CLUSTER  64
+/* Blocks one cache miss may fetch, past what the request needs, when they
+ * follow it on disk and in the file and are not cached yet.  With PIO every
+ * extra sector cost ~17 us, so fetching what nobody asked for was a loss (see
+ * docs/perf/firefox-startup.md); with bus-master DMA a read's cost is nearly
+ * all per command (~75 us), so the neighbours of a miss are nearly free and
+ * the next miss next to them is not. */
+#define EXT2_READAHEAD     32
 
 #define EXT2_CACHE_WAYS     4
 
@@ -188,6 +195,7 @@ typedef struct {
 /* The slot array is allocated at mount alongside the slab, so the cache size is
  * decided by the machine rather than reserved in the kernel's BSS. */
 static ext2_cache_entry_t *g_cache;
+static uint8_t *g_ra_buf;        /* EXT2_READAHEAD blocks, for read-ahead */
 static uint32_t g_cache_slots;
 static uint32_t g_cache_age = 1;
 static int g_cache_ready = 0;
@@ -409,6 +417,7 @@ static void ext2_cache_init(void) {
            (unsigned)(g_cache_slots * sizeof(*g_cache) / 1024u),
            (unsigned)(budget / 1024u),
            (unsigned)(heap_headroom() / 1024u));
+    g_ra_buf = (uint8_t *)kmalloc((size_t)EXT2_READAHEAD * g_state.block_size);
     g_cache_ready = 1;
 }
 
@@ -1072,6 +1081,35 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
                        done + (run + 1) * blk_size <= size &&
                        ext2_file_blk(&inode, blk_idx + run) == blk_num + run)
                     run++;
+                /* Read-ahead: the same command continues over the following
+                 * blocks of the file while they are consecutive on disk and
+                 * not cached, into g_ra_buf, and they go to the cache only. */
+                uint32_t total = run;
+                uint32_t nblk = (inode.i_size + blk_size - 1) / blk_size;
+                if ((uintptr_t)(buf + done) >= KERNEL_VMA && g_ra_buf &&
+                    run < EXT2_READAHEAD) {
+                    while (total < EXT2_READAHEAD && blk_idx + total < nblk &&
+                           ext2_file_blk(&inode, blk_idx + total) == blk_num + total &&
+                           !ext2_cache_find(blk_num + total))
+                        total++;
+                }
+                if (total > run) {
+                    int failed;
+                    preempt_disable();       /* same invariant as below */
+                    failed = ext2_raw_read_blocks(blk_num, total, g_ra_buf) < 0;
+                    if (!failed) {
+                        memcpy(buf + done, g_ra_buf, run * blk_size);
+                        for (uint32_t r = 0; r < total; r++)
+                            ext2_cache_insert(blk_num + r, g_ra_buf + r * blk_size);
+                    }
+                    preempt_enable();
+                    if (failed) break;
+                    kprof_add(KPE_EXT2_BLK, run);
+                    kprof_add(KPE_EXT2_MISS, run);
+                    kprof_add(KPE_EXT2_RA, total - run);
+                    done += run * blk_size;
+                    continue;
+                }
                 if (run > 1) {
                     /* CACHE INVARIANT: the raw read and the inserts that
                      * publish it MUST be one non-preemptible section, exactly

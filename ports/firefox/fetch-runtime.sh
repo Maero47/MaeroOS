@@ -28,6 +28,11 @@
 #     both are present on the host (else a warning), the Packages.xz sha256
 #     must match the one InRelease records (fetched via by-hash), and every
 #     .deb must match the sha256 recorded in Packages.xz.
+#   * Packages whose files land in the COMMITTED testfiles/lib (libc6,
+#     libgcc-s1, libstdc++6) are pinned to an exact version + sha256 in
+#     DEBIAN_PINS below, so a Debian point/security update cannot dirty a
+#     fresh clone.  A pinned .deb comes from the mirror's pool while it is
+#     still there, else from snapshot.debian.org, and must match the pin.
 #   * Mirrors must be https, and every download refuses to follow a redirect
 #     off https, unless ALLOW_INSECURE_MIRROR=1.
 #
@@ -41,6 +46,8 @@
 #   FF_VERSION=115.15.0esr  Firefox release to fetch
 #   FF_SHA256=<hex>         expected sha256 of the tarball (pinned for the default)
 #   DEBIAN_MIRROR=...       default https://deb.debian.org/debian
+#   SNAPSHOT_MIRROR=...     default https://snapshot.debian.org/archive/debian
+#                           (fallback source for pinned .debs, see DEBIAN_PINS)
 #   DEBIAN_KEYRING=<file>   gpg keyring holding the Debian archive signing keys
 #                           (default: the usual debian-archive-keyring paths)
 #   ALLOW_INSECURE_MIRROR=1 permit http:// in DEBIAN_MIRROR / MOZ_BASE and in
@@ -64,6 +71,26 @@ FF_LOCALE=en-US
 # SHA256SUMS, recorded here so a substituted mirror cannot swap the binary.
 FF_SHA256_PINNED_VERSION=115.15.0esr
 FF_SHA256_PINNED=9a8b03f993049e75418e4753aedfe661016557c708cd6099eb2949b306d6f695
+SNAPSHOT_MIRROR=${SNAPSHOT_MIRROR:-https://snapshot.debian.org/archive/debian}
+
+# Pinned Debian packages: everything that ends up in testfiles/lib, which is
+# committed.  All other packages float with the suite index (their files are
+# gitignored).  Columns: suite package version pool-filename sha256
+# snapshot-timestamp.  The .deb is fetched from $DEBIAN_MIRROR/<filename>
+# while the pool still carries it, else from
+# $SNAPSHOT_MIRROR/<timestamp>/<filename>, and must match the sha256 here.
+# Only pins for the selected SUITE apply.
+#
+# Provenance: the sha256s are the ones Debian's own trixie/main/binary-i386
+# Packages.xz records for these versions (checked in the snapshot.debian.org
+# copy of 20260601T000000Z for libc6, the live index for gcc-14), and the
+# libraries extracted from each .deb are byte-identical to the committed
+# testfiles/lib files.  To bump: see "Bumping the pinned glibc" in README.md.
+DEBIAN_PINS="
+trixie libc6      2.41-12+deb13u3 pool/main/g/glibc/libc6_2.41-12+deb13u3_i386.deb    410dae774925cb89a959a595bb9c9766f910df9ce3fdba334544fd7f0cb04b7e 20260601T000000Z
+trixie libgcc-s1  14.2.0-19       pool/main/g/gcc-14/libgcc-s1_14.2.0-19_i386.deb    a4c71fd856d2a48a7505a087b4186e3cca23f94603c05e3fb7c799b27e72f761 20260601T000000Z
+trixie libstdc++6 14.2.0-19       pool/main/g/gcc-14/libstdc++6_14.2.0-19_i386.deb   b6020260b92a97ac33ae58a73b16f3ab31fed7632e9b861f7cd5fc393facd6ed 20260601T000000Z
+"
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -121,7 +148,7 @@ need awk
 #     stay on TLS all the way.
 # ALLOW_INSECURE_MIRROR=1 relaxes both (for a local/plain-http package cache);
 # the sha256 chain in this script is what still protects the contents then.
-for u in "$DEBIAN_MIRROR" "$MOZ_BASE"; do
+for u in "$DEBIAN_MIRROR" "$MOZ_BASE" "$SNAPSHOT_MIRROR"; do
     case "$u" in
         https://*) ;;
         *) [ "${ALLOW_INSECURE_MIRROR:-0}" = 1 ] || die "refusing non-https URL '$u' (set ALLOW_INSECURE_MIRROR=1 to override)" ;;
@@ -309,15 +336,42 @@ resolve_pkg() {
 # ---------------------------------------------------------------------------
 # 3. Fetch + unpack the packages
 # ---------------------------------------------------------------------------
+pin_lookup() {  # pin_lookup PKG -> "version\tfilename\tsha256\ttimestamp" or nothing
+    printf '%s\n' "$DEBIAN_PINS" | awk -v s="$SUITE" -v p="$1" \
+        '$1==s && $2==p { print $3 "\t" $4 "\t" $5 "\t" $6; exit }'
+}
+
 fetch_pkg() {  # fetch_pkg PKG : download, verify, dpkg-deb -x (stamped)
     pkg=$1
     entry=$(index_lookup "$pkg")
-    ver=$(printf '%s' "$entry" | cut -f1)
-    file=$(printf '%s' "$entry" | cut -f2)
-    sum=$(printf '%s' "$entry" | cut -f3)
+    pin=$(pin_lookup "$pkg")
+    if [ -n "$pin" ]; then
+        ver=$(printf '%s' "$pin" | cut -f1)
+        file=$(printf '%s' "$pin" | cut -f2)
+        sum=$(printf '%s' "$pin" | cut -f3)
+        snap=$(printf '%s' "$pin" | cut -f4)
+        cur=$(printf '%s' "$entry" | cut -f1)
+        [ "$cur" = "$ver" ] || log "$pkg pinned to $ver (committed testfiles/lib); $SUITE now has $cur (README: Bumping the pinned glibc)"
+        sources="$DEBIAN_MIRROR/$file $SNAPSHOT_MIRROR/$snap/$file"
+        what="the sha256 pinned in DEBIAN_PINS"
+    else
+        ver=$(printf '%s' "$entry" | cut -f1)
+        file=$(printf '%s' "$entry" | cut -f2)
+        sum=$(printf '%s' "$entry" | cut -f3)
+        sources="$DEBIAN_MIRROR/$file"
+        what="Packages.xz"
+    fi
     deb="$DEBS/$(basename "$file")"
-    download "$DEBIAN_MIRROR/$file" "$deb"
-    sha256_check "$deb" "$sum" || { rm -f "$deb"; die "$(basename "$deb") failed SHA256 verification (deleted; re-run)"; }
+    if [ ! -s "$deb" ]; then
+        log "fetching $(basename "$deb")"
+        for u in $sources; do
+            curl_get "$deb.part" "$u" && break
+            rm -f "$deb.part"
+        done
+        [ -s "$deb.part" ] || die "download failed: $(basename "$deb") from $sources (if the mirror redirects to plain http, see ALLOW_INSECURE_MIRROR)"
+        mv "$deb.part" "$deb"
+    fi
+    sha256_check "$deb" "$sum" || { rm -f "$deb"; die "$(basename "$deb") does not match $what (deleted; re-run)"; }
     # One directory per package; a version change replaces it wholesale so no
     # file from the previous version can survive next to the new one.
     pdir="$UNPACK/$pkg"

@@ -5739,6 +5739,7 @@ static int sys_poll(registers_t *regs) {
                  * the caller asked for it (net/unix/af_unix.c unix_poll:
                  * EPOLLHUP once sk_shutdown is SHUTDOWN_MASK). */
                 if (f->type == FD_USOCKET && usocket_hup(f->usock)) rev |= POLLHUP;
+                if (f->type == FD_SOCKET && net_socket_poll_err(f->socket)) rev |= POLLERR;
             }
             kfds[i * 2 + 1] = (kfds[i * 2 + 1] & 0xffff) | ((uint32_t)(uint16_t)rev << 16);
             if (rev) ready++;
@@ -5945,11 +5946,18 @@ static int sys_wait4(registers_t *regs) {
     return sys_waitpid(regs);
 }
 
-/* ── sys_sched_yield() — EAX=159 ────────────────────────────────────────── */
-static int sys_sched_yield(registers_t *regs) {
-    (void)regs;
-    yield();
-    return 0;
+/* ── sched_get_priority_max/min(policy) — EAX=159/160 ─────────────────────
+ * The static priority range per policy (kernel/sched/syscalls.c): 1..99 for
+ * SCHED_FIFO(1)/SCHED_RR(2), 0 for SCHED_OTHER(0)/BATCH(3)/IDLE(5)/
+ * DEADLINE(6), EINVAL otherwise.  159 used to be wired to sched_yield (and
+ * the in-tree libc's sched_yield called 159), so a caller asking for a
+ * priority range yielded and got 0 for every policy. */
+static int sys_sched_get_priority(registers_t *regs, int max) {
+    switch ((int)regs->ebx) {
+    case 1: case 2:                 return max ? 99 : 1;
+    case 0: case 3: case 5: case 6: return 0;
+    default:                        return -22;
+    }
 }
 
 /* ── sys_getrlimit / sys_setrlimit — EAX=76/75 (stubs) ──────────────────── */
@@ -5960,6 +5968,7 @@ static int sys_getrlimit(registers_t *regs) {
     if (rl) {
         uint32_t krl[2] = { 0xFFFFFFFFU, 0xFFFFFFFFU }; /* RLIM_INFINITY */
         if (resource == 3 /*RLIMIT_STACK*/) krl[0] = 8U * 1024 * 1024;
+        if (resource == 7 /*RLIMIT_NOFILE*/) krl[0] = krl[1] = MAX_FD;
         int cr = copy_to_user(rl, krl, sizeof(krl));
         if (cr < 0) return cr;
     }
@@ -5980,6 +5989,7 @@ static int sys_setrlimit(registers_t *regs) {
  * stack as RLIMIT_STACK → bogus size → pthread_create EAGAIN.  Report a real,
  * finite RLIMIT_STACK (8 MiB) and RLIM_INFINITY for everything else. */
 #define RLIMIT_STACK 3
+#define RLIMIT_NOFILE 7      /* the fd table really is MAX_FD entries */
 #define RLIM64_INFINITY 0xFFFFFFFFFFFFFFFFULL
 static int sys_prlimit64(registers_t *regs) {
     int resource          = (int)regs->ecx;
@@ -5994,6 +6004,8 @@ static int sys_prlimit64(registers_t *regs) {
         if (resource == RLIMIT_STACK) {
             rl.cur = 8ULL * 1024 * 1024;     /* 8 MiB default stack */
             rl.max = RLIM64_INFINITY;
+        } else if (resource == RLIMIT_NOFILE) {
+            rl.cur = rl.max = MAX_FD;
         } else {
             rl.cur = RLIM64_INFINITY;
             rl.max = RLIM64_INFINITY;
@@ -6014,6 +6026,8 @@ static int sys_ugetrlimit(registers_t *regs) {
         if (resource == RLIMIT_STACK) {
             krl[0] = 8U * 1024 * 1024;       /* rlim_cur = 8 MiB */
             krl[1] = 0xFFFFFFFFU;            /* rlim_max = RLIM_INFINITY */
+        } else if (resource == RLIMIT_NOFILE) {
+            krl[0] = krl[1] = MAX_FD;
         } else {
             krl[0] = 0xFFFFFFFFU;
             krl[1] = 0xFFFFFFFFU;
@@ -6734,6 +6748,8 @@ static int sys_readv(registers_t *regs) {
         fake.ecx = (uint32_t)(uintptr_t)base;
         fake.edx = (uint32_t)len;
         int n = sys_read(&fake);
+        /* Bytes already read are consumed: report them, not a later iovec's
+         * EAGAIN/EFAULT, or they are lost to the caller. */
         if (n < 0) return total ? total : n;
         total += n;
         if (n < len) break;  /* short read — don't continue */
@@ -7218,9 +7234,16 @@ static int sys_writev(registers_t *regs) {
         fake.ecx = (uint32_t)(uintptr_t)base;
         fake.edx = (uint32_t)len;
         int n = sys_write(&fake);
+        /* A short write ends the call, and bytes already written are what it
+         * returns (fs/read_write.c do_loop_readv_writev).  Carrying on to the
+         * next iovec after a short one dropped the rest of that one from the
+         * stream; returning a later iovec's EAGAIN after a partial write made
+         * the caller send those bytes again.  libxcb writes [header][image]
+         * non-blocking, so a PutImage bigger than the 64 KiB AF_UNIX ring
+         * corrupted the X stream this way whenever maeroX read it promptly. */
         if (n < 0) return total ? total : n;
         total += n;
-        if (n < len) break;                   /* short write: stop here */
+        if (n < len) break;
     }
     return total;
 }
@@ -7550,7 +7573,7 @@ static void scm_abort(usocket_t *us, uint32_t id, proc_file_t *pass, int npass) 
         for (int k = 0; k < npass; k++) fd_release(&pass[k]);
 }
 
-static int socketcall_core(int call, uint32_t *kargs) {
+static int socketcall_core_inner(int call, uint32_t *kargs) {
     /* accept4(fd, addr, addrlen, flags) is socketcall index 18 (Linux
      * SYS_ACCEPT4).  Its SOCK_CLOEXEC/SOCK_NONBLOCK apply to the NEW
      * descriptor only (net/socket.c __sys_accept4), so carry them aside and
@@ -8003,10 +8026,45 @@ static int socketcall_core(int call, uint32_t *kargs) {
         return 0;
     }
 
-    if (call == 4 || call == 5 || call == 6 || call == 7 || call == 8)
+    if (call == 6 || call == 7) {   /* getsockname / getpeername */
+        void     *uaddr = (void *)(uintptr_t)kargs[1];
+        uint32_t *ulen  = (uint32_t *)(uintptr_t)kargs[2];
+        uint32_t  klen;
+        net_sockaddr_in_t kaddr;
+        if (!ulen || copy_from_user(&klen, ulen, sizeof(klen)) < 0) return -14;
+        if ((int32_t)klen < 0) return -22;
+        int r = net_socket_getname(f->socket, call == 7, &kaddr);
+        if (r < 0) return r;
+        /* Linux copies min(len, sizeof addr) and reports the full size. */
+        if (klen > sizeof(kaddr)) klen = sizeof(kaddr);
+        if (klen && copy_to_user(uaddr, &kaddr, klen) < 0) return -14;
+        klen = sizeof(kaddr);
+        if (copy_to_user(ulen, &klen, sizeof(klen)) < 0) return -14;
+        return 0;
+    }
+
+    if (call == 4 || call == 5 || call == 8)
         return -95;
 
     return -22;
+}
+
+/* NETTRACE (include/kernel/config.h) logs every AF_INET socket call with its
+ * result: the trace that showed Firefox's socket thread asleep in a recv it
+ * had asked not to block. */
+static int socketcall_core(int call, uint32_t *kargs) {
+    int r = socketcall_core_inner(call, kargs);
+    if (NETTRACE) {
+        int inet = 0;
+        if (call == 1) inet = ((int)kargs[0] != AF_UNIX_K);
+        else if ((int)kargs[0] >= 0 && (int)kargs[0] < MAX_FD)
+            inet = current_proc->ofile[kargs[0]].type == FD_SOCKET;
+        if (inet)
+            printk("[NET] pid=%d socketcall %d (%x,%x,%x,%x) -> %d\n",
+                   current_proc->pid, call, (unsigned)kargs[0], (unsigned)kargs[1],
+                   (unsigned)kargs[2], (unsigned)kargs[3], r);
+    }
+    return r;
 }
 
 /* socketcall(102): fetch the args array from user space, then run the core. */
@@ -8144,7 +8202,8 @@ void syscall_dispatch(registers_t *regs) {
     case 132: ret = sys_getpgid(regs);         break;
     case 141: ret = sys_getdents(regs);        break;
     case 146: ret = sys_writev(regs);          break;
-    case 159: ret = sys_sched_yield(regs);     break;
+    case 159: ret = sys_sched_get_priority(regs, 1); break;
+    case 160: ret = sys_sched_get_priority(regs, 0); break;
     case 162: ret = sys_nanosleep(regs);       break;
     case 168: ret = sys_poll(regs);            break;
     case 309: ret = sys_ppoll(regs, 0);        break;  /* ppoll */

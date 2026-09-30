@@ -92,6 +92,13 @@ void net_lwip_poll(void) {
     if (!lwip_ready)
         return;
     sys_check_timeouts();
+    static int bound;
+    if (!bound && !ip4_addr_isany_val(*netif_ip4_addr(&lwip_eth0))) {
+        char b[80];
+        bound = 1;
+        net_lwip_ipv4(b, sizeof(b));
+        printk("[LWIP] eth0 bound%s\n", b);
+    }
 }
 
 int net_lwip_ipv4(char *buf, uint32_t cap) {

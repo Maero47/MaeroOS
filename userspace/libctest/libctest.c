@@ -11,6 +11,7 @@
 #include "../include/sys/stat.h"
 #include "../include/syscall.h"
 #include "../include/unistd.h"
+#include "../include/sys/uio.h"
 
 static int failures;
 
@@ -361,7 +362,46 @@ static void test_signals(void) {
     sigprocmask(SIG_SETMASK, &none, 0);
 }
 
+/* i386 numbers: 158 sched_yield, 159/160 sched_get_priority_max/min.  159
+ * used to be sched_yield in both the kernel and this libc. */
+static void test_sched(void) {
+    check(sched_yield() == 0, "sched_yield returns 0");
+    check(syscall1(159, 1) == 99 && syscall1(160, 1) == 1,
+          "sched_get_priority_max/min(SCHED_FIFO) are 99/1");
+    check(syscall1(159, 0) == 0 && syscall1(160, 0) == 0,
+          "sched_get_priority_max/min(SCHED_OTHER) are 0");
+    check(syscall1(159, 42) == -EINVAL, "sched_get_priority_max(bad policy) is EINVAL");
+}
+
+/* writev/readv on a non-blocking pipe (4 KiB): a short write ends the call
+ * and returns what was written; an error after a partial transfer is not
+ * reported over the bytes already moved. */
+static void test_rwv(void) {
+    static char a[4096 - 10], b[100], c[5], out[4200];
+    int p[2];
+    memset(a, 'a', sizeof(a)); memset(b, 'b', sizeof(b)); memset(c, 'c', sizeof(c));
+    if (pipe(p) < 0) { check(0, "pipe for writev"); return; }
+    fcntl(p[1], F_SETFL, O_NONBLOCK);
+    fcntl(p[0], F_SETFL, O_NONBLOCK);
+    struct iovec w[3] = { { a, sizeof(a) }, { b, sizeof(b) }, { c, sizeof(c) } };
+    int n = syscall3(146, p[1], (int)(uintptr_t)w, 3);          /* writev */
+    int got = (int)read(p[0], out, sizeof(out));
+    int ok = got == 4096;
+    for (int i = 0; ok && i < got; i++)
+        ok = out[i] == (i < (int)sizeof(a) ? 'a' : 'b');
+    check(n == 4096 && ok, "writev: short write stops, returns bytes written");
+
+    write(p[1], "0123456789", 10);
+    struct iovec r[2] = { { out, 10 }, { out + 10, 10 } };
+    n = syscall3(145, p[0], (int)(uintptr_t)r, 2);              /* readv */
+    check(n == 10 && !memcmp(out, "0123456789", 10),
+          "readv: EAGAIN after a full iovec returns the bytes read");
+    close(p[0]); close(p[1]);
+}
+
 int main(void) {
+    test_sched();
+    test_rwv();
     test_snprintf();
     test_malloc();
     test_asprintf();

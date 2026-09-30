@@ -3,6 +3,7 @@
 #include "net.h"
 #include "firewall.h"
 #include "../lib/string.h"
+#include "../kernel/printk.h"
 #include "../arch/i686/cpu/pit.h"
 #include "../proc/scheduler.h"
 #include "../proc/process.h"
@@ -141,7 +142,7 @@ static err_t tcp_connected_cb(void *arg, struct tcp_pcb *pcb, err_t err) {
         s->tcp_error = 0;
     } else {
         s->tcp_state = TCP_STATE_ERROR;
-        s->tcp_error = -101;
+        s->tcp_error = -111;     /* -ECONNREFUSED */
     }
     return ERR_OK;
 }
@@ -273,8 +274,11 @@ static int socket_create_locked(int domain, int type, int protocol, net_socket_t
         upcb = udp_new_ip_type(IPADDR_TYPE_V4);
     else
         tpcb = tcp_new_ip_type(IPADDR_TYPE_V4);
-    if (!upcb && !tpcb)
+    if (!upcb && !tpcb) {
+        printk("[NET] socket: lwIP has no free %s pcb\n",
+               type == SOCK_DGRAM_K ? "UDP" : "TCP");
         return -12;
+    }
 
     for (int i = 0; i < MAX_NET_SOCKETS; i++) {
         if (!sockets[i].used) {
@@ -302,6 +306,7 @@ static int socket_create_locked(int domain, int type, int protocol, net_socket_t
         }
     }
 
+    printk("[NET] socket: all %d sockets in use\n", MAX_NET_SOCKETS);
     if (upcb)
         udp_remove(upcb);
     if (tpcb)
@@ -366,9 +371,13 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
      * -EALREADY, an established connection -EISCONN. */
     preempt_disable();
     int st = s->tcp_state, have_pcb = (s->tcp != NULL), was = s->was_connected;
+    int pending = (st == TCP_STATE_ERROR && !was) ? take_error_locked(s) : 0;
     preempt_enable();
     if (st == TCP_STATE_CONNECTING) return -114;          /* -EALREADY */
     if (was) return -106;                                 /* -EISCONN */
+    /* A failed non-blocking attempt not yet collected with SO_ERROR reports
+     * its error here (inet_stream_connect -> sock_error). */
+    if (pending) return pending;
     if (!have_pcb) return -22;      /* a failed attempt released the pcb */
 
     s->tcp_state = TCP_STATE_CONNECTING;
@@ -603,6 +612,40 @@ int net_socket_write_ready(net_socket_t *s) {
         r = (s->was_connected && s->tcp && tcp_sndbuf(s->tcp) > 0) ||
             s->tcp_state == TCP_STATE_ERROR || s->tx_shut ||
             (s->was_connected && !s->tcp);
+    preempt_enable();
+    return r;
+}
+
+/* poll: a pending connection error is POLLERR (tcp_poll on sk_err). */
+int net_socket_poll_err(net_socket_t *s) {
+    return s && s->used && s->type == SOCK_STREAM_K &&
+           s->tcp_state == TCP_STATE_ERROR && s->tcp_error;
+}
+
+/* getsockname (peer = 0) / getpeername (peer = 1).  An unbound socket
+ * reports 0.0.0.0:0 like Linux's inet_getname; a peer name needs a connection
+ * (UDP: connect() having set a default destination), else ENOTCONN. */
+int net_socket_getname(net_socket_t *s, int peer, net_sockaddr_in_t *out) {
+    if (!s || !s->used || !out)
+        return -9;
+    memset(out, 0, sizeof(*out));
+    out->family = AF_INET_K;
+    preempt_disable();
+    int r = 0;
+    if (peer) {
+        if (!s->connected)
+            r = -107;
+        else {
+            out->addr = ip4_addr_get_u32(ip_2_ip4(&s->remote_addr));
+            out->port = bswap16(s->remote_port);
+        }
+    } else if (s->tcp) {
+        out->addr = ip4_addr_get_u32(ip_2_ip4(&s->tcp->local_ip));
+        out->port = bswap16(s->tcp->local_port);
+    } else if (s->udp) {
+        out->addr = ip4_addr_get_u32(ip_2_ip4(&s->udp->local_ip));
+        out->port = bswap16(s->udp->local_port);
+    }
     preempt_enable();
     return r;
 }

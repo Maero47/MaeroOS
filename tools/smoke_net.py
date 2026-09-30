@@ -230,11 +230,12 @@ def main():
             raise AssertionError(
                 f"two-step shutdown sent FIN={flags['fin']} RST={flags['rst']} "
                 "to the peer; expected a FIN and no RST")
-        # 16 half-closed fetches kept open fill the pcb pool with TIME_WAIT
-        # pcbs; the next connection recycles one.  Closing the old fds while
-        # it is live must not tear it down.
+        # 64 half-closed fetches fill the pcb pool with TIME_WAIT pcbs, the
+        # oldest 24 with their fds still open; the next connection recycles
+        # one of those.  Closing the old fds while it is live must not tear
+        # it down.
         before = len("".join(log))
-        send(proc, f"sockprobe tcptw {http_port} 16")
+        send(proc, f"sockprobe tcptw {http_port} 64")
         wait_for(proc, sel, PROMPT, log, timeout=30.0, start=before)
         recent = "".join(log)[before:]
         if "sockprobe tcptw ok" not in recent:
@@ -249,6 +250,18 @@ def main():
         recent = "".join(log)[before:]
         if "abi2probe net ok" not in recent:
             raise AssertionError("abi2probe net: socket flag/EPIPE cases failed")
+        # Non-blocking client calls: EINPROGRESS connect, SO_ERROR, the
+        # socket names, EAGAIN from an idle recv, and a refused connect.
+        closed = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        closed.bind(("0.0.0.0", 0))
+        closed_port = closed.getsockname()[1]
+        closed.close()
+        before = len("".join(log))
+        send(proc, f"sockprobe nb {http_port} {closed_port}")
+        wait_for(proc, sel, PROMPT, log, timeout=30.0, start=before)
+        recent = "".join(log)[before:]
+        if "sockprobe nb ok" not in recent:
+            raise AssertionError("non-blocking TCP client calls failed")
         before = len("".join(log))
         send(proc, f"httpget 10.0.2.2 {http_port} /index.html")
         wait_for(proc, sel, PROMPT, log, timeout=15.0, start=before)

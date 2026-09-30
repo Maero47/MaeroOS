@@ -38,22 +38,27 @@ What is proven by the automated QEMU tests in `tools/`:
 | Native coreutils-style commands, user faults | `kwprobe ok` (a user write to kernel memory dies of SIGSEGV, a user `int3` of SIGTRAP), then `uname`, `whoami`, `hostname`, `free`, `df`, `uptime`, `which` | `make smoke-cmds` |
 | ext2 disk, login/passwd/doas, permissions, init services, sessions | 152 checks including `passwd` keeping `/etc/shadow` root-only 0600, `login` dropping to `uid=1000`, `doas` ignoring a planted `./ls`, `credprobe ok`, `fsprobe ok` and `svc` state transitions | `make smoke-disk` |
 | `pkg` and the signed repo index | `tools/test_pkg_sign.py` runs the RFC 8032 vectors through the Python signer and the C verifier and rejects altered, unsigned and foreign-key indexes; in the guest, `pkg update` rejects unsigned, tampered and rolled-back indexes, installs and runs busybox, and `install` rejects a tarball whose SHA-256 does not match | `make smoke-pkg` |
-| TCP/IP over lwIP and RTL8139 | `MAEROS_HTTP_OK` fetched from a host HTTP server; `sockprobe` checks that `send` after `shutdown(SHUT_WR)` fails with `EPIPE`, a two-step shutdown ends in a FIN and no RST, and closing TIME_WAIT sockets keeps TCP working | `make smoke-net` |
+| TCP/IP over lwIP and RTL8139 | `MAEROS_HTTP_OK` fetched from a host HTTP server; `sockprobe` checks that `send` after `shutdown(SHUT_WR)` fails with `EPIPE`, a two-step shutdown ends in a FIN and no RST, closing TIME_WAIT sockets keeps TCP working, and a non-blocking client gets `EINPROGRESS`, `SO_ERROR`, `EAGAIN`, `ECONNREFUSED` and both socket names | `make smoke-net` |
 | Kernel firewall | after `fwctl enable` plus a drop rule the same fetch fails, `fwctl list` reports the firewall `enabled` with the `drop out tcp` rule, malformed rules (`/33`, an overflowing prefix, port 70000, `tcpp`) are rejected under `policy out drop`, and `fwctl flush` restores the fetch | `make smoke-fw` |
 | Dynamic linker | `DYNPROBE_OK` from a PIE loaded through musl `ld.so`; `WXPIE_OK` (the PIE's text and RELRO, libc's text and a `PROT_READ\|PROT_EXEC` library mapping are read-only) | `make smoke-dyn` |
 | External shared libraries and pthreads | `GREET_OK sum=42`, `ZLIB_OK ver=1.3`, `THREADS_OK count=200000`, `UNIX_SOCK_OK` | `make smoke-dynlib` |
 | X11 server | `XHANDSHAKE_OK`, `XDRAW_OK` (`w=320 h=200` from `GetGeometry`), `XEVENT_OK`, and `XREAL_PAINTED` from a client linked against the cross-built libX11 | `make smoke-x` |
 | GLib, Cairo, Pango, GTK3 | `GLIB_OK` (v2.78), `CAIRO_OK rect_px=0xe69919`, `PANGO_OK`, `GTK_OK init`, `GTK_WINDOW_SHOWN`, `GTK_DRAWN` (needs probe binaries a fresh clone lacks, see Testing) | `make smoke-gtk` |
+| Firefox 115.15.0esr | `ff: Firefox painted` (the browser window, about 5 s after `firefox-bin` starts); with `--web`, a page served from the host (HTML, a CSS rule, a PNG) requested and its image on screen about 3 s after Enter (needs the Firefox tree, see `ports/firefox/`) | `make smoke-firefox`, `make smoke-firefox-web` |
 
 ### What does not work
 
-- **Firefox 115.15.0esr does not reach first paint.** The prebuilt i686 ESR build loads
-  and `/disk/firefox/firefox-bin --version` prints `Mozilla Firefox 115.15.0esr` (the
-  `run-firefox` comment in the Makefile records this), but the browser stalls during
-  startup before rendering a page. Much of the Firefox-specific code left in
-  `proc/syscall.c`, `proc/scheduler.c` and `proc/usocket.c` exists to chase that stall;
-  its hot-path traces are only compiled in with `make KTRACE=1`. This is the current
-  frontier of the project, not a finished feature.
+- **Firefox 115.15.0esr is usable, not finished.** The prebuilt i686 ESR build paints
+  its window and loads pages over HTTP and HTTPS (a real `https://example.com` loads
+  through QEMU's user network, DNS and TLS included), but: text in scripts the disk has
+  no font for (it ships DejaVu Sans and Twemoji) is drawn as missing-glyph boxes; the
+  content sandbox is off (`MOZ_DISABLE_CONTENT_SANDBOX`, `security.sandbox.content.level
+  0`); startup still takes about 5 s after `firefox-bin` starts; and `ff` has to bring
+  its own profile (`testfiles/ffprofile`) that turns off first-run dialogs, telemetry
+  and add-on scans. Firefox-specific diagnostics left in `proc/syscall.c`,
+  `proc/scheduler.c` and `proc/usocket.c` are compiled in only with `make KTRACE=1`.
+  `docs/audit/firefox-first-paint.md` and `docs/perf/firefox-startup.md` record how it
+  got here.
 - **No execute protection (NX).** The kernel runs i686 page tables without PAE, which
   have no no-execute bit, so every readable user page is also executable. Write
   protection is enforced: `proc/elf.c` maps each `PT_LOAD` segment with its own
@@ -444,6 +449,7 @@ make smoke-x        # maeroX handshake, drawing and input events
 make smoke-gtk      # GLib, Cairo, Pango and a real GTK3 window
 make smoke-abi      # Linux-ABI probes (ports/abiprobes/README.md), needs i686-linux-musl-gcc
 make smoke-firefox  # does Firefox paint? (README-BROWSER.md)
+make smoke-firefox-web  # ...and load a page served from the host over the network
 ```
 
 `SMOKE_SMP=N make smoke-cmds` boots the same guest with `-smp N`. `make smoke-gtk` needs

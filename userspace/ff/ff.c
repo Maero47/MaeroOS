@@ -18,6 +18,8 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 /* Ask the kernel to dump its cycle-accounting counters (kprof, syscall 503) at
  * the instant the paint marker appears, so the profile covers exactly the
@@ -134,23 +136,44 @@ static char *const ff_envp[] = {
  * modules are on, and rewriting a 6-byte file inside disk-ff.img is a great
  * deal cheaper than rebuilding the 1 GiB image for every experiment. */
 static char  moz_log_buf[512];
+static char  moz_log_file_buf[256];
 static char *ff_env[sizeof(ff_envp) / sizeof(ff_envp[0])];
+
+/* Read a one-line override file into buf after `prefix`; 1 if it had content. */
+static int read_override(const char *path, char *buf, int cap, const char *prefix) {
+    int plen = (int)strlen(prefix);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    int r = read(fd, buf + plen, cap - plen - 1);
+    close(fd);
+    if (r <= 0) return 0;
+    memcpy(buf, prefix, plen);
+    r += plen;
+    while (r > plen && (buf[r - 1] == '\n' || buf[r - 1] == '\r'))
+        r--;
+    buf[r] = '\0';
+    return r > plen;
+}
 
 static char *const *build_env(void) {
     unsigned n = 0;
     for (; ff_envp[n]; n++) ff_env[n] = ff_envp[n];
     ff_env[n] = 0;
 
-    int fd = open("/disk/ffcfg/ffmozlog", O_RDONLY);
-    if (fd < 0) return ff_env;
-    int r = read(fd, moz_log_buf + 8, sizeof(moz_log_buf) - 9);
-    close(fd);
-    if (r <= 0) return ff_env;
-    memcpy(moz_log_buf, "MOZ_LOG=", 8);
-    r += 8;
-    while (r > 8 && (moz_log_buf[r - 1] == '\n' || moz_log_buf[r - 1] == '\r'))
-        r--;
-    moz_log_buf[r] = '\0';
+    /* /disk/ffcfg/ffmozlogfile moves the log onto the ext2 disk, where it
+     * survives the run and can be read back with debugfs after a page load
+     * (the stall dump below only fires when nothing paints). */
+    if (read_override("/disk/ffcfg/ffmozlogfile", moz_log_file_buf,
+                      sizeof(moz_log_file_buf), "MOZ_LOG_FILE="))
+        for (unsigned i = 0; i < n; i++)
+            if (strncmp(ff_env[i], "MOZ_LOG_FILE=", 13) == 0) {
+                ff_env[i] = moz_log_file_buf;
+                printf("ff: %s\n", moz_log_file_buf);
+            }
+
+    if (!read_override("/disk/ffcfg/ffmozlog", moz_log_buf,
+                       sizeof(moz_log_buf), "MOZ_LOG="))
+        return ff_env;
     for (unsigned i = 0; i < n; i++)
         if (strncmp(ff_env[i], "MOZ_LOG=", 8) == 0) {
             ff_env[i] = moz_log_buf;
@@ -247,17 +270,39 @@ static void dump_tail(const char *path, int maxbytes) {
     close(fd);
 }
 
+static int x_listening(void) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    strcpy(a.sun_path, "/tmp/.X11-unix/X0");
+    int ok = connect(fd, (struct sockaddr *)&a,
+                     (socklen_t)(sizeof(a.sun_family) + strlen(a.sun_path))) == 0;
+    close(fd);
+    return ok;
+}
+
 int main(void) {
     char *const *envp = build_env();
     printf("Starting maeroX X server in a desktop slot...\n");
+    /* -T: maeroX's XT trace on the serial line (smoke-firefox reads it).
+     * -D adds four half-resolution frame dumps in base64 (1 MB of serial
+     * each, for tools/ff_dump_capture.py); they land during the first seconds
+     * after paint and stall everything behind the UART, so they are opt-in
+     * through /disk/ffcfg/ffdump.  smoke-firefox takes QEMU screendumps. */
+    int dump = access("/disk/ffcfg/ffdump", F_OK) == 0;
     int pid = fork();
     if (pid == 0) {
-        char *a[] = { "/disk/maerox", "3", "-D", (char *)0 };
+        char *a[] = { "/disk/maerox", "3", dump ? "-D" : "-T", (char *)0 };
         execve(a[0], a, envp);
         _exit(127);
     }
-    usleep(1000000);   /* give maeroX ~1s to start listening */
-    usleep(1000000);
+    /* Wait until maeroX accepts connections (at most 5 s) rather than a fixed
+     * 2 s: it listens within a few hundred ms.  The bound name has no node in
+     * the filesystem, so probe it with connect(). */
+    for (int i = 0; i < 100 && !x_listening(); i++)
+        usleep(50000);
 
     mkdir("/tmp/ffhome", 0755);      /* writable $HOME for .mozilla/profiles.ini */
     mkdir("/tmp/fontcache", 0777);   /* fonts.conf <cachedir>; fontconfig needs

@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <gui.h>
 #include <signal.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -207,9 +208,33 @@ static const char *atom_name(uint32_t id, int *len) {
 }
 static char      status[96] = "maeroX :0 - listening, 0 clients";
 
-static void sleep_ms(long ms) {
-    struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
-    nanosleep(&ts, 0);
+static unsigned now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned)ts.tv_sec * 1000u + (unsigned)(ts.tv_nsec / 1000000L);
+}
+
+/* Sleep until an X client sends something, a client connects, a client with
+ * queued output can take more of it, or ms pass.
+ * A request that needs a reply (InternAtom, GetProperty, QueryExtension, a
+ * sync) blocks its client until we answer, and GTK starts up on hundreds of
+ * them: sleeping a fixed 12 ms per loop made every one of them wait out the
+ * rest of that sleep (two 10 ms ticks, rounded up).  The desktop's event FIFO
+ * stays on the timeout — a FIFO whose writer is not open polls readable. */
+static void wait_for_clients(int ms) {
+    struct pollfd pfd[1 + MAX_XCLIENTS];
+    int n = 0;
+    if (listen_fd >= 0) { pfd[n].fd = listen_fd; pfd[n].events = POLLIN; pfd[n].revents = 0; n++; }
+    for (int i = 0; i < MAX_XCLIENTS; i++) {
+        xclient_t *c = &clients[i];
+        if (!c->used || c->dead) continue;
+        short ev = 0;
+        if (c->inlen < INBUF_SIZE) ev |= POLLIN;
+        if (c->outlen > 0) ev |= POLLOUT;     /* out_flush can make progress */
+        if (!ev) continue;
+        pfd[n].fd = c->fd; pfd[n].events = ev; pfd[n].revents = 0; n++;
+    }
+    poll(pfd, (unsigned long)n, ms);
 }
 
 /* ── little-endian readers (clients are LSBFirst on x86) ─────────────────── */
@@ -2198,8 +2223,8 @@ int main(int argc, char *argv[]) {
     xt("XT keychannel: %s (%s)\n", keyfifo_fd >= 0 ? "OPEN" : "absent",
        access(KEYFIFO_PATH, F_OK) == 0 ? "node present" : "no node");
 
-    unsigned tick = 0;
-    unsigned last_dump_tick = 0;
+    unsigned last_hist = now_ms();
+    unsigned last_dump = last_hist;
     while (headless || !gui.closed) {
         int events = headless ? 0 : gui_poll(&gui);
         keyfifo_poll();
@@ -2211,12 +2236,16 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < MAX_XCLIENTS; i++)
             if (clients[i].used && clients[i].dead) client_close(&clients[i]);
         if (!headless && (dirty || events > 0)) render();
-        if (trace_fd >= 0 && ++tick % 167 == 0) xt_dump_hist();   /* ~every 2s */
+        unsigned now = now_ms();
+        if (trace_fd >= 0 && now - last_hist >= 2000) {   /* every 2 s */
+            xt_dump_hist();
+            last_hist = now;
+        }
         /* Frame-dump mode: once Firefox has painted (putimage_n>0) and a full-
          * size toplevel is mapped, stream the composited frame every ~2s, a few
          * times (first paint is often partial; later ones are settled). */
         if (dumpmode && dumps_done < 4 && putimage_n > 0 &&
-            (tick - last_dump_tick) >= 167) {
+            now - last_dump >= 2000) {
             int have_top = 0;
             for (int ci = 0; ci < MAX_XCLIENTS && !have_top; ci++) {
                 if (!clients[ci].used) continue;
@@ -2226,9 +2255,9 @@ int main(int argc, char *argv[]) {
                         { have_top = 1; break; }
                 }
             }
-            if (have_top) { frame_dump(); dumps_done++; last_dump_tick = tick; }
+            if (have_top) { frame_dump(); dumps_done++; last_dump = now; }
         }
-        sleep_ms(12);
+        wait_for_clients(12);
     }
 
     close(listen_fd);

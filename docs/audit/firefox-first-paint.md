@@ -22,6 +22,34 @@ and each carries a probe program (section 8) that proves or disproves it in QEMU
 
 ---
 
+## Status (2026-09-30): the stall is gone; page loads were the next wall
+
+Firefox now paints on every boot measured: 9 of 9 on `main` at `b69c099`
+(`-smp 1` and `-smp 2`), and 60 of 60 `smoke-firefox --web` boots on
+`yonet/firefox` (the last 20 also loaded the page every time). The fixes that got it there are the ones this audit ranked
+(thread-group signals, the vfork model, the futex and wake-up paths) plus
+the startup profile in `docs/perf/firefox-startup.md`. The sections below
+are kept as the record of that investigation; read their `file:line`
+references against `8da3cde`.
+
+The frontier moved to loading a page, which nothing had tried. With a NIC
+attached, a typed URL never reached the server. Kernel defects stood in
+the way, each found from a trace (`make KTRACE=1` now logs every AF_INET
+socket call) and each covered by a probe:
+
+| Symptom | Cause | Probe |
+|---|---|---|
+| NSPR dropped every connection right after `connect` | `getsockname`/`getpeername` on AF_INET returned `EOPNOTSUPP` | `sockprobe nb` (`smoke-net`) |
+| the socket thread went to sleep for good | `O_NONBLOCK` never reached TCP: `recv` on an idle keep-alive connection blocked the one thread doing all of necko's I/O; `connect` blocked instead of `EINPROGRESS`; no `SO_ERROR` | `sockprobe nb` |
+| the browser died seconds after the page arrived | `[proc] table FULL (128/128)` and `EMFILE` in the parent once a fresh web content process started; the failed clone/memfd became a NULL write | (limits: 256 threads, 512 fds) |
+| an image on the page never requested (4 of 20 boots) | lwIP's 16 TCP pcbs used up by background TLS sessions and lingering closed connections | `[NET] socket: lwIP has no free TCP pcb` is now logged; pool 64 |
+| the X stream corrupted, the window froze | `writev` carried on past a short write and returned `EAGAIN` over bytes already written; libxcb's non-blocking `[header][image]` writes hit it whenever maeroX read promptly | `libctest` (`smoke-toybox`) |
+
+With those fixed, a page served from the host renders (HTML, CSS, a PNG) and
+`https://example.com` loads over the real network. `make smoke-firefox-web`
+checks the first. What remains is recorded in the "What is left" section of
+`docs/perf/firefox-startup.md`.
+
 ## 1. Executive summary
 
 > **Errata after measurement (2026-09-08).** The section 8 probes have since

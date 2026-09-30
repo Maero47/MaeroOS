@@ -35,5 +35,7 @@ int net_socket_recvfrom(net_socket_t *s, void *buf, uint32_t len,
 /* SO_ERROR: the pending error (a negative errno, or 0), cleared by reading. */
 int net_socket_take_error(net_socket_t *s);
 int net_socket_shutdown(net_socket_t *s, int how);
+int net_socket_getname(net_socket_t *s, int peer, net_sockaddr_in_t *out);
 int net_socket_read_ready(net_socket_t *s);
 int net_socket_write_ready(net_socket_t *s);
+int net_socket_poll_err(net_socket_t *s);

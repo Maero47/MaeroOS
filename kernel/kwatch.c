@@ -16,18 +16,16 @@
 #define TICKS_PER_SEC   100u
 #define STALL_TICKS     (KWATCH_STALL_SEC * TICKS_PER_SEC)
 
-#define SYS_SCHED_YIELD_A  158
-#define SYS_SCHED_YIELD_B  159
+#define SYS_SCHED_YIELD  158
 
-/* Syscalls that are not progress.  Both respawnprobe services run
- * `while (1) sched_yield()`, which keeps the raw syscall counter climbing at
- * roughly 800k/s no matter how dead everything else is; counting those as
- * progress would make this watchdog unable to fire on the one workload it
- * exists for. */
+/* Syscalls that are not progress.  A thread spinning in
+ * `while (1) sched_yield()` keeps the raw syscall counter climbing at
+ * hundreds of thousands a second no matter how dead everything else is (the
+ * heartbeat test service did exactly that until it was made to sleep);
+ * counting those as progress would make this watchdog unable to fire. */
 static uint32_t progress_count(void) {
     return (uint32_t)kprof_ev[KPE_SYSCALL]
-         - kprof_syscall_count(SYS_SCHED_YIELD_A)
-         - kprof_syscall_count(SYS_SCHED_YIELD_B);
+         - kprof_syscall_count(SYS_SCHED_YIELD);
 }
 
 static uint32_t g_last_sysc;      /* syscall counter at the last movement  */
@@ -158,8 +156,7 @@ void kwatch_dump(const char *tag) {
            tag, (unsigned)++g_stalls,
            (unsigned)(pit_ticks() / 100u), (unsigned)(pit_ticks() % 100u),
            (unsigned)kprof_ev[KPE_SYSCALL],
-           (unsigned)(kprof_syscall_count(SYS_SCHED_YIELD_A) +
-                      kprof_syscall_count(SYS_SCHED_YIELD_B)),
+           (unsigned)kprof_syscall_count(SYS_SCHED_YIELD),
            (unsigned)kprof_ev[KPE_CTXSW], (unsigned)kprof_ev[KPE_WAKE]);
     {
         int locked = 0, depth = 0;

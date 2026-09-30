@@ -624,7 +624,8 @@ handler was 4.6 s and is now 0.22 s; and the scheduler, which was 5 % of a
 startup, is now the largest single bucket — not because it got slower but
 because of what it now has to absorb:
 
-* **The yield storm.** Firefox spins on `sched_yield`, and now that a yield is
+* **The yield storm.** *(Corrected in round four below: the spinner was the
+  `heartbeat` test service, not Firefox.)* Firefox spins on `sched_yield`, and now that a yield is
   cheap it spins far faster: **299 613 calls before, 14.5 million after**. The
   spin is bounded by what it waits for, not by how fast we serve it, so the
   count rose to fill the same wall time. Those 14.5 M context switches are the
@@ -645,3 +646,110 @@ because of what it now has to absorb:
   fault distribution that is 90 % scattered is a bet, not a win.
 * **`exit_group` 2.37 s over 9 calls.** Tearing down an address space costs
   260 ms. Nothing else in the profile is that concentrated.
+
+## Round four (2026-09-30): after the paint
+
+`main` at `b69c099` already painted: 9 of 9 boots (`-smp 1` and `-smp 2`,
+four at a time), first paint 29.2-29.8 s and 31.8-32.6 s. So this round
+measured the next thing a browser is for, loading a page. `smoke-firefox
+--web` (`make smoke-firefox-web`) serves a page from the harness (HTML, a
+CSS rule, a 96x96 pure-red PNG), types its URL after the paint and times
+Enter -> request -> image request -> red block found in a screendump.
+
+On `b69c099` the page was never requested. The four kernel defects behind
+that are in `docs/audit/firefox-first-paint.md` (status section). Once it
+loaded, it took about 40 s, and the profile had three surprises.
+
+### The yield storm was a test service
+
+`sched_yield` was never Firefox. `/etc/services` starts `respawnprobe` as the
+`heartbeat` service, and once respawned it sat in `while (1) sched_yield()`
+for the life of the machine, in every desktop boot. (It also spun on
+syscall 159, which is `sched_get_priority_max` on i386; the kernel and the
+in-tree libc had both wired 159 to yield.) It now sleeps. KTRACE=1, at
+t = 60 s of a `--web` run:
+
+| | before | after |
+|---|---:|---:|
+| `sched` | 25.1 s | 0.07 s |
+| `idle` | 0 | 37.2 s |
+| context switches | 17.1 M | 100 k |
+| syscalls | 17.6 M | 567 k |
+
+### Page loads waited on maeroX's sleep
+
+maeroX slept a fixed 12 ms (two ticks) between passes of its main loop, so
+every X request a client blocks on (InternAtom, GetProperty, a sync) waited
+out the rest of the sleep. It now blocks in `poll()` on its listener and
+client sockets, 12 ms at most. That exposed a kernel bug the sleep had been
+hiding: `writev` went on past a short write and returned `EAGAIN` over bytes
+already written, and libxcb's non-blocking `[header][image]` writes of a
+PutImage bigger than the 64 KiB AF_UNIX ring then desynchronised the X
+stream. Fixed, with a probe in `libctest`.
+
+| Enter -> | before (3 runs) | after (9 runs) |
+|---|---:|---:|
+| page requested | 14-19 s | 0.0-0.1 s |
+| image on screen | 40.2-47.0 s | 3.1-3.2 s (3 s sampling), 1.0-2.4 s with 1 s sampling |
+
+### Disk: bus-master DMA, then read-ahead
+
+With the storm gone, the PIO disk was 4.67 s of the ~6 s from
+`firefox-bin`'s exec to its paint mark. Reads now use PCI bus-master DMA
+(`drivers/ata.c`, READ DMA through a .bss bounce buffer). The same 27 640
+reads cost 2.12 s instead of 4.67 s, and what is left is per command
+(~75 us), not per sector. That reverses the round-three verdict on
+read-ahead: a miss now continues the same command over up to 32 blocks
+that follow it on disk and in the file (`fs/ext2.c`), and the reads before
+paint drop to 7 639 (31 % more sectors, `ata` 1.11 s).
+
+Two traps on the way. A 64 KiB-aligned DMA buffer in .bss raised the ELF
+data segment's alignment, the linker padded its file offset, and the
+multiboot loader (which copies the file linearly) put `.data` in the wrong
+place: `init` came up as pid 0. The buffer is page aligned and the PRD
+table splits at 64 KiB lines instead. And a KTRACE profile of a page load
+blamed 18 s on `socketcall`, all of it the per-call `[NET]` trace line:
+QEMU's UART paces output at 115200 baud, ~87 us a character, so one line
+cost its syscall ~5 ms. That trace is now `NETTRACE`, off unless asked for.
+
+### Numbers
+
+`make smoke-firefox` counts from QEMU start and includes about 10 s that is
+not Firefox: boot, the desktop's `ffauto` delay (120 passes of its loop) and,
+until this round, `ff` sleeping 2 s before starting Firefox (it now waits for
+maeroX's socket, ~0.2 s). "Launcher" below is `ff` starting.
+
+| Tree (four boots at a time) | first paint | launcher -> paint |
+|---|---:|---:|
+| `b69c099` (`main`) | 29.2-29.8 s | 16.7-17.2 s |
+| + heartbeat sleeps, maeroX poll, writev | 28.0-33.3 s (20 boots) | 15.4-19.5 s |
+| + `ff` waits for the socket | 26.4-27.2 s | 13.5-14.1 s |
+| + DMA | 24.2-24.8 s | 11.3-11.9 s |
+| + read-ahead (A/B, two at a time) | 21.3-23.9 s vs 22.5-25.5 s | 9.3-10.9 s vs 10.2-12.2 s |
+
+The final tree (`6a8a74a`), twenty `--web` boots four at a time: **20/20 PASS**,
+first paint 22.1-27.4 s (launcher -> paint 9.9-14.0 s), image on screen
+1.2-3.5 s after Enter. Two `-smp 2` boots: 23.4 and 23.6 s, 1.1 and 2.4 s.
+The batch before the last fix had 4 of 20 FAIL with the image never
+requested: lwIP had only 16 TCP pcbs, which Firefox's background TLS
+sessions plus lingering closed connections used up (`[NET] socket: lwIP has
+no free TCP pcb`); now 64.
+
+### What is left
+
+* **Before paint, ~5 s of Firefox**: user ~1.0 s, syscalls ~1.3 s (`execve`
+  30 ms a call over 17, `mmap2` population 0.5 s, `mprotect` 110 us a call),
+  `ata` 1.1 s, page faults 0.36 s, the rest waits.
+* **The heap walk.** `kmalloc` is first fit over every block, used or free,
+  with interrupts off: 23 M blocks stepped over before paint (~1 050 per
+  call, counted by the new `ev kmalloc= heap_walk=` line). A free-only list
+  or size classes would remove it.
+* **Enter can be lost.** Twice in eleven `--web` runs before the maeroX fix,
+  Firefox received the Enter key (maeroX's trace shows it delivered) and did
+  not navigate: the URL bar still waiting on its query for the typed text on a
+  busy main thread. Not seen in the 30+ runs since; the harness does not
+  retry, so it would show as a FAIL.
+* **Fonts.** `https://example.com` loads over the real network (DNS, TLS),
+  but its text is drawn as missing-glyph boxes. The disk has DejaVu Sans and
+  Twemoji only; not investigated further.
+
