@@ -90,6 +90,14 @@ def main():
         recent = "".join(log)[before:]
         if "sockprobe udp ok" not in recent:
             raise AssertionError("socket ABI probe failed")
+        # send() after shutdown(SHUT_WR) must fail with EPIPE promptly,
+        # not sleep forever waiting for send-buffer space.
+        before = len("".join(log))
+        send(proc, f"sockprobe tcpshut {http_port}")
+        wait_for(proc, sel, PROMPT, log, timeout=10.0, start=before)
+        recent = "".join(log)[before:]
+        if "sockprobe tcpshut ok" not in recent:
+            raise AssertionError("send after shutdown(SHUT_WR) did not fail with EPIPE")
         before = len("".join(log))
         send(proc, f"httpget 10.0.2.2 {http_port} /index.html")
         wait_for(proc, sel, PROMPT, log, timeout=15.0, start=before)

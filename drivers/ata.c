@@ -1,6 +1,7 @@
 #include "ata.h"
 #include "../kernel/printk.h"
 #include <kernel/kprof.h>
+#include "../arch/i686/cpu/tsc.h"
 #include <io.h>
 #include <stdint.h>
 
@@ -86,28 +87,85 @@ static inline void ata_settle(void) {
     inb(ATA_ALT);
 }
 
-/* Wait until BSY clears; return -1 on timeout */
-static int ata_wait_bsy(void) {
-    for (int i = 0; i < 0x100000; i++) {
-        uint8_t s = inb(ATA_STATUS);
-        if (!(s & ATA_SR_BSY))
-            return 0;
+/*
+ * Command timeouts are wall-clock, not a fixed number of status reads.  A read
+ * costs anything from ~1 us on hardware to far more under emulation, and some
+ * commands are slow when nothing is wrong: FLUSH CACHE on QEMU's default
+ * writeback cache is a host fdatasync, which a busy host can hold for seconds,
+ * and a real drive may spin up or flush for tens of seconds.  Failing those
+ * turned a slow but successful write into an ext2 I/O error.
+ *
+ * The transactions run with interrupts off (see ata_irq_save), so the PIT tick
+ * cannot advance inside them; the deadline is measured on the TSC instead,
+ * which keeps counting.  Before the TSC is calibrated (ata_init runs before
+ * the PIT is even programmed) a status-read budget stands in, sized for at
+ * least the same time on hardware.
+ */
+#define ATA_TIMEOUT_MS        10000   /* BSY / DRQ for ordinary commands */
+#define ATA_FLUSH_TIMEOUT_MS  30000   /* FLUSH CACHE */
+
+typedef struct {
+    uint64_t end;          /* TSC deadline, or 0 when uncalibrated */
+    uint32_t spins, max_spins;
+} ata_timer_t;
+
+static inline uint64_t ata_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static void ata_timer_start(ata_timer_t *t, uint32_t ms) {
+    uint32_t cpt = tsc_cycles_per_tick();          /* cycles per 10 ms */
+    t->spins = 0;
+    if (cpt) {
+        t->end = ata_rdtsc() + (uint64_t)cpt * (ms / 10u);
+        t->max_spins = 0;
+    } else {
+        t->end = 0;
+        t->max_spins = ms * 1000u;                 /* >= 1 us per status read */
     }
+}
+
+static int ata_timer_expired(ata_timer_t *t) {
+    if (t->end)
+        return ata_rdtsc() >= t->end;
+    return ++t->spins > t->max_spins;
+}
+
+/* Wait until BSY clears; return -1 on timeout */
+static int ata_wait_bsy_ms(uint32_t ms) {
+    ata_timer_t t;
+    ata_timer_start(&t, ms);
+    do {
+        if (!(inb(ATA_STATUS) & ATA_SR_BSY))
+            return 0;
+    } while (!ata_timer_expired(&t));
     return -1;  /* timeout */
+}
+
+static int ata_wait_bsy(void) {
+    return ata_wait_bsy_ms(ATA_TIMEOUT_MS);
 }
 
 /* Wait for the end of a non-data command (or the last sector of a write) and
  * report its outcome: -1 on timeout, or when the drive set ERR or DF. */
-static int ata_wait_done(void) {
-    if (ata_wait_bsy() < 0)
+static int ata_wait_done_ms(uint32_t ms) {
+    if (ata_wait_bsy_ms(ms) < 0)
         return -1;
     return (inb(ATA_STATUS) & (ATA_SR_ERR | ATA_SR_DF)) ? -1 : 0;
+}
+
+static int ata_wait_done(void) {
+    return ata_wait_done_ms(ATA_TIMEOUT_MS);
 }
 
 /* Wait until DRQ is set (data ready); return -1 on error.  ERR, DF and DRQ are
  * only meaningful once BSY has cleared, so a busy status is just polled past. */
 static int ata_wait_drq(void) {
-    for (int i = 0; i < 0x100000; i++) {
+    ata_timer_t t;
+    ata_timer_start(&t, ATA_TIMEOUT_MS);
+    do {
         uint8_t s = inb(ATA_STATUS);
         if (s & ATA_SR_BSY)
             continue;
@@ -115,7 +173,7 @@ static int ata_wait_drq(void) {
             return -1;
         if (s & ATA_SR_DRQ)
             return 0;
-    }
+    } while (!ata_timer_expired(&t));
     return -1;  /* timeout */
 }
 
@@ -330,7 +388,7 @@ int ata_write(uint32_t lba, uint8_t count, const void *buf) {
     /* Flush the write cache, and fail the write if the flush did not land. */
     outb(ATA_CMD, ATA_CMD_FLUSH);
     ata_delay();
-    if (ata_wait_done() < 0)
+    if (ata_wait_done_ms(ATA_FLUSH_TIMEOUT_MS) < 0)
         goto out;
     rc = 0;
 out:

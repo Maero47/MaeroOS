@@ -57,6 +57,7 @@ struct net_socket {
     struct udp_pcb *udp;
     struct tcp_pcb *tcp;
     int connected;
+    int tx_shut;        /* shutdown(SHUT_WR/SHUT_RDWR) done: send is EPIPE */
     int tcp_state;
     int tcp_error;
     uint8_t tcp_rx[TCP_RX_SIZE];
@@ -338,6 +339,8 @@ static int socket_sendto_locked(net_socket_t *s, const void *buf, uint32_t len,
     if (!s || !s->used || !buf)
         return -9;
     if (s->type == SOCK_STREAM_K) {
+        if (s->tx_shut)
+            return -32;   /* -EPIPE, as Linux after SHUT_WR */
         if (!s->connected || !s->tcp)
             return -107;
         if (len == 0)
@@ -345,6 +348,7 @@ static int socket_sendto_locked(net_socket_t *s, const void *buf, uint32_t len,
         uint32_t left = len;
         const uint8_t *p = (const uint8_t *)buf;
         uint32_t sent = 0;
+        int err = -11;
         while (left > 0) {
             /* Clamp in 32 bits: a (uint16_t) cast of left would turn a
              * multiple of 64 KiB into a 0-byte write that tcp_write() accepts,
@@ -358,15 +362,23 @@ static int socket_sendto_locked(net_socket_t *s, const void *buf, uint32_t len,
             if (chunk > 1460)
                 chunk = 1460;
             err_t e = tcp_write(s->tcp, p, (u16_t)chunk, TCP_WRITE_FLAG_COPY);
-            if (e != ERR_OK)
+            /* Only ERR_MEM (send buffer or segment queue full) is worth
+             * waiting on; the blocking caller sleeps and retries on -EAGAIN.
+             * Anything else (ERR_CONN once the pcb is past ESTABLISHED/
+             * CLOSE_WAIT, e.g. after a FIN went out) never clears, and
+             * reporting it as -EAGAIN left a blocking send asleep forever. */
+            if (e != ERR_OK) {
+                if (e != ERR_MEM)
+                    err = -32;   /* -EPIPE */
                 break;
+            }
             tcp_output(s->tcp);
             p += chunk;
             left -= chunk;
             sent += chunk;
             net_poll_all();
         }
-        return sent ? (int)sent : -11;
+        return sent ? (int)sent : err;
     }
     if (len > UDP_PACKET_MAX)
         return -90;
@@ -481,8 +493,29 @@ static int socket_shutdown_locked(net_socket_t *s, int how) {
         return -107;
     int shut_rx = (how == 0 || how == 2);
     int shut_tx = (how == 1 || how == 2);
+    if (shut_rx && shut_tx) {
+        /* For the raw API, shutting down both directions IS tcp_close: the
+         * pcb may be freed on the spot and must not be referenced again.
+         * Keeping s->tcp made a later close() tcp_close it a second time.
+         * Detach and close exactly as the release path does. */
+        tcp_arg(s->tcp, NULL);
+        tcp_recv(s->tcp, NULL);
+        tcp_err(s->tcp, NULL);
+        tcp_poll(s->tcp, NULL, 0);
+        if (tcp_close(s->tcp) != ERR_OK)
+            tcp_abort(s->tcp);
+        s->tcp = NULL;
+        s->connected = 0;
+        s->tcp_state = TCP_STATE_CLOSED;
+        s->tx_shut = 1;
+        return 0;
+    }
     err_t e = tcp_shutdown(s->tcp, shut_rx, shut_tx);
-    return e == ERR_OK ? 0 : -107;
+    if (e != ERR_OK)
+        return -107;
+    if (shut_tx)
+        s->tx_shut = 1;
+    return 0;
 }
 
 /*
