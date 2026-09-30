@@ -4,6 +4,9 @@ and capture maeroX's serial FRAME DUMPS (base64 half-res RGB between FFDUMP /
 FFDUMPEND markers), decoding each to a PNG.  This makes the proven-but-headless
 paint (putimg>0, no framebuffer) actually viewable without the flaky ISO path.
 
+ff only asks maeroX for the dumps (-D) when /disk/ffcfg/ffdump exists on the
+disk (e.g. `debugfs -w -R "write /dev/null ffcfg/ffdump" disk-ff.img`).
+
 Usage: python3 tools/ff_dump_capture.py [run_seconds]
 Writes /tmp/ff_dump_N.png for each frame dumped.
 """

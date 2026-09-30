@@ -271,9 +271,15 @@ static void dump_tail(const char *path, int maxbytes) {
 int main(void) {
     char *const *envp = build_env();
     printf("Starting maeroX X server in a desktop slot...\n");
+    /* -T: maeroX's XT trace on the serial line (smoke-firefox reads it).
+     * -D adds four half-resolution frame dumps in base64 (1 MB of serial
+     * each, for tools/ff_dump_capture.py); they land during the first seconds
+     * after paint and stall everything behind the UART, so they are opt-in
+     * through /disk/ffcfg/ffdump.  smoke-firefox takes QEMU screendumps. */
+    int dump = access("/disk/ffcfg/ffdump", F_OK) == 0;
     int pid = fork();
     if (pid == 0) {
-        char *a[] = { "/disk/maerox", "3", "-D", (char *)0 };
+        char *a[] = { "/disk/maerox", "3", dump ? "-D" : "-T", (char *)0 };
         execve(a[0], a, envp);
         _exit(127);
     }
