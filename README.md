@@ -98,9 +98,9 @@ What is proven by the automated QEMU tests in `tools/`:
   RTC, GDT/TSS/IDT/FPU, PIC, VGA, physical memory, paging, LAPIC, framebuffer, heap,
   VFS, initrd, PCI, network, ATA/ext2, tmpfs, devfs, procfs, scheduler, input, PIT,
   application processors, then `/disk/init` or `/init`.
-- About 27,000 lines of C, headers and assembly across the kernel directories, of which
-  `proc/syscall.c` is about 8,100.
-- Limits in `include/kernel/config.h`: `MAX_PROCS` 128, `MAX_FD` 128, 32 KiB kernel
+- About 30,000 lines of C, headers and assembly across the kernel directories, of which
+  `proc/syscall.c` is about 8,800.
+- Limits in `include/kernel/config.h`: `MAX_PROCS` 256, `MAX_FD` 512, 32 KiB kernel
   stacks, a 256 MiB kernel heap window at `0xD0000000`, 64-page user stacks below
   `0xC0000000`.
 
@@ -183,7 +183,7 @@ keyboard and mouse (`keyboard.c`, `mouse.c`), CMOS RTC (`rtc.c`) and 16550 seria
 
 ### Userland
 
-`userspace/` is about 30,000 lines across 206 source files, built with the same
+`userspace/` is about 34,000 lines across 219 source files, built with the same
 `i686-elf-gcc` and
 linked against its own freestanding libc (`userspace/libc/`: syscall stubs, stdio, stdlib,
 string, dirent, termios, sockets, a DNS resolver, pthreads and a toybox compatibility
