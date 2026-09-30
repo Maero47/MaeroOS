@@ -168,7 +168,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    dir = access("/etc/shadow", R_OK) == 0 ? "/etc" : "/disk/etc";
+    dir = access("/etc/shadow", F_OK) == 0 ? "/etc" : "/disk/etc";  /* exists? */
     snprintf(shadow, sizeof(shadow), "%s/shadow", dir);
     snprintf(tmp, sizeof(tmp), "%s/shadow.tmp", dir);
     snprintf(backup, sizeof(backup), "%s/shadow-", dir);

@@ -115,6 +115,10 @@ typedef struct {
     uint32_t npages;
 } shm_map_t;
 
+/* Supplementary groups a process may hold.  Linux allows NGROUPS_MAX (65536);
+ * setgroups() with more than this is -EINVAL here. */
+#define PROC_NGROUPS_MAX 32
+
 /* ── Process control block ──────────────────────────────────────────────── */
 
 struct proc {
@@ -277,6 +281,11 @@ struct proc {
      * unprivileged setuid()/setresuid() may only move among real, effective
      * and saved.  Inherited across fork/clone. */
     uint32_t         uid, gid, euid, egid, suid, sgid;
+    /* Supplementary group list (Linux cred->group_info): setgroups() sets it,
+     * fork/clone copy it, exec keeps it.  A file whose group is any of these
+     * is accessed with its group permission bits. */
+    uint32_t         ngroups;
+    uint32_t         groups[PROC_NGROUPS_MAX];
     /* Set by execve, clear in a fresh fork (Linux !PF_FORKNOEXEC): a parent
      * may no longer setpgid() a child that has exec'd (-EACCES). */
     int              did_exec;

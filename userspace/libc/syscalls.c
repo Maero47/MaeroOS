@@ -26,43 +26,19 @@ int write(int fd, const void *buf, int n) {
     return __chkerr(syscall3(4, fd, (int)buf, n));
 }
 
-/* The kernel's open(5) ignores the mode argument: a created file always gets
- * 0666 & ~umask.  So libc does the rest.  O_EXCL is enforced by the kernel
- * itself (atomically, a dangling symlink counting as existing); the lstat()
- * here only answers EEXIST early, with the same rule, and the flag is still
- * passed down so a concurrent creator loses the race cleanly.  For a new file
- * the umask is narrowed around the call so the kernel never creates it more
- * open than `mode` allows, and bits 0666 cannot express (execute, setuid...)
- * are added with fchmod() afterwards. */
+/* The kernel creates a file with `mode & ~umask` and enforces O_EXCL itself
+ * (atomically, a dangling symlink counting as existing), so this is a plain
+ * system call; the mode argument is only read when O_CREAT is given. */
 int open(const char *path, int flags, ...) {
-    struct stat st;
-    int mode, old_mask, fd, want;
+    int mode = 0;
 
-    if (!(flags & O_CREAT))
-        return __chkerr(syscall3(5, (int)path, flags, 0));
-
-    __builtin_va_list ap;
-    __builtin_va_start(ap, flags);
-    mode = __builtin_va_arg(ap, int) & 07777;
-    __builtin_va_end(ap);
-
-    if (lstat(path, &st) == 0) {
-        if (flags & O_EXCL) { errno = 17; return -1; }   /* EEXIST */
-        return __chkerr(syscall3(5, (int)path, flags, mode));
+    if (flags & O_CREAT) {
+        __builtin_va_list ap;
+        __builtin_va_start(ap, flags);
+        mode = __builtin_va_arg(ap, int) & 07777;
+        __builtin_va_end(ap);
     }
-
-    old_mask = syscall1(60, 0);
-    syscall1(60, old_mask | (~mode & 0777));
-    fd = syscall3(5, (int)path, flags, mode);
-    syscall1(60, old_mask);
-    if (fd < 0) return __chkerr(fd);
-
-    want = mode & ~old_mask & 07777;
-    if (want != (want & 0666) && fstat(fd, &st) == 0 &&
-        (st.st_mode & 07777) == (unsigned)(want & 0666))
-        syscall2(94, fd, want);                          /* fchmod */
-    errno = 0;
-    return fd;
+    return __chkerr(syscall3(5, (int)path, flags, mode));
 }
 
 int close(int fd) {
@@ -208,8 +184,16 @@ int uname(struct utsname *buf) {
     return __chkerr(syscall1(122, (int)buf));
 }
 
-int openat(int dirfd, const char *path, int flags) {
-    return __chkerr(syscall3(295, dirfd, (int)path, flags));
+int openat(int dirfd, const char *path, int flags, ...) {
+    int mode = 0;
+
+    if (flags & O_CREAT) {          /* as open(): mode only with O_CREAT */
+        __builtin_va_list ap;
+        __builtin_va_start(ap, flags);
+        mode = __builtin_va_arg(ap, int) & 07777;
+        __builtin_va_end(ap);
+    }
+    return __chkerr(syscall4(295, dirfd, (int)path, flags, mode));
 }
 
 int nanosleep(const struct timespec *req, struct timespec *rem) {

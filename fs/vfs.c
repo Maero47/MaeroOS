@@ -89,7 +89,13 @@ void vfs_retain(vfs_node_t *node) {
 }
 
 int vfs_access_check(vfs_node_t *node, uint32_t euid, uint32_t egid, int want) {
+    return vfs_access_check_groups(node, euid, egid, NULL, 0, want);
+}
+
+int vfs_access_check_groups(vfs_node_t *node, uint32_t euid, uint32_t egid,
+                            const uint32_t *groups, uint32_t ngroups, int want) {
     uint32_t m, bits;
+    int in_group;
 
     if (!node) return -2;            /* -ENOENT */
     if (euid == 0) {                 /* root bypasses, except X needs an x bit */
@@ -111,8 +117,11 @@ int vfs_access_check(vfs_node_t *node, uint32_t euid, uint32_t egid, int want) {
         else
             m = 0555;
     }
+    in_group = (egid == node->gid);
+    for (uint32_t i = 0; !in_group && i < ngroups; i++)
+        in_group = (groups[i] == node->gid);
     bits = (euid == node->uid) ? (m >> 6)
-         : (egid == node->gid) ? (m >> 3)
+         : in_group ? (m >> 3)
          : m;
     return (((int)bits & 7 & want) == want) ? 0 : -13;   /* -EACCES */
 }

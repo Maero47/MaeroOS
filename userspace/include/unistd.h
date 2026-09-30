@@ -36,7 +36,7 @@ int  fcntl(int fd, int cmd, ...);
 int  sched_yield(void);
 int  setpgid(int pid, int pgid);
 int  getpgrp(void);
-int  openat(int dirfd, const char *path, int flags);
+int  openat(int dirfd, const char *path, int flags, ...);
 int  fstatat(int dirfd, const char *path, struct stat *buf, int flags);
 int  mkdirat(int dirfd, const char *path, int mode);
 int  fchmodat(int dirfd, const char *path, int mode, int flags);

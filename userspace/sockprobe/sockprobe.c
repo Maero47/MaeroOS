@@ -1,5 +1,6 @@
 #include "../include/errno.h"
 #include "../include/stdio.h"
+#include "../include/signal.h"
 #include "../include/string.h"
 #include "../include/sys/socket.h"
 #include "../include/netinet/in.h"
@@ -9,8 +10,10 @@
 
 /* sockprobe tcpshut <port>: connect to the host (10.0.2.2), shutdown(SHUT_WR),
  * then send().  The send must fail with EPIPE at once; it used to be reported
- * as "buffer full" and the blocking send slept forever. */
+ * as "buffer full" and the blocking send slept forever.  As on Linux it also
+ * raises SIGPIPE, which would kill the probe, so that is ignored here. */
 static int tcpshut(int port) {
+    signal(SIGPIPE, SIG_IGN);
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         printf("sockprobe: tcp socket failed errno=%d\n", errno);

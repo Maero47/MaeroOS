@@ -23,6 +23,14 @@ void tty_set_termios(const void *buf);
 
 /* Terminal foreground process group (for TIOCGPGRP / TIOCSPGRP) */
 extern int tty_fg_pgrp;
+/* TIOCSPGRP / TIOCSCTTY on the serial console, with Linux's rules: the
+ * console must be the caller's session's controlling terminal (-ENOTTY), and
+ * the group one of that session (-ESRCH/-EPERM).  0 or a negative errno. */
+int tty_console_setpgrp(int pgrp);
+int tty_console_setctty(void);
+/* Called when the leader of session `sid` exits: releases the console if it
+ * was that session's controlling terminal. */
+void devfs_console_session_exit(int sid);
 
 /* Hang up and detach the controlling terminal for a session. */
 void devfs_session_tty_hangup(int sid, vfs_node_t *tty);

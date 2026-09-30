@@ -47,4 +47,12 @@ extern int errno;
 #define EAFNOSUPPORT 97 /* Address family not supported */
 #define EADDRINUSE 98 /* Address already in use */
 #define ENETDOWN 100 /* Network is down */
+#define ENETUNREACH 101 /* Network is unreachable */
+#define ECONNABORTED 103 /* Software caused connection abort */
+#define ECONNRESET 104 /* Connection reset by peer */
+#define EISCONN  106 /* Transport endpoint is already connected */
 #define ENOTCONN 107 /* Transport endpoint is not connected */
+#define ETIMEDOUT 110 /* Connection timed out */
+#define ECONNREFUSED 111 /* Connection refused */
+#define EALREADY 114 /* Operation already in progress */
+#define EINPROGRESS 115 /* Operation now in progress */

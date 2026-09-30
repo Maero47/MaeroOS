@@ -102,7 +102,7 @@ int main(void) {
         int r = syscall3(296, tmpfd, (int)"spdir", 0755);
         failed |= expect_raw("mkdirat relative", r, 0);
 
-        int fd = syscall3(295, tmpfd, (int)"spdir/file", O_CREAT | O_RDWR);
+        int fd = syscall4(295, tmpfd, (int)"spdir/file", O_CREAT | O_RDWR, 0644);
         if (fd < 0) {
             printf("sysprobe: openat relative create failed ret=%d\n", fd);
             failed = 1;

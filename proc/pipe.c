@@ -66,7 +66,10 @@ int pipe_write(pipe_buf_t *p, const char *buf, int len, int nonblock) {
     int n = 0;
     while (n < len) {
         while (p->count == PIPE_BUF_SIZE) {
-            if (p->nreaders == 0) return n ? n : -32;
+            if (p->nreaders == 0) {                       /* reader gone */
+                signal_send(current_proc, SIGPIPE);        /* Linux pipe_write */
+                return n ? n : -32;
+            }
             if (nonblock) return n ? n : -11;             /* -EAGAIN */
             if (pipe_signal_pending()) return n ? n : -4; /* -EINTR */
             sleep_on(p);

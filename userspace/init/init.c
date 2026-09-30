@@ -104,6 +104,12 @@ static int file_available(const char *path) {
     return access(path, X_OK) == 0;
 }
 
+/* For data files (scripts init has a shell source, sounds): access() checks
+ * the mode bits, and a 0644 file is not X_OK even for root. */
+static int file_readable(const char *path) {
+    return access(path, R_OK) == 0;
+}
+
 /* pid of the graphical session while it runs; the console sessions wait
  * for it to end so the desktop keeps the keyboard/screen to itself. */
 static int desktop_pid = -1;
@@ -705,7 +711,7 @@ int main(void) {
         secure_shadow_files();
     init_log("=== MaeroOS init boot ===");
 
-    if (disk_userland && file_available("/etc/rc")) {
+    if (disk_userland && file_readable("/etc/rc")) {
         printf("[init] Running /etc/rc\n");
         run_program(command_shell_path, disk_rc_argv, envp);
         init_log("ran /etc/rc");
@@ -714,7 +720,7 @@ int main(void) {
     if (disk_userland)
         load_inittab();
 
-    if (disk_userland && file_available("/etc/services")) {
+    if (disk_userland && file_readable("/etc/services")) {
         setup_initctl();
         run_services(command_shell_path, envp);
         settle_respawn_services(command_shell_path, envp);
@@ -727,12 +733,12 @@ int main(void) {
 
         printf("[init] Starting graphical session\n");
         /* Startup chime (fire-and-forget; silent without an audio device) */
-        if (file_available("/disk/chime.wav") || file_available("/chime.wav")) {
+        if (file_readable("/disk/chime.wav") || file_readable("/chime.wav")) {
             int cpid = fork();
             if (cpid == 0) {
                 char *wp = file_available("/disk/wavplay") ? "/disk/wavplay"
                                                            : "/wavplay";
-                char *cw = file_available("/disk/chime.wav") ? "/disk/chime.wav"
+                char *cw = file_readable("/disk/chime.wav") ? "/disk/chime.wav"
                                                              : "/chime.wav";
                 char *cargv[] = { wp, cw, 0 };
                 execve(wp, cargv, (char *const *)envp);

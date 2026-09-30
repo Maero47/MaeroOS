@@ -72,6 +72,15 @@ int recvfrom(int fd, void *buf, size_t len, int flags,
     return socketcall(12, args);
 }
 
+int getsockopt(int fd, int level, int optname, void *optval,
+               socklen_t *optlen) {
+    uint32_t args[5] = {
+        (uint32_t)fd, (uint32_t)level, (uint32_t)optname,
+        (uint32_t)optval, (uint32_t)optlen
+    };
+    return socketcall(15, args);
+}
+
 int shutdown(int fd, int how) {
     uint32_t args[2] = { (uint32_t)fd, (uint32_t)how };
     return socketcall(13, args);
