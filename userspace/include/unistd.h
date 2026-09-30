@@ -120,7 +120,6 @@ int  pipe2(int fd[2], int flags);
 int  dup3(int oldfd, int newfd, int flags);
 ssize_t pread(int fd, void *buf, size_t count, off_t offset);
 ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset);
-unsigned int alarm(unsigned int seconds);
 int  pause(void);
 
 /* sysconf() names (Linux numbering) */

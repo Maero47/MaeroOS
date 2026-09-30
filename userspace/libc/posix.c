@@ -423,8 +423,6 @@ unsigned int sleep(unsigned int seconds) {
     return 0;
 }
 
-/* No interval timers: alarm() cannot schedule SIGALRM. */
-unsigned int alarm(unsigned int seconds) { (void)seconds; return 0; }
 int pause(void) {
     sigset_t mask;
     sigprocmask(SIG_BLOCK, 0, &mask);
