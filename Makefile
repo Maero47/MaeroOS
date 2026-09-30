@@ -33,8 +33,18 @@ KSTACK_TEST ?= 0
 ifneq ($(KSTACK_TEST),0)
 CFLAGS  += -DKSTACK_TEST=$(KSTACK_TEST)
 endif
+# Kernel heap self-test (debug builds only): `make KHEAP_TEST=1` runs a
+# randomised alloc/free/realloc stress with content, invariant and leak checks
+# right after heap_init, and poisons free heap memory to catch use-after-free.
+# The serial log shows "[HEAP-TEST] PASS" or a FAIL line and a panic.
+# KHEAP_TEST=2 then writes through a freed pointer on purpose: the log must
+# end in "use after free" and a heap-corruption panic.
+KHEAP_TEST ?= 0
+ifneq ($(KHEAP_TEST),0)
+CFLAGS  += -DKHEAP_TEST=$(KHEAP_TEST)
+endif
 KTRACE_STAMP := .ktrace-stamp
-$(shell [ "$$(cat $(KTRACE_STAMP) 2>/dev/null)" = "$(KTRACE) $(KSTACK_TEST)" ] || echo "$(KTRACE) $(KSTACK_TEST)" > $(KTRACE_STAMP))
+$(shell [ "$$(cat $(KTRACE_STAMP) 2>/dev/null)" = "$(KTRACE) $(KSTACK_TEST) $(KHEAP_TEST)" ] || echo "$(KTRACE) $(KSTACK_TEST) $(KHEAP_TEST)" > $(KTRACE_STAMP))
 
 ASFLAGS := -f elf32 -g
 

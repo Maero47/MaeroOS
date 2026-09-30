@@ -177,8 +177,15 @@ void kprof_dump(const char *tag) {
            (unsigned)kprof_ev[KPE_EXT2_DISTINCT], (unsigned)kprof_ev[KPE_EXT2_RA],
            (unsigned)kprof_ev[KPE_EXT2_RA_USED], (unsigned)kprof_ev[KPE_PF_FILE_SEQ],
            (unsigned)kprof_ev[KPE_PF_FILE_AROUND]);
-    printk("[kprof] ev kmalloc=%u heap_walk=%u\n",
-           (unsigned)kprof_ev[KPE_KMALLOC], (unsigned)kprof_ev[KPE_HEAP_WALK]);
+    {
+        struct heap_stats hs;
+        heap_stats(&hs);
+        printk("[kprof] ev kmalloc=%u kfree=%u heap_walk=%u  heap live=%uKiB/%u blk free=%uKiB/%u blk\n",
+               (unsigned)kprof_ev[KPE_KMALLOC], (unsigned)kprof_ev[KPE_KFREE],
+               (unsigned)kprof_ev[KPE_HEAP_WALK],
+               (unsigned)(hs.used_bytes / 1024u), (unsigned)hs.used_blocks,
+               (unsigned)(hs.free_bytes / 1024u), (unsigned)hs.free_blocks);
+    }
 
     /* Probes: additive spans, printed only when used.  Never summed with the
      * buckets above -- see the note in kprof.h. */

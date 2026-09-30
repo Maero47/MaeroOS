@@ -118,6 +118,7 @@ testfiles/awk
 /testfiles/readlink
 /testfiles/reboot
 /testfiles/respawnprobe
+/testfiles/heapprobe
 /testfiles/rm
 /testfiles/sed
 /testfiles/session
