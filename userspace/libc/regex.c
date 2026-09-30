@@ -22,7 +22,9 @@
  * and the caller wants submatches, a second pass reruns the unpruned matcher
  * from the known start, accepting only the known end: the first path to reach
  * it carries the same submatches the unpruned search would have reported.
- * That pass has its own cap, scaled by the match length. */
+ * That pass abandons any path that runs past the known end, so its work is
+ * bounded by the match rather than the rest of the line, and it has its own
+ * cap, scaled by the match length. */
 #include "../include/regex.h"
 #include "../include/fnmatch.h"
 #include "../include/ctype.h"
@@ -588,6 +590,9 @@ static int run(matcher_t *m, long pos) {
             ok = 0;
             break;
         }
+        /* Second pass: nothing moves backwards, so a path already past the
+         * wanted end can never reach it. */
+        if (ok && m->want_end >= 0 && pos > m->want_end) ok = 0;
         if (ok) { pc++; continue; }
         /* Backtrack: undo slot writes until a pending branch. */
         for (;;) {

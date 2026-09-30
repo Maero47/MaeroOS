@@ -286,6 +286,19 @@ int main(void) {
         long no[] = { -1, -1 };
         lines("(a|aa)*b", E, a32, REG_NOMATCH, no, 1);
     }
+    /* The second pass must stop at the known end: text after it used to
+     * count against a cap scaled only by the match length (REG_ESPACE,
+     * although the first pass had found the match). */
+    {
+        static char buf[3100];
+        long x1[] = { 0, 1, -1, -1 };
+        buf[0] = 'x'; memset(buf + 1, 'a', 3000); buf[3001] = 0;
+        lines("x(.*a.*b)?", E, buf, 0, x1, 2);
+        buf[41] = 0;
+        lines("x((a|aa)*b)?", E, buf, 0, x1, 2);
+        buf[0] = 'a'; memset(buf + 1, ' ', 30); buf[31] = 0;
+        lines("(a|b)(( *)* z)?", E, buf, 0, (long[]){ 0, 1, 0, 1, -1, -1 }, 3);
+    }
     /* Ordinary patterns on long lines with nmatch = 10 (what toybox sed
      * passes): O(n^2) over all start positions without the memo, so a
      * step cap alone returned REG_ESPACE from about 1.5 KB. */
