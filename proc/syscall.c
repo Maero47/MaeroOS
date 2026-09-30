@@ -4219,11 +4219,12 @@ static int sys_mmap2(registers_t *regs) {
             length = (fb_len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
         end = va + length;
         if (!vma_add(va, end, prot, VMA_F_SHARED | nowrite, NULL, 0)) return -12;
-        /* SHARED: no COW on fork; bit 4 is PCD. */
+        /* SHARED: no COW on fork; bit 4 is PCD.  A PROT_READ view of the
+         * framebuffer is read-only like any other mapping. */
+        uint32_t fb_flags = PAGE_PRESENT | PAGE_USER | PAGE_SHARED | (1U << 4) |
+                            ((prot & PROT_WRITE_K) ? PAGE_WRITABLE : 0);
         for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
-            if (paging_map(va + i, fb_phys + i,
-                           PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER |
-                           PAGE_SHARED | (1U << 4)) != 0) {
+            if (paging_map(va + i, fb_phys + i, fb_flags) != 0) {
                 /* Device frames are not refcounted, so unmap_range drops the
                  * PTEs and the VMA without touching the physical allocator —
                  * the same path munmap of an fb0 mapping already takes. */
@@ -4428,6 +4429,16 @@ static int sys_mprotect(registers_t *regs) {
     /* SMP: permission reductions must be seen by sibling threads on other CPUs
      * before they next touch the page (W^X / JIT correctness). */
     tlb_shootdown();
+
+    /* A SIGSEGV handler that changes protections is making progress, not
+     * looping: write barriers (GCs, JITs, this kernel's wxprobe) fault the
+     * same store instruction on page after page and unprotect each one.
+     * Forget the last fault so the page-fault loop breaker only fires on a
+     * handler that returns without fixing anything. */
+    if (current_proc) {
+        current_proc->last_fault_eip = 0;
+        current_proc->fault_repeat   = 0;
+    }
     return 0;
 }
 

@@ -19,6 +19,12 @@ LDFLAGS := -nostdlib -static -T ../userspace/user.ld
 
 TESTFILES := ../testfiles
 
+# Programs built against musl instead of the in-tree libc.  Their binaries are
+# committed (like testfiles/dynprobe) and rebuilt only where the musl cross
+# compiler is installed.  wxpie: the W^X probe as a PIE started by ld-musl.
+MUSL_CC   := $(shell command -v i686-linux-musl-gcc 2>/dev/null)
+MUSL_BINS := $(if $(MUSL_CC),$(TESTFILES)/wxpie)
+
 LIBC_SRCS := libc/syscalls.c libc/stdio.c libc/stdlib.c libc/pthread.c \
              libc/string.c libc/dirent.c libc/termios.c libc/socket.c \
              libc/resolve.c libc/toybox_compat.c
@@ -27,7 +33,7 @@ CRT0_OBJ  := libc/crt0.o
 
 .PHONY: all clean
 
-all: $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
+USER_BINS := $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
      $(TESTFILES)/cat $(TESTFILES)/cp $(TESTFILES)/rm \
      $(TESTFILES)/touch $(TESTFILES)/mkdir $(TESTFILES)/head \
      $(TESTFILES)/grep $(TESTFILES)/wc $(TESTFILES)/sleep \
@@ -56,7 +62,12 @@ all: $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
      $(TESTFILES)/sudo $(TESTFILES)/whoami $(TESTFILES)/uname $(TESTFILES)/clear $(TESTFILES)/hostname \
      $(TESTFILES)/which $(TESTFILES)/free $(TESTFILES)/uptime $(TESTFILES)/du $(TESTFILES)/df $(TESTFILES)/top $(TESTFILES)/wget $(TESTFILES)/bbwrap \
      $(TESTFILES)/maerox $(TESTFILES)/ff \
-     $(TESTFILES)/kwprobe $(TESTFILES)/libctest
+     $(TESTFILES)/kwprobe $(TESTFILES)/libctest $(TESTFILES)/wxprobe
+
+all: $(USER_BINS) $(MUSL_BINS)
+
+# Everything above links with user.ld: relink when the segment layout changes.
+$(USER_BINS): user.ld
 
 # Compile C → .o
 %.o: %.c
@@ -670,6 +681,18 @@ shmprobe/shmprobe.o: shmprobe/shmprobe.c
 
 $(TESTFILES)/shmprobe: $(CRT0_OBJ) shmprobe/shmprobe.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) shmprobe/shmprobe.o libc/libc.a
+
+# wxpie (see MUSL_BINS above)
+ifneq ($(MUSL_CC),)
+$(TESTFILES)/wxpie: wxprobe/wxpie.c
+	$(MUSL_CC) -O2 -Wall -Wextra -fpie -pie $< -o $@
+endif
+
+# wxprobe
+wxprobe/wxprobe.o: wxprobe/wxprobe.c
+	$(CC) $(CFLAGS) -c $< -o $@
+$(TESTFILES)/wxprobe: $(CRT0_OBJ) wxprobe/wxprobe.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) wxprobe/wxprobe.o libc/libc.a
 
 # memprobe
 memprobe/memprobe.o: memprobe/memprobe.c

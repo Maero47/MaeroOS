@@ -303,8 +303,12 @@ struct proc {
 
     /* Fault-loop breaker: if the same faulting EIP repeats with no forward
      * progress (a SIGSEGV handler that returns straight to the bad
-     * instruction), force-kill rather than re-delivering forever. */
+     * instruction), force-kill rather than re-delivering forever.  For a
+     * page fault the address must repeat too: one store instruction faulting
+     * on a different page each time is a caller probing or write-barriering
+     * memory, not a loop. */
     uint32_t         last_fault_eip;
+    uint32_t         last_fault_addr;
     uint32_t         fault_repeat;
 };
 

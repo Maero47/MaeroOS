@@ -655,10 +655,12 @@ static void page_fault_handler(registers_t *regs) {
      * Fault-loop breaker: a process may install a SIGSEGV handler that returns
      * straight back to the faulting instruction (e.g. Firefox's crash handler
      * that expects the re-fault to hit SIG_DFL).  If the same EIP keeps faulting
-     * with no forward progress, the handler is making things worse — force the
+     * on the same address with no forward progress (sys_mprotect counts as
+     * progress and clears the record), the handler is making things worse — force the
      * default action (terminate) instead of re-invoking it endlessly. */
     if ((err & 0x4U) && current_proc) {
-        if (regs->eip == current_proc->last_fault_eip) {
+        if (regs->eip == current_proc->last_fault_eip &&
+            cr2 == current_proc->last_fault_addr) {
             if (++current_proc->fault_repeat >= 3) {
                 /* On a call-to-NULL, [esp] is the caller's return address.
                  * Read it only if the page is actually mapped — a crashed
@@ -675,8 +677,9 @@ static void page_fault_handler(registers_t *regs) {
                 proc_group_exit(SIGSEGV);   /* does not return */
             }
         } else {
-            current_proc->last_fault_eip = regs->eip;
-            current_proc->fault_repeat   = 0;
+            current_proc->last_fault_eip  = regs->eip;
+            current_proc->last_fault_addr = cr2;
+            current_proc->fault_repeat    = 0;
         }
         /* Synchronous fault: thread-directed SIGSEGV.  With SIG_DFL the whole
          * thread group exits (Linux force_sig_fault -> get_signal ->
