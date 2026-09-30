@@ -13,11 +13,11 @@
  *
  * The umask is set to 077 first, so every file this creates is 0600 from
  * the moment it exists; it is then chowned/chmodded to root:MODE before any
- * data is written, so no other user can ever open it.  One gap remains and
- * is the kernel's to close: this kernel's rename() recreates PATH with a
- * default 0644 mode and copies into it, so the new contents are readable
- * from the rename until maero_replace_file() re-locks PATH (init also
- * re-locks /etc/shadow at boot).  An atomic, mode-preserving rename removes it.
+ * data is written, so no other user can ever open it.  The kernel's
+ * rename() replaces PATH atomically and keeps TMP's inode, so PATH is
+ * root:MODE from the instant it holds the new contents; the post-rename
+ * re-lock and compare remain as a check (init also re-locks /etc/shadow at
+ * boot).
  *
  * Returns MAERO_REPLACED, MAERO_UNCHANGED (failed, PATH holds OLD_DATA), or
  * MAERO_LOST (failed and PATH could not be restored; TMP and BACKUP kept).

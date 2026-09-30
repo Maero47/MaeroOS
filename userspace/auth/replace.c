@@ -6,7 +6,7 @@
 #include "../include/syscall.h"
 
 void maero_strict_umask(void) {
-    /* libc umask() is a no-op stub, so go to the syscall (umask = 60). */
+    /* umask = 60; the raw syscall keeps this independent of libc. */
     syscall1(60, 077);
 }
 
@@ -55,8 +55,8 @@ static int write_verified(const char *path, const char *data, int len, int mode)
 
     unlink(path);
     /* With umask 077 the kernel creates this 0600 -- nobody else can open
-     * it before the fchown/fchmod below.  The mode argument is for a libc
-     * and kernel that honour it. */
+     * it before the fchown/fchmod below.  O_EXCL (enforced by the kernel)
+     * refuses anything left at PATH after the unlink. */
     fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC, 0600);
     if (fd < 0)
         return 0;
@@ -89,9 +89,9 @@ int maero_replace_file(const char *path, const char *tmp, const char *backup,
         return MAERO_UNCHANGED;
     }
 
-    /* The result of rename() is not trusted either way: a non-atomic rename
-     * can fail after removing PATH, or succeed with the wrong mode.  What is
-     * on disk afterwards decides. */
+    /* The kernel's rename() is atomic and keeps TMP's inode (owner, mode,
+     * contents), but its result is still not trusted: what is on disk
+     * afterwards decides. */
     rename(tmp, path);
 
     if (check_target(path, mode, new_data, new_len)) {

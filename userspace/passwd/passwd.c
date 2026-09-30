@@ -136,9 +136,10 @@ int main(int argc, char *argv[]) {
      * `umask 0`) must not make a shadow copy world-readable, even briefly. */
     maero_strict_umask();
 
-    /* Run as root through and through, so nothing below (in particular the
-     * temp file, which the kernel stamps with the real uid) is ever owned
-     * by the caller. */
+    /* Run as root through and through (real, effective and saved ids), so
+     * nothing below is ever owned by, or reachable through, the caller.
+     * The kernel stamps new files with the effective ids, and the temp file
+     * keeps that owner and its 0600 mode across the rename. */
     if (setgid(0) != 0 || setuid(0) != 0 || getuid() != 0 || getgid() != 0) {
         printf("passwd: cannot become root (not installed set-uid root?)\n");
         return 1;
