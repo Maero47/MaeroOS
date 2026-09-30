@@ -6543,7 +6543,9 @@ static int sys_readv(registers_t *regs) {
         fake.ecx = (uint32_t)(uintptr_t)base;
         fake.edx = (uint32_t)len;
         int n = sys_read(&fake);
-        if (n < 0) return n;
+        /* Bytes already read are consumed: report them, not a later iovec's
+         * EAGAIN/EFAULT, or they are lost to the caller. */
+        if (n < 0) return total ? total : n;
         total += n;
         if (n < len) break;  /* short read — don't continue */
     }
@@ -7021,8 +7023,16 @@ static int sys_writev(registers_t *regs) {
         fake.ecx = (uint32_t)(uintptr_t)base;
         fake.edx = (uint32_t)len;
         int n = sys_write(&fake);
-        if (n < 0) return n;
+        /* A short write ends the call, and bytes already written are what it
+         * returns (fs/read_write.c do_loop_readv_writev).  Carrying on to the
+         * next iovec after a short one dropped the rest of that one from the
+         * stream; returning a later iovec's EAGAIN after a partial write made
+         * the caller send those bytes again.  libxcb writes [header][image]
+         * non-blocking, so a PutImage bigger than the 64 KiB AF_UNIX ring
+         * corrupted the X stream this way whenever maeroX read it promptly. */
+        if (n < 0) return total ? total : n;
         total += n;
+        if (n < len) break;
     }
     return total;
 }
