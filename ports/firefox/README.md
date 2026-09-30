@@ -82,6 +82,19 @@ What the script verifies, and what it merely relies on:
   recorded in `Packages.xz`. So with a keyring the chain is
   signature → InRelease → Packages.xz → .deb; without one it is
   https → InRelease → Packages.xz → .deb.
+* **Pinned packages**: `libc6`, `libgcc-s1` and `libstdc++6` are the
+  exception to "take whatever the index says". Their libraries land in the
+  committed `testfiles/lib/`, so they are pinned to an exact version and
+  sha256 in `DEBIAN_PINS` in `fetch-runtime.sh`; otherwise a Debian
+  point/security update would leave a fresh clone with a dirty tree. The
+  pinned `.deb` is fetched from the mirror's pool while it is still there,
+  else from `snapshot.debian.org` (`SNAPSHOT_MIRROR`, https only), and must
+  match the pinned sha256 whichever source served it. The pins were taken
+  from Debian's own signed `Packages.xz` for those versions and checked
+  against the committed bytes. When the suite has moved on, the run logs
+  `libc6 pinned to X; trixie now has Y`. Everything else floats with the
+  index (its files are gitignored). Pins apply only to their suite, so
+  `SUITE=bookworm` still takes bookworm's current glibc.
 * **Transport**: `DEBIAN_MIRROR` and `MOZ_BASE` must be https, and every
   download is pinned to https for redirects too (`curl --proto '=https'
   --proto-redir '=https'`). Curl's default redirect protocol set includes
@@ -94,6 +107,24 @@ What the script verifies, and what it merely relies on:
 * Not verified: Mozilla's `SHA256SUMS.asc` (only relevant in the unpinned
   fallback), and the contents of the Debian packages beyond their recorded
   hashes.
+
+## Bumping the pinned glibc
+
+Deliberately moving `testfiles/lib/` to a newer glibc (or gcc runtime) is
+one edit to the `DEBIAN_PINS` line of that package in `fetch-runtime.sh`:
+
+1. Run `REFRESH_INDEX=1 sh ports/firefox/fetch-runtime.sh`; it logs the
+   version the suite now has. Take version, `Filename` and `SHA256` for the
+   package from `ports/firefox/prebuilt/trixie/Packages.tsv` (columns:
+   package, version, filename, sha256), which the script has just verified
+   against `InRelease`.
+2. Put them in the pin line, and set its snapshot timestamp to one at which
+   `snapshot.debian.org` carries the file (today's date, e.g.
+   `20261001T000000Z`, is fine once the version is in the suite). Update the
+   provenance comment above `DEBIAN_PINS`.
+3. Re-run the script, boot-test it (`make disk-ff && make run-firefox`), and commit
+   `fetch-runtime.sh` together with the changed `testfiles/lib/` files
+   (`GLIBC-VERSION` records the new version).
 
 ## Idempotence
 
