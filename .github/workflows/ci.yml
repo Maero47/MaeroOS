@@ -1,0 +1,83 @@
+# Build MaeroOS (kernel, userspace, initrd, ext2 disk, ISO) and run the
+# headless QEMU smoke suites.  The same suite list runs locally as `make check`.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      # The i686-elf binutils + gcc build is the slow part (~15-25 min cold).
+      # It depends only on the pinned versions, digests and configure flags in
+      # setup-linux.sh, and on the host gmp/mpfr/mpc/isl it links against, so
+      # the key is those lines plus the runner's distro release.  Other edits
+      # to setup-linux.sh do not throw the toolchain away.
+      - name: Toolchain cache key
+        id: key
+        run: |
+          . /etc/os-release
+          sum=$(grep -E '^DEFAULT_(BINUTILS|GCC)_VER=|_SHA256:-|--target=|--disable-|--enable-|--with' \
+                tools/setup-linux.sh | sha256sum | cut -c1-16)
+          echo "key=i686-elf-${ID}${VERSION_ID}-${sum}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore i686-elf toolchain
+        id: cross
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/opt/cross
+          key: ${{ steps.key.outputs.key }}
+
+      # --apt installs the host packages with sudo (passwordless on runners),
+      # then builds the cross toolchain unless the restored one already works.
+      # The musl toolchain is only for ports/ and smoke-abi, so it is skipped.
+      # Sources and build trees go to the runner's temp dir, keeping the cache
+      # to the installed toolchain.
+      - name: Host packages and cross toolchain
+        env:
+          SRC_DIR: ${{ runner.temp }}/cross-src
+        run: tools/setup-linux.sh --apt --no-musl
+
+      # Saved right away, so a later smoke failure still keeps the toolchain.
+      - name: Save i686-elf toolchain
+        if: steps.cross.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/opt/cross
+          key: ${{ steps.key.outputs.key }}
+
+      - name: Add toolchain to PATH
+        run: echo "$HOME/opt/cross/bin" >> "$GITHUB_PATH"
+
+      - name: Build kernel, initrd, disk and ISO
+        run: make -j"$(nproc)" all initrd disk iso
+
+      # The suites start QEMU without -display, and with qemu-system-gui
+      # installed QEMU picks GTK and exits "gtk initialization failed" when
+      # there is no display.  Xvfb gives it one.
+      - name: Install Xvfb
+        run: sudo apt-get install -y --no-install-recommends xvfb
+
+      - name: Smoke suites
+        run: xvfb-run -a make check
+
+      - name: Upload smoke logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/check/
+          if-no-files-found: ignore

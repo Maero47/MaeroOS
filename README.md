@@ -1,5 +1,7 @@
 # MaeroOS
 
+[![CI](https://github.com/Maero47/MaeroOS/actions/workflows/ci.yml/badge.svg)](https://github.com/Maero47/MaeroOS/actions/workflows/ci.yml)
+
 A 32-bit operating system written from scratch for i686: kernel, C library, userland,
 window system and desktop. It boots under `qemu-system-i386` from a Multiboot kernel
 image or a GRUB ISO, speaks the Linux i386 system-call ABI over `int 0x80`, and runs
@@ -427,6 +429,35 @@ rebuilds the kernel objects.
 
 Each script exits non-zero and prints the failing expectation, for example
 `command 'threadprobe' did not produce 'threadprobe ok'`.
+
+### Continuous integration
+
+`make check` runs the suites that need nothing beyond a fresh clone: `smoke`,
+`smoke-cmds`, `smoke-toybox`, `smoke-disk`, `smoke-net`, `smoke-fw`, `smoke-dyn`,
+`smoke-dynlib` and `smoke-x`. It runs them one after another, writes each suite's
+console to `build/check/<suite>.log`, prints the tail of the log for any suite that
+fails, carries on with the rest and exits non-zero at the end. `CHECK_SUITES="smoke
+smoke-x" make check` runs a subset.
+
+GitHub Actions (`.github/workflows/ci.yml`) runs the same command on every push and
+pull request, on `ubuntu-latest`:
+
+```sh
+tools/setup-linux.sh --apt --no-musl      # host packages + i686-elf toolchain
+make -j"$(nproc)" all initrd disk iso
+xvfb-run -a make check
+```
+
+The smoke suites start QEMU without `-display`, so with `qemu-system-gui` installed QEMU
+opens a GTK window, and on a host with no display (ssh, CI) it exits with
+`gtk initialization failed` before the guest boots. There, run the suites under Xvfb
+(`sudo apt install xvfb`) as CI does; `make check` points this out when it happens.
+
+The built `~/opt/cross` toolchain is cached, keyed on the binutils/gcc versions, digests
+and configure flags in `tools/setup-linux.sh` and on the runner's Ubuntu release, so only
+the first run and version bumps pay for the gcc build. When `make check` fails, the
+`build/check/` logs are uploaded as a `smoke-logs-*` artifact of the run. Neither the
+smoke suites nor CI use KVM: `make run` boots QEMU with its default TCG accelerator.
 
 ### Diagnosing a hang
 

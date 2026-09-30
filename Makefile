@@ -108,7 +108,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk abiprobes smoke-abi smoke-firefox repo repo-serve start resolutions icons
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk check abiprobes smoke-abi smoke-firefox repo repo-serve start resolutions icons
 
 all: $(TARGET)
 
@@ -316,6 +316,39 @@ smoke-x: $(TARGET) initrd
 
 smoke-gtk: $(TARGET) initrd
 	python3 tools/smoke_gtk.py
+
+# The headless suites CI runs (.github/workflows/ci.yml), in one command.
+# Each suite's console goes to $(CHECK_LOG_DIR)/<suite>.log; a failure prints
+# the tail of its log and the rest still run, then check exits non-zero.
+# Suites run one at a time: each boots QEMU under TCG and their prompt
+# timeouts assume the guest has a host core to itself.  QEMU opens its GTK
+# window when qemu-system-gui is installed, so a host without a display (ssh,
+# CI) needs `xvfb-run -a make check`.
+# Pick a subset with CHECK_SUITES="smoke smoke-x".
+CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-fw \
+                 smoke-dyn smoke-dynlib smoke-x
+CHECK_LOG_DIR ?= build/check
+
+check: $(TARGET) initrd disk
+	@mkdir -p $(CHECK_LOG_DIR); rm -f $(CHECK_LOG_DIR)/*.log; failed=""; \
+	for s in $(CHECK_SUITES); do \
+	    log=$(CHECK_LOG_DIR)/$$s.log; t0=$$(date +%s); \
+	    if python3 tools/$$(echo $$s | tr - _).py >$$log 2>&1; then \
+	        echo "[CHECK] $$s: pass ($$(( $$(date +%s) - t0 ))s)"; \
+	    else \
+	        echo "[CHECK] $$s: FAIL ($$(( $$(date +%s) - t0 ))s), last lines of $$log:"; \
+	        tail -n 30 $$log | sed 's/^/    /'; \
+	        failed="$$failed $$s"; \
+	    fi; \
+	done; \
+	if [ -n "$$failed" ]; then \
+	    echo "[CHECK] failed:$$failed"; \
+	    if grep -qs 'gtk initialization failed' $(CHECK_LOG_DIR)/*.log; then \
+	        echo "[CHECK] QEMU found no display for its GTK window; run: xvfb-run -a make check"; \
+	    fi; \
+	    exit 1; \
+	fi; \
+	echo "[CHECK] all passed: $(CHECK_SUITES)"
 
 # Linux-ABI probes (docs/audit/firefox-first-paint.md section 8).  The static
 # musl probes are built into testfiles/abiprobes/ so the initrd picks them up;
