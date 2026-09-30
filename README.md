@@ -451,7 +451,8 @@ Each script exits non-zero and prints the failing expectation, for example
 
 `make check` runs the suites that need nothing beyond a fresh clone: `smoke`,
 `smoke-cmds`, `smoke-toybox`, `smoke-disk`, `smoke-net`, `smoke-fw`, `smoke-dyn`,
-`smoke-dynlib` and `smoke-x`. It runs them one after another, writes each suite's
+`smoke-dynlib`, `smoke-x` and `smoke-pkg` (which first builds `repo/` and, on a host
+without one, a repo signing key). It runs them one after another, writes each suite's
 console to `build/check/<suite>.log`, prints the tail of the log for any suite that
 fails, carries on with the rest and exits non-zero at the end. `CHECK_SUITES="smoke
 smoke-x" make check` runs a subset.

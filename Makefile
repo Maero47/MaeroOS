@@ -340,10 +340,11 @@ smoke-gtk: $(TARGET) initrd
 # CI) needs `xvfb-run -a make check`.
 # Pick a subset with CHECK_SUITES="smoke smoke-x".
 CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-fw \
-                 smoke-dyn smoke-dynlib smoke-x
+                 smoke-dyn smoke-dynlib smoke-x smoke-pkg
 CHECK_LOG_DIR ?= build/check
 
-check: $(TARGET) initrd disk
+# repo: smoke-pkg serves packages from repo/ (see the smoke-pkg target).
+check: $(TARGET) initrd disk repo
 	@mkdir -p $(CHECK_LOG_DIR); rm -f $(CHECK_LOG_DIR)/*.log; failed=""; \
 	for s in $(CHECK_SUITES); do \
 	    log=$(CHECK_LOG_DIR)/$$s.log; t0=$$(date +%s); \
