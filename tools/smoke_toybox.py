@@ -84,6 +84,10 @@ def main():
             ("sigshareprobe disp | cat\n", DISP_DFL),
             ("sigshareprobe disp & sleep 1\n", DISP_DFL),
             ("echo $(sigshareprobe disp)\n", DISP_DFL),
+            # alarm/setitimer/POSIX timers deliver signals that interrupt
+            # blocking calls (EINTR / SA_RESTART); fork clears, exec keeps
+            # (userspace/timerprobe).
+            ("timerprobe\n", "timerprobe ok"),
             ("whoami\n", "root"),
             # libc regression checks (userspace/libctest)
             ("libctest\n", "LIBCTEST PASS"),

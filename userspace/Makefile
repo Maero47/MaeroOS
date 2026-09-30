@@ -53,7 +53,7 @@ USER_BINS := $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
 	     $(TESTFILES)/sysprobe $(TESTFILES)/fcprobe $(TESTFILES)/lspci $(TESTFILES)/ifconfig \
 	     $(TESTFILES)/diskprobe $(TESTFILES)/fsprobe $(TESTFILES)/respawnprobe $(TESTFILES)/heapprobe \
 	     $(TESTFILES)/sockprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget \
-	     $(TESTFILES)/randprobe $(TESTFILES)/sysmiscprobe $(TESTFILES)/abi2probe $(TESTFILES)/sigexecprobe $(TESTFILES)/symprobe $(TESTFILES)/sigshareprobe \
+	     $(TESTFILES)/randprobe $(TESTFILES)/sysmiscprobe $(TESTFILES)/abi2probe $(TESTFILES)/sigexecprobe $(TESTFILES)/timerprobe $(TESTFILES)/symprobe $(TESTFILES)/sigshareprobe \
 	     $(TESTFILES)/fbtest $(TESTFILES)/evtest $(TESTFILES)/mousetest \
 	     $(TESTFILES)/polltest $(TESTFILES)/ptytest $(TESTFILES)/cttytest \
 	     $(TESTFILES)/desktop $(TESTFILES)/wmctl $(TESTFILES)/gui_demo \
@@ -520,6 +520,13 @@ sigshareprobe/sigshareprobe.o: sigshareprobe/sigshareprobe.c
 
 $(TESTFILES)/sigshareprobe: $(CRT0_OBJ) sigshareprobe/sigshareprobe.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) sigshareprobe/sigshareprobe.o libc/libc.a
+
+# timerprobe
+timerprobe/timerprobe.o: timerprobe/timerprobe.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TESTFILES)/timerprobe: $(CRT0_OBJ) timerprobe/timerprobe.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) timerprobe/timerprobe.o libc/libc.a
 
 # sysmiscprobe
 sysmiscprobe/sysmiscprobe.o: sysmiscprobe/sysmiscprobe.c

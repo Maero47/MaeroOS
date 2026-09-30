@@ -2,6 +2,7 @@
 #include "scheduler.h"
 #include "process.h"
 #include "signal.h"
+#include "ktimer.h"
 #include "pipe.h"
 #include "usocket.h"
 #include "shm.h"
@@ -2278,6 +2279,9 @@ static int sys_exec(registers_t *regs) {
     current_proc->clear_child_tid  = 0;
     current_proc->set_child_tid    = 0;
     current_proc->robust_list_head = 0;
+    /* The itimers (alarm, setitimer) carry over to the new image; the POSIX
+     * timers do not (Linux begin_new_exec -> exit_itimers). */
+    ktimer_exec(current_proc->tgid);
     vfork_wake_parent();         /* CLONE_VFORK: we have our own pgdir now */
 
     /* Store executable path for /proc/self/exe */
@@ -9141,6 +9145,17 @@ void syscall_dispatch(registers_t *regs) {
     case 383: ret = sys_statx(regs);           break;  /* statx (fontconfig) */
     case 403: ret = sys_clock_gettime64(regs); break;  /* clock_gettime64 */
     case 407: ret = sys_clock_nanosleep_time64(regs); break;
+    /* Signal-delivering timers (proc/ktimer.c) */
+    case 27:  ret = sys_alarm(regs);           break;
+    case 104: ret = sys_setitimer(regs);       break;
+    case 105: ret = sys_getitimer(regs);       break;
+    case 259: ret = sys_timer_create(regs);    break;
+    case 260: ret = sys_timer_settime(regs);   break;
+    case 261: ret = sys_timer_gettime(regs);   break;
+    case 262: ret = sys_timer_getoverrun(regs); break;
+    case 263: ret = sys_timer_delete(regs);    break;
+    case 408: ret = sys_timer_gettime64(regs); break;
+    case 409: ret = sys_timer_settime64(regs); break;
     case 422: ret = sys_futex(regs, 1);        break;  /* futex_time64 (64-bit ts) */
     /* chmod/chown stubs */
     case 15:  ret = sys_chmod(regs);           break;

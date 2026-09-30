@@ -115,6 +115,7 @@ testfiles/awk
 /testfiles/abi2probe
 /testfiles/sigexecprobe
 /testfiles/sigshareprobe
+/testfiles/timerprobe
 /testfiles/kwprobe
 /testfiles/readlink
 /testfiles/reboot
