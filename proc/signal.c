@@ -82,6 +82,27 @@ void sighand_put(struct sighand *sh) {
     kfree(sh);
 }
 
+/* ── Process-wide signal state ───────────────────────────────────────────── */
+
+struct sigshared *sigshared_alloc(void) {
+    struct sigshared *ss = (struct sigshared *)kmalloc(sizeof(*ss));
+    if (!ss) return ss;
+    ss->refcount = 1;
+    ss->pending  = 0;
+    return ss;
+}
+
+void sigshared_put(struct sigshared *ss) {
+    if (!ss) return;
+    if (--ss->refcount > 0) return;
+    kfree(ss);
+}
+
+uint32_t signal_pending_set(struct proc *p) {
+    if (!p) return 0;
+    return p->pending_sigs | (p->sigshared ? p->sigshared->pending : 0);
+}
+
 /* ── Sending ─────────────────────────────────────────────────────────────── */
 
 /* Default action of sig when its handler is SIG_DFL: 1 = ignore, 2 = stop,
@@ -134,13 +155,112 @@ static void sig_wake_sleeper(struct proc *p, int sig) {
     }
 }
 
+static int proc_live(struct proc *q) {
+    return q->state != PROC_UNUSED && q->state != PROC_ZOMBIE;
+}
+
+/* ── Job control: group stop / continue ──────────────────────────────────── */
+
+static int sig_is_stop(int sig) {
+    return sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU;
+}
+
+int proc_group_stopped(struct proc *leader) {
+    if (!leader || !leader->group_stop) return 0;
+    int stopped = 0;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (!proc_live(q) || q->tgid != leader->tgid) continue;
+        if (q->state != PROC_STOPPED) return 0;
+        stopped = 1;
+    }
+    return stopped;
+}
+
+void signal_group_stop_check(struct proc *p) {
+    struct proc *leader = proc_group_leader(p);
+    if (!leader || !leader->group_stop || leader->stop_reported) return;
+    if (!proc_group_stopped(leader)) return;
+    /* The last thread has stopped: the process is stopped.  Wake the parent
+     * where waitpid(WUNTRACED) sleeps — on its group leader. */
+    if (leader->parent)
+        wake_up(proc_group_leader(leader->parent));
+}
+
+/* Linux prepare_signal(): SIGCONT, however it is sent and even when ignored,
+ * ends a group stop — every thread is resumed, any stop still pending is
+ * dropped and waitpid(WCONTINUED) will report it; a stop signal drops a
+ * pending SIGCONT. */
+static void prepare_job_control(struct proc *p, int sig) {
+    int tg = p->tgid;
+    uint32_t drop;
+    if (sig == SIGCONT) {
+        drop = (1u << SIGSTOP) | (1u << SIGTSTP) | (1u << SIGTTIN) | (1u << SIGTTOU);
+        struct proc *leader = proc_group_leader(p);
+        int was_stopped = 0;
+        for (int i = 0; i < MAX_PROCS; i++) {
+            struct proc *q = &ptable[i];
+            if (!proc_live(q) || q->tgid != tg) continue;
+            q->jobctl_stop = 0;
+            if (q->state == PROC_STOPPED) { q->state = PROC_RUNNABLE; was_stopped = 1; }
+        }
+        if (leader && (leader->group_stop || was_stopped)) {
+            leader->group_stop      = 0;
+            leader->group_continued = 1;
+            if (leader->parent) wake_up(proc_group_leader(leader->parent));
+        }
+    } else if (sig_is_stop(sig)) {
+        drop = 1u << SIGCONT;
+    } else {
+        return;
+    }
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (!proc_live(q) || q->tgid != tg) continue;
+        q->pending_sigs &= ~drop;
+        if (q->sigshared) q->sigshared->pending &= ~drop;
+    }
+}
+
+/* This thread joins the group stop: it stops, and if it was the last one to
+ * do so the parent is told.  Returns once SIGCONT (or SIGKILL) resumes it. */
+static void group_stop_participate(void) {
+    struct proc *me = current_proc;
+    me->jobctl_stop = 0;
+    me->state = PROC_STOPPED;          /* counted as stopped by the check */
+    signal_group_stop_check(me);
+    proc_stop_self();
+}
+
+/* Linux do_signal_stop(): a stop signal taken with its default action stops
+ * the whole THREAD GROUP, not just the thread that dequeued it.  Every other
+ * live thread is asked to stop on its next return to user mode (a sleeping one
+ * is woken for it; its interrupted call restarts after SIGCONT), and waitpid
+ * (WUNTRACED) reports the process once all of them have. */
+static void do_group_stop(int sig) {
+    struct proc *me = current_proc;
+    struct proc *leader = proc_group_leader(me);
+    if (leader) {
+        leader->group_stop      = sig;
+        leader->group_continued = 0;
+        leader->stop_sig        = sig;
+        leader->stop_reported   = 0;
+    }
+    me->stop_sig = sig;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (q == me || !proc_live(q) || q->tgid != me->tgid) continue;
+        if (q->state == PROC_STOPPED) continue;
+        q->jobctl_stop = 1;
+        sig_wake_sleeper(q, sig);
+    }
+    group_stop_participate();
+}
+
 void signal_send(struct proc *p, int sig) {
     if (!p || sig < 1 || sig >= NSIGS) return;
     if (p->state == PROC_UNUSED || p->state == PROC_ZOMBIE) return;
-    /* SIGCONT resumes a stopped process even when it is ignored (Linux
-     * prepare_signal: SIGCONT always wakes the group out of a stop). */
-    if (sig == SIGCONT && p->state == PROC_STOPPED)
-        p->state = PROC_RUNNABLE;
+    prepare_job_control(p, sig);
     if (sig_ignored(p, sig)) return;
     p->pending_sigs |= (1u << sig);
     if (sig_wakes(p, sig))
@@ -166,24 +286,71 @@ void signal_send_fault(struct proc *p, int sig, int code, uint32_t addr) {
 void signal_send_group(struct proc *p, int sig) {
     if (!p || sig < 1 || sig >= NSIGS) return;
     int tg = p->tgid;
-    struct proc *leader = (struct proc *)0, *open_thread = (struct proc *)0,
-                *any = (struct proc *)0;
+    uint32_t bit = 1u << sig;
+
+    /* The live threads of the group.  p itself may be the zombie of a leader
+     * that called pthread_exit while its siblings run on: the process is still
+     * there and still takes signals (Linux keeps the leader's task as the
+     * group's anchor for exactly this). */
+    struct proc *leader = (struct proc *)0, *any = (struct proc *)0;
     for (int i = 0; i < MAX_PROCS; i++) {
         struct proc *q = &ptable[i];
-        if (q->state == PROC_UNUSED || q->state == PROC_ZOMBIE) continue;
-        if (q->tgid != tg) continue;
-        if (q->pid == q->tgid) leader = q;
+        if (!proc_live(q) || q->tgid != tg) continue;
         if (!any) any = q;
-        if (!(q->blocked_sigs & (1u << sig))) {
-            /* Prefer the leader when it can take the signal, else the first
-             * thread that does not block it (Linux complete_signal: the main
-             * thread first, then wants_signal() over the others). */
-            if (q == leader) { open_thread = q; break; }
-            if (!open_thread) open_thread = q;
-        }
+        if (q->pid == tg) leader = q;
     }
-    struct proc *target = open_thread ? open_thread : (leader ? leader : any);
-    if (target) signal_send(target, sig);
+    if (!any) return;                           /* the whole process is gone */
+    struct proc *ref = proc_live(p) ? p : (leader ? leader : any);
+
+    /* SIGKILL is fatal to the group whoever takes it: queue it on every thread
+     * at once (Linux complete_signal's fatal path does the same), so no thread
+     * runs on in user mode waiting for its turn. */
+    if (sig == SIGKILL) {
+        for (int i = 0; i < MAX_PROCS; i++) {
+            struct proc *q = &ptable[i];
+            if (proc_live(q) && q->tgid == tg) signal_send(q, SIGKILL);
+        }
+        return;
+    }
+    prepare_job_control(ref, sig);
+
+    struct sigshared *ss = ref->sigshared;
+    if (!ss) { signal_send(ref, sig); return; }   /* no process state: kthread */
+    if (sig_ignored(ref, sig)) return;
+    ss->pending |= bit;
+
+    /* complete_signal(): pick a thread that can take it — the addressed one,
+     * then the leader, then any other that does not block it — and make it
+     * notice.  If every thread blocks it, nobody is woken and it waits in the
+     * process-wide set until one unblocks it. */
+    struct proc *target = (struct proc *)0;
+    if (!(ref->blocked_sigs & bit)) target = ref;
+    else if (leader && !(leader->blocked_sigs & bit)) target = leader;
+    else
+        for (int i = 0; i < MAX_PROCS && !target; i++) {
+            struct proc *q = &ptable[i];
+            if (proc_live(q) && q->tgid == tg && !(q->blocked_sigs & bit))
+                target = q;
+        }
+    if (target && sig_wakes(target, sig))
+        sig_wake_sleeper(target, sig);
+}
+
+void signal_retarget_shared(struct proc *p, uint32_t which) {
+    if (!p || !p->sigshared) return;
+    uint32_t left = p->sigshared->pending & which;
+    for (int i = 0; i < MAX_PROCS && left; i++) {
+        struct proc *q = &ptable[i];
+        if (q == p || !proc_live(q) || q->tgid != p->tgid) continue;
+        uint32_t take = left & ~q->blocked_sigs;
+        if (!take) continue;
+        for (int sig = 1; sig < NSIGS; sig++)
+            if ((take & (1u << sig)) && sig_wakes(q, sig)) {
+                sig_wake_sleeper(q, sig);
+                break;
+            }
+        left &= ~take;
+    }
 }
 
 int signal_send_pgrp(int pg, int sig) {
@@ -200,7 +367,8 @@ int signal_send_pgrp(int pg, int sig) {
 
 int signal_interrupt_pending(struct proc *p) {
     if (!p) return 0;
-    uint32_t pending = p->pending_sigs & ~p->blocked_sigs;
+    if (p->jobctl_stop) return 1;      /* must reach the stop on the way out */
+    uint32_t pending = signal_pending_set(p) & ~p->blocked_sigs;
     if (!pending) return 0;
     for (int i = 1; i < NSIGS; i++) {
         if (!(pending & (1u << i))) continue;
@@ -255,6 +423,8 @@ static void syscall_restart(registers_t *regs, int syscall_nr) {
  * every other syscall. */
 static void restore_saved_sigmask(void) {
     if (current_proc && current_proc->restore_sigmask) {
+        signal_retarget_shared(current_proc,
+                               current_proc->saved_sigmask & ~current_proc->blocked_sigs);
         current_proc->blocked_sigs    = current_proc->saved_sigmask;
         current_proc->restore_sigmask = 0;
     }
@@ -265,10 +435,25 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
     /* Only deliver to user-mode frames */
     if ((regs->cs & 3) != 3) return;
 
+    /* A group stop asked this thread to stop (Linux JOBCTL_STOP_PENDING), unless
+     * it is being killed.  After SIGCONT it carries on below: whatever is
+     * pending then is delivered, and an interrupted call is restarted. */
+    if (current_proc->jobctl_stop) {
+        if (current_proc->pending_sigs & (1u << SIGKILL))
+            current_proc->jobctl_stop = 0;
+        else
+            group_stop_participate();
+    }
+
     int32_t  ret = (int32_t)regs->eax;
     int restartable = syscall_nr >= 0 && (ret == -4 || ret == -ERESTARTNOHAND);
 
-    uint32_t pending = current_proc->pending_sigs & ~current_proc->blocked_sigs;
+    /* The thread's own signals are taken before the process-wide ones (Linux
+     * dequeue_signal: task->pending, then signal->shared_pending). */
+    struct sigshared *ss = current_proc->sigshared;
+    uint32_t own    = current_proc->pending_sigs & ~current_proc->blocked_sigs;
+    uint32_t shared = ss ? (ss->pending & ~current_proc->blocked_sigs) : 0;
+    uint32_t pending = own ? own : shared;
     if (!pending) {
         /* Woken by a signal that is no longer deliverable (or the syscall
          * returned an internal restart code with nothing pending): transparently
@@ -288,7 +473,8 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
     }
     if (!sig) { restore_saved_sigmask(); return; }
 
-    current_proc->pending_sigs &= ~(1u << sig);
+    if (own) current_proc->pending_sigs &= ~(1u << sig);
+    else     ss->pending               &= ~(1u << sig);
 
     struct sighand *sh = current_proc->sighand;
     sighandler_t handler = sh ? sh->handlers[sig] : SIG_DFL;
@@ -325,17 +511,11 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
             restore_saved_sigmask();
             return;  /* default: ignore */
         case 2:
-            /* Record the stop for waitpid(WUNTRACED) — reported once per
-             * stop — and wake the parent where waitpid sleeps: on its group
-             * leader (the kernel is BKL-serialised, so the parent cannot look
-             * before proc_stop_self below has marked us stopped). */
-            current_proc->stop_sig      = sig;
-            current_proc->stop_reported = 0;
-            if (current_proc->parent)
-                wake_up(proc_group_leader(current_proc->parent));
-            /* Stop and yield — won't return until SIGCONT makes us RUNNABLE.
-             * The interrupted syscall is then restarted (no handler ran). */
-            proc_stop_self();
+            /* Stop the whole thread group; waitpid(WUNTRACED) reports it once
+             * every thread has stopped.  Won't return until SIGCONT makes us
+             * RUNNABLE; the interrupted syscall is then restarted (no handler
+             * ran). */
+            do_group_stop(sig);
             if (restartable) syscall_restart(regs, syscall_nr);
             restore_saved_sigmask();
             return;
@@ -349,6 +529,12 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
             proc_group_exit(sig & 0x7f);
         }
     }
+
+    /* SA_RESETHAND (SA_ONESHOT): the disposition goes back to SIG_DFL as the
+     * handler is entered, so the next such signal takes the default action
+     * (Linux get_signal).  sa_flags and sa_mask stay as they were. */
+    if ((sflags & SA_RESETHAND) && sh)
+        sh->handlers[sig] = SIG_DFL;
 
     /*
      * User-installed handler.
@@ -586,8 +772,11 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
     {
         uint32_t blocked = current_proc->blocked_sigs | samask;
         if (!(sflags & SA_NODEFER)) blocked |= (1u << sig);
-        current_proc->blocked_sigs =
-            blocked & ~((1u << SIGKILL) | (1u << SIGSTOP));
+        blocked &= ~((1u << SIGKILL) | (1u << SIGSTOP));
+        /* Process-wide signals this thread now blocks go to another thread
+         * (Linux set_current_blocked -> retarget_shared_pending). */
+        signal_retarget_shared(current_proc, blocked & ~current_proc->blocked_sigs);
+        current_proc->blocked_sigs = blocked;
     }
 
     /* Redirect trapframe to the user handler */

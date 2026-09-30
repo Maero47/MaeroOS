@@ -123,6 +123,30 @@ static int wait_status_to_exit(int st) {
 static int    shell_pgrp = 0;
 static int    job_pgrp = 0;
 
+/* Signals the shell ignores for ITSELF (an interactive job-control shell must
+ * survive ^C, ^Z, SIGQUIT and terminal-access stops; SIGPIPE is handled by
+ * return codes).  SIG_IGN survives execve, so every child must put these back
+ * to SIG_DFL before it runs a command — or no job could be interrupted or
+ * stopped with ^Z.  The exceptions stay ignored in children, as POSIX
+ * requires: a signal already ignored when the shell started (nohup, a parent
+ * that ignores it) and one ignored by `trap '' SIG`. */
+static const int shell_ign_sigs[] = { SIGINT, SIGQUIT, SIGPIPE, SIGTSTP, SIGTTIN, SIGTTOU };
+#define N_SHELL_IGN_SIGS ((int)(sizeof(shell_ign_sigs) / sizeof(shell_ign_sigs[0])))
+static uint32_t sig_keep_ignored;          /* bit sig: stays SIG_IGN in children */
+
+static void shell_ignore_signals(void) {
+    for (int i = 0; i < N_SHELL_IGN_SIGS; i++)
+        if (signal(shell_ign_sigs[i], SIG_IGN) == SIG_IGN)
+            sig_keep_ignored |= 1u << shell_ign_sigs[i];
+}
+
+/* In a forked child, before it runs a command. */
+static void child_reset_signals(void) {
+    for (int i = 0; i < N_SHELL_IGN_SIGS; i++)
+        if (!(sig_keep_ignored & (1u << shell_ign_sigs[i])))
+            signal(shell_ign_sigs[i], SIG_DFL);
+}
+
 /* Background/stopped jobs */
 typedef struct { int pid; int stopped; } job_t;
 static job_t jobs_list[MAX_JOBS];
@@ -318,6 +342,7 @@ static void expand_cmdsub(const char **pp, char *out, int *oo, int outsz) {
 
     int pid = fork();
     if (pid == 0) {
+        child_reset_signals();
         /* Child: redirect stdout to pipe write end */
         close(pfd[0]);
         dup2(pfd[1], 1);
@@ -794,9 +819,17 @@ static int run_builtin(char *argv[], int argc) {
         jobs_list[idx].stopped = 0;
         job_take_terminal(pid);
         kill(-pid, 18); /* SIGCONT=18 */
-        /* Wait for it to finish or stop again */
+        /* Wait for every process of the job (a pipeline is one process
+         * group) to finish, or for it to stop again.  The status is the
+         * leader's — the first stage for a pipeline. */
         int st=0;
-        waitpid(pid, &st, 2); /* WUNTRACED=2 */
+        for (;;) {
+            int s=0;
+            int r = waitpid(-pid, &s, 2); /* WUNTRACED=2 */
+            if (r < 0) break;             /* no member left */
+            if ((s & 0xff) == 0x7f) { st = s; break; }
+            if (r == pid) st = s;
+        }
         shell_take_terminal();
         g_status = wait_status_to_exit(st);
         if ((st & 0xff) == 0x7f) {
@@ -863,8 +896,10 @@ static int run_builtin(char *argv[], int argc) {
                 if (sig > 0 && sig < 32) {
                     if (strcmp(action,"")==0) {
                         signal(sig, (sighandler_t)1); /* SIG_IGN */
+                        sig_keep_ignored |= 1u << sig;      /* children too */
                     } else if (strcmp(action,"-")==0) {
                         signal(sig, (sighandler_t)0); /* SIG_DFL */
+                        sig_keep_ignored &= ~(1u << sig);
                     }
                     /* Non-empty action string: not fully implemented */
                 }
@@ -959,8 +994,7 @@ static int run_simple(const char *cmdstr, int in_fd, int out_fd, int background)
     if (pid==0) {
         int pg = job_pgrp ? job_pgrp : getpid();
         setpgid(0, pg);
-        signal(SIGINT,  SIG_DFL);
-        signal(SIGPIPE, SIG_DFL);
+        child_reset_signals();
         if (in_fd>=0)  { dup2(in_fd,0);  close(in_fd); }
         if (out_fd>=0) { dup2(out_fd,1); close(out_fd); }
         apply_redirs(redirs, nredirs);
@@ -1055,7 +1089,7 @@ static int run_pipeline(const char *cmdstr, int background) {
         if (pid<0) { printf("shell: fork failed\n"); return -1; }
         if (pid==0) {
             setpgid(0, getpid());
-            signal(SIGINT,SIG_DFL); signal(SIGPIPE,SIG_DFL);
+            child_reset_signals();
             apply_redirs(redirs,nredirs);
             char **envp=make_envp();
             if (run_builtin(argv,argc)) exit(g_status);
@@ -1097,8 +1131,15 @@ static int run_pipeline(const char *cmdstr, int background) {
     if (!background) {
         job_take_terminal(pgid);
         int st=0;
+        /* ^Z stops the whole job (the terminal signals its process group):
+         * stop waiting at the first stage that reports stopped, or the wait
+         * on the next stage — stopped too — never ends and the job is not
+         * recorded for `fg`. */
         for (int i=0;i<ncmds;i++)
-            if (pids[i]>0) { int s; waitpid(pids[i],&s,2); st=s; }
+            if (pids[i]>0) {
+                int s=0; waitpid(pids[i],&s,2); st=s;
+                if ((s & 0xff) == 0x7f) break;
+            }
         shell_take_terminal();
         g_status=wait_status_to_exit(st);
         if ((st & 0xff) == 0x7f && pgid > 0 && jobs_n < MAX_JOBS) {
@@ -1467,9 +1508,7 @@ static int collect_stdin_block(const char *first_line, const char *open_kw,
 int main(int argc, char *argv[], char *envp[]) {
     g_envp = envp;
 
-    signal(SIGINT,  SIG_IGN);
-    signal(SIGPIPE, SIG_IGN);
-    signal(SIGTSTP, SIG_IGN);
+    shell_ignore_signals();
 
     setsid();
     shell_pgrp = getpid();

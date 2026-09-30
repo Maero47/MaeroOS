@@ -143,16 +143,26 @@ struct proc *allocproc(void) {
      * CLONE_SIGHAND thread drops it for the shared one — see sys_clone). */
     p->sighand = sighand_alloc();
     if (!p->sighand) { p->state = PROC_UNUSED; return NULL; }
+    /* Fresh process-wide signal state (a CLONE_THREAD thread drops it for the
+     * group's — see sys_clone). */
+    p->sigshared = sigshared_alloc();
+    if (!p->sigshared) { sighand_put(p->sighand); p->sighand = NULL; p->state = PROC_UNUSED; return NULL; }
     /* Fresh private fd table (fork/initial keep it; thread clone replaces it
      * with the shared group table — see sys_clone). */
     fdtable_attach(p, fdtable_alloc());
-    if (!p->fdt) { sighand_put(p->sighand); p->sighand = NULL; p->state = PROC_UNUSED; return NULL; }
+    if (!p->fdt) {
+        sighand_put(p->sighand); p->sighand = NULL;
+        sigshared_put(p->sigshared); p->sigshared = NULL;
+        p->state = PROC_UNUSED;
+        return NULL;
+    }
 
     /* Allocate kernel stack */
     p->kstack = kstack_alloc();
     if (!p->kstack) {
         fdtable_put(p);
         sighand_put(p->sighand); p->sighand = NULL;
+        sigshared_put(p->sigshared); p->sigshared = NULL;
         p->state = PROC_UNUSED;
         return NULL;
     }
@@ -266,6 +276,9 @@ struct proc *proc_create_kthread(void (*fn)(void), const char *name) {
     p->set_child_tid = 0;
     p->vm_owner    = NULL;
     p->group_exit  = 0;
+    p->group_stop  = 0;
+    p->group_continued = 0;
+    p->jobctl_stop = 0;
     p->pending_sigs = 0;
     p->blocked_sigs = 0;
     fpu_state_init(fpu_area(p));
@@ -273,6 +286,8 @@ struct proc *proc_create_kthread(void (*fn)(void), const char *name) {
      * stack's blocking waits) consult the handler table of current_proc. */
     p->sighand = sighand_alloc();
     if (!p->sighand) { p->state = PROC_UNUSED; return NULL; }
+    p->sigshared = (struct sigshared *)0;   /* nothing can signal a kthread's
+                                             * process; the slot is not zeroed */
 
     p->kstack = kstack_alloc();
     if (!p->kstack) { sighand_put(p->sighand); p->sighand = NULL; p->state = PROC_UNUSED; return NULL; }

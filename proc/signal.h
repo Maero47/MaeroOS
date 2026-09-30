@@ -101,6 +101,20 @@ struct sighand *sighand_alloc(void);                 /* zeroed table, refcount=1
 struct sighand *sighand_copy(struct sighand *src);   /* private copy, refcount=1 */
 void            sighand_put(struct sighand *sh);     /* decref; free at 0 */
 
+/* Process-wide signal state (the part of Linux struct signal_struct this kernel
+ * needs).  Every thread of a thread group (CLONE_THREAD) holds ONE of these;
+ * fork and a clone without CLONE_THREAD get a fresh one, exec keeps it.
+ * `pending` is Linux signal->shared_pending: signals sent to the PROCESS
+ * (kill(pid), SIGCHLD, tty signals) wait here until whichever thread does not
+ * block them takes one, so they are neither lost when the thread that happened
+ * to be chosen exits nor stuck on a thread that blocks them. */
+struct sigshared {
+    int      refcount;
+    uint32_t pending;
+};
+struct sigshared *sigshared_alloc(void);             /* empty, refcount=1 */
+void              sigshared_put(struct sigshared *ss);   /* decref; free at 0 */
+
 /* Forward declarations */
 struct proc;
 struct registers;
@@ -123,11 +137,29 @@ void signal_send_fault(struct proc *p, int sig, int code, uint32_t addr);
 static inline uint32_t sigset_from_user(uint32_t uset) { return uset << 1; }
 static inline uint32_t sigset_to_user(uint32_t kset)   { return kset >> 1; }
 
-/* Process-directed signal (kill, SIGCHLD, tty signals): queue sig on ONE thread
- * of p's thread group that does not block it, preferring the group leader, as
- * Linux complete_signal() does.  If every thread blocks it, it stays pending on
- * the leader until unblocked. */
+/* Process-directed signal (kill, SIGCHLD, tty signals): queue sig on the
+ * process-wide pending set of p's thread group and wake ONE thread that does not
+ * block it, preferring p itself, then the group leader (Linux __send_signal
+ * with PIDTYPE_TGID + complete_signal()).  Whichever unblocked thread next
+ * returns to user mode takes it; if every thread blocks it, it stays pending
+ * for the process until some thread unblocks it. */
 void signal_send_group(struct proc *p, int sig);
+
+/* Signals pending for thread p: its own plus the process-wide ones. */
+uint32_t signal_pending_set(struct proc *p);
+
+/* Linux retarget_shared_pending(): p is about to stop taking the process-wide
+ * signals in `which` (it blocks them now, or it is exiting) — wake another
+ * thread of the group that can take them.  Nothing is lost if none can: they
+ * stay pending for the process. */
+void signal_retarget_shared(struct proc *p, uint32_t which);
+
+/* Group stop (job control).  proc_group_stopped: a stop is in force for
+ * leader's thread group and every live thread of it has stopped — what
+ * waitpid(WUNTRACED) reports.  signal_group_stop_check: p's group may just have
+ * completed its stop (a thread stopped or exited); wake the waiting parent. */
+int  proc_group_stopped(struct proc *leader);
+void signal_group_stop_check(struct proc *p);
 
 /* Deliver sig to every process whose pgrp is pg (one thread per process).
  * Returns the number of processes signalled. */

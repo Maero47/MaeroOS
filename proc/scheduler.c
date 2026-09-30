@@ -468,6 +468,13 @@ void proc_exit(int status) {
     /* Likewise the shared handler table. */
     sighand_put(current_proc->sighand);
     current_proc->sighand = (struct sighand *)0;
+    /* Process-wide pending signals stay with the process; one this thread
+     * would have taken is handed to a sibling that can (Linux exit_signals). */
+    signal_retarget_shared(current_proc, ~0u);
+    /* If the rest of the group is stopped, this exit completes a group stop. */
+    signal_group_stop_check(current_proc);
+    sigshared_put(current_proc->sigshared);
+    current_proc->sigshared = (struct sigshared *)0;
 
     /* Drop the address space's shm attachments if this was the last thread
      * running in it (frame refs are released when the pgdir is torn down at
