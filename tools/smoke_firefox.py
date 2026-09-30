@@ -35,13 +35,24 @@ Artifacts go to build/ff-smoke/<timestamp>-<tag>/ (gitignored):
                     Firefox's address bar through QEMU sendkey
   summary.txt       verdict, timings, attempt list, crash lines, last kernel
                     lines, moz.log tail, and with --keycheck the key-trace result
+  screen-web.png    with --web only: the frame in which the served page's
+                    marker image was found on screen (or the last one tried)
   qemu-cmdline.txt  the exact QEMU command
+
+--web (implies --net) is the page-load check: after the paint verdict it serves
+a small page from the host (an HTML document with a stylesheet rule and a
+WEB_MARK_W x WEB_MARK_H pure-red PNG), types http://10.0.2.2:PORT/ into the
+address bar, and PASSes only if the image is requested from the server AND its
+red block shows up in a screendump within --web-timeout seconds.  The request
+alone proves the document was parsed; the pixels prove it was laid out and
+composited.  summary.txt records the time from Enter to each request and to
+the red block appearing.
 
 Usage:
   python3 tools/smoke_firefox.py [--accel kvm|tcg|<qemu -accel value>]
                                  [--smp N] [--timeout SEC] [--mem SIZE]
                                  [--iso PATH] [--disk PATH] [--out DIR]
-                                 [--tag NAME] [-v]
+                                 [--tag NAME] [--net] [--web] [-v]
 Defaults: -accel kvm when /dev/kvm is writable, else tcg; -smp 1; -m 2048M;
 timeout 360 s under KVM, 900 s under TCG.
 """
@@ -58,7 +69,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import zlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -85,6 +98,78 @@ PAINT_ATT   = re.compile(r"\(attempt (\d+)\)")
 STATUS_N    = re.compile(r"status=(-?\d+)")
 KERNEL_LINE = re.compile(r"^\[[A-Za-z_]+\]")
 ASSERT_PAT  = re.compile(r"(ASSERT|assert(ion)? failed|Unhandled exception|Double fault)", re.I)
+
+
+WEB_MARK_W, WEB_MARK_H = 96, 96
+
+
+def png_bytes(w, h, rgb):
+    """A w x h PNG of one solid colour (no colour-space chunk, so Firefox
+    shows the exact value; a tagged image would be colour-managed)."""
+    raw = b"".join(b"\x00" + bytes(rgb) * w for _ in range(h))
+
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+    return (b"\x89PNG\r\n\x1a\n" +
+            chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+class WebServer:
+    """The page --web loads, served from a thread; records every request."""
+    PAGE = (b"<!doctype html><html><head><title>MaeroOS web smoke</title>"
+            b"<style>body{background:#e8eefc;font-family:sans-serif}"
+            b"h1{color:#1d4ed8}</style></head><body>"
+            b"<h1>Served over HTTP to MaeroOS</h1>"
+            b"<p>Fetched by Firefox through the MaeroOS TCP stack.</p>"
+            b"<img src=\"mark.png\" width=\"%d\" height=\"%d\" alt=\"mark\">"
+            b"</body></html>" % (WEB_MARK_W, WEB_MARK_H))
+
+    def __init__(self):
+        self.requests = []          # (host time, path, status)
+        files = {"/": self.PAGE, "/mark.png": png_bytes(WEB_MARK_W, WEB_MARK_H, (255, 0, 0))}
+        types = {"/": "text/html", "/mark.png": "image/png"}
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = files.get(self.path)
+                outer.requests.append((time.time(), self.path, 200 if body else 404))
+                if body is None:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", types[self.path])
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        self.httpd = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def first(self, path):
+        for t, p, _ in self.requests:
+            if p == path:
+                return t
+        return None
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def red_pixels(frame):
+    """Pixels of exactly (255, 0, 0) - the --web marker; nothing else on this
+    desktop uses that colour."""
+    if not frame:
+        return 0
+    rgb = frame[2]
+    return sum(1 for i in range(0, len(rgb) - 2, 3)
+               if rgb[i] == 255 and rgb[i + 1] == 0 and rgb[i + 2] == 0)
 
 
 def kvm_usable():
@@ -381,6 +466,7 @@ class Run:
         self.paint_scores = []
         self.wedge_qmp = None
         self.type_note = None
+        self.web_notes = []
         self.key_notes = None
         self.key_ok = None
 
@@ -546,6 +632,8 @@ class Run:
             L.append("")
         if self.type_note:
             L.append("typing      : %s" % self.type_note)
+        for n in self.web_notes:
+            L.append("web         : %s" % n)
             L.append("")
         if self.wedge_qmp:
             L.append("wedge capture : %s" % self.wedge_qmp)
@@ -696,26 +784,90 @@ def run_key_checks(qmp, args, run, pump):
     return ok
 
 
-def type_into_guest(qmp, args, run, pump, shot):
-    """Focus Firefox's address bar and type args.type_text into it.
-
-    Ctrl+L is the address-bar accelerator; it only works if the modifier state
-    reaches the browser as a real X11 KeyPress with ControlMask set, so this is
-    itself part of what the screenshot proves."""
-    try:
-        keys = qemu_keys_for(args.type_text)
-    except ValueError as exc:
-        print("smoke-firefox: --type: %s" % exc)
-        run.type_note = "not typed: %s" % exc
-        return
-    print("smoke-firefox: typing %r into the address bar (%d keys)"
-          % (args.type_text, len(keys)))
+def send_text(qmp, args, pump, text):
+    """Ctrl+L, then `text` through QEMU sendkey.  Raises ValueError for a
+    character with no key name."""
+    keys = qemu_keys_for(text)
     pump(2.0)
     qmp.hmp("sendkey ctrl-l")
     pump(1.5)
     for k in keys:
         qmp.hmp("sendkey " + k)
         pump(args.type_delay)
+    return len(keys)
+
+
+def web_load(qmp, args, run, pump, web):
+    """Type the served page's URL and wait for its image to be requested and
+    its red block to reach the screen."""
+    url = "http://10.0.2.2:%d/" % web.port
+    print("smoke-firefox: --web: loading %s" % url)
+    send_text(qmp, args, pump, url[:-1])       # all but the last key...
+    t_enter = time.time()
+    qmp.hmp("sendkey ret")                     # ...then Enter, timed
+    need = WEB_MARK_W * WEB_MARK_H * 9 // 10
+    end = t_enter + args.web_timeout
+    best, best_red, t_red = None, -1, None
+    tmpdir = tempfile.mkdtemp(prefix="ffweb-")
+    try:
+        while time.time() < end:
+            if not pump(3.0):
+                break
+            if web.first("/mark.png") is None:
+                continue
+            cand = qmp.screendump_ppm(os.path.join(tmpdir, "web.ppm"))
+            frame = read_ppm(cand) if cand else None
+            red = red_pixels(frame)
+            if red > best_red:
+                best, best_red = frame, red
+            if red >= need:
+                t_red = time.time()
+                break
+        if best is None:
+            cand = qmp.screendump_ppm(os.path.join(tmpdir, "web.ppm"))
+            best = read_ppm(cand) if cand else None
+            best_red = red_pixels(best)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    if best:
+        pth = os.path.join(args.outdir, "screen-web.png")
+        write_png(pth, best)
+        run.shots["screen-web"] = pth
+
+    def since(t):
+        return "%.1fs" % (t - t_enter) if t else "never"
+    reqs = ", ".join("%s %d at +%.1fs" % (p, st, t - t_enter) for t, p, st in web.requests)
+    run.web_notes = ["url %s" % url,
+                     "requests: %s" % (reqs or "none"),
+                     "page requested %s after Enter, image %s, red block on screen %s "
+                     "(%d of %d marker pixels)" % (since(web.first("/")), since(web.first("/mark.png")),
+                                                   since(t_red), max(best_red, 0),
+                                                   WEB_MARK_W * WEB_MARK_H)]
+    for n in run.web_notes:
+        print("smoke-firefox:   " + n)
+    if web.first("/") is None:
+        run.result, run.reason = "FAIL", "--web: the page was never requested from the host"
+    elif web.first("/mark.png") is None:
+        run.result, run.reason = "FAIL", "--web: the page was fetched but its image never was"
+    elif t_red is None:
+        run.result, run.reason = "FAIL", "--web: the image was fetched but never appeared on screen"
+    else:
+        run.reason += " Page loaded: image on screen %.1fs after Enter." % (t_red - t_enter)
+
+
+def type_into_guest(qmp, args, run, pump, shot):
+    """Focus Firefox's address bar and type args.type_text into it.
+
+    Ctrl+L is the address-bar accelerator; it only works if the modifier state
+    reaches the browser as a real X11 KeyPress with ControlMask set, so this is
+    itself part of what the screenshot proves."""
+    print("smoke-firefox: typing %r into the address bar" % args.type_text)
+    try:
+        send_text(qmp, args, pump, args.type_text)
+    except ValueError as exc:
+        print("smoke-firefox: --type: %s" % exc)
+        run.type_note = "not typed: %s" % exc
+        return
     pump(args.type_settle)
     p = shot("screen-typed")
     run.type_note = "typed %r -> %s" % (args.type_text, p or "(no screendump)")
@@ -756,10 +908,21 @@ def main():
                     help="seconds to wait for each --keycheck keystroke to show up in "
                          "maeroX's trace (default 90; the guest can be busy streaming a "
                          "diagnostic frame over the serial line)")
+    ap.add_argument("--net", action="store_true",
+                    help="attach an rtl8139 on QEMU user networking, so the guest can reach "
+                         "the host as 10.0.2.2 (e.g. --type 'http://10.0.2.2:8000/'). "
+                         "Off by default: the default run has no NIC.")
+    ap.add_argument("--web", action="store_true",
+                    help="after the paint verdict, load a page served from the host "
+                         "(implies --net) and require its image on screen; see above")
+    ap.add_argument("--web-timeout", type=float, default=240.0,
+                    help="seconds from Enter to the page's image on screen (default 240)")
     ap.add_argument("-v", "--verbose", action="store_true", help="echo every serial line")
     args = ap.parse_args()
 
     os.chdir(ROOT)
+    if args.web:
+        args.net = True
     accel = args.accel or ("kvm" if kvm_usable() else "tcg")
     is_kvm = accel.split(",")[0] == "kvm"
     if args.timeout is None:
@@ -808,6 +971,8 @@ def main():
            "-no-reboot", "-no-shutdown"]
     if args.cpu:
         cmd[1:1] = ["-cpu", args.cpu]
+    if args.net:
+        cmd += ["-netdev", "user,id=n0", "-device", "rtl8139,netdev=n0"]
     with open(os.path.join(args.outdir, "qemu-cmdline.txt"), "w") as f:
         f.write(" ".join(cmd) + "\n")
 
@@ -899,6 +1064,12 @@ def main():
                 type_into_guest(qmp, args, run, pump, shot)
             if args.keycheck:
                 run_key_checks(qmp, args, run, pump)
+            if args.web:
+                web = WebServer()
+                try:
+                    web_load(qmp, args, run, pump, web)
+                finally:
+                    web.close()
         elif run.panic_lines:
             pump(2.0)         # collect the register dump / stack trace
         else:
