@@ -257,7 +257,8 @@ invocation (a few minutes).
   Debian i386 packages, no Docker/root); `ports/firefox/check-runtime.sh`
   proves the tree is closed under dynamic linking.  See `ports/firefox/README.md`.
 - Cross builds: `ports/Dockerfile.cross` (linux/amd64 + musl.cc i686).
-  The toolchain tarball is vendored at `ports/i686-linux-musl-cross.tgz`.
+  It copies in `ports/i686-linux-musl-cross.tgz`, which is gitignored and
+  downloaded there by `tools/setup-linux.sh`.
 - Most ports build `-static -no-pie`; **as of Phase 30 the kernel also runs
   PT_INTERP (dynamic) binaries** via musl ld.so (`ports/build-dynprobe.sh`
   builds the `-fpie -pie` probe and exports the linker).

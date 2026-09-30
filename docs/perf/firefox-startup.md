@@ -50,7 +50,10 @@ make smoke-firefox                     # KVM, -smp 1, 2 GiB; artifacts under bui
 grep '^\[kprof\]' build/ff-smoke/<run>/serial.log
 ```
 
-A dump is emitted every 10 s of tick time and on demand through syscall 503
+The bucket accounting is always built in; the probe spans (below) and the
+periodic dump are compiled in only with `make KTRACE=1`, so rebuild with it
+before measuring probes. A dump is emitted every 10 s of tick time (KTRACE=1)
+and on demand through syscall 503
 (504 resets the counters). `/disk/ff` issues 503 the instant the paint marker
 appears, so the line tagged `mark` covers exactly the startup being measured
 rather than the nearest periodic dump. All figures below are from `mark` lines.

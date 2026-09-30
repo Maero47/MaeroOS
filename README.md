@@ -14,7 +14,7 @@ desktop application and reporting `0 clients, DISPLAY=:0`.
 ## Why it is unusual
 
 - The kernel implements the **Linux i386 syscall table**, not a bespoke one.
-  `proc/syscall.c` dispatches 176 Linux syscall numbers, so software built with an
+  `proc/syscall.c` dispatches 199 Linux syscall numbers, so software built with an
   ordinary `i686-linux-musl` or `i686-linux-gnu` toolchain runs without patching.
 - **Dynamic linking works.** The real musl `ld-musl-i386.so.1` loads PIEs and external
   shared objects, which is what makes prebuilt Linux packages usable at all.
@@ -31,30 +31,41 @@ What is proven by the automated QEMU tests in `tools/`:
 
 | Area | Proof | Target |
 |---|---|---|
-| Boot, shell, procfs, PTYs, threads, shm, RNG | `ls`, `cat`, `sysprobe ok`, `shmprobe ok`, `threadprobe ok`, `ptytest ok`, `cttytest ok`, `/proc/self/status` | `make smoke` |
-| toybox 0.8.13 as a static guest binary | `TOYBOX_OK` plus 17 applet checks | `make smoke-toybox` |
-| Native coreutils-style commands | `uname`, `whoami`, `hostname`, `free`, `df`, `uptime`, `which` | `make smoke-cmds` |
-| ext2 disk, login/passwd, init services, sessions | 108 assertions including `passwd: password updated for root` and `svc` state transitions | `make smoke-disk` |
-| TCP/IP over lwIP and RTL8139 | `MAEROS_HTTP_OK` fetched from a host HTTP server | `make smoke-net` |
-| Kernel firewall | after `fwctl enable` plus a drop rule the same fetch fails, `fwctl list` reports the firewall `enabled` with the `drop out tcp` rule, and `fwctl flush` restores the fetch | `make smoke-fw` |
+| Boot, shell, procfs, PTYs, threads, shm, RNG, bad user pointers | `ls`, `cat`, `sysprobe ok`, `shmprobe ok`, `threadprobe ok`, `ptytest ok`, `cttytest ok`, `memprobe ok`, `/proc/self/status` | `make smoke` |
+| toybox 0.8.13, syscall edge cases, libc, `pkg` archive checks | `TOYBOX_OK` plus applet checks, `sysmiscprobe ok`, `LIBCTEST PASS`, `pkg` refusing `../etc`, and the host-side `tools/test_pkg_tarx.py` | `make smoke-toybox` |
+| Native coreutils-style commands, user faults | `kwprobe ok` (a user write to kernel memory dies of SIGSEGV, a user `int3` of SIGTRAP), then `uname`, `whoami`, `hostname`, `free`, `df`, `uptime`, `which` | `make smoke-cmds` |
+| ext2 disk, login/passwd/doas, permissions, init services, sessions | 152 checks including `passwd` keeping `/etc/shadow` root-only 0600, `login` dropping to `uid=1000`, `doas` ignoring a planted `./ls`, `credprobe ok`, `fsprobe ok` and `svc` state transitions | `make smoke-disk` |
+| TCP/IP over lwIP and RTL8139 | `MAEROS_HTTP_OK` fetched from a host HTTP server; `sockprobe` checks that `send` after `shutdown(SHUT_WR)` fails with `EPIPE`, a two-step shutdown ends in a FIN and no RST, and closing TIME_WAIT sockets keeps TCP working | `make smoke-net` |
+| Kernel firewall | after `fwctl enable` plus a drop rule the same fetch fails, `fwctl list` reports the firewall `enabled` with the `drop out tcp` rule, malformed rules (`/33`, an overflowing prefix, port 70000, `tcpp`) are rejected under `policy out drop`, and `fwctl flush` restores the fetch | `make smoke-fw` |
 | Dynamic linker | `DYNPROBE_OK` from a PIE loaded through musl `ld.so` | `make smoke-dyn` |
 | External shared libraries and pthreads | `GREET_OK sum=42`, `ZLIB_OK ver=1.3`, `THREADS_OK count=200000`, `UNIX_SOCK_OK` | `make smoke-dynlib` |
 | X11 server | `XHANDSHAKE_OK`, `XDRAW_OK` (`w=320 h=200` from `GetGeometry`), `XEVENT_OK`, and `XREAL_PAINTED` from a client linked against the cross-built libX11 | `make smoke-x` |
-| GLib, Cairo, Pango, GTK3 | `GLIB_OK` (v2.78), `CAIRO_OK rect_px=0xe69919`, `PANGO_OK`, `GTK_OK init`, `GTK_WINDOW_SHOWN`, `GTK_DRAWN` | `make smoke-gtk` |
+| GLib, Cairo, Pango, GTK3 | `GLIB_OK` (v2.78), `CAIRO_OK rect_px=0xe69919`, `PANGO_OK`, `GTK_OK init`, `GTK_WINDOW_SHOWN`, `GTK_DRAWN` (needs probe binaries a fresh clone lacks, see Testing) | `make smoke-gtk` |
 
 ### What does not work
 
 - **Firefox 115.15.0esr does not reach first paint.** The prebuilt i686 ESR build loads
   and `/disk/firefox/firefox-bin --version` prints `Mozilla Firefox 115.15.0esr` (the
   `run-firefox` comment in the Makefile records this), but the browser stalls during
-  startup before rendering a page. Much of the Firefox-specific tracing left in
-  `proc/syscall.c`, `proc/scheduler.c` and `proc/usocket.c` exists to chase that stall.
-  This is the current frontier of the project, not a finished feature.
+  startup before rendering a page. Much of the Firefox-specific code left in
+  `proc/syscall.c`, `proc/scheduler.c` and `proc/usocket.c` exists to chase that stall;
+  its hot-path traces are only compiled in with `make KTRACE=1`. This is the current
+  frontier of the project, not a finished feature.
 - **No W^X.** ELF segments are mapped writable; `proc/elf.c` does not yet enforce
   per-segment protection.
 - **inotify is deliberately absent.** Numbers 291, 292, 293 and 332 return `-ENOSYS`
   on purpose so GLib falls back to its polling backend (see the comment on those
   cases in `proc/syscall.c`).
+- **Unfinished credential and socket semantics.** The kernel applies only the umask
+  to a new file's mode (libc's `open()` narrows the umask and `fchmod`s to honour the
+  requested mode); there are no supplementary groups (`initgroups` is a stub in
+  `userspace/libc/toybox_compat.c`); `setfsuid`/`setfsgid` just report the effective id;
+  `O_NONBLOCK` and `send` flags such as `MSG_NOSIGNAL` are not passed to the network
+  layer, so SIGPIPE on a closed TCP socket is not implemented.
+- **`pkg` trusts its index.** Each tarball is checked against the SHA-256 in
+  `index.txt`, but the index itself is fetched over plain HTTP and is not signed.
+- **No console login during the desktop session.** While the graphical session runs,
+  no getty is offered on the serial/VGA console.
 - **No SMP scaling.** One Big Kernel Lock serialises all kernel execution
   (`arch/i686/cpu/bkl.c`).
 - **Only Linux and macOS hosts are covered.** The Makefile looks up `mke2fs`, `debugfs`
@@ -72,8 +83,8 @@ What is proven by the automated QEMU tests in `tools/`:
   RTC, GDT/TSS/IDT/FPU, PIC, VGA, physical memory, paging, LAPIC, framebuffer, heap,
   VFS, initrd, PCI, network, ATA/ext2, tmpfs, devfs, procfs, scheduler, input, PIT,
   application processors, then `/disk/init` or `/init`.
-- 21,612 lines of C, headers and assembly across the kernel directories, of which
-  `proc/syscall.c` is 6,653.
+- About 27,000 lines of C, headers and assembly across the kernel directories, of which
+  `proc/syscall.c` is about 8,100.
 - Limits in `include/kernel/config.h`: `MAX_PROCS` 128, `MAX_FD` 128, 32 KiB kernel
   stacks, a 256 MiB kernel heap window at `0xD0000000`, 64-page user stacks below
   `0xC0000000`.
@@ -84,7 +95,10 @@ What is proven by the automated QEMU tests in `tools/`:
   use-after-free detector that reports frames handed out with a stale refcount.
 - `arch/i686/mm/paging.c`: recursive page-directory self-map at PDE 1023, copy-on-write
   fork, demand-paged anonymous VMAs, and an exception table (`__start___ex_table`) so a
-  faulting `copy_from_user` returns `-EFAULT` instead of panicking.
+  faulting `copy_from_user`/`copy_to_user` (`proc/syscall.c`) returns `-EFAULT` instead
+  of panicking. The kernel touches user memory only through these copies; file and
+  socket I/O is bounced through kernel buffers, and a user fault on a kernel page is a
+  SIGSEGV rather than a retry loop.
 - RAM above 512 MiB boots: the higher-half direct map stops at 256 MiB (the heap window
   at `0xD0000000`) and frames above it are reached through temporary maps, so the kernel
   reaches the shell with `-m 1024M` and `-m 2048M` (`run-firefox` uses 2 GiB).
@@ -96,6 +110,14 @@ What is proven by the automated QEMU tests in `tools/`:
 - `sys_clone` handles `CLONE_VM`, `CLONE_SETTLS` (per-thread TLS through GDT entry 6),
   `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID`, which is what
   makes `pthread_join` return.
+- Credentials follow Linux: real, effective and saved set-IDs (`proc/process.h`),
+  `setuid`/`setreuid`/`setresuid` and their gid twins with the unprivileged-move rules,
+  and set-uid exec. `vfs_access_check` (`fs/vfs.c`) applies owner/group/other bits to
+  open, exec and directory changes; `chmod`/`chown` are owner- or root-only. `/tmp` is
+  sticky, new files are owned by the effective ids, `O_EXCL` is honoured, and `rename`
+  is atomic within one filesystem and fails with `EXDEV` across filesystems. `kill`
+  checks the sender against the target's ids; a SIGKILL also reaches the target's
+  descendants, each of which must pass the same check.
 - `futex` WAIT/WAKE backs musl mutexes and condition variables.
 - `proc/usocket.c`: AF_UNIX stream sockets with `socketpair`, named bind/listen/connect,
   `sendmsg`/`recvmsg`, and `SCM_RIGHTS` file-descriptor passing integrated into `poll`
@@ -118,9 +140,11 @@ deadlock the sender.
 
 ### Filesystems
 
-`fs/vfs.c` mount table with a root overlay, `fs/initrd.c` ustar archive read from the
-Multiboot module, `fs/ext2.c` (1,522 lines, read and write, mounted at `/disk` and
-overlaid on `/`), `fs/tmpfs.c` at `/tmp`, `fs/devfs.c` at `/dev` (`null`, `zero`, `tty`,
+`fs/vfs.c` mount table with a root overlay and path lookup (symlinks are followed
+iteratively with a 40-link budget, then `ELOOP`), `fs/initrd.c` ustar archive read from
+the Multiboot module, `fs/ext2.c` (read and write, mounted at `/disk` and overlaid on
+`/`), `fs/tmpfs.c` at `/tmp` (files capped at 256 MiB, `EFBIG` beyond), `fs/devfs.c` at
+`/dev` (`null`, `zero`, `tty`,
 `ptmx`, `pts/`, `random`, `urandom`, `fb0`, `dsp`, `shm`, `input/event0`, `input/event1`,
 standard fd aliases), and `fs/procfs.c` at `/proc` (`self`, per-pid `status`, `stat`,
 `statm`, `maps`, `fd`, `cmdline`, `environ`, `auxv`, `exe`, plus `meminfo`, `version`,
@@ -144,10 +168,11 @@ keyboard and mouse (`keyboard.c`, `mouse.c`), CMOS RTC (`rtc.c`) and 16550 seria
 
 ### Userland
 
-`userspace/` is 26,190 lines across 192 files, built with the same `i686-elf-gcc` and
+`userspace/` is about 30,000 lines across 206 source files, built with the same
+`i686-elf-gcc` and
 linked against its own freestanding libc (`userspace/libc/`: syscall stubs, stdio, stdlib,
 string, dirent, termios, sockets, a DNS resolver, pthreads and a toybox compatibility
-layer, entered from `crt0.asm`). `userspace/Makefile` produces 100 binaries into
+layer, entered from `crt0.asm`). `userspace/Makefile` installs the binaries into
 `testfiles/`.
 
 **init** (`userspace/init/init.c`) prefers a disk userland over the initrd, runs `/etc/rc`
@@ -161,7 +186,7 @@ to 1 s, and after 8 in a row the session is parked instead of restarted. When a
 framebuffer is present, init plays a startup chime through `wavplay` and runs the desktop
 as the unprivileged user.
 
-**The shell** (`userspace/shell/shell.c`, 1,528 lines) handles single and double quoting,
+**The shell** (`userspace/shell/shell.c`) handles single and double quoting,
 `;`, `&&`, `||` and `&`, pipelines of up to 16 commands, redirections (`<`, `>`, `>>`,
 `2>`, `2>&1` and `<<` heredocs), `$VAR`, `$?`, `$$` and `$(...)` command substitution,
 shell variables with `export` and `unset`, `if`/`elif`/`else`/`fi`, `while`/`do`/`done`,
@@ -176,13 +201,20 @@ it.
 `du`, `uptime`, `dmesg`, `lspci`, `ifconfig`, `fwctl`, `svc`, `session`), account tools
 (`login`, `passwd`, `doas`, `sudo`, `getty`, `id`, `whoami`) and the `*probe` binaries the
 smoke tests assert on. Passwords are PBKDF2-HMAC-SHA256 at 100,000 iterations, implemented
-in `userspace/auth/auth.c` and stored in `/etc/shadow`. Eighteen BusyBox applet names
+in `userspace/auth/auth.c` and stored in `/etc/shadow` (root-only, 0600). The accounts
+are `root` and `user` (uid 1000); the default `user` password is `user`, stored hashed.
+`login` switches to the target user's ids before starting the shell, `passwd` rewrites
+the shadow file through a replace helper (`userspace/auth/replace.c`) that keeps
+`/etc/shadow-` as a backup, and `doas` runs commands only from a fixed
+`PATH=/disk:/disk/bin:/:/bin`, never the caller's. `/disk/etc` is 0755 root
+(`tools/diskperms.txt`), so an ordinary user cannot add files to it. Eighteen BusyBox
+applet names
 (`vi`, `less`, `ping`, `mount`, `gzip` and others) are installed into `/bin` as copies of
 a small `bbwrap` launcher.
 
 ### Desktop and window system
 
-`desktop` (`userspace/desktop/desktop.c`, 4,889 lines) opens `/dev/fb0`,
+`desktop` (`userspace/desktop/desktop.c`) opens `/dev/fb0`,
 `/dev/input/event0` and `/dev/input/event1`, and composites the whole screen into a back
 buffer that it presents once per frame. It draws a PPM wallpaper (kept in a blurred copy
 for the window backdrop), desktop icons that launch on double-click, and a taskbar with a
@@ -205,7 +237,7 @@ images). `term`, `edit`, `calc`, `view`, `files`, `taskmgr`, `settings`, `store`
 `browse` are written this way; `term` runs a real shell on a PTY and several instances can
 run side by side.
 
-`maerox` (`userspace/maerox/maerox.c`, 1,334 lines) is the X11 server. It takes a desktop
+`maerox` (`userspace/maerox/maerox.c`) is the X11 server. It takes a desktop
 slot like any other libgui application, listens on the AF_UNIX socket `/tmp/.X11-unix/X0`
 for up to 8 clients, and answers the connection setup with one screen, two pixmap formats
 and a single depth-24 TrueColor visual. The core request dispatch covers window and pixmap
@@ -224,7 +256,10 @@ bitmaps.
 `store` and `pkg` install packages from a repository built by `tools/mkrepo.py` out of
 `ports/packages/*/pkg.conf`. `pkg update`, `list`, `install` and `remove` fetch
 `index.txt` and per-package ustar archives over HTTP into `/disk/apps/<name>/`, defaulting
-to the QEMU host at `10.0.2.2:8000` and overridable in `/disk/etc/pkg.conf`; `store` is
+to the QEMU host at `10.0.2.2:8000` and overridable in `/disk/etc/pkg.conf`. `pkg`
+refuses a tarball whose SHA-256 does not match the index, package names that are paths,
+and archives with anything but regular files under flat, plain names, checking every
+header before it writes; `store` is
 the libgui front end that drives the `pkg` binary. `make repo-serve` serves the repository
 from the host.
 
@@ -363,7 +398,7 @@ Everything goes to the serial console, so `make run` gives you the boot log and 
 
 ## Testing
 
-The ten smoke targets each boot QEMU, drive the guest shell over the serial console and
+The smoke targets each boot QEMU, drive the guest shell over the serial console and
 assert on the output. They are the project's regression suite; `tools/smoke.py` is the
 baseline the others build on, so it is the one to read first.
 
@@ -378,7 +413,17 @@ make smoke-dyn      # PIE through the musl dynamic linker
 make smoke-dynlib   # external .so files, zlib, pthreads, AF_UNIX
 make smoke-x        # maeroX handshake, drawing and input events
 make smoke-gtk      # GLib, Cairo, Pango and a real GTK3 window
+make smoke-abi      # Linux-ABI probes (ports/abiprobes/README.md), needs i686-linux-musl-gcc
+make smoke-firefox  # does Firefox paint? (README-BROWSER.md)
 ```
+
+`SMOKE_SMP=N make smoke-cmds` boots the same guest with `-smp N`. `make smoke-gtk` needs
+`testfiles/cairoprobe`, `pangoprobe` and `gtkprobe`, which are not in git: they are
+linked by hand inside the GTK build container (`ports/gtk/`), and without them the
+script stops with instructions and runs nothing. `make KTRACE=1` builds the kernel with
+the hot-path debug traces (per-exec, per-signal and per-fault lines, `kprof` probe spans
+and its periodic dump); the setting is recorded in `.ktrace-stamp`, so switching it
+rebuilds the kernel objects.
 
 Each script exits non-zero and prints the failing expectation, for example
 `command 'threadprobe' did not produce 'threadprobe ok'`.
@@ -431,7 +476,7 @@ A wedged boot prints nothing, so three things exist to make one visible.
 | `testfiles/` | the root filesystem staged into `initrd.tar` and `disk.img` |
 | `third_party/` | vendored lwIP and toybox |
 | `tools/` | smoke tests, QEMU launch script, icon/font/wallpaper/repo generators |
-| `docs/` | screenshots |
+| `docs/` | screenshots, the Firefox first-paint audit (`docs/audit/`) and startup profile (`docs/perf/`) |
 
 ## Architecture notes
 
@@ -442,9 +487,9 @@ A wedged boot prints nothing, so three things exist to make one visible.
 - **Recursive page tables.** PDE 1023 points at the page directory itself, so any page
   table is reachable at `0xFFC00000 + (pde << 12)` without a temporary mapping.
 - **Linux i386 ABI over `int 0x80`.** Arguments arrive in EBX, ECX, EDX, ESI, EDI, EBP,
-  which is why `mmap2` reads its file offset from `regs->ebp`. The kernel adds four
-  numbers of its own outside the Linux table, 500 to 502 for shared memory and 505 for
-  the desktop kill target.
+  which is why `mmap2` reads its file offset from `regs->ebp`. The kernel adds six
+  numbers of its own outside the Linux table: 500 to 502 for shared memory, 503 and 504
+  to dump and reset the `kprof` cycle accounting, and 505 for the desktop kill target.
 - **One Big Kernel Lock.** Application processors run user threads concurrently, but any
   CPU entering the kernel takes the recursive BKL. The first user process dispatched
   releases it in `forkret` on the way to user mode.
