@@ -11,8 +11,10 @@
  *         desktop surface.
  */
 #include <draw.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <gui.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +37,12 @@
  * PutImage (818*531*4 = 1.7 MB, chunked to 256 KiB pieces) disconnected
  * Firefox instead of painting. */
 #define INBUF_SIZE    270336   /* 264 KiB >= 65535 * 4 */
+/* Replies and events a client has not read yet are queued per client instead
+ * of being pushed with a blocking retry loop: the server is single-threaded, so
+ * one client that stops reading used to freeze every client and the display.
+ * The cap is the largest GetImage reply we produce (1<<22 pixels * 4) plus
+ * slack; a client that lets more than this pile up is disconnected. */
+#define OUTBUF_MAX    (20u << 20)
 
 #define ROOT_WINDOW   0x00000001u
 #define ROOT_COLORMAP 0x00000020u
@@ -101,6 +109,10 @@ typedef struct {
     uint16_t seq;
     xres_t   res[MAX_RES];
     int      nres;
+    uint8_t *out;          /* bytes queued for the client (see out_write) */
+    size_t   outoff, outlen, outcap;
+    int      dead;         /* write failed / protocol violation: close it */
+    uint8_t  cur_major, cur_minor;   /* request being dispatched (for errors) */
 } xclient_t;
 
 static gui_window_t gui;
@@ -214,12 +226,94 @@ static void b16(buf_t *b, uint32_t v) { b8(b, v); b8(b, v >> 8); }
 static void b32(buf_t *b, uint32_t v) { b8(b, v); b8(b, v >> 8); b8(b, v >> 16); b8(b, v >> 24); }
 static void bpad(buf_t *b, int n)     { while (n-- > 0) b8(b, 0); }
 
-static void write_all(int fd, const uint8_t *p, int n) {
-    int off = 0;
+/* ── output ──────────────────────────────────────────────────────────────────
+ * Every byte for a client goes through out_write().  It never blocks: what the
+ * socket takes now is sent, the rest waits in the client's queue and
+ * out_flush() pushes it from the main loop.  A client that has gone away (EPIPE
+ * — sent with MSG_NOSIGNAL and SIGPIPE is ignored too, so it cannot kill the
+ * server) or that lets OUTBUF_MAX pile up is marked dead and closed by the
+ * main loop, never from inside a request handler. */
+static int out_send(xclient_t *c, const uint8_t *p, size_t n) {
+    size_t off = 0;
     while (off < n) {
-        int w = write(fd, p + off, n - off);
-        if (w > 0) off += w; else sleep_ms(1);
+        int w = send(c->fd, p + off, n - off, MSG_NOSIGNAL);
+        if (w > 0) { off += (size_t)w; continue; }
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && errno == EAGAIN) break;
+        c->dead = 1;                          /* EPIPE, EBADF, ... */
+        break;
     }
+    return (int)off;
+}
+
+static void out_flush(xclient_t *c) {
+    if (c->dead || c->outlen == 0) return;
+    size_t w = (size_t)out_send(c, c->out + c->outoff, c->outlen);
+    c->outoff += w;
+    c->outlen -= w;
+    if (c->outlen == 0) c->outoff = 0;
+}
+
+static void out_write(xclient_t *c, const void *data, size_t n) {
+    const uint8_t *p = (const uint8_t *)data;
+    if (c->dead || n == 0) return;
+    if (c->outlen == 0) {                      /* nothing queued: try direct */
+        size_t w = (size_t)out_send(c, p, n);
+        if (c->dead) return;
+        p += w; n -= w;
+        if (n == 0) return;
+    }
+    if (c->outlen + n > OUTBUF_MAX) {
+        xt("XT client output queue over %u bytes, disconnecting\n", OUTBUF_MAX);
+        c->dead = 1;
+        return;
+    }
+    if (c->outoff + c->outlen + n > c->outcap && c->outoff) {
+        memmove(c->out, c->out + c->outoff, c->outlen);
+        c->outoff = 0;
+    }
+    if (c->outlen + n > c->outcap) {
+        size_t cap = c->outcap ? c->outcap : 4096;
+        while (cap < c->outlen + n) cap *= 2;
+        if (cap > OUTBUF_MAX) cap = OUTBUF_MAX;
+        uint8_t *np = (uint8_t *)realloc(c->out, cap);
+        if (!np) { c->dead = 1; return; }
+        c->out = np;
+        c->outcap = cap;
+    }
+    memcpy(c->out + c->outoff + c->outlen, p, n);
+    c->outlen += n;
+}
+
+/* X error codes (core protocol). */
+#define BadValue     2
+#define BadPixmap    4
+#define BadAlloc    11
+#define BadGC       13
+#define BadIDChoice 14
+#define BadLength   16
+
+static void put32(uint8_t *p, uint32_t v);
+static void put16(uint8_t *p, uint32_t v);
+
+/* An X error for the request being dispatched (c->seq, c->cur_major/minor).
+ *
+ * Errors are sent only for requests a well-formed client never issues —
+ * short or truncated requests, reused ids, a GC request on a window — because
+ * Xlib's default handler, GDK's and Firefox's treat an unexpected error as
+ * fatal: a case maeroX merely does not implement stays a silent no-op. */
+static void x_error(xclient_t *c, int code, uint32_t bad) {
+    uint8_t e[32];
+    memset(e, 0, sizeof(e));
+    e[0] = 0;                           /* Error */
+    e[1] = (uint8_t)code;
+    put16(e + 2, c->seq);
+    put32(e + 4, bad);
+    put16(e + 8, c->cur_minor);
+    e[10] = c->cur_major;
+    out_write(c, e, 32);
+    xt("XT error %d op=%d.%d seq=%d bad=0x%x\n", code, c->cur_major,
+       c->cur_minor, c->seq, (unsigned)bad);
 }
 
 /* ── resources ───────────────────────────────────────────────────────────── */
@@ -230,13 +324,31 @@ static xres_t *res_find(xclient_t *c, uint32_t xid) {
     return NULL;
 }
 
-static xres_t *res_new(xclient_t *c, uint32_t xid, int kind) {
-    xres_t *r = res_find(c, xid);
-    if (!r) {
-        for (int i = 0; i < MAX_RES; i++)
-            if (!c->res[i].kind) { r = &c->res[i]; if (i >= c->nres) c->nres = i + 1; break; }
+/* Release everything a resource owns and free its slot. */
+static void res_free(xres_t *r) {
+    if (r->px) { free(r->px); r->px = NULL; }
+    if (r->gset) {
+        glyphset_t *gs = (glyphset_t *)r->gset;
+        for (int k = 0; k < gs->n; k++)
+            if (gs->g[k].bits) free(gs->g[k].bits);
+        free(gs->g);
+        free(gs);
+        r->gset = NULL;
     }
-    if (!r) return NULL;
+    r->kind = R_NONE;
+}
+
+/* A new resource.  An id this client already uses is BadIDChoice: silently
+ * re-initialising the slot dropped its pixel buffer and glyphs on the floor. */
+static xres_t *res_new(xclient_t *c, uint32_t xid, int kind) {
+    if (xid == ROOT_WINDOW || res_find(c, xid)) {
+        x_error(c, BadIDChoice, xid);
+        return NULL;
+    }
+    xres_t *r = NULL;
+    for (int i = 0; i < MAX_RES; i++)
+        if (!c->res[i].kind) { r = &c->res[i]; if (i >= c->nres) c->nres = i + 1; break; }
+    if (!r) return NULL;   /* table full: stays silent, see x_error() */
     memset(r, 0, sizeof(*r));
     r->xid = xid;
     r->kind = kind;
@@ -303,7 +415,7 @@ static void send_reply(xclient_t *c, uint8_t b1, const uint8_t data24[24]) {
     r[3] = (c->seq >> 8) & 0xFF;
     /* r[4..7] reply-length = 0 (no extra) */
     if (data24) memcpy(r + 8, data24, 24);
-    write_all(c->fd, r, 32);
+    out_write(c, r, 32);
     if (xdbg) printf("maerox: reply seq=%d b1=%d sent\n", c->seq, b1);
 }
 
@@ -317,11 +429,11 @@ static void send_reply_var(xclient_t *c, uint8_t b1, const uint8_t data24[24],
     int words = (extra_len + 3) / 4;
     put32(r + 4, (uint32_t)words);
     if (data24) memcpy(r + 8, data24, 24);
-    write_all(c->fd, r, 32);
+    out_write(c, r, 32);
     if (extra_len > 0) {
-        write_all(c->fd, extra, extra_len);
+        out_write(c, extra, extra_len);
         int pad = words * 4 - extra_len;
-        if (pad > 0) { uint8_t z[4] = {0,0,0,0}; write_all(c->fd, z, pad); }
+        if (pad > 0) { uint8_t z[4] = {0,0,0,0}; out_write(c, z, pad); }
     }
 }
 
@@ -352,7 +464,7 @@ static void send_expose(xclient_t *c, xres_t *w) {
     put16(e + 8, 0); put16(e + 10, 0);  /* x, y */
     put16(e + 12, w->w); put16(e + 14, w->h);
     put16(e + 16, 0);                   /* count */
-    write_all(c->fd, e, 32);
+    out_write(c, e, 32);
 }
 
 /* MapNotify: tell the client its window is now mapped/viewable.  GDK keeps the
@@ -365,7 +477,7 @@ static void send_map_notify(xclient_t *c, xres_t *w) {
     put32(e + 4, w->xid);               /* event window */
     put32(e + 8, w->xid);               /* window */
     e[12] = 0;                          /* override-redirect = False */
-    write_all(c->fd, e, 32);
+    out_write(c, e, 32);
 }
 
 /* ConfigureNotify: report the window's geometry after mapping. */
@@ -379,7 +491,7 @@ static void send_configure(xclient_t *c, xres_t *w) {
     put32(e + 12, 0);                   /* above-sibling = None */
     put16(e + 16, w->x); put16(e + 18, w->y);
     put16(e + 20, w->w); put16(e + 22, w->h);
-    write_all(c->fd, e, 32);
+    out_write(c, e, 32);
 }
 
 /* X TIMESTAMPs are milliseconds since server start.  Zero is reserved
@@ -416,7 +528,7 @@ static void send_property_notify(xclient_t *c, uint32_t window, uint32_t atom,
     put32(e + 8, atom);
     put32(e + 12, x_time());            /* time */
     e[16] = (uint8_t)(deleted ? 1 : 0); /* state: 0 NewValue, 1 Deleted */
-    write_all(c->fd, e, 32);
+    out_write(c, e, 32);
 }
 
 /* A pointer event (ButtonPress/Release/Motion) relative to a window. */
@@ -435,7 +547,7 @@ static void send_pointer(xclient_t *c, xres_t *w, int type, int detail,
     put16(e + 24, ex); put16(e + 26, ey);                /* event-x/y */
     put16(e + 28, 0);                  /* state */
     e[30] = 1;                          /* same-screen */
-    write_all(c->fd, e, 32);
+    out_write(c, e, 32);
 }
 
 /* ── keyboard ────────────────────────────────────────────────────────────────
@@ -611,7 +723,7 @@ static void send_focus(xclient_t *c, uint32_t window, int in) {
     put16(e + 2, c->seq);
     put32(e + 4, window);               /* event window */
     e[8] = 0;                           /* mode = NotifyNormal */
-    write_all(c->fd, e, 32);
+    out_write(c, e, 32);
 }
 
 static void xfocus_set(int ci, uint32_t xid) {
@@ -682,7 +794,7 @@ static void send_key(xclient_t *c, xres_t *w, int type, int keycode, int state) 
     put16(e + 24, 0);    put16(e + 26, 0);      /* event-x/y */
     put16(e + 28, (uint32_t)state);     /* state */
     e[30] = 1;                          /* same-screen */
-    write_all(c->fd, e, 32);
+    out_write(c, e, 32);
 }
 
 static unsigned key_events_sent;
@@ -799,16 +911,42 @@ static void keyfifo_poll(void) {
     }
 }
 
+/* ── clipping ────────────────────────────────────────────────────────────────
+ * Widths and heights are 16-bit client values, so a drawing loop that walks the
+ * whole requested rectangle and skips pixels outside the drawable costs up to
+ * 65535^2 iterations for a single rectangle.  Every loop clips first and then
+ * walks only the intersection.
+ *
+ * clip_span() clips one axis of a copy: the run of *n pixels starting at *d in
+ * a destination of size dl and — unless s is NULL — at *s in a source of size
+ * sl.  It advances both starts by the same amount, shrinks *n, stores how many
+ * leading pixels were cut in *skip (if non-NULL), and returns 0 when nothing
+ * is left. */
+static int clip_span(int *d, int *s, int *n, int dl, int sl, int *skip) {
+    long lo = 0, hi = *n;
+    if (*d < 0 && -(long)*d > lo) lo = -(long)*d;
+    if ((long)dl - *d < hi) hi = (long)dl - *d;
+    if (s) {
+        if (*s < 0 && -(long)*s > lo) lo = -(long)*s;
+        if ((long)sl - *s < hi) hi = (long)sl - *s;
+    }
+    if (hi <= lo) return 0;
+    *d += (int)lo;
+    if (s) *s += (int)lo;
+    *n = (int)(hi - lo);
+    if (skip) *skip = (int)lo;
+    return 1;
+}
+
 /* ── drawing into a drawable's backing buffer ────────────────────────────── */
 static void fill_rect(xres_t *d, int x, int y, int w, int h, uint32_t color) {
     if (!d || !d->px) return;
     d->painted = 1;
+    if (!clip_span(&x, NULL, &w, d->w, 0, NULL) ||
+        !clip_span(&y, NULL, &h, d->h, 0, NULL)) return;
     for (int yy = y; yy < y + h; yy++) {
-        if (yy < 0 || yy >= d->h) continue;
-        for (int xx = x; xx < x + w; xx++) {
-            if (xx < 0 || xx >= d->w) continue;
-            d->px[(size_t)yy * d->w + xx] = color;
-        }
+        uint32_t *row = d->px + (size_t)yy * d->w + x;
+        for (int xx = 0; xx < w; xx++) row[xx] = color;
     }
 }
 
@@ -861,12 +999,15 @@ static void glyph_blit(xres_t *dd, xglyph_t *g, int px, int py, uint32_t col) {
     if (!g || !g->bits || !dd || !dd->px) return;
     dd->painted = 1;
     int ox = px - g->x, oy = py - g->y;
+    int gx = 0, gy = 0, w = g->w, h = g->h;
+    if (!clip_span(&ox, &gx, &w, dd->w, g->w, NULL) ||
+        !clip_span(&oy, &gy, &h, dd->h, g->h, NULL)) return;
     uint32_t cr = (col >> 16) & 0xff, cg = (col >> 8) & 0xff, cb = col & 0xff;
-    for (int yy = 0; yy < g->h; yy++) {
-        int ty = oy + yy; if (ty < 0 || ty >= dd->h) continue;
-        for (int xx = 0; xx < g->w; xx++) {
-            int tx = ox + xx; if (tx < 0 || tx >= dd->w) continue;
-            int cov = g->bits[yy * g->w + xx];
+    for (int yy = 0; yy < h; yy++) {
+        int ty = oy + yy;
+        for (int xx = 0; xx < w; xx++) {
+            int tx = ox + xx;
+            int cov = g->bits[(gy + yy) * g->w + gx + xx];
             if (!cov) continue;
             /* premultiplied src for blend_over */
             uint32_t s = ((uint32_t)cov << 24) | ((cr * cov / 255) << 16) |
@@ -877,8 +1018,45 @@ static void glyph_blit(xres_t *dd, xglyph_t *g, int px, int py, uint32_t col) {
     }
 }
 
+/* Fixed-part size in bytes of each RENDER request maeroX reads fields from;
+ * anything shorter is BadLength instead of being parsed out of the bytes that
+ * follow it in the input buffer. */
+static int render_min_len(int minor) {
+    switch (minor) {
+    case 0:  return 12;   /* QueryVersion */
+    case 2:  return 8;    /* QueryPictIndexValues */
+    case 4:  return 20;   /* CreatePicture */
+    case 5:  return 12;   /* ChangePicture */
+    case 6:  return 12;   /* SetPictureClipRectangles */
+    case 7:  return 8;    /* FreePicture */
+    case 8:  return 36;   /* Composite */
+    case 10: case 11: return 24;   /* Trapezoids / Triangles */
+    case 17: return 12;   /* CreateGlyphSet */
+    case 18: return 12;   /* ReferenceGlyphSet */
+    case 19: return 8;    /* FreeGlyphSet */
+    case 20: return 12;   /* AddGlyphs */
+    case 22: return 8;    /* FreeGlyphs */
+    case 23: case 24: case 25: return 28;   /* CompositeGlyphs8/16/32 */
+    case 26: return 20;   /* FillRectangles */
+    case 33: return 16;   /* CreateSolidFill */
+    default: return 4;
+    }
+}
+
+/* Remove glyph `id` from a set (FreeGlyphs); order in the set is irrelevant. */
+static void glyph_remove(glyphset_t *gs, uint32_t id) {
+    for (int i = 0; i < gs->n; i++)
+        if (gs->g[i].id == id) {
+            free(gs->g[i].bits);
+            gs->g[i] = gs->g[--gs->n];
+            return;
+        }
+}
+
 static void dispatch_render(xclient_t *c, const uint8_t *q, int qlen) {
     int minor = q[1];
+    c->cur_minor = (uint8_t)minor;
+    if (qlen < render_min_len(minor)) { x_error(c, BadLength, 0); return; }
     switch (minor) {
     case 0: {        /* QueryVersion */
         uint8_t data[24]; memset(data, 0, sizeof(data));
@@ -920,7 +1098,7 @@ static void dispatch_render(xclient_t *c, const uint8_t *q, int qlen) {
     case 6: break;   /* SetPictureClipRectangles — accept (no clip tracking) */
     case 7: {        /* FreePicture */
         xres_t *p = res_find(c, r32(q + 4));
-        if (p && p->kind == R_PICTURE) p->kind = R_NONE;
+        if (p && p->kind == R_PICTURE) res_free(p);
         break;
     }
     case 8: {        /* Composite(op, src, mask, dst, sx,sy, mx,my, dx,dy, w,h) */
@@ -939,20 +1117,22 @@ static void dispatch_render(xclient_t *c, const uint8_t *q, int qlen) {
         xres_t *sd   = (!solid && srcp && srcp->kind == R_PICTURE)
                      ? res_find(c, srcp->pic_drawable) : NULL;
         int has_alpha = solid || (srcp && srcp->pic_format == PICTFMT_ARGB32);
-        for (int yy = 0; yy < h; yy++) {
-            int ty = dy + yy; if (ty < 0 || ty >= dd->h) continue;
-            for (int xx = 0; xx < w; xx++) {
-                int tx = dx + xx; if (tx < 0 || tx >= dd->w) continue;
-                uint32_t sp;
-                if (solid) sp = sc;
-                else if (sd && sd->px) {
-                    int ux = sx + xx, uy = sy + yy;
-                    if (ux < 0 || ux >= sd->w || uy < 0 || uy >= sd->h) continue;
-                    sp = sd->px[(size_t)uy * sd->w + ux];
-                } else continue;
-                uint32_t *dp = &dd->px[(size_t)ty * dd->w + tx];
-                if (op == 1 || !has_alpha) *dp = sp & 0x00FFFFFF;   /* Src */
-                else                        *dp = blend_over(sp, *dp); /* Over */
+        int have_src = solid || (sd && sd->px);
+        /* Clip to the destination and, for a drawable source, to the source:
+         * pixels outside either are left alone. */
+        if (have_src &&
+            clip_span(&dx, solid ? NULL : &sx, &w, dd->w, solid ? 0 : sd->w, NULL) &&
+            clip_span(&dy, solid ? NULL : &sy, &h, dd->h, solid ? 0 : sd->h, NULL)) {
+            for (int yy = 0; yy < h; yy++) {
+                uint32_t *drow = dd->px + (size_t)(dy + yy) * dd->w + dx;
+                const uint32_t *srow = solid ? NULL
+                                     : sd->px + (size_t)(sy + yy) * sd->w + sx;
+                for (int xx = 0; xx < w; xx++) {
+                    uint32_t sp = solid ? sc : srow[xx];
+                    uint32_t *dp = &drow[xx];
+                    if (op == 1 || !has_alpha) *dp = sp & 0x00FFFFFF;   /* Src */
+                    else                        *dp = blend_over(sp, *dp); /* Over */
+                }
             }
         }
         render_n++;
@@ -976,10 +1156,12 @@ static void dispatch_render(xclient_t *c, const uint8_t *q, int qlen) {
             const uint8_t *rr = q + 20 + i * 8;
             int x = rs16(rr), y = rs16(rr + 2);
             int rw = (int)r16(rr + 4), rh = (int)r16(rr + 6);
+            if (!clip_span(&x, NULL, &rw, dd->w, 0, NULL) ||
+                !clip_span(&y, NULL, &rh, dd->h, 0, NULL)) continue;
             for (int yy = 0; yy < rh; yy++) {
-                int ty = y + yy; if (ty < 0 || ty >= dd->h) continue;
+                int ty = y + yy;
                 for (int xx = 0; xx < rw; xx++) {
-                    int tx = x + xx; if (tx < 0 || tx >= dd->w) continue;
+                    int tx = x + xx;
                     uint32_t *dp = &dd->px[(size_t)ty * dd->w + tx];
                     if (op == 1 || ca == 255) *dp = color & 0x00FFFFFF;
                     else if (ca > 0)          *dp = blend_over(color, *dp);
@@ -1003,13 +1185,19 @@ static void dispatch_render(xclient_t *c, const uint8_t *q, int qlen) {
         xres_t *g = res_new(c, r32(q + 4), R_GLYPHSET); (void)g;
         break;
     }
-    case 18: case 19: break;   /* Reference/FreeGlyphSet variants — accept */
+    case 18: break;  /* ReferenceGlyphSet — accept (glyphsets are not shared) */
+    case 19: {       /* FreeGlyphSet */
+        xres_t *g = res_find(c, r32(q + 4));
+        if (g && g->kind == R_GLYPHSET) res_free(g);
+        break;
+    }
     case 20: {       /* AddGlyphs(glyphset, nglyphs, ids[], infos[], A8 images) */
         xres_t *gr = res_find(c, r32(q + 4));
         glyphset_t *gs = gset_of(gr);
         if (!gs) break;
         uint32_t ng = r32(q + 8);
-        if (ng > 8192) break;
+        if (ng > 8192) { x_error(c, BadLength, 0); break; }
+        if (12 + (size_t)ng * 16 > (size_t)qlen) { x_error(c, BadLength, 0); break; }
         const uint8_t *ids   = q + 12;
         const uint8_t *infos = ids + (size_t)ng * 4;
         const uint8_t *img   = infos + (size_t)ng * 12;
@@ -1027,21 +1215,39 @@ static void dispatch_render(xclient_t *c, const uint8_t *q, int qlen) {
                 for (int yy = 0; yy < gh; yy++)
                     for (int xx = 0; xx < gw; xx++)
                         bits[yy * gw + xx] = img[imgoff + (size_t)yy * stride + xx];
-            if (gs->n >= gs->cap) {
-                gs->cap = gs->cap ? gs->cap * 2 : 128;
-                gs->g = (xglyph_t *)realloc(gs->g, (size_t)gs->cap * sizeof(xglyph_t));
-            }
-            if (gs->g) {
-                xglyph_t *gg = &gs->g[gs->n++];
-                gg->id = r32(ids + (size_t)i * 4);
-                gg->w = gw; gg->h = gh; gg->x = gx; gg->y = gy;
-                gg->xoff = xo; gg->yoff = yo; gg->bits = bits;
-            }
             imgoff += (size_t)stride * gh;
+            if (!bits) continue;
+            /* An id already in the set is replaced: cairo frees glyph ids and
+             * reuses them, and appending left glyph_find() returning the stale
+             * (older) bitmap. */
+            uint32_t gid = r32(ids + (size_t)i * 4);
+            xglyph_t *gg = glyph_find(gs, gid);
+            if (gg) {
+                free(gg->bits);
+            } else {
+                if (gs->n >= gs->cap) {
+                    int ncap = gs->cap ? gs->cap * 2 : 128;
+                    xglyph_t *ng2 = (xglyph_t *)realloc(gs->g,
+                                        (size_t)ncap * sizeof(xglyph_t));
+                    if (!ng2) { free(bits); continue; }
+                    gs->g = ng2;
+                    gs->cap = ncap;
+                }
+                gg = &gs->g[gs->n++];
+            }
+            gg->id = gid;
+            gg->w = gw; gg->h = gh; gg->x = gx; gg->y = gy;
+            gg->xoff = xo; gg->yoff = yo; gg->bits = bits;
         }
         break;
     }
-    case 21: case 22: break;   /* FreeGlyphs — accept (we don't reclaim) */
+    case 21: break;  /* AddGlyphsFromPicture — accept */
+    case 22: {       /* FreeGlyphs(glyphset, glyph ids...) */
+        glyphset_t *gs = gset_of(res_find(c, r32(q + 4)));
+        if (!gs) break;
+        for (int off = 8; off + 4 <= qlen; off += 4) glyph_remove(gs, r32(q + off));
+        break;
+    }
     case 23: case 24: case 25: {   /* CompositeGlyphs 8/16/32 — render text */
         int idsz = (minor == 23) ? 1 : (minor == 24) ? 2 : 4;
         xres_t *srcp = res_find(c, r32(q + 8));
@@ -1090,12 +1296,63 @@ static void dispatch_render(xclient_t *c, const uint8_t *q, int qlen) {
 }
 
 /* ── per-request dispatch ────────────────────────────────────────────────── */
+/* Fixed-part size in bytes of each core request maeroX reads fields from.  A
+ * shorter request is answered with BadLength instead of having its missing
+ * fields read out of the next request (or stale bytes) in the input buffer. */
+static int core_min_len(int op) {
+    switch (op) {
+    case 1:  return 32;   /* CreateWindow */
+    case 2:  return 12;   /* ChangeWindowAttributes */
+    case 3:  return 8;    /* GetWindowAttributes */
+    case 8:  return 8;    /* MapWindow */
+    case 10: return 8;    /* UnmapWindow */
+    case 12: return 12;   /* ConfigureWindow */
+    case 14: return 8;    /* GetGeometry */
+    case 15: return 8;    /* QueryTree */
+    case 16: return 8;    /* InternAtom */
+    case 17: return 8;    /* GetAtomName */
+    case 18: return 24;   /* ChangeProperty */
+    case 19: return 12;   /* DeleteProperty */
+    case 20: return 24;   /* GetProperty */
+    case 23: return 8;    /* GetSelectionOwner */
+    case 38: return 8;    /* QueryPointer */
+    case 42: return 12;   /* SetInputFocus */
+    case 53: return 16;   /* CreatePixmap */
+    case 54: return 8;    /* FreePixmap */
+    case 55: return 16;   /* CreateGC */
+    case 56: return 12;   /* ChangeGC */
+    case 60: return 8;    /* FreeGC */
+    case 61: return 16;   /* ClearArea */
+    case 62: return 28;   /* CopyArea */
+    case 67: return 12;   /* PolyRectangle */
+    case 70: return 12;   /* PolyFillRectangle */
+    case 72: return 24;   /* PutImage */
+    case 73: return 20;   /* GetImage */
+    case 78: return 16;   /* CreateColormap */
+    case 98: return 8;    /* QueryExtension */
+    case 101: return 8;   /* GetKeyboardMapping */
+    case RENDER_MAJOR: return 4;   /* minor checked in dispatch_render */
+    default: return 4;
+    }
+}
+
+/* Count the set bits of a value-list mask: the number of CARD32 values that
+ * follow a CreateGC/ChangeGC/ConfigureWindow header. */
+static int mask_bits(uint32_t m) {
+    int n = 0;
+    for (; m; m &= m - 1) n++;
+    return n;
+}
+
 static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
     int op = q[0];
     c->seq++;
+    c->cur_major = (uint8_t)op;
+    c->cur_minor = 0;
     op_hist[op & 0xFF]++;
     op_ring[op_ring_n++ & 31] = (uint8_t)op;
     if (xdbg) printf("maerox: req op=%d seq=%d len=%d\n", op, c->seq, qlen);
+    if (qlen < core_min_len(op)) { x_error(c, BadLength, 0); return; }
 
     switch (op) {
     case RENDER_MAJOR:           /* XRender extension requests */
@@ -1153,6 +1410,7 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
         if (w && w->kind == R_WINDOW) {
             uint32_t mask = r16(q + 8);
             int off = 12;               /* value list follows the 12-byte header */
+            if (12 + 4 * mask_bits(mask & 0x7F) > qlen) { x_error(c, BadLength, 0); break; }
             int nx = w->x, ny = w->y, nw = w->w, nh = w->h;
             if (mask & 0x01) { nx = rs16(q + off); off += 4; }   /* x */
             if (mask & 0x02) { ny = rs16(q + off); off += 4; }   /* y */
@@ -1243,7 +1501,8 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
     }
     case 54: {       /* FreePixmap */
         xres_t *p = res_find(c, r32(q + 4));
-        if (p) { if (p->px) free(p->px); p->kind = R_NONE; }
+        if (p && p->kind == R_PIXMAP) res_free(p);
+        else if (p) x_error(c, BadPixmap, r32(q + 4));   /* a window, GC, ... */
         break;
     }
     case 62: {       /* CopyArea (pixmap/window → window) — how GTK/Cairo paint */
@@ -1257,14 +1516,17 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
             int sx = rs16(q + 16), sy = rs16(q + 18);
             int dx = rs16(q + 20), dy = rs16(q + 22);
             int w  = (int)r16(q + 24), h = (int)r16(q + 26);
-            for (int yy = 0; yy < h; yy++) {
-                int syy = sy + yy, dyy = dy + yy;
-                if (syy < 0 || syy >= src->h || dyy < 0 || dyy >= dst->h) continue;
-                for (int xx = 0; xx < w; xx++) {
-                    int sxx = sx + xx, dxx = dx + xx;
-                    if (sxx < 0 || sxx >= src->w || dxx < 0 || dxx >= dst->w) continue;
-                    dst->px[(size_t)dyy * dst->w + dxx] =
-                        src->px[(size_t)syy * src->w + sxx];
+            if (clip_span(&dx, &sx, &w, dst->w, src->w, NULL) &&
+                clip_span(&dy, &sy, &h, dst->h, src->h, NULL)) {
+                /* Row-wise memmove; a scroll within one drawable that moves
+                 * content down must copy bottom-up so rows are read before
+                 * they are overwritten. */
+                int down = (src == dst && dy > sy);
+                for (int i = 0; i < h; i++) {
+                    int yy = down ? h - 1 - i : i;
+                    memmove(dst->px + (size_t)(dy + yy) * dst->w + dx,
+                            src->px + (size_t)(sy + yy) * src->w + sx,
+                            (size_t)w * 4);
                 }
             }
             dirty = 1;
@@ -1276,9 +1538,16 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
         uint32_t gid  = r32(q + 4);
         int      voff = (op == 55) ? 16 : 12;
         uint32_t mask = r32(q + (op == 55 ? 12 : 8));
+        if (voff + 4 * mask_bits(mask & 0x7FFFFF) > qlen) {
+            x_error(c, BadLength, 0);
+            break;
+        }
         xres_t *g = (op == 55) ? res_new(c, gid, R_GC) : res_find(c, gid);
         if (!g) break;
-        g->kind = R_GC;
+        /* ChangeGC on a window or pixmap used to retype it to a GC, leaking
+         * its pixels; the kind is only ever set by CreateGC. */
+        if (op == 55) g->kind = R_GC;
+        else if (g->kind != R_GC) { x_error(c, BadGC, gid); break; }
         for (int bit = 0; bit < 23; bit++) {
             if (!(mask & (1u << bit))) continue;
             uint32_t val = r32(q + voff);
@@ -1290,7 +1559,8 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
     }
     case 60: {       /* FreeGC */
         xres_t *g = res_find(c, r32(q + 4));
-        if (g) g->kind = R_NONE;
+        if (g && g->kind == R_GC) res_free(g);
+        else if (g) x_error(c, BadGC, r32(q + 4));
         break;
     }
     case 70: {       /* PolyFillRectangle */
@@ -1324,6 +1594,7 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
         int iw = (int)r16(q + 12), ih = (int)r16(q + 14);
         int dx = rs16(q + 16), dy = rs16(q + 18);
         int depth = q[21];
+        int format = q[1];
         putimage_n++;
         if (putimage_n <= 8) xt("XT PutImage win=0x%x %dx%d @%d,%d depth=%d\n",
                                 (unsigned)r32(q + 4), iw, ih, dx, dy, depth);
@@ -1334,21 +1605,32 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
             int mfd = open("/tmp/ff_painted", O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (mfd >= 0) close(mfd);
         }
-        if (d && d->px && (depth == 24 || depth == 32)) {
-            d->painted = 1;
-            int stride = ((iw * 4 + 3) & ~3);          /* scanline pad 32 */
-            const uint8_t *img = q + 24;
-            for (int yy = 0; yy < ih; yy++) {
-                int ty = dy + yy;
-                if (ty < 0 || ty >= d->h) continue;
-                const uint8_t *row = img + (size_t)yy * stride;
-                for (int xx = 0; xx < iw; xx++) {
-                    int tx = dx + xx;
-                    if (tx < 0 || tx >= d->w) continue;
-                    d->px[(size_t)ty * d->w + tx] = r32(row + xx * 4) & 0x00FFFFFF;
-                }
+        /* Only ZPixmap at 24/32 bpp is drawn; bitmaps and XY formats stay a
+         * silent no-op as before.  The image must fit inside the request: the
+         * row pointer used to be computed from the header alone, so a short
+         * request with a large height read past the input buffer into other
+         * clients' state. */
+        if (format == 2 && (depth == 24 || depth == 32)) {
+            size_t stride = (size_t)iw * 4;           /* 32 bpp: already padded */
+            if (24 + (uint64_t)stride * ih > (uint64_t)qlen) {
+                x_error(c, BadLength, 0);
+                break;
             }
-            dirty = 1;
+            if (d && d->px) {
+                d->painted = 1;
+                const uint8_t *img = q + 24;
+                int ix = 0, iy = 0, cw = iw, ch = ih;
+                if (clip_span(&dx, &ix, &cw, d->w, iw, NULL) &&
+                    clip_span(&dy, &iy, &ch, d->h, ih, NULL)) {
+                    for (int yy = 0; yy < ch; yy++) {
+                        const uint8_t *row = img + (size_t)(iy + yy) * stride + (size_t)ix * 4;
+                        uint32_t *out = d->px + (size_t)(dy + yy) * d->w + dx;
+                        for (int xx = 0; xx < cw; xx++)
+                            out[xx] = r32(row + (size_t)xx * 4) & 0x00FFFFFF;
+                    }
+                }
+                dirty = 1;
+            }
         }
         break;
     }
@@ -1364,23 +1646,35 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
         int iw = (int)r16(q + 12), ih = (int)r16(q + 14);
         uint8_t data[24]; memset(data, 0, sizeof(data));
         put32(data + 0, ROOT_VISUAL);          /* visual */
-        if (d && d->px && iw > 0 && ih > 0 && iw * ih <= 1 << 22) {
-            int n = iw * ih * 4;
-            uint8_t *buf = (uint8_t *)malloc((size_t)n);
-            if (buf) {
-                for (int yy = 0; yy < ih; yy++) {
-                    for (int xx = 0; xx < iw; xx++) {
-                        uint32_t px = 0;
-                        int sx = ix + xx, sy = iy + yy;
-                        if (sx >= 0 && sx < d->w && sy >= 0 && sy < d->h)
-                            px = d->px[(size_t)sy * d->w + sx];
-                        put32(buf + ((size_t)yy * iw + xx) * 4, px);
-                    }
+        /* The size check is 64-bit: in int, iw*ih for e.g. 46341x46341 wrapped
+         * negative, passed, and the reply buffer came out a few KB long. */
+        if ((uint64_t)iw * ih > (1u << 22)) { x_error(c, BadAlloc, 0); break; }
+        if (d && d->px && iw > 0 && ih > 0) {
+            /* Stream the reply a row at a time straight into the output queue
+             * instead of materialising up to 16 MiB first. */
+            size_t n = (size_t)iw * ih * 4;
+            uint8_t head[32];
+            memset(head, 0, sizeof(head));
+            head[0] = 1; head[1] = 24;          /* reply, depth */
+            put16(head + 2, c->seq);
+            put32(head + 4, (uint32_t)(n / 4));
+            memcpy(head + 8, data, 24);
+            out_write(c, head, 32);
+            uint8_t *row = (uint8_t *)malloc((size_t)iw * 4);
+            if (!row) { c->dead = 1; break; }  /* reply half-sent: must drop */
+            for (int yy = 0; yy < ih && !c->dead; yy++) {
+                memset(row, 0, (size_t)iw * 4);
+                int sy = iy + yy, sx = ix, cw = iw, skip = 0;
+                if (sy >= 0 && sy < d->h &&
+                    clip_span(&sx, NULL, &cw, d->w, 0, &skip)) {
+                    const uint32_t *src = d->px + (size_t)sy * d->w + sx;
+                    for (int xx = 0; xx < cw; xx++)
+                        put32(row + (size_t)(skip + xx) * 4, src[xx]);
                 }
-                send_reply_var(c, 24 /* depth */, data, buf, n);
-                free(buf);
-                break;
+                out_write(c, row, (size_t)iw * 4);
             }
+            free(row);
+            break;
         }
         send_reply_var(c, 24, data, NULL, 0);
         break;
@@ -1403,7 +1697,8 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
         int only_if_exists = q[1];
         int nlen = (int)r16(q + 4);
         const char *name = (const char *)(q + 8);
-        if (nlen < 0 || nlen > 63 || 8 + nlen > qlen) nlen = 0;
+        if (8 + nlen > qlen) { x_error(c, BadLength, 0); break; }
+        if (nlen > 63) nlen = 0;
         uint32_t a = atom_intern(name, nlen, only_if_exists);
         uint8_t data[24]; memset(data, 0, sizeof(data));
         put32(data + 0, a);
@@ -1459,7 +1754,8 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
     case 98: {       /* QueryExtension */
         int nlen = (int)r16(q + 4);
         char nm[40]; nm[0] = '\0';
-        if (nlen > 0 && nlen < 40 && 8 + nlen <= qlen) {
+        if (8 + nlen > qlen) { x_error(c, BadLength, 0); break; }
+        if (nlen > 0 && nlen < 40) {
             memcpy(nm, q + 8, (size_t)nlen); nm[nlen] = '\0';
         }
         uint8_t data[24];
@@ -1510,6 +1806,10 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
     case 101: {      /* GetKeyboardMapping → the US layout, 2 keysyms/keycode */
         int first = q[4], count = q[5];
         if (count < 1) count = 1;
+        if (first < X_KEYCODE_BASE || first + count - 1 > 255) {
+            x_error(c, BadValue, (uint32_t)first);
+            break;
+        }
         int per = KEYSYMS_PER_KEYCODE;
         int n = count * per;
         uint8_t *ks = (uint8_t *)malloc((size_t)n * 4);
@@ -1570,36 +1870,57 @@ static void client_free_resources(xclient_t *c) {
     for (int i = 0; i < (int)(sizeof(key_down) / sizeof(key_down[0])); i++)
         if (key_down[i].ci1 == (unsigned char)(client_index(c) + 1))
             { key_down[i].ci1 = 0; key_down[i].xid = 0; }
-    for (int i = 0; i < c->nres; i++) {
-        xres_t *r = &c->res[i];
-        if (r->kind == R_NONE) continue;
-        if (r->px) { free(r->px); r->px = NULL; }
-        if (r->kind == R_GLYPHSET && r->gset) {
-            glyphset_t *gs = (glyphset_t *)r->gset;
-            for (int k = 0; k < gs->n; k++)
-                if (gs->g[k].bits) free(gs->g[k].bits);
-            if (gs->g) free(gs->g);
-            free(gs);
-            r->gset = NULL;
-        }
-        r->kind = R_NONE;
-    }
+    for (int i = 0; i < c->nres; i++)
+        if (c->res[i].kind != R_NONE) res_free(&c->res[i]);
     c->nres = 0;
+}
+
+static void client_close(xclient_t *c) {
+    xt("XT client disconnected (last seq=%d%s)\n", c->seq, c->dead ? ", dropped" : "");
+    close(c->fd);
+    client_free_resources(c);
+    free(c->out);
+    c->out = NULL;
+    c->outoff = c->outlen = c->outcap = 0;
+    c->used = 0;
+    dirty = 1;
+}
+
+/* Refuse a connection whose setup we cannot serve, with a setup Failed reply
+ * in the byte order the client asked for, then drop it. */
+static void setup_refuse(xclient_t *c, int msb, const char *why) {
+    uint8_t r[8 + 64];
+    int n = (int)strlen(why), words = (n + 3) / 4;
+    memset(r, 0, sizeof(r));
+    r[0] = 0;                              /* Failed */
+    r[1] = (uint8_t)n;
+    if (msb) { r[3] = 11; r[7] = (uint8_t)words; }   /* major 11, length */
+    else     { r[2] = 11; r[6] = (uint8_t)words; }
+    memcpy(r + 8, why, (size_t)n);
+    out_write(c, r, 8 + (size_t)words * 4);
+    c->dead = 1;
 }
 
 static void process_client(xclient_t *c) {
     /* Only read when there is room: read(fd, p, 0) returns 0, which is also how
      * a closed connection reports itself, so a full buffer would look like a
      * disconnect. */
+    if (c->dead) return;
     if (c->inlen < INBUF_SIZE) {
         int r = read(c->fd, c->inbuf + c->inlen, INBUF_SIZE - c->inlen);
-        if (r == 0) { xt("XT client disconnected (last seq=%d)\n", c->seq);
-                      close(c->fd); client_free_resources(c);
-                      c->used = 0; dirty = 1; return; }   /* closed */
+        if (r == 0) { client_close(c); return; }            /* closed */
+        if (r < 0 && errno != EAGAIN && errno != EINTR) { c->dead = 1; return; }
         if (r > 0) c->inlen += r;
     }
 
     if (!c->setup_done) {
+        if (c->inlen < 1) return;
+        /* Every field is parsed little-endian; an MSB-first client would be
+         * misparsed from the first request on, so it is refused up front. */
+        if (c->inbuf[0] != 'l') {
+            setup_refuse(c, c->inbuf[0] == 'B', "maeroX serves LSBFirst clients only");
+            return;
+        }
         if (c->inlen < 12) return;
         int nauth = (int)r16(c->inbuf + 6), dauth = (int)r16(c->inbuf + 8);
         int need = 12 + ((nauth + 3) & ~3) + ((dauth + 3) & ~3);
@@ -1608,7 +1929,7 @@ static void process_client(xclient_t *c) {
         int sw = (!headless && gui.surf.w > 0) ? gui.surf.w : 1280;
         int sh = (!headless && gui.surf.h > 0) ? gui.surf.h : 800;
         int len = build_setup_reply(reply, sizeof(reply), sw, sh);
-        write_all(c->fd, reply, len);
+        out_write(c, reply, (size_t)len);
         c->setup_done = 1;
         memmove(c->inbuf, c->inbuf + need, c->inlen - need);
         c->inlen -= need;
@@ -1616,19 +1937,31 @@ static void process_client(xclient_t *c) {
                sw, sh, headless, gui.surf.w, gui.surf.h);
     }
 
-    /* Process complete requests. */
-    while (c->setup_done && c->inlen >= 4) {
-        int qlen = (int)r16(c->inbuf + 2) * 4;
-        if (qlen < 4) { c->inlen = 0; break; }       /* malformed; drop */
-        if (qlen > INBUF_SIZE) {                     /* cannot ever complete */
-            xt("XT oversize request op=%d len=%d > inbuf %d, dropping\n",
-               c->inbuf[0], qlen, INBUF_SIZE);
-            c->inlen = 0; break;
+    /* Process complete requests.  They are consumed by offset and the
+     * leftover moved down once: a memmove per request made a buffer of 65536
+     * NoOperations cost ~8 GB of copying. */
+    int pos = 0;
+    while (c->setup_done && !c->dead && c->inlen - pos >= 4) {
+        const uint8_t *q = c->inbuf + pos;
+        int qlen = (int)r16(q + 2) * 4;
+        if (qlen < 4) {
+            /* Length 0 means BIG-REQUESTS, which is not advertised: there is
+             * no way to find where the next request starts, so the stream
+             * cannot be resynchronised.  Report it and drop the client. */
+            c->seq++;
+            c->cur_major = q[0]; c->cur_minor = 0;
+            x_error(c, BadLength, 0);
+            c->dead = 1;
+            break;
         }
-        if (c->inlen < qlen) break;                  /* wait for the rest */
-        dispatch(c, c->inbuf, qlen);
-        memmove(c->inbuf, c->inbuf + qlen, c->inlen - qlen);
-        c->inlen -= qlen;
+        /* qlen <= 65535*4 < INBUF_SIZE, so every request can complete. */
+        if (c->inlen - pos < qlen) break;            /* wait for the rest */
+        dispatch(c, q, qlen);
+        pos += qlen;
+    }
+    if (pos) {
+        memmove(c->inbuf, c->inbuf + pos, (size_t)(c->inlen - pos));
+        c->inlen -= pos;
     }
 }
 
@@ -1741,15 +2074,12 @@ static void composite_windows(draw_surface_t *s) {
     }
     for (int k = 0; k < n; k++) {
         xres_t *w = order[k];
-        for (int yy = 0; yy < w->h; yy++) {
-            int ty = w->y + yy;
-            if (ty < 0 || ty >= s->h) continue;
-            for (int xx = 0; xx < w->w; xx++) {
-                int tx = w->x + xx;
-                if (tx < 0 || tx >= s->w) continue;
-                s->px[(size_t)ty * s->w + tx] = w->px[(size_t)yy * w->w + xx];
-            }
-        }
+        int tx = w->x, ty = w->y, sx = 0, sy = 0, cw = w->w, ch = w->h;
+        if (!clip_span(&tx, &sx, &cw, s->w, w->w, NULL) ||
+            !clip_span(&ty, &sy, &ch, s->h, w->h, NULL)) continue;
+        for (int yy = 0; yy < ch; yy++)
+            memcpy(s->px + (size_t)(ty + yy) * s->w + tx,
+                   w->px + (size_t)(sy + yy) * w->w + sx, (size_t)cw * 4);
     }
 }
 
@@ -1809,7 +2139,7 @@ static void accept_clients(void) {
     fcntl(cfd, F_SETFL, O_RDWR | O_NONBLOCK);
     for (int i = 0; i < MAX_XCLIENTS; i++)
         if (!clients[i].used) {
-            memset(&clients[i], 0, sizeof(clients[i]));
+            memset(&clients[i], 0, sizeof(clients[i]));   /* out == NULL */
             clients[i].used = 1;
             clients[i].fd = cfd;
             dirty = 1;
@@ -1836,6 +2166,9 @@ int main(int argc, char *argv[]) {
         xt("XT maeroX trace armed\n");
     }
     if (slot < 1 || slot > WM_MAX_SLOTS) slot = 1;
+    /* A client that exits with a reply pending must not take the server with
+     * it: writes to it get EPIPE (sends also pass MSG_NOSIGNAL). */
+    signal(SIGPIPE, SIG_IGN);
 
     listen_fd = start_listener();
     if (listen_fd < 0) { printf("maerox: listen failed (%d)\n", listen_fd); return 1; }
@@ -1872,7 +2205,11 @@ int main(int argc, char *argv[]) {
         keyfifo_poll();
         accept_clients();
         for (int i = 0; i < MAX_XCLIENTS; i++)
-            if (clients[i].used) process_client(&clients[i]);
+            if (clients[i].used) { out_flush(&clients[i]); process_client(&clients[i]); }
+        /* Close clients whose writes failed or that broke the protocol — only
+         * here, never from inside a handler that may still reference them. */
+        for (int i = 0; i < MAX_XCLIENTS; i++)
+            if (clients[i].used && clients[i].dead) client_close(&clients[i]);
         if (!headless && (dirty || events > 0)) render();
         if (trace_fd >= 0 && ++tick % 167 == 0) xt_dump_hist();   /* ~every 2s */
         /* Frame-dump mode: once Firefox has painted (putimage_n>0) and a full-
