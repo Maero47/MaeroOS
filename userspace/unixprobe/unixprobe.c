@@ -26,7 +26,8 @@
  *          nothing; a large control buffer still passes its fds.
  *  recname a recvmsg faulting on msg_name does not shift fds to the next one.
  *  sigpipe a write that sent something returns its count without SIGPIPE.
- *  epoll   a registration ends with its file (close + fd reuse).
+ *  epoll   a registration ends with its file (close + fd reuse), and is
+ *          shared by every copy of that file (fork).
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -781,6 +782,34 @@ static void test_epoll(void) {
     n = epoll_wait(ep, out, 4, 0);
     CHECK(n == 1, "closing a dup ended the registration");
     close(q[0]); close(q[1]); close(ep);
+
+    /* An epoll and a socket shared across fork (both made BEFORE the fork,
+     * and never used with each other before it): the child registers the
+     * socket, and the parent sees the event and can MOD and DEL it. */
+    int sv[2];
+    ep = epoll_create1(0);
+    CHECK(ep >= 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "fork setup");
+    pid_t kid = fork();
+    if (kid == 0) {
+        struct epoll_event e = { .events = EPOLLIN, .data.u64 = 0x1234 };
+        _exit(epoll_ctl(ep, EPOLL_CTL_ADD, sv[0], &e) == 0 ? 0 : 1);
+    }
+    int st = -1;
+    waitpid(kid, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "child EPOLL_CTL_ADD");
+    CHECK(write(sv[1], "y", 1) == 1, "write");
+    n = epoll_wait(ep, out, 4, 0);
+    CHECK(n == 1 && out[0].data.u64 == 0x1234,
+          "parent does not see the child's registration: %d", n);
+    ev.events = EPOLLIN; ev.data.u64 = 0x5678;
+    CHECK(epoll_ctl(ep, EPOLL_CTL_MOD, sv[0], &ev) == 0, "parent MOD of the child's registration");
+    n = epoll_wait(ep, out, 4, 0);
+    CHECK(n == 1 && out[0].data.u64 == 0x5678, "after MOD: %d", n);
+    CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, sv[0], &ev) < 0 && errno == EEXIST,
+          "parent re-ADD over the child's registration not EEXIST");
+    CHECK(epoll_ctl(ep, EPOLL_CTL_DEL, sv[0], 0) == 0, "parent DEL of the child's registration");
+    CHECK(epoll_wait(ep, out, 4, 0) == 0, "still reported after DEL");
+    close(sv[0]); close(sv[1]); close(ep);
 }
 
 static void test_dgram(void)     { test_records(SOCK_DGRAM, "DGRAM"); }

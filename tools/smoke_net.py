@@ -178,6 +178,21 @@ def stalled_listener():
     return port, keep
 
 
+def drain_later(srv, delay):
+    """After `delay` seconds, accept (and hold) everything queued on srv."""
+    time.sleep(delay)
+    srv.settimeout(0.2)
+    held = []
+    end = time.time() + 8
+    while time.time() < end:
+        try:
+            held.append(srv.accept()[0])
+        except OSError:
+            pass
+    for c in held:
+        c.close()
+
+
 def main():
     webdir = tempfile.TemporaryDirectory()
     index_path = os.path.join(webdir.name, "index.html")
@@ -327,6 +342,21 @@ def main():
             s_.close()
         if "sockprobe conn ok" not in recent:
             raise AssertionError("a signal did not interrupt a blocking connect()")
+        # With SA_RESTART the restarted connect() waits for the handshake
+        # still under way (never EALREADY); the host frees its accept queue
+        # after 2 s so that handshake completes.
+        stall_port, stall_keep = stalled_listener()
+        threading.Thread(target=drain_later, args=(stall_keep[0], 2.0),
+                         daemon=True).start()
+        before = len("".join(log))
+        send(proc, f"sockprobe conn {stall_port} restart")
+        wait_for(proc, sel, PROMPT, log, timeout=20.0, start=before)
+        recent = "".join(log)[before:]
+        time.sleep(0.5)
+        for s_ in stall_keep:
+            s_.close()
+        if "sockprobe conn restart ok" not in recent:
+            raise AssertionError("a connect() restarted after SA_RESTART failed")
         before = len("".join(log))
         send(proc, f"httpget 10.0.2.2 {http_port} /index.html")
         wait_for(proc, sel, PROMPT, log, timeout=15.0, start=before)

@@ -49,9 +49,9 @@ typedef struct {
     int              flags;   /* O_RDONLY / O_WRONLY / O_RDWR */
     uint8_t          cloexec; /* FD_CLOEXEC: close on exec */
     uint32_t         seals;   /* memfd F_ADD_SEALS bitmask (accepted, not enforced) */
-    uint32_t         fid;     /* open-file identity for epoll, given on first
-                               * EPOLL_CTL_ADD; copies (dup, fork, SCM_RIGHTS)
-                               * share it, close clears it; 0 = none yet */
+    uint32_t         fid;     /* open-file identity for epoll, given on the
+                               * first copy (fd_copy) or EPOLL_CTL_ADD; every
+                               * copy shares it, close clears it; 0 = none */
     char             path[256]; /* FD_FILE: canonical opened path */
 } proc_file_t;
 
@@ -71,6 +71,7 @@ void            fdtable_put(struct proc *p);    /* decref; release fds + free at
 /* fd-table reference counting (defined in syscall.c) — exposed so SCM_RIGHTS
  * fd-passing in usocket.c can retain/release the underlying open-file objects. */
 void fd_retain(proc_file_t *f);
+void fd_copy(proc_file_t *dst, proc_file_t *src);   /* dup: fid + copy + retain */
 void fd_release(proc_file_t *f);
 
 /* SCM_RIGHTS fd-passing over AF_UNIX sockets (defined in usocket.c). */

@@ -364,58 +364,12 @@ static int socket_bind_locked(net_socket_t *s, const net_sockaddr_in_t *addr) {
     return e == ERR_OK ? 0 : -98;
 }
 
-int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
-                       int nonblock) {
-    if (!s || !s->used || !addr)
-        return -9;
-    if (addr->family != AF_INET_K)
-        return -97;
-    /* Egress firewall: block outbound by remote ip/port if a rule matches. */
-    {
-        int proto = (s->type == SOCK_DGRAM_K) ? FW_UDP : FW_TCP;
-        int fr = firewall_check(FW_OUT, proto, addr->addr, bswap16(addr->port));
-        if (fr < 0) return fr;
-    }
-    ip_addr_set_ip4_u32(&s->remote_addr, addr->addr);
-    s->remote_port = bswap16(addr->port);
-    if (s->type == SOCK_DGRAM_K) {
-        preempt_disable();
-        err_t e = udp_connect(s->udp, &s->remote_addr, s->remote_port);
-        preempt_enable();
-        if (e != ERR_OK)
-            return -101;
-        s->connected = 1;
-        return 0;
-    }
-
-    /* Linux __inet_stream_connect: a handshake already under way is
-     * -EALREADY, an established connection -EISCONN. */
-    preempt_disable();
-    int st = s->tcp_state, have_pcb = (s->tcp != NULL), was = s->was_connected;
-    int pending = (st == TCP_STATE_ERROR && !was) ? take_error_locked(s) : 0;
-    preempt_enable();
-    if (st == TCP_STATE_CONNECTING) return -114;          /* -EALREADY */
-    if (was) return -106;                                 /* -EISCONN */
-    /* A failed non-blocking attempt not yet collected with SO_ERROR reports
-     * its error here (inet_stream_connect -> sock_error). */
-    if (pending) return pending;
-    if (!have_pcb) return -22;      /* a failed attempt released the pcb */
-
-    s->tcp_state = TCP_STATE_CONNECTING;
-    s->tcp_error = 0;
-    preempt_disable();
-    err_t e = tcp_connect(s->tcp, &s->remote_addr, s->remote_port,
-                          tcp_connected_cb);
-    preempt_enable();
-    if (e != ERR_OK) {
-        s->tcp_state = TCP_STATE_ERROR;
-        return -101;
-    }
-    /* O_NONBLOCK: the handshake goes on without us; poll() reports the
-     * socket writable when it ends, and SO_ERROR says how. */
-    if (nonblock)
-        return -115;                                      /* -EINPROGRESS */
-    /* Pin across the sleeping wait (see net_socket_recvfrom). */
+/* A blocking connect()'s wait for its handshake (Linux inet_wait_for_connect):
+ * 0 once established, the socket error if it failed, -ETIMEDOUT after 3 s, or
+ * -EINTR (restart per SA_RESTART) when a signal arrives.  The handshake
+ * carries on either way; a later blocking connect() waits for it again.
+ * Pinned across the sleeps (see net_socket_recvfrom). */
+static int connect_wait(net_socket_t *s) {
     net_socket_retain(s);
     int r = -110;
     uint32_t start = pit_ticks();
@@ -432,11 +386,8 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
             if (!r) r = -101;
             break;
         }
-        /* A signal interrupts the wait (Linux inet_wait_for_connect ->
-         * sock_intr_errno: -ERESTARTSYS, so EINTR or a restart per
-         * SA_RESTART).  The handshake carries on regardless: a restarted
-         * or repeated connect() sees -EALREADY until it ends, and poll()
-         * plus SO_ERROR report how it did, as on Linux. */
+        /* A signal interrupts the wait (sock_intr_errno: -ERESTARTSYS,
+         * so EINTR or a restart per SA_RESTART). */
         if (current_proc && signal_interrupt_pending(current_proc)) {
             r = -4;
             break;
@@ -445,6 +396,69 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
     }
     net_socket_release(s);
     return r;
+}
+
+int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
+                       int nonblock) {
+    if (!s || !s->used || !addr)
+        return -9;
+    if (addr->family != AF_INET_K)
+        return -97;
+    /* Egress firewall: block outbound by remote ip/port if a rule matches. */
+    {
+        int proto = (s->type == SOCK_DGRAM_K) ? FW_UDP : FW_TCP;
+        int fr = firewall_check(FW_OUT, proto, addr->addr, bswap16(addr->port));
+        if (fr < 0) return fr;
+    }
+    if (s->type == SOCK_DGRAM_K) {
+        ip_addr_set_ip4_u32(&s->remote_addr, addr->addr);
+        s->remote_port = bswap16(addr->port);
+        preempt_disable();
+        err_t e = udp_connect(s->udp, &s->remote_addr, s->remote_port);
+        preempt_enable();
+        if (e != ERR_OK)
+            return -101;
+        s->connected = 1;
+        return 0;
+    }
+
+    /* Linux __inet_stream_connect: a handshake already under way is
+     * -EALREADY, an established connection -EISCONN. */
+    preempt_disable();
+    int st = s->tcp_state, have_pcb = (s->tcp != NULL), was = s->was_connected;
+    int pending = (st == TCP_STATE_ERROR && !was) ? take_error_locked(s) : 0;
+    preempt_enable();
+    /* A handshake already under way: -EALREADY for a non-blocking socket,
+     * but a blocking one waits for it (__inet_stream_connect on
+     * SS_CONNECTING with a timeout) — which is also what a connect()
+     * restarted after a signal (SA_RESTART) must do. */
+    if (st == TCP_STATE_CONNECTING)
+        return nonblock ? -114 : connect_wait(s);         /* -EALREADY */
+    if (was) return -106;                                 /* -EISCONN */
+    /* A failed non-blocking attempt not yet collected with SO_ERROR reports
+     * its error here (inet_stream_connect -> sock_error). */
+    if (pending) return pending;
+    if (!have_pcb) return -22;      /* a failed attempt released the pcb */
+
+    /* Only a new attempt takes the address: one already under way (or
+     * done) keeps its own peer, whatever a repeated connect() names. */
+    ip_addr_set_ip4_u32(&s->remote_addr, addr->addr);
+    s->remote_port = bswap16(addr->port);
+    s->tcp_state = TCP_STATE_CONNECTING;
+    s->tcp_error = 0;
+    preempt_disable();
+    err_t e = tcp_connect(s->tcp, &s->remote_addr, s->remote_port,
+                          tcp_connected_cb);
+    preempt_enable();
+    if (e != ERR_OK) {
+        s->tcp_state = TCP_STATE_ERROR;
+        return -101;
+    }
+    /* O_NONBLOCK: the handshake goes on without us; poll() reports the
+     * socket writable when it ends, and SO_ERROR says how. */
+    if (nonblock)
+        return -115;                                      /* -EINPROGRESS */
+    return connect_wait(s);
 }
 
 int net_socket_is_stream(net_socket_t *s) {

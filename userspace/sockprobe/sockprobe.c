@@ -433,16 +433,23 @@ static int msgprobe(int port, int uport) {
     return 0;
 }
 
-/* sockprobe conn <port>: the host's listener on port never completes a
- * handshake, so a blocking connect() waits (3 s here).  A signal (SIGUSR1
- * from a child after 1 s) whose handler has no SA_RESTART must end that wait
- * with EINTR, promptly. */
+/* sockprobe conn <port> [restart]: the host's listener on port does not
+ * complete a handshake at once, so a blocking connect() waits (3 s here).
+ * SIGUSR1 arrives from a child after 1 s.
+ *   default: the handler has no SA_RESTART, so the wait ends with EINTR,
+ *            promptly.
+ *   restart: the handler has SA_RESTART, so connect() is restarted and must
+ *            go on waiting for the handshake under way (Linux
+ *            __inet_stream_connect on SS_CONNECTING) — ending in success once
+ *            the host frees its accept queue (smoke_net.py does after 2 s),
+ *            or the real error — never EALREADY. */
 static volatile int conn_alarms;
 static void conn_alarm(int s) { (void)s; conn_alarms++; }
-static int connintr(int port) {
+static int connintr(int port, int restart) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = conn_alarm;              /* no SA_RESTART */
+    sa.sa_handler = conn_alarm;
+    sa.sa_flags = restart ? SA_RESTART : 0;
     sigaction(SIGUSR1, &sa, 0);
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in host;
@@ -459,17 +466,29 @@ static int connintr(int port) {
         _exit(0);
     }
     int r = connect(fd, (struct sockaddr *)&host, sizeof(host));
-    int err = errno;
+    int err = r < 0 ? errno : 0;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     waitpid(kid, 0, 0);
-    close(fd);
     int ms = (int)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
-    if (r != -1 || err != EINTR || ms > 2000 || conn_alarms != 1) {
-        printf("sockprobe: interrupted connect returned %d errno=%d after %d ms (alarms %d)\n",
-               r, err, ms, conn_alarms);
+    int ok;
+    if (restart) {
+        /* Waited past the signal, and either connected or failed for real. */
+        ok = conn_alarms == 1 && ms > 1300 && err != EALREADY && err != EINTR &&
+             (r == 0 || err == ETIMEDOUT || err == ECONNREFUSED);
+        if (ok && r == 0) {
+            struct sockaddr_in peer;
+            ok = getname(fd, 1, &peer) == 0 && peer.sin_port == host.sin_port;
+        }
+    } else {
+        ok = r == -1 && err == EINTR && ms <= 2000 && conn_alarms == 1;
+    }
+    close(fd);
+    if (!ok) {
+        printf("sockprobe: %s connect returned %d errno=%d after %d ms (signals %d)\n",
+               restart ? "restarted" : "interrupted", r, err, ms, conn_alarms);
         return 1;
     }
-    printf("sockprobe conn ok %d ms\n", ms);
+    printf("sockprobe conn%s ok %d ms r=%d errno=%d\n", restart ? " restart" : "", ms, r, err);
     return 0;
 }
 
@@ -487,7 +506,9 @@ int main(int argc, char **argv) {
     if (argc == 4 && strcmp(argv[1], "msg") == 0)
         return msgprobe(atoi(argv[2]), atoi(argv[3]));
     if (argc == 3 && strcmp(argv[1], "conn") == 0)
-        return connintr(atoi(argv[2]));
+        return connintr(atoi(argv[2]), 0);
+    if (argc == 4 && strcmp(argv[1], "conn") == 0 && strcmp(argv[3], "restart") == 0)
+        return connintr(atoi(argv[2]), 1);
 
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {

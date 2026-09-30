@@ -774,6 +774,24 @@ static int proc_in_group(uint32_t g) {
     return 0;
 }
 
+/* Every copy of an open file (fork, dup, SCM_RIGHTS) must carry the same
+ * epoll identity, so the source gets one BEFORE it is copied: an fid handed
+ * out only at EPOLL_CTL_ADD time would reach the adder's entry alone, and a
+ * copy made earlier (a forked sharer of the epoll, say) would never match. */
+static uint32_t fd_new_fid(void) {
+    static uint32_t next_fid = 1;
+    uint32_t id;
+    do { id = next_fid++; } while (!id);
+    return id;
+}
+
+/* *dst = *src plus a reference: the one way to duplicate a descriptor. */
+void fd_copy(proc_file_t *dst, proc_file_t *src) {
+    if (src->type != FD_NONE && !src->fid) src->fid = fd_new_fid();
+    *dst = *src;
+    fd_retain(dst);
+}
+
 void fd_retain(proc_file_t *f) {
     if (f->type == FD_FILE)    vfs_retain(f->node);
     /* A named pipe's descriptor also holds the FIFO's vfs node; an anonymous
@@ -1090,8 +1108,7 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
 
     /* Copy open file descriptors; bump pipe refcounts */
     for (int i = 0; i < MAX_FD; i++) {
-        child->ofile[i] = parent->ofile[i];
-        fd_retain(&parent->ofile[i]);
+        fd_copy(&child->ofile[i], &parent->ofile[i]);
     }
 
     /* Inherit shared-memory mapping records (PTEs already cloned above) */
@@ -2533,7 +2550,7 @@ static int sys_dup2(registers_t *regs) {
 
 
     /* Copy the entry and bump refcount */
-    *dst = *src;
+    fd_copy(dst, src);
     /* POSIX/Linux dup2(2): the DUPLICATE fd does NOT inherit the close-on-exec
      * flag — it is always CLEARED on newfd.  Our `*dst = *src` copies cloexec
      * from the source, which is WRONG: Chromium dup2's a MFD_CLOEXEC memfd onto
@@ -2542,7 +2559,6 @@ static int sys_dup2(registers_t *regs) {
      * the jsInit/prefMap shared-memory fd vanished → child mmap'd a stale/reused
      * fd → EBADF → ImageBridgeChild::InitSameProcess NULL-deref crash.  Clear it. */
     dst->cloexec = 0;
-    fd_retain(dst);
 
     return newfd;
 }
@@ -2989,10 +3005,9 @@ static int sys_fcntl(registers_t *regs) {
         if (arg < 0 || arg >= MAX_FD) return -22;
         for (int i = arg >= 0 ? arg : 0; i < MAX_FD; i++) {
             if (current_proc->ofile[i].type == FD_NONE) {
-                current_proc->ofile[i] = *f;
+                fd_copy(&current_proc->ofile[i], f);
                 /* F_DUPFD clears cloexec; F_DUPFD_CLOEXEC sets it */
                 current_proc->ofile[i].cloexec = (cmd == 1030) ? 1 : 0;
-                fd_retain(&current_proc->ofile[i]);
                 return i;
             }
         }
@@ -5326,9 +5341,8 @@ static int sys_dup(registers_t *regs) {
 
     for (int i = 0; i < MAX_FD; i++) {
         if (current_proc->ofile[i].type == FD_NONE) {
-            current_proc->ofile[i] = *src;
+            fd_copy(&current_proc->ofile[i], src);
             current_proc->ofile[i].cloexec = 0;
-            fd_retain(&current_proc->ofile[i]);
             return i;
         }
     }
@@ -5993,7 +6007,6 @@ static int sys_epoll_ctl(registers_t *regs) {
     proc_file_t *wf = &current_proc->ofile[fd];
     switch (op) {
     case 1: { /* EPOLL_CTL_ADD */
-        static uint32_t next_fid = 1;
         if (wf->type == FD_EPOLL && wf->epoll == ep) return -22;  /* itself */
         int slot = -1;
         for (int i = 0; i < EPOLL_MAX_ITEMS; i++) {
@@ -6006,9 +6019,7 @@ static int sys_epoll_ctl(registers_t *regs) {
         for (int i = 0; i < EPOLL_MAX_ITEMS && slot < 0; i++)
             if (!epoll_item_live(ep, i)) slot = i;
         if (slot < 0) return -28;  /* -ENOSPC */
-        if (!wf->fid) {
-            do { wf->fid = next_fid++; } while (!wf->fid);
-        }
+        if (!wf->fid) wf->fid = fd_new_fid();   /* never copied yet */
         ep->items[slot].fd  = fd;
         ep->items[slot].fid = wf->fid;
         ep->items[slot].events = ev.events;
@@ -7633,8 +7644,7 @@ static int sys_clone(registers_t *regs) {
     } else {
         /* Private copy (CLONE_VM without CLONE_FILES: posix_spawn, vfork). */
         for (int i = 0; i < MAX_FD; i++) {
-            child->ofile[i] = parent->ofile[i];
-            fd_retain(&parent->ofile[i]);
+            fd_copy(&child->ofile[i], &parent->ofile[i]);
         }
     }
     shm_proc_fork(parent, child);
@@ -7962,8 +7972,7 @@ static int usock_collect_fds(uint32_t uctrl, uint32_t uctrllen,
                                        4) < 0) { err = -14; break; }
                     if (sfd < 0 || sfd >= MAX_FD ||
                         current_proc->ofile[sfd].type == FD_NONE) { err = -9; break; }
-                    pass[npass] = current_proc->ofile[sfd];
-                    fd_retain(&pass[npass]);
+                    fd_copy(&pass[npass], &current_proc->ofile[sfd]);
                     npass++;
                 }
                 if (err) break;
