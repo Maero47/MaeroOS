@@ -1220,13 +1220,18 @@ static int sys_waitpid(registers_t *regs) {
                 return child_pid;
             }
 
-            /* WUNTRACED: also report stopped children */
-            if ((options & WUNTRACED) && p->state == PROC_STOPPED) {
+            /* WUNTRACED: also report a stopped child — once per stop, with
+             * the signal that stopped it (Linux wait_task_stopped clears the
+             * group's stop code as it reports it). */
+            if ((options & WUNTRACED) && p->state == PROC_STOPPED &&
+                !p->stop_reported) {
                 if (status_ptr) {
-                    int status = (SIGTSTP << 8) | 0x7f;
+                    int sig = p->stop_sig ? p->stop_sig : SIGSTOP;
+                    int status = ((sig & 0xff) << 8) | 0x7f;
                     int cr = copy_to_user(status_ptr, &status, sizeof(status));
                     if (cr < 0) return cr;
                 }
+                p->stop_reported = 1;
                 return p->pid;
             }
         }

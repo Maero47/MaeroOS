@@ -324,9 +324,14 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
             restore_saved_sigmask();
             return;  /* default: ignore */
         case 2:
-            /* Wake parent so waitpid(WUNTRACED) returns */
+            /* Record the stop for waitpid(WUNTRACED) — reported once per
+             * stop — and wake the parent where waitpid sleeps: on its group
+             * leader (the kernel is BKL-serialised, so the parent cannot look
+             * before proc_stop_self below has marked us stopped). */
+            current_proc->stop_sig      = sig;
+            current_proc->stop_reported = 0;
             if (current_proc->parent)
-                wake_up(current_proc->parent);
+                wake_up(proc_group_leader(current_proc->parent));
             /* Stop and yield — won't return until SIGCONT makes us RUNNABLE.
              * The interrupted syscall is then restarted (no handler ran). */
             proc_stop_self();

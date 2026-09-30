@@ -126,6 +126,8 @@ struct proc {
     registers_t     *tf;          /* trapframe pointer (for user processes) */
     struct proc     *parent;      /* parent process */
     int              exit_status;
+    int              stop_sig;      /* signal that last stopped this process */
+    int              stop_reported; /* waitpid(WUNTRACED) already saw this stop */
     int              time_slice;
     int              last_syscall;            /* diagnostic: last syscall number */
     int              kprof_bucket;            /* kprof: bucket in effect when this
