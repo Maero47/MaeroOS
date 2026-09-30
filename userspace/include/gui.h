@@ -9,6 +9,11 @@
 #define GUI_INPUT_MAX 64
 #define GUI_LIST_ROW_H 22
 
+/* Window body origin relative to the window: 1px frame, 28px title bar.
+ * Events arrive window-relative; widgets live in surface coordinates. */
+#define GUI_BODY_X 1
+#define GUI_BODY_Y 28
+
 typedef struct gui_window gui_window_t;
 typedef void (*gui_button_cb)(gui_window_t *gui, int id);
 typedef void (*gui_layout_cb)(gui_window_t *gui);
@@ -93,6 +98,11 @@ struct gui_window {
 
 int gui_open(gui_window_t *gui, int slot, const char *title,
              int x, int y, int w, int h);
+/* Write one "[tag] ..." line to the console (serial).  Apps trace the state
+ * changes the GUI smoke test (tools/smoke_gui.py) waits for, and where the
+ * controls it clicks are, as window-relative points (surface point +
+ * GUI_BODY_X/Y).  Only on events, never per frame. */
+void gui_trace(const char *tag, const char *fmt, ...);
 void gui_close(gui_window_t *gui);
 int gui_panel(gui_window_t *gui, int x, int y, int w, int h,
               const char *color);

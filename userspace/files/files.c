@@ -333,6 +333,25 @@ static void refresh_rows(files_app_t *state) {
     }
 }
 
+/* On each new directory: trace it and where its first subdirectory row is,
+ * so tools/smoke_gui.py can navigate (see gui_trace). */
+static void trace_listing(files_app_t *s) {
+    static char traced[256];
+    int rows = files_row_capacity(&s->gui);
+
+    if (s->mode != MODE_BROWSE || !strcmp(traced, s->path)) return;
+    strcpy(traced, s->path);
+    gui_trace("files", "cwd %s entries=%d", s->path, s->entry_count);
+    for (int i = 0; i < rows && s->scroll + i < s->entry_count; i++) {
+        int idx = s->scroll + i;
+        gui_widget_t *w = &s->gui.widgets[IDX_ROW0 + i];
+        if (s->kinds[idx] != 'D' || !strcmp(s->names[idx], "..")) continue;
+        gui_trace("files", "dir %s at %d,%d", s->names[idx],
+                  GUI_BODY_X + w->x + 40, GUI_BODY_Y + w->y + w->h / 2);
+        break;
+    }
+}
+
 static void layout_files(gui_window_t *gui) {
     int body_w = gui_body_width(gui);
     int panel_w = body_w - 20;
@@ -488,6 +507,7 @@ static void on_button(gui_window_t *gui, int id) {
     }
 
     refresh_rows(&app);
+    trace_listing(&app);
     gui_draw(gui);
 }
 
@@ -567,6 +587,7 @@ int main(int argc, char *argv[]) {
     load_entries(&app);
     layout_files(&app.gui);
     refresh_rows(&app);
+    trace_listing(&app);
     gui_draw(&app.gui);
     wm_status(&app.gui.wm, "FILES RUNNING");
 

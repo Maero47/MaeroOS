@@ -169,12 +169,17 @@ static void load_image(void) {
 
     if (img) { free(img); img = 0; }
     img_w = img_h = 0;
-    if (!d) { snprintf(status, sizeof(status), "Cannot open %s", path); return; }
+    if (!d) {
+        snprintf(status, sizeof(status), "Cannot open %s", path);
+        gui_trace("view", "%s", status);
+        return;
+    }
     if (load_ppm(d, len) == 0 || load_bmp(d, len) == 0)
         snprintf(status, sizeof(status), "%s  (%dx%d)", path, img_w, img_h);
     else
         snprintf(status, sizeof(status), "Unsupported format: %s", path);
     free(d);
+    gui_trace("view", "%s", status);
     dirty = 1;
 }
 

@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <linux/input.h>
 #include <poll.h>
+#include <stdarg.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -767,6 +768,25 @@ static int parse_client_index(const char **p) {
     return v - 1;
 }
 
+/* One "[desktop] ..." console (serial) line per state change the GUI smoke
+ * test (tools/smoke_gui.py) waits for — launches, windows opening/closing,
+ * focus, app exits — plus the screen positions of the controls it clicks,
+ * so the test does not copy the layout constants.  Events only, never per
+ * frame. */
+static void trace(const char *fmt, ...) {
+    char buf[200];
+    int n = 10;
+    va_list ap;
+
+    memcpy(buf, "[desktop] ", 10);
+    va_start(ap, fmt);
+    n += vsnprintf(buf + n, sizeof(buf) - (size_t)n - 1, fmt, ap);
+    va_end(ap);
+    if (n > (int)sizeof(buf) - 2) n = (int)sizeof(buf) - 2;
+    buf[n++] = '\n';
+    write(1, buf, (size_t)n);
+}
+
 static desktop_window_t *find_window(int id) {
     for (int i = 0; i < window_count; i++) {
         if (windows[i].id == id) return &windows[i];
@@ -792,11 +812,31 @@ static void raise_window(int id) {
 }
 
 static void focus_window(int id) {
-    if (find_window(id)) {
+    desktop_window_t *win = find_window(id);
+
+    if (win) {
+        /* slot=0: Console/System.  A client's title can still be the slot's
+         * previous one here (gui_open focuses before it sends the title),
+         * so the slot is what identifies the window. */
+        if (id != active_window)
+            trace("focus %s slot=%d", win->title,
+                  is_client_window(id) ? client_index_for_window(id) + 1 : 0);
         active_window = id;
         raise_window(id);
         emit_client_focus_event(id);
     }
+}
+
+/* The focused window went away: focus the topmost window still on screen,
+ * rather than raising the Console over the other open windows. */
+static void focus_next_window(void) {
+    for (int i = window_count - 1; i >= 0; i--) {
+        if (windows[i].visible && !windows[i].minimized) {
+            focus_window(windows[i].id);
+            return;
+        }
+    }
+    focus_window(WIN_TERMINAL);
 }
 
 static void clamp_window(desktop_window_t *win) {
@@ -1441,7 +1481,7 @@ static void drop_app_window(int idx) {
     if (win && win->visible) win->visible = 0;
     drop_client_pixels(idx);   /* release its shared surface */
     if (active_window == WIN_CLIENT_BASE + idx)
-        focus_window(WIN_TERMINAL);
+        focus_next_window();
 }
 
 static int poll_app_exits(void) {
@@ -1452,6 +1492,7 @@ static int poll_app_exits(void) {
         if (client_pids[i] >= 0 &&
             waitpid(client_pids[i], &status, WNOHANG) == client_pids[i]) {
             client_pids[i] = -1;
+            trace("app exited: slot=%d status=%d", i + 1, status);
             drop_app_window(i);
             copy_text(client_status, sizeof(client_status), "APP EXITED");
             exited++;
@@ -1492,6 +1533,7 @@ static int spawn_app2(const char *path, int idx, const char *logname,
         exit(127);
     }
     client_pids[idx] = pid;
+    trace("launch %s slot=%d pid=%d", path, idx + 1, pid);
     copy_text(client_status, sizeof(client_status), "APP STARTING");
     add_log(logname);
     return 0;
@@ -1730,8 +1772,13 @@ static void drop_client_pixels(int idx) {
     cs->surf_shm = -1;
 }
 
+/* "window opened" is traced once per spawn, at the first surface: gui_open
+ * sends the title and geometry before it. */
+static char open_traced[MAX_CLIENT_WINDOWS];
+
 static void reset_client_surface(int idx) {
     if (idx < 0 || idx >= MAX_CLIENT_WINDOWS) return;
+    open_traced[idx] = 0;
     drop_client_pixels(idx);
     client_surfaces[idx].bg = rgb(236, 242, 244);
     for (int i = 0; i < CLIENT_RECTS; i++)
@@ -1794,9 +1841,11 @@ static void hide_client_app(int idx) {
 
     if (idx < 0 || idx >= MAX_CLIENT_WINDOWS) return;
     client = find_window(WIN_CLIENT_BASE + idx);
+    if (client && client->visible)
+        trace("window closed: %s slot=%d", client->title, idx + 1);
     if (client) client->visible = 0;
     if (active_window == WIN_CLIENT_BASE + idx)
-        focus_window(WIN_TERMINAL);
+        focus_next_window();
     emit_client_close_event(idx);
     sprintf(status, "APP %d WINDOW HIDDEN", idx + 1);
     copy_text(client_status, sizeof(client_status), status);
@@ -1931,6 +1980,15 @@ static void set_client_pixels(int idx, const char *arg) {
     client_surfaces[idx].surf_w = w;
     client_surfaces[idx].surf_h = h;
     client_surfaces[idx].surf_shm = shmid;
+    if (!open_traced[idx]) {
+        desktop_window_t *win = find_window(WIN_CLIENT_BASE + idx);
+        open_traced[idx] = 1;
+        if (win)
+            trace("window opened: %s slot=%d x=%d y=%d w=%d h=%d close=%d,%d",
+                  win->title, idx + 1, win->x, win->y, win->w, win->h,
+                  win->x + win->w - CAP_RIGHT - CAP_CLOSE_W / 2,
+                  win->y + 1 + CAP_BTN_H / 2);
+    }
 }
 
 /* icondef INDEX W H — declare an icon's size (clears its pixels). */
@@ -2055,6 +2113,7 @@ static void handle_wmctl_line(char *line) {
         load_wallpaper();
         make_wallpaper_blur();
         add_log("CONF RELOADED");
+        trace("conf reloaded accent=#%06x", (unsigned)(col_accent & 0xffffff));
         return;
     }
     arg = command_arg(line, "status");
@@ -3086,12 +3145,14 @@ static void close_window_like_button(desktop_window_t *win) {
     } else {
         win->visible = 0;
         if (active_window == win->id)
-            focus_window(WIN_TERMINAL);
+            focus_next_window();
     }
 }
 
 static void handle_click(int x, int y) {
     desktop_window_t *win;
+
+    trace("click %d,%d", x, y);
 
     /* Context menu gets the click first: pick an item or dismiss. */
     if (ctx_open) {
@@ -3172,6 +3233,9 @@ static void handle_click(int x, int y) {
                     (unsigned)((int)fb_h - TASKBAR_H - 4),
                     ORB_SIZE, ORB_SIZE)) {
             launcher_open = 1;
+            trace("launcher open settings=%d,%d",
+                  sm_x() + SM_LEFT_W + SM_RIGHT_W / 2,
+                  sm_y() + 100 + 3 * 32 + 16);
             return;
         }
         if (x >= (int)fb_w - 10) {         /* Show Desktop sliver */
@@ -3388,7 +3452,7 @@ static char key_to_char(uint16_t key) {
         [KEY_X] = 'x', [KEY_C] = 'c', [KEY_V] = 'v', [KEY_B] = 'b',
         [KEY_N] = 'n', [KEY_M] = 'm', [KEY_SPACE] = ' ',
         [KEY_COMMA] = ',', [KEY_DOT] = '.', [KEY_SLASH] = '/',
-        [KEY_SEMICOLON] = ':', [KEY_APOSTROPHE] = '\'', [KEY_LEFTBRACE] = '[',
+        [KEY_SEMICOLON] = ';', [KEY_APOSTROPHE] = '\'', [KEY_LEFTBRACE] = '[',
         [KEY_RIGHTBRACE] = ']', [KEY_BACKSLASH] = '\\', [KEY_GRAVE] = '`'
     };
     static const char shifted[] = {
@@ -3396,7 +3460,7 @@ static char key_to_char(uint16_t key) {
         [KEY_5] = '%', [KEY_6] = '^', [KEY_7] = '&', [KEY_8] = '*',
         [KEY_9] = '(', [KEY_0] = ')', [KEY_MINUS] = '_', [KEY_EQUAL] = '+',
         [KEY_COMMA] = '<', [KEY_DOT] = '>', [KEY_SLASH] = '?',
-        [KEY_SEMICOLON] = ';', [KEY_APOSTROPHE] = '"', [KEY_LEFTBRACE] = '{',
+        [KEY_SEMICOLON] = ':', [KEY_APOSTROPHE] = '"', [KEY_LEFTBRACE] = '{',
         [KEY_RIGHTBRACE] = '}', [KEY_BACKSLASH] = '|', [KEY_GRAVE] = '~'
     };
     char c = 0;
@@ -4817,6 +4881,8 @@ int main(void) {
         close(fb_fd);
         return 1;
     }
+    trace("ready fb=%ux%u orb=%d,%d", fb_w, fb_h, ORB_X + ORB_SIZE / 2,
+          (int)fb_h - TASKBAR_H - 4 + ORB_SIZE / 2);
 
     /* Diagnostic one-shot: if /disk/ffauto exists, auto-launch the Firefox
      * launcher once the wm is up, so the X-protocol trace can be captured

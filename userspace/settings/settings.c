@@ -118,6 +118,7 @@ static void apply(void) {
     }
     write(fd, buf, n);
     close(fd);
+    gui_trace("settings", "applied wallpaper=%d accent=%d", sel_wall, sel_accent);
     wm_command(&gui.wm, "reload");
     strcpy(status, "Applied (desktop reloaded)");
     dirty = 1;
@@ -185,6 +186,7 @@ static void on_click(gui_window_t *g, int x, int y) {
         int idx = r * 3 + c;
         if (c >= 0 && c < 3 && idx >= 0 && idx < 6) {
             sel_accent = idx;
+            gui_trace("settings", "accent %d selected", idx);
             dirty = 1;
         }
     }
@@ -203,6 +205,11 @@ int main(int argc, char *argv[]) {
 
     scan_walls();
     render();
+    /* Click targets for tools/smoke_gui.py: the last accent swatch, Apply. */
+    gui_trace("settings", "ready walls=%d accent5=%d,%d apply=%d,%d", wall_count,
+              GUI_BODY_X + gui.surf.w / 2 + 10 + 2 * 56 + 22,
+              GUI_BODY_Y + 42 + 56 + 22,
+              GUI_BODY_X + 65, GUI_BODY_Y + gui.surf.h - 46);
     while (!gui.closed) {
         int events = gui_poll(&gui);
         if (dirty || events > 0)

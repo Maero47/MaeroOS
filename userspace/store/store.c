@@ -148,6 +148,16 @@ static void start_op(int kind, const char *target) {
         op_worker(0);
 }
 
+/* What the window shows, for tools/smoke_gui.py. */
+static void trace_state(void) {
+    if (entry_count)
+        gui_trace("store", "verified list: %d packages", entry_count);
+    else if (index_error)
+        gui_trace("store", "unverified list (%s): run pkg update", index_error);
+    else
+        gui_trace("store", "no package list: run pkg update");
+}
+
 static void render(void) {
     draw_surface_t *s = &gui.surf;
     char txt[128];
@@ -250,6 +260,7 @@ int main(int argc, char *argv[]) {
     gui_set_click_handler(&gui, on_click);
 
     load_index();
+    trace_state();
     if (!entry_count)
         start_op(1, 0);
     else
@@ -267,6 +278,9 @@ int main(int argc, char *argv[]) {
                        "Cannot reach the app store server. On your computer "
                        "run: make repo-serve" :
                        "Operation failed (see console)");
+            gui_trace("store", "pkg %s exit=%d", op_kind == 1 ? "update" :
+                      op_kind == 2 ? "install" : "remove", op_result);
+            trace_state();
             wm_command(&gui.wm, "apps-changed");
             dirty = 1;
         }
