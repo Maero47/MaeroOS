@@ -1,5 +1,8 @@
 #include "ata.h"
+#include "pci.h"
 #include "../kernel/printk.h"
+#include "../lib/string.h"
+#include <kernel/config.h>
 #include <kernel/kprof.h>
 #include "../arch/i686/cpu/tsc.h"
 #include <io.h>
@@ -45,6 +48,7 @@ static inline void ata_irq_restore(uint32_t f) {
 /* Commands */
 #define ATA_CMD_READ       0x20
 #define ATA_CMD_READ_MUL   0xC4
+#define ATA_CMD_READ_DMA   0xC8
 #define ATA_CMD_WRITE      0x30
 #define ATA_CMD_FLUSH      0xE7
 #define ATA_CMD_IDENT      0xEC
@@ -254,6 +258,118 @@ static int ata_probe(uint16_t *ident) {
     return 1;
 }
 
+/*
+ * Bus-master DMA for reads (PCI IDE, SFF-8038i).  PIO moves every word with
+ * `rep insw`, and under KVM that is a trip into QEMU per chunk of the string
+ * plus QEMU's per-sector PIO state machine: ~17 us a sector, 4.5 s of the
+ * ~6 s from firefox-bin's exec to its first paint.  With DMA the controller
+ * (QEMU) writes the sectors straight into guest memory in one request.
+ *
+ * The transfer goes through a bounce buffer in .bss, physically contiguous
+ * because the kernel image is, and big enough for the largest read (count 0 =
+ * 256 sectors = 128 KiB); callers pass heap or cache buffers, which are not.
+ * A PRD entry may not cross a 64 KiB boundary, so the table splits the buffer
+ * there (three entries at most).  The buffer is only page aligned on purpose:
+ * a 64 KiB alignment raises the ELF data segment's alignment, the linker then
+ * pads its file offset, and the multiboot loader - which copies the file
+ * linearly (load_end_addr 0 in boot.asm) - put .data at the wrong address
+ * (init came up as pid 0).  Completion is
+ * polled with interrupts off, like the PIO path (IRQ 14 stays masked).
+ * Writes stay PIO: they are rare and small here.  A controller that is absent,
+ * not bus-master capable, or that reports an error leaves DMA off and every
+ * read on the PIO path.
+ */
+#define BM_CMD     0      /* bus-master registers, primary channel */
+#define BM_STATUS  2
+#define BM_PRDT    4
+#define BM_CMD_START 0x01
+#define BM_CMD_READ  0x08 /* device -> memory */
+#define BM_ST_ACTIVE 0x01
+#define BM_ST_ERR    0x02
+#define BM_ST_IRQ    0x04
+
+typedef struct { uint32_t addr; uint16_t bytes; uint16_t flags; } __attribute__((packed)) ata_prd_t;
+#define ATA_DMA_BYTES (128u * 1024u)
+static ata_prd_t ata_prdt[3] __attribute__((aligned(8)));
+static uint8_t   ata_dma_buf[ATA_DMA_BYTES] __attribute__((aligned(4096)));
+static uint16_t  ata_bm;          /* bus-master I/O base, 0 = no DMA */
+
+static uint32_t kphys(const void *p) {
+    return (uint32_t)(uintptr_t)p - (uint32_t)KERNEL_VMA;
+}
+
+static void ata_dma_init(const uint16_t *ident) {
+    if (!(ident[49] & 0x0100))                     /* DMA supported */
+        return;
+    const pci_device_t *d = pci_find_class(0x01, 0x01);   /* IDE controller */
+    if (!d || !(d->prog_if & 0x80))                /* bus-master capable */
+        return;
+    uint32_t bar4 = d->bar[4];
+    if (!(bar4 & 1) || !(bar4 & ~3u))              /* must be an I/O BAR */
+        return;
+    uint32_t cmd = pci_read_config32(d->bus, d->slot, d->func, 0x04);
+    if (!(cmd & 0x4))                              /* enable bus mastering */
+        pci_write_config32(d->bus, d->slot, d->func, 0x04, (cmd & 0xFFFF) | 0x5);
+    ata_bm = (uint16_t)(bar4 & ~3u);
+    outb(ata_bm + BM_CMD, 0);
+    outb(ata_bm + BM_STATUS, BM_ST_ERR | BM_ST_IRQ);
+}
+
+/* One READ DMA of nsect (1..256) sectors into the bounce buffer.  0 on
+ * success, -1 if the transfer failed (the caller then falls back to PIO).
+ * Runs with interrupts off. */
+static int ata_read_dma(uint32_t lba, uint8_t count, uint32_t nsect) {
+    uint32_t left = nsect * 512u, pa = kphys(ata_dma_buf);
+    int n = 0;
+    while (left) {
+        uint32_t run = 0x10000u - (pa & 0xFFFFu);  /* to the next 64 KiB line */
+        if (run > left) run = left;
+        ata_prdt[n].addr  = pa;
+        ata_prdt[n].bytes = (uint16_t)run;         /* 65536 wraps to 0 = 64 KiB */
+        ata_prdt[n].flags = 0;
+        pa += run; left -= run; n++;
+    }
+    ata_prdt[n - 1].flags = 0x8000;                /* end of table */
+
+    if (ata_wait_bsy() < 0)
+        return -1;
+    outb(ata_bm + BM_CMD, 0);
+    outl(ata_bm + BM_PRDT, kphys(ata_prdt));
+    outb(ata_bm + BM_CMD, BM_CMD_READ);
+    outb(ata_bm + BM_STATUS, BM_ST_ERR | BM_ST_IRQ);
+
+    outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(ATA_FEAT,  0x00);
+    outb(ATA_NSECT, count);
+    outb(ATA_LBAL,  (uint8_t)(lba));
+    outb(ATA_LBAM,  (uint8_t)(lba >> 8));
+    outb(ATA_LBAH,  (uint8_t)(lba >> 16));
+    outb(ATA_CMD,   ATA_CMD_READ_DMA);
+    outb(ata_bm + BM_CMD, BM_CMD_READ | BM_CMD_START);
+
+    /* Done when the controller raises its interrupt bit (or stops with an
+     * error) and the drive has dropped BSY. */
+    ata_timer_t t;
+    ata_timer_start(&t, ATA_TIMEOUT_MS);
+    uint8_t bst;
+    int ok = 0;
+    do {
+        bst = inb(ata_bm + BM_STATUS);
+        if (bst & BM_ST_ERR)
+            break;
+        if ((bst & BM_ST_IRQ) && !(inb(ATA_ALT) & ATA_SR_BSY)) {
+            ok = 1;
+            break;
+        }
+    } while (!ata_timer_expired(&t));
+    outb(ata_bm + BM_CMD, 0);
+    uint8_t st = inb(ATA_STATUS);                  /* also acks the drive's INTRQ */
+    outb(ata_bm + BM_STATUS, BM_ST_ERR | BM_ST_IRQ);
+    if (!ok || (bst & BM_ST_ERR) || (st & (ATA_SR_ERR | ATA_SR_DF | ATA_SR_BSY)))
+        return -1;
+    return 0;
+}
+
 void ata_init(void) {
     /* Read the 256-word identify data; word 47 low byte is the largest block
      * READ/WRITE MULTIPLE may use (0 means the drive does not support it). */
@@ -284,11 +400,13 @@ void ata_init(void) {
         }
     }
 
+    ata_dma_init(ident);
+
     if (ata_multi)
-        printk("[ATA]  Primary master ready (READ MULTIPLE, %u sectors/block).\n",
-               (unsigned)ata_multi);
+        printk("[ATA]  Primary master ready (READ MULTIPLE, %u sectors/block%s).\n",
+               (unsigned)ata_multi, ata_bm ? ", bus-master DMA" : "");
     else
-        printk("[ATA]  Primary master ready.\n");
+        printk("[ATA]  Primary master ready%s.\n", ata_bm ? " (bus-master DMA)" : "");
 }
 
 int ata_present(void) {
@@ -305,7 +423,20 @@ int ata_read(uint32_t lba, uint8_t count, void *buf) {
      * the per-sector cost can be separated from the totals alone. */
     int kp_id = (count && count <= 4) ? KPP_ATA_SMALL : KPP_ATA_BIG;
     uint64_t kp_t0 = kprof_probe_begin();
-    uint32_t irq = ata_irq_save();   /* serialize the whole PIO transaction */
+    uint32_t irq = ata_irq_save();   /* serialize the whole transaction */
+    if (ata_bm) {
+        uint32_t n = count ? count : 256u;
+        if (ata_read_dma(lba, count, n) == 0) {
+            memcpy(buf, ata_dma_buf, n * 512u);
+            ata_irq_restore(irq);
+            kprof_probe_end(kp_id, kp_t0);
+            kprof_switch(kp_old);
+            return 0;
+        }
+        printk("[ATA]  DMA read of LBA %u failed; using PIO from now on.\n",
+               (unsigned)lba);
+        ata_bm = 0;
+    }
     if (ata_wait_bsy() < 0) {
         ata_irq_restore(irq);
         kprof_probe_end(kp_id, kp_t0);
