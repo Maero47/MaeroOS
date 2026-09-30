@@ -2,6 +2,7 @@
 import os
 import re
 import selectors
+import shutil
 import subprocess
 import sys
 import time
@@ -22,7 +23,47 @@ def send(proc, text):
     smokelib.send(proc, text)
 
 
+def debugfs(cmd):
+    tool = shutil.which("debugfs") or "/sbin/debugfs"
+    out = subprocess.run([tool, "-R", cmd, os.path.join(ROOT, "disk.img")],
+                         capture_output=True, text=True, timeout=30)
+    return out.stdout + out.stderr
+
+
+def check_host_symlinks():
+    """symprobe's persistent links, as e2fsprogs sees them after shutdown."""
+    fast = debugfs("stat /sp-keep-fast")
+    if "Type: symlink" not in fast or 'Fast link dest: "hello.txt"' not in fast:
+        raise AssertionError(f"debugfs: /sp-keep-fast is not a fast symlink:\n{fast}")
+    slow = debugfs("stat /sp-keep-slow")
+    target = "/disk" + "/." * 40 + "/hello.txt"
+    if "Type: symlink" not in slow or f"Size: {len(target)}" not in slow:
+        raise AssertionError(f"debugfs: /sp-keep-slow is not a slow symlink:\n{slow}")
+    if "Fast link dest" in slow:
+        raise AssertionError("debugfs: /sp-keep-slow was stored as a fast link")
+    body = debugfs("cat /sp-keep-slow")
+    if target not in body:
+        raise AssertionError(f"debugfs: /sp-keep-slow block holds {body!r}")
+
+
+HOST_SLOW = "/disk" + "/." * 40 + "/etc/os-release"
+
+
+def make_host_symlinks():
+    """A fast and a slow symlink written by e2fsprogs, for the guest to read."""
+    for name, target in (("/host-fast", "etc/os-release"), ("/host-slow", HOST_SLOW)):
+        tool = shutil.which("debugfs") or "/sbin/debugfs"
+        img = os.path.join(ROOT, "disk.img")
+        subprocess.run([tool, "-w", "-R", f"rm {name}", img],
+                       capture_output=True, timeout=30)
+        subprocess.run([tool, "-w", "-R", f"symlink {name} {target}", img],
+                       capture_output=True, timeout=30, check=True)
+        if "Type: symlink" not in debugfs(f"stat {name}"):
+            raise AssertionError(f"debugfs could not create {name}")
+
+
 def main():
+    make_host_symlinks()
     proc = subprocess.Popen(
         [
             "qemu-system-i386",
@@ -247,6 +288,27 @@ def main():
             # set-uid root on the disk and re-runs itself as uid 1000.
             ("credprobe\n", "credprobe ok", "FAILED"),
             ("fsprobe\n", "fsprobe ok", "fsprobe FAIL"),
+            # ext2 symlinks: fast and slow, readlink/lstat/unlink/ELOOP; the
+            # probe leaves /disk/sp-keep-{fast,slow} for the host check below.
+            ("symprobe\n", "symprobe ok", "symprobe FAIL"),
+            # Links e2fsprogs made before boot (fast and slow) resolve too.
+            ("readlink /disk/host-fast\n", "etc/os-release"),
+            ("cat /disk/host-fast\n", "NAME=MaeroOS"),
+            ("readlink /disk/host-slow\n", HOST_SLOW),
+            ("cat /disk/host-slow\n", "NAME=MaeroOS"),
+            ("cat /host-slow\n", "NAME=MaeroOS"),
+            # The in-tree ln and toybox's ln make links /disk can follow.
+            ("ln -s /disk/etc/os-release /disk/ln-os\n", "MaeroOS$ ", "failed"),
+            ("cat /disk/ln-os\n", "NAME=MaeroOS"),
+            ("readlink /disk/ln-os\n", "/disk/etc/os-release"),
+            ("toybox ln -s etc/os-release /disk/tb-os\n", "MaeroOS$ ", "ln:"),
+            ("cat /disk/tb-os\n", "NAME=MaeroOS"),
+            ("toybox readlink /disk/tb-os\n", "etc/os-release"),
+            ("toybox ls -l /disk/tb-os\n", re.compile(r"^lrwxrwxrwx .*-> etc/os-release", re.M)),
+            ("rm /disk/ln-os\n", "MaeroOS$ "),
+            ("toybox rm /disk/tb-os\n", "MaeroOS$ "),
+            ("cat /disk/tb-os\n", "cat: cannot open file"),
+            ("cat /disk/etc/os-release\n", "NAME=MaeroOS"),
             ("randprobe\n", "randprobe getrandom ok"),
             ("randprobe\n", "randprobe urandom ok"),
             ("cat /disk/hello.txt\n", "DISK"),
@@ -387,6 +449,16 @@ def main():
         wait_for(proc, sel, PROMPT, log, start=before)
         if "uid=1000 gid=100" not in "".join(log)[before:]:
             raise AssertionError("console login as user did not drop to uid 1000")
+
+        # The links symprobe left must be real ext2 symlinks on the image
+        # itself: stop the guest and read them back with the host's debugfs.
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        check_host_symlinks()
 
         print("\n[SMOKE-DISK] passed")
         return 0

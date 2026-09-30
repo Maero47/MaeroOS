@@ -5492,12 +5492,15 @@ static int sys_lstat64_real(registers_t *regs) {
 /* ── sys_symlink(target, linkpath) — EAX=83 ─────────────────────────────── */
 static int sys_symlink(registers_t *regs) {
     char target[512], linkpath[512];
-    if (copy_user_str((const char *)(uintptr_t)regs->ebx, target, 512) < 0) return -14;
-    if (copy_user_str((const char *)(uintptr_t)regs->ecx, linkpath, 512) < 0) return -14;
+    /* -EFAULT, or -ENAMETOOLONG for a string that does not fit. */
+    int rc = copy_user_str((const char *)(uintptr_t)regs->ebx, target, 512);
+    if (rc < 0) return rc;
+    rc = copy_user_str((const char *)(uintptr_t)regs->ecx, linkpath, 512);
+    if (rc < 0) return rc;
     /* Resolve linkpath relative to cwd (bounded: cwd + a 511-byte user path
      * used to be joined into a 512-byte stack buffer unchecked). */
     char abspath[256];
-    int rc = resolve_path_at_fd(AT_FDCWD, linkpath, abspath, sizeof(abspath));
+    rc = resolve_path_at_fd(AT_FDCWD, linkpath, abspath, sizeof(abspath));
     if (rc < 0) return rc;
     /* Creating the link needs write+search on its directory, and the link is
      * the caller's (effective ids). */
@@ -6343,6 +6346,7 @@ static int sys_fstatat64(registers_t *regs) {
     int dirfd = (int)regs->ebx;
     const char *upath = (const char *)(uintptr_t)regs->ecx;
     struct kstat64 *st = (struct kstat64 *)(uintptr_t)regs->edx;
+    int flags = (int)regs->esi;
     if (!access_ok(st, sizeof(*st))) return -14;
     char path[256], resolved[256];
     int r = copy_user_str(upath, path, sizeof(path));
@@ -6356,7 +6360,8 @@ static int sys_fstatat64(registers_t *regs) {
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
     int lerr;
-    vfs_node_t *n = vfs_lookup(resolved, 1, &lerr);
+    /* AT_SYMLINK_NOFOLLOW: stat the link itself, as lstat() does. */
+    vfs_node_t *n = vfs_lookup(resolved, !(flags & AT_SYMLINK_NOFOLLOW_K), &lerr);
     if (!n) return lerr;
     fill_kstat64(&kst, n);
     return copy_to_user(st, &kst, sizeof(kst));

@@ -93,6 +93,9 @@ typedef struct {
 #define EXT2_S_IFLNK  0xA000
 #define EXT2_S_IFSOCK 0xC000
 #define EXT2_FT_SOCK  6       /* dirent file_type of a socket */
+#define EXT2_FT_SYMLINK 7     /* dirent file_type of a symlink */
+/* A target shorter than i_block (60 bytes) is stored in i_block itself. */
+#define EXT2_FAST_LINK_MAX (15 * 4)
 
 /* ── Filesystem state ─────────────────────────────────────────────────────── */
 
@@ -244,6 +247,7 @@ static int ext2_truncate(vfs_node_t *node, uint32_t new_size);
 static int ext2_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid,
                         uint32_t gid);
 static int ext2_unlink(vfs_node_t *dir, const char *name);
+static int ext2_symlink(vfs_node_t *dir, const char *name, const char *target);
 static int ext2_rename(vfs_node_t *old_dir, const char *old_name,
                        vfs_node_t *new_dir, const char *new_name);
 static int ext2_free_block(uint32_t blk);
@@ -835,6 +839,15 @@ int ext2_statfs(uint32_t *block_size, uint32_t *blocks, uint32_t *bfree,
     return 0;
 }
 
+/* Linux ext2_inode_is_fast_symlink(): a symlink whose only block, if any, is
+ * its extended-attribute block keeps the target in i_block, which then holds
+ * text rather than block numbers. */
+static int ext2_is_fast_symlink(const ext2_inode_t *ino) {
+    if ((ino->i_mode & EXT2_S_IFMT) != EXT2_S_IFLNK) return 0;
+    uint32_t ea = ino->i_file_acl ? g_state.sectors_per_block : 0;
+    return ino->i_blocks == ea;
+}
+
 /* ── Resolve an indirect block pointer ───────────────────────────────────── */
 
 /* Returns the physical block number for file-block index `idx`.
@@ -1036,6 +1049,12 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
 
     if (offset >= inode.i_size) return 0;
     if (size > inode.i_size - offset) size = inode.i_size - offset;
+
+    if (ext2_is_fast_symlink(&inode)) {
+        if (inode.i_size > EXT2_FAST_LINK_MAX) return 0;
+        memcpy(buf, (const uint8_t *)inode.i_block + offset, size);
+        return size;
+    }
 
     uint32_t blk_size = g_state.block_size;
     uint32_t done = 0;
@@ -1489,6 +1508,11 @@ static int ext2_free_subtree(uint32_t blk, int level, uint32_t base,
  */
 static void ext2_free_blocks_from(ext2_inode_t *inode, uint32_t from) {
     if (!inode) return;
+    /* A fast symlink's i_block is its target text, not block numbers. */
+    if (ext2_is_fast_symlink(inode)) {
+        if (from == 0) memset(inode->i_block, 0, sizeof(inode->i_block));
+        return;
+    }
     uint32_t n = g_state.block_size / 4;
     uint32_t freed = 0;
     uint32_t *bufs[3];
@@ -1649,12 +1673,28 @@ static void ext2_fill_node(vfs_node_t *node, const ext2_inode_t *inode) {
         node->readdir_fn  = ext2_readdir;
         node->create_fn   = ext2_create;
         node->unlink_fn   = ext2_unlink;
+        node->symlink_fn  = ext2_symlink;
         node->rename_fn   = ext2_rename;
         node->read_fn     = NULL;
         node->write_fn    = NULL;
         node->truncate_fn = NULL;
         node->retain_fn   = NULL;
         node->close_fn    = NULL;
+    } else if (type == EXT2_S_IFLNK) {
+        /* read_fn yields the target (fast or slow); the VFS resolver and
+         * readlink() read it that way.  The target is never rewritten. */
+        node->flags       = VFS_FLAG_SYMLINK;
+        node->finddir_fn  = NULL;
+        node->readdir_fn  = NULL;
+        node->create_fn   = NULL;
+        node->unlink_fn   = NULL;
+        node->symlink_fn  = NULL;
+        node->rename_fn   = NULL;
+        node->read_fn     = ext2_read_node;
+        node->write_fn    = NULL;
+        node->truncate_fn = NULL;
+        node->retain_fn   = ext2_retain_node;
+        node->close_fn    = ext2_close_node;
     } else {
         /* A socket inode (bind()) has no data: nothing to read or write. */
         int sock = (type == EXT2_S_IFSOCK);
@@ -1663,6 +1703,7 @@ static void ext2_fill_node(vfs_node_t *node, const ext2_inode_t *inode) {
         node->readdir_fn  = NULL;
         node->create_fn   = NULL;
         node->unlink_fn   = NULL;
+        node->symlink_fn  = NULL;
         node->rename_fn   = NULL;
         node->read_fn     = sock ? NULL : ext2_read_node;
         node->write_fn    = sock ? NULL : ext2_write_node;
@@ -1793,6 +1834,73 @@ static int ext2_create(vfs_node_t *dir, const char *name, uint32_t flags) {
     return 0;
 }
 
+/* symlink(2): a target shorter than 60 bytes lives in i_block (a fast
+ * symlink, i_blocks 0, as mke2fs/debugfs and Linux write it); a longer one
+ * gets one data block.  Owner and mode are set by the caller (vfs_setattr). */
+static int ext2_symlink(vfs_node_t *dir, const char *name, const char *target) {
+    if (!g_mounted || !dir || !dir->private || !name || !target) return -22;
+    uint32_t tlen = strlen(target);
+    if (tlen == 0) return -2;                                   /* -ENOENT */
+    if (tlen >= g_state.block_size) return -36;                 /* -ENAMETOOLONG */
+    uint32_t nlen = strlen(name);
+    if (nlen == 0) return -22;
+    if (nlen > 255) return -36;
+    if (ext2_finddir(dir, name)) return -17;                    /* -EEXIST */
+
+    ext2_priv_t *dpriv = (ext2_priv_t *)dir->private;
+    ext2_inode_t dir_inode;
+    if (ext2_read_inode(dpriv->ino, &dir_inode) < 0) return -5;
+    if ((dir_inode.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) return -20;
+
+    uint32_t ino = ext2_alloc_inode();
+    if (!ino) return -28;                                       /* -ENOSPC */
+
+    ext2_inode_t inode;
+    memset(&inode, 0, sizeof(inode));
+    uint32_t now = ext2_now();
+    inode.i_atime = inode.i_ctime = inode.i_mtime = now;
+    inode.i_mode = EXT2_S_IFLNK | 0777;
+    inode.i_links_count = 1;
+    inode.i_size = tlen;
+
+    if (tlen < EXT2_FAST_LINK_MAX) {
+        memcpy(inode.i_block, target, tlen);
+    } else {
+        uint8_t *buf = (uint8_t *)kmalloc(g_state.block_size);
+        if (!buf) { ext2_free_inode(ino); return -12; }         /* -ENOMEM */
+        uint32_t blk = ext2_alloc_block();
+        if (!blk) { kfree(buf); ext2_free_inode(ino); return -28; }
+        memset(buf, 0, g_state.block_size);
+        memcpy(buf, target, tlen);
+        int w = ext2_write_block(blk, buf);
+        kfree(buf);
+        if (w < 0) {
+            ext2_free_block(blk);
+            ext2_free_inode(ino);
+            return -5;
+        }
+        inode.i_block[0] = blk;
+        inode.i_blocks = g_state.sectors_per_block;
+    }
+
+    if (ext2_write_inode(ino, &inode) < 0) {
+        ext2_free_inode_blocks(&inode);
+        ext2_free_inode(ino);
+        return -5;
+    }
+    if (ext2_add_dirent(dpriv->ino, &dir_inode, ino, name, EXT2_FT_SYMLINK) < 0) {
+        ext2_free_inode_blocks(&inode);
+        memset(&inode, 0, sizeof(inode));
+        ext2_write_inode(ino, &inode);
+        ext2_free_inode(ino);
+        return -28;
+    }
+    dir_inode.i_mtime = now;
+    dir_inode.i_ctime = now;
+    ext2_write_inode(dpriv->ino, &dir_inode);
+    return 0;
+}
+
 /* The last name of `ino` is gone (victim->i_links_count is 0).  Free it now,
  * or — while a descriptor or a mapping still holds it — mark it orphaned so
  * ext2_close_node() frees it when the last one closes. */
@@ -1835,7 +1943,8 @@ static int ext2_unlink(vfs_node_t *dir, const char *name) {
     if (type == EXT2_S_IFDIR && !ext2_dir_is_empty(&victim))
         return -1;
 
-    if (type != EXT2_S_IFREG && type != EXT2_S_IFDIR && type != EXT2_S_IFSOCK)
+    if (type != EXT2_S_IFREG && type != EXT2_S_IFDIR && type != EXT2_S_IFSOCK &&
+        type != EXT2_S_IFLNK)
         return -1;
 
     if (ext2_remove_dirent(&dir_inode, name, NULL) < 0) return -1;
@@ -2177,6 +2286,7 @@ static int ext2_readdir(vfs_node_t *dir, uint32_t req_idx,
                     out->ino  = de->inode;
                     out->type = (de->file_type == 2) ? VFS_FLAG_DIR
                               : (de->file_type == EXT2_FT_SOCK) ? VFS_FLAG_SOCK
+                              : (de->file_type == EXT2_FT_SYMLINK) ? VFS_FLAG_SYMLINK
                               : VFS_FLAG_FILE;
                     memcpy(out->name, de->name, de->name_len);
                     out->name[de->name_len] = '\0';
