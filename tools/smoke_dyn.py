@@ -68,7 +68,16 @@ def main():
         if "ld-musl-i386.so.1" not in body:
             raise AssertionError("the musl dynamic linker was not loaded")
 
-        # 2) Static binary must still load and run unchanged.
+        # 2) W^X through ld.so: the PIE's text and RELRO, libc's text and a
+        #    PROT_READ|PROT_EXEC mapping of a shared object are read-only.
+        before = len("".join(log))
+        send(proc, "/wxpie\n")
+        wait_for(proc, sel, PROMPT, log, start=before)
+        body = "".join(log)[before:]
+        if "WXPIE_OK" not in body or "FAILED" in body:
+            raise AssertionError("wxpie did not print WXPIE_OK (W^X broken for dynamic binaries)")
+
+        # 3) Static binary must still load and run unchanged.
         before = len("".join(log))
         send(proc, "toybox echo STATIC_OK\n")
         wait_for(proc, sel, PROMPT, log, start=before)

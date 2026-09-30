@@ -31,13 +31,13 @@ What is proven by the automated QEMU tests in `tools/`:
 
 | Area | Proof | Target |
 |---|---|---|
-| Boot, shell, procfs, PTYs, threads, shm, RNG, bad user pointers | `ls`, `cat`, `sysprobe ok`, `shmprobe ok`, `threadprobe ok`, `ptytest ok`, `cttytest ok`, `memprobe ok`, `/proc/self/status` | `make smoke` |
+| Boot, shell, procfs, PTYs, threads, shm, RNG, bad user pointers | `ls`, `cat`, `sysprobe ok`, `shmprobe ok`, `threadprobe ok`, `ptytest ok`, `cttytest ok`, `memprobe ok`, `wxprobe ok` (read-only text/rodata/mprotect'ed pages refuse writes, also after fork), `/proc/self/status` | `make smoke` |
 | toybox 0.8.13, syscall edge cases, libc, `pkg` archive checks | `TOYBOX_OK` plus applet checks, `sysmiscprobe ok`, `LIBCTEST PASS`, `pkg` refusing `../etc`, and the host-side `tools/test_pkg_tarx.py` | `make smoke-toybox` |
 | Native coreutils-style commands, user faults | `kwprobe ok` (a user write to kernel memory dies of SIGSEGV, a user `int3` of SIGTRAP), then `uname`, `whoami`, `hostname`, `free`, `df`, `uptime`, `which` | `make smoke-cmds` |
 | ext2 disk, login/passwd/doas, permissions, init services, sessions | 152 checks including `passwd` keeping `/etc/shadow` root-only 0600, `login` dropping to `uid=1000`, `doas` ignoring a planted `./ls`, `credprobe ok`, `fsprobe ok` and `svc` state transitions | `make smoke-disk` |
 | TCP/IP over lwIP and RTL8139 | `MAEROS_HTTP_OK` fetched from a host HTTP server; `sockprobe` checks that `send` after `shutdown(SHUT_WR)` fails with `EPIPE`, a two-step shutdown ends in a FIN and no RST, and closing TIME_WAIT sockets keeps TCP working | `make smoke-net` |
 | Kernel firewall | after `fwctl enable` plus a drop rule the same fetch fails, `fwctl list` reports the firewall `enabled` with the `drop out tcp` rule, malformed rules (`/33`, an overflowing prefix, port 70000, `tcpp`) are rejected under `policy out drop`, and `fwctl flush` restores the fetch | `make smoke-fw` |
-| Dynamic linker | `DYNPROBE_OK` from a PIE loaded through musl `ld.so` | `make smoke-dyn` |
+| Dynamic linker | `DYNPROBE_OK` from a PIE loaded through musl `ld.so`; `WXPIE_OK` (the PIE's text and RELRO, libc's text and a `PROT_READ\|PROT_EXEC` library mapping are read-only) | `make smoke-dyn` |
 | External shared libraries and pthreads | `GREET_OK sum=42`, `ZLIB_OK ver=1.3`, `THREADS_OK count=200000`, `UNIX_SOCK_OK` | `make smoke-dynlib` |
 | X11 server | `XHANDSHAKE_OK`, `XDRAW_OK` (`w=320 h=200` from `GetGeometry`), `XEVENT_OK`, and `XREAL_PAINTED` from a client linked against the cross-built libX11 | `make smoke-x` |
 | GLib, Cairo, Pango, GTK3 | `GLIB_OK` (v2.78), `CAIRO_OK rect_px=0xe69919`, `PANGO_OK`, `GTK_OK init`, `GTK_WINDOW_SHOWN`, `GTK_DRAWN` (needs probe binaries a fresh clone lacks, see Testing) | `make smoke-gtk` |
@@ -51,8 +51,13 @@ What is proven by the automated QEMU tests in `tools/`:
   `proc/syscall.c`, `proc/scheduler.c` and `proc/usocket.c` exists to chase that stall;
   its hot-path traces are only compiled in with `make KTRACE=1`. This is the current
   frontier of the project, not a finished feature.
-- **No W^X.** ELF segments are mapped writable; `proc/elf.c` does not yet enforce
-  per-segment protection.
+- **No execute protection (NX).** The kernel runs i686 page tables without PAE, which
+  have no no-execute bit, so every readable user page is also executable. Write
+  protection is enforced: `proc/elf.c` maps each `PT_LOAD` segment with its own
+  `p_flags` (`.text` and `.rodata` read-only, the in-tree programs are linked by
+  `userspace/user.ld` into separate R-X and RW segments), `ld.so` can `mprotect` a
+  `PT_GNU_RELRO` range read-only, and a write to a read-only page is `SIGSEGV`
+  (`SEGV_ACCERR`), in a forked child as well.
 - **inotify is deliberately absent.** Numbers 291, 292, 293 and 332 return `-ENOSYS`
   on purpose so GLib falls back to its polling backend (see the comment on those
   cases in `proc/syscall.c`).

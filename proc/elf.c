@@ -171,13 +171,33 @@ int elf_load_bias(vfs_node_t *node, uint32_t pgdir_phys, uint32_t want_bias,
             return -1;
         }
 
+        /* W^X: a segment is writable only if p_flags says so (Linux
+         * elf_map with make_prot(p_flags)).  Read-only pages also carry
+         * PAGE_WRPROT, the "write refused" marker the COW fault handler checks:
+         * fork makes every private page COW, and without it a write to .text
+         * in the child would break COW instead of raising SIGSEGV.  Execute
+         * permission cannot be expressed: i686 without PAE has no NX bit, so
+         * every present user page is executable. */
+        uint32_t pflags = (phdr->p_flags & PF_W)
+                          ? PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE
+                          : PAGE_PRESENT | PAGE_USER | PAGE_WRPROT;
+
         /* Map and populate each page.  A biased segment may share its first
          * or last page with an adjacent segment (PIE text/data are often only
-         * one page apart); reuse an already-mapped frame instead of clobbering. */
+         * one page apart); reuse an already-mapped frame instead of clobbering.
+         * Such a page gets the union of both segments' permissions: it must
+         * stay writable for the data half. */
         for (uint32_t va = vstart; va < vend; va += PAGE_SIZE) {
             uint8_t *dst;
             uint32_t existing = pgdir_virt_to_phys(pgdir_phys, va);
             if (existing) {
+                if ((phdr->p_flags & PF_W) &&
+                    pgdir_map(pgdir_phys, va, existing, pflags) != 0) {
+                    printk("[ELF] OOM remapping segment page\n");
+                    if (owned_hdr) { kfree(owned_hdr); }
+                    if (bounce)    { kfree(bounce); }
+                    return -1;
+                }
                 dst = (uint8_t *)paging_temp_map(existing);
             } else {
                 uint32_t phys = pmm_alloc_frame();
@@ -188,8 +208,7 @@ int elf_load_bias(vfs_node_t *node, uint32_t pgdir_phys, uint32_t want_bias,
                     return -1;
                 }
                 pmm_frame_incref(phys);
-                if (pgdir_map(pgdir_phys, va, phys,
-                              PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
+                if (pgdir_map(pgdir_phys, va, phys, pflags) != 0) {
                     printk("[ELF] OOM mapping segment page\n");
                     pmm_frame_decref(phys);
                     if (owned_hdr) { kfree(owned_hdr); }

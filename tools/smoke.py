@@ -56,6 +56,7 @@ def main():
             ("sysprobe\n", "sysprobe ok"),
             ("shmprobe\n", "shmprobe ok"),
             ("memprobe\n", "memprobe ok", "FAILED"),
+            ("wxprobe\n", "wxprobe ok", "FAILED"),
             ("threadprobe\n", "threadprobe ok"),
             ("busybox sh -c 'busybox seq 3 | busybox tail -1; busybox awk \"BEGIN{printf \\\"fpu %.1f\\\\n\\\", 2.5*2}\"'\n", "fpu 5.0"),
             ("randprobe\n", "randprobe getrandom ok"),

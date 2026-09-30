@@ -32,6 +32,12 @@ typedef struct {
 
 #define PT_LOAD   1
 #define PT_INTERP 3
+
+/* p_flags */
+#define PF_X      0x1
+#define PF_W      0x2
+#define PF_R      0x4
+
 #define ET_EXEC   2
 #define ET_DYN    3
 #define EM_386    3
