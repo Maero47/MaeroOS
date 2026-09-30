@@ -22,9 +22,9 @@ def send(proc, text):
 
 
 def main():
-    # pkg's tar/name and index-signature checks are plain C: exercise them on
-    # the host first.
-    for test in ("test_pkg_tarx.py", "test_pkg_sign.py"):
+    # pkg's tar/name and index-signature checks and the libc regex engine are
+    # plain C: exercise them on the host first.
+    for test in ("test_pkg_tarx.py", "test_pkg_sign.py", "test_regex.py"):
         if subprocess.run([sys.executable,
                            os.path.join(ROOT, "tools", test)]).returncode:
             raise AssertionError(f"tools/{test} failed")
@@ -67,6 +67,12 @@ def main():
             ("toybox echo a b | toybox xargs toybox echo X\n", "X a b"),
             ("toybox echo hello | toybox tr a-z A-Z\n", "HELLO"),
             ("toybox echo 3 4 | toybox awk '{print $1*$2}'\n", "12"),
+            # Two output pipes open at once: closing the first must not wait on
+            # the second child, which (before popen closed the parent's other
+            # pipe ends in the child) held the first pipe's write end open.
+            ("toybox awk 'BEGIN{print \"P1\" | \"toybox cat\"; print \"P2\" | \"toybox cat\"; "
+             "print \"b\" | \"toybox sort\"; close(\"toybox cat\"); close(\"toybox sort\"); "
+             "print \"AWK_PIPES_OK\"}'\n", "AWK_PIPES_OK"),
             ("toybox expr 6 \\* 7\n", "42"),
             ("toybox echo 2^10 | toybox bc -q\n", "1024"),
             ("toybox factor 360\n", "360: 2 2 2 3 3 5"),

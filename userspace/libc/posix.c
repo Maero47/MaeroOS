@@ -1036,6 +1036,9 @@ FILE *popen(const char *command, const char *mode) {
     if (pid < 0) { close(fds[0]); close(fds[1]); return 0; }
     if (!pid) {
         const char *sh = shell_path();
+        /* POSIX: the child must not keep the parent's ends of earlier popen()
+         * pipes, or a reader of one of them never sees EOF. */
+        for (int i = 0; i < 16; i++) if (popen_tab[i].f) close(fileno(popen_tab[i].f));
         dup2(fds[rd ? 1 : 0], rd ? 1 : 0);
         close(fds[0]);
         close(fds[1]);

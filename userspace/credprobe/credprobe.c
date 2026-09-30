@@ -101,15 +101,6 @@ static int sys_mmap2(unsigned len, int prot, int flags, int fd) {
     return ret;
 }
 
-static int syscall5(int num, int a1, int a2, int a3, int a4, int a5) {
-    int ret;
-    __asm__ volatile("int $0x80"
-        : "=a"(ret)
-        : "0"(num), "b"(a1), "c"(a2), "d"(a3), "S"(a4), "D"(a5)
-        : "memory");
-    return ret;
-}
-
 static int kopen(const char *path, int flags) {
     return syscall3(NR_OPEN, (int)path, flags, 0644);
 }
