@@ -49,7 +49,11 @@ void idt_init(void) {
     idt_set_gate( 5, (uint32_t)isr5,  0x08, 0x8F);  /* #BR Bound range exceeded */
     idt_set_gate( 6, (uint32_t)isr6,  0x08, 0x8F);  /* #UD Invalid opcode */
     idt_set_gate( 7, (uint32_t)isr7,  0x08, 0x8F);  /* #NM Device not available */
-    idt_set_gate( 8, (uint32_t)isr8,  0x08, 0x8E);  /* #DF Double fault (errcode) */
+    /* #DF: a TASK gate (0x85) to the per-CPU double-fault TSS, selector 0x38
+     * — each CPU's GDT points that selector at its own TSS and stack.  A
+     * double fault is most often a kernel stack overflow, and a gate that
+     * pushed onto the overflowed stack would triple-fault instead. */
+    idt_set_gate( 8, 0,                0x38, 0x85);
     idt_set_gate( 9, (uint32_t)isr9,  0x08, 0x8F);  /* Coprocessor segment overrun */
     idt_set_gate(10, (uint32_t)isr10, 0x08, 0x8F);  /* #TS Invalid TSS (errcode) */
     idt_set_gate(11, (uint32_t)isr11, 0x08, 0x8F);  /* #NP Segment not present (ec)*/

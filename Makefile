@@ -22,8 +22,18 @@ KTRACE ?= 0
 ifeq ($(KTRACE),1)
 CFLAGS  += -DKTRACE=1
 endif
+# Kernel-stack guard self-test (debug builds only, never in a normal build): a
+# kernel thread started at boot overflows its own stack on purpose, and the
+# serial log must show the overflow diagnosis instead of a reset.
+#   make KSTACK_TEST=1   runaway recursion  -> double fault on the #DF task
+#   make KSTACK_TEST=2   store into the guard -> page-fault overflow report
+#   make KSTACK_TEST=3   mode 1 on an AP (boot with -smp 2+) -> that CPU's #DF task
+KSTACK_TEST ?= 0
+ifneq ($(KSTACK_TEST),0)
+CFLAGS  += -DKSTACK_TEST=$(KSTACK_TEST)
+endif
 KTRACE_STAMP := .ktrace-stamp
-$(shell [ "$$(cat $(KTRACE_STAMP) 2>/dev/null)" = "$(KTRACE)" ] || echo "$(KTRACE)" > $(KTRACE_STAMP))
+$(shell [ "$$(cat $(KTRACE_STAMP) 2>/dev/null)" = "$(KTRACE) $(KSTACK_TEST)" ] || echo "$(KTRACE) $(KSTACK_TEST)" > $(KTRACE_STAMP))
 
 ASFLAGS := -f elf32 -g
 

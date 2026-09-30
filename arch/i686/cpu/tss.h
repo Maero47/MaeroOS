@@ -25,8 +25,19 @@ typedef struct tss_entry {
  */
 void tss_install(int n, void *gdt_entry);
 
-/* tss_init — called after GDT is loaded; executes ltr to load TSS selector */
+/* The same for this CPU's double-fault task (GDT entry 7, selector 0x38). */
+void tss_install_df(int cpu, void *gdt_entry);
+
+/* tss_init — called after GDT is loaded; executes ltr to load TSS selector,
+ * and prepares this CPU's double-fault task. */
 void tss_init(void);
 
 /* tss_set_kernel_stack — must be called on every context switch */
 void tss_set_kernel_stack(uint32_t stack_top);
+
+/* Page directory the double-fault task runs with (the kernel's). */
+void tss_set_df_cr3(uint32_t cr3);
+
+/* CPU `cpu`'s main TSS.  After a double fault the task switch has stored the
+ * interrupted context (eip, esp, general registers) in it. */
+const tss_entry_t *tss_saved_state(int cpu);

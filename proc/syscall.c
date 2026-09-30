@@ -8,6 +8,7 @@
 #include "elf.h"
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
+#include "../mm/kstack.h"
 #include "../arch/i686/mm/paging.h"
 #include "../arch/i686/mm/tlb.h"
 #include "../drivers/serial.h"
@@ -933,7 +934,7 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
     /* Create child's page directory with kernel mappings */
     child->pgdir_phys = pgdir_create();
     if (!child->pgdir_phys) {
-        kfree(child->kstack);
+        kstack_free(child->kstack);
         child->state = PROC_UNUSED;
         return -11;
     }
@@ -958,7 +959,7 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
         if (!child_pt_phys) {
             paging_temp_unmap2();
             pgdir_free_user(child->pgdir_phys);
-            kfree(child->kstack);
+            kstack_free(child->kstack);
             child->state = PROC_UNUSED;
             return -11;
         }

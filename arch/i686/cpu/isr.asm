@@ -152,6 +152,27 @@ global spurious_isr
 spurious_isr:
     iret
 
+; ─── Double-fault task entry (vector 8, via task gate) ──────────────────────
+; Not an interrupt handler: the task gate on vector 8 switches to this CPU's
+; double-fault TSS (tss.c), whose EIP is here and whose ESP is a stack of its
+; own.  The interrupted context is in the CPU's main TSS, not on any stack; the
+; only thing on ours is the #DF error code (always 0).  Never returns — there is
+; nothing sane to resume after a double fault.
+extern double_fault_report
+global double_fault_task
+double_fault_task:
+    ; Clear EFLAGS.NT, set by the task switch: should anything below fault and
+    ; its handler iret, NT would make that iret a task return — straight back
+    ; into the context that just double-faulted.
+    pushfd
+    and dword [esp], ~0x4000
+    popfd
+    call double_fault_report
+.hang:
+    cli
+    hlt
+    jmp .hang
+
 ; ─── NMI stub (vector 2) ─────────────────────────────────────────────────────
 ; Bare handler: the NMI is the way into a guest that has stopped, and the most
 ; likely reason it has stopped is that this CPU is holding the Big Kernel Lock

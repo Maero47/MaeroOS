@@ -23,6 +23,19 @@
 #define HEAP_START      0xD0000000UL
 #define HEAP_MAX        0xE0000000UL
 
+/* Kernel stacks live in their own window, not the heap (mm/kstack.c).  Each
+ * slot is KSTACK_SLOT_SIZE of address space: the stack occupies the top
+ * KSTACKSIZE and everything below it stays unmapped, so running off the bottom
+ * of a stack faults on the guard instead of scribbling over whatever the heap
+ * put next to it.  The guard is as large as the stack itself, so even a frame
+ * that moves %esp by several pages in one go cannot step over it into the
+ * neighbouring slot.  Sits above the framebuffer window (0xE0000000-0xF0000000)
+ * and well below the identity-mapped LAPIC (0xFEE00000). */
+#define KSTACK_REGION_START 0xF0000000UL
+#define KSTACK_SLOT_SIZE    0x10000UL      /* 64 KiB: 32 KiB guard + stack */
+#define KSTACK_SLOTS        256            /* MAX_PROCS + one per AP, with room */
+#define KSTACK_REGION_END   (KSTACK_REGION_START + KSTACK_SLOTS * KSTACK_SLOT_SIZE)
+
 #define USER_STACK_TOP    0xC0000000UL
 #define USER_STACK_PAGES  64
 #define USER_STACK_BASE   (USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE))

@@ -23,10 +23,11 @@ typedef struct {
  * One GDT per CPU.  The fixed segments (null, kernel/user code+data) are
  * identical across CPUs, but entry 5 (TSS) and entry 6 (user TLS / %gs) are
  * per-CPU: each CPU has its own ring0 stack (its TSS) and runs a different
- * thread (its TLS base).  Same selectors (0x08..0x33) on every CPU; they just
+ * thread (its TLS base).  Entry 7 is the CPU's double-fault task (tss.c),
+ * reached through the task gate on vector 8.  Same selectors (0x08..0x38) on every CPU; they just
  * resolve through whichever GDT that CPU loaded.
  */
-static gdt_entry_t gdt[MAX_CPUS][7];
+static gdt_entry_t gdt[MAX_CPUS][8];
 static gdt_ptr_t   gdt_ptr[MAX_CPUS];
 
 /* Defined in gdt_flush.asm */
@@ -57,6 +58,7 @@ static void gdt_build_and_load(void) {
     gdt_set_entry(cpu, 4, 0, 0xFFFFFFFF, 0xF2, 0xCF); /* User data */
     tss_install(cpu, &gdt[cpu][5]);                    /* TSS for this CPU */
     gdt_set_entry(cpu, 6, 0, 0xFFFFFFFF, 0xF2, 0xCF);  /* User TLS (%gs) */
+    tss_install_df(cpu, &gdt[cpu][7]);                 /* #DF task (0x38) */
 
     gdt_ptr[cpu].limit = (uint16_t)(sizeof(gdt[cpu]) - 1);
     gdt_ptr[cpu].base  = (uint32_t)&gdt[cpu][0];
