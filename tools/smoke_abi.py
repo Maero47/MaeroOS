@@ -32,6 +32,7 @@ import subprocess
 import sys
 import time
 
+import smokelib
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PROBE_DIR = os.path.join(ROOT, "testfiles", "abiprobes")
@@ -187,7 +188,7 @@ def kill_qemu(proc):
 
 
 def boot(args):
-    """Start QEMU and wait for the shell prompt.  Returns (proc, sel, log)."""
+    """Start QEMU, log in on the console and wait for the shell prompt.  Returns (proc, sel, log)."""
     # p26 measures real ext2 free space, so the volume must exist.  Without this
     # QEMU fails to open it and the run dies at "no shell prompt within N s",
     # which says nothing about the actual cause.
@@ -208,8 +209,7 @@ def boot(args):
     sel.register(proc.stdout, selectors.EVENT_READ)
     log = []
     try:
-        if not wait_for(proc, sel, PROMPT, log, timeout=BOOT_TIMEOUT):
-            raise TimeoutError(f"no shell prompt within {BOOT_TIMEOUT} s")
+        smokelib.login(proc, sel, log, timeout=BOOT_TIMEOUT)
     except Exception:
         kill_qemu(proc)
         raise
