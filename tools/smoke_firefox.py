@@ -811,7 +811,7 @@ def web_load(qmp, args, run, pump, web):
     tmpdir = tempfile.mkdtemp(prefix="ffweb-")
     try:
         while time.time() < end:
-            if not pump(3.0):
+            if not pump(1.0):
                 break
             if web.first("/mark.png") is None:
                 continue
