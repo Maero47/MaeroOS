@@ -239,7 +239,10 @@ static uint32_t tty_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf
                 if (do_echo) { serial_putc('^'); serial_putc('C'); serial_putc('\n'); }
                 signal_send(current_proc, SIGINT);
             }
-            return 0;
+            /* Linux n_tty_read: -ERESTARTSYS, not 0 (which the reader takes
+             * for EOF).  The call is restarted when no handler runs — after
+             * SIGCONT for ^Z, straight away when the signal is ignored. */
+            return (uint32_t)-4;
         }
 
         /* ^Z — SIGTSTP (always) */
@@ -248,7 +251,7 @@ static uint32_t tty_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf
                 if (do_echo) { serial_putc('^'); serial_putc('Z'); serial_putc('\n'); }
                 signal_send(current_proc, SIGTSTP);
             }
-            return 0;
+            return (uint32_t)-4;                     /* as for ^C */
         }
 
         /* ^D — EOF (canonical mode only) */

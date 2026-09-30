@@ -358,7 +358,7 @@ static void *stop_worker(void *arg) {
 }
 
 static int stop_child(void) {
-    /* The shell that runs us ignores SIGTSTP, and SIG_IGN survives exec. */
+    /* Whatever started us may ignore SIGTSTP, and SIG_IGN survives exec. */
     set_act(SIGTSTP, (void (*)(int))SIG_DFL, 0, 0);
     set_act(SIGUSR1, on_quit, 0, 0);
     pthread_t t;
@@ -429,8 +429,29 @@ static void run(const char *name, int (*fn)(void)) {
     }
 }
 
+/* `sigshareprobe disp`: print the disposition this process was started with
+ * for the signals an interactive shell ignores for itself (D = SIG_DFL,
+ * I = SIG_IGN, H = a handler) — what the shell hands its commands. */
+static int print_dispositions(void) {
+    static const struct { int sig; const char *name; } s[] = {
+        { SIGINT, "INT" }, { SIGQUIT, "QUIT" }, { SIGPIPE, "PIPE" },
+        { SIGTSTP, "TSTP" }, { SIGTTIN, "TTIN" }, { SIGTTOU, "TTOU" },
+    };
+    printf("disp:");
+    for (unsigned i = 0; i < sizeof(s) / sizeof(s[0]); i++) {
+        struct kact a;
+        get_act(s[i].sig, &a);
+        printf(" %s=%c", s[i].name,
+               a.handler == (uint32_t)SIG_DFL ? 'D' :
+               a.handler == (uint32_t)SIG_IGN ? 'I' : 'H');
+    }
+    printf("\n");
+    return 0;
+}
+
 int main(int argc, char **argv, char **envp) {
     if (argc > 1 && strcmp(argv[1], "exec-child") == 0) return after_exec();
+    if (argc > 1 && strcmp(argv[1], "disp") == 0) return print_dispositions();
     g_envp = envp;
 
     int before = failures;

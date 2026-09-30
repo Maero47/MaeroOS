@@ -9,6 +9,7 @@ import time
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PROMPT = "MaeroOS$ "
 TIMEOUT = 25.0
+DISP_DFL = "disp: INT=D QUIT=D PIPE=D TSTP=D TTIN=D TTOU=D"
 
 
 def wait_for(proc, sel, needle, log, timeout=TIMEOUT, start=0):
@@ -88,6 +89,13 @@ def main():
             # threads, a leader's exit and a non-leader's execve
             # (userspace/sigshareprobe).
             ("sigshareprobe\n", "sigshareprobe ok"),
+            # The shell ignores INT/QUIT/PIPE/TSTP/TTIN/TTOU for itself;
+            # SIG_IGN survives exec, so every kind of child must get SIG_DFL
+            # back or ^C/^Z could not reach a job.
+            ("sigshareprobe disp\n", DISP_DFL),
+            ("sigshareprobe disp | cat\n", DISP_DFL),
+            ("sigshareprobe disp & sleep 1\n", DISP_DFL),
+            ("echo $(sigshareprobe disp)\n", DISP_DFL),
             ("whoami\n", "root"),
             # libc regression checks (userspace/libctest)
             ("libctest\n", "LIBCTEST PASS"),
@@ -108,6 +116,33 @@ def main():
                 raise AssertionError(
                     f"command {command.strip()!r} did not produce {expected!r}"
                 )
+
+        # ^Z stops a foreground job and gives the prompt back; `jobs` shows it
+        # stopped; `fg` resumes it (its interrupted read restarts) and ^D ends
+        # it.  cat is used because the serial console only turns ^Z into
+        # SIGTSTP for a reader.
+        before = len("".join(log))
+        send(proc, "cat\n")
+        wait_for(proc, sel, "cat' pid=", log, start=before)
+        time.sleep(1.0)
+        before = len("".join(log))
+        send(proc, "\x1a")
+        wait_for(proc, sel, PROMPT, log, start=before)
+        before = len("".join(log))
+        send(proc, "jobs\n")
+        wait_for(proc, sel, PROMPT, log, start=before)
+        if "Stopped" not in "".join(log)[before:]:
+            raise AssertionError("^Z did not stop the foreground job")
+        before = len("".join(log))
+        send(proc, "fg\n")
+        time.sleep(1.0)
+        send(proc, "\x04")
+        wait_for(proc, sel, PROMPT, log, start=before)
+        before = len("".join(log))
+        send(proc, "jobs\n")
+        wait_for(proc, sel, PROMPT, log, start=before)
+        if "Stopped" in "".join(log)[before:] or "Running" in "".join(log)[before:]:
+            raise AssertionError("the resumed job did not finish")
 
         # Log out of the console shell while a background job of its session
         # lives on; init starts a new shell in a new session.  The old
