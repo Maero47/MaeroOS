@@ -7825,11 +7825,12 @@ static int socketcall_core_inner(int call, uint32_t *kargs) {
     return -22;
 }
 
-/* KTRACE=1 logs every AF_INET socket call with its result: the trace that
- * showed Firefox's socket thread asleep in a recv it had asked not to block. */
+/* NETTRACE (include/kernel/config.h) logs every AF_INET socket call with its
+ * result: the trace that showed Firefox's socket thread asleep in a recv it
+ * had asked not to block. */
 static int socketcall_core(int call, uint32_t *kargs) {
     int r = socketcall_core_inner(call, kargs);
-    if (KTRACE) {
+    if (NETTRACE) {
         int inet = 0;
         if (call == 1) inet = ((int)kargs[0] != AF_UNIX_K);
         else if ((int)kargs[0] >= 0 && (int)kargs[0] < MAX_FD)

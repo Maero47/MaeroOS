@@ -7,6 +7,13 @@
 #ifndef KTRACE
 #define KTRACE 0
 #endif
+/* Set to 1 to log every AF_INET socket call and its result (proc/syscall.c).
+ * Separate from KTRACE because it distorts what KTRACE measures: QEMU's UART
+ * paces output at 115200 baud, ~87 us a character, so each ~60-character
+ * line costs the calling syscall about 5 ms. */
+#ifndef NETTRACE
+#define NETTRACE 0
+#endif
 /* printk() only in a KTRACE build; the arguments are still type-checked. */
 #define ktrace(...) do { if (KTRACE) printk(__VA_ARGS__); } while (0)
 
