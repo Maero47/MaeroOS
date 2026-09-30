@@ -4,8 +4,27 @@
  * regcomp() compiles to a small program that regexec() runs with a
  * backtracking matcher.  Matching is byte-oriented.  POSIX wants the longest
  * of the leftmost matches, so after the first match is found the matcher keeps
- * exploring the remaining alternatives for a longer one, within a step budget
- * that keeps pathological patterns from running away. */
+ * exploring the remaining alternatives for a longer one.
+ *
+ * Without back-references, the set of match ends reachable from a SPLIT at
+ * (pc, pos) does not depend on the path that reached it, so once a call has
+ * spent MEMO_AFTER steps the matcher records visited SPLIT states in a bitmap
+ * and never explores one twice: nested loops like (a*)*b stay
+ * O(len * pattern) instead of going exponential.  The bitmap is shared by
+ * every start position (a state that failed from one start fails from all).
+ * With back-references, or when the bitmap would be too large, a per-call
+ * step cap applies instead, and a search that exceeds it returns REG_ESPACE
+ * (or the longest match found so far).
+ *
+ * Pruning keeps the whole match (leftmost start, longest end) exact, but not
+ * which path reaches it first: a loop's CHK reads its MARK register, so the
+ * submatches could differ from an unpruned search.  So when the memo was used
+ * and the caller wants submatches, a second pass reruns the unpruned matcher
+ * from the known start, accepting only the known end: the first path to reach
+ * it carries the same submatches the unpruned search would have reported.
+ * That pass abandons any path that runs past the known end, so its work is
+ * bounded by the match rather than the rest of the line, and it has its own
+ * cap, scaled by the match length. */
 #include "../include/regex.h"
 #include "../include/fnmatch.h"
 #include "../include/ctype.h"
@@ -429,8 +448,45 @@ typedef struct {
     int have_best;
     bt_t *stk;
     int sp, cap;
-    long steps;
+    long steps;             /* over the whole regexec() call */
+    unsigned char *seen;    /* visited SPLIT states, or 0 */
+    int *split_ix;          /* pc -> SPLIT number */
+    int memo;               /* 1: may use `seen`; 0: never; -1: over step cap */
+    long want_end;          /* >= 0: second pass, accept only this end */
+    long cap_steps;
 } matcher_t;
+
+/* Overridable so tools/test_regex.py can build unpruned and always-pruned
+ * variants to compare against. */
+#ifndef MEMO_AFTER
+#define MEMO_AFTER     4096L
+#endif
+#define MEMO_MAX_BITS  (32L << 20)
+#ifndef STEP_CAP
+#define STEP_CAP       (4L << 20)    /* plus 16 steps per (pc, pos) pair */
+#endif
+
+/* Allocate the visited bitmap; 0 if memoisation is not possible. */
+static int memo_init(matcher_t *m) {
+    struct re_prog *g = m->g;
+    long nsplit = 0, span = m->end - m->start + 1;
+    for (int i = 0; i < g->len; i++) {
+        if (g->code[i].op == OP_BREF) return 0;
+        if (g->code[i].op == OP_SPLIT) nsplit++;
+    }
+    if (!nsplit || nsplit > MEMO_MAX_BITS / span) return 0;
+    m->split_ix = malloc(g->len * sizeof(int));
+    m->seen = calloc((nsplit * span + 7) / 8, 1);
+    if (!m->split_ix || !m->seen) {
+        free(m->split_ix);
+        free(m->seen);
+        m->split_ix = 0;
+        m->seen = 0;
+        return 0;
+    }
+    for (int i = 0, k = 0; i < g->len; i++) m->split_ix[i] = g->code[i].op == OP_SPLIT ? k++ : -1;
+    return 1;
+}
 
 static int is_word(int c) { return isalnum(c) || c == '_'; }
 
@@ -454,7 +510,6 @@ static int push(matcher_t *m, int pc, int kind, int slot, long val) {
 static int run(matcher_t *m, long pos) {
     struct re_prog *g = m->g;
     int nslots = 2 * (g->nsub + 1) + g->nmarks, pc = 0;
-    long budget = -1;
 
     for (int i = 0; i < nslots; i++) m->regs[i] = -1;
     m->sp = 0;
@@ -469,7 +524,10 @@ static int run(matcher_t *m, long pos) {
         int eol = (pos == m->end && !(m->eflags & REG_NOTEOL)) ||
                   ((g->cflags & REG_NEWLINE) && c == '\n');
 
-        if (budget >= 0 && --budget < 0) break;
+        if (++m->steps == MEMO_AFTER && m->memo > 0) {
+            m->memo = memo_init(m);
+        }
+        if (!m->seen && m->steps > m->cap_steps) { m->memo = -1; return m->have_best; }
         switch (in->op) {
         case OP_CHAR:  ok = c == in->c; if (ok) pos++; break;
         case OP_ANY:   ok = c > 0; if (ok) pos++; break;
@@ -484,6 +542,11 @@ static int run(matcher_t *m, long pos) {
             break;
         }
         case OP_SPLIT:
+            if (m->seen) {
+                long bit = (long)m->split_ix[pc] * (m->end - m->start + 1) + (pos - m->start);
+                if (m->seen[bit >> 3] & (1 << (bit & 7))) { ok = 0; break; }
+                m->seen[bit >> 3] |= 1 << (bit & 7);
+            }
             if (push(m, pc + in->y, 0, 0, pos) < 0) return -1;
             pc += in->x;
             continue;
@@ -512,16 +575,24 @@ static int run(matcher_t *m, long pos) {
             break;
         }
         case OP_MATCH:
+            if (m->want_end >= 0) {
+                if (pos != m->want_end) { ok = 0; break; }
+                memcpy(m->best, m->regs, 2 * (g->nsub + 1) * sizeof(long));
+                m->best[1] = pos;
+                return m->have_best = 1;
+            }
             if (!m->have_best || pos > m->best[1]) {
                 memcpy(m->best, m->regs, 2 * (g->nsub + 1) * sizeof(long));
                 m->best[1] = pos;
                 m->have_best = 1;
             }
             if (pos == m->end) return 1;        /* nothing can be longer */
-            if (budget < 0) budget = 20000;
             ok = 0;
             break;
         }
+        /* Second pass: nothing moves backwards, so a path already past the
+         * wanted end can never reach it. */
+        if (ok && m->want_end >= 0 && pos > m->want_end) ok = 0;
         if (ok) { pc++; continue; }
         /* Backtrack: undo slot writes until a pending branch. */
         for (;;) {
@@ -532,9 +603,13 @@ static int run(matcher_t *m, long pos) {
             pos = b->val;
             break;
         }
-        if (++m->steps > 50000000L && m->have_best) return 1;
     }
     return m->have_best;
+}
+
+/* Steps a search over `pairs` positions may take without the memo. */
+static long step_cap(long pairs, int len) {
+    return pairs > (LONG_MAX / 32) / len ? LONG_MAX : STEP_CAP + 16 * pairs * len;
 }
 
 int regexec(const regex_t *preg, const char *string, unsigned long nmatch,
@@ -548,10 +623,13 @@ int regexec(const regex_t *preg, const char *string, unsigned long nmatch,
     m.s = string;
     m.g = g;
     m.eflags = eflags;
+    m.memo = 1;
+    m.want_end = -1;
     if ((eflags & REG_STARTEND) && pmatch) {
         m.start = pmatch[0].rm_so;
         m.end = pmatch[0].rm_eo;
     } else m.end = (long)strlen(string);
+    m.cap_steps = step_cap(m.end - m.start + 1, g->len);
     int nslots = 2 * (g->nsub + 1) + g->nmarks;
     m.regs = malloc(nslots * sizeof(long));
     m.best = malloc(2 * (g->nsub + 1) * sizeof(long));
@@ -567,6 +645,20 @@ int regexec(const regex_t *preg, const char *string, unsigned long nmatch,
         }
         int got = run(&m, pos);
         if (got < 0) { r = REG_ESPACE; break; }
+        if (!got && m.memo < 0) { r = REG_ESPACE; break; }
+        if (got && m.seen && nmatch > 1 && pmatch && !(g->cflags & REG_NOSUB)) {
+            /* Second pass for the submatches: unpruned, from `pos`, and
+             * ending exactly where the pruned search found the match. */
+            long end = m.best[1];
+            free(m.seen);
+            m.seen = 0;
+            m.memo = 0;
+            m.want_end = end;
+            m.steps = 0;
+            m.cap_steps = step_cap(end - pos + 1, g->len);
+            got = run(&m, pos);
+            if (got <= 0) { r = REG_ESPACE; break; }
+        }
         if (got) {
             r = 0;
             if (!(g->cflags & REG_NOSUB) && pmatch) {
@@ -585,6 +677,8 @@ out:
     free(m.regs);
     free(m.best);
     free(m.stk);
+    free(m.seen);
+    free(m.split_ix);
     return r;
 }
 
