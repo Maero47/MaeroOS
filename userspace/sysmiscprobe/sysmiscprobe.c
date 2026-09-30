@@ -209,8 +209,11 @@ static void test_offsets(void) {
 
     expect("ftruncate -1", syscall2(SYS_ftruncate, fd, -1), -E_INVAL);
     expect("pwrite64 >4GiB", sc5(SYS_pwrite64, fd, (int)"x", 1, 0, 1), -E_FBIG);
-    /* tmpfs caps a file at 256 MiB: a write at the cap is EFBIG. */
-    expect("pwrite64 tmpfs cap", sc5(SYS_pwrite64, fd, (int)"x", 1, 0x10000000, 0),
+    /* tmpfs caps a file at 1 GiB: a write at the cap is EFBIG.  Bodies are
+     * page frames, not kernel heap, so the old 256 MiB cap (the heap window)
+     * is gone, and a sparse write there costs one frame. */
+    expect("pwrite64 past old cap", sc5(SYS_pwrite64, fd, (int)"x", 1, 0x10000000, 0), 1);
+    expect("pwrite64 tmpfs cap", sc5(SYS_pwrite64, fd, (int)"x", 1, 0x40000000, 0),
            -E_FBIG);
 
     syscall1(SYS_close, fd);
