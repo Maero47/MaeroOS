@@ -243,11 +243,11 @@ static int vfs_write_user(vfs_node_t *n, uint32_t off, const char *ubuf, uint32_
 /* One net_socket_recvfrom() into user `ubuf` (a datagram must arrive whole,
  * and a stream read may block, so exactly one call). */
 static int sock_recv_user(net_socket_t *s, void *ubuf, uint32_t len,
-                          net_sockaddr_in_t *addr) {
+                          net_sockaddr_in_t *addr, int nonblock) {
     uint32_t bsz;
     uint8_t *kbuf = bounce_alloc(len, &bsz);
     if (!kbuf) return -12;
-    int r = net_socket_recvfrom(s, kbuf, len < bsz ? len : bsz, addr);
+    int r = net_socket_recvfrom(s, kbuf, len < bsz ? len : bsz, addr, nonblock);
     if (r > 0 && copy_to_user(ubuf, kbuf, (uint32_t)r) < 0) r = -14;
     kfree(kbuf);
     return r;
@@ -256,7 +256,7 @@ static int sock_recv_user(net_socket_t *s, void *ubuf, uint32_t len,
 /* net_socket_sendto() of user `ubuf`, in chunks (any valid datagram fits in
  * the first), stopping at a short send. */
 static int sock_send_user(net_socket_t *s, const void *ubuf, uint32_t len,
-                          const net_sockaddr_in_t *addr) {
+                          const net_sockaddr_in_t *addr, int nonblock) {
     uint32_t bsz;
     uint8_t *kbuf = bounce_alloc(len, &bsz);
     if (!kbuf) return -12;
@@ -265,7 +265,7 @@ static int sock_send_user(net_socket_t *s, const void *ubuf, uint32_t len,
     do {
         uint32_t want = len - done < bsz ? len - done : bsz;
         if (copy_from_user(kbuf, (const uint8_t *)ubuf + done, want) < 0) { err = -14; break; }
-        int r = net_socket_sendto(s, kbuf, want, addr);
+        int r = net_socket_sendto(s, kbuf, want, addr, nonblock);
         if (r < 0) { err = r; break; }
         if ((uint32_t)r > want) r = (int)want;
         done += (uint32_t)r;
@@ -1112,7 +1112,8 @@ static int sys_read(registers_t *regs) {
     }
 
     if (f->type == FD_SOCKET)
-        return sock_recv_user(f->socket, buf, (uint32_t)len, NULL);
+        return sock_recv_user(f->socket, buf, (uint32_t)len, NULL,
+                              (f->flags & O_NONBLOCK) != 0);
 
     if (f->type == FD_USOCKET)
         return usocket_read(f->usock, buf, len, (f->flags & O_NONBLOCK) != 0);
@@ -1163,7 +1164,8 @@ static int sys_write(registers_t *regs) {
     }
 
     if (f->type == FD_SOCKET)
-        return sock_send_user(f->socket, buf, (uint32_t)len, NULL);
+        return sock_send_user(f->socket, buf, (uint32_t)len, NULL,
+                              (f->flags & O_NONBLOCK) != 0);
 
     if (f->type == FD_USOCKET)
         return usocket_write(f->usock, buf, len, (f->flags & O_NONBLOCK) != 0);
@@ -5531,6 +5533,7 @@ static int sys_poll(registers_t *regs) {
                  * the caller asked for it (net/unix/af_unix.c unix_poll:
                  * EPOLLHUP once sk_shutdown is SHUTDOWN_MASK). */
                 if (f->type == FD_USOCKET && usocket_hup(f->usock)) rev |= POLLHUP;
+                if (f->type == FD_SOCKET && net_socket_poll_err(f->socket)) rev |= POLLERR;
             }
             kfds[i * 2 + 1] = (kfds[i * 2 + 1] & 0xffff) | ((uint32_t)(uint16_t)rev << 16);
             if (rev) ready++;
@@ -7334,7 +7337,7 @@ static void scm_abort(usocket_t *us, uint32_t id, proc_file_t *pass, int npass) 
         for (int k = 0; k < npass; k++) fd_release(&pass[k]);
 }
 
-static int socketcall_core(int call, uint32_t *kargs) {
+static int socketcall_core_inner(int call, uint32_t *kargs) {
     /* accept4(fd, addr, addrlen, flags) is socketcall index 18 (Linux
      * SYS_ACCEPT4).  Its SOCK_CLOEXEC/SOCK_NONBLOCK apply to the NEW
      * descriptor only (net/socket.c __sys_accept4), so carry them aside and
@@ -7671,6 +7674,9 @@ static int socketcall_core(int call, uint32_t *kargs) {
 
     if (f->type != FD_SOCKET || !f->socket)
         return -88;
+    /* The descriptor's O_NONBLOCK, or MSG_DONTWAIT on this one call. */
+    int inb = (f->flags & O_NONBLOCK) != 0;
+    int dnb = inb || ((call >= 9 && call <= 12) && (kargs[3] & MSG_DONTWAIT_K));
 
     if (call == 2 || call == 3) { /* bind/connect */
         net_sockaddr_in_t *uaddr = (net_sockaddr_in_t *)(uintptr_t)kargs[1];
@@ -7682,7 +7688,7 @@ static int socketcall_core(int call, uint32_t *kargs) {
         if (copy_from_user(&kaddr, uaddr, sizeof(kaddr)) < 0)
             return -14;
         return (call == 2) ? net_socket_bind(f->socket, &kaddr)
-                           : net_socket_connect(f->socket, &kaddr);
+                           : net_socket_connect(f->socket, &kaddr, inb);
     }
 
     if (call == 9) { /* send(fd, buf, len, flags) */
@@ -7690,7 +7696,7 @@ static int socketcall_core(int call, uint32_t *kargs) {
         uint32_t len = kargs[2];
         if (!access_ok(buf, len))
             return -14;
-        return sock_send_user(f->socket, buf, len, NULL);
+        return sock_send_user(f->socket, buf, len, NULL, dnb);
     }
 
     if (call == 10) { /* recv(fd, buf, len, flags) */
@@ -7698,7 +7704,7 @@ static int socketcall_core(int call, uint32_t *kargs) {
         uint32_t len = kargs[2];
         if (!access_ok(buf, len))
             return -14;
-        return sock_recv_user(f->socket, buf, len, NULL);
+        return sock_recv_user(f->socket, buf, len, NULL, dnb);
     }
 
     if (call == 11) { /* sendto */
@@ -7709,14 +7715,14 @@ static int socketcall_core(int call, uint32_t *kargs) {
         if (!access_ok(buf, len))
             return -14;
         if (!uaddr)
-            return sock_send_user(f->socket, buf, len, NULL);
+            return sock_send_user(f->socket, buf, len, NULL, dnb);
         if (addrlen < sizeof(net_sockaddr_in_t) ||
             !access_ok(uaddr, sizeof(net_sockaddr_in_t)))
             return -14;
         net_sockaddr_in_t kaddr;
         if (copy_from_user(&kaddr, uaddr, sizeof(kaddr)) < 0)
             return -14;
-        return sock_send_user(f->socket, buf, len, &kaddr);
+        return sock_send_user(f->socket, buf, len, &kaddr, dnb);
     }
 
     if (call == 12) { /* recvfrom */
@@ -7734,7 +7740,7 @@ static int socketcall_core(int call, uint32_t *kargs) {
                 !access_ok(uaddr, sizeof(net_sockaddr_in_t)))
                 return -14;
         }
-        int ret = sock_recv_user(f->socket, buf, len, uaddr ? &kaddr : NULL);
+        int ret = sock_recv_user(f->socket, buf, len, uaddr ? &kaddr : NULL, dnb);
         if (ret >= 0 && uaddr) {
             uint32_t klen = sizeof(net_sockaddr_in_t);
             int cr = copy_to_user(uaddr, &kaddr, sizeof(kaddr));
@@ -7761,8 +7767,10 @@ static int socketcall_core(int call, uint32_t *kargs) {
             if (copy_from_user(&len, optlen, sizeof(len)) < 0) return -14;
         }
         if (optval && len >= 4) {
-            uint32_t v = 0;         /* SO_ERROR=0: connection succeeded */
+            uint32_t v = 0;
             if (level == 1 && (optname == 7 || optname == 8)) v = 65536; /* SO_SNDBUF/RCVBUF */
+            if (level == 1 && optname == 4)                  /* SO_ERROR */
+                v = (uint32_t)net_socket_take_error(f->socket);
             if (copy_to_user(optval, &v, 4) < 0) return -14;
             len = 4;
             if (optlen && copy_to_user(optlen, &len, sizeof(len)) < 0)
@@ -7771,10 +7779,44 @@ static int socketcall_core(int call, uint32_t *kargs) {
         return 0;
     }
 
-    if (call == 4 || call == 5 || call == 6 || call == 7 || call == 8)
+    if (call == 6 || call == 7) {   /* getsockname / getpeername */
+        void     *uaddr = (void *)(uintptr_t)kargs[1];
+        uint32_t *ulen  = (uint32_t *)(uintptr_t)kargs[2];
+        uint32_t  klen;
+        net_sockaddr_in_t kaddr;
+        if (!ulen || copy_from_user(&klen, ulen, sizeof(klen)) < 0) return -14;
+        if ((int32_t)klen < 0) return -22;
+        int r = net_socket_getname(f->socket, call == 7, &kaddr);
+        if (r < 0) return r;
+        /* Linux copies min(len, sizeof addr) and reports the full size. */
+        if (klen > sizeof(kaddr)) klen = sizeof(kaddr);
+        if (klen && copy_to_user(uaddr, &kaddr, klen) < 0) return -14;
+        klen = sizeof(kaddr);
+        if (copy_to_user(ulen, &klen, sizeof(klen)) < 0) return -14;
+        return 0;
+    }
+
+    if (call == 4 || call == 5 || call == 8)
         return -95;
 
     return -22;
+}
+
+/* KTRACE=1 logs every AF_INET socket call with its result: the trace that
+ * showed Firefox's socket thread asleep in a recv it had asked not to block. */
+static int socketcall_core(int call, uint32_t *kargs) {
+    int r = socketcall_core_inner(call, kargs);
+    if (KTRACE) {
+        int inet = 0;
+        if (call == 1) inet = ((int)kargs[0] != AF_UNIX_K);
+        else if ((int)kargs[0] >= 0 && (int)kargs[0] < MAX_FD)
+            inet = current_proc->ofile[kargs[0]].type == FD_SOCKET;
+        if (inet)
+            printk("[NET] pid=%d socketcall %d (%x,%x,%x,%x) -> %d\n",
+                   current_proc->pid, call, (unsigned)kargs[0], (unsigned)kargs[1],
+                   (unsigned)kargs[2], (unsigned)kargs[3], r);
+    }
+    return r;
 }
 
 /* socketcall(102): fetch the args array from user space, then run the core. */

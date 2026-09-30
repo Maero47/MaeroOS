@@ -16,11 +16,15 @@ int net_socket_create(int domain, int type, int protocol, net_socket_t **out);
 void net_socket_retain(net_socket_t *s);
 void net_socket_release(net_socket_t *s);
 int net_socket_bind(net_socket_t *s, const net_sockaddr_in_t *addr);
-int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr);
+int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
+                       int nonblock);
 int net_socket_sendto(net_socket_t *s, const void *buf, uint32_t len,
-                      const net_sockaddr_in_t *addr);
+                      const net_sockaddr_in_t *addr, int nonblock);
 int net_socket_recvfrom(net_socket_t *s, void *buf, uint32_t len,
-                        net_sockaddr_in_t *addr);
+                        net_sockaddr_in_t *addr, int nonblock);
 int net_socket_shutdown(net_socket_t *s, int how);
+int net_socket_getname(net_socket_t *s, int peer, net_sockaddr_in_t *out);
 int net_socket_read_ready(net_socket_t *s);
 int net_socket_write_ready(net_socket_t *s);
+int net_socket_take_error(net_socket_t *s);
+int net_socket_poll_err(net_socket_t *s);

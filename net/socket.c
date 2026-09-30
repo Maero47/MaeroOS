@@ -138,7 +138,7 @@ static err_t tcp_connected_cb(void *arg, struct tcp_pcb *pcb, err_t err) {
         s->tcp_error = 0;
     } else {
         s->tcp_state = TCP_STATE_ERROR;
-        s->tcp_error = -101;
+        s->tcp_error = -111;     /* -ECONNREFUSED */
     }
     return ERR_OK;
 }
@@ -222,8 +222,11 @@ static void tcp_err_cb(void *arg, err_t err) {
      * recv keeps reporting EOF instead of turning it into an error. */
     if (err == ERR_CLSD && s->tcp_state == TCP_STATE_CLOSED)
         return;
+    /* A reset answering our SYN is a refused connection. */
+    int connecting = s->tcp_state == TCP_STATE_CONNECTING;
     s->tcp_state = TCP_STATE_ERROR;
-    s->tcp_error = (err == ERR_ABRT) ? -104 : -101;
+    s->tcp_error = (err == ERR_RST && connecting) ? -111 :
+                   (err == ERR_ABRT) ? -104 : -101;
 }
 
 static err_t tcp_poll_cb(void *arg, struct tcp_pcb *pcb) {
@@ -317,9 +320,23 @@ static int socket_bind_locked(net_socket_t *s, const net_sockaddr_in_t *addr) {
     return e == ERR_OK ? 0 : -98;
 }
 
-int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr) {
+int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
+                       int nonblock) {
     if (!s || !s->used || !addr)
         return -9;
+    /* A second connect on a stream socket reports where the first one got
+     * to (inet_stream_connect): still going, done, or how it failed. */
+    if (s->type == SOCK_STREAM_K) {
+        if (s->tcp_state == TCP_STATE_CONNECTING && nonblock)
+            return -114;         /* -EALREADY */
+        if (s->tcp_state == TCP_STATE_CONNECTED)
+            return -106;         /* -EISCONN */
+        if (s->tcp_state == TCP_STATE_ERROR && s->tcp_error) {
+            int e = s->tcp_error;
+            s->tcp_error = 0;
+            return e;
+        }
+    }
     if (addr->family != AF_INET_K)
         return -97;
     /* Egress firewall: block outbound by remote ip/port if a rule matches. */
@@ -350,6 +367,10 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr) {
         s->tcp_state = TCP_STATE_ERROR;
         return -101;
     }
+    /* O_NONBLOCK: the handshake finishes behind the caller, which polls for
+     * POLLOUT and reads the outcome from SO_ERROR (NSPR, GLib, libcurl). */
+    if (nonblock)
+        return -115;             /* -EINPROGRESS */
     /* Pin across the sleeping wait (see net_socket_recvfrom). */
     net_socket_retain(s);
     int r = -110;
@@ -377,6 +398,8 @@ static int socket_sendto_locked(net_socket_t *s, const void *buf, uint32_t len,
     if (s->type == SOCK_STREAM_K) {
         if (s->tx_shut)
             return -32;   /* -EPIPE, as Linux after SHUT_WR */
+        if (s->tcp_state == TCP_STATE_CONNECTING && s->tcp)
+            return -11;          /* handshake still in flight */
         if (!s->connected || !s->tcp)
             return -107;
         if (len == 0)
@@ -515,7 +538,55 @@ int net_socket_write_ready(net_socket_t *s) {
     preempt_disable();
     int r = 1;
     if (s->type == SOCK_STREAM_K)
-        r = s->connected && s->tcp && tcp_sndbuf(s->tcp) > 0;
+        /* A failed (non-blocking) connect is writable too, so the poller
+         * wakes to collect SO_ERROR — tcp_poll's EPOLLOUT on sk_err. */
+        r = (s->connected && s->tcp && tcp_sndbuf(s->tcp) > 0) ||
+            s->tcp_state == TCP_STATE_ERROR;
+    preempt_enable();
+    return r;
+}
+
+/* SO_ERROR: the pending error, cleared by reading it (sock_error()). */
+int net_socket_take_error(net_socket_t *s) {
+    if (!s || !s->used)
+        return 0;
+    preempt_disable();
+    int e = s->tcp_state == TCP_STATE_ERROR ? s->tcp_error : 0;
+    s->tcp_error = 0;
+    preempt_enable();
+    return e < 0 ? -e : 0;
+}
+
+/* poll: a pending connection error is POLLERR (tcp_poll on sk_err). */
+int net_socket_poll_err(net_socket_t *s) {
+    return s && s->used && s->type == SOCK_STREAM_K &&
+           s->tcp_state == TCP_STATE_ERROR && s->tcp_error;
+}
+
+/* getsockname (peer = 0) / getpeername (peer = 1).  An unbound socket
+ * reports 0.0.0.0:0 like Linux's inet_getname; a peer name needs a connection
+ * (UDP: connect() having set a default destination), else ENOTCONN. */
+int net_socket_getname(net_socket_t *s, int peer, net_sockaddr_in_t *out) {
+    if (!s || !s->used || !out)
+        return -9;
+    memset(out, 0, sizeof(*out));
+    out->family = AF_INET_K;
+    preempt_disable();
+    int r = 0;
+    if (peer) {
+        if (!s->connected)
+            r = -107;
+        else {
+            out->addr = ip4_addr_get_u32(ip_2_ip4(&s->remote_addr));
+            out->port = bswap16(s->remote_port);
+        }
+    } else if (s->tcp) {
+        out->addr = ip4_addr_get_u32(ip_2_ip4(&s->tcp->local_ip));
+        out->port = bswap16(s->tcp->local_port);
+    } else if (s->udp) {
+        out->addr = ip4_addr_get_u32(ip_2_ip4(&s->udp->local_ip));
+        out->port = bswap16(s->udp->local_port);
+    }
     preempt_enable();
     return r;
 }
@@ -588,7 +659,7 @@ int net_socket_bind(net_socket_t *s, const net_sockaddr_in_t *addr) {
 }
 
 int net_socket_sendto(net_socket_t *s, const void *buf, uint32_t len,
-                      const net_sockaddr_in_t *addr) {
+                      const net_sockaddr_in_t *addr, int nonblock) {
     /* TCP send BLOCKS while the send buffer is full, like recv and like a
      * blocking Linux socket: it returns once all of buf is queued, or with
      * the partial count when a signal or a connection error cuts it short.
@@ -616,7 +687,7 @@ int net_socket_sendto(net_socket_t *s, const void *buf, uint32_t len,
                 break;
             continue;
         }
-        if (r != -11)
+        if (r != -11 || nonblock)
             break;           /* error: reported unless something went out */
         if (current_proc && signal_interrupt_pending(current_proc)) {
             r = -4;          /* -EINTR */
@@ -631,7 +702,7 @@ int net_socket_sendto(net_socket_t *s, const void *buf, uint32_t len,
 }
 
 int net_socket_recvfrom(net_socket_t *s, void *buf, uint32_t len,
-                        net_sockaddr_in_t *addr) {
+                        net_sockaddr_in_t *addr, int nonblock) {
     /* TCP recv BLOCKS until data/EOF (Linux default semantics) — the
      * io_activity sleep wakes instantly on NIC interrupts.  UDP stays
      * non-blocking (-EAGAIN): existing probes and the DNS resolver use
@@ -651,7 +722,7 @@ int net_socket_recvfrom(net_socket_t *s, void *buf, uint32_t len,
         preempt_disable();
         r = socket_recvfrom_locked(s, buf, len, addr);
         preempt_enable();
-        if (r != -11 || s->type != SOCK_STREAM_K) break;
+        if (r != -11 || s->type != SOCK_STREAM_K || nonblock) break;
         if (current_proc && signal_interrupt_pending(current_proc)) {
             r = -4;      /* -EINTR */
             break;

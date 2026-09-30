@@ -204,6 +204,18 @@ def main():
         recent = "".join(log)[before:]
         if "sockprobe tcptw ok" not in recent:
             raise AssertionError("closing sockets whose pcbs were in TIME_WAIT broke TCP")
+        # Non-blocking client calls: EINPROGRESS connect, SO_ERROR, the
+        # socket names, EAGAIN from an idle recv, and a refused connect.
+        closed = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        closed.bind(("0.0.0.0", 0))
+        closed_port = closed.getsockname()[1]
+        closed.close()
+        before = len("".join(log))
+        send(proc, f"sockprobe nb {http_port} {closed_port}")
+        wait_for(proc, sel, PROMPT, log, timeout=30.0, start=before)
+        recent = "".join(log)[before:]
+        if "sockprobe nb ok" not in recent:
+            raise AssertionError("non-blocking TCP client calls failed")
         before = len("".join(log))
         send(proc, f"httpget 10.0.2.2 {http_port} /index.html")
         wait_for(proc, sel, PROMPT, log, timeout=15.0, start=before)
