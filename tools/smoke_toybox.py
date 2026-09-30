@@ -80,6 +80,10 @@ def main():
             # Creation modes, O_APPEND, supplementary groups, access(),
             # TIOCSPGRP, unlink(dir) (userspace/abi2probe).
             ("abi2probe\n", "abi2probe ok"),
+            # Signal state across fork/clone/execve: SIG_IGN, the blocked mask
+            # and pending signals survive exec, handlers reset
+            # (userspace/sigexecprobe).
+            ("sigexecprobe\n", "sigexecprobe ok"),
             ("whoami\n", "root"),
             # libc regression checks (userspace/libctest)
             ("libctest\n", "LIBCTEST PASS"),
