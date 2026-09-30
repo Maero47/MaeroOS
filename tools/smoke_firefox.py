@@ -36,7 +36,9 @@ Artifacts go to build/ff-smoke/<timestamp>-<tag>/ (gitignored):
   summary.txt       verdict, timings, attempt list, crash lines, last kernel
                     lines, moz.log tail, and with --keycheck the key-trace result
   screen-web.png    with --web only: the frame in which the served page's
-                    marker image was found on screen (or the last one tried)
+                    marker image was found on screen (or the last one tried),
+                    retaken once the page's font report is in
+  fonts.json        with --web only: the page's font report
   qemu-cmdline.txt  the exact QEMU command
 
 --web (implies --net) is the page-load check: after the paint verdict it serves
@@ -46,7 +48,12 @@ address bar, and PASSes only if the image is requested from the server AND its
 red block shows up in a screendump within --web-timeout seconds.  The request
 alone proves the document was parsed; the pixels prove it was laid out and
 composited.  summary.txt records the time from Enter to each request and to
-the red block appearing.
+the red block appearing.  The page also carries a font test (see FONT_JS):
+its script reports within --font-timeout seconds whether any character of
+Latin, Turkish/German accented, Greek and Cyrillic text came out as a
+missing-glyph box in sans/serif/mono/system-ui and named families, and
+whether serif, mono, bold and italic are real faces; any failure FAILs the
+run and the report is saved as fonts.json.
 
 Usage:
   python3 tools/smoke_firefox.py [--accel kvm|tcg|<qemu -accel value>]
@@ -102,6 +109,78 @@ ASSERT_PAT  = re.compile(r"(ASSERT|assert(ion)? failed|Unhandled exception|Doubl
 
 WEB_MARK_W, WEB_MARK_H = 96, 96
 
+# The --web page's font section: one row per family, every row carrying the
+# same text so a missing-glyph box stands out next to a rendered line.
+FONT_FAMILIES = [
+    ("sans", "sans-serif"),
+    ("serif", "serif"),
+    ("mono", "monospace"),
+    ("system-ui", "system-ui"),
+    # example.com's body stack: named families the disk does not have, then
+    # the generic, so it exercises fontconfig's aliases and fallback
+    ("web-stack", "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Open Sans', "
+                  "'Helvetica Neue', Helvetica, Arial, sans-serif"),
+    ("times", "'Times New Roman', Times"),
+    ("courier", "'Courier New', Courier"),
+]
+FONT_TEXT = "Latin AaBbGgQq äöüçşğ ÄÖÜÇŞĞİı " \
+            "Ελληνικά Кириллица"
+
+# Runs in the page after load.  For every family and every character of
+# FONT_TEXT it measures the advance and ink box on a canvas and compares them
+# with those of U+0378/U+0379 (unassigned, so no font has them: that is
+# Firefox's missing-glyph hex box in that family).  A character whose advance
+# and ink box both match was drawn as a box (the advance alone is not enough:
+# in a monospaced font every glyph can have the box's width); U+A000, which
+# no installed font covers, must come out as a box, or the detector is blind.
+# It also checks that serif, sans and monospace are different faces, that
+# monospace is monospaced, that bold and italic change the rendering and that
+# serif italic is a real italic face, then POSTs the result to /fontreport and
+# puts the verdict in the title (visible in maeroX's _NET_WM_NAME trace on the
+# serial line).
+FONT_JS = r"""
+(function () {
+  var FAM = %s, TEXT = %s, SIZE = 37;
+  var c = document.createElement('canvas').getContext('2d');
+  function w(font, s) { c.font = font; return c.measureText(s).width; }
+  // advance + ink box; a missing-glyph box matches the reference in all five
+  function shape(font, s) {
+    c.font = font; var m = c.measureText(s);
+    return [m.width, m.actualBoundingBoxLeft, m.actualBoundingBoxRight,
+            m.actualBoundingBoxAscent, m.actualBoundingBoxDescent];
+  }
+  function same(a, b) { return a.every(function (x, i) { return Math.abs(x - b[i]) < 0.001; }); }
+  function ink(font, s) { return shape(font, s).slice(1, 3).map(function (x) { return +x.toFixed(2); }); }
+  var r = {families: {}, checks: {}, fails: []};
+  var chars = Array.from(TEXT).filter(function (ch) { return ch !== ' '; });
+  FAM.forEach(function (f) {
+    var font = SIZE + 'px ' + f[1];
+    var box = shape(font, '\u0378'), box2 = shape(font, '\u0379'), boxed = [];
+    chars.forEach(function (ch) { if (same(shape(font, ch), box)) boxed.push(ch); });
+    r.families[f[0]] = {box: box.map(function (x) { return +x.toFixed(2); }),
+                        text: +w(font, TEXT).toFixed(3), boxed: boxed.join('')};
+    if (!same(box, box2)) r.fails.push(f[0] + ': missing-glyph reference differs between U+0378 and U+0379');
+    if (boxed.length) r.fails.push(f[0] + ': ' + boxed.length + ' boxed (' + boxed.join('') + ')');
+  });
+  var sans = SIZE + 'px sans-serif', serif = SIZE + 'px serif', mono = SIZE + 'px monospace';
+  var ck = r.checks;
+  // negative control: U+A000 (Yi) is in no installed font, so the detector
+  // must call it a box; if it does not, "0 boxed" above proves nothing
+  ck.detector_sees_boxes = same(shape(sans, '\ua000'), shape(sans, '\u0378'));
+  ck.serif_ne_sans = Math.abs(w(serif, TEXT) - w(sans, TEXT)) > 1;
+  ck.mono_ne_sans = Math.abs(w(mono, TEXT) - w(sans, TEXT)) > 1;
+  ck.mono_fixed = Math.abs(w(mono, 'iiiiiiii') - w(mono, 'MMMMMMMM')) < 0.01;
+  ck.bold_differs = Math.abs(w('bold ' + sans, TEXT) - w(sans, TEXT)) > 1;
+  ck.italic_differs = JSON.stringify(ink('italic ' + sans, 'lIl')) !== JSON.stringify(ink(sans, 'lIl'));
+  // a real serif italic 'f' has a descender; a synthesized oblique only
+  // slants the upright one (a sans oblique is a slanted upright either way)
+  ck.serif_italic_face = shape('italic ' + serif, 'f')[4] > 3 && shape(serif, 'f')[4] < 2;
+  Object.keys(ck).forEach(function (k) { if (!ck[k]) r.fails.push('check ' + k + ' failed'); });
+  document.title = r.fails.length ? 'FONTS FAIL ' + r.fails.length : 'FONTS OK';
+  fetch('/fontreport', {method: 'POST', body: JSON.stringify(r)});
+})();
+"""
+
 
 def png_bytes(w, h, rgb):
     """A w x h PNG of one solid colour (no colour-space chunk, so Firefox
@@ -116,19 +195,39 @@ def png_bytes(w, h, rgb):
 
 
 class WebServer:
-    """The page --web loads, served from a thread; records every request."""
-    PAGE = (b"<!doctype html><html><head><title>MaeroOS web smoke</title>"
-            b"<style>body{background:#e8eefc;font-family:sans-serif}"
-            b"h1{color:#1d4ed8}</style></head><body>"
-            b"<h1>Served over HTTP to MaeroOS</h1>"
-            b"<p>Fetched by Firefox through the MaeroOS TCP stack.</p>"
-            b"<img src=\"mark.png\" width=\"%d\" height=\"%d\" alt=\"mark\">"
-            b"</body></html>" % (WEB_MARK_W, WEB_MARK_H))
+    """The page --web loads, served from a thread; records every request and
+    the font report the page POSTs back."""
+    PAGE_HEAD = (b"<!doctype html><html><head><meta charset=\"utf-8\">"
+                 b"<title>MaeroOS web smoke</title>"
+                 b"<style>body{background:#e8eefc;font-family:sans-serif;margin:6px 8px}"
+                 b"h1{color:#1d4ed8;font-size:22px;margin:2px 0}p{margin:2px 0}"
+                 b"#mark{display:block;margin:4px 0}"
+                 b"table{border-collapse:collapse;font-size:15px;line-height:1.15}"
+                 b"td{padding:0 6px 0 0;white-space:nowrap}td.k{color:#555;font:11px monospace}"
+                 b"</style></head><body>"
+                 b"<h1>Served over HTTP to MaeroOS</h1>"
+                 b"<p>Fetched by Firefox through the MaeroOS TCP stack.</p>")
+
+    @staticmethod
+    def page():
+        rows = []
+        for key, fam in FONT_FAMILIES:
+            style = "font-family:%s" % fam
+            rows.append("<tr><td class=k>%s</td><td style=\"%s\">%s</td>"
+                        "<td style=\"%s\"><b>Bold</b> <i>Italic</i> <b><i>BoldItalic</i></b></td></tr>"
+                        % (key, style, FONT_TEXT, style))
+        body = ("<img id=mark src=\"mark.png\" width=\"%d\" height=\"%d\" alt=\"mark\">"
+                "<table>%s</table><p style=\"font-size:15px\">missing-glyph control "
+                "(U+A000, no font has it): \ua000</p><script>%s</script></body></html>"
+                % (WEB_MARK_W, WEB_MARK_H, "".join(rows),
+                   FONT_JS % (json.dumps([list(f) for f in FONT_FAMILIES]), json.dumps(FONT_TEXT))))
+        return WebServer.PAGE_HEAD + body.encode("utf-8")
 
     def __init__(self):
         self.requests = []          # (host time, path, status)
-        files = {"/": self.PAGE, "/mark.png": png_bytes(WEB_MARK_W, WEB_MARK_H, (255, 0, 0))}
-        types = {"/": "text/html", "/mark.png": "image/png"}
+        self.font_report = None     # (host time, parsed JSON) from the page
+        files = {"/": self.page(), "/mark.png": png_bytes(WEB_MARK_W, WEB_MARK_H, (255, 0, 0))}
+        types = {"/": "text/html; charset=utf-8", "/mark.png": "image/png"}
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -143,6 +242,20 @@ class WebServer:
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                data = self.rfile.read(n) if n > 0 else b""
+                ok = self.path == "/fontreport"
+                outer.requests.append((time.time(), "POST " + self.path, 204 if ok else 404))
+                if ok:
+                    try:
+                        outer.font_report = (time.time(), json.loads(data.decode("utf-8")))
+                    except ValueError:
+                        outer.font_report = (time.time(), {"fails": ["unparsable report: %r" % data[:200]]})
+                self.send_response(204 if ok else 404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
 
             def log_message(self, *a):
                 pass
@@ -827,6 +940,19 @@ def web_load(qmp, args, run, pump, web):
             cand = qmp.screendump_ppm(os.path.join(tmpdir, "web.ppm"))
             best = read_ppm(cand) if cand else None
             best_red = red_pixels(best)
+        # The page's script reports its font measurements right after load;
+        # give it a little longer than the image, then take a frame with the
+        # text fully drawn for screen-web.png.
+        if t_red is not None:
+            fend = time.time() + args.font_timeout
+            while web.font_report is None and time.time() < fend:
+                if not pump(1.0):
+                    break
+            pump(2.0)
+            cand = qmp.screendump_ppm(os.path.join(tmpdir, "web.ppm"))
+            frame = read_ppm(cand) if cand else None
+            if red_pixels(frame) >= need:
+                best = frame
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
     if best:
@@ -843,6 +969,20 @@ def web_load(qmp, args, run, pump, web):
                      "(%d of %d marker pixels)" % (since(web.first("/")), since(web.first("/mark.png")),
                                                    since(t_red), max(best_red, 0),
                                                    WEB_MARK_W * WEB_MARK_H)]
+    rep = web.font_report[1] if web.font_report else None
+    if rep is not None:
+        with open(os.path.join(args.outdir, "fonts.json"), "w") as f:
+            json.dump(rep, f, indent=1, ensure_ascii=False)
+        fams = rep.get("families", {})
+        run.web_notes.append("font report %s after Enter: %s" % (
+            since(web.font_report[0]), "OK" if not rep.get("fails") else
+            "%d problem(s): %s" % (len(rep["fails"]), "; ".join(rep["fails"]))))
+        run.web_notes.append("fonts: boxed chars per family: %s" % ", ".join(
+            "%s=%d" % (k, len(v.get("boxed", ""))) for k, v in fams.items()))
+        run.web_notes.append("fonts: checks %s" % " ".join(
+            "%s=%s" % (k, "ok" if v else "NO") for k, v in rep.get("checks", {}).items()))
+    else:
+        run.web_notes.append("font report: never received")
     for n in run.web_notes:
         print("smoke-firefox:   " + n)
     if web.first("/") is None:
@@ -851,8 +991,13 @@ def web_load(qmp, args, run, pump, web):
         run.result, run.reason = "FAIL", "--web: the page was fetched but its image never was"
     elif t_red is None:
         run.result, run.reason = "FAIL", "--web: the image was fetched but never appeared on screen"
+    elif rep is None:
+        run.result, run.reason = "FAIL", "--web: the page's font report never arrived"
+    elif rep.get("fails"):
+        run.result, run.reason = "FAIL", "--web: text rendering: %s" % "; ".join(rep["fails"])
     else:
-        run.reason += " Page loaded: image on screen %.1fs after Enter." % (t_red - t_enter)
+        run.reason += (" Page loaded: image on screen %.1fs after Enter; fonts OK "
+                       "(no missing-glyph boxes in %d families)." % (t_red - t_enter, len(rep.get("families", {}))))
 
 
 def type_into_guest(qmp, args, run, pump, shot):
@@ -917,6 +1062,8 @@ def main():
                          "(implies --net) and require its image on screen; see above")
     ap.add_argument("--web-timeout", type=float, default=240.0,
                     help="seconds from Enter to the page's image on screen (default 240)")
+    ap.add_argument("--font-timeout", type=float, default=60.0,
+                    help="seconds after the image appears to wait for the page's font report (default 60)")
     ap.add_argument("-v", "--verbose", action="store_true", help="echo every serial line")
     args = ap.parse_args()
 

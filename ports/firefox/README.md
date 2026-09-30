@@ -22,7 +22,7 @@ package index, 17 MB of `.deb` files); everything is cached under
 
 | Path | Contents | Size |
 |------|----------|------|
-| `testfiles/firefox/` | Firefox tarball as-is (`firefox-bin`, `libxul.so`, `omni.ja`, `browser/`, `gmp-clearkey/`, `fonts/`, `defaults/`, `dependentlibs.list`, ...) plus the Debian shared objects, `pixbuf-loaders/` and the GL stubs, all flat | 283 MB |
+| `testfiles/firefox/` | Firefox tarball as-is (`firefox-bin`, `libxul.so`, `omni.ja`, `browser/`, `gmp-clearkey/`, `fonts/`, `defaults/`, `dependentlibs.list`, ...) plus the Debian shared objects, `pixbuf-loaders/` and the GL stubs, all flat, and the DejaVu fonts in `share/fonts/dejavu/` | 288 MB |
 | `testfiles/lib/` | glibc runtime (`ld-linux.so.2`, `libc.so.6`, `libm`, `libdl`, `libpthread`, `librt`, `libresolv`, `libnss_*`, `libanl`, `libutil`, `libthread_db`) plus `libgcc_s.so.1`, `libstdc++.so.6`, mirrored into `i386-linux-gnu/`; `GLIBC-VERSION` records the suite | 11 MB |
 
 `testfiles/lib/` is committed (the initrd needs it); `testfiles/firefox/` is
@@ -43,7 +43,18 @@ The runtime layout mirrors what the launchers (`userspace/ff/ff.c`,
   `loaders.cache.template` is used instead.
 * `XDG_DATA_DIRS=/disk/usr/share` — the hicolor icon theme and DejaVu Sans in
   `testfiles/usr/share/` are committed; the script only refetches the font if
-  it is missing.
+  it is missing.  That single face is what the initrd's GTK probes use.
+* `FONTCONFIG_PATH=/etc/fonts` — `testfiles/etc/fonts/fonts.conf` scans
+  `/usr/share/fonts`, `/disk/usr/share/fonts` and `/disk/firefox/share/fonts`
+  and maps the CSS generics (`sans-serif`, `serif`, `monospace`,
+  `system-ui`) and common named families (Arial, Helvetica, Segoe UI, Times
+  New Roman, Courier New, ...) onto DejaVu Sans / Serif / Sans Mono.  The
+  twelve faces (regular, bold, italic/oblique, bold italic of each) come from
+  the pinned `fonts-dejavu-core`, `-extra` and `-mono` packages and are
+  installed into `testfiles/firefox/share/fonts/dejavu/` (5.3 MB); the list
+  is `FONT_FILES` in `fetch-runtime.sh`.  Before this set existed, serif,
+  monospace, Times and Courier all fell back to DejaVu Sans and bold/italic
+  were synthesized.
 * `libGL.so.1`, `libEGL.so.1`, `libGLESv2.so.2`, `libpci.so.3`, `libdrm.so.2`
   are empty stubs so Firefox's `glxtest` probe fails fast instead of timing
   out (see `build-glstubs.sh` for the story).  They are compiled with the
@@ -82,11 +93,14 @@ What the script verifies, and what it merely relies on:
   recorded in `Packages.xz`. So with a keyring the chain is
   signature → InRelease → Packages.xz → .deb; without one it is
   https → InRelease → Packages.xz → .deb.
-* **Pinned packages**: `libc6`, `libgcc-s1` and `libstdc++6` are the
-  exception to "take whatever the index says". Their libraries land in the
-  committed `testfiles/lib/`, so they are pinned to an exact version and
-  sha256 in `DEBIAN_PINS` in `fetch-runtime.sh`; otherwise a Debian
-  point/security update would leave a fresh clone with a dirty tree. The
+* **Pinned packages**: `libc6`, `libgcc-s1`, `libstdc++6` and
+  `fonts-dejavu-core` / `-extra` / `-mono` are the exception to "take
+  whatever the index says", pinned to an exact version and sha256 in
+  `DEBIAN_PINS` in `fetch-runtime.sh`. The libraries land in the committed
+  `testfiles/lib/`, where a Debian point/security update would otherwise
+  leave a fresh clone with a dirty tree; the fonts are pinned so the faces,
+  and with them the text layout the smoke test sees, cannot change under a
+  re-fetch. The
   pinned `.deb` is fetched from the mirror's pool while it is still there,
   else from `snapshot.debian.org` (`SNAPSHOT_MIRROR`, https only), and must
   match the pinned sha256 whichever source served it. The pins were taken

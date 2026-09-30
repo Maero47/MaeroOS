@@ -90,10 +90,13 @@ static char *const ff_envp[] = {
      * and it reaches the 1152x720 resize).  So there is no way to avoid the
      * content-process launch; the only path to paint is making WaitForProcessHandle
      * complete.  e10s stays enabled. */
-    "FONTCONFIG_PATH=/etc/fonts",  /* libfontconfig was built with prefix=/sysroot,
-                                    * so its compiled config dir is /sysroot/etc/fonts
-                                    * (absent here).  Point it at our real config,
-                                    * which declares <cachedir>/tmp/fontcache</cachedir>. */
+    "FONTCONFIG_PATH=/etc/fonts",  /* testfiles/etc/fonts/fonts.conf: the font dirs
+                                    * (/disk/firefox/share/fonts holds the DejaVu
+                                    * Sans/Serif/Mono set), the CSS generic and
+                                    * named-family aliases, and
+                                    * <cachedir>/tmp/fontcache</cachedir>.  Explicit
+                                    * so an earlier self-built libfontconfig with
+                                    * another compiled-in prefix finds it too. */
     /* Diagnostic: make Firefox report compositor/widget/webrender bring-up to
      * stderr (→ /dev/tty → host serial) so we can see WHERE first paint stalls. */
     /* Diagnostic: make Firefox report compositor/widget/webrender bring-up to

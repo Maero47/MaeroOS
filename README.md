@@ -51,7 +51,8 @@ What is proven by the automated QEMU tests in `tools/`:
 - **Firefox 115.15.0esr is usable, not finished.** The prebuilt i686 ESR build paints
   its window and loads pages over HTTP and HTTPS (a real `https://example.com` loads
   through QEMU's user network, DNS and TLS included), but: text in scripts the disk has
-  no font for (it ships DejaVu Sans and Twemoji) is drawn as missing-glyph boxes; the
+  no font for (it ships DejaVu Sans, Serif and Sans Mono, which cover Latin, Greek and
+  Cyrillic, and Twemoji; not CJK or Indic) is drawn as missing-glyph boxes; the
   content sandbox is off (`MOZ_DISABLE_CONTENT_SANDBOX`, `security.sandbox.content.level
   0`); startup still takes about 5 s after `firefox-bin` starts; and `ff` has to bring
   its own profile (`testfiles/ffprofile`) that turns off first-run dialogs, telemetry
