@@ -25,9 +25,7 @@
 #define NR_READ         3
 #define NR_MMAP2        192
 #define NR_MPROTECT     125
-#define NR_RT_SIGACTION 174
 
-#define SA_SIGINFO      4
 #define SEGV_ACCERR     2
 #define EFAULT          14
 #define PAGE            4096u
@@ -93,11 +91,10 @@ static void on_segv(int sig, void *info, void *uc) {
 }
 
 static int install_segv(void (*h)(int, void *, void *), unsigned flags) {
-    unsigned kact[8];
-    memset(kact, 0, sizeof(kact));
-    kact[0] = (unsigned)h;
-    kact[1] = flags;
-    return syscall4(NR_RT_SIGACTION, SIGSEGV, (int)kact, 0, 8);
+    struct sigaction sa = { 0 };
+    sa.sa_sigaction = (void (*)(int, siginfo_t *, void *))h;
+    sa.sa_flags = (int)flags;
+    return sigaction(SIGSEGV, &sa, 0);
 }
 
 /* Write `val` to `p`, expecting exactly one SEGV_ACCERR at p, after which the

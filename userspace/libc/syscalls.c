@@ -83,18 +83,8 @@ void exit(int status) {
     for (;;);
 }
 
-int kill(int pid, int sig) {
-    return __chkerr(syscall2(37, pid, sig));
-}
-
 int pipe(int fd[2]) {
     return __chkerr(syscall1(42, (int)fd));
-}
-
-sighandler_t signal(int signum, sighandler_t handler) {
-    int ret = syscall2(48, signum, (int)handler);
-    if (ret < 0) { errno = -ret; return (sighandler_t)-1; }
-    return (sighandler_t)(uintptr_t)ret;
 }
 
 int dup2(int oldfd, int newfd) {

@@ -27,7 +27,7 @@ MUSL_BINS := $(if $(MUSL_CC),$(TESTFILES)/wxpie)
 
 LIBC_SRCS := libc/syscalls.c libc/stdio.c libc/stdlib.c libc/pthread.c \
              libc/string.c libc/dirent.c libc/termios.c libc/socket.c \
-             libc/resolve.c libc/toybox_compat.c
+             libc/resolve.c libc/toybox_compat.c libc/signal.c
 LIBC_OBJS := $(LIBC_SRCS:.c=.o)
 CRT0_OBJ  := libc/crt0.o
 
