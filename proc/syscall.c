@@ -2561,6 +2561,19 @@ static int sys_chdir(registers_t *regs) {
     return 0;
 }
 
+/* ── sys_fchdir(fd) — EAX=133 ───────────────────────────────────────────── */
+/* An FD_FILE remembers the canonical path it was opened by, which is what
+ * the cwd holds. */
+static int sys_fchdir(registers_t *regs) {
+    int fd = (int)regs->ebx;
+    if (fd < 0 || fd >= MAX_FD) return -9;
+    proc_file_t *f = &current_proc->ofile[fd];
+    if (f->type != FD_FILE || !f->node || !f->path[0]) return -9;
+    if (!(f->node->flags & VFS_FLAG_DIR)) return -20;  /* ENOTDIR */
+    __builtin_memcpy(current_proc->cwd, f->path, sizeof(f->path));
+    return 0;
+}
+
 /* ── sys_lseek(fd, offset, whence) — EAX=19 ─────────────────────────────── */
 /* The offset lseek/_llseek would move `f` to, computed in 64 bits: Linux
  * vfs_setpos() refuses a negative result or one past the largest file (here
@@ -5490,17 +5503,17 @@ static int sys_lstat64_real(registers_t *regs) {
 }
 
 /* ── sys_symlink(target, linkpath) — EAX=83 ─────────────────────────────── */
-static int sys_symlink(registers_t *regs) {
+static int symlink_at(uint32_t utarget, int dirfd, uint32_t ulinkpath) {
     char target[512], linkpath[512];
     /* -EFAULT, or -ENAMETOOLONG for a string that does not fit. */
-    int rc = copy_user_str((const char *)(uintptr_t)regs->ebx, target, 512);
+    int rc = copy_user_str((const char *)(uintptr_t)utarget, target, 512);
     if (rc < 0) return rc;
-    rc = copy_user_str((const char *)(uintptr_t)regs->ecx, linkpath, 512);
+    rc = copy_user_str((const char *)(uintptr_t)ulinkpath, linkpath, 512);
     if (rc < 0) return rc;
-    /* Resolve linkpath relative to cwd (bounded: cwd + a 511-byte user path
-     * used to be joined into a 512-byte stack buffer unchecked). */
+    /* Resolve linkpath relative to dirfd or the cwd (bounded: cwd + a 511-byte
+     * user path used to be joined into a 512-byte stack buffer unchecked). */
     char abspath[256];
-    rc = resolve_path_at_fd(AT_FDCWD, linkpath, abspath, sizeof(abspath));
+    rc = resolve_path_at_fd(dirfd, linkpath, abspath, sizeof(abspath));
     if (rc < 0) return rc;
     /* Creating the link needs write+search on its directory, and the link is
      * the caller's (effective ids). */
@@ -5517,6 +5530,15 @@ static int sys_symlink(registers_t *regs) {
             vfs_setattr(link, 0777, current_proc->euid, current_proc->egid);
     }
     return rc;
+}
+
+static int sys_symlink(registers_t *regs) {
+    return symlink_at(regs->ebx, AT_FDCWD, regs->ecx);
+}
+
+/* ── sys_symlinkat(target, newdirfd, linkpath) — EAX=304 ─────────────────── */
+static int sys_symlinkat(registers_t *regs) {
+    return symlink_at(regs->ebx, (int)regs->ecx, regs->edx);
 }
 
 /* ── sys_readlink(path, buf, bufsiz) — EAX=85 ───────────────────────────── */
@@ -5625,6 +5647,7 @@ static int fd_read_ready(int fd) {
     switch (f->type) {
     case FD_NONE:   return 0;
     case FD_PIPE_R: return (f->pipe->count > 0 || f->pipe->nwriters == 0) ? 1 : 0;
+    case FD_PIPE_W: return 0;   /* Linux pipe_poll: a write end never reads */
     case FD_SOCKET: return net_socket_read_ready(f->socket);
     case FD_USOCKET: return usocket_read_ready(f->usock);
     case FD_EVENTFD: return f->efd->count > 0 ? 1 : 0;
@@ -5644,6 +5667,7 @@ static int fd_write_ready(int fd) {
     switch (f->type) {
     case FD_NONE:   return 0;
     case FD_PIPE_W: return (f->pipe->count < PIPE_BUF_SIZE || f->pipe->nreaders == 0) ? 1 : 0;
+    case FD_PIPE_R: return 0;   /* ... nor is a read end ever writable */
     case FD_SOCKET: return net_socket_write_ready(f->socket);
     case FD_USOCKET: return usocket_write_ready(f->usock);
     case FD_EVENTFD: return f->efd->count < 0xFFFFFFFFFFFFFFFEULL ? 1 : 0;
@@ -6760,6 +6784,14 @@ static int sys_getpgid(registers_t *regs) {
     return p->pgrp;
 }
 
+/* ── sys_getsid(pid) — EAX=147 ──────────────────────────────────────────── */
+static int sys_getsid(registers_t *regs) {
+    int pid = (int)regs->ebx;
+    struct proc *p = (pid == 0) ? current_proc : proc_find_by_pid(pid);
+    if (!p) return -3;   /* -ESRCH */
+    return p->sid;
+}
+
 /* Thread-directed signal (Linux do_tkill -> do_send_specific): queued on
  * exactly the thread `tid`, which must belong to thread group `tgid` (or any
  * group when tgid is -1, i.e. tkill).  Whether it is fatal for the whole group
@@ -6892,15 +6924,20 @@ static int sys_llseek(registers_t *regs) {
 
 /* ── sys_sysinfo(struct sysinfo *) — EAX=116 (stub) ─────────────────────── */
 static int sys_sysinfo(registers_t *regs) {
-    /* struct sysinfo is 64 bytes; zero it and fill plausible values */
+    /* i386 struct sysinfo is 64 bytes: the same uptime and memory figures as
+     * /proc/uptime and /proc/meminfo, in 4 KiB units (mem_unit), no swap. */
     uint32_t *si = (uint32_t *)(uintptr_t)regs->ebx;
     if (!si || !access_ok(si, 64)) return -14;
     uint32_t ksi[16];
     __builtin_memset(ksi, 0, sizeof(ksi));
-    ksi[0] = 0;         /* uptime seconds */
-    ksi[4] = 128*1024*1024; /* totalram */
-    ksi[5] = 64*1024*1024;  /* freeram */
-    ksi[11] = 1;        /* mem_unit = 1 byte */
+    ksi[0] = pit_ticks() / 100;     /* uptime seconds */
+    ksi[4] = pmm_total_frames();    /* totalram */
+    ksi[5] = pmm_free_frames();     /* freeram */
+    uint32_t procs = 0;
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (ptable[i].state != PROC_UNUSED) procs++;
+    ksi[10] = procs & 0xFFFF;       /* u16 procs, then 2 bytes pad */
+    ksi[13] = 4096;                 /* mem_unit (after totalhigh, freehigh) */
     return copy_to_user(si, ksi, sizeof(ksi));
 }
 
@@ -7218,8 +7255,8 @@ static int do_chmod_node(vfs_node_t *n, uint32_t mode) {
  * a group it belongs to (Linux chown_ok/chgrp_ok).  uid/gid of -1
  * (0xFFFFFFFF) means "unchanged". */
 static int do_chown_node(vfs_node_t *n, uint32_t uid, uint32_t gid) {
-    uint32_t new_uid = n->uid, new_gid = n->gid;
     if (!n) return -2;
+    uint32_t new_uid = n->uid, new_gid = n->gid;
     if (uid != 0xFFFFFFFFU && uid != n->uid) {
         if (current_proc->euid != 0) return -1; /* -EPERM */
         new_uid = uid;
@@ -7275,6 +7312,27 @@ static int sys_lchown(registers_t *regs) {
     if (r < 0) return r;
     return do_chown_node(vfs_open_nofollow(resolved), (uint32_t)regs->ecx,
                          (uint32_t)regs->edx);
+}
+
+/* ── sys_fchownat(dirfd, path, owner, group, flags) — EAX=298 ────────────── */
+static int sys_fchownat(registers_t *regs) {
+    char path[256], resolved[256];
+    int flags = (int)regs->edi;
+    if (flags & ~(0x100 | 0x1000)) return -22;   /* AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH */
+    int r = copy_user_str((const char *)(uintptr_t)regs->ecx, path, sizeof(path));
+    if (r < 0) return r;
+    if (!path[0]) {
+        int fd = (int)regs->ebx;
+        if (!(flags & 0x1000)) return -2;
+        if (fd < 0 || fd >= MAX_FD || current_proc->ofile[fd].type == FD_NONE)
+            return -9;
+        return do_chown_node(current_proc->ofile[fd].node, (uint32_t)regs->edx,
+                             (uint32_t)regs->esi);
+    }
+    r = resolve_path_at_fd((int)regs->ebx, path, resolved, sizeof(resolved));
+    if (r < 0) return r;
+    vfs_node_t *n = (flags & 0x100) ? vfs_open_nofollow(resolved) : vfs_open(resolved);
+    return do_chown_node(n, (uint32_t)regs->edx, (uint32_t)regs->esi);
 }
 
 static int sys_fchmodat(registers_t *regs) {
@@ -8646,6 +8704,8 @@ void syscall_dispatch(registers_t *regs) {
     case 122: ret = sys_uname(regs);           break;
     case 125: ret = sys_mprotect(regs);        break;
     case 132: ret = sys_getpgid(regs);         break;
+    case 133: ret = sys_fchdir(regs);          break;
+    case 147: ret = sys_getsid(regs);          break;
     case 141: ret = sys_getdents(regs);        break;
     case 146: ret = sys_writev(regs);          break;
     case 159: ret = sys_sched_get_priority(regs, 1); break;
@@ -8787,6 +8847,8 @@ void syscall_dispatch(registers_t *regs) {
 
     case 296: ret = sys_mkdirat(regs);         break;
     case 297: ret = sys_mknodat(regs);         break;
+    case 298: ret = sys_fchownat(regs);        break;
+    case 304: ret = sys_symlinkat(regs);       break;
     case 300: ret = sys_fstatat64(regs);       break;
     case 301: ret = sys_unlinkat(regs);        break;
     case 302: ret = sys_renameat(regs);        break;

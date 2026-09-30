@@ -29,7 +29,9 @@ MUSL_BINS := $(if $(MUSL_CC),$(TESTFILES)/wxpie $(TESTFILES)/unixprobe)
 
 LIBC_SRCS := libc/syscalls.c libc/stdio.c libc/stdlib.c libc/pthread.c \
              libc/string.c libc/dirent.c libc/termios.c libc/socket.c \
-             libc/resolve.c libc/toybox_compat.c libc/signal.c
+             libc/resolve.c libc/toybox_compat.c libc/signal.c \
+             libc/posix.c libc/math.c libc/regex.c \
+             libc/time.c
 LIBC_OBJS := $(LIBC_SRCS:.c=.o)
 CRT0_OBJ  := libc/crt0.o
 
@@ -82,9 +84,16 @@ libc/clone.o: libc/clone.asm
 libc/crt0.o: libc/crt0.asm
 	$(AS) -f elf32 $< -o $@
 
-# Static library
+# Static library.  Programs link without -lgcc, so the libgcc members the
+# libc itself calls (64-bit division, popcount) are copied into it.
+LIBGCC      := $(shell $(CC) -print-libgcc-file-name 2>/dev/null)
+LIBGCC_OBJS := _udivdi3.o _umoddi3.o _divdi3.o _moddi3.o _divmoddi4.o \
+               _udivmoddi4.o _popcountsi2.o
 libc/libc.a: $(LIBC_OBJS) libc/clone.o
-	$(AR) rcs $@ $^
+	rm -rf libc/libgcc && mkdir -p libc/libgcc
+	cd libc/libgcc && $(AR) x $(LIBGCC) $(LIBGCC_OBJS)
+	rm -f $@
+	$(AR) rcs $@ $^ $(addprefix libc/libgcc/,$(LIBGCC_OBJS))
 
 # init binary
 init/init.o: init/init.c

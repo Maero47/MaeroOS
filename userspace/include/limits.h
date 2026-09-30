@@ -20,3 +20,16 @@
 #define PATH_MAX 4096
 #define NAME_MAX 255
 #define PIPE_BUF 4096
+
+#define CHAR_MIN SCHAR_MIN
+#define CHAR_MAX SCHAR_MAX
+#define SSIZE_MAX LONG_MAX
+#define LONG_BIT 32
+#define WORD_BIT 32
+#define ARG_MAX 131072
+#define LINE_MAX 2048
+#define HOST_NAME_MAX 64
+#define LOGIN_NAME_MAX 256
+#define NGROUPS_MAX 65536
+#define SYMLOOP_MAX 40
+#define RE_DUP_MAX 255

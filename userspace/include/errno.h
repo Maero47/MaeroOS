@@ -56,3 +56,24 @@ extern int errno;
 #define ECONNREFUSED 111 /* Connection refused */
 #define EALREADY 114 /* Operation already in progress */
 #define EINPROGRESS 115 /* Operation now in progress */
+
+#define ENOTBLK 15   /* Block device required */
+#define ETXTBSY 26   /* Text file busy */
+#define EDOM    33   /* Math argument out of domain */
+#define EDEADLK 35   /* Resource deadlock would occur */
+#define ENAMETOOLONG 36 /* File name too long */
+#define ENOLCK  37   /* No record locks available */
+#define ENOMSG  42   /* No message of desired type */
+#define ENODATA 61   /* No data available */
+#define ETIME   62   /* Timer expired */
+#define ENOLINK 67   /* Link has been severed */
+#define EPROTO  71   /* Protocol error */
+#define EOVERFLOW 75 /* Value too large for defined data type */
+#define EILSEQ  84   /* Illegal byte sequence */
+#define ENOBUFS 105  /* No buffer space available */
+#define EHOSTUNREACH 113 /* No route to host */
+#define ESTALE  116  /* Stale file handle */
+#define EDQUOT  122  /* Quota exceeded */
+#define ECANCELED 125 /* Operation canceled */
+#define ENOTSUP EOPNOTSUPP
+#define EWOULDBLOCK EAGAIN

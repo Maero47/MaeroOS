@@ -59,3 +59,4 @@ int fchown(int fd, int owner, int group);
 
 int mkdir(const char *path, int mode);
 int mkfifo(const char *path, int mode);
+int mknodat(int dirfd, const char *path, int mode, int dev);

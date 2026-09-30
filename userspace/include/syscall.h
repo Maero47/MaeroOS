@@ -45,4 +45,13 @@ static inline int syscall4(int num, int a1, int a2, int a3, int a4) {
     return ret;
 }
 
+static inline int syscall5(int num, int a1, int a2, int a3, int a4, int a5) {
+    int ret;
+    __asm__ volatile("int $0x80"
+        : "=a"(ret)
+        : "0"(num), "b"(a1), "c"(a2), "d"(a3), "S"(a4), "D"(a5)
+        : "memory");
+    return ret;
+}
+
 long syscall(long num, ...);

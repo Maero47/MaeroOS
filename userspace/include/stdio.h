@@ -78,3 +78,9 @@ void   perror(const char *s);
 #define SEEK_SET 0
 #define SEEK_CUR 1
 #define SEEK_END 2
+
+#define BUFSIZ 4096
+#define FILENAME_MAX 4096
+#define L_tmpnam 20
+FILE  *popen(const char *command, const char *mode);
+int    pclose(FILE *stream);

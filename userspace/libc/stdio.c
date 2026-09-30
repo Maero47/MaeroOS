@@ -267,6 +267,140 @@ static unsigned _divmod_u64(unsigned long long *n, unsigned base) {
     return r;
 }
 
+/* ── floating point conversions ─────────────────────────────────────────── */
+
+static long double _pow10l(int e) {
+    long double r = 1.0L, b = 10.0L;
+    unsigned n = e < 0 ? -(unsigned)e : (unsigned)e;
+    while (n) {
+        if (n & 1) r *= b;
+        b *= b;
+        n >>= 1;
+    }
+    return e < 0 ? 1.0L / r : r;
+}
+
+/* Decimal digits of v > 0 (or 0): mode 'e' gives prec+1 significant digits,
+ * mode 'f' every digit down to 10^-prec.  Returns the digit count (at most
+ * `cap`, zeros past the 19 that a long double holds) and the decimal exponent
+ * of the first digit in *e10. */
+static int _fdigits(long double v, int mode, int prec, char *dig, int cap, int *e10) {
+    int e = 0, nd, k;
+    unsigned long long u, lim;
+
+    if (v == 0) {
+        *e10 = 0;
+        nd = mode == 'e' ? prec + 1 : prec + 1;
+        if (nd > cap) nd = cap;
+        for (int i = 0; i < nd; i++) dig[i] = '0';
+        return nd;
+    }
+    /* Normalise v = m * 10^e with 1 <= m < 10. */
+    long double m = v;
+    if (m >= 10.0L || m < 1.0L) {
+        int guess = 0;
+        long double t = m;
+        while (t >= 1e32L) { t /= 1e32L; guess += 32; }
+        while (t < 1e-32L) { t *= 1e32L; guess -= 32; }
+        while (t >= 10.0L) { t /= 10.0L; guess++; }
+        while (t < 1.0L) { t *= 10.0L; guess--; }
+        e = guess;
+        m = v * _pow10l(-e);
+        if (e < -4900) m = t;
+        while (m >= 10.0L) { m /= 10.0L; e++; }
+        while (m < 1.0L) { m *= 10.0L; e--; }
+    }
+    nd = mode == 'e' ? prec + 1 : e + 1 + prec;
+    if (nd <= 0) {
+        /* Everything is below the last printed place: rounds to 0 or 1 unit. */
+        *e10 = e;
+        if (nd == 0 && m > 5.0L) { dig[0] = '1'; *e10 = e + 1; return 1; }
+        dig[0] = '0';
+        *e10 = -prec - 1;
+        return 0;
+    }
+    if (nd > cap) nd = cap;
+    k = nd < 19 ? nd : 19;
+    lim = 1;
+    for (int i = 0; i < k; i++) lim *= 10;
+    long double scaled = m * _pow10l(k - 1);
+    u = (unsigned long long)scaled;
+    long double rem = scaled - (long double)u;
+    if (rem > 0.5L || (rem == 0.5L && (u & 1))) u++;     /* ties to even */
+    if (u >= lim) {             /* 9.99 -> 10.0: one more digit to the left */
+        u /= 10;
+        e++;
+        if (mode != 'e' && nd < cap) { nd++; if (k < 19) { k++; lim *= 10; u *= 10; } }
+    }
+    for (int i = k - 1; i >= 0; i--) { dig[i] = (char)('0' + u % 10); u /= 10; }
+    for (int i = k; i < nd; i++) dig[i] = '0';
+    *e10 = e;
+    return nd;
+}
+
+/* Format v by a %e/%f/%g conversion into out (NUL-terminated, no sign). */
+static int _ffmt(char *out, int cap, long double v, char spec, int prec, int alt) {
+    char dig[400];
+    int e10, nd, n = 0, lower = spec >= 'a';
+    char c = spec | 32;
+
+#define PUT(ch) do { if (n < cap - 1) out[n++] = (ch); } while (0)
+    if (v != v) { const char *t = lower ? "nan" : "NAN"; while (*t) PUT(*t++); out[n] = 0; return n; }
+    if (v > 1e4932L) { const char *t = lower ? "inf" : "INF"; while (*t) PUT(*t++); out[n] = 0; return n; }
+    if (prec < 0) prec = 6;
+    if (c == 'g') {
+        int P = prec ? prec : 1, X;
+        _fdigits(v, 'e', P - 1, dig, sizeof(dig), &X);
+        if (v == 0) X = 0;
+        if (P > X && X >= -4) { c = 'f'; prec = P - 1 - X; }
+        else { c = 'e'; prec = P - 1; }
+        if (!alt) {
+            /* %g drops trailing zeros: format, then trim. */
+            int len = _ffmt(out, cap, v, lower ? c : c - 32, prec, 0);
+            char *dot = 0, *ep = 0;
+            for (int i = 0; i < len; i++) {
+                if (out[i] == '.') dot = out + i;
+                if ((out[i] | 32) == 'e') ep = out + i;
+            }
+            if (!dot) return len;
+            char *end = ep ? ep : out + len, *z = end;
+            while (z > dot + 1 && z[-1] == '0') z--;
+            if (z == dot + 1) z = dot;
+            int tail = (int)(out + len - end);
+            for (int i = 0; i <= tail; i++) z[i] = end[i];
+            return (int)(z - out) + tail;
+        }
+    }
+    if (c == 'e') {
+        nd = _fdigits(v, 'e', prec, dig, sizeof(dig), &e10);
+        if (v == 0) e10 = 0;
+        PUT(dig[0]);
+        if (prec || alt) PUT('.');
+        for (int i = 1; i < nd; i++) PUT(dig[i]);
+        for (int i = nd; i < prec + 1; i++) PUT('0');
+        PUT(lower ? 'e' : 'E');
+        PUT(e10 < 0 ? '-' : '+');
+        int ae = e10 < 0 ? -e10 : e10;
+        if (ae >= 1000) PUT('0' + ae / 1000);
+        if (ae >= 100) PUT('0' + ae / 100 % 10);
+        PUT('0' + ae / 10 % 10);
+        PUT('0' + ae % 10);
+    } else {
+        nd = _fdigits(v, 'f', prec, dig, sizeof(dig), &e10);
+        if (v == 0) e10 = 0;
+        if (e10 < 0) PUT('0');
+        else for (int i = 0; i <= e10; i++) PUT(i < nd ? dig[i] : '0');
+        if (prec || alt) PUT('.');
+        for (int j = 1; j <= prec; j++) {
+            int idx = e10 + j;
+            PUT(idx >= 0 && idx < nd ? dig[idx] : '0');
+        }
+    }
+#undef PUT
+    out[n] = 0;
+    return n;
+}
+
 int vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap) {
     size_t pos = 0;
 
@@ -279,8 +413,9 @@ int vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap) {
         fmt++; /* skip % */
 
         /* Flags */
-        int flag_zero = 0, flag_left = 0, flag_plus = 0, flag_space = 0;
-        while (*fmt == '0' || *fmt == '-' || *fmt == '+' || *fmt == ' ') {
+        int flag_zero = 0, flag_left = 0, flag_plus = 0, flag_space = 0, flag_alt = 0;
+        while (*fmt == '0' || *fmt == '-' || *fmt == '+' || *fmt == ' ' || *fmt == '#') {
+            if (*fmt == '#') flag_alt = 1;
             if (*fmt == '0') flag_zero = 1;
             if (*fmt == '-') flag_left = 1;
             if (*fmt == '+') flag_plus = 1;
@@ -303,8 +438,10 @@ int vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap) {
         }
 
         /* Length modifier */
-        int is_long = 0, is_llong = 0;
+        int is_long = 0, is_llong = 0, is_ldbl = 0;
         if (*fmt == 'l') { is_long = 1; fmt++; if (*fmt == 'l') { is_llong = 1; fmt++; } }
+        else if (*fmt == 'L' || *fmt == 'q') { is_ldbl = 1; is_llong = 1; fmt++; }
+        else if (*fmt == 't') { is_long = 1; fmt++; }
         else if (*fmt == 'j') { is_llong = 1; fmt++; }
         else if (*fmt == 'h') { fmt++; if (*fmt == 'h') fmt++; }
         else if (*fmt == 'z') { is_long = 1; fmt++; }
@@ -328,6 +465,24 @@ int vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap) {
         }
 
         if (spec == 'n') { *(va_arg(ap, int *)) = (int)pos; continue; }
+
+        if (spec == 'f' || spec == 'F' || spec == 'e' || spec == 'E' ||
+            spec == 'g' || spec == 'G') {
+            long double v = is_ldbl ? va_arg(ap, long double) : (long double)va_arg(ap, double);
+            char fbuf[512], sign = 0;
+            if (__builtin_signbit(v)) { sign = '-'; v = -v; }
+            else if (flag_plus) sign = '+';
+            else if (flag_space) sign = ' ';
+            int flen = _ffmt(fbuf, sizeof(fbuf), v, spec, prec, flag_alt);
+            int pad = width - flen - (sign ? 1 : 0);
+            if (v != v || v > 1e4932L) flag_zero = 0;
+            if (!flag_left && !flag_zero) while (pad-- > 0) OUT(' ');
+            if (sign) OUT(sign);
+            if (!flag_left && flag_zero) while (pad-- > 0) OUT('0');
+            for (int i = 0; i < flen; i++) OUT(fbuf[i]);
+            if (flag_left) while (pad-- > 0) OUT(' ');
+            continue;
+        }
 
         /* Numeric conversions.  64-bit throughout: %lld/%llu consume a whole
          * long long vararg, everything else is widened from int/long. */
@@ -354,6 +509,8 @@ int vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap) {
             uval = is_llong ? va_arg(ap, unsigned long long)
                  : is_long ? (unsigned long long)va_arg(ap, unsigned long)
                  : (unsigned long long)va_arg(ap, unsigned int);
+            if (flag_alt && uval && base == 16) { prefix[0] = '0'; prefix[1] = spec; }
+            if (flag_alt && uval && base == 8) prefix[0] = '0';
             break;
         case 'p': base = 16; is_long = 1; prefix[0]='0'; prefix[1]='x';
             uval = (unsigned long)(uintptr_t)va_arg(ap, void *);
@@ -420,6 +577,9 @@ int vprintf(const char *fmt, va_list ap) {
     int n;
     char *out = _vformat(buf, sizeof(buf), &n, fmt, ap);
     int off = 0;
+    /* printf writes at once, but whatever putchar/fputs left in stdout's
+     * buffer has to go out first to keep the order. */
+    _fflush_unlocked(stdout);
     while (off < n) {
         int w = write(1, out + off, n - off);
         if (w < 0 && errno == EINTR) continue;
@@ -497,80 +657,154 @@ int getchar(void) {
     return (unsigned char)c;
 }
 
-/* ── sscanf (basic) ──────────────────────────────────────────────────────────── */
+/* ── sscanf ──────────────────────────────────────────────────────────────────── */
 
-int vsscanf(const char *s, const char *fmt, va_list ap) {
+static int _isspace(int c) { return c == ' ' || (c >= '\t' && c <= '\r'); }
+
+static int _digit(int c, int base) {
+    int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'z' ? c - 'a' + 10
+          : c >= 'A' && c <= 'Z' ? c - 'A' + 10 : 99;
+    return d < base ? d : -1;
+}
+
+/* C99 sscanf: whitespace, literals, %% and the d i u o x X p n s c [ and
+ * floating conversions, with assignment suppression, widths and the
+ * hh h l ll L j z t q modifiers. */
+int vsscanf(const char *str, const char *fmt, va_list ap) {
+    const unsigned char *s = (const unsigned char *)str;
     int n = 0;
-    while (*fmt && *s) {
-        if (*fmt == '%') {
-            fmt++;
-            int suppress = 0, width = 0, lmod = 0;   /* lmod: -2 hh, -1 h, 1 l, 2 ll */
-            if (*fmt == '*') { suppress = 1; fmt++; }
-            while (*fmt >= '0' && *fmt <= '9') width = width * 10 + (*fmt++ - '0');
-            if (*fmt == 'h') { lmod = -1; fmt++; if (*fmt == 'h') { lmod = -2; fmt++; } }
-            else if (*fmt == 'l') { lmod = 1; fmt++; if (*fmt == 'l') { lmod = 2; fmt++; } }
-            else if (*fmt == 'z' || *fmt == 'j') { lmod = *fmt == 'j' ? 2 : 1; fmt++; }
-            char spec = *fmt++;
-            if (!spec) break;
-            if (spec == '%') {
-                while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-                if (*s != '%') break;
-                s++;
-                continue;
-            }
-            /* Digits a numeric field may still consume (width 0 = unlimited). */
-            int left = width ? width : 0x7fffffff;
 
-            /* skip leading whitespace */
-            while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-
-            if (spec == 'd' || spec == 'i' || spec == 'u' || spec == 'x' || spec == 'X') {
-                unsigned long long v = 0; int neg = 0, got = 0;
-                int base = (spec == 'x' || spec == 'X') ? 16 : 10;
-                if (spec != 'u' && left && (*s == '-' || *s == '+')) { neg = *s == '-'; s++; left--; }
-                if (base == 16 && left >= 2 && s[0]=='0' && (s[1]=='x'||s[1]=='X')) { s += 2; left -= 2; }
-                while (left) {
-                    int d;
-                    if (*s >= '0' && *s <= '9') d = *s - '0';
-                    else if (base == 16 && *s >= 'a' && *s <= 'f') d = *s - 'a' + 10;
-                    else if (base == 16 && *s >= 'A' && *s <= 'F') d = *s - 'A' + 10;
-                    else break;
-                    v = v * (unsigned)base + (unsigned)d; s++; left--; got = 1;
-                }
-                if (!got) break;
-                if (neg) v = 0ULL - v;
-                if (!suppress) {
-                    void *dst = va_arg(ap, void *);
-                    if (lmod == 2)       *(unsigned long long *)dst = v;
-                    else if (lmod == -1) *(unsigned short *)dst = (unsigned short)v;
-                    else if (lmod == -2) *(unsigned char *)dst = (unsigned char)v;
-                    else                 *(unsigned int *)dst = (unsigned int)v;
-                    n++;
-                }
-            } else if (spec == 's') {
-                /* %Ns stores at most N characters plus the terminator; a bare %s keeps
-                 * the historical 255-character cap. */
-                char *dst = suppress ? (char *)0 : va_arg(ap, char *);
-                int ti = 0;
-                while (*s && *s!=' ' && *s!='\t' && *s!='\n' && ti < (width ? width : 255)) {
-                    if (dst) dst[ti] = *s;
-                    ti++; s++;
-                }
-                if (!ti) break;
-                if (dst) { dst[ti] = '\0'; n++; }
-            } else if (spec == 'c') {
-                if (!suppress) { *va_arg(ap, char *) = *s; n++; }
-                s++;
-            } else if (spec == 'n') {
-                if (!suppress) *va_arg(ap, int *) = (int)(s - (fmt)); /* approx */
-            }
-        } else if (*fmt == ' ') {
-            while (*s == ' ' || *s == '\t' || *s == '\n') s++;
+    while (*fmt) {
+        if (_isspace((unsigned char)*fmt)) {
+            while (_isspace(*s)) s++;
             fmt++;
-        } else {
-            if (*s != *fmt) break;
-            s++; fmt++;
+            continue;
         }
+        if (*fmt != '%' || fmt[1] == '%') {
+            if (*fmt == '%') {
+                fmt++;
+                while (_isspace(*s)) s++;
+            }
+            if (*s != (unsigned char)*fmt) return (!*s && !n) ? EOF : n;
+            s++;
+            fmt++;
+            continue;
+        }
+        fmt++;
+        int suppress = 0, width = 0, lmod = 0;   /* -2 hh, -1 h, 1 l, 2 ll, 3 L */
+        if (*fmt == '*') { suppress = 1; fmt++; }
+        while (*fmt >= '0' && *fmt <= '9') width = width * 10 + (*fmt++ - '0');
+        if (*fmt == 'h') { lmod = -1; fmt++; if (*fmt == 'h') { lmod = -2; fmt++; } }
+        else if (*fmt == 'l') { lmod = 1; fmt++; if (*fmt == 'l') { lmod = 2; fmt++; } }
+        else if (*fmt == 'L') { lmod = 3; fmt++; }
+        else if (*fmt == 'j' || *fmt == 'q') { lmod = 2; fmt++; }
+        else if (*fmt == 'z' || *fmt == 't') { lmod = 1; fmt++; }
+        char spec = *fmt++;
+        if (!spec) break;
+
+        if (spec == 'n') {
+            if (!suppress) {
+                void *dst = va_arg(ap, void *);
+                long long v = (const char *)s - str;
+                if (lmod == 2) *(long long *)dst = v;
+                else if (lmod == -1) *(short *)dst = (short)v;
+                else if (lmod == -2) *(signed char *)dst = (signed char)v;
+                else *(int *)dst = (int)v;
+            }
+            continue;
+        }
+        if (spec != 'c' && spec != '[') while (_isspace(*s)) s++;
+        if (!*s) return n ? n : EOF;
+        int left = width ? width : 0x7fffffff;
+
+        if (spec == 'd' || spec == 'i' || spec == 'u' || spec == 'o' ||
+            spec == 'x' || spec == 'X' || spec == 'p') {
+            int base = spec == 'o' ? 8 : (spec == 'x' || spec == 'X' || spec == 'p') ? 16
+                     : spec == 'i' ? 0 : 10, neg = 0, got = 0, d;
+            unsigned long long v = 0;
+            if (left && (*s == '-' || *s == '+')) { neg = *s == '-'; s++; left--; }
+            if ((base == 0 || base == 16) && left >= 2 && s[0] == '0' && (s[1] | 32) == 'x'
+                && _digit(s[2], 16) >= 0) {
+                s += 2;
+                left -= 2;
+                base = 16;
+            } else if (base == 0) base = (*s == '0') ? 8 : 10;
+            while (left && (d = _digit(*s, base)) >= 0) {
+                v = v * (unsigned)base + (unsigned)d;
+                s++;
+                left--;
+                got = 1;
+            }
+            if (!got) return n;
+            if (neg) v = 0ULL - v;
+            if (!suppress) {
+                void *dst = va_arg(ap, void *);
+                if (spec == 'p') *(void **)dst = (void *)(uintptr_t)v;
+                else if (lmod == 2) *(unsigned long long *)dst = v;
+                else if (lmod == -1) *(unsigned short *)dst = (unsigned short)v;
+                else if (lmod == -2) *(unsigned char *)dst = (unsigned char)v;
+                else if (lmod == 1) *(unsigned long *)dst = (unsigned long)v;
+                else *(unsigned int *)dst = (unsigned int)v;
+                n++;
+            }
+        } else if (spec == 'f' || spec == 'F' || spec == 'e' || spec == 'E' ||
+                   spec == 'g' || spec == 'G' || spec == 'a' || spec == 'A') {
+            char buf[128], *end;
+            int len = 0;
+            while (len < left && len < (int)sizeof(buf) - 1 && s[len] && !_isspace(s[len]))
+                buf[len] = (char)s[len], len++;
+            buf[len] = 0;
+            long double v = strtold(buf, &end);
+            if (end == buf) return n;
+            s += end - buf;
+            if (!suppress) {
+                void *dst = va_arg(ap, void *);
+                if (lmod == 3) *(long double *)dst = v;
+                else if (lmod == 1) *(double *)dst = (double)v;
+                else *(float *)dst = (float)v;
+                n++;
+            }
+        } else if (spec == 's') {
+            /* A bare %s keeps the historical 255-character cap. */
+            char *dst = suppress ? (char *)0 : va_arg(ap, char *);
+            int ti = 0;
+            if (!width) left = 255;
+            while (*s && !_isspace(*s) && ti < left) {
+                if (dst) dst[ti] = (char)*s;
+                ti++;
+                s++;
+            }
+            if (dst) { dst[ti] = '\0'; n++; }
+        } else if (spec == 'c') {
+            char *dst = suppress ? (char *)0 : va_arg(ap, char *);
+            int want = width ? width : 1, ti = 0;
+            for (; ti < want && *s; ti++, s++) if (dst) dst[ti] = (char)*s;
+            if (ti < want) return n;
+            if (dst) n++;
+        } else if (spec == '[') {
+            unsigned char set[32];
+            int neg = 0, ti = 0;
+            memset(set, 0, sizeof(set));
+            if (*fmt == '^') { neg = 1; fmt++; }
+            if (*fmt == ']') { set[']' >> 3] |= 1 << (']' & 7); fmt++; }
+            while (*fmt && *fmt != ']') {
+                int lo = (unsigned char)*fmt++;
+                if (*fmt == '-' && fmt[1] && fmt[1] != ']') {
+                    int hi = (unsigned char)fmt[1];
+                    for (int c = lo; c <= hi; c++) set[c >> 3] |= 1 << (c & 7);
+                    fmt += 2;
+                } else set[lo >> 3] |= 1 << (lo & 7);
+            }
+            if (*fmt == ']') fmt++;
+            char *dst = suppress ? (char *)0 : va_arg(ap, char *);
+            while (*s && ti < left && (!!(set[*s >> 3] & (1 << (*s & 7))) != neg)) {
+                if (dst) dst[ti] = (char)*s;
+                ti++;
+                s++;
+            }
+            if (!ti) return n;
+            if (dst) { dst[ti] = '\0'; n++; }
+        } else return n;
     }
     return n;
 }

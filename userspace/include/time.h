@@ -12,6 +12,8 @@ struct tm {
     int tm_wday;
     int tm_yday;
     int tm_isdst;
+    long tm_gmtoff;
+    const char *tm_zone;
 };
 
 #define CLOCK_REALTIME 0
@@ -26,8 +28,16 @@ struct tm *localtime(const time_t *timep);
 struct tm *localtime_r(const time_t *timep, struct tm *result);
 struct tm *gmtime(const time_t *timep);
 char *ctime(const time_t *timep);
-unsigned long strftime(char *s, unsigned long max, const char *format,
-                       const struct tm *tm);
+size_t strftime(char *s, size_t max, const char *format, const struct tm *tm);
+struct tm *gmtime_r(const time_t *timep, struct tm *result);
+time_t timegm(struct tm *tm);
+char *asctime(const struct tm *tm);
+char *asctime_r(const struct tm *tm, char *buf);
+char *ctime_r(const time_t *timep, char *buf);
+double difftime(time_t a, time_t b);
+extern char *tzname[2];
+extern long timezone;
+extern int daylight;
 char *strptime(const char *buf, const char *format, struct tm *tm);
 time_t mktime(struct tm *tm);
 void tzset(void);
