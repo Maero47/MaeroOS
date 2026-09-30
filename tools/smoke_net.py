@@ -140,6 +140,59 @@ def reset_conn(conn):
     conn.close()
 
 
+def udp_echo_server():
+    """Echo every UDP datagram back to its sender.  Returns the port."""
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u.bind(("0.0.0.0", 0))
+
+    def run():
+        while True:
+            try:
+                data, addr = u.recvfrom(65536)
+                u.sendto(data, addr)
+            except OSError:
+                return
+
+    threading.Thread(target=run, daemon=True).start()
+    return u.getsockname()[1]
+
+
+def stalled_listener():
+    """A listener whose accept queue is full, so a new connect() to it never
+    completes its handshake (the host drops the SYNs).  Returns (port,
+    sockets to keep alive)."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("0.0.0.0", 0))
+    srv.listen(0)
+    port = srv.getsockname()[1]
+    keep = [srv]
+    for _ in range(4):
+        c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        c.setblocking(False)
+        try:
+            c.connect(("127.0.0.1", port))
+        except OSError:
+            pass
+        keep.append(c)
+    time.sleep(0.2)
+    return port, keep
+
+
+def drain_later(srv, delay):
+    """After `delay` seconds, accept (and hold) everything queued on srv."""
+    time.sleep(delay)
+    srv.settimeout(0.2)
+    held = []
+    end = time.time() + 8
+    while time.time() < end:
+        try:
+            held.append(srv.accept()[0])
+        except OSError:
+            pass
+    for c in held:
+        c.close()
+
+
 def main():
     webdir = tempfile.TemporaryDirectory()
     index_path = os.path.join(webdir.name, "index.html")
@@ -270,6 +323,40 @@ def main():
         recent = "".join(log)[before:]
         if "sockprobe many ok 96" not in recent:
             raise AssertionError("holding 96 sockets open at once failed")
+        # sendmsg/recvmsg on TCP and UDP (iovec gather/scatter, msg_name).
+        udp_port = udp_echo_server()
+        before = len("".join(log))
+        send(proc, f"sockprobe msg {http_port} {udp_port}")
+        wait_for(proc, sel, PROMPT, log, timeout=20.0, start=before)
+        recent = "".join(log)[before:]
+        if "sockprobe msg ok" not in recent:
+            raise AssertionError("sendmsg/recvmsg on AF_INET sockets failed")
+        # A blocking connect() that a signal interrupts returns EINTR at
+        # once instead of waiting out its 3 s handshake timeout.
+        stall_port, stall_keep = stalled_listener()
+        before = len("".join(log))
+        send(proc, f"sockprobe conn {stall_port}")
+        wait_for(proc, sel, PROMPT, log, timeout=20.0, start=before)
+        recent = "".join(log)[before:]
+        for s_ in stall_keep:
+            s_.close()
+        if "sockprobe conn ok" not in recent:
+            raise AssertionError("a signal did not interrupt a blocking connect()")
+        # With SA_RESTART the restarted connect() waits for the handshake
+        # still under way (never EALREADY); the host frees its accept queue
+        # after 2 s so that handshake completes.
+        stall_port, stall_keep = stalled_listener()
+        threading.Thread(target=drain_later, args=(stall_keep[0], 2.0),
+                         daemon=True).start()
+        before = len("".join(log))
+        send(proc, f"sockprobe conn {stall_port} restart")
+        wait_for(proc, sel, PROMPT, log, timeout=20.0, start=before)
+        recent = "".join(log)[before:]
+        time.sleep(0.5)
+        for s_ in stall_keep:
+            s_.close()
+        if "sockprobe conn restart ok" not in recent:
+            raise AssertionError("a connect() restarted after SA_RESTART failed")
         before = len("".join(log))
         send(proc, f"httpget 10.0.2.2 {http_port} /index.html")
         wait_for(proc, sel, PROMPT, log, timeout=15.0, start=before)

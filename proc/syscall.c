@@ -774,6 +774,24 @@ static int proc_in_group(uint32_t g) {
     return 0;
 }
 
+/* Every copy of an open file (fork, dup, SCM_RIGHTS) must carry the same
+ * epoll identity, so the source gets one BEFORE it is copied: an fid handed
+ * out only at EPOLL_CTL_ADD time would reach the adder's entry alone, and a
+ * copy made earlier (a forked sharer of the epoll, say) would never match. */
+static uint32_t fd_new_fid(void) {
+    static uint32_t next_fid = 1;
+    uint32_t id;
+    do { id = next_fid++; } while (!id);
+    return id;
+}
+
+/* *dst = *src plus a reference: the one way to duplicate a descriptor. */
+void fd_copy(proc_file_t *dst, proc_file_t *src) {
+    if (src->type != FD_NONE && !src->fid) src->fid = fd_new_fid();
+    *dst = *src;
+    fd_retain(dst);
+}
+
 void fd_retain(proc_file_t *f) {
     if (f->type == FD_FILE)    vfs_retain(f->node);
     /* A named pipe's descriptor also holds the FIFO's vfs node; an anonymous
@@ -804,6 +822,7 @@ void fd_release(proc_file_t *f) {
     f->offset  = 0;
     f->flags   = 0;
     f->cloexec = 0;
+    f->fid     = 0;
     f->path[0] = '\0';
 }
 
@@ -886,6 +905,20 @@ static void proc_copy_image_ids(struct proc *child, struct proc *parent) {
  * Honouring child_stack here is essential: otherwise the child runs the glibc
  * clone trampoline on the parent's stack, pops garbage as its entry fn, and
  * jumps into the weeds. */
+/* Undo a half-built fork child: everything allocproc and do_fork gave it
+ * before the address-space copy failed (the fds are copied only after that
+ * point, so its table is still empty).  Leaking these cost ~150 KiB of heap
+ * per failed fork, which made the next fork under pressure likelier to fail. */
+static void fork_abort(struct proc *child) {
+    vma_clear(child);
+    fdtable_put(child);
+    if (child->sighand) { sighand_put(child->sighand); child->sighand = NULL; }
+    if (child->ctty) { vfs_close(child->ctty); child->ctty = NULL; }
+    kstack_free(child->kstack);
+    child->kstack = NULL;
+    child->state = PROC_UNUSED;
+}
+
 static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags,
                    uint32_t uptid, uint32_t uctid) {
     (void)regs;
@@ -973,8 +1006,7 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
     /* Create child's page directory with kernel mappings */
     child->pgdir_phys = pgdir_create();
     if (!child->pgdir_phys) {
-        kstack_free(child->kstack);
-        child->state = PROC_UNUSED;
+        fork_abort(child);
         return -11;
     }
 
@@ -998,8 +1030,8 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
         if (!child_pt_phys) {
             paging_temp_unmap2();
             pgdir_free_user(child->pgdir_phys);
-            kstack_free(child->kstack);
-            child->state = PROC_UNUSED;
+            child->pgdir_phys = 0;
+            fork_abort(child);
             return -11;
         }
 
@@ -1076,8 +1108,7 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
 
     /* Copy open file descriptors; bump pipe refcounts */
     for (int i = 0; i < MAX_FD; i++) {
-        child->ofile[i] = parent->ofile[i];
-        fd_retain(&parent->ofile[i]);
+        fd_copy(&child->ofile[i], &parent->ofile[i]);
     }
 
     /* Inherit shared-memory mapping records (PTEs already cloned above) */
@@ -2537,7 +2568,7 @@ static int sys_dup2(registers_t *regs) {
 
 
     /* Copy the entry and bump refcount */
-    *dst = *src;
+    fd_copy(dst, src);
     /* POSIX/Linux dup2(2): the DUPLICATE fd does NOT inherit the close-on-exec
      * flag — it is always CLEARED on newfd.  Our `*dst = *src` copies cloexec
      * from the source, which is WRONG: Chromium dup2's a MFD_CLOEXEC memfd onto
@@ -2546,7 +2577,6 @@ static int sys_dup2(registers_t *regs) {
      * the jsInit/prefMap shared-memory fd vanished → child mmap'd a stale/reused
      * fd → EBADF → ImageBridgeChild::InitSameProcess NULL-deref crash.  Clear it. */
     dst->cloexec = 0;
-    fd_retain(dst);
 
     return newfd;
 }
@@ -2993,10 +3023,9 @@ static int sys_fcntl(registers_t *regs) {
         if (arg < 0 || arg >= MAX_FD) return -22;
         for (int i = arg >= 0 ? arg : 0; i < MAX_FD; i++) {
             if (current_proc->ofile[i].type == FD_NONE) {
-                current_proc->ofile[i] = *f;
+                fd_copy(&current_proc->ofile[i], f);
                 /* F_DUPFD clears cloexec; F_DUPFD_CLOEXEC sets it */
                 current_proc->ofile[i].cloexec = (cmd == 1030) ? 1 : 0;
-                fd_retain(&current_proc->ofile[i]);
                 return i;
             }
         }
@@ -5341,9 +5370,8 @@ static int sys_dup(registers_t *regs) {
 
     for (int i = 0; i < MAX_FD; i++) {
         if (current_proc->ofile[i].type == FD_NONE) {
-            current_proc->ofile[i] = *src;
+            fd_copy(&current_proc->ofile[i], src);
             current_proc->ofile[i].cloexec = 0;
-            fd_retain(&current_proc->ofile[i]);
             return i;
         }
     }
@@ -5935,9 +5963,18 @@ static int sys_ppoll(registers_t *regs, int time64) {
 #define EPOLL_MAX_ITEMS 256
 #define EPOLLIN_K   0x001
 #define EPOLLOUT_K  0x004
+/* An item names a descriptor NUMBER plus the identity (proc_file_t.fid) of
+ * the open file it held when it was added.  Linux ties a registration to the
+ * struct file, so it ends when that file's last descriptor closes: here an
+ * item whose number now holds another file (closed, or closed and reused) is
+ * dead to the caller's table — never reported, and replaced by an ADD of the
+ * number, whose MOD/DEL see ENOENT.  It is not freed eagerly because a forked
+ * sharer of the epoll can still hold that file under the same number; its
+ * slot is reclaimed when the set is full. */
 struct epoll {
     struct {
         int      fd;          /* -1 = empty slot */
+        uint32_t fid;         /* open-file identity at ADD time */
         uint32_t events;      /* requested EPOLL* mask */
         uint8_t  data[8];     /* opaque epoll_data, echoed back */
     } items[EPOLL_MAX_ITEMS];
@@ -5950,6 +5987,15 @@ static void epoll_retain(struct epoll *ep) {
 static void epoll_release(struct epoll *ep) {
     if (!ep) return;
     if (--ep->refcount <= 0) kfree(ep);
+}
+
+/* Does item i still watch the open file it was added for, in the caller's
+ * table? */
+static int epoll_item_live(struct epoll *ep, int i) {
+    int fd = ep->items[i].fd;
+    if (fd < 0 || fd >= MAX_FD) return 0;
+    proc_file_t *f = &current_proc->ofile[fd];
+    return f->type != FD_NONE && f->fid && f->fid == ep->items[i].fid;
 }
 
 static int sys_epoll_create1(registers_t *regs) {
@@ -5987,21 +6033,31 @@ static int sys_epoll_ctl(registers_t *regs) {
         if (copy_from_user(&ev, uev, 12) < 0) return -14;
     }
 
+    proc_file_t *wf = &current_proc->ofile[fd];
     switch (op) {
-    case 1: /* EPOLL_CTL_ADD */
-        for (int i = 0; i < EPOLL_MAX_ITEMS; i++)
-            if (ep->items[i].fd == fd) return -17;  /* -EEXIST */
-        for (int i = 0; i < EPOLL_MAX_ITEMS; i++)
-            if (ep->items[i].fd == -1) {
-                ep->items[i].fd = fd;
-                ep->items[i].events = ev.events;
-                __builtin_memcpy(ep->items[i].data, ev.data, 8);
-                return 0;
-            }
-        return -28;  /* -ENOSPC */
+    case 1: { /* EPOLL_CTL_ADD */
+        if (wf->type == FD_EPOLL && wf->epoll == ep) return -22;  /* itself */
+        int slot = -1;
+        for (int i = 0; i < EPOLL_MAX_ITEMS; i++) {
+            if (ep->items[i].fd != fd) continue;
+            if (epoll_item_live(ep, i)) return -17;  /* -EEXIST */
+            slot = i;              /* the number's previous file is gone */
+        }
+        for (int i = 0; i < EPOLL_MAX_ITEMS && slot < 0; i++)
+            if (ep->items[i].fd == -1) slot = i;
+        for (int i = 0; i < EPOLL_MAX_ITEMS && slot < 0; i++)
+            if (!epoll_item_live(ep, i)) slot = i;
+        if (slot < 0) return -28;  /* -ENOSPC */
+        if (!wf->fid) wf->fid = fd_new_fid();   /* never copied yet */
+        ep->items[slot].fd  = fd;
+        ep->items[slot].fid = wf->fid;
+        ep->items[slot].events = ev.events;
+        __builtin_memcpy(ep->items[slot].data, ev.data, 8);
+        return 0;
+    }
     case 3: /* EPOLL_CTL_MOD */
         for (int i = 0; i < EPOLL_MAX_ITEMS; i++)
-            if (ep->items[i].fd == fd) {
+            if (ep->items[i].fd == fd && epoll_item_live(ep, i)) {
                 ep->items[i].events = ev.events;
                 __builtin_memcpy(ep->items[i].data, ev.data, 8);
                 return 0;
@@ -6009,7 +6065,10 @@ static int sys_epoll_ctl(registers_t *regs) {
         return -2;   /* -ENOENT */
     case 2: /* EPOLL_CTL_DEL */
         for (int i = 0; i < EPOLL_MAX_ITEMS; i++)
-            if (ep->items[i].fd == fd) { ep->items[i].fd = -1; return 0; }
+            if (ep->items[i].fd == fd && epoll_item_live(ep, i)) {
+                ep->items[i].fd = -1;
+                return 0;
+            }
         return -2;
     }
     return -22;
@@ -6034,8 +6093,7 @@ static int sys_epoll_wait(registers_t *regs) {
         int n = 0;
         for (int i = 0; i < EPOLL_MAX_ITEMS && n < maxevents; i++) {
             int wfd = ep->items[i].fd;
-            if (wfd < 0 || wfd >= MAX_FD ||
-                current_proc->ofile[wfd].type == FD_NONE) continue;
+            if (!epoll_item_live(ep, i)) continue;
             uint32_t want = ep->items[i].events, rev = 0;
             if ((want & EPOLLIN_K)  && fd_read_ready(wfd))  rev |= EPOLLIN_K;
             if ((want & EPOLLOUT_K) && fd_write_ready(wfd)) rev |= EPOLLOUT_K;
@@ -7005,6 +7063,40 @@ static int sys_pipe2(registers_t *regs) {
  * iovec array (defined with the AF_UNIX glue below); -1 when fd is not one. */
 static int usock_rw_record(int fd, uint32_t uiov, int iovcnt, int write);
 
+/* One iovec segment of a readv/writev after earlier segments already moved
+ * data.  Linux runs the whole iovec through one read_iter/write_iter pass, so
+ * a pipe or socket read returns as soon as it has something (it never sleeps
+ * for a later segment) and a socket write raises SIGPIPE only when the call
+ * sent nothing.  -EAGAIN here just ends the call.  Returns -1000 for a
+ * descriptor that needs no special handling (plain sys_read/sys_write). */
+#define IOV_SEG_PLAIN (-1000)
+static int iov_seg_more(int fd, void *base, int len, int write) {
+    proc_file_t *f = &current_proc->ofile[fd];
+    if (f->type == FD_PIPE_R && !write)
+        return pipe_read(f->pipe, base, len, 1);
+    if (f->type == FD_SOCKET)
+        return write ? sock_send_user(f->socket, base, (uint32_t)len, NULL,
+                                      SOCK_MSG_NOSIGNAL |
+                                      ((f->flags & O_NONBLOCK) ? NET_MSG_DONTWAIT : 0))
+                     : sock_recv_user(f->socket, base, (uint32_t)len, NULL,
+                                      NET_MSG_DONTWAIT);
+    if (f->type == FD_USOCKET) {
+        usocket_t *us = f->usock;
+        int fl = write ? (USOCK_NOSIGNAL | ((f->flags & O_NONBLOCK) ? USOCK_NONBLOCK : 0))
+                       : USOCK_NONBLOCK;
+        usocket_pin(us);
+        int r = write ? usocket_write(us, base, len, fl) : usocket_read(us, base, len, fl);
+        usocket_unpin(us);
+        return r;
+    }
+    /* Anything else that can block a read (a tty, a device, an eventfd):
+     * stop at the data already read unless more is ready now. */
+    if (!write && f->type != FD_FILE) return fd_read_ready(fd) ? IOV_SEG_PLAIN : -11;
+    if (!write && f->node && !node_is_regular(f->node) && !fd_read_ready(fd))
+        return -11;
+    return IOV_SEG_PLAIN;
+}
+
 static int sys_readv(registers_t *regs) {
     int fd     = (int)regs->ebx;
     const uint32_t *iov = (const uint32_t *)(uintptr_t)regs->ecx;
@@ -7025,11 +7117,14 @@ static int sys_readv(registers_t *regs) {
         int   len  = (int)kiov[1];
         if (len <= 0) continue;
         if (!access_ok(base, (size_t)len)) return -14;
-        registers_t fake = *regs;
-        fake.ebx = (uint32_t)fd;
-        fake.ecx = (uint32_t)(uintptr_t)base;
-        fake.edx = (uint32_t)len;
-        int n = sys_read(&fake);
+        int n = total ? iov_seg_more(fd, base, len, 0) : IOV_SEG_PLAIN;
+        if (n == IOV_SEG_PLAIN) {
+            registers_t fake = *regs;
+            fake.ebx = (uint32_t)fd;
+            fake.ecx = (uint32_t)(uintptr_t)base;
+            fake.edx = (uint32_t)len;
+            n = sys_read(&fake);
+        }
         /* Bytes already read are consumed: report them, not a later iovec's
          * EAGAIN/EFAULT, or they are lost to the caller. */
         if (n < 0) return total ? total : n;
@@ -7513,11 +7608,14 @@ static int sys_writev(registers_t *regs) {
         if (!access_ok(base, (size_t)len)) return -14;
 
         /* Reuse sys_write logic via direct dispatch */
-        registers_t fake = *regs;
-        fake.ebx = (uint32_t)fd;
-        fake.ecx = (uint32_t)(uintptr_t)base;
-        fake.edx = (uint32_t)len;
-        int n = sys_write(&fake);
+        int n = total ? iov_seg_more(fd, (void *)base, len, 1) : IOV_SEG_PLAIN;
+        if (n == IOV_SEG_PLAIN) {
+            registers_t fake = *regs;
+            fake.ebx = (uint32_t)fd;
+            fake.ecx = (uint32_t)(uintptr_t)base;
+            fake.edx = (uint32_t)len;
+            n = sys_write(&fake);
+        }
         /* A short write ends the call, and bytes already written are what it
          * returns (fs/read_write.c do_loop_readv_writev).  Carrying on to the
          * next iovec after a short one dropped the rest of that one from the
@@ -7737,8 +7835,7 @@ static int sys_clone(registers_t *regs) {
     } else {
         /* Private copy (CLONE_VM without CLONE_FILES: posix_spawn, vfork). */
         for (int i = 0; i < MAX_FD; i++) {
-            child->ofile[i] = parent->ofile[i];
-            fd_retain(&parent->ofile[i]);
+            fd_copy(&child->ofile[i], &parent->ofile[i]);
         }
     }
     shm_proc_fork(parent, child);
@@ -8035,34 +8132,51 @@ static void usock_deliver_fds(usocket_t *us, uint32_t umsg, uint32_t uctrl,
     copy_to_user((void *)(uintptr_t)(umsg + 24), &out_flags, 4);
 }
 
-/* sendmsg: parse the SCM_RIGHTS cmsg(s) and retain the named files. */
+/* sendmsg: parse the control buffer straight from user memory and retain the
+ * files its SCM_RIGHTS cmsg(s) name.  Anything wrong fails the whole call
+ * before a byte is queued, as Linux __scm_send/scm_fp_copy do: a malformed
+ * cmsg or too many fds is -EINVAL, a bad fd -EBADF, an unreadable buffer
+ * -EFAULT.  Dropping them silently instead would hand the receiver a message
+ * without the fds its protocol expects.  Returns the count (the refs in
+ * pass[] are then the caller's) or a negative errno (nothing retained). */
+#define SCM_CTL_MAX 20480U                 /* net.core.optmem_max */
 static int usock_collect_fds(uint32_t uctrl, uint32_t uctrllen,
                              proc_file_t *pass) {
-    int npass = 0;
-    if (!uctrl || uctrllen < 12 || uctrllen > 256) return 0;
-    uint8_t cbuf[256];
-    if (copy_from_user(cbuf, (void *)(uintptr_t)uctrl, uctrllen) < 0) return 0;
+    int npass = 0, err = 0;
+    if (uctrllen < 12) return 0;           /* CMSG_FIRSTHDR: none */
+    if (uctrllen > SCM_CTL_MAX) return -105;                 /* -ENOBUFS */
+    if (!uctrl) return -14;
     uint32_t off = 0;
     while (off + 12 <= uctrllen) {
-        uint32_t clen; int level, ctype;
-        __builtin_memcpy(&clen,  cbuf + off,     4);
-        __builtin_memcpy(&level, cbuf + off + 4, 4);
-        __builtin_memcpy(&ctype, cbuf + off + 8, 4);
-        if (clen < 12 || off + clen > uctrllen) break;
-        if (level == 1 /*SOL_SOCKET*/ && ctype == 1 /*SCM_RIGHTS*/) {
-            int cnt = (int)((clen - 12) / 4);
-            for (int k = 0; k < cnt && npass < SCM_MAX_FDS; k++) {
-                int sfd;
-                __builtin_memcpy(&sfd, cbuf + off + 12 + k * 4, 4);
-                if (sfd < 0 || sfd >= MAX_FD) continue;
-                proc_file_t *src = &current_proc->ofile[sfd];
-                if (src->type == FD_NONE) continue;
-                pass[npass] = *src;
-                fd_retain(&pass[npass]);
-                npass++;
+        uint32_t h[3];                     /* cmsg_len, cmsg_level, cmsg_type */
+        if (copy_from_user(h, (void *)(uintptr_t)(uctrl + off), 12) < 0) {
+            err = -14; break;
+        }
+        if (h[0] < 12 || h[0] > uctrllen - off) { err = -22; break; }  /* !CMSG_OK */
+        if (h[1] == 1 /*SOL_SOCKET*/) {
+            if (h[2] == 1 /*SCM_RIGHTS*/) {
+                uint32_t cnt = (h[0] - 12) / 4;
+                if (cnt > (uint32_t)(SCM_MAX_FDS - npass)) { err = -22; break; }
+                for (uint32_t k = 0; k < cnt; k++) {
+                    int sfd;
+                    if (copy_from_user(&sfd, (void *)(uintptr_t)(uctrl + off + 12 + k * 4),
+                                       4) < 0) { err = -14; break; }
+                    if (sfd < 0 || sfd >= MAX_FD ||
+                        current_proc->ofile[sfd].type == FD_NONE) { err = -9; break; }
+                    fd_copy(&pass[npass], &current_proc->ofile[sfd]);
+                    npass++;
+                }
+                if (err) break;
+            } else if (h[2] != 2 /*SCM_CREDENTIALS: accepted, not checked*/) {
+                err = -22; break;
             }
         }
-        off += (clen + 3u) & ~3u;
+        off += (h[0] + 3u) & ~3u;
+        if (off < h[0]) break;             /* wrapped */
+    }
+    if (err) {
+        for (int k = 0; k < npass; k++) fd_release(&pass[k]);
+        return err;
     }
     return npass;
 }
@@ -8118,6 +8232,7 @@ static int usock_record_msg(int call, uint32_t *kargs, usocket_t *us, int nb) {
         }
         proc_file_t pass[SCM_MAX_FDS];
         int npass = usock_collect_fds(uctrl, uctrllen, pass);
+        if (npass < 0) { kfree(iv); return npass; }
         r = usocket_send_record(us, iv, niov, pass, npass,
                                 has_to ? &to : NULL, tonode, mflags);
         if (r < 0)                            /* the fds never left */
@@ -8134,8 +8249,14 @@ static int usock_record_msg(int call, uint32_t *kargs, usocket_t *us, int nb) {
     if (r < 0) return r;
     if (uname) {
         /* msg_namelen is the msghdr field right after msg_name. */
-        if (usock_name_to_user(&from, uname, (uint32_t *)(uintptr_t)(umsg + 4), 1) < 0)
+        if (usock_name_to_user(&from, uname, (uint32_t *)(uintptr_t)(umsg + 4), 1) < 0) {
+            /* The record is consumed; so are its fds, or they would ride
+             * with the NEXT record. */
+            proc_file_t got[SCM_MAX_FDS];
+            int ngot = usocket_recv_fds(us, got, SCM_MAX_FDS);
+            for (int k = 0; k < ngot; k++) fd_release(&got[k]);
             return -14;
+        }
     } else {
         uint32_t zero = 0;
         copy_to_user((void *)(uintptr_t)(umsg + 4), &zero, 4);
@@ -8361,6 +8482,7 @@ static int usock_call(int call, uint32_t *kargs, usocket_t *us, int nb,
         /* sendmsg: parse SCM_RIGHTS cmsg(s), retain the named fds. */
         proc_file_t pass[SCM_MAX_FDS];
         int npass = (call == 16) ? usock_collect_fds(uctrl, uctrllen, pass) : 0;
+        if (npass < 0) return npass;          /* nothing queued, nothing sent */
 
         /* Linux attaches the fds to the FIRST skb of the message
          * (unix_stream_sendmsg), so the batch goes in BEFORE the bytes it
@@ -8370,10 +8492,16 @@ static int usock_call(int call, uint32_t *kargs, usocket_t *us, int nb,
          * them to a plain read().  If the data cannot be written at all,
          * scm_abort() takes the batch back out. */
         uint32_t scm_id = 0;
-        if (call == 16 && npass > 0 &&
-            usocket_send_fds(us, pass, npass, &scm_id) < 0) {
-            for (int k = 0; k < npass; k++) fd_release(&pass[k]);
-            npass = 0;                  /* the data still goes out */
+        if (call == 16 && npass > 0) {
+            int sr = usocket_send_fds(us, pass, npass, &scm_id);
+            if (sr < 0) {
+                for (int k = 0; k < npass; k++) fd_release(&pass[k]);
+                npass = 0;
+                /* A reader that is gone makes the write below fail with
+                 * EPIPE (and SIGPIPE) as usual; any other failure fails the
+                 * call rather than send the data without its fds. */
+                if (sr != -32) return sr;
+            }
         }
 
         int total = 0, eagain = 0;
@@ -8407,6 +8535,11 @@ static int usock_call(int call, uint32_t *kargs, usocket_t *us, int nb,
             total += n;
             if (n < len) break;          /* short read/write — stop */
             if (mflags & USOCK_PEEK) break;   /* peek does not advance */
+            /* Once some bytes have moved, the rest of the call must not
+             * block (a recvmsg returns what is there, as Linux's single
+             * read_iter pass does) nor raise SIGPIPE (Linux: only when
+             * nothing was sent). */
+            mflags |= (call == 17) ? USOCK_NONBLOCK : USOCK_NOSIGNAL;
             /* One message's ancillary data per recvmsg: stop rather than
              * read into a second batch whose fds this call cannot also
              * deliver (Linux breaks its loop on !unix_skb_scm_eq). */
@@ -8439,6 +8572,104 @@ static int usock_call(int call, uint32_t *kargs, usocket_t *us, int nb,
     if (call == 15)                      /* getsockopt */
         return usock_getsockopt(us, kargs);
     return -22;
+}
+
+/* sendmsg/recvmsg on an AF_INET socket: the iovecs gathered/scattered through
+ * the same send/recv paths as send()/recv(), msg_name as sendto()/recvfrom().
+ * A UDP datagram is one net_socket_sendto/recvfrom over the whole iovec array
+ * (so it is never split or glued); a TCP stream goes segment by segment, and
+ * once some bytes have moved the rest neither blocks (recv) nor raises
+ * SIGPIPE (send), as Linux's single tcp_sendmsg/tcp_recvmsg pass.  Control
+ * data (IP_PKTINFO and friends) is not supported: on send it is ignored, on
+ * receive msg_controllen comes back 0. */
+static int inet_msg(int call, uint32_t *kargs, proc_file_t *f) {
+    uint32_t umsg = kargs[1];
+    uint32_t mh[7];                 /* name,namelen,iov,iovlen,control,controllen,flags */
+    if (copy_from_user(mh, (void *)(uintptr_t)umsg, sizeof(mh)) < 0) return -14;
+    net_socket_t *so = f->socket;
+    int stream = net_socket_is_stream(so);
+    int mflags = (int)(kargs[2] & (NET_MSG_PEEK | NET_MSG_DONTWAIT |
+                                   NET_MSG_WAITALL | SOCK_MSG_NOSIGNAL));
+    if (f->flags & O_NONBLOCK) mflags |= NET_MSG_DONTWAIT;
+    usock_iov_t *iv = NULL;
+    int r = usock_iov_from_user(mh[2], mh[3], &iv);
+    if (r < 0) return r;
+    int niov = (int)mh[3];
+    uint32_t total = 0;
+    for (int i = 0; i < niov; i++) total += iv[i].len;
+
+    net_sockaddr_in_t kaddr, *pa = NULL;
+    if (call == 16 && mh[0] && mh[1]) {
+        if (mh[1] < sizeof(kaddr)) { kfree(iv); return -22; }
+        if (copy_from_user(&kaddr, (void *)(uintptr_t)mh[0], sizeof(kaddr)) < 0) {
+            kfree(iv); return -14;
+        }
+        pa = &kaddr;
+    }
+
+    net_socket_retain(so);          /* the descriptor may close while we sleep */
+    int done = 0;
+    if (!stream) {
+        /* One datagram over the whole array, through a kernel buffer. */
+        uint32_t cap = total ? total : 1;
+        if (cap > 65536) cap = 65536;
+        uint8_t *kb = (uint8_t *)kmalloc(cap);
+        if (!kb) { r = -12; goto out; }
+        if (call == 16) {
+            uint32_t off = 0;
+            if (total > cap) { kfree(kb); r = -90; goto out; }       /* -EMSGSIZE */
+            for (int i = 0; i < niov && r >= 0; i++) {
+                if (iv[i].len && copy_from_user(kb + off, iv[i].base, iv[i].len) < 0)
+                    r = -14;
+                off += iv[i].len;
+            }
+            if (r >= 0) r = net_socket_sendto(so, kb, total, pa, mflags);
+        } else {
+            r = net_socket_recvfrom(so, kb, total < cap ? total : cap,
+                                    mh[0] ? &kaddr : NULL, mflags);
+            uint32_t left = r > 0 ? (uint32_t)r : 0, off = 0;
+            for (int i = 0; i < niov && left; i++) {
+                uint32_t c = iv[i].len < left ? iv[i].len : left;
+                if (copy_to_user(iv[i].base, kb + off, c) < 0) { r = -14; break; }
+                off += c; left -= c;
+            }
+            if (r >= 0) pa = mh[0] ? &kaddr : NULL;
+        }
+        kfree(kb);
+        done = r;
+    } else {
+        for (int i = 0; i < niov; i++) {
+            if (!iv[i].len) continue;
+            int n = (call == 16)
+                ? sock_send_user(so, iv[i].base, iv[i].len, NULL, mflags)
+                : sock_recv_user(so, iv[i].base, iv[i].len, NULL, mflags);
+            if (n < 0) { if (!done) r = n; break; }
+            done += n;
+            if ((uint32_t)n < iv[i].len || (mflags & NET_MSG_PEEK)) break;
+            if (call == 16) mflags |= SOCK_MSG_NOSIGNAL;
+            else if (!(mflags & NET_MSG_WAITALL)) mflags |= NET_MSG_DONTWAIT;
+        }
+        if (done) r = done;
+        else if (r >= 0) r = 0;
+    }
+    if (r >= 0 && call == 17) {
+        /* msg_name: the datagram's source; a stream reports none (Linux
+         * tcp_recvmsg leaves msg_namelen 0). */
+        uint32_t nl = 0, zero = 0;
+        if (pa) {
+            nl = sizeof(kaddr);
+            uint32_t want = mh[1] < nl ? mh[1] : nl;
+            if (want && copy_to_user((void *)(uintptr_t)mh[0], &kaddr, want) < 0) r = -14;
+        }
+        if (copy_to_user((void *)(uintptr_t)(umsg + 4), &nl, 4) < 0 ||
+            copy_to_user((void *)(uintptr_t)(umsg + 20), &zero, 4) < 0 ||
+            copy_to_user((void *)(uintptr_t)(umsg + 24), &zero, 4) < 0)
+            r = -14;
+    }
+out:
+    net_socket_release(so);
+    kfree(iv);
+    return r;
 }
 
 static int socketcall_core_inner(int call, uint32_t *kargs) {
@@ -8679,6 +8910,9 @@ static int socketcall_core_inner(int call, uint32_t *kargs) {
         if (copy_to_user(ulen, &klen, sizeof(klen)) < 0) return -14;
         return 0;
     }
+
+    if (call == 16 || call == 17)   /* sendmsg / recvmsg */
+        return inet_msg(call, kargs, f);
 
     if (call == 4 || call == 5 || call == 8)
         return -95;
