@@ -284,6 +284,30 @@ real network included (QEMU's slirp routes it):
 python3 tools/smoke_firefox.py --net --type $'https://example.com/\n' --type-settle 60
 ```
 
+### Real websites (manual only)
+
+`--sites` (implies `--net`) drives Firefox through real sites over the live
+internet. It is **never** part of a default smoke target, since what a live
+site serves changes from day to day, and it reports what happened instead of
+judging it. Keep it to a few loads per site.
+
+```sh
+python3 tools/smoke_firefox.py --sites default          # Wikipedia, gnu.org, HN, DDG html, GitHub
+python3 tools/smoke_firefox.py --sites "https://www.gnu.org/|Philosophy,https://example.com/"
+```
+
+For each `URL[|link text]` it types the URL, presses Enter (and presses it
+again, counted as `Enter xN`, if the screen does not move at all), then waits
+for the frame to **settle**: three identical screendumps in a row, so a
+spinning tab throbber still counts as loading. Then it presses PageDown twice
+and, when a link text is given, follows that link with Firefox's quick find
+for links (`'` + text + Enter), timing it the same way. `summary.txt` gets one
+`site` line per URL: time from Enter to a settled frame, how much of the screen
+PageDown moved, the link's settle time, and any `[SIG]` kill, `ff` restart,
+`[SYSCALL] unimplemented` (ENOSYS), `[OOM]` or panic line printed during that site. The frames are saved as
+`site-N-load.png`, `site-N-scroll.png` and `site-N-click.png`.
+`--site-timeout` (150 s) bounds each wait.
+
 `/disk/ffcfg/ffmozlogfile` (one line, e.g. `/disk/ffout/moz.log`) moves
 Firefox's MOZ_LOG onto the ext2 disk, where it survives the run; read it
 back from the image with `debugfs -R "dump ffout/moz.log.moz_log out.log"`.

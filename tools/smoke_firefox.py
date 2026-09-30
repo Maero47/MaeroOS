@@ -580,6 +580,7 @@ class Run:
         self.wedge_qmp = None
         self.type_note = None
         self.web_notes = []
+        self.site_rows = []
         self.key_notes = None
         self.key_ok = None
 
@@ -747,6 +748,12 @@ class Run:
             L.append("typing      : %s" % self.type_note)
         for n in self.web_notes:
             L.append("web         : %s" % n)
+            L.append("")
+        for r in self.site_rows:
+            L.append("site        : %s" % site_row_text(r))
+            for l in r.get("sig", [])[:10]:
+                L.append("                %s" % l)
+        if self.site_rows:
             L.append("")
         if self.wedge_qmp:
             L.append("wedge capture : %s" % self.wedge_qmp)
@@ -1019,6 +1026,195 @@ def type_into_guest(qmp, args, run, pump, shot):
     print("smoke-firefox: %s" % run.type_note)
 
 
+# ── --sites: real-world pages (manual, needs the live internet) ─────────
+# Never part of a default smoke target: what a live site serves changes from
+# day to day, so this mode reports what happened instead of judging it.
+DEFAULT_SITES = [
+    ("https://en.wikipedia.org/wiki/Operating_system", "Kernel"),
+    ("https://www.gnu.org/", "Philosophy"),
+    ("https://news.ycombinator.com/", "past"),
+    ("https://duckduckgo.com/html/", "About"),
+    ("https://github.com/", "Pricing"),
+]
+
+
+def frame_diff(a, b, step=7):
+    """Fraction (0..1) of sampled pixels that differ between two frames."""
+    if not a or not b or a[:2] != b[:2]:
+        return 1.0
+    ra, rb = a[2], b[2]
+    n = diff = 0
+    for i in range(0, len(ra) - 2, 3 * step):
+        n += 1
+        if ra[i] != rb[i] or ra[i + 1] != rb[i + 1] or ra[i + 2] != rb[i + 2]:
+            diff += 1
+    return diff / max(n, 1)
+
+
+def parse_sites(spec):
+    """'default' or a comma list of URL[|link text]."""
+    if spec in ("default", "all", ""):
+        return list(DEFAULT_SITES)
+    out = []
+    for item in spec.split(","):
+        url, _, link = item.partition("|")
+        out.append((url.strip(), link.strip() or None))
+    return out
+
+
+def settle(qmp, pump, tmpdir, base, timeout, gap=2.0, still=3):
+    """Sample the screen until it differs from `base` and then stays pixel-for-
+    pixel identical for `still` consecutive samples (a spinning tab throbber
+    keeps a loading page "unsettled").  Returns (frame, t_first_change,
+    t_settled, alive) with times relative to the call."""
+    t0 = time.time()
+    prev, t_change, t_settled, n_still, t_still = None, None, None, 0, None
+    alive = True
+    while time.time() - t0 < timeout:
+        if not pump(gap):
+            alive = False
+            break
+        p = qmp.screendump_ppm(os.path.join(tmpdir, "s.ppm"))
+        fr = read_ppm(p) if p else None
+        if fr is None:
+            continue
+        now = time.time() - t0
+        if t_change is None and frame_diff(fr, base) > 0.002:
+            t_change = now
+        if t_change is not None and prev is not None and fr[2] == prev[2]:
+            n_still += 1
+            if n_still >= still:
+                t_settled = t_still
+                prev = fr
+                break
+        else:
+            n_still, t_still = 0, now
+        prev = fr
+    return prev, t_change, t_settled, alive
+
+
+def press_enter(qmp, pump, tmpdir, base, retries=2, wait=6.0):
+    """Enter, and again if the screen has not moved at all within `wait` s
+    (the dropdown closing is enough).  Returns how many Enters were needed."""
+    for k in range(1 + retries):
+        qmp.hmp("sendkey ret")
+        end = time.time() + wait
+        while time.time() < end:
+            pump(1.0)
+            p = qmp.screendump_ppm(os.path.join(tmpdir, "e.ppm"))
+            fr = read_ppm(p) if p else None
+            if fr and frame_diff(fr, base) > 0.002:
+                return k + 1
+    return 0
+
+
+def sites_run(qmp, args, run, pump):
+    """Load each site, time it to a settled frame, PageDown twice, then follow
+    a link through Firefox's quick-find-links (') + Enter.  Evidence per site:
+    site-N-load.png, site-N-scroll.png, site-N-click.png and a summary row."""
+    tmpdir = tempfile.mkdtemp(prefix="ffsites-")
+    try:
+        for n, (url, link) in enumerate(parse_sites(args.sites), 1):
+            print("smoke-firefox: --sites [%d] %s" % (n, url))
+            row = {"url": url, "n": n}
+            first_line = len(run.lines)
+            try:
+                send_text(qmp, args, pump, url)
+            except ValueError as exc:
+                row["note"] = str(exc)
+                run.site_rows.append(row)
+                continue
+            pump(2.0)
+            p = qmp.screendump_ppm(os.path.join(tmpdir, "b.ppm"))
+            base = read_ppm(p) if p else None
+            t_enter = time.time()
+            row["enters"] = press_enter(qmp, pump, tmpdir, base)
+            off = time.time() - t_enter
+            fr, tc, ts, alive = settle(qmp, pump, tmpdir, base, args.site_timeout)
+            row["settled"] = None if ts is None else ts + off
+            if fr:
+                pth = os.path.join(args.outdir, "site-%d-load.png" % n)
+                write_png(pth, fr)
+                run.shots["site-%d-load" % n] = pth
+            if alive:
+                before = fr
+                for _ in range(2):
+                    qmp.hmp("sendkey pgdn")
+                    pump(3.0)
+                p = qmp.screendump_ppm(os.path.join(tmpdir, "c.ppm"))
+                fr2 = read_ppm(p) if p else None
+                row["scroll_diff"] = frame_diff(fr2, before) if fr2 else None
+                if fr2:
+                    pth = os.path.join(args.outdir, "site-%d-scroll.png" % n)
+                    write_png(pth, fr2)
+                    run.shots["site-%d-scroll" % n] = pth
+                if link:
+                    qmp.hmp("sendkey home")
+                    pump(2.0)
+                    try:
+                        keys = qemu_keys_for("'" + link)
+                    except ValueError:
+                        keys = []
+                    for k in keys:
+                        qmp.hmp("sendkey " + k)
+                        pump(args.type_delay)
+                    pump(2.0)
+                    p = qmp.screendump_ppm(os.path.join(tmpdir, "d.ppm"))
+                    base2 = read_ppm(p) if p else fr2
+                    t_enter = time.time()
+                    row["click_enters"] = press_enter(qmp, pump, tmpdir, base2)
+                    off = time.time() - t_enter
+                    fr3, tc3, ts3, alive = settle(qmp, pump, tmpdir, base2, args.site_timeout)
+                    row["link"] = link
+                    row["click_settled"] = None if ts3 is None else ts3 + off
+                    if fr3:
+                        pth = os.path.join(args.outdir, "site-%d-click.png" % n)
+                        write_png(pth, fr3)
+                        run.shots["site-%d-click" % n] = pth
+            lines = [l for _, l in run.lines[first_line:]]
+            row["sig"] = [l for l in lines if SIG_KILLED.search(l)]
+            row["ff_events"] = [l for l in lines if FF_STALLED in l or FF_EXITED in l or FF_CRASHREP in l]
+            row["enosys"] = [l for l in lines if "ENOSYS" in l or "[SYSCALL] unimplemented" in l]
+            row["oom"] = sum(1 for l in lines if l.startswith("[OOM]"))
+            row["panic"] = any(PANIC in l for l in lines)
+            run.site_rows.append(row)
+            print("smoke-firefox:   %s" % site_row_text(row))
+            if not alive or row["panic"]:
+                break
+            # back to a blank page so the next site's first change is its own
+            send_text(qmp, args, pump, "about:blank")
+            pump(1.0)
+            qmp.hmp("sendkey ret")
+            pump(5.0)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def site_row_text(r):
+    def s(t):
+        return "%.0fs" % t if t is not None else "never"
+    parts = ["[%d] %s" % (r["n"], r["url"]),
+             "Enter x%s, settled +%s" % (r.get("enters"), s(r.get("settled")))]
+    if r.get("scroll_diff") is not None:
+        parts.append("PageDown moved %.0f%% of the screen" % (100 * r["scroll_diff"]))
+    if r.get("link"):
+        parts.append("link %r: Enter x%s, settled +%s" % (r["link"], r.get("click_enters"),
+                                                            s(r.get("click_settled"))))
+    if r.get("sig"):
+        parts.append("%d [SIG] kill(s)" % len(r["sig"]))
+    if r.get("ff_events"):
+        parts.append("ff: " + "; ".join(r["ff_events"]))
+    if r.get("enosys"):
+        parts.append("ENOSYS: " + "; ".join(r["enosys"]))
+    if r.get("oom"):
+        parts.append("%d [OOM] line(s)" % r["oom"])
+    if r.get("panic"):
+        parts.append("KERNEL PANIC")
+    if r.get("note"):
+        parts.append(r["note"])
+    return " | ".join(parts)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--accel", default=None, help="kvm, tcg, or any QEMU -accel value (default: kvm if usable else tcg)")
@@ -1064,11 +1260,17 @@ def main():
                     help="seconds from Enter to the page's image on screen (default 240)")
     ap.add_argument("--font-timeout", type=float, default=60.0,
                     help="seconds after the image appears to wait for the page's font report (default 60)")
+    ap.add_argument("--sites", default=None, metavar="LIST",
+                    help="(implies --net; needs the live internet; manual only) after the paint, "
+                         "load each site, time it to a settled frame, PageDown, and follow a link "
+                         "via quick find. LIST is 'default' or a comma list of URL[|link text]")
+    ap.add_argument("--site-timeout", type=float, default=150.0,
+                    help="seconds to wait for a site's frame to settle (default 150)")
     ap.add_argument("-v", "--verbose", action="store_true", help="echo every serial line")
     args = ap.parse_args()
 
     os.chdir(ROOT)
-    if args.web:
+    if args.web or args.sites:
         args.net = True
     accel = args.accel or ("kvm" if kvm_usable() else "tcg")
     is_kvm = accel.split(",")[0] == "kvm"
@@ -1211,6 +1413,8 @@ def main():
                 type_into_guest(qmp, args, run, pump, shot)
             if args.keycheck:
                 run_key_checks(qmp, args, run, pump)
+            if args.sites:
+                sites_run(qmp, args, run, pump)
             if args.web:
                 web = WebServer()
                 try:

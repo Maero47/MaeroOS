@@ -86,6 +86,10 @@ PROBES = {
     # kernel to still fork and exec.  Hundreds of MiB are zeroed and freed
     # under TCG, so it is the slowest probe in the set.
     "p28_alloc_failure":       (300, ""),
+    # Writes a 288 MiB /tmp file (bigger than the kernel heap window) three
+    # times; under TCG that is the bulk of its time.
+    "p29_tmpfs_big_file":      (240, ""),
+    "p30_waitid":              (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

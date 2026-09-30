@@ -523,9 +523,13 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
             /* Fatal signal with the default disposition: Linux get_signal()
              * calls do_group_exit(signr), so the WHOLE thread group dies with
              * this signal as its wait status (kernel/signal.c complete_signal
-             * + zap_other_threads), not just the thread it was queued on. */
-            printk("[SIG] pid=%d tgid=%d killed by signal %d\n",
-                   current_proc->pid, current_proc->tgid, sig);
+             * + zap_other_threads), not just the thread it was queued on.
+             * The SIGKILL a group exit queues on the other threads is not a
+             * kill: logging it made every clean exit_group() of a Firefox
+             * content process look like a dozen threads SIGKILLed. */
+            if (sig != SIGKILL || !proc_group_leader(current_proc)->group_exit)
+                printk("[SIG] pid=%d tgid=%d killed by signal %d\n",
+                       current_proc->pid, current_proc->tgid, sig);
             proc_group_exit(sig & 0x7f);
         }
     }

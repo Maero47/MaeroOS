@@ -6066,6 +6066,146 @@ static int sys_wait4(registers_t *regs) {
     return sys_waitpid(regs);
 }
 
+/* ── sys_waitid(idtype, id, infop, options, rusage) — EAX=284 ─────────────
+ * Linux kernel/exit.c: the same wait set as waitpid (see sys_waitpid), with
+ * the result reported as a SIGCHLD siginfo instead of a status word, and
+ * WNOWAIT, which reports a child without reaping it.  Firefox's IPC process
+ * watcher (base::IsProcessDead) asks exactly that - waitid(P_PID, pid,
+ * WEXITED | WNOWAIT | WNOHANG) - to learn whether a content process has
+ * exited while leaving the reaping to its waitpid; with -ENOSYS every such
+ * check came back as an error ("[SYSCALL] unimplemented 284" once per boot,
+ * on every page load). */
+#define WSTOPPED_W   2
+#define WEXITED_W    4
+#define WCONTINUED_W 8
+#define WNOWAIT_W    0x01000000
+#define P_ALL_W  0
+#define P_PID_W  1
+#define P_PGID_W 2
+#define CLD_EXITED_W  1
+#define CLD_KILLED_W  2
+#define CLD_DUMPED_W  3
+#define CLD_STOPPED_W 5
+
+/* Fill the SIGCHLD siginfo for child `p` (i386 layout: signo, errno, code,
+ * then si_pid, si_uid, si_status at 12/16/20; 128 bytes in all). */
+static int waitid_report(void *infop, struct proc *p, int code, int status) {
+    if (!infop) return 0;
+    int32_t si[32];
+    __builtin_memset(si, 0, sizeof si);
+    si[0] = SIGCHLD;
+    si[2] = code;
+    si[3] = p->pid;
+    si[4] = (int32_t)p->uid;
+    si[5] = status;
+    return copy_to_user(infop, si, sizeof si);
+}
+
+static int sys_waitid(registers_t *regs) {
+    int      idtype  = (int)regs->ebx;
+    int      id      = (int)regs->ecx;
+    void    *infop   = (void *)(uintptr_t)regs->edx;
+    int      options = (int)regs->esi;
+    void    *ru      = (void *)(uintptr_t)regs->edi;
+
+    /* __WNOTHREAD/__WALL/__WCLONE are accepted and change nothing here. */
+    if (options & ~(WNOHANG | WSTOPPED_W | WEXITED_W | WCONTINUED_W | WNOWAIT_W |
+                    0x20000000 | 0x40000000 | (int)0x80000000))
+        return -22;                                          /* -EINVAL */
+    if (!(options & (WSTOPPED_W | WEXITED_W | WCONTINUED_W)))
+        return -22;
+    if (idtype == P_PID_W) {
+        if (id <= 0) return -22;
+    } else if (idtype == P_PGID_W) {
+        if (id < 0) return -22;
+        if (id == 0) id = current_proc->pgrp;
+    } else if (idtype != P_ALL_W) {
+        return -22;                                          /* incl. P_PIDFD */
+    }
+    if (infop && !access_ok(infop, 128)) return -14;
+    if (ru) {
+        uint8_t z[72];
+        __builtin_memset(z, 0, sizeof z);
+        int cr = copy_to_user(ru, z, sizeof z);
+        if (cr < 0) return cr;
+    }
+
+    struct proc *me = proc_group_leader(current_proc);
+    int my_tgid = current_proc->tgid;
+
+    for (;;) {
+        int found_child = 0;
+        for (int i = 0; i < MAX_PROCS; i++) {
+            struct proc *p = &ptable[i];
+            if (p->state == PROC_UNUSED) continue;
+            if (!p->parent || p->parent->tgid != my_tgid) continue;
+            if (p->pid != p->tgid) continue;               /* threads: never */
+            if (idtype == P_PID_W && p->pid != id) continue;
+            if (idtype == P_PGID_W && p->pgrp != id) continue;
+            found_child = 1;
+
+            if ((options & WEXITED_W) && p->state == PROC_ZOMBIE) {
+                if (!proc_group_empty(p)) continue;        /* siblings still exiting */
+                int st = p->exit_status;
+                int code = (st & 0x7f) == 0 ? CLD_EXITED_W
+                         : (st & 0x80) ? CLD_DUMPED_W : CLD_KILLED_W;
+                int val = code == CLD_EXITED_W ? (st >> 8) & 0xff : st & 0x7f;
+                int cr = waitid_report(infop, p, code, val);
+                if (cr < 0) return cr;
+                if (!(options & WNOWAIT_W)) proc_release(p);
+                return 0;
+            }
+            if ((options & WSTOPPED_W) && p->state == PROC_STOPPED &&
+                !p->stop_reported) {
+                int cr = waitid_report(infop, p, CLD_STOPPED_W,
+                                       p->stop_sig ? p->stop_sig : SIGSTOP);
+                if (cr < 0) return cr;
+                if (!(options & WNOWAIT_W)) p->stop_reported = 1;
+                return 0;
+            }
+        }
+
+        if (!found_child)
+            return -10;                                      /* -ECHILD */
+
+        if (options & WNOHANG) {
+            /* Nothing to report: Linux clears signo/errno/code/pid/uid/
+             * status, and si_pid == 0 is how the caller tells "still
+             * running" from a report. */
+            if (infop) {
+                int32_t z[6] = { 0, 0, 0, 0, 0, 0 };
+                int cr = copy_to_user(infop, z, sizeof z);
+                if (cr < 0) return cr;
+            }
+            return 0;
+        }
+
+        if (signal_interrupt_pending(current_proc))
+            return -4;                                       /* -EINTR */
+        sleep_on(me);
+    }
+}
+
+/* ── sys_getrusage(who, usage) — EAX=77 ────────────────────────────────────
+ * struct rusage on i386 is two timevals and fourteen longs (72 bytes).  Only
+ * user CPU time is accounted (utime_ticks), so that is what is reported for
+ * RUSAGE_SELF (the thread group) and RUSAGE_THREAD; the rest reads zero.
+ * Firefox calls it for its CPU-time telemetry. */
+static int sys_getrusage(registers_t *regs) {
+    int   who = (int)regs->ebx;
+    void *ru  = (void *)(uintptr_t)regs->ecx;
+    uint32_t t;
+    if (who == 0)       t = cputime_ticks(current_proc->tgid, 0);   /* SELF */
+    else if (who == 1)  t = cputime_ticks(0, current_proc->pid);    /* THREAD */
+    else if (who == -1) t = 0;                                      /* CHILDREN */
+    else return -22;
+    int32_t r[18];
+    __builtin_memset(r, 0, sizeof r);
+    r[0] = (int32_t)(t / TICK_HZ);
+    r[1] = (int32_t)((t % TICK_HZ) * (1000000U / TICK_HZ));
+    return copy_to_user(ru, r, sizeof r);
+}
+
 /* ── sched_get_priority_max/min(policy) — EAX=159/160 ─────────────────────
  * The static priority range per policy (kernel/sched/syscalls.c): 1..99 for
  * SCHED_FIFO(1)/SCHED_RR(2), 0 for SCHED_OTHER(0)/BATCH(3)/IDLE(5)/
@@ -8676,6 +8816,8 @@ void syscall_dispatch(registers_t *regs) {
     case 106: ret = sys_stat(regs);            break;
     case 108: ret = sys_fstat(regs);           break;
     case 114: ret = sys_wait4(regs);           break;
+    case 284: ret = sys_waitid(regs);          break;
+    case 77:  ret = sys_getrusage(regs);       break;
     case 119: sys_sigreturn(regs);             return; /* regs fully restored —
         the dispatcher must NOT stomp the restored eax with its ret value */
     case 120: ret = sys_clone(regs);           break;
