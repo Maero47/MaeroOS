@@ -4,6 +4,11 @@
  * kprof's probe spans and periodic dump.  Off by default so normal runs are
  * neither slowed nor spammed; `make KTRACE=1` builds them in.  Boot-time and
  * one-shot messages stay plain printk. */
+/* `make KHEAP_TEST=1`: kernel heap self-test at boot plus free-memory
+ * poisoning (mm/heap.c).  Debug builds only. */
+#ifndef KHEAP_TEST
+#define KHEAP_TEST 0
+#endif
 #ifndef KTRACE
 #define KTRACE 0
 #endif

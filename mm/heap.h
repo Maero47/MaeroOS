@@ -26,3 +26,25 @@ size_t heap_headroom(void);
 void *kcalloc(size_t count, size_t size);
 void *krealloc(void *ptr, size_t size);
 void  kfree(void *ptr);
+
+/* A snapshot of the heap's bookkeeping.  used_bytes is payload in live
+ * allocations (rounded up to 8), so after any balanced sequence of allocations
+ * and frees it returns to its starting value. */
+struct heap_stats {
+    size_t   mapped;        /* bytes of the heap window mapped so far */
+    size_t   used_bytes;
+    size_t   free_bytes;
+    uint32_t used_blocks;
+    uint32_t free_blocks;
+};
+void heap_stats(struct heap_stats *s);
+
+/* Walk every block and free list and panic on any broken invariant.  Returns
+ * the number of blocks.  O(heap): debugging and the self-test only. */
+int  heap_check(void);
+
+#if defined(KHEAP_TEST) && KHEAP_TEST
+/* `make KHEAP_TEST=1`: randomised alloc/free/realloc stress with content and
+ * leak checks, run from kmain right after heap_init. */
+void heap_selftest(void);
+#endif

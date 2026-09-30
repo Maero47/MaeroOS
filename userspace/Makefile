@@ -51,7 +51,7 @@ USER_BINS := $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
 	     $(TESTFILES)/diff $(TESTFILES)/tar \
 	     $(TESTFILES)/mkfifo $(TESTFILES)/ln $(TESTFILES)/readlink \
 	     $(TESTFILES)/sysprobe $(TESTFILES)/fcprobe $(TESTFILES)/lspci $(TESTFILES)/ifconfig \
-	     $(TESTFILES)/diskprobe $(TESTFILES)/fsprobe $(TESTFILES)/respawnprobe \
+	     $(TESTFILES)/diskprobe $(TESTFILES)/fsprobe $(TESTFILES)/respawnprobe $(TESTFILES)/heapprobe \
 	     $(TESTFILES)/sockprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget \
 	     $(TESTFILES)/randprobe $(TESTFILES)/sysmiscprobe $(TESTFILES)/abi2probe $(TESTFILES)/sigexecprobe \
 	     $(TESTFILES)/fbtest $(TESTFILES)/evtest $(TESTFILES)/mousetest \
@@ -393,6 +393,13 @@ respawnprobe/respawnprobe.o: respawnprobe/respawnprobe.c
 
 $(TESTFILES)/respawnprobe: $(CRT0_OBJ) respawnprobe/respawnprobe.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) respawnprobe/respawnprobe.o libc/libc.a
+
+# heapprobe
+heapprobe/heapprobe.o: heapprobe/heapprobe.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TESTFILES)/heapprobe: $(CRT0_OBJ) heapprobe/heapprobe.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) heapprobe/heapprobe.o libc/libc.a
 
 # svc
 svc/svc.o: svc/svc.c auth/replace.h

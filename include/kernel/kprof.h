@@ -50,7 +50,9 @@ enum {
     KPE_PF_FILE_SEQ,        /* file fault on the page after the previous one */
     KPE_PF_FILE_AROUND,     /* pages populated by fault-around, not faulted  */
     KPE_KMALLOC,            /* kmalloc/kmalloc_try calls                     */
-    KPE_HEAP_WALK,          /* heap blocks first_fit stepped over            */
+    KPE_HEAP_WALK,          /* heap lookup steps: one per class lookup, plus  */
+                            /* one per free block scanned in the fallback     */
+    KPE_KFREE,              /* kfree calls                                   */
     KPE_MAX
 };
 
@@ -89,6 +91,8 @@ enum {
     KPP_SCHED_FPUSAVE,  /* fxsave per switch                                 */
     KPP_DUMP,           /* the profiler's own periodic dump (printk to serial) */
     KPP_CALIB,          /* an empty span: the cost of a probe pair itself      */
+    KPP_KMALLOC,        /* kmalloc/kmalloc_try, interrupts-off part            */
+    KPP_KFREE,          /* kfree, interrupts-off part                          */
     KPP_MAX
 };
 
