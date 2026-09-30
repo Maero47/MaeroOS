@@ -3,6 +3,7 @@
 #include "../include/fcntl.h"
 #include "../include/unistd.h"
 #include "../include/signal.h"
+#include "../include/errno.h"
 
 #define NAME_MAX_LEN 32
 
@@ -53,7 +54,7 @@ static int read_name(char *buf, int cap) {
     char c;
     while (1) {
         int r = read(0, &c, 1);
-        if (r == 0) return -2;
+        if (r == 0 || (r < 0 && errno == EINTR)) return -2;
         if (r != 1) return -1;
         if (c == '\n' || c == '\r') break;
         if (n < cap - 1) buf[n++] = c;
@@ -77,6 +78,19 @@ static int valid_name(const char *s) {
     return 1;
 }
 
+/* ^C/^\/^Z are caught, not ignored: the console restarts a read the signal
+ * would not otherwise disturb (Linux -ERESTARTSYS), so only a handler
+ * installed without SA_RESTART ends it — with EINTR, a cancelled line. */
+static void on_console_sig(int sig) { (void)sig; }
+
+static void catch_console_sig(int sig) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_console_sig;
+    sa.sa_flags   = 0;
+    sigaction(sig, &sa, 0);
+}
+
 int main(int argc, char *argv[]) {
     const char *tty = argc > 1 ? argv[1] : "tty0";
     int disk_login = access("/disk/login", X_OK) == 0;
@@ -86,10 +100,11 @@ int main(int argc, char *argv[]) {
 
     /* ^C/^Z/^\ on the console must not kill or stop getty: a killed getty
      * is a rapid exit to init, and a stopped one is a console nobody
-     * respawns.  login ignores them too (exec resets dispositions here). */
-    signal(SIGINT, SIG_IGN);
-    signal(SIGQUIT, SIG_IGN);
-    signal(SIGTSTP, SIG_IGN);
+     * respawns.  They end a pending read as a cancelled line (see
+     * catch_console_sig); login handles them the same way. */
+    catch_console_sig(SIGINT);
+    catch_console_sig(SIGQUIT);
+    catch_console_sig(SIGTSTP);
     signal(SIGTTIN, SIG_IGN);
     signal(SIGTTOU, SIG_IGN);
 
@@ -121,6 +136,11 @@ int main(int argc, char *argv[]) {
         break;
     }
 
+    /* exec resets a caught signal to its default but keeps SIG_IGN: ignore
+     * them across the exec so login cannot be killed before it catches them. */
+    signal(SIGINT, SIG_IGN);
+    signal(SIGQUIT, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
     char *login_argv[] = { login_path, name, (char *)0 };
     execve(login_path, login_argv, envp);
     printf("getty: failed to exec %s\n", login_path);

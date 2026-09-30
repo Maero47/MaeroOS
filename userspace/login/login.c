@@ -160,14 +160,28 @@ static void build_env(void) {
 /* Console job-control signals.  Until the user's shell runs they are
  * ignored: ^C or ^Z at "Password:" must not kill login (a rapid exit init
  * counts toward parking the console) or stop it (nobody would respawn it,
- * and echo would stay off).  The console then ends the read with 0 bytes,
- * and login fails with "password required".  The shell gets the defaults
+ * and echo would stay off).  ^C/^\/^Z are caught by a handler without
+ * SA_RESTART, so the console read they interrupt fails with EINTR (an
+ * ignored signal would just restart it) and login fails with "password
+ * required"; SIGTTIN/SIGTTOU are ignored.  The shell gets the defaults
  * back. */
 static const int console_sigs[] = { SIGINT, SIGQUIT, SIGTSTP, SIGTTIN, SIGTTOU };
 
-static void set_console_sigs(void (*handler)(int)) {
-    for (unsigned i = 0; i < sizeof(console_sigs) / sizeof(console_sigs[0]); i++)
-        signal(console_sigs[i], handler);
+static void on_console_sig(int sig) { (void)sig; }
+
+static void set_console_sigs(int catch_them) {
+    for (unsigned i = 0; i < sizeof(console_sigs) / sizeof(console_sigs[0]); i++) {
+        int sig = console_sigs[i];
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        if (!catch_them)
+            sa.sa_handler = SIG_DFL;
+        else if (sig == SIGTTIN || sig == SIGTTOU)
+            sa.sa_handler = SIG_IGN;
+        else
+            sa.sa_handler = on_console_sig;       /* no SA_RESTART */
+        sigaction(sig, &sa, 0);
+    }
 }
 
 /* A rejected login waits before it exits, as shadow's FAIL_DELAY does: it
@@ -184,7 +198,7 @@ int main(int argc, char *argv[]) {
     const char *name = "root";
     char password[128];
 
-    set_console_sigs(SIG_IGN);
+    set_console_sigs(1);
 
     if (argc > 1 && strcmp(argv[1], "--check") == 0) {
         if (argc < 4) {
@@ -267,7 +281,7 @@ int main(int argc, char *argv[]) {
     printf("login: %s accepted\n", username);
 
     char *shell_argv[] = { shell_path, (char *)0 };
-    set_console_sigs(SIG_DFL);
+    set_console_sigs(0);
     execve(shell_path, shell_argv, envp);
     printf("login: failed to exec %s\n", shell_path);
     return 1;
