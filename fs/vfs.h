@@ -9,6 +9,9 @@
 #define VFS_FLAG_PIPE    0x5
 #define VFS_FLAG_SYMLINK 0x6
 #define VFS_FLAG_FIFO    0x7   /* named pipe (FIFO) */
+/* AF_UNIX socket inode (S_IFSOCK), made by bind().  Outside the low three
+ * bits on purpose: several callers test those bits as a mask. */
+#define VFS_FLAG_SOCK    0x8
 
 /* Returned by vfs_readdir for each entry */
 typedef struct vfs_dirent {

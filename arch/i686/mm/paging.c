@@ -5,6 +5,7 @@
 #include "../../../proc/process.h"
 #include "../../../proc/scheduler.h"
 #include "../../../proc/signal.h"
+#include "../../../proc/shm.h"
 #include "../cpu/isr.h"
 #include "../cpu/gdt.h"
 #include "../cpu/pit.h"
@@ -420,6 +421,11 @@ uint32_t pgdir_virt_to_phys(uint32_t pgdir_phys, uint32_t virt) {
  * the target page directory.  IF must be 0 at call time.
  */
 void pgdir_free_user(uint32_t pgdir_phys) {
+    /* The address space dies here, whoever frees it (reap, exec, a failed
+     * fork): its shm attachments and reservations go with it, before the
+     * frame can be handed to a new page directory. */
+    shm_mm_release(pgdir_phys);
+
     uint32_t prev_cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(prev_cr3));
     __asm__ volatile("mov %0, %%cr3" :: "r"(pgdir_phys) : "memory");

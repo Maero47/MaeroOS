@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 
+#define X_SOCKET_DIR  "/tmp/.X11-unix"
 #define X_SOCKET_PATH "/tmp/.X11-unix/X0"
 #define MAX_XCLIENTS  8
 #define MAX_RES       128
@@ -2153,6 +2154,17 @@ static int start_listener(void) {
     addr.sun_family = AF_UNIX;
     strcpy(addr.sun_path, X_SOCKET_PATH);
     socklen_t alen = (socklen_t)(sizeof(addr.sun_family) + strlen(X_SOCKET_PATH));
+    /* bind() makes a real socket inode, as on Linux: the directory must exist
+     * (world-writable and sticky, as X servers create it), and a socket file
+     * left by an earlier server holds the name until it is removed — unless
+     * a server still answers on it. */
+    if (mkdir(X_SOCKET_DIR, 01777) == 0)
+        chmod(X_SOCKET_DIR, 01777);        /* past the umask */
+    int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (probe >= 0) {
+        if (connect(probe, (struct sockaddr *)&addr, alen) != 0) unlink(X_SOCKET_PATH);
+        close(probe);
+    }
     if (bind(fd, (struct sockaddr *)&addr, alen) != 0) { close(fd); return -2; }
     if (listen(fd, 8) != 0) { close(fd); return -3; }
     return fd;

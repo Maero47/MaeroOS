@@ -569,6 +569,7 @@ static uint32_t vnode_mode(vfs_node_t *n) {
                             : (n->flags == VFS_FLAG_DIR ? 0755U : 0644U);
     uint32_t type = n->mask & 0170000U;
 
+    if (!type && n->flags == VFS_FLAG_SOCK) type = 0140000U;   /* S_IFSOCK */
     if (!type) {
         switch (n->flags & 0x7U) {
         case VFS_FLAG_DIR:     type = 0040000U; break;
@@ -585,6 +586,7 @@ static uint32_t vnode_mode(vfs_node_t *n) {
 
 /* VFS node kind → Linux dirent d_type (DT_*) */
 static uint8_t vfs_type_to_dt(uint8_t t) {
+    if (t == VFS_FLAG_SOCK) return 12;  /* DT_SOCK */
     switch (t & 0x7U) {
     case VFS_FLAG_DIR:     return 4;    /* DT_DIR  */
     case VFS_FLAG_CHARDEV: return 2;    /* DT_CHR  */
@@ -1153,8 +1155,14 @@ static int sys_read(registers_t *regs) {
         return sock_recv_user(f->socket, buf, (uint32_t)len, NULL,
                               (f->flags & O_NONBLOCK) ? NET_MSG_DONTWAIT : 0);
 
-    if (f->type == FD_USOCKET)
-        return usocket_read(f->usock, buf, len, (f->flags & O_NONBLOCK) != 0);
+    if (f->type == FD_USOCKET) {
+        /* Pinned across the sleep: a sibling thread may close the fd. */
+        usocket_t *us = f->usock;
+        usocket_pin(us);
+        int r = usocket_read(us, buf, len, (f->flags & O_NONBLOCK) != 0);
+        usocket_unpin(us);
+        return r;
+    }
 
     return -9;  /* -EBADF */
 }
@@ -1208,8 +1216,13 @@ static int sys_write(registers_t *regs) {
         return sock_send_user(f->socket, buf, (uint32_t)len, NULL,
                               (f->flags & O_NONBLOCK) ? NET_MSG_DONTWAIT : 0);
 
-    if (f->type == FD_USOCKET)
-        return usocket_write(f->usock, buf, len, (f->flags & O_NONBLOCK) != 0);
+    if (f->type == FD_USOCKET) {
+        usocket_t *us = f->usock;
+        usocket_pin(us);
+        int r = usocket_write(us, buf, len, (f->flags & O_NONBLOCK) != 0);
+        usocket_unpin(us);
+        return r;
+    }
 
     return -9;  /* -EBADF */
 }
@@ -1391,6 +1404,10 @@ static int sys_open_kernel_path(const char *path, int flags, uint32_t mode) {
         if (proc_access_check(node, want) < 0)
             return -13;   /* -EACCES */
     }
+
+    /* A socket inode is reached with connect(), never opened (Linux
+     * no_open → -ENXIO). */
+    if (node->flags == VFS_FLAG_SOCK) return -6;
 
     /* Named FIFO: open as a pipe endpoint */
     if (node->flags == VFS_FLAG_FIFO) {
@@ -2294,9 +2311,9 @@ static int sys_exec(registers_t *regs) {
     tf->eip     = entry;
     tf->useresp = user_esp;
 
-    /* The new image starts with no shared-memory mappings and a fresh mmap
-     * region (the old pgdir's frame references are released below). */
-    shm_proc_cleanup(current_proc);
+    /* The new image starts with a fresh mmap region.  Its shm attachments
+     * belong to the old page directory and go with it (pgdir_free_user below,
+     * or at the last co-owner's reap when it is shared). */
     current_proc->mmap_next = mmap_floor;
     fpu_state_init(fpu_area(current_proc));
 
@@ -3533,6 +3550,9 @@ struct vma {
 /* A MAP_SHARED file mapping whose descriptor was not opened O_RDWR (Linux
  * !VM_MAYWRITE): it may never become writable, not even by mprotect later. */
 #define VMA_F_NOWRITE  0x2U
+/* A shm_map attachment (proc/shm.c).  Kept apart from ordinary shared anon
+ * VMAs so the two never merge and shm_unmap only ever drops its own. */
+#define VMA_F_SHM      0x4U
 
 #define PROT_READ_K    0x1
 #define PROT_WRITE_K   0x2
@@ -4272,6 +4292,73 @@ static void unmap_pages(uint32_t start, uint32_t end) {
 static void unmap_range(uint32_t start, uint32_t end) {
     vma_remove_range(start, end);
     unmap_pages(start, end);
+}
+
+/* ── shm attachments (proc/shm.c keeps the bookkeeping) ─────────────────────
+ * An attachment is a shared anonymous VMA flagged VMA_F_SHM whose PTEs map the
+ * object's frames, one reference per PTE.  The range comes from the owner's
+ * free-range search, so it is right for every thread of the process and never
+ * lands on a live mapping. */
+uint32_t mm_shm_attach(const uint32_t *frames, uint32_t npages) {
+    uint32_t len = npages * PAGE_SIZE;
+    uint32_t base = vma_gap_find(len, PAGE_SIZE);
+    if (!base) return 0;
+    /* Reserve the page tables before taking any reference, so the attach
+     * either happens whole or leaves the address space as it was (Linux
+     * shmat() returns ENOMEM here too). */
+    if (paging_reserve_range(base, base + len, 1) != 0) return 0;
+    if (!vma_add(base, base + len, PROT_READ_K | PROT_WRITE_K,
+                 VMA_F_SHARED | VMA_F_SHM, NULL, 0))
+        return 0;
+    for (uint32_t i = 0; i < npages; i++) {
+        pmm_frame_incref(frames[i]);        /* this PTE's reference */
+        if (paging_map(base + i * PAGE_SIZE, frames[i],
+                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_SHARED) != 0)
+            panic("shmat: reserved page table vanished", NULL);
+    }
+    return base;
+}
+
+/* Is the page at va still mapping `frame` (present or PROT_NONE'd)? */
+static int pte_maps_frame(uint32_t va, uint32_t frame) {
+    if (!(*paging_get_pde(va) & PAGE_PRESENT)) return 0;
+    uint32_t pte = *paging_get_pte(va);
+    return pte_mapped(pte) && (pte & ~0xFFFU) == frame;
+}
+
+uint32_t mm_shm_mapped(uint32_t base, const uint32_t *frames, uint32_t npages) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < npages; i++)
+        if (pte_maps_frame(base + i * PAGE_SIZE, frames[i])) n++;
+    return n;
+}
+
+/* Only the pages that still map the object are the attachment's: a munmap or
+ * a MAP_FIXED overlay already released the others (and whatever lives there
+ * now is not ours to touch).  Flush before free, as unmap_pages does. */
+void mm_shm_detach(uint32_t base, const uint32_t *frames, uint32_t npages) {
+    uint32_t cleared[(SHM_MAX_PAGES + 31) / 32];
+    uint32_t run = 0, run_len = 0;
+    if (npages > SHM_MAX_PAGES) npages = SHM_MAX_PAGES;
+    __builtin_memset(cleared, 0, sizeof(cleared));
+    for (uint32_t i = 0; i < npages; i++) {
+        uint32_t va = base + i * PAGE_SIZE;
+        if (pte_maps_frame(va, frames[i])) {
+            *paging_get_pte(va) = 0;
+            tlb_flush_single(va);
+            cleared[i / 32] |= 1U << (i % 32);
+            if (!run_len) run = va;
+            run_len += PAGE_SIZE;
+            continue;
+        }
+        if (run_len) vma_remove_range(run, run + run_len);
+        run_len = 0;
+    }
+    if (run_len) vma_remove_range(run, run + run_len);
+    tlb_shootdown();                    /* no CPU keeps a stale entry now */
+    for (uint32_t i = 0; i < npages; i++)
+        if (cleared[i / 32] & (1U << (i % 32)))
+            pmm_frame_decref(frames[i]);
 }
 
 /* ── sys_mmap2(addr,len,prot,flags,fd,pgoffset) — EAX=192 ──────────────── */
@@ -5287,6 +5374,7 @@ static int do_mknod(const char *path, uint32_t mode) {
     else if (fmt == 0x2000)  vfs_flag = VFS_FLAG_CHARDEV; /* S_IFCHR  = 0020000 */
     else if (fmt == 0x8000)  vfs_flag = VFS_FLAG_FILE;    /* S_IFREG  = 0100000 */
     else if (fmt == 0)       vfs_flag = VFS_FLAG_FILE;    /* mode 0 = regular file */
+    else if (fmt == 0xC000)  vfs_flag = VFS_FLAG_SOCK;    /* S_IFSOCK = 0140000 */
     else return -22;  /* -EINVAL: unsupported type */
     /* A device node needs CAP_MKNOD (Linux vfs_mknod). */
     if (vfs_flag == VFS_FLAG_CHARDEV && current_proc->euid != 0)
@@ -6725,6 +6813,10 @@ static int sys_pipe2(registers_t *regs) {
 }
 
 /* ── sys_readv(fd, iov, iovcnt) — EAX=145 ───────────────────────────────── */
+/* readv/writev on a SEQPACKET/DGRAM AF_UNIX socket: one record over the whole
+ * iovec array (defined with the AF_UNIX glue below); -1 when fd is not one. */
+static int usock_rw_record(int fd, uint32_t uiov, int iovcnt, int write);
+
 static int sys_readv(registers_t *regs) {
     int fd     = (int)regs->ebx;
     const uint32_t *iov = (const uint32_t *)(uintptr_t)regs->ecx;
@@ -6733,6 +6825,8 @@ static int sys_readv(registers_t *regs) {
     if (iovcnt < 0 || iovcnt > 1024) return -22;
     if (!access_ok(iov, (size_t)iovcnt * 8)) return -14;
     if (fd < 0 || fd >= MAX_FD) return -9;
+    int rr = usock_rw_record(fd, regs->ecx, iovcnt, 0);
+    if (rr != -1) return rr;
 
     int total = 0;
     for (int i = 0; i < iovcnt; i++) {
@@ -7217,6 +7311,8 @@ static int sys_writev(registers_t *regs) {
     if (iovcnt < 0 || iovcnt > 1024) return -22;
     if (!access_ok(iov, (size_t)iovcnt * 8)) return -14;
     if (fd < 0 || fd >= MAX_FD) return -9;
+    int rr = usock_rw_record(fd, regs->ecx, iovcnt, 1);
+    if (rr != -1) return rr;
 
     int total = 0;
     for (int i = 0; i < iovcnt; i++) {
@@ -7560,6 +7656,7 @@ static int usock_flags(uint32_t msgflags, int nb) {
     int f = (nb || (msgflags & MSG_DONTWAIT_K)) ? USOCK_NONBLOCK : 0;
     if (msgflags & MSG_PEEK_K)     f |= USOCK_PEEK;
     if (msgflags & MSG_NOSIGNAL_K) f |= USOCK_NOSIGNAL;
+    if (msgflags & 0x0020)         f |= USOCK_TRUNC;     /* MSG_TRUNC */
     return f;
 }
 
@@ -7571,6 +7668,581 @@ static void scm_abort(usocket_t *us, uint32_t id, proc_file_t *pass, int npass) 
     if (npass <= 0 || !id) return;
     if (usocket_cancel_fds(us, id))
         for (int k = 0; k < npass; k++) fd_release(&pass[k]);
+}
+
+/* ── AF_UNIX glue ────────────────────────────────────────────────────────── */
+
+#define MSG_TRUNC_K         0x0020
+
+/* socket()/socketpair() type and protocol for AF_UNIX (net/unix/af_unix.c
+ * unix_create): SOCK_RAW is taken as SOCK_DGRAM, anything else unknown is
+ * -ESOCKTNOSUPPORT, and the protocol must be 0 or PF_UNIX. */
+static int usock_type_check(uint32_t rawtype, int protocol) {
+    if (rawtype & ~(0xFU | SOCK_NONBLOCK_K | SOCK_CLOEXEC_K)) return -22;
+    if (protocol != 0 && protocol != AF_UNIX_K) return -93;  /* -EPROTONOSUPPORT */
+    int t = (int)(rawtype & 0xF);
+    if (t == 3) t = USOCK_DGRAM;                             /* SOCK_RAW */
+    if (t != USOCK_STREAM && t != USOCK_DGRAM && t != USOCK_SEQPACKET)
+        return -94;                                          /* -ESOCKTNOSUPPORT */
+    return t;
+}
+
+/* struct sockaddr_un from user memory.  Returns 1 for an address that names
+ * nothing (just the family: autobind / unnamed), 0 for a name, -errno. */
+static int usock_name_from_user(uint32_t ua, uint32_t alen, usock_name_t *n) {
+    uint8_t kbuf[2 + USOCK_PATH_MAX];
+    /* Linux unix_validate_addr: family present, at most sizeof(sockaddr_un). */
+    if (alen < 2 || alen > 2 + USOCK_PATH_MAX) return -22;
+    if (!ua || !access_ok((void *)(uintptr_t)ua, alen)) return -14;
+    if (copy_from_user(kbuf, (void *)(uintptr_t)ua, alen) < 0) return -14;
+    uint16_t fam = (uint16_t)(kbuf[0] | (kbuf[1] << 8));
+    if (fam != AF_UNIX_K) return -22;
+    uint32_t plen = alen - 2;
+    if (plen == 0) return 1;
+    __builtin_memcpy(n->path, kbuf + 2, plen);
+    if (n->path[0] == '\0') {
+        /* Abstract namespace (Linux): sun_path[0]==0, the name is the raw
+         * bytes that follow, embedded NULs and all.  libxcb tries
+         * "@/tmp/.X11-unix/X0" before the filesystem path. */
+        n->len = plen;
+    } else {
+        /* Filesystem namespace: the path runs to the first NUL, or fills
+         * the whole of sun_path (unix_mkname_bsd). */
+        uint32_t l = 0;
+        while (l < plen && n->path[l]) l++;
+        n->len = l;
+    }
+    n->path[n->len] = '\0';
+    return 0;
+}
+
+/* Write a name out as struct sockaddr_un to uaddr, clipped to the caller's
+ * *ulen, then store the full length in *ulen.  An unnamed socket reads as
+ * the bare family (getsockname/getpeername/accept) or, for the sender of a
+ * received message, as no address at all (`zero_unnamed`). */
+static int usock_name_to_user(const usock_name_t *n, uint32_t uaddr,
+                              uint32_t *ulen, int zero_unnamed) {
+    uint8_t kbuf[2 + USOCK_PATH_MAX + 1];
+    uint32_t total, klen;
+    if (!ulen) return 0;
+    if (copy_from_user(&klen, ulen, sizeof(klen)) < 0) return -14;
+    if ((int32_t)klen < 0) return -22;
+    kbuf[0] = AF_UNIX_K; kbuf[1] = 0;
+    if (!n->len) {
+        total = zero_unnamed ? 0 : 2;
+    } else if (n->path[0]) {                  /* path: reported with its NUL */
+        __builtin_memcpy(kbuf + 2, n->path, n->len + 1);
+        total = 2 + n->len + 1;
+    } else {                                  /* abstract: exactly the bytes */
+        __builtin_memcpy(kbuf + 2, n->path, n->len);
+        total = 2 + n->len;
+    }
+    uint32_t copy = klen < total ? klen : total;
+    if (copy && (!uaddr || copy_to_user((void *)(uintptr_t)uaddr, kbuf, copy) < 0))
+        return -14;
+    if (copy_to_user(ulen, &total, sizeof(total)) < 0) return -14;
+    return 0;
+}
+
+/* bind() to a filesystem name: create the socket inode (S_IFSOCK) like
+ * mknod, with the directory's write+search permission checked, owned by the
+ * caller with 0777 & ~umask (Linux unix_bind_bsd).  A name that exists in any
+ * form is -EADDRINUSE. */
+static int usock_fs_create(const char *path, vfs_node_t **out) {
+    char resolved[256], dir_path[256], base[256];
+    int r = resolve_path_at_fd(AT_FDCWD, path, resolved, sizeof(resolved));
+    if (r < 0) return r;
+    if (path_split(resolved, dir_path, base) < 0 || base[0] == '\0') return -22;
+    if (vfs_open_nofollow(resolved)) return -98;            /* -EADDRINUSE */
+    vfs_node_t *dir = vfs_open_parent_at(resolved, dir_path);
+    if (!dir) return -2;                                    /* -ENOENT */
+    if (!dir->create_fn) return -30;                        /* -EROFS */
+    if (proc_access_check(dir, VFS_WANT_W | VFS_WANT_X) < 0) return -13;
+    r = dir->create_fn(dir, base, VFS_FLAG_SOCK);
+    if (r == -17) return -98;
+    if (r < 0) return r;
+    vfs_node_t *node = vfs_open_nofollow(resolved);
+    if (!node) return -2;
+    init_new_node(dir, node, 0777 & ~current_proc->umask);
+    *out = node;
+    return 0;
+}
+
+/* connect()/sendto() to a filesystem name: the inode must be a socket
+ * (-ECONNREFUSED otherwise, as Linux) and writable by the caller. */
+static int usock_fs_lookup(const char *path, vfs_node_t **out) {
+    int err = -2;
+    vfs_node_t *node = vfs_lookup_at(path, 1, &err);
+    if (!node) return err;
+    if (node->flags != VFS_FLAG_SOCK) return -111;
+    if (proc_access_check(node, VFS_WANT_W) < 0) return -13;
+    *out = node;
+    return 0;
+}
+
+/* Resolve a destination name to (name, node) for connect/sendto. */
+static int usock_resolve(usock_name_t *n, vfs_node_t **node) {
+    *node = NULL;
+    if (n->path[0] == '\0') return 0;                       /* abstract */
+    return usock_fs_lookup(n->path, node);
+}
+
+/* recvmsg: hand over the ready SCM_RIGHTS fds.  An fd is installed only once
+ * there is room for it BOTH in the caller's control buffer and in the fd
+ * table; any that does not fit is closed and MSG_CTRUNC is reported, so
+ * nothing can end up installed but unnameable — an unclosable leak in the
+ * receiving process (Linux scm_detach_fds + __scm_destroy).  Writes
+ * msg_controllen and msg_flags. */
+static void usock_deliver_fds(usocket_t *us, uint32_t umsg, uint32_t uctrl,
+                              uint32_t uctrllen, int wantfds, uint32_t msgflags,
+                              uint32_t out_flags) {
+    uint32_t ctrl_used = 0;
+    proc_file_t got[SCM_MAX_FDS];
+    int ngot = usocket_recv_fds(us, got, SCM_MAX_FDS);
+    int room = wantfds ? (int)((uctrllen - 12) / 4) : 0;
+    if (room > SCM_MAX_FDS) room = SCM_MAX_FDS;
+    if (ngot > 0) {
+        int cloex = (msgflags & MSG_CMSG_CLOEXEC_K) ? 1 : 0;
+        int newfds[SCM_MAX_FDS]; int ninst = 0;
+        for (int k = 0; k < ngot; k++) {
+            int slot = -1;
+            if (ninst < room) {         /* the cmsg can name it */
+                for (int j = 0; j < MAX_FD; j++)
+                    if (current_proc->ofile[j].type == FD_NONE) { slot = j; break; }
+                if (slot < 0)
+                    printk("[scm] fd table FULL on recv (pid %d)\n",
+                           current_proc ? current_proc->pid : -1);
+            }
+            if (slot < 0) {             /* no room: close, truncate */
+                fd_release(&got[k]);
+                out_flags |= MSG_CTRUNC_K;
+                continue;
+            }
+            current_proc->ofile[slot] = got[k];
+            current_proc->ofile[slot].cloexec = (uint8_t)cloex;
+            newfds[ninst++] = slot;
+        }
+        if (ninst > 0) {
+            uint8_t cbuf[256];
+            uint32_t clen = 12 + (uint32_t)ninst * 4;
+            uint32_t lvl = 1, typ = 1;       /* SOL_SOCKET, SCM_RIGHTS */
+            __builtin_memcpy(cbuf + 0, &clen, 4);
+            __builtin_memcpy(cbuf + 4, &lvl, 4);
+            __builtin_memcpy(cbuf + 8, &typ, 4);
+            for (int k = 0; k < ninst; k++)
+                __builtin_memcpy(cbuf + 12 + k * 4, &newfds[k], 4);
+            copy_to_user((void *)(uintptr_t)uctrl, cbuf, clen);
+            ctrl_used = clen;
+        }
+    }
+    copy_to_user((void *)(uintptr_t)(umsg + 20), &ctrl_used, 4);
+    copy_to_user((void *)(uintptr_t)(umsg + 24), &out_flags, 4);
+}
+
+/* sendmsg: parse the SCM_RIGHTS cmsg(s) and retain the named files. */
+static int usock_collect_fds(uint32_t uctrl, uint32_t uctrllen,
+                             proc_file_t *pass) {
+    int npass = 0;
+    if (!uctrl || uctrllen < 12 || uctrllen > 256) return 0;
+    uint8_t cbuf[256];
+    if (copy_from_user(cbuf, (void *)(uintptr_t)uctrl, uctrllen) < 0) return 0;
+    uint32_t off = 0;
+    while (off + 12 <= uctrllen) {
+        uint32_t clen; int level, ctype;
+        __builtin_memcpy(&clen,  cbuf + off,     4);
+        __builtin_memcpy(&level, cbuf + off + 4, 4);
+        __builtin_memcpy(&ctype, cbuf + off + 8, 4);
+        if (clen < 12 || off + clen > uctrllen) break;
+        if (level == 1 /*SOL_SOCKET*/ && ctype == 1 /*SCM_RIGHTS*/) {
+            int cnt = (int)((clen - 12) / 4);
+            for (int k = 0; k < cnt && npass < SCM_MAX_FDS; k++) {
+                int sfd;
+                __builtin_memcpy(&sfd, cbuf + off + 12 + k * 4, 4);
+                if (sfd < 0 || sfd >= MAX_FD) continue;
+                proc_file_t *src = &current_proc->ofile[sfd];
+                if (src->type == FD_NONE) continue;
+                pass[npass] = *src;
+                fd_retain(&pass[npass]);
+                npass++;
+            }
+        }
+        off += (clen + 3u) & ~3u;
+    }
+    return npass;
+}
+
+/* The user iovec array of a msghdr, validated, in kernel memory (kfree it). */
+static int usock_iov_from_user(uint32_t uiov, uint32_t iovlen, usock_iov_t **out) {
+    *out = NULL;
+    if (iovlen > 1024) return -22;                           /* UIO_MAXIOV */
+    if (!iovlen) return 0;
+    usock_iov_t *iv = (usock_iov_t *)kmalloc(iovlen * sizeof(usock_iov_t));
+    if (!iv) return -12;
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < iovlen; i++) {
+        uint32_t e[2];
+        if (copy_from_user(e, (void *)(uintptr_t)(uiov + i * 8), sizeof(e)) < 0 ||
+            (e[1] && !access_ok((void *)(uintptr_t)e[0], e[1]))) {
+            kfree(iv);
+            return -14;
+        }
+        if ((int32_t)e[1] < 0 || total + e[1] < total) { kfree(iv); return -22; }
+        total += e[1];
+        iv[i].base = (void *)(uintptr_t)e[0];
+        iv[i].len  = e[1];
+    }
+    *out = iv;
+    return 0;
+}
+
+/* sendmsg/recvmsg on a SEQPACKET or DGRAM socket: one record per call,
+ * gathered from / scattered into the whole iovec array. */
+static int usock_record_msg(int call, uint32_t *kargs, usocket_t *us, int nb) {
+    uint32_t umsg = kargs[1];
+    uint32_t mh[7];
+    if (copy_from_user(mh, (void *)(uintptr_t)umsg, sizeof(mh)) < 0) return -14;
+    uint32_t uname = mh[0], unamelen = mh[1];
+    uint32_t uctrl = mh[4], uctrllen = mh[5];
+    int mflags = usock_flags(kargs[2], nb);
+    usock_iov_t *iv = NULL;
+    int r = usock_iov_from_user(mh[2], mh[3], &iv);
+    if (r < 0) return r;
+    int niov = (int)mh[3];
+
+    if (call == 16) {
+        usock_name_t to;
+        vfs_node_t *tonode = NULL;
+        int has_to = 0;
+        if (uname && unamelen) {
+            r = usock_name_from_user(uname, unamelen, &to);
+            if (r == 0) r = usock_resolve(&to, &tonode);
+            else if (r == 1) r = -22;
+            if (r < 0) { kfree(iv); return r; }
+            has_to = 1;
+        }
+        proc_file_t pass[SCM_MAX_FDS];
+        int npass = usock_collect_fds(uctrl, uctrllen, pass);
+        r = usocket_send_record(us, iv, niov, pass, npass,
+                                has_to ? &to : NULL, tonode, mflags);
+        if (r < 0)                            /* the fds never left */
+            for (int k = 0; k < npass; k++) fd_release(&pass[k]);
+        kfree(iv);
+        return r;
+    }
+
+    int wantfds = (uctrl && uctrllen >= 12);
+    usock_name_t from;
+    int oflags = 0;
+    r = usocket_recv_record(us, iv, niov, mflags | USOCK_WANTFDS, &oflags, &from);
+    kfree(iv);
+    if (r < 0) return r;
+    if (uname) {
+        /* msg_namelen is the msghdr field right after msg_name. */
+        if (usock_name_to_user(&from, uname, (uint32_t *)(uintptr_t)(umsg + 4), 1) < 0)
+            return -14;
+    } else {
+        uint32_t zero = 0;
+        copy_to_user((void *)(uintptr_t)(umsg + 4), &zero, 4);
+    }
+    usock_deliver_fds(us, umsg, uctrl, uctrllen, wantfds, kargs[2],
+                      (oflags & USOCK_MSG_TRUNC) ? MSG_TRUNC_K : 0);
+    return r;
+}
+
+/* getsockopt(SOL_SOCKET) on an AF_UNIX socket (net/core/sock.c
+ * sk_getsockopt): each option's value clipped to the caller's optlen, whose
+ * new value is the length written.  Unknown options are -ENOPROTOOPT; other
+ * levels have no handler on AF_UNIX (-EOPNOTSUPP). */
+static int usock_getsockopt(usocket_t *us, uint32_t *kargs) {
+    int       level   = (int)kargs[1];
+    int       optname = (int)kargs[2];
+    void     *optval  = (void *)(uintptr_t)kargs[3];
+    uint32_t *optlen  = (uint32_t *)(uintptr_t)kargs[4];
+    uint32_t  len = 0;
+    uint32_t  v[3] = { 0, 0, 0 };
+    uint32_t  size = 4;
+
+    if (!optlen) return -14;
+    if (copy_from_user(&len, optlen, sizeof(len)) < 0) return -14;
+    if ((int32_t)len < 0) return -22;
+    if (level != 1) return -95;                     /* not SOL_SOCKET */
+
+    switch (optname) {
+    case 3:  v[0] = (uint32_t)usocket_type(us); break;        /* SO_TYPE */
+    case 4:  v[0] = 0; break;                                 /* SO_ERROR */
+    /* SO_SNDBUF(7)/SO_RCVBUF(8) must report a POSITIVE buffer size — Firefox's
+     * IPC Channel::SetPipe (ipc_channel_posix.cc:181) does CHECK(buf_len > 0)
+     * on getsockopt(SO_SNDBUF).  Our per-direction ring size. */
+    case 7: case 8: v[0] = 65536; break;
+    case 2: case 5: case 6: case 9: case 10: case 12: case 16: case 34:
+        v[0] = 0; break;           /* REUSEADDR DONTROUTE BROADCAST KEEPALIVE
+                                    * OOBINLINE PRIORITY PASSCRED PASSSEC */
+    case 13: size = 8; break;                                 /* SO_LINGER */
+    case 17: {                                                /* SO_PEERCRED */
+        usock_cred_t c;
+        usocket_peercred(us, &c);
+        v[0] = (uint32_t)c.pid; v[1] = c.uid; v[2] = c.gid;
+        size = 12;
+        break;
+    }
+    case 18: case 19: v[0] = 1; break;                        /* RCV/SNDLOWAT */
+    case 20: case 21: size = 8; break;                        /* RCV/SNDTIMEO */
+    case 30: v[0] = usocket_listening(us) ? 1 : 0; break;     /* SO_ACCEPTCONN */
+    case 38: v[0] = 0; break;                                 /* SO_PROTOCOL */
+    case 39: v[0] = AF_UNIX_K; break;                         /* SO_DOMAIN */
+    default: return -92;                                      /* -ENOPROTOOPT */
+    }
+    if (len > size) len = size;
+    if (len && (!optval || copy_to_user(optval, v, len) < 0)) return -14;
+    if (copy_to_user(optlen, &len, sizeof(len)) < 0) return -14;
+    return 0;
+}
+
+static int usock_rw_record(int fd, uint32_t uiov, int iovcnt, int write) {
+    proc_file_t *f = &current_proc->ofile[fd];
+    if (f->type != FD_USOCKET || !f->usock || !usocket_is_record(f->usock))
+        return -1;
+    usocket_t *us = f->usock;
+    int flags = (f->flags & O_NONBLOCK) ? USOCK_NONBLOCK : 0;
+    usock_iov_t *iv = NULL;
+    int r = usock_iov_from_user(uiov, (uint32_t)iovcnt, &iv);
+    if (r < 0) return r;
+    usocket_pin(us);
+    r = write ? usocket_send_record(us, iv, iovcnt, NULL, 0, NULL, NULL, flags)
+              : usocket_recv_record(us, iv, iovcnt, flags, NULL, NULL);
+    usocket_unpin(us);
+    kfree(iv);
+    return r;
+}
+
+/* One socketcall on an AF_UNIX socket.  The caller holds a pin on `us` for
+ * the whole call, and nothing here may look at the descriptor again once the
+ * call may have slept: another thread can have closed it meanwhile. */
+static int usock_call(int call, uint32_t *kargs, usocket_t *us, int nb,
+                      int accept4_flags) {
+    if (call == 2) {                     /* bind(fd, sockaddr_un, len) */
+        usock_name_t n;
+        int r = usock_name_from_user(kargs[1], kargs[2], &n);
+        if (r < 0) return r;
+        if (r == 1) return usocket_autobind(us);
+        if (n.path[0] == '\0') return usocket_bind(us, &n, NULL);
+        /* As unix_bind_bsd: the inode first (an existing name is
+         * -EADDRINUSE even for a bound socket), then the socket's state. */
+        vfs_node_t *node = NULL;
+        r = usock_fs_create(n.path, &node);
+        if (r < 0) return r;
+        r = usocket_bind(us, &n, node);
+        if (r < 0) {
+            /* Linux unix_bind_bsd: the inode it made goes again. */
+            char dir_path[256], base[256], resolved[256];
+            if (resolve_path_at_fd(AT_FDCWD, n.path, resolved, sizeof(resolved)) == 0 &&
+                path_split(resolved, dir_path, base) == 0) {
+                vfs_node_t *dir = vfs_open_parent_at(resolved, dir_path);
+                if (dir) vfs_unlink(dir, base);
+            }
+        }
+        return r;
+    }
+    if (call == 3) {                     /* connect(fd, sockaddr_un, len) */
+        usock_name_t n;
+        vfs_node_t *node = NULL;
+        /* AF_UNSPEC dissolves a datagram socket's association. */
+        if (kargs[2] >= 2 && usocket_type(us) == USOCK_DGRAM) {
+            uint16_t fam = 0;
+            if (copy_from_user(&fam, (void *)(uintptr_t)kargs[1], 2) < 0) return -14;
+            if (fam == 0) return usocket_connect(us, NULL, NULL, nb);
+        }
+        int r = usock_name_from_user(kargs[1], kargs[2], &n);
+        if (r == 1) r = -22;
+        if (r < 0) return r;
+        r = usock_resolve(&n, &node);
+        if (r < 0) return r;
+        return usocket_connect(us, &n, node, nb);
+    }
+    if (call == 4)                       /* listen(fd, backlog) */
+        return usocket_listen(us, (int)kargs[1]);
+    if (call == 5) {                     /* accept(fd, addr, addrlen) */
+        int err = 0;
+        usocket_t *ns = usocket_accept(us, nb, &err);
+        if (!ns) return err;
+        for (int nfd = 0; nfd < MAX_FD; nfd++)
+            if (current_proc->ofile[nfd].type == FD_NONE) {
+                if (kargs[1]) {
+                    usock_name_t pn;
+                    usocket_getname(ns, 1, &pn);
+                    if (usock_name_to_user(&pn, kargs[1],
+                                           (uint32_t *)(uintptr_t)kargs[2], 0) < 0) {
+                        usocket_release(ns);
+                        return -14;
+                    }
+                }
+                current_proc->ofile[nfd].type  = FD_USOCKET;
+                current_proc->ofile[nfd].usock = ns;
+                current_proc->ofile[nfd].flags = O_RDWR |
+                    ((accept4_flags & SOCK_NONBLOCK_K) ? O_NONBLOCK : 0);
+                current_proc->ofile[nfd].cloexec =
+                    (accept4_flags & SOCK_CLOEXEC_K) ? 1 : 0;
+                return nfd;
+            }
+        usocket_release(ns);
+        return -24;
+    }
+    if (call == 6 || call == 7) {        /* getsockname / getpeername */
+        usock_name_t n;
+        int r = usocket_getname(us, call == 7, &n);
+        if (r < 0) return r;
+        return usock_name_to_user(&n, kargs[1], (uint32_t *)(uintptr_t)kargs[2], 0);
+    }
+    if (call == 9 || call == 11) {       /* send / sendto */
+        const void *buf = (const void *)(uintptr_t)kargs[1];
+        uint32_t len = kargs[2];
+        if (!access_ok(buf, len)) return -14;
+        if (call == 11 && kargs[4] && kargs[5]) {
+            usock_name_t to;
+            vfs_node_t *tonode = NULL;
+            int r = usock_name_from_user(kargs[4], kargs[5], &to);
+            if (r == 1) r = -22;
+            if (r < 0) return r;
+            if (!usocket_is_record(us))             /* unix_stream_sendmsg */
+                return usocket_getname(us, 1, &to) == 0 ? -106 : -95;
+            r = usock_resolve(&to, &tonode);
+            if (r < 0) return r;
+            usock_iov_t iov = { (void *)buf, len };
+            return usocket_send_record(us, &iov, 1, NULL, 0, &to, tonode,
+                                       usock_flags(kargs[3], nb));
+        }
+        return usocket_write(us, buf, (int)len, usock_flags(kargs[3], nb));
+    }
+    if (call == 10 || call == 12) {      /* recv / recvfrom */
+        void *buf = (void *)(uintptr_t)kargs[1];
+        uint32_t len = kargs[2];
+        int mflags = usock_flags(kargs[3], nb);
+        if (!access_ok(buf, len)) return -14;
+        if (usocket_is_record(us)) {
+            usock_iov_t iov = { buf, len };
+            usock_name_t from;
+            int r = usocket_recv_record(us, &iov, 1, mflags, NULL, &from);
+            if (r >= 0 && call == 12 && kargs[4] &&
+                usock_name_to_user(&from, kargs[4], (uint32_t *)(uintptr_t)kargs[5], 1) < 0)
+                return -14;
+            return r;
+        }
+        int r = usocket_read(us, buf, (int)len, mflags);
+        if (r >= 0 && call == 12 && kargs[4]) {
+            usock_name_t from;
+            if (usocket_getname(us, 1, &from) < 0) from.len = 0;
+            if (usock_name_to_user(&from, kargs[4], (uint32_t *)(uintptr_t)kargs[5], 1) < 0)
+                return -14;
+        }
+        return r;
+    }
+    if (call == 16 || call == 17) {      /* sendmsg / recvmsg */
+        if (usocket_is_record(us))
+            return usock_record_msg(call, kargs, us, nb);
+        /* struct msghdr { name,namelen,iov,iovlen,control,controllen,flags }.
+         * Firefox's multiprocess IPC passes its channel + shared-memory file
+         * descriptors as SCM_RIGHTS ancillary data here; without honouring it
+         * the child processes never get their fds and Firefox exits(1). */
+        uint32_t umsg = kargs[1];
+        uint32_t mh[7];
+        if (copy_from_user(mh, (void *)(uintptr_t)umsg, sizeof(mh)) < 0)
+            return -14;
+        uint32_t iov = mh[2], iovlen = mh[3];
+        uint32_t uctrl = mh[4], uctrllen = mh[5];
+        if (iovlen > 1024) return -22;
+        if (call == 16 && mh[1]) {                   /* unix_stream_sendmsg */
+            usock_name_t peer;
+            return usocket_getname(us, 1, &peer) == 0 ? -106 : -95;
+        }
+        /* Only a control buffer big enough for a cmsg header can name
+         * received fds; a recvmsg without one still collects them here
+         * (rather than letting the read drop them silently) so that it can
+         * close them and report MSG_CTRUNC, as scm_recv does. */
+        int wantfds = (call == 17 && uctrl && uctrllen >= 12);
+        int mflags  = usock_flags(kargs[2], nb);
+        if (call == 17) mflags |= USOCK_WANTFDS;
+
+        /* sendmsg: parse SCM_RIGHTS cmsg(s), retain the named fds. */
+        proc_file_t pass[SCM_MAX_FDS];
+        int npass = (call == 16) ? usock_collect_fds(uctrl, uctrllen, pass) : 0;
+
+        /* Linux attaches the fds to the FIRST skb of the message
+         * (unix_stream_sendmsg), so the batch goes in BEFORE the bytes it
+         * rides with: a reader draining concurrently can then never pass
+         * the batch's position while the batch is still invisible to it —
+         * which would hand the fds to the next message's bytes, or lose
+         * them to a plain read().  If the data cannot be written at all,
+         * scm_abort() takes the batch back out. */
+        uint32_t scm_id = 0;
+        if (call == 16 && npass > 0 &&
+            usocket_send_fds(us, pass, npass, &scm_id) < 0) {
+            for (int k = 0; k < npass; k++) fd_release(&pass[k]);
+            npass = 0;                  /* the data still goes out */
+        }
+
+        int total = 0, eagain = 0;
+        for (uint32_t i = 0; i < iovlen; i++) {
+            uint32_t iv[2];
+            if (copy_from_user(iv, (void *)(uintptr_t)(iov + i * 8),
+                               sizeof(iv)) < 0) {
+                if (total) break;
+                scm_abort(us, scm_id, pass, npass);
+                return -14;
+            }
+            int len = (int)iv[1];
+            if (len <= 0) continue;
+            if (!access_ok((void *)(uintptr_t)iv[0], (size_t)len)) {
+                if (total) break;
+                scm_abort(us, scm_id, pass, npass);
+                return -14;
+            }
+            int n = (call == 16)
+                ? usocket_write(us, (void *)(uintptr_t)iv[0], len, mflags)
+                : usocket_read(us, (void *)(uintptr_t)iv[0], len, mflags);
+            if (n < 0) {
+                if (total) break;
+                if (call == 16) {
+                    scm_abort(us, scm_id, pass, npass);
+                    return n;
+                }
+                if (n == -11) { eagain = 1; break; }
+                return n;
+            }
+            total += n;
+            if (n < len) break;          /* short read/write — stop */
+            if (mflags & USOCK_PEEK) break;   /* peek does not advance */
+            /* One message's ancillary data per recvmsg: stop rather than
+             * read into a second batch whose fds this call cannot also
+             * deliver (Linux breaks its loop on !unix_skb_scm_eq). */
+            if (call == 17 && usocket_fds_ready(us)) break;
+        }
+
+        /* A sendmsg that put no bytes on the stream sends no fds either:
+         * unix_stream_sendmsg never enters its loop for a zero-length
+         * message, so no skb carries them and scm_destroy closes them. */
+        if (call == 16 && total == 0)
+            scm_abort(us, scm_id, pass, npass);
+
+        if (call == 17) {
+            if (mh[0]) {
+                usock_name_t from;
+                if (usocket_getname(us, 1, &from) < 0) from.len = 0;
+                usock_name_to_user(&from, mh[0], (uint32_t *)(uintptr_t)(umsg + 4), 1);
+            } else {
+                uint32_t zero = 0;
+                copy_to_user((void *)(uintptr_t)(umsg + 4), &zero, 4);
+            }
+            usock_deliver_fds(us, umsg, uctrl, uctrllen, wantfds, kargs[2], 0);
+            if (total == 0 && eagain) return -11;
+        }
+        return total;
+    }
+    if (call == 13)                      /* shutdown(fd, how) */
+        return usocket_shutdown(us, (int)kargs[1]);
+    if (call == 14) return 0;            /* setsockopt: accepted, ignored */
+    if (call == 15)                      /* getsockopt */
+        return usock_getsockopt(us, kargs);
+    return -22;
 }
 
 static int socketcall_core_inner(int call, uint32_t *kargs) {
@@ -7589,7 +8261,9 @@ static int socketcall_core_inner(int call, uint32_t *kargs) {
         int cloexec  = ((int)kargs[1] & SOCK_CLOEXEC_K) != 0;
 
         if (domain == AF_UNIX_K) {           /* AF_UNIX local socket */
-            usocket_t *us = usocket_create(type);
+            int ut = usock_type_check(kargs[1], (int)kargs[2]);
+            if (ut < 0) return ut;
+            usocket_t *us = usocket_create(ut);
             if (!us) return -12;
             for (int fd = 0; fd < MAX_FD; fd++) {
                 if (current_proc->ofile[fd].type == FD_NONE) {
@@ -7626,10 +8300,12 @@ static int socketcall_core_inner(int call, uint32_t *kargs) {
     if (call == 8) { /* socketpair(domain, type, protocol, sv[2]) */
         int domain = (int)kargs[0];
         if (domain != AF_UNIX_K) return -95;     /* only AF_UNIX pairs */
+        int ut = usock_type_check(kargs[1], (int)kargs[2]);
+        if (ut < 0) return ut;
         uint32_t *usv = (uint32_t *)(uintptr_t)kargs[3];
         if (!access_ok(usv, 2 * sizeof(uint32_t))) return -14;
         usocket_t *a = NULL, *b = NULL;
-        if (usocket_socketpair(&a, &b) < 0) return -12;
+        if (usocket_socketpair(ut, &a, &b) < 0) return -12;
         int fda = -1, fdb = -1;
         for (int fd = 0; fd < MAX_FD; fd++)
             if (current_proc->ofile[fd].type == FD_NONE) {
@@ -7662,250 +8338,15 @@ static int socketcall_core_inner(int call, uint32_t *kargs) {
 
     /* ── AF_UNIX local sockets ─────────────────────────────────────────── */
     if (f->type == FD_USOCKET && f->usock) {
+        /* Hold the socket for the whole call (Linux fdget): another thread
+         * sharing the fd table can close the descriptor while this one
+         * sleeps, and the socket must outlive the sleep. */
         usocket_t *us = f->usock;
         int nb = (f->flags & O_NONBLOCK) != 0;
-
-        if (call == 2 || call == 3) {        /* bind / connect (sockaddr_un) */
-            /* struct sockaddr_un { u16 sun_family; char sun_path[108]; } */
-            uint32_t ua = kargs[1], alen = kargs[2];
-            char path[110];
-            if (alen < 3 || alen > 2 + 108) return -22;
-            if (!access_ok((void *)(uintptr_t)ua, alen)) return -14;
-            uint32_t plen = alen - 2;
-            if (plen > 108) plen = 108;
-            if (copy_from_user(path, (void *)(uintptr_t)(ua + 2), plen) < 0)
-                return -14;
-            /* Abstract namespace (Linux): sun_path[0]==0, name follows.  libxcb
-             * tries "@/tmp/.X11-unix/X0" before the filesystem path.  Key it as
-             * '@'+name so it can't collide with a real path (which starts '/'). */
-            if (plen >= 1 && path[0] == '\0') {
-                path[0] = '@';
-                path[plen] = '\0';
-            } else {
-                path[plen] = '\0';           /* filesystem namespace */
-            }
-            return (call == 2) ? usocket_bind(us, path)
-                               : usocket_connect(us, path);
-        }
-        if (call == 4)                       /* listen(fd, backlog) */
-            return usocket_listen(us, (int)kargs[1]);
-        if (call == 5) {                     /* accept(fd, addr, addrlen) */
-            int err = 0;
-            usocket_t *ns = usocket_accept(us, nb, &err);
-            if (!ns) return err;
-            for (int nfd = 0; nfd < MAX_FD; nfd++)
-                if (current_proc->ofile[nfd].type == FD_NONE) {
-                    current_proc->ofile[nfd].type  = FD_USOCKET;
-                    current_proc->ofile[nfd].usock = ns;
-                    current_proc->ofile[nfd].flags = O_RDWR |
-                        ((accept4_flags & SOCK_NONBLOCK_K) ? O_NONBLOCK : 0);
-                    current_proc->ofile[nfd].cloexec =
-                        (accept4_flags & SOCK_CLOEXEC_K) ? 1 : 0;
-                    return nfd;
-                }
-            usocket_release(ns);
-            return -24;
-        }
-        if (call == 6 || call == 7) {        /* getsockname / getpeername */
-            return 0;                        /* enough for X's checks */
-        }
-        if (call == 9 || call == 11) {       /* send / sendto */
-            const void *buf = (const void *)(uintptr_t)kargs[1];
-            uint32_t len = kargs[2];
-            if (!access_ok(buf, len)) return -14;
-            return usocket_write(us, buf, (int)len, usock_flags(kargs[3], nb));
-        }
-        if (call == 10 || call == 12) {      /* recv / recvfrom */
-            void *buf = (void *)(uintptr_t)kargs[1];
-            uint32_t len = kargs[2];
-            if (!access_ok(buf, len)) return -14;
-            return usocket_read(us, buf, (int)len, usock_flags(kargs[3], nb));
-        }
-        if (call == 16 || call == 17) {      /* sendmsg / recvmsg */
-            /* struct msghdr { name,namelen,iov,iovlen,control,controllen,flags }.
-             * Firefox's multiprocess IPC passes its channel + shared-memory file
-             * descriptors as SCM_RIGHTS ancillary data here; without honouring it
-             * the child processes never get their fds and Firefox exits(1). */
-            uint32_t umsg = kargs[1];
-            uint32_t mh[7];
-            if (copy_from_user(mh, (void *)(uintptr_t)umsg, sizeof(mh)) < 0)
-                return -14;
-            uint32_t iov = mh[2], iovlen = mh[3];
-            uint32_t uctrl = mh[4], uctrllen = mh[5];
-            if (iovlen > 1024) return -22;
-            /* Only a control buffer big enough for a cmsg header can name
-             * received fds; a recvmsg without one still collects them here
-             * (rather than letting the read drop them silently) so that it can
-             * close them and report MSG_CTRUNC, as scm_recv does. */
-            int wantfds = (call == 17 && uctrl && uctrllen >= 12);
-            int mflags  = usock_flags(kargs[2], nb);
-            if (call == 17) mflags |= USOCK_WANTFDS;
-
-            /* sendmsg: parse SCM_RIGHTS cmsg(s), retain the named fds. */
-            proc_file_t pass[SCM_MAX_FDS];
-            int npass = 0;
-            if (call == 16 && uctrl && uctrllen >= 12 && uctrllen <= 256) {
-                uint8_t cbuf[256];
-                if (copy_from_user(cbuf, (void *)(uintptr_t)uctrl, uctrllen) >= 0) {
-                    uint32_t off = 0;
-                    while (off + 12 <= uctrllen) {
-                        uint32_t clen; int level, ctype;
-                        __builtin_memcpy(&clen,  cbuf + off,     4);
-                        __builtin_memcpy(&level, cbuf + off + 4, 4);
-                        __builtin_memcpy(&ctype, cbuf + off + 8, 4);
-                        if (clen < 12 || off + clen > uctrllen) break;
-                        if (level == 1 /*SOL_SOCKET*/ && ctype == 1 /*SCM_RIGHTS*/) {
-                            int cnt = (int)((clen - 12) / 4);
-                            for (int k = 0; k < cnt && npass < SCM_MAX_FDS; k++) {
-                                int sfd;
-                                __builtin_memcpy(&sfd, cbuf + off + 12 + k * 4, 4);
-                                if (sfd < 0 || sfd >= MAX_FD) continue;
-                                proc_file_t *src = &current_proc->ofile[sfd];
-                                if (src->type == FD_NONE) continue;
-                                pass[npass] = *src;
-                                fd_retain(&pass[npass]);
-                                npass++;
-                            }
-                        }
-                        off += (clen + 3u) & ~3u;
-                    }
-                }
-            }
-
-            /* Linux attaches the fds to the FIRST skb of the message
-             * (unix_stream_sendmsg), so the batch goes in BEFORE the bytes it
-             * rides with: a reader draining concurrently can then never pass
-             * the batch's position while the batch is still invisible to it —
-             * which would hand the fds to the next message's bytes, or lose
-             * them to a plain read().  If the data cannot be written at all,
-             * scm_abort() takes the batch back out. */
-            uint32_t scm_id = 0;
-            if (call == 16 && npass > 0 &&
-                usocket_send_fds(us, pass, npass, &scm_id) < 0) {
-                for (int k = 0; k < npass; k++) fd_release(&pass[k]);
-                npass = 0;                  /* the data still goes out */
-            }
-
-            int total = 0, eagain = 0;
-            for (uint32_t i = 0; i < iovlen; i++) {
-                uint32_t iv[2];
-                if (copy_from_user(iv, (void *)(uintptr_t)(iov + i * 8),
-                                   sizeof(iv)) < 0) {
-                    if (total) break;
-                    scm_abort(us, scm_id, pass, npass);
-                    return -14;
-                }
-                int len = (int)iv[1];
-                if (len <= 0) continue;
-                if (!access_ok((void *)(uintptr_t)iv[0], (size_t)len)) {
-                    if (total) break;
-                    scm_abort(us, scm_id, pass, npass);
-                    return -14;
-                }
-                int n = (call == 16)
-                    ? usocket_write(us, (void *)(uintptr_t)iv[0], len, mflags)
-                    : usocket_read(us, (void *)(uintptr_t)iv[0], len, mflags);
-                if (n < 0) {
-                    if (total) break;
-                    if (call == 16) {
-                        scm_abort(us, scm_id, pass, npass);
-                        return n;
-                    }
-                    if (n == -11) { eagain = 1; break; }
-                    return n;
-                }
-                total += n;
-                if (n < len) break;          /* short read/write — stop */
-                if (mflags & USOCK_PEEK) break;   /* peek does not advance */
-                /* One message's ancillary data per recvmsg: stop rather than
-                 * read into a second batch whose fds this call cannot also
-                 * deliver (Linux breaks its loop on !unix_skb_scm_eq). */
-                if (call == 17 && usocket_fds_ready(us)) break;
-            }
-
-            /* A sendmsg that put no bytes on the stream sends no fds either:
-             * unix_stream_sendmsg never enters its loop for a zero-length
-             * message, so no skb carries them and scm_destroy closes them. */
-            if (call == 16 && total == 0)
-                scm_abort(us, scm_id, pass, npass);
-
-            /* recvmsg: deliver the ready fds.  An fd is installed only once
-             * there is room for it BOTH in the caller's control buffer and in
-             * the fd table; any that does not fit is closed and MSG_CTRUNC is
-             * reported, so nothing can end up installed but unnameable — an
-             * unclosable leak in the receiving process (Linux
-             * scm_detach_fds + __scm_destroy). */
-            if (call == 17) {
-                uint32_t ctrl_used = 0, out_flags = 0;
-                proc_file_t got[SCM_MAX_FDS];
-                int ngot = usocket_recv_fds(us, got, SCM_MAX_FDS);
-                int room = wantfds ? (int)((uctrllen - 12) / 4) : 0;
-                if (room > SCM_MAX_FDS) room = SCM_MAX_FDS;
-                if (ngot > 0) {
-                    int cloex = (kargs[2] & MSG_CMSG_CLOEXEC_K) ? 1 : 0;
-                    int newfds[SCM_MAX_FDS]; int ninst = 0;
-                    for (int k = 0; k < ngot; k++) {
-                        int slot = -1;
-                        if (ninst < room) {         /* the cmsg can name it */
-                            for (int j = 0; j < MAX_FD; j++)
-                                if (current_proc->ofile[j].type == FD_NONE) { slot = j; break; }
-                            if (slot < 0)
-                                printk("[scm] fd table FULL on recv (pid %d)\n",
-                                       current_proc ? current_proc->pid : -1);
-                        }
-                        if (slot < 0) {             /* no room: close, truncate */
-                            fd_release(&got[k]);
-                            out_flags |= MSG_CTRUNC_K;
-                            continue;
-                        }
-                        current_proc->ofile[slot] = got[k];
-                        current_proc->ofile[slot].cloexec = (uint8_t)cloex;
-                        newfds[ninst++] = slot;
-                    }
-                    if (ninst > 0) {
-                        uint8_t cbuf[256];
-                        uint32_t clen = 12 + (uint32_t)ninst * 4;
-                        uint32_t lvl = 1, typ = 1;       /* SOL_SOCKET, SCM_RIGHTS */
-                        __builtin_memcpy(cbuf + 0, &clen, 4);
-                        __builtin_memcpy(cbuf + 4, &lvl, 4);
-                        __builtin_memcpy(cbuf + 8, &typ, 4);
-                        for (int k = 0; k < ninst; k++)
-                            __builtin_memcpy(cbuf + 12 + k * 4, &newfds[k], 4);
-                        copy_to_user((void *)(uintptr_t)uctrl, cbuf, clen);
-                        ctrl_used = clen;
-                    }
-                }
-                copy_to_user((void *)(uintptr_t)(umsg + 20), &ctrl_used, 4);
-                copy_to_user((void *)(uintptr_t)(umsg + 24), &out_flags, 4);
-                if (total == 0 && eagain) return -11;
-            }
-            return total;
-        }
-        if (call == 13) return 0;            /* shutdown */
-        if (call == 14) return 0;            /* setsockopt: ignore */
-        if (call == 15) {                    /* getsockopt */
-            int       level   = (int)kargs[1];
-            int       optname = (int)kargs[2];
-            void     *optval = (void *)(uintptr_t)kargs[3];
-            uint32_t *optlen = (uint32_t *)(uintptr_t)kargs[4];
-            uint32_t  l = 0;
-            if (optlen && copy_from_user(&l, optlen, sizeof(l)) < 0) return -14;
-            if (optval && l >= 4) {
-                /* SOL_SOCKET(1): SO_SNDBUF(7)/SO_RCVBUF(8) must report a POSITIVE
-                 * buffer size — Firefox's IPC Channel::SetPipe
-                 * (ipc_channel_posix.cc:181) does CHECK(buf_len > 0) on
-                 * getsockopt(SO_SNDBUF) and ABORTS the IPC I/O thread if it's 0.
-                 * Report our per-direction unix-socket ring size (64 KiB).
-                 * Everything else (SO_ERROR etc.) reports 0 = "no error". */
-                uint32_t v = 0;
-                if (level == 1 && (optname == 7 || optname == 8)) v = 65536;
-                if (copy_to_user(optval, &v, 4) < 0) return -14;
-                l = 4;
-                if (optlen && copy_to_user(optlen, &l, sizeof(l)) < 0) return -14;
-            }
-            return 0;
-        }
-        return -22;
+        usocket_pin(us);
+        int r = usock_call(call, kargs, us, nb, accept4_flags);
+        usocket_unpin(us);
+        return r;
     }
 
     if (f->type != FD_SOCKET || !f->socket)
@@ -8325,6 +8766,7 @@ void syscall_dispatch(registers_t *regs) {
     case 500: ret = shm_sys_create(regs->ebx); break;
     case 501: ret = shm_sys_map((int)regs->ebx);   break;
     case 502: ret = shm_sys_unmap((int)regs->ebx); break;
+    case 506: ret = shm_sys_chmod((int)regs->ebx, regs->ecx); break;
     case 503:  /* kprof: dump the cycle accounting (see include/kernel/kprof.h) */
         kprof_dump("mark");
         ret = 0;
