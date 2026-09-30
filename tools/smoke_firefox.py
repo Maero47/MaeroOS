@@ -1029,7 +1029,8 @@ def sites_run(qmp, args, run, pump):
             lines = [l for _, l in run.lines[first_line:]]
             row["sig"] = [l for l in lines if SIG_KILLED.search(l)]
             row["ff_events"] = [l for l in lines if FF_STALLED in l or FF_EXITED in l or FF_CRASHREP in l]
-            row["enosys"] = sum(1 for l in lines if "ENOSYS" in l)
+            row["enosys"] = [l for l in lines if "ENOSYS" in l or "[SYSCALL] unimplemented" in l]
+            row["oom"] = sum(1 for l in lines if l.startswith("[OOM]"))
             row["panic"] = any(PANIC in l for l in lines)
             run.site_rows.append(row)
             print("smoke-firefox:   %s" % site_row_text(row))
@@ -1059,7 +1060,9 @@ def site_row_text(r):
     if r.get("ff_events"):
         parts.append("ff: " + "; ".join(r["ff_events"]))
     if r.get("enosys"):
-        parts.append("%d ENOSYS line(s)" % r["enosys"])
+        parts.append("ENOSYS: " + "; ".join(r["enosys"]))
+    if r.get("oom"):
+        parts.append("%d [OOM] line(s)" % r["oom"])
     if r.get("panic"):
         parts.append("KERNEL PANIC")
     if r.get("note"):
