@@ -8,6 +8,9 @@
 #include "../cpu/isr.h"
 #include "../cpu/gdt.h"
 #include "../cpu/pit.h"
+#include "../cpu/tss.h"
+#include "../cpu/dfault.h"
+#include "../../../mm/kstack.h"
 #include <kernel/config.h>
 #include <stdint.h>
 #include <kernel/kprof.h>
@@ -128,6 +131,12 @@ void paging_init(void) {
      * side effect; capping it to 256 MiB removed that, so we do it explicitly.)
      */
     reserve_kernel_pagetables(HEAP_START, HEAP_MAX);
+    /* Same for the guarded kernel-stack window (mm/kstack.c). */
+    reserve_kernel_pagetables(KSTACK_REGION_START, KSTACK_REGION_END);
+
+    /* The double-fault task switches CR3; give it this directory, which maps
+     * every kernel region (arch/i686/cpu/tss.c). */
+    tss_set_df_cr3(pd_phys);
 
     printk("[VMM]  New PD at phys 0x%08x. Recursive mapping active.\n",
            (unsigned)pd_phys);
@@ -451,6 +460,13 @@ static void page_fault_handler(registers_t *regs) {
 
     uint32_t err = regs->err_code;
 
+    /* A kernel-mode touch of a kernel stack's guard is a stack overflow.  Say
+     * so, and stop, before anything here uses more of the little stack that
+     * is left.  (A push into the guard never gets this far: the CPU cannot
+     * deliver the #PF on that stack either, and it becomes a double fault.) */
+    if (!(err & 0x4U) && kstack_guard_stack(cr2))
+        kstack_overflow_panic("page fault in kernel stack guard", regs, cr2);
+
     /*
      * COW fault: protection violation (bit 0) + write (bit 1) + PAGE_COW set.
      * Allocate a new frame, copy the old one, update PTE.
@@ -698,7 +714,12 @@ static void page_fault_handler(registers_t *regs) {
 
 /* ── Shared page directories (threads) ──────────────────────────────────── */
 
-#define PGDIR_SHARES 64
+/* Only a pgdir with two or more users has an entry, and every user is a live
+ * process, so MAX_PROCS / 2 entries can never all be taken.  Sized from
+ * MAX_PROCS so raising the process limit cannot outgrow it; a full table would
+ * leave a shared pgdir untracked, and the first of its users to exit would free
+ * it under the others. */
+#define PGDIR_SHARES (MAX_PROCS / 2 + 1)
 static struct { uint32_t phys; int count; } pgdir_shares[PGDIR_SHARES];
 
 void pgdir_retain(uint32_t pgdir_phys) {
@@ -712,11 +733,13 @@ void pgdir_retain(uint32_t pgdir_phys) {
         if (free_slot < 0 && pgdir_shares[i].count == 0)
             free_slot = i;
     }
-    if (free_slot >= 0) {
-        /* First share: the original owner + the new user. */
-        pgdir_shares[free_slot].phys = pgdir_phys;
-        pgdir_shares[free_slot].count = 2;
-    }
+    /* Cannot happen (see PGDIR_SHARES); refusing loudly beats a later
+     * use-after-free of a page directory that is still loaded somewhere. */
+    if (free_slot < 0)
+        panic("pgdir_retain: shared page directory table full", 0);
+    /* First share: the original owner + the new user. */
+    pgdir_shares[free_slot].phys = pgdir_phys;
+    pgdir_shares[free_slot].count = 2;
 }
 
 int pgdir_release(uint32_t pgdir_phys) {

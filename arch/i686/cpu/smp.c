@@ -7,7 +7,8 @@
 #include "percpu.h"
 #include "../mm/paging.h"
 #include "../../../kernel/printk.h"
-#include "../../../mm/heap.h"
+#include "../../../mm/kstack.h"
+#include <kernel/config.h>
 #include "../../../proc/scheduler.h"
 #include "pit.h"
 #include <stddef.h>
@@ -28,7 +29,6 @@ extern uint32_t kernel_pgdir_phys;
 
 #define TRAMP_PHYS   0x8000U
 #define TRAMP_VIRT   (0xC0000000U + TRAMP_PHYS)   /* direct map of phys 0x8000 */
-#define AP_STACK_SZ  (16U * 1024U)
 
 static volatile uint32_t g_cpu_count = 1;    /* BSP only, until APs come online  */
 
@@ -217,9 +217,11 @@ static int boot_one_ap(uint8_t apicid, uint32_t idx) {
     uint32_t o_stack = (uint32_t)((char *)&ap_tramp_stack - ap_trampoline_start);
     uint32_t o_entry = (uint32_t)((char *)&ap_tramp_entry - ap_trampoline_start);
 
-    void *stack = kmalloc(AP_STACK_SZ);
+    /* A guarded kernel stack (mm/kstack.c): this CPU's scheduler loop runs
+     * on it for good, so an overflow there must fault, not corrupt. */
+    void *stack = kstack_alloc();
     if (!stack) return 0;
-    uint32_t stack_top = (uint32_t)(uintptr_t)stack + AP_STACK_SZ;
+    uint32_t stack_top = (uint32_t)(uintptr_t)stack + KSTACKSIZE;
 
     *(volatile uint32_t *)(TRAMP_VIRT + o_cr3)   = kernel_pgdir_phys;
     *(volatile uint32_t *)(TRAMP_VIRT + o_stack) = stack_top;
@@ -229,7 +231,7 @@ static int boot_one_ap(uint8_t apicid, uint32_t idx) {
      * page must be valid in the kernel pgdir until it reaches higher-half C.
      * Identity-map it (kernel pgdir only — never copied into user pgdirs). */
     if (paging_map(TRAMP_PHYS, TRAMP_PHYS, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
-        kfree(stack);
+        kstack_free(stack);
         return 0;                  /* this AP stays offline; the BSP runs on */
     }
 

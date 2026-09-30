@@ -8,6 +8,7 @@
 #define SEG_USER_CODE   0x1B    /* Ring 3, executable  (0x18 | RPL=3) */
 #define SEG_USER_DATA   0x23    /* Ring 3, data        (0x20 | RPL=3) */
 #define SEG_TSS         0x28    /* TSS descriptor */
+#define SEG_DF_TSS      0x38    /* double-fault task TSS descriptor */
 
 void gdt_init(void);     /* BSP: build + load this CPU's GDT */
 void gdt_init_ap(void);  /* AP:  build + load this CPU's GDT (per-CPU TSS/TLS) */

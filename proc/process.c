@@ -4,6 +4,7 @@
 #include "../mm/heap.h"
 #include "../mm/vmm.h"
 #include "../mm/pmm.h"
+#include "../mm/kstack.h"
 #include "../kernel/printk.h"
 #include "../arch/i686/cpu/tss.h"
 #include "../arch/i686/cpu/percpu.h"
@@ -24,10 +25,53 @@ static int next_pid = 1;
 
 extern void trapret(void);  /* defined in isr.asm */
 
+#if KSTACK_TEST
+/*
+ * Kernel-stack guard self-test (`make KSTACK_TEST=n`; compiled out otherwise,
+ * so no build a user runs can reach it).  A kernel thread deliberately runs
+ * off the bottom of its own stack; the serial log must then carry the
+ * overflow report (mm/kstack.c, arch/i686/cpu/dfault.c) rather than the
+ * machine resetting or carrying on with a corrupted heap.
+ */
+static volatile uint32_t kstack_test_depth;
+
+static uint32_t __attribute__((noinline)) kstack_test_recurse(uint32_t n) {
+    volatile uint8_t frame[256];
+    frame[0] = (uint8_t)n;
+    kstack_test_depth = n;
+    if (n == 0xFFFFFFFFU) return 0;     /* never: the guard stops us first */
+    /* Not a tail call: the addition keeps every frame live. */
+    return kstack_test_recurse(n + 1) + frame[0];
+}
+
+static void kstack_test_thread(void) {
+    /* Mode 3: the same overflow, but on an application processor, so the
+     * per-CPU double-fault task is exercised (boot with -smp 2 or more). */
+    for (int i = 0; KSTACK_TEST == 3 && this_cpu_id() == 0 && i < 100000; i++)
+        yield();
+    uint32_t base = (uint32_t)(uintptr_t)current_proc->kstack;
+    printk("[KSTACK-TEST] mode %d: cpu %u pid %d kstack [0x%08x,0x%08x)\n",
+           KSTACK_TEST, (unsigned)this_cpu_id(), current_proc->pid, (unsigned)base,
+           (unsigned)(base + KSTACKSIZE));
+    if (KSTACK_TEST == 2) {
+        /* One word below the stack: the first byte of the guard. */
+        *(volatile uint32_t *)(uintptr_t)(base - 4) = 0xDEADBEEFU;
+    } else {
+        kstack_test_recurse(0);
+    }
+    printk("[KSTACK-TEST] FAILED: overflow went unnoticed (depth %u)\n",
+           (unsigned)kstack_test_depth);
+    for (;;) __asm__ volatile("hlt");
+}
+#endif
+
 void proc_init(void) {
     for (int i = 0; i < MAX_PROCS; i++)
         ptable[i].state = PROC_UNUSED;
     printk("[PROC] Process table initialized (%d slots).\n", MAX_PROCS);
+#if KSTACK_TEST
+    proc_create_kthread(kstack_test_thread, "kstacktest");
+#endif
 }
 
 
@@ -107,7 +151,7 @@ struct proc *allocproc(void) {
         p->shm_maps[i].id = -1;
 
     /* Allocate kernel stack */
-    p->kstack = kmalloc(KSTACKSIZE);
+    p->kstack = kstack_alloc();
     if (!p->kstack) {
         fdtable_put(p);
         sighand_put(p->sighand); p->sighand = NULL;
@@ -189,7 +233,7 @@ void proc_release(struct proc *p) {
     if (!p || p->state != PROC_ZOMBIE) return;
     if (p->pgdir_phys && !pgdir_release(p->pgdir_phys))
         pgdir_free_user(p->pgdir_phys);
-    if (p->kstack) kfree(p->kstack);
+    kstack_free(p->kstack);
     p->kstack     = NULL;
     p->pgdir_phys = 0;
     p->parent     = NULL;
@@ -234,7 +278,7 @@ struct proc *proc_create_kthread(void (*fn)(void), const char *name) {
     p->sighand = sighand_alloc();
     if (!p->sighand) { p->state = PROC_UNUSED; return NULL; }
 
-    p->kstack = kmalloc(KSTACKSIZE);
+    p->kstack = kstack_alloc();
     if (!p->kstack) { sighand_put(p->sighand); p->sighand = NULL; p->state = PROC_UNUSED; return NULL; }
 
     uint8_t *sp = p->kstack + KSTACKSIZE;
@@ -274,7 +318,7 @@ struct proc *proc_create_userproc(const uint8_t *code, uint32_t code_len,
     /* Create a private page directory for this process */
     p->pgdir_phys = pgdir_create();
     if (!p->pgdir_phys) {
-        kfree(p->kstack);
+        kstack_free(p->kstack);
         p->state = PROC_UNUSED;
         return NULL;
     }
@@ -283,7 +327,7 @@ struct proc *proc_create_userproc(const uint8_t *code, uint32_t code_len,
     uint32_t code_phys = pmm_alloc_frame();
     if (!code_phys) {
         pgdir_free_user(p->pgdir_phys);
-        kfree(p->kstack);
+        kstack_free(p->kstack);
         p->state = PROC_UNUSED;
         return NULL;
     }
@@ -292,7 +336,7 @@ struct proc *proc_create_userproc(const uint8_t *code, uint32_t code_len,
                   PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
         pmm_frame_decref(code_phys);
         pgdir_free_user(p->pgdir_phys);
-        kfree(p->kstack);
+        kstack_free(p->kstack);
         p->state = PROC_UNUSED;
         return NULL;
     }
@@ -309,7 +353,7 @@ struct proc *proc_create_userproc(const uint8_t *code, uint32_t code_len,
         if (!stack_phys) {
             pmm_frame_decref(code_phys);
             pgdir_free_user(p->pgdir_phys);
-            kfree(p->kstack);
+            kstack_free(p->kstack);
             p->state = PROC_UNUSED;
             return NULL;
         }
@@ -321,7 +365,7 @@ struct proc *proc_create_userproc(const uint8_t *code, uint32_t code_len,
              * code page included, is decref'd by pgdir_free_user. */
             pmm_frame_decref(stack_phys);
             pgdir_free_user(p->pgdir_phys);
-            kfree(p->kstack);
+            kstack_free(p->kstack);
             p->state = PROC_UNUSED;
             return NULL;
         }
@@ -362,7 +406,7 @@ struct proc *proc_create_from_elf(vfs_node_t *node, const char *name) {
 
     p->pgdir_phys = pgdir_create();
     if (!p->pgdir_phys) {
-        kfree(p->kstack);
+        kstack_free(p->kstack);
         p->state = PROC_UNUSED;
         return NULL;
     }
@@ -370,7 +414,7 @@ struct proc *proc_create_from_elf(vfs_node_t *node, const char *name) {
     uint32_t entry = 0, heap_end = 0;
     if (elf_load(node, p->pgdir_phys, &entry, &heap_end) < 0) {
         pgdir_free_user(p->pgdir_phys);
-        kfree(p->kstack);
+        kstack_free(p->kstack);
         p->state = PROC_UNUSED;
         return NULL;
     }
@@ -382,7 +426,7 @@ struct proc *proc_create_from_elf(vfs_node_t *node, const char *name) {
         uint32_t stack_phys = pmm_alloc_frame();
         if (!stack_phys) {
             pgdir_free_user(p->pgdir_phys);
-            kfree(p->kstack);
+            kstack_free(p->kstack);
             p->state = PROC_UNUSED;
             return NULL;
         }
@@ -391,7 +435,7 @@ struct proc *proc_create_from_elf(vfs_node_t *node, const char *name) {
                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
             pmm_frame_decref(stack_phys);
             pgdir_free_user(p->pgdir_phys);
-            kfree(p->kstack);
+            kstack_free(p->kstack);
             p->state = PROC_UNUSED;
             return NULL;
         }
