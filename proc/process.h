@@ -147,10 +147,14 @@ struct proc {
     uint32_t         heap_end;    /* user heap break (managed by sys_brk) */
 
     /* Signals.  pending/blocked are per thread (Linux task->pending, ->blocked);
-     * the handler table is shared by the thread group (see struct sighand). */
+     * the handler table is shared by the thread group (see struct sighand), and
+     * so are process-directed pending signals (see struct sigshared). */
     uint32_t         pending_sigs;          /* bitmask of pending signals */
     uint32_t         blocked_sigs;          /* bitmask of blocked signals */
     struct sighand  *sighand;               /* shared under CLONE_SIGHAND */
+    struct sigshared *sigshared;            /* process-wide pending set, shared
+                                             * under CLONE_THREAD; NULL for
+                                             * kernel threads */
     uint32_t         sigframe_addr;         /* user addr of saved trapframe for sigreturn */
 
     /* sigsuspend's temporary mask (Linux saved_sigmask + TIF_RESTORE_SIGMASK).

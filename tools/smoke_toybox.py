@@ -84,6 +84,10 @@ def main():
             # and pending signals survive exec, handlers reset
             # (userspace/sigexecprobe).
             ("sigexecprobe\n", "sigexecprobe ok"),
+            # SA_RESETHAND/SA_NODEFER, process-wide pending signals across
+            # threads, a leader's exit and a non-leader's execve
+            # (userspace/sigshareprobe).
+            ("sigshareprobe\n", "sigshareprobe ok"),
             ("whoami\n", "root"),
             # libc regression checks (userspace/libctest)
             ("libctest\n", "LIBCTEST PASS"),

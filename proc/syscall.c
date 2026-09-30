@@ -1770,6 +1770,7 @@ static void de_thread(void) {
      * by this point, so undo the collateral damage here: the process is not
      * dying, it is being taken over. */
     me->pending_sigs &= ~(1u << SIGKILL);
+    if (me->sigshared) me->sigshared->pending &= ~(1u << SIGKILL);
     me->group_exit    = 0;
     me->exit_status   = 0;
 
@@ -2350,8 +2351,10 @@ static int kill_many(int how, int pg, int sig) {
         matched++;
         if (!kill_permitted(q, sig)) continue;
         /* An unreaped zombie is still a member (Linux: signalling it succeeds
-         * and does nothing). */
-        if (sig && q->state != PROC_ZOMBIE) signal_send_group(q, sig);
+         * and does nothing) — and a zombie LEADER whose other threads still run
+         * is a live process: signal_send_group reaches them and does nothing
+         * for a group with no live thread left. */
+        if (sig) signal_send_group(q, sig);
         sent++;
     }
     if (sent) return 0;
@@ -5116,8 +5119,11 @@ static int sys_rt_sigaction(registers_t *regs) {
         sighandler_t nh = sh->handlers[sig];
         if (nh == SIG_IGN || (nh == SIG_DFL && (sig == SIGCHLD || sig == SIGCONT)))
             for (int i = 0; i < MAX_PROCS; i++)
-                if (ptable[i].state != PROC_UNUSED && ptable[i].sighand == sh)
+                if (ptable[i].state != PROC_UNUSED && ptable[i].sighand == sh) {
                     ptable[i].pending_sigs &= ~(1u << sig);
+                    if (ptable[i].sigshared)
+                        ptable[i].sigshared->pending &= ~(1u << sig);
+                }
     }
     return 0;
 }
@@ -5145,22 +5151,30 @@ static int sys_rt_sigprocmask(registers_t *regs) {
         set = sigset_from_user(set);
         /* SIGKILL and SIGSTOP cannot be blocked */
         set &= ~((1u << SIGKILL) | (1u << SIGSTOP));
+        uint32_t nb;
         switch (how) {
-        case 0: /* SIG_BLOCK */   current_proc->blocked_sigs |=  set; break;
-        case 1: /* SIG_UNBLOCK */ current_proc->blocked_sigs &= ~set; break;
-        case 2: /* SIG_SETMASK */ current_proc->blocked_sigs  =  set; break;
+        case 0: /* SIG_BLOCK */   nb = current_proc->blocked_sigs |  set; break;
+        case 1: /* SIG_UNBLOCK */ nb = current_proc->blocked_sigs & ~set; break;
+        case 2: /* SIG_SETMASK */ nb = set;                               break;
         default: return -22;  /* EINVAL */
         }
+        /* Process-wide pending signals this thread starts blocking are handed
+         * to a sibling that can take them (Linux set_current_blocked ->
+         * retarget_shared_pending); ones it unblocks it takes itself on the way
+         * back to user mode. */
+        signal_retarget_shared(current_proc, nb & ~current_proc->blocked_sigs);
+        current_proc->blocked_sigs = nb;
     }
     return 0;
 }
 
 /* ── sys_rt_sigpending(set, sigsetsize) — EAX=176, sigpending(set) — EAX=73 ──
- * The signals raised while blocked and still waiting (Linux do_sigpending:
- * pending & blocked).  Both write one word of user sigset_t. */
+ * The signals raised while blocked and still waiting, the thread's own and the
+ * process's (Linux do_sigpending: (pending | shared_pending) & blocked).  Both
+ * write one word of user sigset_t. */
 static int sys_rt_sigpending(registers_t *regs) {
     uint32_t *uset = (uint32_t *)(uintptr_t)regs->ebx;
-    uint32_t set = sigset_to_user(current_proc->pending_sigs &
+    uint32_t set = sigset_to_user(signal_pending_set(current_proc) &
                                   current_proc->blocked_sigs);
     if (copy_to_user(uset, &set, sizeof(set)) < 0) return -14;
     return 0;
@@ -7241,6 +7255,7 @@ static int sys_rt_sigsuspend(registers_t *regs) {
         int cr = copy_from_user(&raw, mask, sizeof(raw));
         if (cr < 0) return cr;
         uint32_t m = sigset_from_user(raw) & ~((1u << SIGKILL) | (1u << SIGSTOP));
+        signal_retarget_shared(current_proc, m & ~current_proc->blocked_sigs);
         current_proc->blocked_sigs = m;
     }
 
@@ -7379,6 +7394,13 @@ static int sys_clone(registers_t *regs) {
          * thread's exit is never a "child exit" for the creating thread. */
         child->tgid   = parent->tgid;
         child->parent = parent->parent;
+        /* One process-wide signal state for the group (copy_signal is skipped
+         * under CLONE_THREAD). */
+        if (parent->sigshared) {
+            sigshared_put(child->sigshared);
+            child->sigshared = parent->sigshared;
+            child->sigshared->refcount++;
+        }
     } else {
         /* Own group in a shared address space.  Its parent is the creating
          * PROCESS; its VMA list and mmap cursor stay with the address-space

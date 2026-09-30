@@ -192,8 +192,8 @@ void kwatch_dump(const char *tag) {
         if (p->tf)
             printk(" eip=%x esp=%x", (unsigned)p->tf->eip, (unsigned)p->tf->useresp);
         if (p->no_preempt) printk(" nopreempt=%d", p->no_preempt);
-        if (p->pending_sigs)
-            printk(" sig=%x/blk=%x", (unsigned)p->pending_sigs,
+        if (signal_pending_set(p))
+            printk(" sig=%x/blk=%x", (unsigned)signal_pending_set(p),
                    (unsigned)p->blocked_sigs);
         printk(" run=%u sched=%u\n", (unsigned)p->utime_ticks,
                (unsigned)p->sched_count);
