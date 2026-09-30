@@ -90,7 +90,7 @@ static int http_halfclose(int fd) {
  * whose fd is still open.  All the old fds are closed while that new
  * connection is live; a socket that still held its freed pcb would detach and
  * close the new connection's pcb.  The new connection must then complete a
- * fetch.  KEEP stays below the 32-entry socket table. */
+ * fetch. */
 #define TCPTW_KEEP 24
 static int tcptw(int port, int n) {
     int fds[TCPTW_KEEP];
@@ -294,6 +294,57 @@ static int nb(int port, int closed_port) {
     return 0;
 }
 
+/* sockprobe many <port> <ntcp> <nudp>: hold ntcp connected TCP sockets and
+ * nudp UDP sockets open at once, well past the 32 slots the kernel socket
+ * table used to have, then use every one of them: a datagram out of each UDP
+ * socket and an HTTP fetch on each TCP connection, oldest first so the first
+ * connections have idled while the rest were opened. */
+#define MANY_MAX 120
+static int many(int port, int ntcp, int nudp) {
+    static int tfd[MANY_MAX], ufd[MANY_MAX];
+    if (ntcp > MANY_MAX || nudp > MANY_MAX) {
+        printf("sockprobe: many: at most %d of each\n", MANY_MAX);
+        return 1;
+    }
+    for (int i = 0; i < ntcp; i++) {
+        tfd[i] = http_connect(port);
+        if (tfd[i] < 0) {
+            printf("sockprobe: many: tcp connect %d failed errno=%d\n", i, errno);
+            return 1;
+        }
+    }
+    for (int i = 0; i < nudp; i++) {
+        ufd[i] = socket(AF_INET, SOCK_DGRAM, 0);
+        if (ufd[i] < 0) {
+            printf("sockprobe: many: udp socket %d failed errno=%d\n", i, errno);
+            return 1;
+        }
+    }
+    struct sockaddr_in discard;
+    discard.sin_family = AF_INET;
+    discard.sin_port = htons(9);
+    discard.sin_addr.s_addr = inet_addr("10.0.2.2");
+    for (int i = 0; i < nudp; i++) {
+        if (sendto(ufd[i], "x", 1, 0, (struct sockaddr *)&discard,
+                   sizeof(discard)) != 1) {
+            printf("sockprobe: many: udp sendto %d failed errno=%d\n", i, errno);
+            return 1;
+        }
+    }
+    for (int i = 0; i < ntcp; i++) {
+        if (!http_halfclose(tfd[i])) {
+            printf("sockprobe: many: fetch on tcp socket %d failed errno=%d\n", i, errno);
+            return 1;
+        }
+    }
+    for (int i = 0; i < ntcp; i++)
+        close(tfd[i]);
+    for (int i = 0; i < nudp; i++)
+        close(ufd[i]);
+    printf("sockprobe many ok %d\n", ntcp + nudp);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "tcpshut") == 0)
         return tcpshut(atoi(argv[2]));
@@ -301,6 +352,8 @@ int main(int argc, char **argv) {
         return shutrd(atoi(argv[2]), atoi(argv[3]));
     if (argc == 4 && strcmp(argv[1], "tcptw") == 0)
         return tcptw(atoi(argv[2]), atoi(argv[3]));
+    if (argc == 5 && strcmp(argv[1], "many") == 0)
+        return many(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]));
     if (argc == 4 && strcmp(argv[1], "nb") == 0)
         return nb(atoi(argv[2]), atoi(argv[3]));
 

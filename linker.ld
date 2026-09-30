@@ -63,6 +63,13 @@ SECTIONS {
     _kernel_end = .;
     _kernel_phys_end = _kernel_end - KERNEL_VMA;
 
+    /* boot.asm maps only the first boot_mapped_bytes (12 MiB) before
+     * paging_init; a .bss tail past it page-faults the first time early C
+     * code touches it, before there is an IDT to report the fault.  Move big static tables to the heap, or add a boot
+     * page table (BOOT_PAGE_TABLES in boot.asm). */
+    ASSERT(_kernel_phys_end <= boot_mapped_bytes,
+           "kernel image (_kernel_end) exceeds boot.asm's initial mapping (boot_mapped_bytes, 12 MiB): shrink .bss or raise BOOT_PAGE_TABLES")
+
     /DISCARD/ : {
         *(.comment)
         *(.note.*)

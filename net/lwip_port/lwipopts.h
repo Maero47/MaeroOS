@@ -23,17 +23,27 @@
 
 #define MEM_ALIGNMENT                   4
 #define MEM_SIZE                        (256 * 1024)
-#define MEMP_NUM_PBUF                   32
+/* Pool sizing follows the socket table (net/socket.c, 128 slots): Firefox
+ * opens UDP sockets for DNS (musl's resolver, one per lookup, several lookups
+ * in flight) and QUIC/connectivity probes next to its TCP connections; with 16
+ * UDP pcbs socket() failed ("[NET] socket: lwIP has no free UDP pcb") ~33
+ * times per smoke-firefox boot.  A udp_pcb is ~40 bytes, so 64 costs ~2.5 KiB.
+ * Per-pool .bss is in the memp_memory_*_base symbols of kernel.elf. */
+#define MEMP_NUM_PBUF                   64
 #define MEMP_NUM_RAW_PCB                8
-#define MEMP_NUM_UDP_PCB                16
+#define MEMP_NUM_UDP_PCB                64
 /* Firefox keeps background TLS sessions to Mozilla services open while it
  * loads a page, and closed connections linger in FIN_WAIT/TIME_WAIT; with 16
  * pcbs tcp_new() failed ("[NET] socket: lwIP has no free TCP pcb") and an
  * image on the page was never requested, in 4 of 20 smoke-firefox --web boots. */
 #define MEMP_NUM_TCP_PCB                64
 #define MEMP_NUM_TCP_PCB_LISTEN         8
-#define MEMP_NUM_TCP_SEG                256
-#define PBUF_POOL_SIZE                  96
+/* Queued TX segments across all pcbs (a tcp_seg is 20 bytes; the data sits
+ * in MEM_SIZE).  One full TCP_SND_BUF is TCP_SND_QUEUELEN (64) segments, so
+ * 512 lets 8 connections have a full send buffer queued at once. */
+#define MEMP_NUM_TCP_SEG                512
+/* NIC RX and out-of-order segments: 128 x 1.5 KiB = 192 KiB (96 was 144). */
+#define PBUF_POOL_SIZE                  128
 #define PBUF_POOL_BUFSIZE               1536
 
 #define LWIP_NETIF_STATUS_CALLBACK      1

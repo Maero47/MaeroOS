@@ -15,7 +15,8 @@
 
 static struct netif lwip_eth0;
 static netif_t *host_eth0;
-static int lwip_ready;
+static int lwip_inited;    /* lwip_init() done: pools and timers usable */
+static int lwip_ready;     /* ... and eth0 attached */
 
 static err_t maero_lwip_output(struct netif *lwif, struct pbuf *p) {
     (void)lwif;
@@ -50,9 +51,17 @@ static err_t maero_lwip_init_if(struct netif *lwif) {
 }
 
 void net_lwip_init(void) {
+    /* The stack comes up even with no NIC: socket() only needs the memp
+     * pools, and connect()/sendto() then fail with ENETUNREACH (no route),
+     * as on a Linux box with no interface up.  Skipping lwip_init left every
+     * pool empty, so each socket() failed with ENOMEM and a bogus "no free
+     * UDP pcb" (72 of them in one no-network Firefox boot). */
+    lwip_init();
+    lwip_inited = 1;
+
     host_eth0 = net_find_interface("eth0");
     if (!host_eth0) {
-        printk("[LWIP] no eth0; skipping lwIP init\n");
+        printk("[LWIP] no eth0; lwIP up with no interface\n");
         return;
     }
 
@@ -61,7 +70,6 @@ void net_lwip_init(void) {
     IP4_ADDR(&netmask, 0, 0, 0, 0);
     IP4_ADDR(&gw, 0, 0, 0, 0);
 
-    lwip_init();
     if (!netif_add(&lwip_eth0, &ipaddr, &netmask, &gw, NULL,
                    maero_lwip_init_if, ethernet_input)) {
         printk("[LWIP] netif_add failed\n");
@@ -89,9 +97,11 @@ void net_lwip_input(netif_t *iface, const void *data, uint32_t len) {
 }
 
 void net_lwip_poll(void) {
-    if (!lwip_ready)
+    if (!lwip_inited)
         return;
     sys_check_timeouts();
+    if (!lwip_ready)
+        return;
     static int bound;
     if (!bound && !ip4_addr_isany_val(*netif_ip4_addr(&lwip_eth0))) {
         char b[80];
