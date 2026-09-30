@@ -4,10 +4,12 @@
 #include "../include/errno.h"
 #include "../include/fcntl.h"
 #include "../include/pwd.h"
+#include "../include/signal.h"
 #include "../include/stdio.h"
 #include "../include/stdlib.h"
 #include "../include/string.h"
 #include "../include/sys/stat.h"
+#include "../include/syscall.h"
 #include "../include/unistd.h"
 
 static int failures;
@@ -155,6 +157,210 @@ static void test_passwd(void) {
     check(getpwnam("nosuchuser") == 0 && getpwuid(4242) == 0, "unknown users are not found");
 }
 
+/* ── Signals ─────────────────────────────────────────────────────────────── */
+
+static volatile int usr1_hits, usr2_hits, usr2_during_usr1, depth, max_depth;
+static volatile sigset_t mask_in_handler;
+
+static sigset_t cur_mask(void) {
+    sigset_t m = 0;
+    sigprocmask(SIG_BLOCK, 0, &m);
+    return m;
+}
+
+static sigset_t one(int sig) {
+    sigset_t s;
+    sigemptyset(&s);
+    sigaddset(&s, sig);
+    return s;
+}
+
+static void set_handler(int sig, sighandler_t h, sigset_t mask, int flags) {
+    struct sigaction sa = { 0 };
+    sa.sa_handler = h;
+    sa.sa_mask = mask;
+    sa.sa_flags = flags;
+    sigaction(sig, &sa, 0);
+}
+
+static void on_usr2(int sig) { (void)sig; usr2_hits++; }
+
+static void on_usr1_masked(int sig) {
+    (void)sig;
+    usr1_hits++;
+    mask_in_handler = cur_mask();
+    raise(SIGUSR2);                 /* blocked by sa_mask: must not run yet */
+    usr2_during_usr1 = usr2_hits;
+}
+
+static void on_usr1_nest(int sig) {
+    (void)sig;
+    usr1_hits++;
+    if (++depth > max_depth) max_depth = depth;
+    if (usr1_hits == 1) raise(SIGUSR1);
+    depth--;
+}
+
+static void on_usr1_count(int sig) { (void)sig; usr1_hits++; mask_in_handler = cur_mask(); }
+
+static void test_sigset(void) {
+    sigset_t s;
+    sigemptyset(&s);
+    int ok = !sigismember(&s, SIGINT);
+    sigaddset(&s, SIGINT);
+    sigaddset(&s, SIGSYS);
+    ok = ok && sigismember(&s, SIGINT) == 1 && sigismember(&s, SIGSYS) == 1 &&
+         !sigismember(&s, SIGQUIT);
+    sigdelset(&s, SIGINT);
+    ok = ok && !sigismember(&s, SIGINT) && sigismember(&s, SIGSYS);
+    sigfillset(&s);
+    ok = ok && sigismember(&s, SIGUSR1) && sigismember(&s, SIGHUP);
+    check(ok, "sigemptyset/sigfillset/sigaddset/sigdelset/sigismember");
+    errno = 0;
+    check(sigaddset(&s, 0) < 0 && errno == EINVAL && sigismember(&s, 99) < 0,
+          "sigset calls reject invalid signal numbers");
+}
+
+static void test_sigaction_mask(void) {
+    usr1_hits = usr2_hits = usr2_during_usr1 = 0;
+    set_handler(SIGUSR2, on_usr2, 0, 0);
+    set_handler(SIGUSR1, on_usr1_masked, one(SIGUSR2), 0);
+    raise(SIGUSR1);
+    getpid();                        /* the unblocked SIGUSR2 is delivered here */
+    check(usr1_hits == 1 && usr2_during_usr1 == 0 && usr2_hits == 1,
+          "sa_mask blocks the masked signal during the handler, delivered after");
+    check((mask_in_handler & one(SIGUSR1)) && (mask_in_handler & one(SIGUSR2)),
+          "handler runs with its own signal and sa_mask blocked");
+    check(!(cur_mask() & (one(SIGUSR1) | one(SIGUSR2))), "mask restored after the handler");
+}
+
+static void test_nodefer(void) {
+    usr1_hits = depth = max_depth = 0;
+    set_handler(SIGUSR1, on_usr1_nest, 0, SA_NODEFER);
+    raise(SIGUSR1);
+    check(usr1_hits == 2 && max_depth == 2, "SA_NODEFER lets the handler nest");
+    usr1_hits = depth = max_depth = 0;
+    set_handler(SIGUSR1, on_usr1_nest, 0, 0);
+    raise(SIGUSR1);
+    getpid();
+    check(usr1_hits == 2 && max_depth == 1, "without SA_NODEFER the signal waits for the handler");
+}
+
+static void test_resethand(void) {
+    struct sigaction sa = { 0 }, old, now;
+    usr1_hits = 0;
+    sa.sa_handler = on_usr1_count;
+    sa.sa_flags = SA_RESETHAND;
+    sa.sa_mask = one(SIGUSR2);
+    sigaction(SIGUSR1, &sa, 0);
+    sigaction(SIGUSR1, 0, &old);
+    check(old.sa_handler == on_usr1_count && (old.sa_flags & SA_RESETHAND) &&
+          old.sa_mask == one(SIGUSR2), "SA_RESETHAND action reads back as installed");
+    raise(SIGUSR1);
+    sigaction(SIGUSR1, 0, &now);
+    check(usr1_hits == 1 && now.sa_handler == SIG_DFL, "SA_RESETHAND resets to SIG_DFL on delivery");
+    check(mask_in_handler & one(SIGUSR1), "SA_RESETHAND without SA_NODEFER blocks the signal");
+}
+
+static void test_sigprocmask(void) {
+    sigset_t old = 0, pend = 0;
+    usr1_hits = 0;
+    set_handler(SIGUSR1, on_usr1_count, 0, 0);
+    sigset_t s = one(SIGUSR1);
+    check(sigprocmask(SIG_BLOCK, &s, &old) == 0 && !(old & s) && (cur_mask() & s),
+          "sigprocmask SIG_BLOCK blocks, returns the old mask");
+    raise(SIGUSR1);
+    check(usr1_hits == 0, "a blocked signal is not delivered");
+
+    /* rt_sigpending was a stub that returned 0 without writing the set;
+     * tell that apart from "nothing pending" with a sentinel. */
+    unsigned raw[2] = { 0xA5A5A5A5u, 0xA5A5A5A5u };
+    syscall2(176, (int)raw, 8);
+    if (raw[0] == 0xA5A5A5A5u) {
+        printf("skip sigpending reports the blocked signal (kernel rt_sigpending is a stub)\n");
+    } else {
+        check(sigpending(&pend) == 0 && (pend & s), "sigpending reports the blocked signal");
+    }
+    check(sigprocmask(SIG_UNBLOCK, &s, 0) == 0 && usr1_hits == 1,
+          "unblocking delivers the pending signal");
+    check(sigprocmask(SIG_SETMASK, &old, 0) == 0 && cur_mask() == old, "SIG_SETMASK restores");
+    errno = 0;
+    check(sigprocmask(7, &s, 0) < 0 && errno == EINVAL, "sigprocmask rejects a bad how");
+}
+
+static void test_sigsuspend(void) {
+    usr1_hits = 0;
+    set_handler(SIGUSR1, on_usr1_count, 0, 0);
+    sigset_t s = one(SIGUSR1), old, wait_mask = one(SIGUSR2);
+    sigprocmask(SIG_BLOCK, &s, &old);
+    int parent = getpid();
+    int pid = fork();
+    if (pid == 0) {
+        usleep(100000);
+        kill(parent, SIGUSR1);
+        _exit(0);
+    }
+    errno = 0;
+    int r = sigsuspend(&wait_mask);
+    check(r == -1 && errno == EINTR && usr1_hits == 1, "sigsuspend waits for the signal, EINTR");
+    check((mask_in_handler & one(SIGUSR2)) && (mask_in_handler & s),
+          "handler runs under the sigsuspend mask");
+    check(cur_mask() == (old | s), "sigsuspend restores the mask");
+    if (pid > 0) waitpid(pid, 0, 0);
+    sigprocmask(SIG_SETMASK, &old, 0);
+}
+
+static void test_oldact(void) {
+    struct { struct sigaction sa; unsigned char guard[32]; } o;
+    struct sigaction sa = { 0 };
+    sa.sa_handler = on_usr2;
+    sa.sa_mask = one(SIGHUP) | one(SIGTERM);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGUSR2, &sa, 0);
+    memset(&o, 0xA5, sizeof(o));
+    sa.sa_handler = SIG_IGN;
+    sa.sa_mask = 0;
+    sa.sa_flags = 0;
+    int r = sigaction(SIGUSR2, &sa, &o.sa);
+    check(r == 0 && o.sa.sa_handler == on_usr2 && o.sa.sa_mask == (one(SIGHUP) | one(SIGTERM)) &&
+          (o.sa.sa_flags & SA_RESTART), "sigaction returns the old action");
+    int intact = 1;
+    for (unsigned i = 0; i < sizeof(o.guard); i++) if (o.guard[i] != 0xA5) intact = 0;
+    check(intact, "sigaction writes nothing past struct sigaction");
+
+    check(signal(SIGUSR2, SIG_DFL) == SIG_IGN, "signal() returns the previous handler");
+    errno = 0;
+    check(signal(SIGKILL, on_usr2) == SIG_ERR && errno == EINVAL, "signal(SIGKILL) fails EINVAL");
+    signal(SIGUSR1, on_usr1_count);
+    sigaction(SIGUSR1, 0, &sa);
+    check(sa.sa_flags & SA_RESTART, "signal() installs with SA_RESTART");
+}
+
+static void test_sigaltstack(void) {
+    static char stk[SIGSTKSZ];
+    stack_t ss = { stk, 0, sizeof(stk) }, old;
+    check(sigaltstack(&ss, 0) == 0 && sigaltstack(0, &old) == 0 && old.ss_sp == stk &&
+          old.ss_size == sizeof(stk) && old.ss_flags == 0, "sigaltstack installs and reads back");
+    ss.ss_flags = SS_DISABLE;
+    check(sigaltstack(&ss, 0) == 0 && sigaltstack(0, &old) == 0 && old.ss_flags == SS_DISABLE,
+          "sigaltstack SS_DISABLE");
+}
+
+static void test_signals(void) {
+    test_sigset();
+    test_sigaction_mask();
+    test_nodefer();
+    test_resethand();
+    test_sigprocmask();
+    test_sigsuspend();
+    test_oldact();
+    test_sigaltstack();
+    signal(SIGUSR1, SIG_DFL);
+    signal(SIGUSR2, SIG_DFL);
+    sigset_t none = 0;
+    sigprocmask(SIG_SETMASK, &none, 0);
+}
+
 int main(void) {
     test_snprintf();
     test_malloc();
@@ -165,6 +371,7 @@ int main(void) {
     test_mkstemp();
     test_stdio_errors();
     test_passwd();
+    test_signals();
     if (failures) printf("LIBCTEST FAILED %d\n", failures);
     else printf("LIBCTEST PASS\n");
     return failures ? 1 : 0;

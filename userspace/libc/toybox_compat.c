@@ -222,13 +222,6 @@ void qsort(void *base, size_t nmemb, size_t size,
     }
 }
 
-int sigfillset(sigset_t *set) { if (set) *set = ~0UL; return 0; }
-int sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
-    (void)how; (void)set; if (oldset) *oldset = 0; return 0;
-}
-int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact) {
-    (void)act; if (oldact) oldact->sa_handler = SIG_DFL; signal(signum, act ? act->sa_handler : SIG_DFL); return 0;
-}
 int sigsetjmp(sigjmp_buf env, int savesigs) { (void)env; (void)savesigs; return 0; }
 void siglongjmp(sigjmp_buf env, int val) { (void)env; exit(val); }
 
