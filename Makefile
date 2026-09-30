@@ -28,6 +28,7 @@ endif
 #   make KSTACK_TEST=1   runaway recursion  -> double fault on the #DF task
 #   make KSTACK_TEST=2   store into the guard -> page-fault overflow report
 #   make KSTACK_TEST=3   mode 1 on an AP (boot with -smp 2+) -> that CPU's #DF task
+#   make KSTACK_TEST=4   runaway recursion on the BSP scheduler stack -> #DF task
 KSTACK_TEST ?= 0
 ifneq ($(KSTACK_TEST),0)
 CFLAGS  += -DKSTACK_TEST=$(KSTACK_TEST)
@@ -505,7 +506,9 @@ clean:
 	find kernel arch/i686 mm fs drivers proc lib net third_party/lwip/src \
 		\( -name "*.o" -o -name "*.d" \) -delete 2>/dev/null || true
 	rm -f $(TARGET) maeros.iso initrd.tar disk.img disk-ff.img $(QEMU_ISO_PID) $(KTRACE_STAMP)
-	rm -rf isodir
+	rm -rf isodir repo
+	rm -rf $(TOYBOX_DIR)/generated
+	rm -f $(TOYBOX_DIR)/toybox $(TOYBOX_DIR)/.singlemake testfiles/toybox
 	$(MAKE) -C userspace clean
 
 # Pull in auto-generated dependency files (silence errors if none exist yet)

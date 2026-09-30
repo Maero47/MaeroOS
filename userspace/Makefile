@@ -649,10 +649,12 @@ extprobe/extprobe.o: extprobe/extprobe.c
 $(TESTFILES)/extprobe: $(CRT0_OBJ) extprobe/extprobe.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) extprobe/extprobe.o libc/libc.a
 
-store/store.o: store/store.c include/gui.h include/draw.h
+# store shows the pkg index cache only once pkg's verifier accepts it.
+STORE_PKG_OBJS := pkg/indexsig.o pkg/ed25519.o pkg/tweetnacl.o
+store/store.o: store/store.c include/gui.h include/draw.h pkg/indexsig.h pkg/repo_pubkey.h
 	$(CC) $(CFLAGS) -c $< -o $@
-$(TESTFILES)/store: store/store.o $(GUIAPP_DEPS)
-	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) store/store.o libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o libwm/wm.o libc/libc.a
+$(TESTFILES)/store: store/store.o $(STORE_PKG_OBJS) $(GUIAPP_DEPS)
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) store/store.o $(STORE_PKG_OBJS) libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o libwm/wm.o libc/libc.a
 
 PKG_OBJS := pkg/pkg.o pkg/tarx.o pkg/sha256.o pkg/indexsig.o pkg/ed25519.o pkg/tweetnacl.o
 $(PKG_OBJS): pkg/tarx.h pkg/sha256.h pkg/indexsig.h pkg/ed25519.h
@@ -738,47 +740,15 @@ browse/browse.o: browse/browse.c include/gui.h include/draw.h
 $(TESTFILES)/browse: $(CRT0_OBJ) browse/browse.o libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o libwm/wm.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) browse/browse.o libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o libwm/wm.o libc/libc.a
 
+# Clean from the same lists the build uses, so a new program is cleaned as soon
+# as it is added to USER_BINS: every program and BusyBox wrapper, uidtest (built
+# only on request), the generated pkg key header, and every object/archive in
+# this tree (all gitignored build products).  The committed musl binaries
+# (MUSL_BINS, testfiles/dynprobe) are sources, not products, and are kept.
 clean:
-	rm -f libc/*.o libc/libc.a pkg/*.o pkg/repo_pubkey.h \
-	      init/init.o shell/shell.o ls/ls.o \
-	      cat/cat.o cp/cp.o rm/rm.o touch/touch.o mkdir_cmd/mkdir.o head/head.o \
-	      grep/grep.o wc/wc.o sleep/sleep.o kill_cmd/kill.o test_cmd/test.o \
-	      sort/sort.o uniq/uniq.o cut/cut.o printf_cmd/printf.o \
-	      env/env.o tee/tee.o tr/tr.o false_cmd/false.o true_cmd/true.o \
-	      basename_cmd/basename.o dirname_cmd/dirname.o \
-	      sed/sed.o awk/awk.o find_cmd/find.o date_cmd/date.o id_cmd/id.o \
-	      ps/ps.o svc/svc.o session/session.o auth/auth.o auth/replace.o login/login.o passwd/passwd.o getty/getty.o xargs_cmd/xargs.o diff/diff.o tar_cmd/tar.o \
-	      mkfifo_cmd/mkfifo.o ln_cmd/ln.o readlink_cmd/readlink.o \
-	      sysprobe/sysprobe.o lspci/lspci.o ifconfig/ifconfig.o \
-	      diskprobe/diskprobe.o fsprobe/fsprobe.o respawnprobe/respawnprobe.o \
-	      sockprobe/sockprobe.o netprobe/netprobe.o httpget/httpget.o randprobe/randprobe.o sysmiscprobe/sysmiscprobe.o abi2probe/abi2probe.o kwprobe/kwprobe.o \
-	      fbtest/fbtest.o evtest/evtest.o mousetest/mousetest.o \
-	      polltest/polltest.o ptytest/ptytest.o cttytest/cttytest.o \
-	      desktop/desktop.o wmctl/wmctl.o gui_demo/gui_demo.o wmevtest/wmevtest.o uidemo/uidemo.o files/files.o \
-	      dmesg/dmesg.o \
-	      libwm/wm.o libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o \
-	      $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
-	      $(TESTFILES)/cat $(TESTFILES)/cp $(TESTFILES)/rm \
-	      $(TESTFILES)/touch $(TESTFILES)/mkdir $(TESTFILES)/head \
-	      $(TESTFILES)/grep $(TESTFILES)/wc $(TESTFILES)/sleep \
-	      $(TESTFILES)/kill $(TESTFILES)/test \
-	      $(TESTFILES)/sort $(TESTFILES)/uniq $(TESTFILES)/cut $(TESTFILES)/printf \
-	      $(TESTFILES)/env $(TESTFILES)/tee $(TESTFILES)/tr \
-	      $(TESTFILES)/false $(TESTFILES)/true \
-	      $(TESTFILES)/basename $(TESTFILES)/dirname \
-	      $(TESTFILES)/sed $(TESTFILES)/awk $(TESTFILES)/find \
-	      $(TESTFILES)/date $(TESTFILES)/id $(TESTFILES)/ps $(TESTFILES)/xargs \
-	      $(TESTFILES)/svc $(TESTFILES)/session $(TESTFILES)/login $(TESTFILES)/passwd $(TESTFILES)/doas $(TESTFILES)/fwctl $(TESTFILES)/getty \
-	      $(TESTFILES)/diff $(TESTFILES)/tar \
-	      $(TESTFILES)/mkfifo $(TESTFILES)/ln $(TESTFILES)/readlink \
-	      $(TESTFILES)/sysprobe $(TESTFILES)/lspci $(TESTFILES)/ifconfig \
-	      $(TESTFILES)/diskprobe $(TESTFILES)/fsprobe $(TESTFILES)/respawnprobe \
-	      $(TESTFILES)/sockprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget $(TESTFILES)/randprobe $(TESTFILES)/sysmiscprobe $(TESTFILES)/abi2probe $(TESTFILES)/kwprobe \
-	      $(TESTFILES)/fbtest $(TESTFILES)/evtest $(TESTFILES)/mousetest \
-	      $(TESTFILES)/polltest $(TESTFILES)/ptytest $(TESTFILES)/cttytest \
-	      $(TESTFILES)/desktop $(TESTFILES)/wmctl $(TESTFILES)/gui_demo \
-	      $(TESTFILES)/wmevtest $(TESTFILES)/uidemo $(TESTFILES)/files \
-	      $(TESTFILES)/dmesg
+	find . \( -name '*.o' -o -name '*.a' -o -name '*.d' \) -type f -delete
+	rm -f pkg/repo_pubkey.h
+	rm -f $(USER_BINS) $(BB_WRAPPERS) $(TESTFILES)/uidtest
 
 
 # ── Phase 28: Linux command parity ──────────────────────────────────────────
