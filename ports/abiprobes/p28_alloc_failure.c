@@ -16,8 +16,9 @@
  *   A  eager anonymous mmap, until the physical allocator runs dry      ENOMEM
  *   B  pipes, until the descriptor table / kernel objects run out       EMFILE
  *   C  AF_UNIX socketpairs, likewise                                    EMFILE
- *   D  a large tmpfs write - file bodies come straight out of the       ENOMEM
- *      kernel heap, so this is the path that fills HEAP_START..HEAP_MAX
+ *   D  a large tmpfs write - file bodies used to come straight out of   ENOMEM
+ *      the kernel heap (HEAP_START..HEAP_MAX); they are page frames now
+ *      (p29), so this is one more path to physical exhaustion
  *   E  an execve argv the kernel must refuse rather than size a buffer  E2BIG
  *      from (4096 pointers at one 128 KiB string = 512 MiB if charged
  *      per pointer)
