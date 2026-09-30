@@ -742,8 +742,8 @@ no free TCP pcb`); now 64.
   `ata` 1.1 s, page faults 0.36 s, the rest waits.
 * **The heap walk.** `kmalloc` is first fit over every block, used or free,
   with interrupts off: 23 M blocks stepped over before paint (~1 050 per
-  call, counted by the new `ev kmalloc= heap_walk=` line). A free-only list
-  or size classes would remove it.
+  call, counted by the new `ev kmalloc= heap_walk=` line). *(Since done:
+  `mm/heap.c` is now TLSF-style segregated free lists.)*
 * **Enter can be lost.** Twice in eleven `--web` runs before the maeroX fix,
   Firefox received the Enter key (maeroX's trace shows it delivered) and did
   not navigate: the URL bar still waiting on its query for the typed text on a
@@ -751,5 +751,6 @@ no free TCP pcb`); now 64.
   retry, so it would show as a FAIL.
 * **Fonts.** `https://example.com` loads over the real network (DNS, TLS),
   but its text is drawn as missing-glyph boxes. The disk has DejaVu Sans and
-  Twemoji only; not investigated further.
+  Twemoji only. *(Since done: DejaVu Sans, Serif and Sans Mono in four styles
+  plus fontconfig aliases; `make smoke-firefox-web` checks for boxes.)*
 

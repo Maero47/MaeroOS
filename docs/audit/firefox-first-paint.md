@@ -34,8 +34,8 @@ references against `8da3cde`.
 
 The frontier moved to loading a page, which nothing had tried. With a NIC
 attached, a typed URL never reached the server. Kernel defects stood in
-the way, each found from a trace (`make KTRACE=1` now logs every AF_INET
-socket call) and each covered by a probe:
+the way, each found from a trace (setting `NETTRACE` to 1 in
+`include/kernel/config.h` logs every AF_INET socket call) and each covered by a probe:
 
 | Symptom | Cause | Probe |
 |---|---|---|
@@ -626,6 +626,10 @@ steal path entirely, but it is not a kernel task.
 ---
 
 ## 6. Firefox-specific hacks and tracing to remove
+
+**Status:** done. None of the symbols below is left in the kernel; the only
+survivor is the cheap `[pmm-UAF]` check in `mm/pmm.c`, kept as a debug assert.
+The table is the record of what was removed, against `8da3cde`.
 
 These distort scheduling (extra wake-ups, serial output under the BKL, extra
 yields) or hard-code Firefox layout facts (`libxul` at `0x43300000`, thread

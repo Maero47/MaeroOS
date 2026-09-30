@@ -1,20 +1,45 @@
-# MaeroOS Browser Roadmap — from `browse` to Firefox-class
+# MaeroOS Browser Roadmap — from `browse` to Firefox
 
 ## Where we are
 
 | Rung | Browser | Status |
 |------|---------|--------|
-| 1 | `browse` (native) | ✅ Done — instant text browsing, links, history, redirects |
-| 2 | **links2 -g** (Linux port) | Phase 21 — real pages **with images** (PNG/JPEG/GIF), tables, frames |
-| 3 | NetSurf framebuffer | Next — true CSS layout engine (libcss), the real-web milestone |
-| 4 | **Dynamic linking (ld.so)** | ✅ **Phase 30 + 31. PIEs run via the real `/lib/ld-musl-i386.so.1`, and EXTERNAL shared libraries now load (zlib runs).** Foundation for everything beyond. |
-| 5 | X11/Wayland compatibility layer | Next — GUI toolkit apps (GTK) become possible |
-| 6 | Firefox-class (Gecko/WebKit) | The summit |
+| 1 | `browse` (native) | ✅ Text browsing, links, history, redirects |
+| 2 | **links2 -g** (Linux port) | ✅ links 2.30 with framebuffer graphics, shipped as a package (`ports/packages/links`) |
+| 3 | NetSurf framebuffer | Skipped: every rung after links2 went straight at Firefox |
+| 4 | **Dynamic linking (ld.so)** | ✅ Phases 30 + 31: PIEs and external shared libraries load through the real musl `ld.so` |
+| 5 | X11 compatibility layer | ✅ Phases 32b–34: AF_UNIX, the maeroX server, real libX11/libxcb and GTK3 (`make smoke-x`, `make smoke-gtk`) |
+| 6 | **Firefox 115.15.0esr** (official i686 build) | ✅ Paints its window about 5 s after `firefox-bin` starts and loads pages over HTTP and HTTPS (`make smoke-firefox`, `make smoke-firefox-web`, `--sites` for live sites) |
 
-## ✅ Phase 31 — external shared libraries now load (rung 2 cleared)
+What is still missing on rung 6 is listed under "What does not work" in
+[README.md](README.md): the content sandbox is off, scripts DejaVu does not
+cover (CJK, Indic) come out as missing-glyph boxes, and `ff` brings its own
+profile. The sections below record how each rung was cleared, oldest first.
 
-Per the user's **Firefox-only** decision, every rung from here is direct Firefox
-infrastructure, verified by a technical proof rather than a stand-in browser.
+## ✅ Phase 30 — the dynamic linker
+
+MaeroOS loads **dynamically-linked** ELF binaries, not just static ones. The
+`dynprobe` PIE (built `i686-linux-musl-gcc -fpie -pie`) boots through the
+genuine musl dynamic linker and prints `DYNPROBE_OK` (`make smoke-dyn`).
+Mechanism:
+
+1. **`proc/elf.c` — `elf_load_bias()`**: accepts `ET_DYN` (PIE / ld.so) with a
+   load bias; `ET_EXEC` still loads at fixed VAs (bias forced to 0). PT_INTERP
+   is *recorded*, not rejected. Adjacent-page sharing between segments is
+   handled (reuse an already-mapped frame rather than clobber it).
+2. **`proc/syscall.c` — exec**: a PIE loads at `0x10000000`; if it names an
+   interpreter, the kernel loads `ld-musl-i386.so.1` at `0x40000000`, bumps
+   `mmap_next` above the interpreter image, and **irets to the interpreter's
+   entry** with a full aux vector — `AT_PHDR/PHENT/PHNUM` (of the *program*),
+   `AT_BASE` (interpreter), `AT_ENTRY` (the program), `AT_RANDOM`, `AT_PAGESZ`.
+   The interpreter then relocates, resolves libc symbols, and jumps to `main`.
+3. The syscalls ld.so needs were already present: `mmap2` (anon + MAP_PRIVATE
+   file), `mprotect` (RELRO), `set_thread_area` (TLS via GDT entry 6), `brk`.
+4. The interpreter path resolves with fallbacks (`/lib/...` → `/<basename>` →
+   `/disk/lib/...`) because the initrd is flat; the ld.so ships at
+   `testfiles/ld-musl-i386.so.1` (→ `/ld-musl-i386.so.1`).
+
+## ✅ Phase 31 — external shared libraries
 
 Phase 30 ran a PIE whose only dependency was libc (which musl's ld.so *is*, so
 it reused its own image). Phase 31 makes the loader handle **arbitrary external
@@ -34,12 +59,11 @@ it reused its own image). Phase 31 makes the loader handle **arbitrary external
   `zprobe` links a real shared **`libz.so.1` (zlib 1.3.1, a Firefox dependency)**
   → **`ZLIB_OK ver=1.3.1`** with a compress/uncompress round-trip. Built by
   `ports/build-dynlib.sh`.
-- **RAM**: default `make run` bumped 128M → **512M**. Full 1–2 GB (needed by
-  GTK/Firefox) requires PMM/VMM work for >512 MB and is a Phase 32 item.
-  *(Since fixed: the direct map is capped at 256 MiB and the rest is high memory,
-  so 1 GiB and 2 GiB boot to the shell; `run-firefox` uses 2 GiB.)*
+- **RAM**: default `make run` bumped 128M → **512M**. Later the direct map was
+  capped at 256 MiB with the rest reached as high memory, so 1 GiB and 2 GiB
+  boot too; `run-firefox` uses 2 GiB.
 
-## ✅ Phase 32a — real pthreads (rung 3 cleared)
+## ✅ Phase 32a — real pthreads
 
 Firefox is heavily multithreaded, so threads are non-negotiable.  The kernel now
 runs genuine multithreaded programs:
@@ -56,38 +80,33 @@ runs genuine multithreaded programs:
   mutex-guarded counter 50 000× each → **`THREADS_OK count=200000`** (no lost
   updates, per-thread TLS intact, all joined).
 
-## ⏳ The honest remaining ladder to Firefox
+## ✅ Phases 32b–33 — AF_UNIX and the X server
 
-The kernel now has the hard low-level primitives Firefox needs — **dynamic
-linking, external shared libraries, threads, futexes, shared memory, mmap**.
-What remains is overwhelmingly a **multi-session userspace porting marathon**,
-not kernel work, and Firefox does **not** run yet:
-
-1. ~~**AF_UNIX sockets**~~ ✅ **DONE (Phase 32b).** `proc/usocket.c` adds local
+1. **AF_UNIX sockets (Phase 32b).** `proc/usocket.c` adds local
    stream sockets — `socketpair`, named `bind`/`listen`/`connect`/`accept`, and
    bidirectional streaming, integrated into the FD layer (`FD_USOCKET`) and
    `poll`/`select`. Proven: `usockprobe` → `UNIX_SOCK_OK`. This is the transport
    X11/Wayland/D-Bus connect over.
-2. **An X11 server subset** — ⏳ **STARTED (Phase 33a).** `userspace/maerox/` is a
+2. **An X11 server (Phase 33).** 33a: `userspace/maerox/` is a
    native libgui app that owns a desktop window, listens on AF_UNIX
    `/tmp/.X11-unix/X0`, and completes the **X11 connection handshake** (byte-exact
    setup reply: 1 screen, a 24-bit TrueColor visual, standard pixmap formats).
    Proven: `make smoke-x` → `xprobe` → `XHANDSHAKE_OK`.
-   **33b done too:** the request loop (CreateWindow, CreateGC, MapWindow,
+   **33b:** the request loop (CreateWindow, CreateGC, MapWindow,
    PolyFillRectangle, PutImage, GetGeometry, + the startup queries) renders
    client windows into the desktop surface — a real X client (`xdraw`) draws a
    window with a rectangle + gradient on the MaeroOS desktop (`XDRAW_OK`).
-   **33c done too:** maeroX is now a **fully interactive X server** — it sends
+   **33c:** maeroX became a **fully interactive X server** — it sends
    `Expose`/`ConfigureNotify` on map and forwards clicks to clients as
    `ButtonPress`/`ButtonRelease` (`xevent` → `XEVENT_OK`; clicking an X window
    draws marks at the exact coordinates).
-   **33d done — the big one:** the **real libX11/libxcb** stack is cross-built for
+   **33d:** the **real libX11/libxcb** stack is cross-built for
    musl/i686 (`ports/x11/build-x11.sh`), and a **genuine Xlib application**
    (`xreal`, linked against the actual libX11 GTK/Firefox use) connects via
    `XOpenDisplay`, creates a window, and paints with `XFillRectangle` on the
    MaeroOS desktop (`XREAL_PAINTED`). The unlock was kernel `sendmsg`/`recvmsg`
    on AF_UNIX (libxcb's transport). The X client library is now **real**.
-   **Keyboard done:** keys travel PS/2 → `drivers/keyboard.c` → the desktop →
+   **Keyboard:** keys travel PS/2 → `drivers/keyboard.c` → the desktop →
    the WM event channel (`rkey`, the uncooked stream) → maeroX → X11
    `KeyPress`/`KeyRelease` on the focused window. maeroX answers
    `GetKeyboardMapping` with the US layout (two keysyms per keycode),
@@ -112,88 +131,19 @@ not kernel work, and Firefox does **not** run yet:
    stand-in, which the headless probe drives — takes an explicit `-K` and is
    refused in a windowed server, so the desktop build has none.
 
-## Next: the GTK stack (Phase 34)
+## ✅ Phases 34–35 — GTK and Firefox
 
-GTK + Cairo + Pango + GLib + GdkPixbuf + FreeType + fontconfig + HarfBuzz, built
-on this same libX11/libxcb via the `build-x11.sh` pattern. maeroX will need many
-more X requests (text/fonts, CopyArea, the RENDER extension). Then Firefox
-(Phase 35) — which does not run yet, but the X foundation it stands on is now
-real and proven.
-3. **The GTK stack** — GTK + Cairo + Pango + GLib + GdkPixbuf + FreeType +
-   fontconfig + HarfBuzz, built in the maeros-cross container and loaded via the
-   Phase-31 loader.
-4. **Firefox ESR (i686)** — Gecko + SpiderMonkey JIT, content processes,
-   NSS/NSPR; a roughly month-scale build needing 1–2 GB RAM (the >512 MB boot
-   hang that gated this step has since been fixed in `arch/i686/mm/paging.c`).
-
-Each of these is its own phase, built and tested incrementally.  The foundation
-is now in place; the climb continues build-by-build.
-
-## ✅ Phase 30 — the dynamic linker now works (first rung cleared)
-
-As of Phase 30, MaeroOS loads **dynamically-linked** ELF binaries, not just
-static ones. The `dynprobe` PIE (built `i686-linux-musl-gcc -fpie -pie`)
-boots through the genuine musl dynamic linker and prints `DYNPROBE_OK`
-(`make smoke-dyn`). Mechanism:
-
-1. **`proc/elf.c` — `elf_load_bias()`**: accepts `ET_DYN` (PIE / ld.so) with a
-   load bias; `ET_EXEC` still loads at fixed VAs (bias forced to 0). PT_INTERP
-   is *recorded*, not rejected. Adjacent-page sharing between segments is
-   handled (reuse an already-mapped frame rather than clobber it).
-2. **`proc/syscall.c` — exec**: a PIE loads at `0x10000000`; if it names an
-   interpreter, the kernel loads `ld-musl-i386.so.1` at `0x40000000`, bumps
-   `mmap_next` above the interpreter image, and **irets to the interpreter's
-   entry** with a full aux vector — `AT_PHDR/PHENT/PHNUM` (of the *program*),
-   `AT_BASE` (interpreter), `AT_ENTRY` (the program), `AT_RANDOM`, `AT_PAGESZ`.
-   The interpreter then relocates, resolves libc symbols, and jumps to `main`.
-3. The syscalls ld.so needs were already present: `mmap2` (anon + MAP_PRIVATE
-   file), `mprotect` (RELRO), `set_thread_area` (TLS via GDT entry 6), `brk`.
-4. The interpreter path resolves with fallbacks (`/lib/...` → `/<basename>` →
-   `/disk/lib/...`) because the initrd is flat; the ld.so ships at
-   `testfiles/ld-musl-i386.so.1` (→ `/ld-musl-i386.so.1`).
-
-**Known limits (next on this rung):** `mmap2`'s file offset is hard-wired to 0
-(EBP not captured at the int-0x80 boundary) — fine for `dynprobe` (its only
-NEEDED lib is the ld.so itself, which musl reuses in place) but it must be
-fixed before loading real multi-`.so` programs. No W^X yet (segments map
-writable). Single TLS slot. These are the gating items before rung 5.
-
-## Why Firefox can't be next
-
-Firefox needs, hard-blocking, in order:
-1. **Dynamic linker** — Firefox is ~100 shared libraries; our loader is static-only.
-   This alone is a kernel + libc project (ld.so, ELF relocations, symbol
-   interposition, dlopen).
-2. **A windowing protocol** — GTK speaks X11/Wayland. We'd implement an X
-   server subset or a Wayland compositor bridge to our WM protocol.
-3. **JIT-grade memory APIs** — precise mprotect transitions, W^X toggling,
-   guard pages, `membarrier`; SpiderMonkey stresses mmap semantics hard.
-4. **Threads at scale** — content processes, thread pools, robust futexes
-   (PI, requeue), TLS beyond one GDT slot.
-5. **~2 GB RAM** and a 64-bit-friendly world — modern Firefox dropped i686
-   support; we'd target an *old ESR* (52/68) even then.
-
-Realistic effort: a SerenityOS-scale, year-class undertaking. SerenityOS
-took ~4 years to first-paint a modern web engine — with a team.
-
-## What each rung buys us
-
-- **links2 (Phase 21)**: real web with images today. Self-contained C,
-  builds static, has its own HTTP/HTTPS-(via openssl, skip)/decoders.
-  Needs: /dev/fb0 mmap (done), FBIO ioctls (done), select() (done),
-  termios raw (done).
-- **NetSurf-fb**: real CSS rendering — pages actually look right. Static
-  build possible (it runs on RISC OS/Amiga/Haiku). Bigger dependency tree
-  (libcss, libdom, libnsgif/bmp, libparserutils) — a weekend-class port
-  on top of our musl cross container.
-- **ld.so**: unlocks prebuilt Linux software in general — the single
-  highest-leverage OS feature after this plan.
-- **X layer**: Xvfb-style in-process server speaking our shm surfaces;
-  then GTK2-era apps (Dillo!, gFTP, Leafpad) run.
+The GTK stack (GLib, Cairo, Pango, GTK3) was cross-built on the same
+libX11/libxcb (`ports/gtk/`, `make smoke-gtk`), and maeroX grew the RENDER
+extension Cairo composites with. Firefox itself is the official 115.15.0esr
+linux-i686 tarball on a glibc GTK3 runtime from Debian i386 packages
+(`ports/firefox/README.md`). The kernel work that took it from a stall to a
+first paint is in `docs/audit/firefox-first-paint.md`, the startup profile
+that brought first paint down to about 5 s is in `docs/perf/firefox-startup.md`.
 
 ## How to test: does Firefox paint, and load a page?
 
-`make smoke-firefox` is the one number that matters for the summit. It
+`make smoke-firefox` answers "does Firefox paint?". It
 boots the GRUB ISO (the only boot path with a framebuffer) plus
 `disk-ff.img` headless in QEMU, lets the desktop launch `ff`, and judges
 PASS/FAIL from the serial console. It exits 0 only when `ff` prints
@@ -225,7 +175,7 @@ Verdicts and exit codes:
 | Serial evidence | Result | Exit |
 |---|---|---|
 | `ff: Firefox painted — window is up (attempt N)` | PASS | 0 |
-| `ff: gave up after 20 attempts` | FAIL | 1 |
+| `ff: gave up after N attempts` (6 attempts of 300 s by default, overridable in `/disk/ffcfg/ffwatch`) | FAIL | 1 |
 | `=== KERNEL PANIC ===` | FAIL | 1 |
 | QEMU dies, the launcher never starts, or the overall timeout (6 min KVM / 15 min TCG) passes | FAIL | 1 |
 | Missing ISO/disk/QEMU/`testfiles/ffauto`, or a boot without a framebuffer | ERROR | 2 |
@@ -234,7 +184,8 @@ Every run writes `build/ff-smoke/<timestamp>-<accel>-smpN/` (gitignored):
 
 - `serial.log` — the complete serial console, verbatim.
 - `screen.png` — the last VGA screendump (`screen.ppm` if PNG is not
-  possible); `screen-paint.png` right after the paint line on a PASS.
+  possible); on a PASS, `screen-paint.png` is the richest of ten frames
+  sampled over `--hold` seconds (25) after the paint line.
 - `summary.txt` — verdict, timeline (graphical session, `ff` start, first
   `firefox-bin` exec, first Firefox X window, first paint), one line per
   concluded attempt (stalled / exited status=N / crash-reporter paint), the
@@ -242,6 +193,8 @@ Every run writes `build/ff-smoke/<timestamp>-<accel>-smpN/` (gitignored):
   `[SIG] pid=N killed by signal S` line, the last 40 kernel trace lines and
   the `moz.log` tail that `ff` dumps on a stall.
 - `qemu-cmdline.txt` — the exact QEMU command.
+- `screen-typed.png` (`--type`), `screen-web.png` and `fonts.json` (`--web`),
+  `site-N-*.png` (`--sites`), described below.
 
 ### Loading a page
 

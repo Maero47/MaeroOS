@@ -41,7 +41,7 @@ The runtime layout mirrors what the launchers (`userspace/ff/ff.c`,
   Debian default minus `tiff` (drags in libtiff plus seven codecs) and `svg`
   (librsvg).  If the host cannot execute i386 binaries the committed
   `loaders.cache.template` is used instead.
-* `XDG_DATA_DIRS=/disk/usr/share` — the hicolor icon theme and DejaVu Sans in
+* `XDG_DATA_DIRS=/disk/usr/share:/usr/share:/usr/local/share` — the hicolor icon theme and DejaVu Sans in
   `testfiles/usr/share/` are committed; the script only refetches the font if
   it is missing.  That single face is what the initrd's GTK probes use.
 * `FONTCONFIG_PATH=/etc/fonts` — `testfiles/etc/fonts/fonts.conf` scans

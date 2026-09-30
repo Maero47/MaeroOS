@@ -1,8 +1,9 @@
 # Linux-ABI probes
 
-Twenty small C programs, one per probe of `docs/audit/firefox-first-paint.md`
-section 8.  Each proves or disproves one kernel-semantics gap found by the
-audit and prints exactly one final line:
+Thirty small C programs.  P1-P20 are the probes of
+`docs/audit/firefox-first-paint.md` section 8; P21-P30 were added with later
+kernel fixes.  Each proves or disproves one kernel-semantics gap and prints
+exactly one final line:
 
     PASS <name>
     FAIL <name>: <what was observed>
@@ -44,13 +45,16 @@ regression tests for the fixes in audit section 5.
 | P25 | `p25_ptmx_lookup.c`         | fix round 1: PTY leaked by a lookup | — |
 | P26 | `p26_unlink_frees_space.c`  | perf round 2: unlink and truncate leaked blocks | — |
 | P27 | `p27_indirect_blocks.c`     | perf round 3: the rewritten ext2 block map | — |
+| P28 | `p28_alloc_failure.c`       | kernel allocators must refuse (ENOMEM/EMFILE), not halt | — |
+| P29 | `p29_tmpfs_big_file.c`      | a 288 MiB tmpfs file, bigger than the kernel heap window | — |
+| P30 | `p30_waitid.c`              | `waitid` with `WNOWAIT`/`WNOHANG` (Firefox's process watcher) | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the
 MaeroOS behaviour the audit describes.
 
 P21 and P22 do not come from the audit: they were added with the fixes for
-the review of the merged kernel (`.yonet/fix1.md`), so that the sigsuspend
+the review of the merged kernel, so that the sigsuspend
 livelock and the `mprotect(PROT_READ)` hole cannot come back unnoticed.  P12
 gained the `SA_RESTART` sleep cases for the same reason (round 2).
 
@@ -94,7 +98,7 @@ On the host (Linux reference; every line must be PASS):
 
 On MaeroOS under QEMU:
 
-    make smoke-abi                          # boots with -m 1024M
+    make smoke-abi                          # boots with -m 1024M; needs disk.img (P26)
     python3 tools/smoke_abi.py --mem 2048M  # the audit's second P18 case
     python3 tools/smoke_abi.py --only p05,p13
 
@@ -106,7 +110,7 @@ P24 is not from the audit: it was added after an intermittent kernel panic in
 `fdtable_put` was traced to `tmpfs_unlink()` freeing a node that a descriptor
 still referenced.  It asserts the ordinary Unix contract that unlinking a file
 removes only its name.  Note that it checks *semantics*, not the crash: under
-this kernel's first-fit heap a freed node keeps its contents until something
+the first-fit heap the kernel had then, a freed node kept its contents until something
 happens to reuse that exact block, which a single process cannot force
 reliably, so the probe passed even before the fix.  The empirical evidence for
 the fix is the `make smoke-firefox` pass rate.
@@ -141,8 +145,8 @@ fail, X xpass, S skip, H hang, R not run, V no verdict`.  Probes that the
 audit expects to fail on the current kernel are listed in `XFAIL` inside the
 script, so the target is green today; when a kernel fix flips one to PASS it
 is reported as XPASS and its entry must be removed to make it required
-(`--strict` turns XPASS into a failure).  P18 and P20 pass on the current
-kernel and are required; the other eighteen are listed in `XFAIL`.
+(`--strict` turns XPASS into a failure).  `XFAIL` is empty today: every
+probe is required to pass.
 
 An `XFAIL` entry is satisfied only by a probe that ran and printed
 `FAIL <name>: ...`.  A probe that printed no verdict line, that wedged the
@@ -158,8 +162,11 @@ the guest:
 
 | Probes | Watchdog | Driver timeout |
 |---|---|---|
-| P1-P10, P12-P15, P17, P19, P20 | 60 s | 90 s |
+| P1-P10, P12-P15, P17, P19-P22, P24, P25, P30 | 60 s | 90 s |
+| P23 | 90 s | 120 s |
 | P11, P16 | 120 s | 150 s |
+| P26, P27, P29 | 240 s | 270 s |
+| P28 | 300 s | 330 s |
 | P18 | `120 + MiB/2` s (470 s at 700 MiB) | watchdog + 30 s |
 
 The driver derives its per-probe timeout as watchdog + 30 s, so the watchdog
