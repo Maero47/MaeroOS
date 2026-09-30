@@ -12,6 +12,8 @@ import subprocess
 import sys
 import time
 
+import smokelib
+
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PROMPT = "MaeroOS$ "
@@ -41,7 +43,7 @@ def send(proc, text):
 
 def main():
     proc = subprocess.Popen(
-        ["make", "run"],
+        ["make", "run"] + smokelib.MAKE_DISPLAY,
         cwd=ROOT,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -53,7 +55,7 @@ def main():
     log = []
 
     try:
-        wait_for(proc, sel, PROMPT, log, timeout=75)
+        smokelib.login(proc, sel, log, timeout=75)
 
         # xprobe spawns the real maeroX server (headless), connects over the
         # AF_UNIX socket, and runs the X11 connection handshake.

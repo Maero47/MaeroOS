@@ -20,6 +20,8 @@ import threading
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
+import smokelib
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROMPT = "MaeroOS$ "
 
@@ -64,7 +66,7 @@ def main():
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
     proc = subprocess.Popen(
-        ["make", "run-net"], cwd=ROOT,
+        ["make", "run-net"] + smokelib.MAKE_DISPLAY, cwd=ROOT,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, bufsize=0)
     sel = selectors.DefaultSelector()
@@ -72,7 +74,7 @@ def main():
     log = []
 
     try:
-        wait_for(proc, sel, PROMPT, log, timeout=25.0)
+        smokelib.login(proc, sel, log, timeout=25.0)
 
         # 1. baseline fetch works
         before = len("".join(log))

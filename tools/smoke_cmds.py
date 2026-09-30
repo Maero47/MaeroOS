@@ -17,6 +17,8 @@ import subprocess
 import sys
 import time
 
+import smokelib
+
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PROMPT = "MaeroOS$ "
@@ -49,12 +51,12 @@ def main():
     smp = os.environ.get("SMOKE_SMP")
     if smp:
         # Same flags as the Makefile's `run` target, plus -smp.
-        cmd = ["qemu-system-i386", "-kernel", "kernel.elf",
+        cmd = ["qemu-system-i386", *smokelib.QEMU_DISPLAY, "-kernel", "kernel.elf",
                "-initrd", "initrd.tar", "-serial", "stdio", "-m", "512M",
-               "-no-reboot", "-no-shutdown", "-display", "none",
+               "-no-reboot", "-no-shutdown",
                "-smp", str(int(smp))]
     else:
-        cmd = ["make", "run"]
+        cmd = ["make", "run"] + smokelib.MAKE_DISPLAY
     proc = subprocess.Popen(
         cmd,
         cwd=ROOT,
@@ -68,7 +70,7 @@ def main():
     log = []
 
     try:
-        wait_for(proc, sel, PROMPT, log)
+        smokelib.login(proc, sel, log)
         checks = [
             ("kwprobe\n", "kwprobe ok"),
             ("uname\n", "MaeroOS"),

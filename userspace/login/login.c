@@ -132,7 +132,12 @@ static int drop_privileges(void) {
 
 static void select_shell_path(void) {
     if (strncmp(shell, "/disk/", 6) == 0) {
-        copy_field(shell_path, sizeof(shell_path), shell);
+        /* Initrd-only boot: no /disk, so fall back to the initrd copy
+         * (/disk/shell -> /shell) rather than fail to start a shell. */
+        if (access(shell, X_OK) != 0 && access(shell + 5, X_OK) == 0)
+            copy_field(shell_path, sizeof(shell_path), shell + 5);
+        else
+            copy_field(shell_path, sizeof(shell_path), shell);
         return;
     }
 
@@ -149,6 +154,15 @@ static void build_env(void) {
     snprintf(env_user, sizeof(env_user), "USER=%s", username);
     snprintf(env_logname, sizeof(env_logname), "LOGNAME=%s", username);
     snprintf(env_shell, sizeof(env_shell), "SHELL=%s", shell_path);
+}
+
+/* A rejected login waits before it exits, as shadow's FAIL_DELAY does: it
+ * slows password guessing on the console, and it keeps a getty session from
+ * ending in under 3 seconds, which init would count as a rapid failure and,
+ * after 8 in a row, park the console. */
+static void fail_delay(void) {
+    for (int i = 0; i < 6; i++)
+        usleep(500000);
 }
 
 int main(int argc, char *argv[]) {
@@ -187,6 +201,15 @@ int main(int argc, char *argv[]) {
     }
 
     if (!load_user(name)) {
+        if (!forced) {
+            /* Ask for the password anyway, so the console does not tell
+             * which account names exist. */
+            if (argc < 3 && maero_read_password("Password: ", password, sizeof(password)))
+                maero_wipe(password, sizeof(password));
+            fail_delay();
+            printf("login: authentication failed\n");
+            return 1;
+        }
         printf("login: unknown user %s\n", name);
         return 1;
     }
@@ -200,12 +223,14 @@ int main(int argc, char *argv[]) {
         if (argc >= 3) {
             copy_field(password, sizeof(password), argv[2]);
         } else if (!maero_read_password("Password: ", password, sizeof(password))) {
+            fail_delay();
             printf("login: password required\n");
             return 1;
         }
         ok = check_password(name, password);
         maero_wipe(password, sizeof(password));
         if (ok <= 0) {
+            fail_delay();
             printf("login: authentication failed\n");
             return 1;
         }

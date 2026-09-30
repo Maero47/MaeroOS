@@ -65,14 +65,9 @@ jobs:
       - name: Build kernel, initrd, disk and ISO
         run: make -j"$(nproc)" all initrd disk iso
 
-      # The suites start QEMU without -display, and with qemu-system-gui
-      # installed QEMU picks GTK and exits "gtk initialization failed" when
-      # there is no display.  Xvfb gives it one.
-      - name: Install Xvfb
-        run: sudo apt-get install -y --no-install-recommends xvfb
-
+      # The suites start QEMU with -display none, so no X server is needed.
       - name: Smoke suites
-        run: xvfb-run -a make check
+        run: make check
 
       - name: Upload smoke logs
         if: failure()

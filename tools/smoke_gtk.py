@@ -11,6 +11,8 @@ import subprocess
 import sys
 import time
 
+import smokelib
+
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PROMPT = "MaeroOS$ "
@@ -73,7 +75,7 @@ def main():
     subprocess.run(["make", "initrd", "disk"], cwd=ROOT, check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     proc = subprocess.Popen(
-        ["qemu-system-i386", "-kernel", "kernel.elf", "-initrd", "initrd.tar",
+        ["qemu-system-i386", *smokelib.QEMU_DISPLAY, "-kernel", "kernel.elf", "-initrd", "initrd.tar",
          "-drive", "file=disk.img,format=raw,if=ide", "-serial", "stdio",
          "-m", "512M", "-no-reboot", "-no-shutdown"],
         cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -83,7 +85,7 @@ def main():
     sel.register(proc.stdout, selectors.EVENT_READ)
     log = []
     try:
-        wait_for(proc, sel, PROMPT, log, timeout=75)
+        smokelib.login(proc, sel, log, timeout=75)
 
         before = len("".join(log))
         send(proc, "/disk/glibprobe\n")

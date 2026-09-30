@@ -5,6 +5,8 @@ import subprocess
 import sys
 import time
 
+import smokelib
+
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PROMPT = "MaeroOS$ "
@@ -35,7 +37,7 @@ def send(proc, text):
 
 def main():
     proc = subprocess.Popen(
-        ["make", "run"],
+        ["make", "run"] + smokelib.MAKE_DISPLAY,
         cwd=ROOT,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -47,7 +49,7 @@ def main():
     log = []
 
     try:
-        wait_for(proc, sel, PROMPT, log)
+        smokelib.login(proc, sel, log)
 
         checks = [
             ("ls\n", "hello.txt"),

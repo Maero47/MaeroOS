@@ -5,6 +5,8 @@ import socket
 import subprocess
 import sys
 import time
+
+import smokelib
 import tempfile
 import threading
 from functools import partial
@@ -169,7 +171,7 @@ def main():
     pcap_dir = tempfile.TemporaryDirectory()
     pcap_path = os.path.join(pcap_dir.name, "net.pcap")
     proc = subprocess.Popen(
-        ["qemu-system-i386", "-kernel", "kernel.elf", "-initrd", "initrd.tar",
+        ["qemu-system-i386", *smokelib.QEMU_DISPLAY, "-kernel", "kernel.elf", "-initrd", "initrd.tar",
          "-serial", "stdio", "-m", "128M", "-no-reboot", "-no-shutdown",
          "-netdev", "user,id=n0", "-device", "rtl8139,netdev=n0",
          "-object", f"filter-dump,id=d0,netdev=n0,file={pcap_path}"],
@@ -184,7 +186,7 @@ def main():
     log = []
 
     try:
-        wait_for(proc, sel, PROMPT, log, timeout=25.0)
+        smokelib.login(proc, sel, log, timeout=25.0)
         before = len("".join(log))
         send(proc, "lspci")
         wait_for(proc, sel, PROMPT, log, timeout=10.0, start=before)

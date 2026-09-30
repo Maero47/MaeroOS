@@ -6,6 +6,8 @@ import subprocess
 import sys
 import time
 
+import smokelib
+
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PROMPT = "MaeroOS$ "
@@ -38,6 +40,7 @@ def main():
     proc = subprocess.Popen(
         [
             "qemu-system-i386",
+            *smokelib.QEMU_DISPLAY,
             "-kernel",
             "kernel.elf",
             "-initrd",
@@ -62,7 +65,16 @@ def main():
     log = []
 
     try:
-        wait_for(proc, sel, PROMPT, log)
+        # getty prompts; a wrong password is rejected and getty comes back.
+        wait_for(proc, sel, smokelib.LOGIN_PROMPT, log, timeout=60.0)
+        before = len("".join(log))
+        send(proc, "root\n")
+        wait_for(proc, sel, smokelib.PASSWORD_PROMPT, log, start=before)
+        send(proc, "wrong\n")
+        wait_for(proc, sel, "login: authentication failed", log, start=before)
+        if "Welcome to MaeroOS" in "".join(log)[before:]:
+            raise AssertionError("a wrong console password started a shell")
+        smokelib.login(proc, sel, log, start=before)
         boot_log = "".join(log)
         if "[BOOT] Launching /disk/init" not in boot_log:
             raise AssertionError("disk boot did not launch /disk/init")
@@ -72,8 +84,10 @@ def main():
             raise AssertionError("disk init did not launch /disk/getty")
         if "MaeroOS getty on tty0" not in boot_log:
             raise AssertionError("disk getty banner did not appear")
-        if "login: root" not in boot_log:
-            raise AssertionError("disk getty login did not appear")
+        if "maeros login: " not in boot_log:
+            raise AssertionError("disk getty login prompt did not appear")
+        if "MaeroOS$ " in boot_log[:boot_log.find("login: root accepted")]:
+            raise AssertionError("the console gave a shell before a login")
         if "exec '/disk/login'" not in boot_log:
             raise AssertionError("disk getty did not launch /disk/login")
         if "login: root accepted" not in boot_log:
@@ -325,6 +339,33 @@ def main():
                 after_restart = "".join(log)[before:]
                 if "[init] Respawning service heartbeat" not in after_restart:
                     wait_for(proc, sel, "[init] Respawning service heartbeat", log, timeout=5.0, start=before)
+
+        # Log out: init respawns getty.  A name that looks like a login
+        # option is refused (getty runs as root; `-f` skips the password),
+        # and the unprivileged user logs in with the documented user/user.
+        before = len("".join(log))
+        send(proc, "exit\n")
+        wait_for(proc, sel, "[init] Session tty0 exited; restarting", log, start=before)
+        wait_for(proc, sel, smokelib.LOGIN_PROMPT, log, start=before)
+        before = len("".join(log))
+        send(proc, "-f root\n")
+        wait_for(proc, sel, "getty: invalid user name", log, start=before)
+        wait_for(proc, sel, smokelib.LOGIN_PROMPT, log, start=before)
+        if "login: root accepted" in "".join(log)[before:]:
+            raise AssertionError("getty passed '-f root' to login")
+        before = len("".join(log))
+        send(proc, "nosuchuser\n")
+        wait_for(proc, sel, smokelib.PASSWORD_PROMPT, log, start=before)
+        send(proc, "x\n")
+        wait_for(proc, sel, "login: authentication failed", log, start=before)
+        if "unknown user" in "".join(log)[before:]:
+            raise AssertionError("console login revealed that the account does not exist")
+        smokelib.login(proc, sel, log, user="user", password="user", start=before)
+        before = len("".join(log))
+        send(proc, "id\n")
+        wait_for(proc, sel, PROMPT, log, start=before)
+        if "uid=1000 gid=100" not in "".join(log)[before:]:
+            raise AssertionError("console login as user did not drop to uid 1000")
 
         print("\n[SMOKE-DISK] passed")
         return 0

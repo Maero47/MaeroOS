@@ -26,6 +26,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mkrepo  # noqa: E402
+import smokelib  # noqa: E402
 
 PROMPT = "MaeroOS$ "
 PKG = "busybox"
@@ -78,7 +79,7 @@ def main():
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
     proc = subprocess.Popen(
-        ["qemu-system-i386", "-kernel", "kernel.elf", "-initrd", "initrd.tar",
+        ["qemu-system-i386", *smokelib.QEMU_DISPLAY, "-kernel", "kernel.elf", "-initrd", "initrd.tar",
          "-drive", f"file={disk},format=raw,index=0,media=disk",
          "-serial", "stdio", "-m", "128M", "-no-reboot", "-no-shutdown",
          "-netdev", "user,id=n0", "-device", "rtl8139,netdev=n0"],
@@ -105,7 +106,7 @@ def main():
     wrong_sha = line[:-64] + ("0" if line[-64] != "0" else "1") + line[-63:]
 
     try:
-        wait_for(proc, sel, PROMPT, log, timeout=40.0)
+        smokelib.login(proc, sel, log, timeout=40.0)
         run(f"printf 'repo=10.0.2.2:{port}\\n' > /disk/etc/pkg.conf", PROMPT)
 
         serve(line + "\n")

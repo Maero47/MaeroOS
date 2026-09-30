@@ -11,6 +11,7 @@ static char *initrd_shell_argv[] = { "/shell", (char *)0 };
 static char *initrd_desktop_argv[] = { "/desktop", (char *)0 };
 static char *disk_shell_argv[] = { "/disk/shell", (char *)0 };
 static char *disk_getty_argv[] = { "/disk/getty", "tty0", (char *)0 };
+static char *initrd_getty_argv[] = { "/getty", "tty0", (char *)0 };
 static char *disk_desktop_argv[] = { "/disk/desktop", (char *)0 };
 static char *disk_rc_argv[] = { "/disk/shell", "-c", ". /etc/rc", (char *)0 };
 static char *disk_service_argv[] = { "/disk/shell", "-c", (char *)0, (char *)0 };
@@ -86,7 +87,8 @@ static char *disk_envp[] = {
 };
 
 /* The graphical session and everything it spawns run as this unprivileged
- * user (root keeps the console/getty for admin).  See /etc/passwd. */
+ * user; the console keeps its getty, where anyone logs in with a password.
+ * See /etc/passwd. */
 #define SESSION_UID 1000
 #define SESSION_GID 100
 
@@ -110,8 +112,11 @@ static int file_readable(const char *path) {
     return access(path, R_OK) == 0;
 }
 
-/* pid of the graphical session while it runs; the console sessions wait
- * for it to end so the desktop keeps the keyboard/screen to itself. */
+/* pid of the graphical session while it runs.  The console sessions run
+ * alongside it: the console reads only the serial line (the PS/2 keyboard
+ * feeds /dev/input/event0 alone) and writes to the serial line and the VGA
+ * text buffer, which is not scanned out in framebuffer mode, so a getty and
+ * the desktop never compete for a device. */
 static int desktop_pid = -1;
 
 /* Fork PATH as the unprivileged session user and return its pid without
@@ -623,32 +628,27 @@ static void start_sessions(char **envp) {
 }
 
 static void monitor_children(char *command_shell_path, char **envp) {
-    if (desktop_pid <= 0)
-        start_sessions(envp);
+    start_sessions(envp);
 
     while (1) {
         int status;
         int pid = waitpid(-1, &status, WNOHANG);
         if (pid <= 0) {
             poll_initctl(command_shell_path, envp);
-            if (desktop_pid > 0) {
-                /* Nothing to do but wait; do not spin against the desktop. */
-                usleep(20000);
-                continue;
-            }
             for (int i = 0; i < session_count; i++) {
                 if (sessions[i].pid <= 0 && !sessions[i].disabled)
                     start_session(&sessions[i], envp);
             }
-            sched_yield();
+            /* Nothing to do but wait; do not spin against the desktop or
+             * the login shell. */
+            usleep(20000);
             continue;
         }
 
         if (pid == desktop_pid) {
             desktop_pid = -1;
-            printf("[init] Graphical session ended; starting shell\n");
+            printf("[init] Graphical session ended\n");
             init_log("graphical session ended");
-            start_sessions(envp);
             continue;
         }
 
@@ -694,9 +694,15 @@ int main(void) {
     char *session_path = command_shell_path;
     char **session_argv = disk_userland ? disk_shell_argv : initrd_shell_argv;
     char **envp = disk_userland ? disk_envp : initrd_envp;
+    /* The console runs getty (a login prompt), never a bare root shell;
+     * the shell is only the fallback for an image without getty/login. */
     if (disk_userland && file_available("/disk/getty")) {
         session_path = "/disk/getty";
         session_argv = disk_getty_argv;
+    } else if (!disk_userland && file_available("/getty") &&
+               file_available("/login")) {
+        session_path = "/getty";
+        session_argv = initrd_getty_argv;
     }
 
     session_count = 1;
