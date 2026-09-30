@@ -113,6 +113,7 @@ testfiles/awk
 /testfiles/randprobe
 /testfiles/sysmiscprobe
 /testfiles/abi2probe
+/testfiles/sigexecprobe
 /testfiles/kwprobe
 /testfiles/readlink
 /testfiles/reboot

@@ -2256,25 +2256,31 @@ static int sys_exec(registers_t *regs) {
         current_proc->environ_len = el;
     }
 
-    /* Reset caught signals to SIG_DFL (fs/exec.c flush_signal_handlers).  If
-     * the table is still shared with other threads, unshare it first (Linux
-     * unshare_sighand) so their dispositions are untouched. */
+    /* Reset caught signals to SIG_DFL (fs/exec.c flush_signal_handlers):
+     * a handler address means nothing in the new image, but SIG_IGN does and
+     * is kept — nohup, `cmd &` (SIGINT/SIGQUIT ignored), getty->login and
+     * daemons rely on it.  sa_flags and sa_mask go with the handler.  The
+     * blocked mask and the pending set are the TASK's and survive exec
+     * (execve(2), signal(7)); a pending signal whose handler was just reset
+     * gets its default action once unblocked.  If the table is still shared
+     * with other tasks (CLONE_SIGHAND without CLONE_THREAD), unshare it first
+     * as a private copy (Linux unshare_sighand) so their dispositions are
+     * untouched and our SIG_IGN entries carry over. */
     if (current_proc->sighand && current_proc->sighand->refcount > 1) {
-        struct sighand *fresh = sighand_alloc();
+        struct sighand *fresh = sighand_copy(current_proc->sighand);
         if (fresh) {
             sighand_put(current_proc->sighand);
             current_proc->sighand = fresh;
         }
     }
     if (current_proc->sighand) {
-        __builtin_memset(current_proc->sighand->handlers, 0,
-                         sizeof(current_proc->sighand->handlers));
-        __builtin_memset(current_proc->sighand->flags, 0,
-                         sizeof(current_proc->sighand->flags));
-        __builtin_memset(current_proc->sighand->mask, 0,
-                         sizeof(current_proc->sighand->mask));
+        struct sighand *sh = current_proc->sighand;
+        for (int i = 0; i < NSIGS; i++) {
+            if (sh->handlers[i] != SIG_IGN) sh->handlers[i] = SIG_DFL;
+            sh->flags[i] = 0;
+            sh->mask[i]  = 0;
+        }
     }
-    current_proc->pending_sigs   = 0;
     current_proc->sigframe_addr  = 0;
     current_proc->restore_sigmask = 0;   /* no sigsuspend mask survives exec */
     current_proc->fault_sig      = 0;
@@ -5053,7 +5059,10 @@ static int sys_statx(registers_t *regs) {
 /* ── sys_rt_sigaction(sig, act, oact, sigsetsize) — EAX=174 ─────────────── */
 static int sys_rt_sigaction(registers_t *regs) {
     int sig = (int)regs->ebx;
-    /* struct sigaction { sa_handler; sa_flags; sa_restorer; sa_mask[2] } */
+    /* struct sigaction { sa_handler; sa_flags; sa_restorer; sa_mask[2] } —
+     * Linux i386 kernel_sigaction, 20 bytes.  Copy exactly that much: musl's
+     * and glibc's k_sigaction are that size, and writing more into oact
+     * overwrites whatever the caller keeps after it on the stack. */
     const uint32_t *act  = (const uint32_t *)(uintptr_t)regs->ecx;
     uint32_t       *oact = (uint32_t *)(uintptr_t)regs->edx;
 
@@ -5067,7 +5076,7 @@ static int sys_rt_sigaction(registers_t *regs) {
      * (report SIG_DFL as the old action) so library init proceeds. */
     if (sig >= NSIGS) {
         if (oact) {
-            uint32_t koact[8];
+            uint32_t koact[5];
             __builtin_memset(koact, 0, sizeof(koact));
             if (copy_to_user(oact, koact, sizeof(koact)) < 0) return -14;
         }
@@ -5083,7 +5092,7 @@ static int sys_rt_sigaction(registers_t *regs) {
     uint32_t     old_mask    = sh->mask[sig];
 
     if (oact) {
-        uint32_t koact[8];
+        uint32_t koact[5];
         __builtin_memset(koact, 0, sizeof(koact));
         koact[0] = (uint32_t)(uintptr_t)old_handler;
         koact[1] = old_flags;
@@ -5092,7 +5101,7 @@ static int sys_rt_sigaction(registers_t *regs) {
         if (cr < 0) return cr;
     }
     if (act) {
-        uint32_t kact[8];
+        uint32_t kact[5];
         int cr = copy_from_user(kact, act, sizeof(kact));
         if (cr < 0) return cr;
         sh->handlers[sig] = (sighandler_t)(uintptr_t)kact[0];
@@ -5143,6 +5152,17 @@ static int sys_rt_sigprocmask(registers_t *regs) {
         default: return -22;  /* EINVAL */
         }
     }
+    return 0;
+}
+
+/* ── sys_rt_sigpending(set, sigsetsize) — EAX=176, sigpending(set) — EAX=73 ──
+ * The signals raised while blocked and still waiting (Linux do_sigpending:
+ * pending & blocked).  Both write one word of user sigset_t. */
+static int sys_rt_sigpending(registers_t *regs) {
+    uint32_t *uset = (uint32_t *)(uintptr_t)regs->ebx;
+    uint32_t set = sigset_to_user(current_proc->pending_sigs &
+                                  current_proc->blocked_sigs);
+    if (copy_to_user(uset, &set, sizeof(set)) < 0) return -14;
     return 0;
 }
 
@@ -8132,7 +8152,8 @@ void syscall_dispatch(registers_t *regs) {
     case 172: ret = sys_prctl(regs);           break;
     case 174: ret = sys_rt_sigaction(regs);    break;
     case 175: ret = sys_rt_sigprocmask(regs);  break;
-    case 176: ret = 0;                         break;  /* rt_sigpending stub */
+    case 176: ret = sys_rt_sigpending(regs);   break;
+    case 73:  ret = sys_rt_sigpending(regs);   break;  /* sigpending */
     /* fsync(118)/fdatasync(148): our filesystems are RAM/simple-backed and every
      * write is already durable to our backing store, so a sync is a correct
      * no-op.  MUST return 0 (success), not -ENOSYS — glibc's fsync propagates

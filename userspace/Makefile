@@ -51,7 +51,7 @@ USER_BINS := $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
 	     $(TESTFILES)/sysprobe $(TESTFILES)/fcprobe $(TESTFILES)/lspci $(TESTFILES)/ifconfig \
 	     $(TESTFILES)/diskprobe $(TESTFILES)/fsprobe $(TESTFILES)/respawnprobe \
 	     $(TESTFILES)/sockprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget \
-	     $(TESTFILES)/randprobe $(TESTFILES)/sysmiscprobe $(TESTFILES)/abi2probe \
+	     $(TESTFILES)/randprobe $(TESTFILES)/sysmiscprobe $(TESTFILES)/abi2probe $(TESTFILES)/sigexecprobe \
 	     $(TESTFILES)/fbtest $(TESTFILES)/evtest $(TESTFILES)/mousetest \
 	     $(TESTFILES)/polltest $(TESTFILES)/ptytest $(TESTFILES)/cttytest \
 	     $(TESTFILES)/desktop $(TESTFILES)/wmctl $(TESTFILES)/gui_demo \
@@ -490,6 +490,13 @@ abi2probe/abi2probe.o: abi2probe/abi2probe.c
 
 $(TESTFILES)/abi2probe: $(CRT0_OBJ) abi2probe/abi2probe.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) abi2probe/abi2probe.o libc/libc.a
+
+# sigexecprobe
+sigexecprobe/sigexecprobe.o: sigexecprobe/sigexecprobe.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TESTFILES)/sigexecprobe: $(CRT0_OBJ) sigexecprobe/sigexecprobe.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) sigexecprobe/sigexecprobe.o libc/libc.a
 
 # sysmiscprobe
 sysmiscprobe/sysmiscprobe.o: sysmiscprobe/sysmiscprobe.c
