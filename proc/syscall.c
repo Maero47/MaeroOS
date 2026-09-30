@@ -1594,31 +1594,44 @@ static int es_push(struct exec_strings *v, const char *str, uint32_t len) {
 
 /* Append a NUL-terminated USER string.  Copied in page-bounded chunks (a
  * string may run right up to the end of a mapped page but never past it), not
- * byte by byte — the strings Linux allows are up to 128 KiB. */
+ * byte by byte — the strings Linux allows are up to 128 KiB.  Each chunk is
+ * clamped to what is left of the budget, so a short string near ARG_MAX is not
+ * refused for the page-sized chunk it was read in, and every exit that does
+ * not keep the string refunds all it charged. */
 static int es_push_user(struct exec_strings *v, const char *up) {
-    uint32_t start = v->used, got = 0;
+    uint32_t start = v->used, got = 0, charged = 0;
+    int rc;
     for (;;) {
         uint32_t chunk = PAGE_SIZE - (((uint32_t)(uintptr_t)up + got) & (PAGE_SIZE - 1));
+        uint32_t left  = EXEC_ARG_MAX - *v->total;
+        if (chunk > left) chunk = left;
         /* Charge FIRST: the budget has to stop us before the allocation, not
          * after the whole vector has been copied. */
-        if (es_charge(v, chunk) < 0) { v->used = start; return -7; }    /* -E2BIG */
-        v->used = start + got;
-        if (es_reserve(v, chunk) < 0) { v->used = start; return -12; }
+        if (chunk == 0 || es_charge(v, chunk) < 0) { rc = -7; break; }  /* -E2BIG */
+        charged += chunk;
+        if (es_reserve(v, chunk) < 0) { rc = -12; break; }
         if (copy_from_user(v->buf + start + got, up + got, chunk) < 0) {
-            v->used = start;
-            return -14;
+            rc = -14;
+            break;
         }
         for (uint32_t i = 0; i < chunk; i++)
             if (v->buf[start + got + i] == '\0') {
-                *v->total -= chunk - (i + 1);   /* refund the unused tail */
-                v->used = start + got + i + 1;
-                int rc = es_index(v, start);
-                if (rc < 0) v->used = start;
-                return rc;
+                uint32_t len = got + i + 1;
+                *v->total -= charged - len;   /* refund the unused tail */
+                charged = len;
+                v->used = start + len;
+                rc = es_index(v, start);
+                if (rc == 0) return 0;
+                goto fail;
             }
         got += chunk;
-        if (got > EXEC_MAX_ARG_STRLEN) { v->used = start; return -7; }  /* -E2BIG */
+        v->used = start + got;             /* es_reserve() appends after used */
+        if (got > EXEC_MAX_ARG_STRLEN) { rc = -7; break; }     /* -E2BIG */
     }
+fail:
+    *v->total -= charged;
+    v->used = start;
+    return rc;
 }
 
 /* Copy a whole NULL-terminated user vector (argv or envp). */
@@ -6778,7 +6791,13 @@ static int sys_getrandom(registers_t *regs) {
     uint32_t flags  = regs->edx;
     uint8_t tmp[64];
 
-    if (flags & ~7U) return -22;   /* allow GRND_NONBLOCK|GRND_RANDOM|GRND_INSECURE */
+    /* Linux: GRND_NONBLOCK(1)|GRND_RANDOM(2)|GRND_INSECURE(4), but INSECURE
+     * and RANDOM together are -EINVAL.  The pool is always initialised here,
+     * so none of them changes what is returned. */
+    if (flags & ~7U) return -22;
+    if ((flags & 6U) == 6U) return -22;
+    /* Linux caps one call at MAX_RW_COUNT, so the count fits the return. */
+    if (buflen > 0x7FFFF000U) buflen = 0x7FFFF000U;
     if (!access_ok(buf, buflen)) return -14;
 
     uint32_t done = 0;
@@ -6787,10 +6806,11 @@ static int sys_getrandom(registers_t *regs) {
         if (chunk > sizeof(tmp)) chunk = sizeof(tmp);
         random_get_bytes(tmp, chunk);
         int cr = copy_to_user(buf + done, tmp, chunk);
-        if (cr < 0) return cr;
+        __builtin_memset(tmp, 0, sizeof(tmp));
+        if (cr < 0) return done ? (int)done : cr;     /* partial: bytes so far */
         done += chunk;
     }
-    return (int)buflen;
+    return (int)done;
 }
 
 /* ── sys_rename(oldpath, newpath) — EAX=38 ────────────────────────────────

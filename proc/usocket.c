@@ -317,8 +317,13 @@ int usocket_send_fds(usocket_t *s, proc_file_t *files, int n, uint32_t *id_out) 
     uscm_t *m = (uscm_t *)kmalloc(sizeof(uscm_t));
     if (!m) return -12;
     m->next = NULL;
-    m->id   = next_id++;
-    if (!next_id) next_id = 1;                         /* 0 means "no batch" */
+    /* Syscalls run under the BKL, but take the id atomically anyway so this
+     * never depends on it; 0 means "no batch", so skip it on wrap. */
+    uint32_t id;
+    do {
+        id = __atomic_fetch_add(&next_id, 1, __ATOMIC_RELAXED);
+    } while (id == 0);
+    m->id   = id;
     m->at   = b->total_in;        /* the bytes written next ride with it */
     m->nfds = n;
     for (int i = 0; i < n; i++) m->files[i] = files[i];
