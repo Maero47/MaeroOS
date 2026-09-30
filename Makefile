@@ -248,9 +248,13 @@ disk-ff: testfiles/firefox/firefox-bin userspace toybox
 # -accel kvm when this user can open /dev/kvm (native speed, real CPU), else TCG.
 QEMU_ACCEL := $(shell test -r /dev/kvm -a -w /dev/kvm && echo "-accel kvm" || echo "-accel tcg")
 
+# QEMU_DISPLAY adds display flags to run/run-net/run-disk; the smoke
+# suites pass QEMU_DISPLAY="-display none" to boot headless.
+QEMU_DISPLAY ?=
+
 # Run in QEMU — uses built-in multiboot loader (no ISO required)
 run: $(TARGET) initrd
-	qemu-system-i386 \
+	qemu-system-i386 $(QEMU_DISPLAY) \
 		-kernel $(TARGET) \
 		-initrd initrd.tar \
 		-serial stdio \
@@ -259,7 +263,7 @@ run: $(TARGET) initrd
 		-no-shutdown
 
 run-net: $(TARGET) initrd
-	qemu-system-i386 \
+	qemu-system-i386 $(QEMU_DISPLAY) \
 		-kernel $(TARGET) \
 		-initrd initrd.tar \
 		-serial stdio \
@@ -271,7 +275,7 @@ run-net: $(TARGET) initrd
 
 # Run with initrd + ATA disk image
 run-disk: $(TARGET) initrd disk
-	qemu-system-i386 \
+	qemu-system-i386 $(QEMU_DISPLAY) \
 		-kernel $(TARGET) \
 		-initrd initrd.tar \
 		-drive file=disk.img,format=raw,index=0,media=disk \
@@ -336,9 +340,8 @@ smoke-gtk: $(TARGET) initrd
 # Each suite's console goes to $(CHECK_LOG_DIR)/<suite>.log; a failure prints
 # the tail of its log and the rest still run, then check exits non-zero.
 # Suites run one at a time: each boots QEMU under TCG and their prompt
-# timeouts assume the guest has a host core to itself.  QEMU opens its GTK
-# window when qemu-system-gui is installed, so a host without a display (ssh,
-# CI) needs `xvfb-run -a make check`.
+# timeouts assume the guest has a host core to itself.  The suites start QEMU
+# with -display none (tools/smokelib.py), so no display is needed.
 # Pick a subset with CHECK_SUITES="smoke smoke-x".
 CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-fw \
                  smoke-dyn smoke-dynlib smoke-x smoke-pkg
@@ -359,9 +362,6 @@ check: $(TARGET) initrd disk repo
 	done; \
 	if [ -n "$$failed" ]; then \
 	    echo "[CHECK] failed:$$failed"; \
-	    if grep -qs 'gtk initialization failed' $(CHECK_LOG_DIR)/*.log; then \
-	        echo "[CHECK] QEMU found no display for its GTK window; run: xvfb-run -a make check"; \
-	    fi; \
 	    exit 1; \
 	fi; \
 	echo "[CHECK] all passed: $(CHECK_SUITES)"

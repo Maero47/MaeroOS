@@ -11,31 +11,19 @@ import subprocess
 import sys
 import time
 
+import smokelib
+
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PROMPT = "MaeroOS$ "
 
 
 def wait_for(proc, sel, needle, log, timeout=30, start=0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        for key, _ in sel.select(0.2):
-            chunk = os.read(key.fd, 4096).decode("latin1", "replace")
-            if not chunk:
-                continue
-            log.append(chunk)
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
-            if needle in "".join(log)[start:]:
-                return
-        if proc.poll() is not None:
-            raise RuntimeError(f"QEMU exited with status {proc.returncode}")
-    raise TimeoutError(f"timed out waiting for {needle!r}")
+    return smokelib.wait_for(proc, sel, needle, log, timeout, start)
 
 
 def send(proc, text):
-    proc.stdin.write(text.encode("latin1"))
-    proc.stdin.flush()
+    smokelib.send(proc, text)
 
 
 # Probes this suite runs, the port script(s) whose static libraries each one is
@@ -73,7 +61,7 @@ def main():
     subprocess.run(["make", "initrd", "disk"], cwd=ROOT, check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     proc = subprocess.Popen(
-        ["qemu-system-i386", "-kernel", "kernel.elf", "-initrd", "initrd.tar",
+        ["qemu-system-i386", *smokelib.QEMU_DISPLAY, "-kernel", "kernel.elf", "-initrd", "initrd.tar",
          "-drive", "file=disk.img,format=raw,if=ide", "-serial", "stdio",
          "-m", "512M", "-no-reboot", "-no-shutdown"],
         cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -83,7 +71,7 @@ def main():
     sel.register(proc.stdout, selectors.EVENT_READ)
     log = []
     try:
-        wait_for(proc, sel, PROMPT, log, timeout=75)
+        smokelib.login(proc, sel, log, timeout=75)
 
         before = len("".join(log))
         send(proc, "/disk/glibprobe\n")

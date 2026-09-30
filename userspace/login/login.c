@@ -2,6 +2,7 @@
 #include "../include/string.h"
 #include "../include/unistd.h"
 #include "../include/grp.h"
+#include "../include/signal.h"
 #include "../auth/auth.h"
 
 #define FIELD_MAX 192
@@ -132,7 +133,12 @@ static int drop_privileges(void) {
 
 static void select_shell_path(void) {
     if (strncmp(shell, "/disk/", 6) == 0) {
-        copy_field(shell_path, sizeof(shell_path), shell);
+        /* Initrd-only boot: no /disk, so fall back to the initrd copy
+         * (/disk/shell -> /shell) rather than fail to start a shell. */
+        if (access(shell, X_OK) != 0 && access(shell + 5, X_OK) == 0)
+            copy_field(shell_path, sizeof(shell_path), shell + 5);
+        else
+            copy_field(shell_path, sizeof(shell_path), shell);
         return;
     }
 
@@ -151,10 +157,34 @@ static void build_env(void) {
     snprintf(env_shell, sizeof(env_shell), "SHELL=%s", shell_path);
 }
 
+/* Console job-control signals.  Until the user's shell runs they are
+ * ignored: ^C or ^Z at "Password:" must not kill login (a rapid exit init
+ * counts toward parking the console) or stop it (nobody would respawn it,
+ * and echo would stay off).  The console then ends the read with 0 bytes,
+ * and login fails with "password required".  The shell gets the defaults
+ * back. */
+static const int console_sigs[] = { SIGINT, SIGQUIT, SIGTSTP, SIGTTIN, SIGTTOU };
+
+static void set_console_sigs(void (*handler)(int)) {
+    for (unsigned i = 0; i < sizeof(console_sigs) / sizeof(console_sigs[0]); i++)
+        signal(console_sigs[i], handler);
+}
+
+/* A rejected login waits before it exits, as shadow's FAIL_DELAY does: it
+ * slows password guessing on the console, and it keeps a getty session from
+ * ending in under 3 seconds, which init would count as a rapid failure and,
+ * after 8 in a row, park the console. */
+static void fail_delay(void) {
+    for (int i = 0; i < 6; i++)
+        usleep(500000);
+}
+
 int main(int argc, char *argv[]) {
     int forced = 0;
     const char *name = "root";
     char password[128];
+
+    set_console_sigs(SIG_IGN);
 
     if (argc > 1 && strcmp(argv[1], "--check") == 0) {
         if (argc < 4) {
@@ -187,6 +217,15 @@ int main(int argc, char *argv[]) {
     }
 
     if (!load_user(name)) {
+        if (!forced) {
+            /* Ask for the password anyway, so the console does not tell
+             * which account names exist. */
+            if (argc < 3 && maero_read_password("Password: ", password, sizeof(password)))
+                maero_wipe(password, sizeof(password));
+            fail_delay();
+            printf("login: authentication failed\n");
+            return 1;
+        }
         printf("login: unknown user %s\n", name);
         return 1;
     }
@@ -200,12 +239,14 @@ int main(int argc, char *argv[]) {
         if (argc >= 3) {
             copy_field(password, sizeof(password), argv[2]);
         } else if (!maero_read_password("Password: ", password, sizeof(password))) {
+            fail_delay();
             printf("login: password required\n");
             return 1;
         }
         ok = check_password(name, password);
         maero_wipe(password, sizeof(password));
         if (ok <= 0) {
+            fail_delay();
             printf("login: authentication failed\n");
             return 1;
         }
@@ -226,6 +267,7 @@ int main(int argc, char *argv[]) {
     printf("login: %s accepted\n", username);
 
     char *shell_argv[] = { shell_path, (char *)0 };
+    set_console_sigs(SIG_DFL);
     execve(shell_path, shell_argv, envp);
     printf("login: failed to exec %s\n", shell_path);
     return 1;

@@ -20,25 +20,14 @@ import threading
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
+import smokelib
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROMPT = "MaeroOS$ "
 
 
 def wait_for(proc, sel, needle, log, timeout=20.0, start=0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        for key, _ in sel.select(0.2):
-            chunk = os.read(key.fd, 4096).decode("latin1", "replace")
-            if not chunk:
-                continue
-            log.append(chunk)
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
-            if needle in "".join(log)[start:]:
-                return
-        if proc.poll() is not None:
-            raise RuntimeError(f"QEMU exited with status {proc.returncode}")
-    raise TimeoutError(f"timed out waiting for {needle!r}")
+    return smokelib.wait_for(proc, sel, needle, log, timeout, start)
 
 
 def send(proc, line):
@@ -64,7 +53,7 @@ def main():
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
     proc = subprocess.Popen(
-        ["make", "run-net"], cwd=ROOT,
+        ["make", "run-net"] + smokelib.MAKE_DISPLAY, cwd=ROOT,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, bufsize=0)
     sel = selectors.DefaultSelector()
@@ -72,7 +61,7 @@ def main():
     log = []
 
     try:
-        wait_for(proc, sel, PROMPT, log, timeout=25.0)
+        smokelib.login(proc, sel, log, timeout=25.0)
 
         # 1. baseline fetch works
         before = len("".join(log))

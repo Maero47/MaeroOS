@@ -75,8 +75,6 @@ What is proven by the automated QEMU tests in `tools/`:
   or across a key change, do not work together. There is no key rotation or revocation,
   and the rollback check is only as strong as the cached index, which the desktop user
   owns.
-- **No console login during the desktop session.** While the graphical session runs,
-  no getty is offered on the serial/VGA console.
 - **No SMP scaling.** One Big Kernel Lock serialises all kernel execution
   (`arch/i686/cpu/bkl.c`).
 - **Only Linux and macOS hosts are covered.** The Makefile looks up `mke2fs`, `debugfs`
@@ -193,9 +191,15 @@ enabled or disabled). It opens a control FIFO at `/tmp/initctl`, writes
 `/tmp/services.status` and `/tmp/sessions.status` for `svc` and `session` to read back,
 and appends to `/var/log/init.log` when the disk root is writable. Respawn has a backoff:
 only an exit within 3 seconds counts as a rapid failure, each one adds 0.25 s of delay up
-to 1 s, and after 8 in a row the session is parked instead of restarted. When a
-framebuffer is present, init plays a startup chime through `wavplay` and runs the desktop
-as the unprivileged user.
+to 1 s, and after 8 in a row the session is parked for 30 s before init tries again. The
+console session is `getty`, on the disk and on an initrd-only boot alike: it prints a
+`maeros login:` prompt and execs `login`, which asks for the password (and waits 3 s
+after a wrong one), drops to the account's ids and starts its shell. Both ignore ^C and
+^Z until the shell runs: at the login prompt they just cancel the line, at `Password:`
+they fail that attempt; logging out ends the
+session and init respawns getty. When a framebuffer is present, init plays a startup
+chime through `wavplay` and runs the desktop as the unprivileged user, with the console
+getty running alongside it.
 
 **The shell** (`userspace/shell/shell.c`) handles single and double quoting,
 `;`, `&&`, `||` and `&`, pipelines of up to 16 commands, redirections (`<`, `>`, `>>`,
@@ -410,15 +414,21 @@ information, so that path is serial and VGA text only. The graphical desktop nee
 GRUB path: `make run-iso`, or `make start`, which also picks a guest resolution that fits
 the host screen and serves the package repository on port 8000.
 
-Everything goes to the serial console, so `make run` gives you the boot log and the
-`MaeroOS$` prompt in your terminal. The boot log is also readable inside the guest with
-`dmesg` and at `/proc/kmsg`.
+Everything goes to the serial console, so `make run` gives you the boot log and a
+`maeros login:` prompt in your terminal. Log in as `root` (password `root`) or `user`
+(password `user`); `exit` logs out and init starts a new getty. The console reads only
+the serial line, so the login is in the terminal QEMU was started from, and it stays
+available while the desktop runs (`make run-iso`, `make run-firefox`; the desktop itself
+runs as `user` without a login, and `make start` writes the serial line to
+`/tmp/maeros_serial.log` instead of a terminal). Change the passwords with `passwd`. The boot log is also readable
+inside the guest with `dmesg` and at `/proc/kmsg`.
 
 ## Testing
 
-The smoke targets each boot QEMU, drive the guest shell over the serial console and
-assert on the output. They are the project's regression suite; `tools/smoke.py` is the
-baseline the others build on, so it is the one to read first.
+The smoke targets each boot QEMU, log in as `root` at the console getty, drive the guest
+shell over the serial console and assert on the output (the login and the headless QEMU
+flags are shared in `tools/smokelib.py`). They are the project's regression suite;
+`tools/smoke.py` is the baseline the others build on, so it is the one to read first.
 
 ```sh
 make smoke          # boot, shell, procfs, PTYs, threads, shm, getrandom, ps
@@ -463,13 +473,11 @@ pull request, on `ubuntu-latest`:
 ```sh
 tools/setup-linux.sh --apt --no-musl      # host packages + i686-elf toolchain
 make -j"$(nproc)" all initrd disk iso
-xvfb-run -a make check
+make check
 ```
 
-The smoke suites start QEMU without `-display`, so with `qemu-system-gui` installed QEMU
-opens a GTK window, and on a host with no display (ssh, CI) it exits with
-`gtk initialization failed` before the guest boots. There, run the suites under Xvfb
-(`sudo apt install xvfb`) as CI does; `make check` points this out when it happens.
+The smoke suites start QEMU with `-display none`, so they need no display (ssh, CI);
+`SMOKE_DISPLAY=1` brings QEMU's window back for watching a run.
 
 The built `~/opt/cross` toolchain is cached, keyed on the binutils/gcc versions, digests
 and configure flags in `tools/setup-linux.sh` and on the runner's Ubuntu release, so only

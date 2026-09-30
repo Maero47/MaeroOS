@@ -6,6 +6,8 @@ import subprocess
 import sys
 import time
 
+import smokelib
+
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PROMPT = "MaeroOS$ "
@@ -13,31 +15,18 @@ TIMEOUT = 25.0
 
 
 def wait_for(proc, sel, needle, log, timeout=TIMEOUT, start=0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        for key, _ in sel.select(0.2):
-            chunk = os.read(key.fd, 4096).decode("latin1", "replace")
-            if not chunk:
-                continue
-            log.append(chunk)
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
-            if needle in "".join(log)[start:]:
-                return
-        if proc.poll() is not None:
-            raise RuntimeError(f"QEMU exited with status {proc.returncode}")
-    raise TimeoutError(f"timed out waiting for {needle!r}")
+    return smokelib.wait_for(proc, sel, needle, log, timeout, start)
 
 
 def send(proc, text):
-    proc.stdin.write(text.encode("latin1"))
-    proc.stdin.flush()
+    smokelib.send(proc, text)
 
 
 def main():
     proc = subprocess.Popen(
         [
             "qemu-system-i386",
+            *smokelib.QEMU_DISPLAY,
             "-kernel",
             "kernel.elf",
             "-initrd",
@@ -62,7 +51,18 @@ def main():
     log = []
 
     try:
-        wait_for(proc, sel, PROMPT, log)
+        # getty prompts; a wrong password is rejected and getty comes back.
+        # Each wait starts where the previous match ended (or at a mark
+        # taken before sending), never at data read before the event.
+        wait_for(proc, sel, smokelib.LOGIN_PROMPT, log, timeout=60.0)
+        before = smokelib.mark(log)
+        send(proc, "root\n")
+        at = wait_for(proc, sel, smokelib.PASSWORD_PROMPT, log, start=before)
+        send(proc, "wrong\n")
+        at = wait_for(proc, sel, "login: authentication failed", log, start=at)
+        if "Welcome to MaeroOS" in "".join(log)[before:]:
+            raise AssertionError("a wrong console password started a shell")
+        smokelib.login(proc, sel, log, start=at)
         boot_log = "".join(log)
         if "[BOOT] Launching /disk/init" not in boot_log:
             raise AssertionError("disk boot did not launch /disk/init")
@@ -72,8 +72,10 @@ def main():
             raise AssertionError("disk init did not launch /disk/getty")
         if "MaeroOS getty on tty0" not in boot_log:
             raise AssertionError("disk getty banner did not appear")
-        if "login: root" not in boot_log:
-            raise AssertionError("disk getty login did not appear")
+        if "maeros login: " not in boot_log:
+            raise AssertionError("disk getty login prompt did not appear")
+        if "MaeroOS$ " in boot_log[:boot_log.find("login: root accepted")]:
+            raise AssertionError("the console gave a shell before a login")
         if "exec '/disk/login'" not in boot_log:
             raise AssertionError("disk getty did not launch /disk/login")
         if "login: root accepted" not in boot_log:
@@ -325,6 +327,66 @@ def main():
                 after_restart = "".join(log)[before:]
                 if "[init] Respawning service heartbeat" not in after_restart:
                     wait_for(proc, sel, "[init] Respawning service heartbeat", log, timeout=5.0, start=before)
+
+        # Log out: init respawns getty.
+        at = smokelib.mark(log)
+        send(proc, "exit\n")
+        at = wait_for(proc, sel, "[init] Session tty0 exited; restarting", log, start=at)
+        at = wait_for(proc, sel, smokelib.LOGIN_PROMPT, log, start=at)
+
+        # ^C and ^Z at the login prompt only cancel the line: getty neither
+        # dies (a rapid exit init would count toward parking the console)
+        # nor stops (nobody would respawn it).
+        span = at
+        for key in ("\x03", "\x1a", "\x03"):
+            at = smokelib.mark(log)
+            send(proc, key)
+            at = wait_for(proc, sel, smokelib.LOGIN_PROMPT, log, start=at)
+        recent = "".join(log)[span:]
+        if "[init] Session tty0" in recent or "killed by signal" in recent:
+            raise AssertionError("^C/^Z at the login prompt ended getty")
+
+        # ^C and ^Z at "Password:" end that login attempt as a failure
+        # (after the 3 s delay, so not a rapid exit), and echo comes back.
+        for key in ("\x03", "\x1a"):
+            at = smokelib.mark(log)
+            send(proc, "root\n")
+            at = wait_for(proc, sel, smokelib.PASSWORD_PROMPT, log, start=at)
+            send(proc, key)
+            at = wait_for(proc, sel, "login: password required", log, start=at)
+            at = wait_for(proc, sel, "[init] Session tty0 exited; restarting (try 0)", log, start=at)
+            at = wait_for(proc, sel, smokelib.LOGIN_PROMPT, log, start=at)
+            recent = "".join(log)[span:]
+            if "killed by signal" in recent or "accepted" in recent:
+                raise AssertionError(f"{key!r} at Password: did not fail the login cleanly")
+
+        # A name that looks like a login option is refused (getty runs as
+        # root; `-f` skips the password).  Its echo shows the password
+        # prompt left echo on.
+        at = smokelib.mark(log)
+        send(proc, "-f root\n")
+        at = wait_for(proc, sel, "-f root", log, start=at)
+        at = wait_for(proc, sel, "getty: invalid user name", log, start=at)
+        at = wait_for(proc, sel, smokelib.LOGIN_PROMPT, log, start=at)
+        if "login: root accepted" in "".join(log)[span:]:
+            raise AssertionError("getty passed '-f root' to login")
+
+        # An unknown name gets the password prompt and the same failure.
+        before = smokelib.mark(log)
+        send(proc, "nosuchuser\n")
+        at = wait_for(proc, sel, smokelib.PASSWORD_PROMPT, log, start=before)
+        send(proc, "x\n")
+        at = wait_for(proc, sel, "login: authentication failed", log, start=at)
+        if "unknown user" in "".join(log)[before:]:
+            raise AssertionError("console login revealed that the account does not exist")
+
+        # The unprivileged user logs in with the documented user/user.
+        smokelib.login(proc, sel, log, user="user", password="user", start=at)
+        before = smokelib.mark(log)
+        send(proc, "id\n")
+        wait_for(proc, sel, PROMPT, log, start=before)
+        if "uid=1000 gid=100" not in "".join(log)[before:]:
+            raise AssertionError("console login as user did not drop to uid 1000")
 
         print("\n[SMOKE-DISK] passed")
         return 0

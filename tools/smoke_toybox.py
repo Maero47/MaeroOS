@@ -5,6 +5,8 @@ import subprocess
 import sys
 import time
 
+import smokelib
+
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PROMPT = "MaeroOS$ "
@@ -12,25 +14,11 @@ TIMEOUT = 25.0
 
 
 def wait_for(proc, sel, needle, log, timeout=TIMEOUT, start=0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        for key, _ in sel.select(0.2):
-            chunk = os.read(key.fd, 4096).decode("latin1", "replace")
-            if not chunk:
-                continue
-            log.append(chunk)
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
-            if needle in "".join(log)[start:]:
-                return
-        if proc.poll() is not None:
-            raise RuntimeError(f"QEMU exited with status {proc.returncode}")
-    raise TimeoutError(f"timed out waiting for {needle!r}")
+    return smokelib.wait_for(proc, sel, needle, log, timeout, start)
 
 
 def send(proc, text):
-    proc.stdin.write(text.encode("latin1"))
-    proc.stdin.flush()
+    smokelib.send(proc, text)
 
 
 def main():
@@ -42,7 +30,7 @@ def main():
             raise AssertionError(f"tools/{test} failed")
 
     proc = subprocess.Popen(
-        ["make", "run"],
+        ["make", "run"] + smokelib.MAKE_DISPLAY,
         cwd=ROOT,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -54,7 +42,7 @@ def main():
     log = []
 
     try:
-        wait_for(proc, sel, PROMPT, log)
+        smokelib.login(proc, sel, log)
         checks = [
             ("toybox echo TOYBOX_OK\n", "TOYBOX_OK"),
             ("toybox cat hello.txt\n", "Hello from MaeroOS initrd!"),
@@ -102,16 +90,17 @@ def main():
                 )
 
         # Log out of the console shell while a background job of its session
-        # lives on; init starts a new shell in a new session.  The old
-        # leader's exit must free the console so the new shell gets it (job
-        # control, the foreground group) instead of the orphaned job.
+        # lives on; init starts a new getty, and the next login's shell runs
+        # in a new session.  The old leader's exit must free the console so
+        # the new shell gets it (job control, the foreground group) instead
+        # of the orphaned job.
         before = len("".join(log))
         send(proc, "sleep 60 &\n")
         wait_for(proc, sel, PROMPT, log, start=before)
         before = len("".join(log))
         send(proc, "exit\n")
         wait_for(proc, sel, "exited; restarting", log, start=before)
-        wait_for(proc, sel, PROMPT, log, start=before)
+        smokelib.login(proc, sel, log, start=before)
         before = len("".join(log))
         send(proc, "abi2probe tty\n")
         wait_for(proc, sel, PROMPT, log, start=before)

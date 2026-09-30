@@ -17,6 +17,8 @@ import subprocess
 import sys
 import time
 
+import smokelib
+
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PROMPT = "MaeroOS$ "
@@ -24,37 +26,23 @@ TIMEOUT = 25.0
 
 
 def wait_for(proc, sel, needle, log, timeout=TIMEOUT, start=0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        for key, _ in sel.select(0.2):
-            chunk = os.read(key.fd, 4096).decode("latin1", "replace")
-            if not chunk:
-                continue
-            log.append(chunk)
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
-            if needle in "".join(log)[start:]:
-                return
-        if proc.poll() is not None:
-            raise RuntimeError(f"QEMU exited with status {proc.returncode}")
-    raise TimeoutError(f"timed out waiting for {needle!r}")
+    return smokelib.wait_for(proc, sel, needle, log, timeout, start)
 
 
 def send(proc, text):
-    proc.stdin.write(text.encode("latin1"))
-    proc.stdin.flush()
+    smokelib.send(proc, text)
 
 
 def main():
     smp = os.environ.get("SMOKE_SMP")
     if smp:
         # Same flags as the Makefile's `run` target, plus -smp.
-        cmd = ["qemu-system-i386", "-kernel", "kernel.elf",
+        cmd = ["qemu-system-i386", *smokelib.QEMU_DISPLAY, "-kernel", "kernel.elf",
                "-initrd", "initrd.tar", "-serial", "stdio", "-m", "512M",
-               "-no-reboot", "-no-shutdown", "-display", "none",
+               "-no-reboot", "-no-shutdown",
                "-smp", str(int(smp))]
     else:
-        cmd = ["make", "run"]
+        cmd = ["make", "run"] + smokelib.MAKE_DISPLAY
     proc = subprocess.Popen(
         cmd,
         cwd=ROOT,
@@ -68,7 +56,7 @@ def main():
     log = []
 
     try:
-        wait_for(proc, sel, PROMPT, log)
+        smokelib.login(proc, sel, log)
         checks = [
             ("kwprobe\n", "kwprobe ok"),
             ("uname\n", "MaeroOS"),
