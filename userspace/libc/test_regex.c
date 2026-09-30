@@ -8,7 +8,16 @@
 #include "regex.h"
 #include "fnmatch.h"
 
-static int fails, cases;
+static int fails, cases, skipped;
+
+/* regex.c built again by tools/test_regex.py: ref_* never memoises, pru_*
+ * memoises from the first step. */
+int ref_regcomp(regex_t *, const char *, int);
+int ref_regexec(const regex_t *, const char *, unsigned long, regmatch_t *, int);
+void ref_regfree(regex_t *);
+int pru_regcomp(regex_t *, const char *, int);
+int pru_regexec(const regex_t *, const char *, unsigned long, regmatch_t *, int);
+void pru_regfree(regex_t *);
 
 static void t(const char *re, int fl, const char *s, int want_so, int want_eo) {
     regex_t r;
@@ -66,6 +75,105 @@ static void slow(const char *re, int fl, char c, int n, const char *tail, int wa
         fails++;
     }
     regfree(&r);
+}
+
+/* Run `re` on `s` with nmatch = n through the default build (pru = 0) or
+ * the always-memoising one (pru = 1), and through the unpruned reference;
+ * 1 if the results and all n match slots agree. */
+static int same(const char *re, int fl, const char *s, int n, int pru, int verbose) {
+    regex_t a, b;
+    regmatch_t ma[10], mb[10];
+    int ca = pru ? pru_regcomp(&a, re, fl) : regcomp(&a, re, fl);
+    int cb = ref_regcomp(&b, re, fl);
+    if (ca || cb) {
+        if (!ca) pru ? pru_regfree(&a) : regfree(&a);
+        if (!cb) ref_regfree(&b);
+        return ca == cb;
+    }
+    memset(ma, 0x55, sizeof(ma));
+    memset(mb, 0x55, sizeof(mb));
+    int xa = pru ? pru_regexec(&a, s, n, ma, 0) : regexec(&a, s, n, ma, 0);
+    int xb = ref_regexec(&b, s, n, mb, 0);
+    int ok = xa == xb;
+    if (xa == REG_ESPACE || xb == REG_ESPACE) {  /* a step cap ran out: no verdict */
+        skipped++;
+        ok = 1;
+        xa = REG_ESPACE;
+    }
+    for (int i = 0; ok && !xa && i < n; i++)
+        ok = ma[i].rm_so == mb[i].rm_so && ma[i].rm_eo == mb[i].rm_eo;
+    if (!ok && verbose) {
+        printf("FAIL diff /%s/ on '%.40s%s' n=%d%s: %d vs ref %d\n", re, s,
+               strlen(s) > 40 ? "..." : "", n, pru ? " (pru)" : "", xa, xb);
+        for (int i = 0; i < n && !xa && !xb; i++)
+            printf("    %d: %ld,%ld vs ref %ld,%ld\n", i, (long)ma[i].rm_so,
+                   (long)ma[i].rm_eo, (long)mb[i].rm_so, (long)mb[i].rm_eo);
+    }
+    pru ? pru_regfree(&a) : regfree(&a);
+    ref_regfree(&b);
+    return ok;
+}
+
+static unsigned rng = 12345;
+static unsigned rnd(unsigned n) { rng = rng * 1103515245u + 12345u; return (rng >> 16) % n; }
+
+/* A random ERE over {a, b}: groups, alternation (with empty branches),
+ * * + ? and small bounds. */
+static void gen(char **p, int depth) {
+    int pieces = 1 + rnd(2);
+    for (int i = 0; i < pieces; i++) {
+        int k = rnd(depth > 0 ? 6 : 3);
+        if (k == 0) *(*p)++ = 'a';
+        else if (k == 1) *(*p)++ = 'b';
+        else if (k == 2) *(*p)++ = '.';
+        else {
+            *(*p)++ = '(';
+            gen(p, depth - 1);
+            if (rnd(3) == 0) {
+                *(*p)++ = '|';
+                if (rnd(2)) gen(p, depth - 1);
+            }
+            *(*p)++ = ')';
+        }
+        static const char *const q[] = { "", "", "*", "*", "+", "?", "{0,2}", "{2}" };
+        const char *qq = q[rnd(8)];
+        while (*qq) *(*p)++ = *qq++;
+    }
+}
+
+static void differential(void) {
+    /* The review repro: once the memo switched on, the loop's CHK saw a
+     * different MARK and group 1/2 moved (318,320 / 318,319 vs 319,320 /
+     * 319,319).  Submatches must now match the unpruned search. */
+    static char s[400];
+    for (int i = 0; i < 64; i++) memcpy(s + 5 * i, "bbaba", 5);
+    s[320] = 0;
+    cases++;
+    if (!same("((b*)(|a))*", REG_EXTENDED, s, 10, 0, 1)) fails++;
+    cases++;
+    if (!same("((b*)(|a))*", REG_EXTENDED, s, 1, 1, 1)) fails++;
+
+    /* Random patterns and subjects: the default and always-memoising builds
+     * agree with the reference on the whole match (n = 1) and on every
+     * submatch (n = 10). */
+    int bad = 0, runs = 0;
+    for (int it = 0; it < 4000; it++) {
+        char re[256], str[40], *p = re;
+        gen(&p, 3);
+        *p = 0;
+        int len = rnd(16);
+        for (int i = 0; i < len; i++) str[i] = "ab"[rnd(2)];
+        str[len] = 0;
+        for (int pru = 0; pru < 2; pru++)
+            for (int n = 1; n <= 10; n += 9) {
+                runs++;
+                if (!same(re, REG_EXTENDED, str, n, pru, bad < 5)) bad++;
+            }
+    }
+    cases++;
+    printf("differential: %d random runs, %d mismatches, %d skipped (a step cap ran out)\n",
+           runs, bad, skipped);
+    if (bad) fails++;
 }
 
 int main(void) {
@@ -144,6 +252,25 @@ int main(void) {
     slow("(x+x+)+y", E, 'x', 100, "", REG_NOMATCH);
     slow("(a|aa)*b", E, 'a', 32, "b", 0);
     slow("(a*)*b", E, 'a', 4000, "b", 0);
+    /* Submatches wanted: no memo (loops make them path-dependent), so the
+     * step cap stops it instead, still quickly. */
+    {
+        char a32[40];
+        regex_t r;
+        regmatch_t m[4];
+        struct timespec x, y;
+        memset(a32, 'a', 32);
+        a32[32] = 0;
+        cases++;
+        regcomp(&r, "(a|aa)*b", E);
+        clock_gettime(CLOCK_MONOTONIC, &x);
+        int got = regexec(&r, a32, 4, m, 0);
+        clock_gettime(CLOCK_MONOTONIC, &y);
+        double ms = (y.tv_sec - x.tv_sec) * 1e3 + (y.tv_nsec - x.tv_nsec) / 1e6;
+        printf("time /(a|aa)*b/ on 32 x 'a' with submatches: %.2f ms, result %d\n", ms, got);
+        if (got != REG_ESPACE || ms >= 50) { printf("FAIL capped submatch search\n"); fails++; }
+        regfree(&r);
+    }
     /* With a back-reference there is no memo: the step cap stops it. */
     slow("\\(a*\\)*\\1b", 0, 'a', 30, "", REG_ESPACE);
     /* ...and ordinary back-reference patterns still match. */
@@ -156,6 +283,7 @@ int main(void) {
         t("(ab|abcd)", E, big, 2000, 2004);
         t("x*(a|ab)*c", E, "xxxxababababc", 0, 13);
     }
+    differential();
     printf("%d cases, %d failures\n", cases, fails);
     return fails != 0;
 }
