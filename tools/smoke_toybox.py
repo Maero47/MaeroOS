@@ -75,6 +75,9 @@ def main():
             # Syscall-layer regressions: long relative paths, symlink loops,
             # offsets, getdents layouts, waitpid(WUNTRACED).
             ("sysmiscprobe\n", "sysmiscprobe ok"),
+            # Creation modes, O_APPEND, supplementary groups, access(),
+            # TIOCSPGRP, unlink(dir) (userspace/abi2probe).
+            ("abi2probe\n", "abi2probe ok"),
             ("whoami\n", "root"),
             # libc regression checks (userspace/libctest)
             ("libctest\n", "LIBCTEST PASS"),

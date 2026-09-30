@@ -148,6 +148,41 @@ static vfs_node_t *proc_ctty_node(void) {
     return NULL;
 }
 
+/* The session the serial console is the controlling terminal of (0: none).
+ * A process never holds the console in ->ctty (that pointer routes I/O to a
+ * pty slave, and the console routing through itself would recurse), so the
+ * association lives here.  The console is claimed by the first session that
+ * asks for it with TIOCSCTTY or TIOCSPGRP while no live session holds it — the
+ * shell does setsid() + TIOCSCTTY at start — and it is free again once every
+ * process of that session is gone (Linux disassociate_ctty at session end). */
+static int tty_sid = 0;
+
+static int session_alive(int sid) {
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (ptable[i].state != PROC_UNUSED && ptable[i].state != PROC_ZOMBIE &&
+            ptable[i].sid == sid)
+            return 1;
+    return 0;
+}
+
+/* Is the console the caller's controlling terminal?  With `claim`, a console
+ * no live session holds becomes the caller's session's. */
+static int console_is_ctty(int claim) {
+    if (!current_proc) return 0;
+    if (tty_sid && tty_sid != current_proc->sid && !session_alive(tty_sid))
+        tty_sid = 0;
+    if (!tty_sid && claim) tty_sid = current_proc->sid;
+    return tty_sid == current_proc->sid;
+}
+
+/* A process group with id `pgrp` exists at all (Linux find_vpid). */
+static int pgrp_exists(int pgrp) {
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (ptable[i].state != PROC_UNUSED && ptable[i].pgrp == pgrp)
+            return 1;
+    return 0;
+}
+
 static int pgrp_in_current_session(int pgrp) {
     if (!current_proc || pgrp <= 0) return 0;
     for (int i = 0; i < MAX_PROCS; i++) {
@@ -283,6 +318,27 @@ int console_vt_ioctl(uint32_t req, void *arg) {
     return -25;                          /* ENOTTY: not a VT request */
 }
 
+int tty_console_setpgrp(int pgrp) {
+    if (!console_is_ctty(1)) return -25;              /* -ENOTTY */
+    if (pgrp < 0) return -22;                          /* -EINVAL */
+    if (!pgrp_exists(pgrp)) return -3;                 /* -ESRCH */
+    if (!pgrp_in_current_session(pgrp)) return -1;     /* -EPERM */
+    tty_fg_pgrp = pgrp;
+    return 0;
+}
+
+/* Linux tiocsctty: a session leader without a controlling terminal takes the
+ * console, unless another live session already has it (-EPERM). */
+int tty_console_setctty(void) {
+    if (!current_proc) return -25;
+    if (console_is_ctty(0)) return 0;                  /* already ours */
+    if (current_proc->sid != current_proc->pid || current_proc->ctty)
+        return -1;                                     /* -EPERM */
+    if (!console_is_ctty(1)) return -1;                /* held elsewhere */
+    tty_fg_pgrp = current_proc->pgrp;
+    return 0;
+}
+
 static int tty_ioctl(vfs_node_t *n, uint32_t req, void *arg) {
     (void)n;
     {
@@ -317,13 +373,17 @@ static int tty_ioctl(vfs_node_t *n, uint32_t req, void *arg) {
                       (current_proc ? current_proc->pgrp : 1);
         return 0;
     }
+    /* Linux tiocspgrp: only for the caller's controlling terminal (-ENOTTY
+     * otherwise), and only to a process group of the caller's own session:
+     * -EINVAL for a negative id, -ESRCH for no such group, -EPERM for a group
+     * of another session.  Before, any process could hand the console's
+     * foreground to any group. */
     if (req == TIOCSPGRP) {
         if (!arg) return -14;
-        int pgrp = *(int *)arg;
-        if (!pgrp_in_current_session(pgrp)) return -3;
-        tty_fg_pgrp = pgrp;
-        return 0;
+        return tty_console_setpgrp(*(int *)arg);
     }
+    if (req == TIOCSCTTY)
+        return tty_console_setctty();
     return -25;
 }
 
@@ -668,9 +728,11 @@ static int pty_ioctl(vfs_node_t *n, uint32_t req, void *arg) {
         if (!current_proc || current_proc->ctty != &p->slave)
             return -25;
         if (p->sid && p->sid != current_proc->sid)
-            return -1;
+            return -25;                  /* -ENOTTY: not this session's tty */
+        if (pgrp < 0) return -22;
+        if (!pgrp_exists(pgrp)) return -3;
         if (!pgrp_in_current_session(pgrp))
-            return -3;
+            return -1;
         p->fg_pgrp = pgrp;
         return 0;
     }

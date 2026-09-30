@@ -1474,14 +1474,18 @@ int main(int argc, char *argv[], char *envp[]) {
     setsid();
     shell_pgrp = getpid();
     setpgid(0, shell_pgrp);
-    ioctl(0, TIOCSCTTY, 0);
-    shell_take_terminal();
 
-    /* -c CMD: execute one command and exit */
+    /* -c CMD: execute one command and exit.  Such a shell (rc, a service, a
+     * script) does not take the terminal as its controlling tty: the console
+     * belongs to one session at a time, and a long-lived service holding it
+     * would leave the interactive shell unable to do job control. */
     if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
         exec_script(argv[2]);
         exit(g_status);
     }
+
+    ioctl(0, TIOCSCTTY, 0);
+    shell_take_terminal();
 
     /* Interactive login shell: run the system-wide profile. */
     source_file_if_present("/etc/profile");

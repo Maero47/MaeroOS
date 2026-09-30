@@ -166,6 +166,10 @@ void vfs_retain(vfs_node_t *node);
  * -13 (-EACCES).  euid 0 (root) bypasses, except X on a file still needs an
  * execute bit somewhere. */
 int vfs_access_check(vfs_node_t *node, uint32_t euid, uint32_t egid, int want);
+/* The same, where the group class also applies when the file's group is any of
+ * the `ngroups` supplementary gids in `groups` (Linux in_group_p). */
+int vfs_access_check_groups(vfs_node_t *node, uint32_t uid, uint32_t gid,
+                            const uint32_t *groups, uint32_t ngroups, int want);
 
 /* Update mode/uid/gid (in-memory + persisted via setattr_fn if present). */
 int vfs_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid);

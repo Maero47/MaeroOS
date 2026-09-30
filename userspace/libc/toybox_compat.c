@@ -111,7 +111,7 @@ int unlinkat(int dirfd, const char *path, int flags) {
 }
 
 int rmdir(const char *path) {
-    return unlink(path);
+    return chkerr(syscall1(40, (int)path));   /* unlink() refuses directories */
 }
 
 char *getcwd(char *buf, int size) {
@@ -417,25 +417,170 @@ struct passwd *getpwnam(const char *name) {
     return r;
 }
 
-static struct group root_gr = {"root", "x", 0, 0};
-struct group *getgrgid(gid_t gid) { return gid ? 0 : &root_gr; }
-struct group *getgrnam(const char *name) { return !strcmp(name, "root") ? &root_gr : 0; }
+/* ── /etc/group ────────────────────────────────────────────────────────────
+ * name:passwd:gid:member,member,...  Fields are split on every ':' so an
+ * empty field (the usual empty member list, "root:x:0:") stays a field
+ * instead of shifting the ones after it.  Empty member names are skipped. */
+static FILE *gr_open(void) {
+    FILE *f = fopen("/etc/group", "r");
+    if (!f) f = fopen("/disk/etc/group", "r");    /* as pw_open */
+    return f;
+}
+
+/* Lay out `line` (a whole group entry) in buf as a struct group: the text
+ * first, then the NULL-terminated member pointer array.  0 or ERANGE. */
+static int gr_fill(const char *line, size_t len, unsigned gid,
+                   struct group *gr, char *buf, size_t buflen) {
+    char *fld[4];
+    size_t nmem = 1;
+    for (size_t k = 0; k < len; k++) if (line[k] == ',') nmem++;
+    size_t text = (len + 1 + sizeof(char *) - 1) & ~(sizeof(char *) - 1);
+    if (text + (nmem + 1) * sizeof(char *) > buflen) return ERANGE;
+    memcpy(buf, line, len + 1);
+    pw_split(buf, fld, 4);
+    char **mem = (char **)(buf + text);
+    size_t n = 0;
+    for (char *m = fld[3]; *m; ) {
+        char *c = strchr(m, ',');
+        if (c) *c = 0;
+        if (*m) mem[n++] = m;
+        if (!c) break;
+        m = c + 1;
+    }
+    mem[n] = 0;
+    gr->gr_name = fld[0];
+    gr->gr_passwd = fld[1];
+    gr->gr_gid = (gid_t)gid;
+    gr->gr_mem = mem;
+    return 0;
+}
+
+/* Next well-formed entry of f into line (NUL-terminated, newline dropped):
+ * its length, or -1 at EOF.  *gid gets its group id. */
+static int gr_next(FILE *f, char *line, size_t cap, unsigned *gid) {
+    while (fgets(line, (int)cap, f)) {
+        size_t len = strlen(line);
+        char tmp[512], *fld[4];
+        if (len && line[len - 1] != '\n' && !feof(f)) {
+            int c;   /* over-long line: skip the rest of it */
+            while ((c = fgetc(f)) != EOF && c != '\n') {}
+            continue;
+        }
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = 0;
+        if (!len || line[0] == '#') continue;
+        memcpy(tmp, line, len + 1);
+        if (pw_split(tmp, fld, 4) || pw_num(fld[2], gid)) continue;
+        return (int)len;
+    }
+    return -1;
+}
+
+/* getgrnam_r/getgrgid_r core: `name`, or `gid` when name is NULL. */
+static int gr_get_r(const char *name, gid_t gid, struct group *grp, char *buf,
+                    size_t buflen, struct group **result) {
+    char line[512];
+    unsigned g;
+    int len, rc = ENOENT;
+    FILE *f = gr_open();
+
+    *result = 0;
+    if (!f) {
+        /* No group file at all (a bare initrd): root still has a group. */
+        if (name ? strcmp(name, "root") : gid != 0) return 0;
+        rc = gr_fill("root:x:0:", 9, 0, grp, buf, buflen);
+        if (!rc) *result = grp;
+        return rc;
+    }
+    while ((len = gr_next(f, line, sizeof(line), &g)) >= 0) {
+        size_t nl = strcspn(line, ":");
+        if (name ? (strlen(name) != nl || strncmp(line, name, nl)) : g != gid)
+            continue;
+        rc = gr_fill(line, (size_t)len, g, grp, buf, buflen);
+        break;
+    }
+    fclose(f);
+    if (rc == 0) *result = grp;
+    return rc == ENOENT ? 0 : rc;   /* "not found" is not an error */
+}
+
 int getgrgid_r(gid_t gid, struct group *grp, char *buf, size_t buflen, struct group **result) {
-    (void)buf; (void)buflen; *result = getgrgid(gid); if (*result && grp) *grp = **result; return *result ? 0 : ENOENT;
+    return gr_get_r((const char *)0, gid, grp, buf, buflen, result);
 }
 int getgrnam_r(const char *name, struct group *grp, char *buf, size_t buflen, struct group **result) {
-    (void)buf; (void)buflen; *result = getgrnam(name); if (*result && grp) *grp = **result; return *result ? 0 : ENOENT;
+    if (!name) { *result = 0; return 0; }
+    return gr_get_r(name, 0, grp, buf, buflen, result);
 }
-int initgroups(const char *user, gid_t group) { (void)user; (void)group; return 0; }
-int getgroups(int size, gid_t list[]) {
-    if (size > 0 && list) list[0] = 0;
-    return 1;
+
+static struct group gr_static;
+static char gr_static_buf[1024];
+struct group *getgrgid(gid_t gid) {
+    struct group *r;
+    int e = getgrgid_r(gid, &gr_static, gr_static_buf, sizeof(gr_static_buf), &r);
+    if (e) errno = e;
+    return r;
 }
+struct group *getgrnam(const char *name) {
+    struct group *r;
+    int e = getgrnam_r(name, &gr_static, gr_static_buf, sizeof(gr_static_buf), &r);
+    if (e) errno = e;
+    return r;
+}
+
+/* glibc getgrouplist(): `group` first, then every group of /etc/group that
+ * lists `user` as a member.  Returns the count, or -1 when more than
+ * *ngroups were found (*ngroups then says how many). */
 int getgrouplist(const char *user, gid_t group, gid_t *groups, int *ngroups) {
-    (void)user;
-    if (groups && ngroups && *ngroups > 0) groups[0] = group;
-    if (ngroups) *ngroups = 1;
-    return 1;
+    char line[512];
+    unsigned g;
+    int len, n = 0, cap = ngroups ? *ngroups : 0;
+    FILE *f;
+
+    if (n < cap && groups) groups[n] = group;
+    n++;
+    if (user && (f = gr_open())) {
+        while ((len = gr_next(f, line, sizeof(line), &g)) >= 0) {
+            char *fld[4];
+            if (g == group) continue;
+            pw_split(line, fld, 4);
+            for (char *m = fld[3]; *m; ) {
+                char *c = strchr(m, ',');
+                if (c) *c = 0;
+                if (strcmp(m, user) == 0) {
+                    int dup = 0;
+                    for (int k = 0; k < n && k < cap; k++)
+                        if (groups && groups[k] == (gid_t)g) dup = 1;
+                    if (!dup) {
+                        if (n < cap && groups) groups[n] = (gid_t)g;
+                        n++;
+                    }
+                    break;
+                }
+                if (!c) break;
+                m = c + 1;
+            }
+        }
+        fclose(f);
+    }
+    if (ngroups) *ngroups = n;
+    return n > cap ? -1 : n;
+}
+
+/* initgroups(): the supplementary list is `group` plus the groups naming
+ * `user` in /etc/group.  The kernel holds at most 32; any beyond that are
+ * dropped rather than failing the login that calls this. */
+int initgroups(const char *user, gid_t group) {
+    gid_t list[32];
+    int n = 32;
+    if (getgrouplist(user, group, list, &n) < 0) n = 32;
+    return setgroups((size_t)n, list);
+}
+
+int getgroups(int size, gid_t list[]) {
+    return chkerr(syscall2(205, size, (int)list));        /* getgroups32 */
+}
+int setgroups(size_t size, const gid_t *list) {
+    return chkerr(syscall2(206, (int)size, (int)list));   /* setgroups32 */
 }
 
 int regcomp(regex_t *preg, const char *regex, int cflags) { (void)preg; (void)regex; (void)cflags; return REG_NOMATCH; }

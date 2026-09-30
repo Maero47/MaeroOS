@@ -1805,6 +1805,11 @@ static int ext2_unlink(vfs_node_t *dir, const char *name) {
      * this by the count rather than by assumption keeps unlink correct if hard
      * links ever arrive.) */
     if (victim.i_links_count > 0) victim.i_links_count--;
+    /* A directory also loses the link its own "." entry held (Linux
+     * ext2_rmdir: i_size = 0 and a second inode_dec_link_count).  Leaving
+     * that one in place kept the removed directory's inode and blocks
+     * allocated for good. */
+    if (type == EXT2_S_IFDIR) victim.i_links_count = 0;
     victim.i_ctime = now;
 
     if (victim.i_links_count > 0)            /* another name still refers to it */

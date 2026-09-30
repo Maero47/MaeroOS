@@ -105,6 +105,52 @@ def sink_server():
     return srv.getsockname()[1], result, t
 
 
+def serve_forever(handler):
+    """Accept connections on a fresh port until the process ends, handing
+    each to handler(conn) on its own thread.  Returns the port."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", 0))
+    srv.listen(8)
+
+    def run():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=handler, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=run, daemon=True).start()
+    return srv.getsockname()[1]
+
+
+def idle_conn(conn):
+    """Keep the connection open and silent (the guest's recv must EAGAIN)."""
+    conn.settimeout(30)
+    try:
+        while conn.recv(4096):
+            pass
+    except OSError:
+        pass
+    conn.close()
+
+
+def reset_conn(conn):
+    """On the guest's first bytes, close with a reset (SO_LINGER 0): slirp
+    passes it on to the guest as a RST, after which the guest's send must
+    fail with EPIPE.  Waiting for data first keeps the reset from racing
+    slirp's handshake with the guest (which would make it ECONNREFUSED)."""
+    import struct
+    conn.settimeout(30)
+    try:
+        conn.recv(16)
+    except OSError:
+        pass
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    conn.close()
+
+
 def main():
     webdir = tempfile.TemporaryDirectory()
     index_path = os.path.join(webdir.name, "index.html")
@@ -204,6 +250,16 @@ def main():
         recent = "".join(log)[before:]
         if "sockprobe tcptw ok" not in recent:
             raise AssertionError("closing sockets whose pcbs were in TIME_WAIT broke TCP")
+        # O_NONBLOCK/MSG_DONTWAIT, non-blocking connect, EPIPE + SIGPIPE
+        # after a peer reset, MSG_NOSIGNAL (userspace/abi2probe).
+        idle_port = serve_forever(idle_conn)
+        reset_port = serve_forever(reset_conn)
+        before = len("".join(log))
+        send(proc, f"abi2probe net {idle_port} {reset_port}")
+        wait_for(proc, sel, PROMPT, log, timeout=30.0, start=before)
+        recent = "".join(log)[before:]
+        if "abi2probe net ok" not in recent:
+            raise AssertionError("abi2probe net: socket flag/EPIPE cases failed")
         before = len("".join(log))
         send(proc, f"httpget 10.0.2.2 {http_port} /index.html")
         wait_for(proc, sel, PROMPT, log, timeout=15.0, start=before)

@@ -43,7 +43,7 @@ static void *raw_mmap(unsigned len, int prot, int flags, int fd) {
 }
 
 static void check_tmpfs(void) {
-    int fd = open("/tmp/fsp.bin", O_CREAT | O_TRUNC | O_RDWR);
+    int fd = open("/tmp/fsp.bin", O_CREAT | O_TRUNC | O_RDWR, 0644);
     if (fd < 0) { fail("open /tmp/fsp.bin"); return; }
     if (write(fd, "hello", 5) != 5) fail("tmpfs write");
 
@@ -145,7 +145,7 @@ static void check_fifo(void) {
         /* A heap block the size of a freed pipe buffer: if the FIFO still
          * pointed at freed memory, the next round's write would land in this
          * file's body. */
-        int fd = open("/tmp/fsp.fill", O_CREAT | O_TRUNC | O_RDWR);
+        int fd = open("/tmp/fsp.fill", O_CREAT | O_TRUNC | O_RDWR, 0644);
         if (fd < 0) { fail("fill open"); return; }
         if (write(fd, fill, sizeof(fill)) != (int)sizeof(fill)) fail("fill write");
         int wfd2 = open("/tmp/fsp.fifo", O_WRONLY);
@@ -198,7 +198,7 @@ static void check_ext2_lookup_leak(void) {
 }
 
 static void check_mmap_after_write(const char *path) {
-    int fd = open(path, O_CREAT | O_TRUNC | O_RDWR);
+    int fd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0644);
     if (fd < 0) { printf("fsprobe FAIL: open %s\n", path); fails++; return; }
     if (write(fd, "old-bytes", 9) != 9) fail("mmap test write old");
     close(fd);
@@ -215,7 +215,7 @@ static void check_mmap_after_write(const char *path) {
     waitpid(pid, &st, 0);
     if (st != 0) { printf("fsprobe FAIL: shared map of %s\n", path); fails++; }
 
-    fd = open(path, O_CREAT | O_TRUNC | O_RDWR);
+    fd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0644);
     if (fd < 0 || write(fd, "new-bytes", 9) != 9) fail("mmap test write new");
     if (fd >= 0) close(fd);
 

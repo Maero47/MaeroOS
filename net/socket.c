@@ -60,7 +60,9 @@ struct net_socket {
     int tx_shut;        /* shutdown(SHUT_WR/SHUT_RDWR) done: send is EPIPE */
     int rx_shut;        /* shutdown(SHUT_RD/SHUT_RDWR) done */
     int tcp_state;
-    int tcp_error;
+    int tcp_error;      /* pending error (SO_ERROR), consumed when reported */
+    int was_connected;  /* the handshake completed at some point */
+    int peer_fin;       /* the peer's FIN arrived: recv reports EOF */
     uint8_t tcp_rx[TCP_RX_SIZE];
     uint32_t tcp_rx_head;
     uint32_t tcp_rx_tail;
@@ -135,6 +137,7 @@ static err_t tcp_connected_cb(void *arg, struct tcp_pcb *pcb, err_t err) {
     if (err == ERR_OK) {
         s->tcp_state = TCP_STATE_CONNECTED;
         s->connected = 1;
+        s->was_connected = 1;
         s->tcp_error = 0;
     } else {
         s->tcp_state = TCP_STATE_ERROR;
@@ -183,6 +186,7 @@ static err_t tcp_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p,
     if (!p) {
         s->tcp_state = TCP_STATE_CLOSED;
         s->connected = 0;
+        s->peer_fin = 1;
         /* The peer's FIN after ours (shutdown(SHUT_WR)) takes the pcb to
          * CLOSING or TIME_WAIT, from which lwIP frees it without telling
          * us.  Nothing is left to send or receive on it: let go now.  Data
@@ -222,8 +226,25 @@ static void tcp_err_cb(void *arg, err_t err) {
      * recv keeps reporting EOF instead of turning it into an error. */
     if (err == ERR_CLSD && s->tcp_state == TCP_STATE_CLOSED)
         return;
+    /* The errno Linux's tcp_reset() leaves in sk_err: a reset answering our
+     * SYN is ECONNREFUSED, one after the peer's FIN (CLOSE_WAIT: it has gone
+     * and our data reached nobody) EPIPE, any other ECONNRESET. */
+    int e;
+    if (s->tcp_state == TCP_STATE_CONNECTING)
+        e = (err == ERR_RST) ? -111 : -110;       /* -ECONNREFUSED/-ETIMEDOUT */
+    else if (err == ERR_RST)
+        e = s->peer_fin ? -32 : -104;             /* -EPIPE / -ECONNRESET */
+    else
+        e = (err == ERR_ABRT) ? -104 : -101;
     s->tcp_state = TCP_STATE_ERROR;
-    s->tcp_error = (err == ERR_ABRT) ? -104 : -101;
+    s->tcp_error = e;
+}
+
+/* Linux sock_error(): report the pending error once. */
+static int take_error_locked(net_socket_t *s) {
+    int e = s->tcp_error;
+    s->tcp_error = 0;
+    return e;
 }
 
 static err_t tcp_poll_cb(void *arg, struct tcp_pcb *pcb) {
@@ -317,7 +338,8 @@ static int socket_bind_locked(net_socket_t *s, const net_sockaddr_in_t *addr) {
     return e == ERR_OK ? 0 : -98;
 }
 
-int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr) {
+int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
+                       int nonblock) {
     if (!s || !s->used || !addr)
         return -9;
     if (addr->family != AF_INET_K)
@@ -340,6 +362,15 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr) {
         return 0;
     }
 
+    /* Linux __inet_stream_connect: a handshake already under way is
+     * -EALREADY, an established connection -EISCONN. */
+    preempt_disable();
+    int st = s->tcp_state, have_pcb = (s->tcp != NULL), was = s->was_connected;
+    preempt_enable();
+    if (st == TCP_STATE_CONNECTING) return -114;          /* -EALREADY */
+    if (was) return -106;                                 /* -EISCONN */
+    if (!have_pcb) return -22;      /* a failed attempt released the pcb */
+
     s->tcp_state = TCP_STATE_CONNECTING;
     s->tcp_error = 0;
     preempt_disable();
@@ -350,6 +381,10 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr) {
         s->tcp_state = TCP_STATE_ERROR;
         return -101;
     }
+    /* O_NONBLOCK: the handshake goes on without us; poll() reports the
+     * socket writable when it ends, and SO_ERROR says how. */
+    if (nonblock)
+        return -115;                                      /* -EINPROGRESS */
     /* Pin across the sleeping wait (see net_socket_recvfrom). */
     net_socket_retain(s);
     int r = -110;
@@ -361,7 +396,10 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr) {
             break;
         }
         if (s->tcp_state == TCP_STATE_ERROR) {
-            r = s->tcp_error ? s->tcp_error : -101;
+            preempt_disable();
+            r = take_error_locked(s);
+            preempt_enable();
+            if (!r) r = -101;
             break;
         }
         net_io_sleep(2);
@@ -377,8 +415,23 @@ static int socket_sendto_locked(net_socket_t *s, const void *buf, uint32_t len,
     if (s->type == SOCK_STREAM_K) {
         if (s->tx_shut)
             return -32;   /* -EPIPE, as Linux after SHUT_WR */
-        if (!s->connected || !s->tcp)
-            return -107;
+        /* Linux tcp_sendmsg -> sk_stream_error: a pending error is reported
+         * once (ECONNRESET after a reset, EPIPE after a reset that followed
+         * the peer's FIN); after that the connection is shut both ways and
+         * every send is EPIPE. */
+        if (s->tcp_state == TCP_STATE_ERROR) {
+            int e = take_error_locked(s);
+            return e ? e : -32;
+        }
+        if (s->tcp_state == TCP_STATE_CONNECTING)
+            return -11;   /* a blocking sender waits for the handshake */
+        if (!s->tcp)
+            return s->was_connected ? -32 : -107;
+        /* Sending after the peer's FIN is allowed (CLOSE_WAIT): TCP is
+         * half-duplex-closeable, and the peer answers with a reset if it has
+         * really gone, which the next send reports. */
+        if (!s->was_connected)
+            return -107;  /* -ENOTCONN */
         if (len == 0)
             return 0;
         uint32_t left = len;
@@ -450,20 +503,38 @@ static int socket_sendto_locked(net_socket_t *s, const void *buf, uint32_t len,
     return e == ERR_OK ? (int)len : -101;
 }
 
+/* Copy up to `len` bytes from the front of the RX ring without consuming
+ * them (MSG_PEEK). */
+static uint32_t tcp_rx_peek(net_socket_t *s, uint8_t *buf, uint32_t len) {
+    uint32_t n = len < s->tcp_rx_count ? len : s->tcp_rx_count;
+    uint32_t at = s->tcp_rx_head;
+    for (uint32_t i = 0; i < n; i++) {
+        buf[i] = s->tcp_rx[at];
+        at = (at + 1) % TCP_RX_SIZE;
+    }
+    return n;
+}
+
 static int socket_recvfrom_locked(net_socket_t *s, void *buf, uint32_t len,
-                                  net_sockaddr_in_t *addr) {
+                                  net_sockaddr_in_t *addr, int peek) {
     if (!s || !s->used || !buf)
         return -9;
 
     net_poll_all();
     if (s->type == SOCK_STREAM_K) {
         if (s->tcp_rx_count == 0) {
-            if (s->tcp_state == TCP_STATE_CLOSED)
+            /* Linux tcp_recvmsg: the peer's FIN is EOF even if a reset came
+             * after it; else a pending error is reported once, then EOF. */
+            if (s->peer_fin || s->rx_shut || s->tcp_state == TCP_STATE_CLOSED)
                 return 0;
             if (s->tcp_state == TCP_STATE_ERROR)
-                return s->tcp_error ? s->tcp_error : -104;
+                return take_error_locked(s);
+            if (!s->was_connected && s->tcp_state != TCP_STATE_CONNECTING)
+                return -107;                               /* -ENOTCONN */
             return -11;
         }
+        if (peek)
+            return (int)tcp_rx_peek(s, (uint8_t *)buf, len);
         int got = (int)tcp_rx_pop(s, (uint8_t *)buf, len);
         /* Advance the TCP receive window by what the app just consumed: this
          * is the flow-control signal that lets the peer keep sending.  Also
@@ -477,6 +548,17 @@ static int socket_recvfrom_locked(net_socket_t *s, void *buf, uint32_t len,
         return -11;
 
     udp_packet_t *pkt = &s->queue[s->qhead];
+    if (peek) {                     /* MSG_PEEK: leave the datagram queued */
+        uint32_t n = pkt->len < len ? pkt->len : len;
+        memcpy(buf, pkt->data, n);
+        if (addr) {
+            memset(addr, 0, sizeof(*addr));
+            addr->family = AF_INET_K;
+            addr->port = bswap16(pkt->port);
+            addr->addr = pkt->addr;
+        }
+        return (int)n;
+    }
     uint32_t n = pkt->len;
     if (n > len)
         n = len;
@@ -502,7 +584,7 @@ int net_socket_read_ready(net_socket_t *s) {
     int r;
     if (s->type == SOCK_STREAM_K)
         r = s->tcp_rx_count > 0 || s->tcp_state == TCP_STATE_CLOSED ||
-            s->tcp_state == TCP_STATE_ERROR;
+            s->tcp_state == TCP_STATE_ERROR || s->peer_fin || s->rx_shut;
     else
         r = s->qcount > 0;
     preempt_enable();
@@ -515,7 +597,12 @@ int net_socket_write_ready(net_socket_t *s) {
     preempt_disable();
     int r = 1;
     if (s->type == SOCK_STREAM_K)
-        r = s->connected && s->tcp && tcp_sndbuf(s->tcp) > 0;
+        /* Also "writable" once a send can no longer block: the connection
+         * failed or is gone (the send then reports why), as Linux tcp_poll
+         * reports a finished non-blocking connect either way. */
+        r = (s->was_connected && s->tcp && tcp_sndbuf(s->tcp) > 0) ||
+            s->tcp_state == TCP_STATE_ERROR || s->tx_shut ||
+            (s->was_connected && !s->tcp);
     preempt_enable();
     return r;
 }
@@ -587,8 +674,15 @@ int net_socket_bind(net_socket_t *s, const net_sockaddr_in_t *addr) {
     return r;
 }
 
+int net_socket_take_error(net_socket_t *s) {
+    preempt_disable();
+    int e = (s && s->used) ? take_error_locked(s) : 0;
+    preempt_enable();
+    return e;
+}
+
 int net_socket_sendto(net_socket_t *s, const void *buf, uint32_t len,
-                      const net_sockaddr_in_t *addr) {
+                      const net_sockaddr_in_t *addr, int flags) {
     /* TCP send BLOCKS while the send buffer is full, like recv and like a
      * blocking Linux socket: it returns once all of buf is queued, or with
      * the partial count when a signal or a connection error cuts it short.
@@ -618,6 +712,8 @@ int net_socket_sendto(net_socket_t *s, const void *buf, uint32_t len,
         }
         if (r != -11)
             break;           /* error: reported unless something went out */
+        if (flags & NET_MSG_DONTWAIT)
+            break;           /* O_NONBLOCK/MSG_DONTWAIT: -EAGAIN or partial */
         if (current_proc && signal_interrupt_pending(current_proc)) {
             r = -4;          /* -EINTR */
             break;
@@ -631,7 +727,7 @@ int net_socket_sendto(net_socket_t *s, const void *buf, uint32_t len,
 }
 
 int net_socket_recvfrom(net_socket_t *s, void *buf, uint32_t len,
-                        net_sockaddr_in_t *addr) {
+                        net_sockaddr_in_t *addr, int flags) {
     /* TCP recv BLOCKS until data/EOF (Linux default semantics) — the
      * io_activity sleep wakes instantly on NIC interrupts.  UDP stays
      * non-blocking (-EAGAIN): existing probes and the DNS resolver use
@@ -645,13 +741,26 @@ int net_socket_recvfrom(net_socket_t *s, void *buf, uint32_t len,
     preempt_enable();
     if (!pinned) return -9;
 
+    /* O_NONBLOCK/MSG_DONTWAIT: -EAGAIN instead of waiting.  MSG_WAITALL: a
+     * stream read waits until all of `len` has arrived, or EOF, an error or
+     * a signal ends it early with the bytes so far (Linux tcp_recvmsg). */
+    int peek = (flags & NET_MSG_PEEK) != 0;
+    uint32_t done = 0;
     int idle_polls = 0;
     int r;
     for (;;) {
         preempt_disable();
-        r = socket_recvfrom_locked(s, buf, len, addr);
+        r = socket_recvfrom_locked(s, (uint8_t *)buf + done, len - done,
+                                   addr, peek);
         preempt_enable();
-        if (r != -11 || s->type != SOCK_STREAM_K) break;
+        if (s->type != SOCK_STREAM_K) break;
+        if (r > 0) {
+            done += (uint32_t)r;
+            if (!(flags & NET_MSG_WAITALL) || peek || done >= len) break;
+            continue;
+        }
+        if (r != -11) break;
+        if (flags & NET_MSG_DONTWAIT) break;
         if (current_proc && signal_interrupt_pending(current_proc)) {
             r = -4;      /* -EINTR */
             break;
@@ -672,7 +781,7 @@ int net_socket_recvfrom(net_socket_t *s, void *buf, uint32_t len,
         net_io_sleep(2);
     }
     net_socket_release(s);
-    return r;
+    return done ? (int)done : r;
 }
 
 int net_socket_shutdown(net_socket_t *s, int how) {

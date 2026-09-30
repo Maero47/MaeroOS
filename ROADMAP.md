@@ -18,10 +18,10 @@ the test that proves it, is in the status table of [README.md](README.md).
 - **Firefox first paint.** Firefox 115 ESR starts but stalls before rendering
   (`make smoke-firefox`, [README-BROWSER.md](README-BROWSER.md)); then remove
   the Firefox-specific workarounds listed in `docs/audit/firefox-first-paint.md`.
-- **Credentials.** Apply the `open()` mode in the kernel instead of only the
-  umask; supplementary groups (`initgroups` is a stub); a separate fsuid.
-- **Sockets.** Pass `O_NONBLOCK` and `send` flags (`MSG_NOSIGNAL`) to the
-  network layer and raise SIGPIPE on a closed TCP socket.
+- **Credentials.** A separate fsuid; search permission on the directories a
+  path lookup walks through.
+- **Sockets.** AF_INET `listen`/`accept`; a blocking UDP `recv` that waits
+  (it returns `EAGAIN` today); `sendmsg`/`recvmsg` on AF_INET sockets.
 - **Packages.** Sign the `pkg` index; today only each tarball's SHA-256 is
   checked against it.
 - **Console.** Offer a getty on the console while the desktop session runs.

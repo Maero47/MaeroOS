@@ -24,9 +24,17 @@ struct sockaddr {
 #define SOCK_STREAM 1
 #define SOCK_DGRAM  2
 #define SOCK_RAW    3
+#define SOCK_NONBLOCK 0x800     /* ORed into socket()'s type */
+#define SOCK_CLOEXEC  0x80000
 
 #define SOL_SOCKET 1
 #define SO_REUSEADDR 2
+#define SO_ERROR     4
+
+#define MSG_PEEK      0x0002
+#define MSG_DONTWAIT  0x0040
+#define MSG_WAITALL   0x0100
+#define MSG_NOSIGNAL  0x4000
 
 #define SHUT_RD   0
 #define SHUT_WR   1
@@ -46,3 +54,5 @@ int recvfrom(int fd, void *buf, size_t len, int flags,
 int shutdown(int fd, int how);
 int setsockopt(int fd, int level, int optname, const void *optval,
                socklen_t optlen);
+int getsockopt(int fd, int level, int optname, void *optval,
+               socklen_t *optlen);

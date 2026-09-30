@@ -240,23 +240,37 @@ static int vfs_write_user(vfs_node_t *n, uint32_t off, const char *ubuf, uint32_
     return done ? (int)done : err;
 }
 
+/* MSG_NOSIGNAL as seen by sock_send_user (net/socket.h has the other bits). */
+#define SOCK_MSG_NOSIGNAL 0x4000
+
 /* One net_socket_recvfrom() into user `ubuf` (a datagram must arrive whole,
- * and a stream read may block, so exactly one call). */
+ * and a stream read may block, so exactly one call) — except that
+ * MSG_WAITALL keeps reading bounce-buffer-sized pieces until `len` is filled
+ * or a read comes up short.  `flags` are NET_MSG_*. */
 static int sock_recv_user(net_socket_t *s, void *ubuf, uint32_t len,
-                          net_sockaddr_in_t *addr) {
+                          net_sockaddr_in_t *addr, int flags) {
     uint32_t bsz;
     uint8_t *kbuf = bounce_alloc(len, &bsz);
     if (!kbuf) return -12;
-    int r = net_socket_recvfrom(s, kbuf, len < bsz ? len : bsz, addr);
-    if (r > 0 && copy_to_user(ubuf, kbuf, (uint32_t)r) < 0) r = -14;
+    uint32_t done = 0;
+    int r;
+    do {
+        uint32_t want = len - done < bsz ? len - done : bsz;
+        r = net_socket_recvfrom(s, kbuf, want, addr, flags);
+        if (r > 0 && copy_to_user((uint8_t *)ubuf + done, kbuf, (uint32_t)r) < 0)
+            r = -14;
+        if (r <= 0) break;
+        done += (uint32_t)r;
+        if ((uint32_t)r < want) break;
+    } while ((flags & NET_MSG_WAITALL) && !(flags & NET_MSG_PEEK) && done < len);
     kfree(kbuf);
-    return r;
+    return done ? (int)done : r;
 }
 
 /* net_socket_sendto() of user `ubuf`, in chunks (any valid datagram fits in
  * the first), stopping at a short send. */
 static int sock_send_user(net_socket_t *s, const void *ubuf, uint32_t len,
-                          const net_sockaddr_in_t *addr) {
+                          const net_sockaddr_in_t *addr, int flags) {
     uint32_t bsz;
     uint8_t *kbuf = bounce_alloc(len, &bsz);
     if (!kbuf) return -12;
@@ -265,13 +279,16 @@ static int sock_send_user(net_socket_t *s, const void *ubuf, uint32_t len,
     do {
         uint32_t want = len - done < bsz ? len - done : bsz;
         if (copy_from_user(kbuf, (const uint8_t *)ubuf + done, want) < 0) { err = -14; break; }
-        int r = net_socket_sendto(s, kbuf, want, addr);
+        int r = net_socket_sendto(s, kbuf, want, addr, flags);
         if (r < 0) { err = r; break; }
         if ((uint32_t)r > want) r = (int)want;
         done += (uint32_t)r;
         if ((uint32_t)r < want) break;
     } while (done < len);
     kfree(kbuf);
+    /* Linux sk_stream_error: EPIPE raises SIGPIPE unless MSG_NOSIGNAL. */
+    if (!done && err == -32 && !(flags & SOCK_MSG_NOSIGNAL))
+        signal_send(current_proc, SIGPIPE);
     return done ? (int)done : err;
 }
 
@@ -642,7 +659,7 @@ static int fd_kstat64(int fd, struct kstat64 *kst) {
     }
 }
 
-static int sys_mkdir_kernel_path(const char *path);
+static int sys_mkdir_kernel_path(const char *path, uint32_t mode);
 static int sys_unlink_kernel_path(const char *path);
 static void io_wait_sleep(uint32_t max_ticks);
 static void epoll_retain(struct epoll *ep);
@@ -734,6 +751,24 @@ static inline int fd_readable(const proc_file_t *f) {
 static inline int fd_writable(const proc_file_t *f) {
     uint32_t m = f->flags & O_ACCMODE;
     return m == O_WRONLY || m == O_RDWR;
+}
+
+/* Permission check of `node` for the caller's effective ids and supplementary
+ * groups (Linux inode_permission with current_fsuid()/in_group_p()). */
+static int proc_access_check(vfs_node_t *node, int want) {
+    struct proc *p = current_proc;
+    return vfs_access_check_groups(node, p->euid, p->egid, p->groups,
+                                   p->ngroups, want);
+}
+
+/* Linux in_group_p(): `g` is the caller's effective gid or one of its
+ * supplementary groups. */
+static int proc_in_group(uint32_t g) {
+    struct proc *p = current_proc;
+    if (g == p->egid) return 1;
+    for (uint32_t i = 0; i < p->ngroups; i++)
+        if (p->groups[i] == g) return 1;
+    return 0;
 }
 
 void fd_retain(proc_file_t *f) {
@@ -901,6 +936,8 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
     child->uid = parent->uid; child->gid = parent->gid;
     child->euid = parent->euid; child->egid = parent->egid;
     child->suid = parent->suid; child->sgid = parent->sgid;
+    child->ngroups = parent->ngroups;
+    __builtin_memcpy(child->groups, parent->groups, sizeof(child->groups));
     child->mmap_next = fowner->mmap_next;
     child->pgrp      = parent->pgrp;
     child->sid       = parent->sid;
@@ -1112,7 +1149,8 @@ static int sys_read(registers_t *regs) {
     }
 
     if (f->type == FD_SOCKET)
-        return sock_recv_user(f->socket, buf, (uint32_t)len, NULL);
+        return sock_recv_user(f->socket, buf, (uint32_t)len, NULL,
+                              (f->flags & O_NONBLOCK) ? NET_MSG_DONTWAIT : 0);
 
     if (f->type == FD_USOCKET)
         return usocket_read(f->usock, buf, len, (f->flags & O_NONBLOCK) != 0);
@@ -1146,6 +1184,9 @@ static int sys_write(registers_t *regs) {
     if (f->type == FD_FILE && f->node) {
         if (!fd_writable(f)) return -9;        /* opened read-only */
         if (!f->node->write_fn)   return -9;   /* node not writable */
+        /* O_APPEND: every write goes to the current end of file (Linux
+         * generic_write_checks), whether it was set at open or by F_SETFL. */
+        if (f->flags & O_APPEND) f->offset = f->node->size;
         int written = vfs_write_user(f->node, f->offset, buf, (uint32_t)len);
         if (written > 0) f->offset += (uint32_t)written;
         return written;
@@ -1162,8 +1203,9 @@ static int sys_write(registers_t *regs) {
         return len;
     }
 
-    if (f->type == FD_SOCKET)
-        return sock_send_user(f->socket, buf, (uint32_t)len, NULL);
+    if (f->type == FD_SOCKET)   /* write() on a socket: SIGPIPE on EPIPE */
+        return sock_send_user(f->socket, buf, (uint32_t)len, NULL,
+                              (f->flags & O_NONBLOCK) ? NET_MSG_DONTWAIT : 0);
 
     if (f->type == FD_USOCKET)
         return usocket_write(f->usock, buf, len, (f->flags & O_NONBLOCK) != 0);
@@ -1272,7 +1314,29 @@ void reap_orphan_zombies(void) {
     }
 }
 
-static int sys_open_kernel_path(const char *path, int flags) {
+/* Owner, group and mode of a node the caller has just created in `dir`
+ * (Linux inode_init_owner + mode_strip_sgid).  `mode` is the requested mode
+ * with the umask already applied.  The owner is the EFFECTIVE uid (Linux
+ * fsuid): a set-uid-root program creates root-owned files.  The group is the
+ * effective gid, unless the directory is set-group-ID: then it is the
+ * directory's group, a new subdirectory inherits the set-group-ID bit, and a
+ * set-group-ID executable the caller could not have made by chmod (not a
+ * member of that group, not root) loses the bit. */
+static void init_new_node(vfs_node_t *dir, vfs_node_t *node, uint32_t mode) {
+    struct proc *p = current_proc;
+    uint32_t gid = p->egid;
+    mode &= 07777;
+    if (dir && (dir->mask & 02000)) {
+        gid = dir->gid;
+        if (node->flags == VFS_FLAG_DIR)
+            mode |= 02000;
+        else if ((mode & 02010) == 02010 && p->euid != 0 && !proc_in_group(gid))
+            mode &= ~02000u;
+    }
+    vfs_setattr(node, mode, p->euid, gid);
+}
+
+static int sys_open_kernel_path(const char *path, int flags, uint32_t mode) {
     /* O_CREAT|O_EXCL: the name must not exist in any form — not even as a
      * dangling symlink, which is why the final component is not followed
      * (Linux open(2); mkstemp and lock files rely on this). */
@@ -1299,8 +1363,7 @@ static int sys_open_kernel_path(const char *path, int flags) {
             return -2;
 
         /* Need write+search on the parent directory to create here. */
-        if (vfs_access_check(dir, current_proc->euid, current_proc->egid,
-                             VFS_WANT_W | VFS_WANT_X) < 0)
+        if (proc_access_check(dir, VFS_WANT_W | VFS_WANT_X) < 0)
             return -13;
 
         int cr = dir->create_fn(dir, base, VFS_FLAG_FILE);
@@ -1309,20 +1372,22 @@ static int sys_open_kernel_path(const char *path, int flags) {
 
         node = vfs_open_at(path);
         if (!node) return -2;
-        /* Stamp the creator as owner with 0666 & ~umask.  The owner is the
-         * EFFECTIVE id (Linux fsuid/fsgid): a set-uid-root program creates
-         * root-owned files, not files owned by whoever ran it. */
-        vfs_setattr(node, (0666 & ~current_proc->umask) & 07777,
-                    current_proc->euid, current_proc->egid);
+        /* The mode asked for, less the umask (Linux open(2)).  A file created
+         * by this open is opened with the access mode requested even when
+         * its new mode would not allow that (open(O_CREAT|O_RDWR, 0444)). */
+        init_new_node(dir, node, mode & ~current_proc->umask);
     } else {
+        /* Linux do_open: a directory can only be opened for reading. */
+        if (node->flags == VFS_FLAG_DIR &&
+            ((flags & O_CREAT) || (flags & O_ACCMODE) != O_RDONLY))
+            return -21;   /* -EISDIR */
         /* Existing node: check requested access mode. */
         int rw = flags & 3;
         int want = (rw == O_WRONLY) ? VFS_WANT_W
                  : (rw == O_RDWR)   ? (VFS_WANT_R | VFS_WANT_W)
                  : VFS_WANT_R;
         if (flags & O_TRUNC) want |= VFS_WANT_W;
-        if (vfs_access_check(node, current_proc->euid, current_proc->egid,
-                             want) < 0)
+        if (proc_access_check(node, want) < 0)
             return -13;   /* -EACCES */
     }
 
@@ -1388,7 +1453,9 @@ static int sys_open_kernel_path(const char *path, int flags) {
             current_proc->ofile[i].type    = FD_FILE;
             current_proc->ofile[i].node    = node;
             current_proc->ofile[i].offset  = (flags & O_APPEND) ? node->size : 0;
-            current_proc->ofile[i].flags   = flags & 3;  /* O_RDONLY/O_WRONLY/O_RDWR */
+            /* Access mode plus the status flags F_GETFL reports and write()
+             * honours (O_APPEND re-seeks to EOF before every write). */
+            current_proc->ofile[i].flags   = flags & (O_ACCMODE | O_APPEND | O_NONBLOCK);
             current_proc->ofile[i].cloexec = (flags & O_CLOEXEC) ? 1 : 0;
             __builtin_memcpy(current_proc->ofile[i].path, path,
                              __builtin_strlen(path) + 1);
@@ -1403,6 +1470,7 @@ static int sys_open_kernel_path(const char *path, int flags) {
 static int sys_open(registers_t *regs) {
     const char *upath = (const char *)(uintptr_t)regs->ebx;
     int         flags = (int)regs->ecx;
+    uint32_t    mode  = regs->edx;
 
     if (!access_ok(upath, 1))
         return -14;  /* -EFAULT */
@@ -1414,8 +1482,19 @@ static int sys_open(registers_t *regs) {
     char resolved[256];
     r = resolve_path_at_fd(AT_FDCWD, path, resolved, sizeof(resolved));
     if (r < 0) return r;
-    int rc = sys_open_kernel_path(resolved, flags);
+    int rc = sys_open_kernel_path(resolved, flags, mode);
     return rc;
+}
+
+/* ── sys_creat(const char *path, mode_t mode) — EAX=8 ───────────────────────
+ * open(path, O_CREAT|O_WRONLY|O_TRUNC, mode) (Linux fs/open.c). */
+static int sys_creat(registers_t *regs) {
+    char path[256], resolved[256];
+    int r = copy_user_str((const char *)(uintptr_t)regs->ebx, path, sizeof(path));
+    if (r < 0) return r;
+    r = resolve_path_at_fd(AT_FDCWD, path, resolved, sizeof(resolved));
+    if (r < 0) return r;
+    return sys_open_kernel_path(resolved, O_CREAT | O_WRONLY | O_TRUNC, regs->ecx);
 }
 
 /* ── sys_close(int fd) — EAX=6 ───────────────────────────────────────────── */
@@ -1772,8 +1851,7 @@ static int sys_exec(registers_t *regs) {
                    path, current_proc->pid);
             EXEC_FAIL(-13);   /* -EACCES */
         }
-        if (vfs_access_check(node, current_proc->euid, current_proc->egid,
-                             VFS_WANT_X) < 0) {
+        if (proc_access_check(node, VFS_WANT_X) < 0) {
             ktrace("[execfail] '%s' pid=%d EACCES (uid=%d gid=%d mode=%o)\n",
                    path, current_proc->pid, (int)current_proc->euid,
                    (int)current_proc->egid, (unsigned)node->mask);
@@ -2636,6 +2714,64 @@ static int sys_setresgid16(registers_t *regs) {
     return do_setresgid(id16(regs->ebx), id16(regs->ecx), id16(regs->edx));
 }
 
+/* getgroups(size, list) / setgroups(size, list) (Linux kernel/groups.c).
+ * getgroups with size 0 only counts; a smaller non-zero size is -EINVAL.
+ * setgroups needs CAP_SETGID — here euid 0 — and is -EPERM otherwise, before
+ * the size is looked at.  The 16-bit legacy calls (80/81) move 16-bit gids:
+ * 0xFFFF widens to -1, and a gid above 0xFFFF reads back as the overflow gid
+ * 65534. */
+static int do_getgroups(int size, void *ulist, int wide) {
+    struct proc *p = current_proc;
+    if (size < 0) return -22;                               /* -EINVAL */
+    if (size == 0) return (int)p->ngroups;
+    if ((uint32_t)size < p->ngroups) return -22;
+    for (uint32_t i = 0; i < p->ngroups; i++) {
+        int cr;
+        if (wide) {
+            cr = copy_to_user((uint32_t *)ulist + i, &p->groups[i], 4);
+        } else {
+            uint16_t g = p->groups[i] > 0xFFFFU ? 65534 : (uint16_t)p->groups[i];
+            cr = copy_to_user((uint16_t *)ulist + i, &g, 2);
+        }
+        if (cr < 0) return cr;
+    }
+    return (int)p->ngroups;
+}
+
+static int do_setgroups(int size, const void *ulist, int wide) {
+    struct proc *p = current_proc;
+    uint32_t list[PROC_NGROUPS_MAX];
+    if (p->euid != 0) return -1;                            /* -EPERM */
+    if (size < 0 || size > PROC_NGROUPS_MAX) return -22;    /* -EINVAL */
+    for (int i = 0; i < size; i++) {
+        int cr;
+        if (wide) {
+            cr = copy_from_user(&list[i], (const uint32_t *)ulist + i, 4);
+        } else {
+            uint16_t g;
+            cr = copy_from_user(&g, (const uint16_t *)ulist + i, 2);
+            list[i] = id16(g);
+        }
+        if (cr < 0) return cr;
+    }
+    __builtin_memcpy(p->groups, list, (uint32_t)size * sizeof(uint32_t));
+    p->ngroups = (uint32_t)size;
+    return 0;
+}
+
+static int sys_getgroups(registers_t *regs) {
+    return do_getgroups((int)regs->ebx, (void *)(uintptr_t)regs->ecx, 1);
+}
+static int sys_setgroups(registers_t *regs) {
+    return do_setgroups((int)regs->ebx, (const void *)(uintptr_t)regs->ecx, 1);
+}
+static int sys_getgroups16(registers_t *regs) {
+    return do_getgroups((int)regs->ebx, (void *)(uintptr_t)regs->ecx, 0);
+}
+static int sys_setgroups16(registers_t *regs) {
+    return do_setgroups((int)regs->ebx, (const void *)(uintptr_t)regs->ecx, 0);
+}
+
 /* setfsuid/setfsgid: there is no separate filesystem id here (fsuid always
  * follows euid, as it does on Linux unless these are called), so report the
  * current one and change nothing — what Linux returns for a refused change. */
@@ -2651,7 +2787,7 @@ static int sys_mkdir(registers_t *regs) {
     char resolved[256];
     int r = resolve_path_at_fd(AT_FDCWD, path, resolved, sizeof(resolved));
     if (r < 0) return r;
-    return sys_mkdir_kernel_path(resolved);
+    return sys_mkdir_kernel_path(resolved, regs->ecx);
 }
 
 /* ── sys_times — EAX=43 ──────────────────────────────────────────────────── */
@@ -2784,14 +2920,13 @@ static int sys_ioctl(registers_t *regs) {
         return fg;
     }
     if (req == 0x5410) {  /* TIOCSPGRP: set foreground pgrp */
-        const int *inp = (const int *)(uintptr_t)regs->edx;
-        if (inp) {
-            int fg = 0;
-            int cr = copy_from_user(&fg, inp, sizeof(fg));
-            if (cr < 0) return cr;
-            tty_fg_pgrp = fg;
-        }
-        return 0;
+        /* Only the implicit serial console behind an unopened stdio fd is a
+         * terminal here; a pipe, socket or plain file is not (-ENOTTY). */
+        if (f->type != FD_NONE || fd > 2) return -25;
+        int fg = 0;
+        int cr = copy_from_user(&fg, (const void *)(uintptr_t)regs->edx, sizeof(fg));
+        if (cr < 0) return cr;
+        return tty_console_setpgrp(fg);
     }
     return -25;  /* ENOTTY */
 }
@@ -2828,7 +2963,7 @@ static int sys_fcntl(registers_t *regs) {
         if (f->type == FD_NONE) return -9;
         return f->flags;
     case 4:  /* F_SETFL */
-        f->flags = (f->flags & 3) | (arg & (O_APPEND | 0x800));
+        f->flags = (f->flags & O_ACCMODE) | (arg & (O_APPEND | O_NONBLOCK));
         return 0;
     case 5:   /* F_GETLK   */
     case 12:  /* F_GETLK64 — advisory locks are not enforced.  CRITICAL: the caller
@@ -4995,16 +5130,54 @@ static int sys_rt_sigprocmask(registers_t *regs) {
     return 0;
 }
 
+/* access(2) family (Linux do_faccessat).  The check is made with the REAL
+ * uid and gid — a set-uid program asks "may the user who ran me do this?" —
+ * unless AT_EACCESS asks for the effective ids.  Supplementary groups count
+ * either way.  F_OK (mode 0) only tests that the path resolves; for root, X_OK
+ * on a non-directory still needs an execute bit somewhere. */
+#define AT_SYMLINK_NOFOLLOW_K 0x100
+#define AT_EACCESS_K          0x200
+#define AT_EMPTY_PATH_K       0x1000
+static int do_faccessat(int dirfd, const char *upath, int mode, int flags) {
+    if (mode & ~7) return -22;                              /* -EINVAL */
+    if (flags & ~(AT_SYMLINK_NOFOLLOW_K | AT_EACCESS_K | AT_EMPTY_PATH_K))
+        return -22;
+    char path[256], resolved[256];
+    int r = copy_user_str(upath, path, sizeof(path));
+    if (r < 0) return r;
+    vfs_node_t *n;
+    if (path[0] == '\0') {
+        if (!(flags & AT_EMPTY_PATH_K)) return -2;          /* -ENOENT */
+        if (dirfd == AT_FDCWD) {
+            n = vfs_open(current_proc->cwd);
+        } else {
+            if (dirfd < 0 || dirfd >= MAX_FD) return -9;    /* -EBADF */
+            proc_file_t *f = &current_proc->ofile[dirfd];
+            if (f->type == FD_NONE) return -9;
+            if (f->type != FD_FILE || !f->node)
+                return mode ? -13 : 0;       /* pipe/socket: anon inode 0600 */
+            n = f->node;
+        }
+        if (!n) return -2;
+    } else {
+        r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
+        if (r < 0) return r;
+        int lerr;
+        n = vfs_lookup(resolved, !(flags & AT_SYMLINK_NOFOLLOW_K), &lerr);
+        if (!n) return lerr;          /* -ENOENT / -ELOOP / -ENAMETOOLONG */
+    }
+    if (mode == 0) return 0;                                /* F_OK */
+    struct proc *p = current_proc;
+    int eff = (flags & AT_EACCESS_K) != 0;
+    return vfs_access_check_groups(n, eff ? p->euid : p->uid,
+                                   eff ? p->egid : p->gid,
+                                   p->groups, p->ngroups, mode);
+}
+
 /* ── sys_access(path, mode) — EAX=33 ────────────────────────────────────── */
 static int sys_access(registers_t *regs) {
-    char path[256];
-    int mode = (int)regs->ecx;
-    if (mode & ~7) return -22;
-    if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0)
-        return -14;
-    int lerr;
-    vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
-    return n ? 0 : lerr;  /* 0=exists, else -ENOENT/-ELOOP/-ENAMETOOLONG */
+    return do_faccessat(AT_FDCWD, (const char *)(uintptr_t)regs->ebx,
+                        (int)regs->ecx, 0);
 }
 
 /* ── sys_dup(int oldfd) — EAX=41 ────────────────────────────────────────── */
@@ -5079,18 +5252,19 @@ static int do_mknod(const char *path, uint32_t mode) {
     else if (fmt == 0x8000)  vfs_flag = VFS_FLAG_FILE;    /* S_IFREG  = 0100000 */
     else if (fmt == 0)       vfs_flag = VFS_FLAG_FILE;    /* mode 0 = regular file */
     else return -22;  /* -EINVAL: unsupported type */
+    /* A device node needs CAP_MKNOD (Linux vfs_mknod). */
+    if (vfs_flag == VFS_FLAG_CHARDEV && current_proc->euid != 0)
+        return -1;    /* -EPERM */
 
     /* Like every other create: write+search on the parent directory, and the
      * new node belongs to the caller's effective ids with mode & ~umask. */
-    if (vfs_access_check(dir, current_proc->euid, current_proc->egid,
-                         VFS_WANT_W | VFS_WANT_X) < 0)
+    if (proc_access_check(dir, VFS_WANT_W | VFS_WANT_X) < 0)
         return -13;
     int r = dir->create_fn(dir, base, vfs_flag);
     if (r < 0) return r;
     vfs_node_t *node = vfs_open_nofollow(path);
     if (node)
-        vfs_setattr(node, (mode & ~current_proc->umask) & 07777,
-                    current_proc->euid, current_proc->egid);
+        init_new_node(dir, node, mode & ~current_proc->umask);
     return r;
 }
 
@@ -5207,8 +5381,7 @@ static int sys_symlink(registers_t *regs) {
     if (path_split(abspath, dir_path, base) < 0 || base[0] == '\0') return -22;
     vfs_node_t *dir = vfs_open_parent_at(abspath, dir_path);
     if (!dir) return -2;
-    if (vfs_access_check(dir, current_proc->euid, current_proc->egid,
-                         VFS_WANT_W | VFS_WANT_X) < 0)
+    if (proc_access_check(dir, VFS_WANT_W | VFS_WANT_X) < 0)
         return -13;
     rc = vfs_symlink(target, abspath);
     if (rc == 0) {
@@ -5258,8 +5431,7 @@ static int sys_truncate(registers_t *regs) {
      * the file itself. */
     if (n->flags == VFS_FLAG_DIR) return -21;              /* -EISDIR */
     if (n->flags != VFS_FLAG_FILE) return -22;             /* -EINVAL */
-    if (vfs_access_check(n, current_proc->euid, current_proc->egid,
-                         VFS_WANT_W) < 0)
+    if (proc_access_check(n, VFS_WANT_W) < 0)
         return -13;                                        /* -EACCES */
     return vfs_truncate(n, len);
 }
@@ -5912,11 +6084,11 @@ static int sys_openat(registers_t *regs) {
     if (r < 0) return r;
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
-    int rc = sys_open_kernel_path(resolved, flags);
+    int rc = sys_open_kernel_path(resolved, flags, regs->esi);
     return rc;
 }
 
-static int sys_mkdir_kernel_path(const char *path) {
+static int sys_mkdir_kernel_path(const char *path, uint32_t mode) {
     char dir_path[256], base[256];
     if (path_split(path, dir_path, base) < 0)
         return -2;
@@ -5925,18 +6097,15 @@ static int sys_mkdir_kernel_path(const char *path) {
     vfs_node_t *dir = vfs_open_parent_at(path, dir_path);
     if (!dir || !dir->create_fn) return -2;
     /* Need write+search on the parent to create a directory in it. */
-    if (vfs_access_check(dir, current_proc->euid, current_proc->egid,
-                         VFS_WANT_W | VFS_WANT_X) < 0)
+    if (proc_access_check(dir, VFS_WANT_W | VFS_WANT_X) < 0)
         return -13;
     int r = dir->create_fn(dir, base, VFS_FLAG_DIR);
     if (r < 0) return r;
-    /* Stamp the creator as owner with 0777 & ~umask so the user who made
-     * the directory can actually write into it (ext2 create hardcodes
-     * root-owned 0755 otherwise). */
+    /* mode & ~umask, permission and sticky bits only (Linux vfs_mkdir:
+     * S_IRWXUGO|S_ISVTX); set-group-ID comes from the parent, if at all. */
     vfs_node_t *node = vfs_open_at(path);
     if (node)
-        vfs_setattr(node, (0777 & ~current_proc->umask) & 07777,
-                    current_proc->euid, current_proc->egid);
+        init_new_node(dir, node, mode & ~current_proc->umask & 01777);
     return r;
 }
 
@@ -5946,7 +6115,7 @@ static int sys_mkdir_kernel_path(const char *path) {
  * entry or the directory, or be root (-EPERM). */
 static int may_delete(vfs_node_t *dir, vfs_node_t *victim) {
     struct proc *p = current_proc;
-    if (vfs_access_check(dir, p->euid, p->egid, VFS_WANT_W | VFS_WANT_X) < 0)
+    if (proc_access_check(dir, VFS_WANT_W | VFS_WANT_X) < 0)
         return -13;                                      /* -EACCES */
     if ((dir->mask & 01000) && p->euid != 0 &&
         p->euid != victim->uid && p->euid != dir->uid)
@@ -5968,6 +6137,9 @@ static int remove_kernel_path(const char *path, int want_dir) {
     vfs_node_t *victim = vfs_finddir(dir, base);
     if (!victim) return -2;                              /* -ENOENT */
     if (want_dir && victim->flags != VFS_FLAG_DIR) return -20;   /* -ENOTDIR */
+    /* unlink() never removes a directory; Linux reports -EISDIR (POSIX
+     * allows -EPERM), and rmdir() is the call for that. */
+    if (!want_dir && victim->flags == VFS_FLAG_DIR) return -21;  /* -EISDIR */
     int r = may_delete(dir, victim);
     if (r < 0) return r;
     if (want_dir) {
@@ -6010,7 +6182,7 @@ static int sys_mkdirat(registers_t *regs) {
     if (r < 0) return r;
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
-    return sys_mkdir_kernel_path(resolved);
+    return sys_mkdir_kernel_path(resolved, regs->edx);
 }
 
 static int sys_unlinkat(registers_t *regs) {
@@ -6052,18 +6224,17 @@ static int sys_fstatat64(registers_t *regs) {
     return copy_to_user(st, &kst, sizeof(kst));
 }
 
+/* faccessat(dirfd, path, mode) — EAX=307 (no flags argument, like Linux) */
 static int sys_faccessat(registers_t *regs) {
-    int dirfd = (int)regs->ebx;
-    const char *upath = (const char *)(uintptr_t)regs->ecx;
-    int mode = (int)regs->edx;
-    if (mode & ~7) return -22;
-    char path[256], resolved[256];
-    int r = copy_user_str(upath, path, sizeof(path));
-    if (r < 0) return r;
-    r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
-    if (r < 0) return r;
-    int lerr;
-    return vfs_lookup(resolved, 1, &lerr) ? 0 : lerr;
+    return do_faccessat((int)regs->ebx, (const char *)(uintptr_t)regs->ecx,
+                        (int)regs->edx, 0);
+}
+
+/* faccessat2(dirfd, path, mode, flags) — EAX=439: AT_EACCESS,
+ * AT_SYMLINK_NOFOLLOW and AT_EMPTY_PATH (musl and glibc use it for flags). */
+static int sys_faccessat2(registers_t *regs) {
+    return do_faccessat((int)regs->ebx, (const char *)(uintptr_t)regs->ecx,
+                        (int)regs->edx, (int)regs->esi);
 }
 
 static int sys_readlinkat(registers_t *regs) {
@@ -6349,7 +6520,7 @@ static int sys_fstatfs64(registers_t *regs) {
  * anonymous file in the /tmp tmpfs: a real fd that supports ftruncate + mmap.
  * (Cross-process sharing via SCM_RIGHTS fd-passing is a separate step; this
  * makes the single-process path work so the parent stops aborting on shm.) */
-static int sys_open_kernel_path(const char *path, int flags);
+static int sys_open_kernel_path(const char *path, int flags, uint32_t mode);
 static int sys_memfd_create(registers_t *regs) {
     static uint32_t memfd_seq = 0;
     char name[64];
@@ -6367,7 +6538,7 @@ static int sys_memfd_create(registers_t *regs) {
     while (seq) { num[n++] = '0' + (seq % 10); seq /= 10; }
     while (n) path[p++] = num[--n];
     path[p] = '\0';
-    int fd = sys_open_kernel_path(path, O_RDWR | O_CREAT | O_TRUNC);
+    int fd = sys_open_kernel_path(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) return fd;
     /* MFD_CLOEXEC = 0x0001 (Linux mm/memfd.c hands O_CLOEXEC to get_unused_fd). */
     current_proc->ofile[fd].cloexec = (regs->ecx & 0x1) ? 1 : 0;
@@ -6527,7 +6698,7 @@ static int sys_readv(registers_t *regs) {
         fake.ecx = (uint32_t)(uintptr_t)base;
         fake.edx = (uint32_t)len;
         int n = sys_read(&fake);
-        if (n < 0) return n;
+        if (n < 0) return total ? total : n;
         total += n;
         if (n < len) break;  /* short read — don't continue */
     }
@@ -6846,19 +7017,18 @@ static int sys_rename_kernel_path(const char *oldpath, const char *newpath) {
         newpath[olen] == '/')
         return -22;                                      /* -EINVAL */
 
-    struct proc *p = current_proc;
     int r = may_delete(src_dir, src);
     if (r < 0) return r;
     vfs_node_t *dst = vfs_finddir(dst_dir, new_base);
     if (dst) {
         r = may_delete(dst_dir, dst);
         if (r < 0) return r;
-    } else if (vfs_access_check(dst_dir, p->euid, p->egid,
+    } else if (proc_access_check(dst_dir,
                                 VFS_WANT_W | VFS_WANT_X) < 0) {
         return -13;                                      /* -EACCES */
     }
     if (src_is_dir && __builtin_strcmp(old_dir, new_dir) != 0 &&
-        vfs_access_check(src, p->euid, p->egid, VFS_WANT_W) < 0)
+        proc_access_check(src, VFS_WANT_W) < 0)
         return -13;
 
     return vfs_rename(src_dir, old_base, dst_dir, new_base);
@@ -6880,16 +7050,22 @@ static int sys_rename(registers_t *regs) {
 }
 
 /* ── chmod / fchmod / chown / fchown / lchown ───────────────────────────── */
-/* chmod: only the file owner or root may change the mode. */
+/* chmod: only the file owner or root may change the mode.  An owner who is
+ * not in the file's group cannot set its set-group-ID bit: it is silently
+ * dropped (Linux setattr_prepare / setattr_should_drop_sgid). */
 static int do_chmod_node(vfs_node_t *n, uint32_t mode) {
     if (!n) return -2;
     if (current_proc->euid != 0 && current_proc->euid != n->uid)
         return -1;  /* -EPERM */
-    return vfs_setattr(n, mode & 07777, n->uid, n->gid);
+    mode &= 07777;
+    if ((mode & 02000) && current_proc->euid != 0 && !proc_in_group(n->gid))
+        mode &= ~02000u;
+    return vfs_setattr(n, mode, n->uid, n->gid);
 }
 
-/* chown: changing the owning uid is root-only; the owner may chgrp to a
- * group (we accept any here).  uid/gid of -1 (0xFFFFFFFF) means "unchanged". */
+/* chown: changing the owning uid is root-only; the owner may chgrp only to
+ * a group it belongs to (Linux chown_ok/chgrp_ok).  uid/gid of -1
+ * (0xFFFFFFFF) means "unchanged". */
 static int do_chown_node(vfs_node_t *n, uint32_t uid, uint32_t gid) {
     uint32_t new_uid = n->uid, new_gid = n->gid;
     if (!n) return -2;
@@ -6898,7 +7074,8 @@ static int do_chown_node(vfs_node_t *n, uint32_t uid, uint32_t gid) {
         new_uid = uid;
     }
     if (gid != 0xFFFFFFFFU && gid != n->gid) {
-        if (current_proc->euid != 0 && current_proc->euid != n->uid)
+        if (current_proc->euid != 0 &&
+            (current_proc->euid != n->uid || !proc_in_group(gid)))
             return -1;
         new_gid = gid;
     }
@@ -7005,8 +7182,9 @@ static int sys_writev(registers_t *regs) {
         fake.ecx = (uint32_t)(uintptr_t)base;
         fake.edx = (uint32_t)len;
         int n = sys_write(&fake);
-        if (n < 0) return n;
+        if (n < 0) return total ? total : n;
         total += n;
+        if (n < len) break;                   /* short write: stop here */
     }
     return total;
 }
@@ -7147,6 +7325,8 @@ static int sys_clone(registers_t *regs) {
     child->uid = parent->uid; child->gid = parent->gid;
     child->euid = parent->euid; child->egid = parent->egid;
     child->suid = parent->suid; child->sgid = parent->sgid;
+    child->ngroups = parent->ngroups;
+    __builtin_memcpy(child->groups, parent->groups, sizeof(child->groups));
     child->mmap_next = parent->mmap_next;
     child->pgrp      = parent->pgrp;
     child->sid       = parent->sid;
@@ -7682,7 +7862,18 @@ static int socketcall_core(int call, uint32_t *kargs) {
         if (copy_from_user(&kaddr, uaddr, sizeof(kaddr)) < 0)
             return -14;
         return (call == 2) ? net_socket_bind(f->socket, &kaddr)
-                           : net_socket_connect(f->socket, &kaddr);
+                           : net_socket_connect(f->socket, &kaddr,
+                                                (f->flags & O_NONBLOCK) != 0);
+    }
+
+    /* send/recv flags: the MSG_* bits net_socket_* understand, the
+     * descriptor's O_NONBLOCK folded in as MSG_DONTWAIT, and MSG_NOSIGNAL for
+     * sock_send_user's SIGPIPE decision. */
+    int mflags = 0;
+    if (call >= 9 && call <= 12) {
+        mflags = (int)(kargs[3] & (NET_MSG_PEEK | NET_MSG_DONTWAIT |
+                                   NET_MSG_WAITALL | SOCK_MSG_NOSIGNAL));
+        if (f->flags & O_NONBLOCK) mflags |= NET_MSG_DONTWAIT;
     }
 
     if (call == 9) { /* send(fd, buf, len, flags) */
@@ -7690,7 +7881,7 @@ static int socketcall_core(int call, uint32_t *kargs) {
         uint32_t len = kargs[2];
         if (!access_ok(buf, len))
             return -14;
-        return sock_send_user(f->socket, buf, len, NULL);
+        return sock_send_user(f->socket, buf, len, NULL, mflags);
     }
 
     if (call == 10) { /* recv(fd, buf, len, flags) */
@@ -7698,7 +7889,7 @@ static int socketcall_core(int call, uint32_t *kargs) {
         uint32_t len = kargs[2];
         if (!access_ok(buf, len))
             return -14;
-        return sock_recv_user(f->socket, buf, len, NULL);
+        return sock_recv_user(f->socket, buf, len, NULL, mflags);
     }
 
     if (call == 11) { /* sendto */
@@ -7709,14 +7900,14 @@ static int socketcall_core(int call, uint32_t *kargs) {
         if (!access_ok(buf, len))
             return -14;
         if (!uaddr)
-            return sock_send_user(f->socket, buf, len, NULL);
+            return sock_send_user(f->socket, buf, len, NULL, mflags);
         if (addrlen < sizeof(net_sockaddr_in_t) ||
             !access_ok(uaddr, sizeof(net_sockaddr_in_t)))
             return -14;
         net_sockaddr_in_t kaddr;
         if (copy_from_user(&kaddr, uaddr, sizeof(kaddr)) < 0)
             return -14;
-        return sock_send_user(f->socket, buf, len, &kaddr);
+        return sock_send_user(f->socket, buf, len, &kaddr, mflags);
     }
 
     if (call == 12) { /* recvfrom */
@@ -7734,7 +7925,8 @@ static int socketcall_core(int call, uint32_t *kargs) {
                 !access_ok(uaddr, sizeof(net_sockaddr_in_t)))
                 return -14;
         }
-        int ret = sock_recv_user(f->socket, buf, len, uaddr ? &kaddr : NULL);
+        int ret = sock_recv_user(f->socket, buf, len, uaddr ? &kaddr : NULL,
+                                 mflags);
         if (ret >= 0 && uaddr) {
             uint32_t klen = sizeof(net_sockaddr_in_t);
             int cr = copy_to_user(uaddr, &kaddr, sizeof(kaddr));
@@ -7761,8 +7953,12 @@ static int socketcall_core(int call, uint32_t *kargs) {
             if (copy_from_user(&len, optlen, sizeof(len)) < 0) return -14;
         }
         if (optval && len >= 4) {
-            uint32_t v = 0;         /* SO_ERROR=0: connection succeeded */
+            uint32_t v = 0;
             if (level == 1 && (optname == 7 || optname == 8)) v = 65536; /* SO_SNDBUF/RCVBUF */
+            /* SO_ERROR (4): the pending error as a positive errno, cleared by
+             * the read — how a non-blocking connect's outcome is learnt. */
+            if (level == 1 && optname == 4)
+                v = (uint32_t)-net_socket_take_error(f->socket);
             if (copy_to_user(optval, &v, 4) < 0) return -14;
             len = 4;
             if (optlen && copy_to_user(optlen, &len, sizeof(len)) < 0)
@@ -8054,6 +8250,14 @@ void syscall_dispatch(registers_t *regs) {
     case 305: ret = sys_readlinkat(regs);      break;
     case 306: ret = sys_fchmodat(regs);        break;
     case 307: ret = sys_faccessat(regs);       break;
+    case 439: ret = sys_faccessat2(regs);      break;
+    case 212: ret = sys_chown(regs);           break;  /* chown32 (musl chown) */
+    case 198: ret = sys_lchown(regs);          break;  /* lchown32 */
+    case 8:   ret = sys_creat(regs);           break;
+    case 80:  ret = sys_getgroups16(regs);     break;
+    case 81:  ret = sys_setgroups16(regs);     break;
+    case 205: ret = sys_getgroups(regs);       break;
+    case 206: ret = sys_setgroups(regs);       break;
     default:
         /* Don't spam the log for common no-op syscalls */
         if (num != 174 && num != 175 && num != 176 &&

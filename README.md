@@ -56,12 +56,11 @@ What is proven by the automated QEMU tests in `tools/`:
 - **inotify is deliberately absent.** Numbers 291, 292, 293 and 332 return `-ENOSYS`
   on purpose so GLib falls back to its polling backend (see the comment on those
   cases in `proc/syscall.c`).
-- **Unfinished credential and socket semantics.** The kernel applies only the umask
-  to a new file's mode (libc's `open()` narrows the umask and `fchmod`s to honour the
-  requested mode); there are no supplementary groups (`initgroups` is a stub in
-  `userspace/libc/toybox_compat.c`); `setfsuid`/`setfsgid` just report the effective id;
-  `O_NONBLOCK` and `send` flags such as `MSG_NOSIGNAL` are not passed to the network
-  layer, so SIGPIPE on a closed TCP socket is not implemented.
+- **Unfinished credential and socket semantics.** `setfsuid`/`setfsgid` just report
+  the effective id; a path lookup does not check search permission on the directories
+  it walks through; AF_INET sockets have no `listen`/`accept` (`-EOPNOTSUPP`), a
+  blocking UDP `recv` returns `EAGAIN` instead of waiting, and `sendmsg`/`recvmsg` work
+  on AF_UNIX sockets only.
 - **`pkg` trusts its index.** Each tarball is checked against the SHA-256 in
   `index.txt`, but the index itself is fetched over plain HTTP and is not signed.
 - **No console login during the desktop session.** While the graphical session runs,

@@ -606,7 +606,12 @@ void perror(const char *s) {
         fprintf(stderr, "error %d\n", errno);
 }
 
+/* C remove(): a file with unlink(), a directory with rmdir() (unlink says
+ * EISDIR for one, as on Linux). */
 int remove(const char *path) {
-    return unlink(path);
+    int r = unlink(path);
+    if (r < 0 && errno == EISDIR)
+        r = rmdir(path);
+    return r;
 }
 
