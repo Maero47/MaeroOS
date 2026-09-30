@@ -9,6 +9,7 @@
 #include "../include/string.h"
 #include "../include/sys/stat.h"
 #include "../include/unistd.h"
+#include "../include/syscall.h"
 
 static int failures;
 
@@ -155,7 +156,19 @@ static void test_passwd(void) {
     check(getpwnam("nosuchuser") == 0 && getpwuid(4242) == 0, "unknown users are not found");
 }
 
+/* i386 numbers: 158 sched_yield, 159/160 sched_get_priority_max/min.  159
+ * used to be sched_yield in both the kernel and this libc. */
+static void test_sched(void) {
+    check(sched_yield() == 0, "sched_yield returns 0");
+    check(syscall1(159, 1) == 99 && syscall1(160, 1) == 1,
+          "sched_get_priority_max/min(SCHED_FIFO) are 99/1");
+    check(syscall1(159, 0) == 0 && syscall1(160, 0) == 0,
+          "sched_get_priority_max/min(SCHED_OTHER) are 0");
+    check(syscall1(159, 42) == -EINVAL, "sched_get_priority_max(bad policy) is EINVAL");
+}
+
 int main(void) {
+    test_sched();
     test_snprintf();
     test_malloc();
     test_asprintf();

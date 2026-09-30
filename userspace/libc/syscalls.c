@@ -189,7 +189,7 @@ int usleep(unsigned int usec) {
 }
 
 int sched_yield(void) {
-    return syscall0(159);
+    return syscall0(158);   /* __NR_sched_yield (159 is get_priority_max) */
 }
 
 int setpgid(int pid, int pgid) {

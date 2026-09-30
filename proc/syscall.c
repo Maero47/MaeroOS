@@ -5740,11 +5740,18 @@ static int sys_wait4(registers_t *regs) {
     return sys_waitpid(regs);
 }
 
-/* ── sys_sched_yield() — EAX=159 ────────────────────────────────────────── */
-static int sys_sched_yield(registers_t *regs) {
-    (void)regs;
-    yield();
-    return 0;
+/* ── sched_get_priority_max/min(policy) — EAX=159/160 ─────────────────────
+ * The static priority range per policy (kernel/sched/syscalls.c): 1..99 for
+ * SCHED_FIFO(1)/SCHED_RR(2), 0 for SCHED_OTHER(0)/BATCH(3)/IDLE(5)/
+ * DEADLINE(6), EINVAL otherwise.  159 used to be wired to sched_yield (and
+ * the in-tree libc's sched_yield called 159), so a caller asking for a
+ * priority range yielded and got 0 for every policy. */
+static int sys_sched_get_priority(registers_t *regs, int max) {
+    switch ((int)regs->ebx) {
+    case 1: case 2:                 return max ? 99 : 1;
+    case 0: case 3: case 5: case 6: return 0;
+    default:                        return -22;
+    }
 }
 
 /* ── sys_getrlimit / sys_setrlimit — EAX=76/75 (stubs) ──────────────────── */
@@ -7960,7 +7967,8 @@ void syscall_dispatch(registers_t *regs) {
     case 132: ret = sys_getpgid(regs);         break;
     case 141: ret = sys_getdents(regs);        break;
     case 146: ret = sys_writev(regs);          break;
-    case 159: ret = sys_sched_yield(regs);     break;
+    case 159: ret = sys_sched_get_priority(regs, 1); break;
+    case 160: ret = sys_sched_get_priority(regs, 0); break;
     case 162: ret = sys_nanosleep(regs);       break;
     case 168: ret = sys_poll(regs);            break;
     case 309: ret = sys_ppoll(regs, 0);        break;  /* ppoll */
