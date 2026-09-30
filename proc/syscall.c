@@ -2919,6 +2919,10 @@ static int sys_ioctl(registers_t *regs) {
         }
         return fg;
     }
+    if (req == 0x540E) {  /* TIOCSCTTY on the implicit serial console */
+        if (f->type != FD_NONE || fd > 2) return -25;
+        return tty_console_setctty();
+    }
     if (req == 0x5410) {  /* TIOCSPGRP: set foreground pgrp */
         /* Only the implicit serial console behind an unopened stdio fd is a
          * terminal here; a pipe, socket or plain file is not (-ENOTTY). */

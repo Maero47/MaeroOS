@@ -28,6 +28,9 @@ extern int tty_fg_pgrp;
  * the group one of that session (-ESRCH/-EPERM).  0 or a negative errno. */
 int tty_console_setpgrp(int pgrp);
 int tty_console_setctty(void);
+/* Called when the leader of session `sid` exits: releases the console if it
+ * was that session's controlling terminal. */
+void devfs_console_session_exit(int sid);
 
 /* Hang up and detach the controlling terminal for a session. */
 void devfs_session_tty_hangup(int sid, vfs_node_t *tty);

@@ -453,6 +453,9 @@ void proc_exit(int status) {
 
     if (current_proc->sid == current_proc->pid && current_proc->ctty)
         devfs_session_tty_hangup(current_proc->sid, current_proc->ctty);
+    /* The serial console is never held in ->ctty (see devfs.c tty_sid). */
+    if (current_proc->sid == current_proc->pid)
+        devfs_console_session_exit(current_proc->sid);
 
     /* Drop this thread's reference to the shared fd table.  The fds are closed
      * only when the last thread of the group exits (refcount → 0) — a thread

@@ -456,7 +456,25 @@ static int net_main(int idle_port, int reset_port) {
     return 0;
 }
 
+/* abi2probe tty: run from a shell that replaced one which exited while a
+ * background job of its session lived on.  The console must have been freed
+ * by the old leader's exit, so the new shell owns it and made this probe's
+ * group the foreground one. */
+#define K_TIOCGPGRP 0x540F
+static int tty_main(void) {
+    int fg = -1, me = getpgrp();
+    syscall3(NR_IOCTL, 0, K_TIOCGPGRP, (int)&fg);
+    check("new login's job is the console's foreground group", fg == me, fg);
+    int r = syscall3(NR_IOCTL, 0, K_TIOCSPGRP, (int)&me);
+    check("TIOCSPGRP works for the new session", r == 0, r);
+    if (failures) { printf("abi2probe tty: %d FAILED\n", failures); return 1; }
+    printf("abi2probe tty ok\n");
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
+    if (argc >= 2 && strcmp(argv[1], "tty") == 0)
+        return tty_main();
     if (argc >= 4 && strcmp(argv[1], "net") == 0)
         return net_main(atoi(argv[2]), atoi(argv[3]));
     if (getuid() != 0) { printf("abi2probe: run as root\n"); return 1; }

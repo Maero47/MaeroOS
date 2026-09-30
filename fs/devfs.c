@@ -153,8 +153,9 @@ static vfs_node_t *proc_ctty_node(void) {
  * pty slave, and the console routing through itself would recurse), so the
  * association lives here.  The console is claimed by the first session that
  * asks for it with TIOCSCTTY or TIOCSPGRP while no live session holds it — the
- * shell does setsid() + TIOCSCTTY at start — and it is free again once every
- * process of that session is gone (Linux disassociate_ctty at session end). */
+ * shell does setsid() + TIOCSCTTY at start — and it is free again as soon as
+ * that session's leader exits (devfs_console_session_exit, Linux
+ * disassociate_ctty), whatever background members of the session remain. */
 static int tty_sid = 0;
 
 static int session_alive(int sid) {
@@ -165,14 +166,37 @@ static int session_alive(int sid) {
     return 0;
 }
 
+static int session_leader_alive(int sid) {
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (ptable[i].pid == sid && ptable[i].state != PROC_UNUSED &&
+            ptable[i].state != PROC_ZOMBIE)
+            return 1;
+    return 0;
+}
+
 /* Is the console the caller's controlling terminal?  With `claim`, a console
  * no live session holds becomes the caller's session's. */
 static int console_is_ctty(int claim) {
     if (!current_proc) return 0;
     if (tty_sid && tty_sid != current_proc->sid && !session_alive(tty_sid))
         tty_sid = 0;
-    if (!tty_sid && claim) tty_sid = current_proc->sid;
+    /* Only a session whose leader still runs can take the console: members
+     * left behind by an exited leader have no controlling terminal (Linux
+     * disassociate_ctty) and must not grab it back from the next login. */
+    if (!tty_sid && claim && session_leader_alive(current_proc->sid))
+        tty_sid = current_proc->sid;
     return tty_sid == current_proc->sid;
+}
+
+/* The leader of session `sid` is exiting (Linux disassociate_ctty): if the
+ * console is that session's terminal, it has no session and no foreground
+ * group any more, so the next session can claim it even while background
+ * members of the old one live on. */
+void devfs_console_session_exit(int sid) {
+    if (sid > 0 && tty_sid == sid) {
+        tty_sid = 0;
+        tty_fg_pgrp = 0;
+    }
 }
 
 /* A process group with id `pgrp` exists at all (Linux find_vpid). */

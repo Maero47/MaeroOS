@@ -99,6 +99,23 @@ def main():
                     f"command {command.strip()!r} did not produce {expected!r}"
                 )
 
+        # Log out of the console shell while a background job of its session
+        # lives on; init starts a new shell in a new session.  The old
+        # leader's exit must free the console so the new shell gets it (job
+        # control, the foreground group) instead of the orphaned job.
+        before = len("".join(log))
+        send(proc, "sleep 60 &\n")
+        wait_for(proc, sel, PROMPT, log, start=before)
+        before = len("".join(log))
+        send(proc, "exit\n")
+        wait_for(proc, sel, "exited; restarting", log, start=before)
+        wait_for(proc, sel, PROMPT, log, start=before)
+        before = len("".join(log))
+        send(proc, "abi2probe tty\n")
+        wait_for(proc, sel, PROMPT, log, start=before)
+        if "abi2probe tty ok" not in "".join(log)[before:]:
+            raise AssertionError("console was not freed when its session leader exited")
+
         print("\n[SMOKE-TOYBOX] passed")
         return 0
     finally:
