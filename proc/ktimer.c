@@ -182,13 +182,16 @@ static int kt_signo(const struct ktimer *t) {
     }
 }
 
-/* Is signal sig pending on thread tid of tgid (tid 0: any thread)? */
+/* Is signal sig pending on thread tid of tgid (tid 0: the process)?  A
+ * process-directed signal waits in the group's shared set (struct sigshared),
+ * a thread-directed one in that thread's own pending_sigs. */
 static int sig_pending_in(int tgid, int tid, int sig) {
     for (int i = 0; i < MAX_PROCS; i++) {
         struct proc *q = &ptable[i];
         if (q->state == PROC_UNUSED || q->state == PROC_ZOMBIE || q->tgid != tgid) continue;
         if (tid && q->pid != tid) continue;
-        if (q->pending_sigs & (1u << sig)) return 1;
+        uint32_t set = tid ? q->pending_sigs : signal_pending_set(q);
+        if (set & (1u << sig)) return 1;
     }
     return 0;
 }
