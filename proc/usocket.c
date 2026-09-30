@@ -107,10 +107,28 @@ static void uscm_unflight(uscm_t *m) {
             m->files[i].usock->inflight--;
 }
 
+/* Closing a batch releases the files it carries, and a socket among them can
+ * be torn down in turn, purging ITS receive queue: batches nest as deeply as
+ * a user cares to chain sockets through each other's queues.  Doing that by
+ * recursion ran a few hundred chained socketpairs off the kernel stack, so a
+ * batch to close goes on a work list instead, drained by the outermost call
+ * only; a release made while draining just adds to the list. */
+static uscm_t *reap_list;
+static int     reaping;
+
 static void uscm_destroy(uscm_t *m) {
     uscm_unflight(m);
-    for (int i = 0; i < m->nfds; i++) fd_release(&m->files[i]);
-    kfree(m);
+    m->next = reap_list;
+    reap_list = m;
+    if (reaping) return;
+    reaping = 1;
+    while (reap_list) {
+        uscm_t *d = reap_list;
+        reap_list = d->next;
+        for (int i = 0; i < d->nfds; i++) fd_release(&d->files[i]);
+        kfree(d);
+    }
+    reaping = 0;
 }
 
 /* Close every batch still queued on b.  The list is detached first: closing a
@@ -139,7 +157,9 @@ static void ucbuf_unref(ucbuf_t *b) {
  * at == total_in, which no reader can have passed, so queuing it early never
  * makes it deliverable early. */
 static int uscm_ready(ucbuf_t *b, uscm_t *m) {
-    return b->total_out > m->at;
+    /* The positions are free-running 32-bit counters: compare distances, so
+     * a ring that has carried 4 GiB still orders them right. */
+    return (int32_t)(b->total_out - m->at) > 0;
 }
 
 /* Pop and close every batch the reader has now passed without collecting: a
@@ -463,7 +483,7 @@ static int stream_read(usocket_t *s, void *buf, int len, int flags) {
      * handed over together with bytes of the message after it (Linux
      * unix_stream_read_generic breaks its loop on !unix_skb_scm_eq). */
     for (uscm_t *m = b->scm_head; m; m = m->next)
-        if (m->at > b->total_out) {
+        if ((int32_t)(m->at - b->total_out) > 0) {
             uint32_t until = m->at - b->total_out;
             if ((uint32_t)take > until) take = (int)until;
             break;
@@ -504,10 +524,10 @@ static int stream_write(usocket_t *s, const void *buf, int len, int flags) {
     while (n < len) {
         for (;;) {
             if (s->closed) return n ? n : -9;
-            if (b->reader_closed || b->writer_closed) {
-                int e = epipe(flags);
-                return n ? n : e;
-            }
+            /* SIGPIPE only for a write that sent nothing (Linux
+             * unix_stream_sendmsg pipe_err: sent == 0). */
+            if (b->reader_closed || b->writer_closed)
+                return n ? n : epipe(flags);
             if (b->count < UBUF_SIZE) break;
             if (flags & USOCK_NONBLOCK) return n ? n : -11;
             if (signal_interrupt_pending(current_proc)) return n ? n : -4;

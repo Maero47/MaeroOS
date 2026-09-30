@@ -19,6 +19,14 @@
  *          MSG_TRUNC, zero-length messages, named datagram senders).
  *  gc      a socket sent over its own connection and closed is collected, not
  *          leaked forever.
+ *  chain   closing the head of a long chain of sockets in flight in each
+ *          other's queues frees it without recursing off the kernel stack.
+ *  iovread readv/recvmsg return at once when the data fills the first iovec.
+ *  scmerr  a sendmsg whose SCM_RIGHTS fds cannot be passed fails and sends
+ *          nothing; a large control buffer still passes its fds.
+ *  recname a recvmsg faulting on msg_name does not shift fds to the next one.
+ *  sigpipe a write that sent something returns its count without SIGPIPE.
+ *  epoll   a registration ends with its file (close + fd reuse).
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -30,6 +38,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -510,6 +519,270 @@ static void test_gc(void) {
     close(got); close(pv[0]); close(sv[0]); close(sv[1]);
 }
 
+/* ── round-3 regressions ─────────────────────────────────────────────────── */
+
+/* chain: socket b[i] sits in flight in b[i-1]'s receive queue, for a chain of
+ * CHAIN_LEN pairs, and only the head has a descriptor.  Closing the head
+ * tears down the whole chain; doing that by recursion ran off the 32 KiB
+ * kernel stack (#DF).  The chain must go, and its memory with it. */
+#define CHAIN_LEN 300
+static int build_and_close_chain(void) {
+    int head[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, head)) { CHECK(0, "socketpair"); return 0; }
+    int prev_a = head[0], built = 0;
+    for (int i = 1; i <= CHAIN_LEN; i++) {
+        int p[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, p)) { CHECK(0, "socketpair %d", i); break; }
+        /* p[1] goes into the previous b's queue, then loses its fd. */
+        if (send_fd(prev_a, p[1]) != 1) { CHECK(0, "send_fd %d", i); close(p[0]); close(p[1]); break; }
+        close(p[1]);
+        if (prev_a != head[0]) close(prev_a);
+        prev_a = p[0];
+        built++;
+    }
+    close(prev_a);
+    close(head[0]);
+    close(head[1]);               /* the whole chain goes here */
+    return built;
+}
+
+static void test_chain(void) {
+    /* The kernel heap keeps pages it has grown into, so measure a second
+     * chain: one that was not freed would need all-new memory. */
+    int b1 = build_and_close_chain();
+    long f0 = free_kb();
+    int b2 = build_and_close_chain();
+    long f1 = free_kb();
+    CHECK(b1 == CHAIN_LEN && b2 == CHAIN_LEN, "built only %d/%d of %d links", b1, b2, CHAIN_LEN);
+    if (!on_linux)
+        CHECK(f0 - f1 < 4096, "closing a %d-link chain left %ld kB behind", b2, f0 - f1);
+}
+
+static double now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static volatile int alarms;
+static void on_alarm(int s) { (void)s; alarms++; }
+
+/* iovread: the data available exactly fills the first iovec.  readv/recvmsg
+ * must return it at once, not sleep in the read for the second iovec. */
+static void test_iovread(void) {
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_alarm;               /* no SA_RESTART */
+    sigaction(SIGALRM, &sa, &old);
+    for (int kind = 0; kind < 3; kind++) {
+        int fds[2];
+        if (kind == 0 ? pipe(fds) : socketpair(AF_UNIX, SOCK_STREAM, 0, fds)) {
+            CHECK(0, "pipe/socketpair"); continue;
+        }
+        char a[4], b[8];
+        struct iovec iov[2] = { { a, sizeof(a) }, { b, sizeof(b) } };
+        CHECK(write(fds[1], "abcd", 4) == 4, "write");
+        alarm(2);
+        double t0 = now_s();
+        ssize_t r;
+        if (kind < 2) {
+            r = readv(fds[0], iov, 2);
+        } else {
+            struct msghdr m;
+            memset(&m, 0, sizeof(m));
+            m.msg_iov = iov; m.msg_iovlen = 2;
+            r = recvmsg(fds[0], &m, 0);
+        }
+        double dt = now_s() - t0;
+        alarm(0);
+        static const char *nm[] = { "readv(pipe)", "readv(socket)", "recvmsg(socket)" };
+        CHECK(r == 4 && !memcmp(a, "abcd", 4), "%s returned %d", nm[kind], (int)r);
+        CHECK(dt < 1.0, "%s slept %.1f s with the first iovec filled", nm[kind], dt);
+        close(fds[0]); close(fds[1]);
+    }
+    sigaction(SIGALRM, &old, 0);
+}
+
+/* scmerr: a sendmsg whose SCM_RIGHTS cannot all be passed fails as a whole
+ * and sends nothing; one that can passes every fd, whatever the size of the
+ * control buffer. */
+static int nothing_queued(int s) {
+    char c;
+    return recv(s, &c, 1, MSG_DONTWAIT) < 0 && errno == EAGAIN;
+}
+static void test_scmerr(void) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) { CHECK(0, "socketpair"); return; }
+    char c = 'm';
+    struct iovec iov = { &c, 1 };
+    struct msghdr m;
+    union { struct cmsghdr h; char b[512]; } u;
+
+    /* A bad descriptor: EBADF, and no data. */
+    memset(&m, 0, sizeof(m)); memset(&u, 0, sizeof(u));
+    m.msg_iov = &iov; m.msg_iovlen = 1;
+    m.msg_control = u.b; m.msg_controllen = CMSG_SPACE(2 * sizeof(int));
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    h->cmsg_level = SOL_SOCKET; h->cmsg_type = SCM_RIGHTS;
+    h->cmsg_len = CMSG_LEN(2 * sizeof(int));
+    int two[2] = { 0, 987 };
+    memcpy(CMSG_DATA(h), two, sizeof(two));
+    CHECK(sendmsg(sv[0], &m, 0) < 0 && errno == EBADF, "sendmsg with a bad fd not EBADF");
+    CHECK(nothing_queued(sv[1]), "a failed sendmsg still sent its data");
+
+    /* An unreadable control buffer: EFAULT, no data. */
+    m.msg_control = (void *)16; m.msg_controllen = CMSG_SPACE(sizeof(int));
+    CHECK(sendmsg(sv[0], &m, 0) < 0 && errno == EFAULT, "sendmsg with a bad control buffer not EFAULT");
+    CHECK(nothing_queued(sv[1]), "a faulting sendmsg still sent its data");
+
+    /* A control buffer over 256 bytes (a foreign-level cmsg first, then the
+     * SCM_RIGHTS one): the fd must arrive. */
+    memset(&u, 0, sizeof(u));
+    m.msg_control = u.b;
+    h = (struct cmsghdr *)u.b;
+    h->cmsg_level = 0 /* IPPROTO_IP */; h->cmsg_type = 1234;
+    h->cmsg_len = CMSG_LEN(300);
+    h = (struct cmsghdr *)(u.b + CMSG_SPACE(300));
+    h->cmsg_level = SOL_SOCKET; h->cmsg_type = SCM_RIGHTS;
+    h->cmsg_len = CMSG_LEN(sizeof(int));
+    int one = sv[0];
+    memcpy(CMSG_DATA(h), &one, sizeof(int));
+    m.msg_controllen = CMSG_SPACE(300) + CMSG_SPACE(sizeof(int));
+    CHECK(sendmsg(sv[0], &m, 0) == 1, "sendmsg with a %d-byte control buffer",
+          (int)m.msg_controllen);
+    {
+        union { struct cmsghdr h; char b[CMSG_SPACE(sizeof(int))]; } r;
+        struct msghdr rm;
+        char rc;
+        struct iovec riov = { &rc, 1 };
+        memset(&rm, 0, sizeof(rm));
+        rm.msg_iov = &riov; rm.msg_iovlen = 1;
+        rm.msg_control = r.b; rm.msg_controllen = sizeof(r.b);
+        int got = -1;
+        if (recvmsg(sv[1], &rm, MSG_DONTWAIT) == 1 && CMSG_FIRSTHDR(&rm))
+            memcpy(&got, CMSG_DATA(CMSG_FIRSTHDR(&rm)), sizeof(int));
+        CHECK(got >= 0, "the fd behind a >256-byte control buffer was dropped");
+        if (got >= 0) close(got);
+    }
+
+    /* More fds than MaeroOS carries per message (16; Linux 253): EINVAL,
+     * never a silent truncation. */
+    if (!on_linux) {
+        int many[17];
+        for (int i = 0; i < 17; i++) many[i] = sv[0];
+        memset(&u, 0, sizeof(u));
+        h = (struct cmsghdr *)u.b;
+        h->cmsg_level = SOL_SOCKET; h->cmsg_type = SCM_RIGHTS;
+        h->cmsg_len = CMSG_LEN(sizeof(many));
+        memcpy(CMSG_DATA(h), many, sizeof(many));
+        m.msg_controllen = CMSG_SPACE(sizeof(many));
+        CHECK(sendmsg(sv[0], &m, 0) < 0 && errno == EINVAL, "17 fds not EINVAL");
+        CHECK(nothing_queued(sv[1]), "an over-long fd list still sent its data");
+    }
+    close(sv[0]); close(sv[1]);
+}
+
+/* recname: a datagram recvmsg that faults on msg_name has consumed its record
+ * and must not leave that record's fds for the next one. */
+static void test_recname(void) {
+    struct sockaddr_un ra, sa;
+    socklen_t rl = abs_addr(&ra, "unixprobe-recname-r", 19);
+    socklen_t sl = abs_addr(&sa, "unixprobe-recname-s", 19);
+    int r = socket(AF_UNIX, SOCK_DGRAM, 0), s = socket(AF_UNIX, SOCK_DGRAM, 0);
+    CHECK(bind(r, (struct sockaddr *)&ra, rl) == 0 && bind(s, (struct sockaddr *)&sa, sl) == 0 &&
+          connect(s, (struct sockaddr *)&ra, rl) == 0, "dgram setup");
+    CHECK(send_fd(s, s) == 1, "record with an fd");
+    CHECK(send(s, "2", 1, 0) == 1, "record without one");
+    char c;
+    struct iovec iov = { &c, 1 };
+    union { struct cmsghdr h; char b[CMSG_SPACE(sizeof(int))]; } u;
+    struct msghdr m;
+    memset(&m, 0, sizeof(m));
+    m.msg_iov = &iov; m.msg_iovlen = 1;
+    m.msg_name = (void *)16; m.msg_namelen = sizeof(struct sockaddr_un);
+    m.msg_control = u.b; m.msg_controllen = sizeof(u.b);
+    CHECK(recvmsg(r, &m, 0) < 0 && errno == EFAULT, "recvmsg into a bad msg_name not EFAULT");
+    /* On Linux the fd was installed before the fault; close it if so. */
+    if (m.msg_controllen >= CMSG_LEN(sizeof(int)) && CMSG_FIRSTHDR(&m)) {
+        int fd; memcpy(&fd, CMSG_DATA(CMSG_FIRSTHDR(&m)), sizeof(int)); close(fd);
+    }
+    memset(&m, 0, sizeof(m)); memset(&u, 0, sizeof(u));
+    m.msg_iov = &iov; m.msg_iovlen = 1;
+    m.msg_control = u.b; m.msg_controllen = sizeof(u.b);
+    CHECK(recvmsg(r, &m, 0) == 1 && c == '2', "second record");
+    CHECK(m.msg_controllen == 0, "the second record came with the first one's fd");
+    close(r); close(s);
+}
+
+/* sigpipe: a write that sent something before the peer went away returns
+ * the count and raises no SIGPIPE; SIGPIPE is for one that sent nothing. */
+static volatile int pipes;
+static void on_pipe(int s) { (void)s; pipes++; }
+static void *close_later(void *arg) { msleep(300); close(*(int *)arg); return 0; }
+static void test_sigpipe(void) {
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_pipe;
+    sigaction(SIGPIPE, &sa, &old);
+    static char big[1024 * 1024];
+    for (int kind = 0; kind < 2; kind++) {
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) { CHECK(0, "socketpair"); break; }
+        pipes = 0;
+        pthread_t t;
+        pthread_create(&t, 0, close_later, &sv[1]);
+        ssize_t n;
+        if (kind == 0) {
+            n = write(sv[0], big, sizeof(big));
+        } else {
+            struct iovec iov[2] = { { big, 1000 }, { big + 1000, sizeof(big) - 1000 } };
+            n = writev(sv[0], iov, 2);
+        }
+        pthread_join(t, 0);
+        CHECK(n > 0 && n < (ssize_t)sizeof(big), "%s into a peer that closed: %d",
+              kind ? "writev" : "write", (int)n);
+        CHECK(pipes == 0, "%s that sent %d bytes raised SIGPIPE", kind ? "writev" : "write", (int)n);
+        pipes = 0;
+        CHECK(write(sv[0], "x", 1) < 0 && errno == EPIPE && pipes == 1,
+              "a write that sent nothing: EPIPE and one SIGPIPE (%d)", pipes);
+        close(sv[0]);
+    }
+    sigaction(SIGPIPE, &old, 0);
+}
+
+/* epoll: a registration ends with its file.  Closing the fd and getting the
+ * same number back for a new file must neither report the new file with the
+ * old registration's data nor make EPOLL_CTL_ADD of the new one EEXIST. */
+static void test_epoll(void) {
+    int ep = epoll_create1(0);
+    int p[2];
+    CHECK(ep >= 0 && pipe(p) == 0, "setup");
+    struct epoll_event ev = { .events = EPOLLIN, .data.u64 = 0xdead };
+    CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, p[0], &ev) == 0, "add");
+    int num = p[0];
+    close(p[0]); close(p[1]);
+    int q[2];
+    CHECK(pipe(q) == 0 && q[0] == num, "the number came back (%d, %d)", q[0], num);
+    CHECK(write(q[1], "x", 1) == 1, "write");
+    struct epoll_event out[4];
+    int n = epoll_wait(ep, out, 4, 0);
+    CHECK(n == 0, "epoll_wait reported %d event(s) for a closed file (data %llx)",
+          n, n > 0 ? (unsigned long long)out[0].data.u64 : 0ULL);
+    ev.data.u64 = 0xbeef;
+    CHECK(epoll_ctl(ep, EPOLL_CTL_MOD, q[0], &ev) < 0 && errno == ENOENT,
+          "MOD of the new file not ENOENT");
+    CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, q[0], &ev) == 0, "ADD of the new file");
+    n = epoll_wait(ep, out, 4, 0);
+    CHECK(n == 1 && out[0].data.u64 == 0xbeef, "new registration: %d", n);
+    /* A dup keeps the file, and with it the registration. */
+    int d = dup(q[0]);
+    CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, q[0], &ev) < 0 && errno == EEXIST, "re-ADD not EEXIST");
+    close(d);
+    n = epoll_wait(ep, out, 4, 0);
+    CHECK(n == 1, "closing a dup ended the registration");
+    close(q[0]); close(q[1]); close(ep);
+}
+
 static void test_dgram(void)     { test_records(SOCK_DGRAM, "DGRAM"); }
 static void test_seqpacket(void) { test_records(SOCK_SEQPACKET, "SEQPACKET"); }
 
@@ -520,6 +793,9 @@ int main(int argc, char **argv) {
         { "cred", test_cred }, { "shut", test_shutdown },
         { "dgram", test_dgram }, { "seqpacket", test_seqpacket },
         { "dgram-named", test_dgram_named }, { "gc", test_gc },
+        { "chain", test_chain }, { "iovread", test_iovread },
+        { "scmerr", test_scmerr }, { "recname", test_recname },
+        { "sigpipe", test_sigpipe }, { "epoll", test_epoll },
     };
     struct utsname u;
     signal(SIGPIPE, SIG_IGN);

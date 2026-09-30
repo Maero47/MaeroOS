@@ -432,10 +432,23 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
             if (!r) r = -101;
             break;
         }
+        /* A signal interrupts the wait (Linux inet_wait_for_connect ->
+         * sock_intr_errno: -ERESTARTSYS, so EINTR or a restart per
+         * SA_RESTART).  The handshake carries on regardless: a restarted
+         * or repeated connect() sees -EALREADY until it ends, and poll()
+         * plus SO_ERROR report how it did, as on Linux. */
+        if (current_proc && signal_interrupt_pending(current_proc)) {
+            r = -4;
+            break;
+        }
         net_io_sleep(2);
     }
     net_socket_release(s);
     return r;
+}
+
+int net_socket_is_stream(net_socket_t *s) {
+    return s && s->type == SOCK_STREAM_K;
 }
 
 static int socket_sendto_locked(net_socket_t *s, const void *buf, uint32_t len,

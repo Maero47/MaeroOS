@@ -49,6 +49,9 @@ typedef struct {
     int              flags;   /* O_RDONLY / O_WRONLY / O_RDWR */
     uint8_t          cloexec; /* FD_CLOEXEC: close on exec */
     uint32_t         seals;   /* memfd F_ADD_SEALS bitmask (accepted, not enforced) */
+    uint32_t         fid;     /* open-file identity for epoll, given on first
+                               * EPOLL_CTL_ADD; copies (dup, fork, SCM_RIGHTS)
+                               * share it, close clears it; 0 = none yet */
     char             path[256]; /* FD_FILE: canonical opened path */
 } proc_file_t;
 

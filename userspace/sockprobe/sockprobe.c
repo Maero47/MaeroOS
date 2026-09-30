@@ -10,6 +10,8 @@
 #include "../include/fcntl.h"
 #include "../include/poll.h"
 #include "../include/syscall.h"
+#include "../include/sys/uio.h"
+#include "../include/time.h"
 
 /* sockprobe tcpshut <port>: connect to the host (10.0.2.2), shutdown(SHUT_WR),
  * then send().  The send must fail with EPIPE at once; it used to be reported
@@ -345,6 +347,132 @@ static int many(int port, int ntcp, int nudp) {
     return 0;
 }
 
+/* sendmsg/recvmsg on AF_INET (socketcall 16/17; this libc wraps neither).
+ * i386 struct msghdr and struct iovec, by hand. */
+struct kmsghdr {
+    void *name; uint32_t namelen;
+    struct iovec *iov; uint32_t iovlen;
+    void *control; uint32_t controllen;
+    int flags;
+};
+static int xsendmsg(int fd, struct kmsghdr *m, int flags) {
+    uint32_t a[3] = { (uint32_t)fd, (uint32_t)(uintptr_t)m, (uint32_t)flags };
+    return sockcall(16, a);
+}
+static int xrecvmsg(int fd, struct kmsghdr *m, int flags) {
+    uint32_t a[3] = { (uint32_t)fd, (uint32_t)(uintptr_t)m, (uint32_t)flags };
+    return sockcall(17, a);
+}
+
+/* sockprobe msg <http_port> <udp_echo_port>: a TCP request gathered from two
+ * iovecs and its reply scattered over two; a UDP datagram sent to msg_name
+ * from two iovecs and its echo received with the source in msg_name.  Both
+ * used to be EINVAL. */
+static int msgprobe(int port, int uport) {
+    int fd = http_connect(port);
+    if (fd < 0) { printf("sockprobe: msg connect failed errno=%d\n", errno); return 1; }
+    char l1[] = "GET /index.html HTTP/1.0\r\n", l2[] = "\r\n";
+    struct iovec siov[2] = { { l1, sizeof(l1) - 1 }, { l2, 2 } };
+    struct kmsghdr m;
+    memset(&m, 0, sizeof(m));
+    m.iov = siov; m.iovlen = 2;
+    int r = xsendmsg(fd, &m, 0);
+    if (r != (int)(sizeof(l1) - 1 + 2)) {
+        printf("sockprobe: tcp sendmsg returned %d errno=%d\n", r, errno);
+        close(fd); return 1;
+    }
+    char h[4], rest[64];
+    struct iovec riov[2] = { { h, 4 }, { rest, sizeof(rest) } };
+    struct sockaddr_in from;
+    memset(&m, 0, sizeof(m));
+    m.iov = riov; m.iovlen = 2;
+    m.name = &from; m.namelen = sizeof(from);
+    m.controllen = 99;
+    r = xrecvmsg(fd, &m, 0);
+    close(fd);
+    if (r <= 4 || memcmp(h, "HTTP", 4) != 0 || m.namelen != 0 || m.controllen != 0) {
+        printf("sockprobe: tcp recvmsg returned %d errno=%d namelen=%u controllen=%u\n",
+               r, errno, (unsigned)m.namelen, (unsigned)m.controllen);
+        return 1;
+    }
+
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in to;
+    to.sin_family = AF_INET;
+    to.sin_port = htons((uint16_t)uport);
+    to.sin_addr.s_addr = inet_addr("10.0.2.2");
+    char a[] = "ab", b[] = "cd";
+    struct iovec uiov[2] = { { a, 2 }, { b, 2 } };
+    memset(&m, 0, sizeof(m));
+    m.name = &to; m.namelen = sizeof(to);
+    m.iov = uiov; m.iovlen = 2;
+    r = xsendmsg(u, &m, 0);
+    if (r != 4) {
+        printf("sockprobe: udp sendmsg returned %d errno=%d\n", r, errno);
+        close(u); return 1;
+    }
+    char e1[2], e2[16];
+    struct iovec eiov[2] = { { e1, 2 }, { e2, sizeof(e2) } };
+    for (int tries = 0; tries < 300; tries++) {
+        memset(&m, 0, sizeof(m));
+        memset(&from, 0, sizeof(from));
+        m.name = &from; m.namelen = sizeof(from);
+        m.iov = eiov; m.iovlen = 2;
+        r = xrecvmsg(u, &m, 0);
+        if (r >= 0 || errno != EAGAIN) break;
+        usleep(10000);
+    }
+    close(u);
+    if (r != 4 || memcmp(e1, "ab", 2) != 0 || memcmp(e2, "cd", 2) != 0 ||
+        m.namelen != sizeof(from) || from.sin_port != htons((uint16_t)uport)) {
+        printf("sockprobe: udp recvmsg returned %d errno=%d namelen=%u port=%u\n",
+               r, errno, (unsigned)m.namelen, (unsigned)ntohs(from.sin_port));
+        return 1;
+    }
+    printf("sockprobe msg ok\n");
+    return 0;
+}
+
+/* sockprobe conn <port>: the host's listener on port never completes a
+ * handshake, so a blocking connect() waits (3 s here).  A signal (SIGUSR1
+ * from a child after 1 s) whose handler has no SA_RESTART must end that wait
+ * with EINTR, promptly. */
+static volatile int conn_alarms;
+static void conn_alarm(int s) { (void)s; conn_alarms++; }
+static int connintr(int port) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = conn_alarm;              /* no SA_RESTART */
+    sigaction(SIGUSR1, &sa, 0);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in host;
+    host.sin_family = AF_INET;
+    host.sin_port = htons((uint16_t)port);
+    host.sin_addr.s_addr = inet_addr("10.0.2.2");
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int parent = getpid();
+    int kid = fork();                        /* no alarm(): signal from a child */
+    if (kid == 0) {
+        usleep(1000000);
+        kill(parent, SIGUSR1);
+        _exit(0);
+    }
+    int r = connect(fd, (struct sockaddr *)&host, sizeof(host));
+    int err = errno;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    waitpid(kid, 0, 0);
+    close(fd);
+    int ms = (int)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
+    if (r != -1 || err != EINTR || ms > 2000 || conn_alarms != 1) {
+        printf("sockprobe: interrupted connect returned %d errno=%d after %d ms (alarms %d)\n",
+               r, err, ms, conn_alarms);
+        return 1;
+    }
+    printf("sockprobe conn ok %d ms\n", ms);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "tcpshut") == 0)
         return tcpshut(atoi(argv[2]));
@@ -356,6 +484,10 @@ int main(int argc, char **argv) {
         return many(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]));
     if (argc == 4 && strcmp(argv[1], "nb") == 0)
         return nb(atoi(argv[2]), atoi(argv[3]));
+    if (argc == 4 && strcmp(argv[1], "msg") == 0)
+        return msgprobe(atoi(argv[2]), atoi(argv[3]));
+    if (argc == 3 && strcmp(argv[1], "conn") == 0)
+        return connintr(atoi(argv[2]));
 
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {

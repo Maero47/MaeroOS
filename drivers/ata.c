@@ -290,7 +290,11 @@ static int ata_probe(uint16_t *ident) {
 
 typedef struct { uint32_t addr; uint16_t bytes; uint16_t flags; } __attribute__((packed)) ata_prd_t;
 #define ATA_DMA_BYTES (128u * 1024u)
-static ata_prd_t ata_prdt[3] __attribute__((aligned(8)));
+/* The bus-master PRD table must not cross a 64 KiB boundary (it is fetched
+ * with a 16-bit offset): aligning the 24-byte table to 32, which divides
+ * 64 KiB, makes that hold wherever .bss puts it. */
+static ata_prd_t ata_prdt[3] __attribute__((aligned(32)));
+_Static_assert(sizeof(ata_prdt) <= 32, "PRD table must fit its alignment");
 static uint8_t   ata_dma_buf[ATA_DMA_BYTES] __attribute__((aligned(4096)));
 static uint16_t  ata_bm;          /* bus-master I/O base, 0 = no DMA */
 
