@@ -47,4 +47,7 @@ $CC -O2 -fpie -pie xevent.c -o /out/xevent
 echo "=== Proof H: xkey (X11 keyboard client) ==="
 $CC -O2 -fpie -pie xkey.c -o /out/xkey
 
-echo "dynlib proofs built: libgreet.so.1 dynprobe2 libz.so.1 zprobe pthreadprobe usockprobe xprobe xdraw xevent xkey"
+echo "=== Proof I: xmal (maeroX malformed-request regression client) ==="
+$CC -O2 -fpie -pie xmal.c -o /out/xmal
+
+echo "dynlib proofs built: libgreet.so.1 dynprobe2 libz.so.1 zprobe pthreadprobe usockprobe xprobe xdraw xevent xkey xmal"

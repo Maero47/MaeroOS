@@ -105,6 +105,20 @@ def main():
         if "XREAL_PAINTED" not in body:
             raise AssertionError("real Xlib client did not connect+paint via libX11")
 
+        # xmal throws malformed requests at one maeroX (short requests, PutImage
+        # rows past the request, overflowing GetImage sizes, reused ids, huge
+        # clipped fills, glyph replacement, zero-length and MSB-first clients,
+        # clients that exit mid-reply or never read) and then runs xdraw and
+        # xreal against that same server: a well-formed client must still draw.
+        before = len("".join(log))
+        send(proc, "xmal --spawn\n")
+        wait_for(proc, sel, PROMPT, log, timeout=150, start=before)
+        body = "".join(log)[before:]
+        if "XMAL_OK" not in body or "XMAL_FAIL" in body:
+            raise AssertionError("maeroX mishandled malformed requests (see xmal output)")
+        if "XDRAW_OK" not in body or "XREAL_PAINTED" not in body:
+            raise AssertionError("well-formed clients did not draw after the malformed cases")
+
         print("\n[SMOKE-X] passed")
         return 0
     finally:
