@@ -27,3 +27,22 @@ int    abs(int v);
 long   labs(long v);
 
 extern char **environ;
+
+long long llabs(long long v);
+unsigned long long strtoull(const char *s, char **endp, int base);
+float  strtof(const char *s, char **endp);
+void  *bsearch(const void *key, const void *base, size_t nmemb, size_t size,
+               int (*compar)(const void *, const void *));
+long   random(void);
+void   srandom(unsigned int seed);
+int    rand(void);
+void   srand(unsigned int seed);
+char  *mkdtemp(char *template);
+int    atexit(void (*fn)(void));
+void   abort(void);
+char  *realpath(const char *path, char *resolved);
+int    clearenv(void);
+int    putenv(char *string);
+#define RAND_MAX 2147483647
+#define EXIT_SUCCESS 0
+#define EXIT_FAILURE 1

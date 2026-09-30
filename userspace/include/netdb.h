@@ -29,3 +29,9 @@ int getaddrinfo(const char *node, const char *service,
                 const struct addrinfo *hints, struct addrinfo **res);
 void freeaddrinfo(struct addrinfo *res);
 const char *gai_strerror(int errcode);
+extern int h_errno;
+#define HOST_NOT_FOUND 1
+#define TRY_AGAIN      2
+#define NO_RECOVERY    3
+#define NO_DATA        4
+const char *hstrerror(int err);

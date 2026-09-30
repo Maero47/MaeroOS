@@ -138,3 +138,16 @@ int          sigfillset(sigset_t *set);
 int          sigaddset(sigset_t *set, int signum);
 int          sigdelset(sigset_t *set, int signum);
 int          sigismember(const sigset_t *set, int signum);
+
+/* si_code values for SIGCHLD */
+#define CLD_EXITED    1
+#define CLD_KILLED    2
+#define CLD_DUMPED    3
+#define CLD_TRAPPED   4
+#define CLD_STOPPED   5
+#define CLD_CONTINUED 6
+
+int          killpg(int pgrp, int sig);
+unsigned int alarm(unsigned int seconds);
+int          pause(void);
+int          sigwait(const sigset_t *set, int *sig);

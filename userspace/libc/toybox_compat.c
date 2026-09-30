@@ -78,7 +78,6 @@ int fchmodat(int dirfd, const char *path, int mode, int flags) {
     return chkerr(syscall4(306, dirfd, (int)path, mode, flags));
 }
 int umask(int mask) { return syscall1(60, mask & 0777); }
-int isatty(int fd) { return fd >= 0 && fd <= 2; }
 
 int fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
     return chkerr(syscall4(300, dirfd, (int)path, (int)buf, flags));
@@ -124,7 +123,6 @@ char *getcwd(char *buf, int size) {
 }
 
 int execv(const char *path, char *const argv[]) { return execve(path, argv, environ); }
-int execvp(const char *file, char *const argv[]) { return execve(file, argv, environ); }
 
 char *stpcpy(char *dst, const char *src) {
     while ((*dst = *src)) { dst++; src++; }
@@ -132,8 +130,45 @@ char *stpcpy(char *dst, const char *src) {
 }
 
 char *strerror(int errnum) {
-    (void)errnum;
-    return "error";
+    static const char *const msgs[] = {
+        [0] = "Success", [EPERM] = "Operation not permitted",
+        [ENOENT] = "No such file or directory", [ESRCH] = "No such process",
+        [EINTR] = "Interrupted system call", [EIO] = "I/O error",
+        [ENXIO] = "No such device or address", [E2BIG] = "Argument list too long",
+        [ENOEXEC] = "Exec format error", [EBADF] = "Bad file descriptor",
+        [ECHILD] = "No child process", [EAGAIN] = "Resource temporarily unavailable",
+        [ENOMEM] = "Out of memory", [EACCES] = "Permission denied",
+        [EFAULT] = "Bad address", [ENOTBLK] = "Block device required",
+        [EBUSY] = "Resource busy", [EEXIST] = "File exists",
+        [EXDEV] = "Cross-device link", [ENODEV] = "No such device",
+        [ENOTDIR] = "Not a directory", [EISDIR] = "Is a directory",
+        [EINVAL] = "Invalid argument", [ENFILE] = "Too many open files in system",
+        [EMFILE] = "No file descriptors available", [ENOTTY] = "Not a tty",
+        [ETXTBSY] = "Text file busy", [EFBIG] = "File too large",
+        [ENOSPC] = "No space left on device", [ESPIPE] = "Invalid seek",
+        [EROFS] = "Read-only file system", [EMLINK] = "Too many links",
+        [EPIPE] = "Broken pipe", [EDOM] = "Domain error", [ERANGE] = "Result not representable",
+        [EDEADLK] = "Resource deadlock would occur", [ENAMETOOLONG] = "Filename too long",
+        [ENOLCK] = "No locks available", [ENOSYS] = "Function not implemented",
+        [ENOTEMPTY] = "Directory not empty", [ELOOP] = "Symbolic link loop",
+        [ENODATA] = "No data available", [EOVERFLOW] = "Value too large for data type",
+        [EILSEQ] = "Illegal byte sequence", [ENOTSOCK] = "Not a socket",
+        [EDESTADDRREQ] = "Destination address required", [EMSGSIZE] = "Message too large",
+        [EPROTONOSUPPORT] = "Protocol not supported", [EOPNOTSUPP] = "Not supported",
+        [EAFNOSUPPORT] = "Address family not supported by protocol",
+        [EADDRINUSE] = "Address in use", [ENETDOWN] = "Network is down",
+        [ENETUNREACH] = "Network unreachable", [ECONNABORTED] = "Connection aborted",
+        [ECONNRESET] = "Connection reset by peer", [EISCONN] = "Socket is connected",
+        [ENOTCONN] = "Socket not connected", [ETIMEDOUT] = "Operation timed out",
+        [ECONNREFUSED] = "Connection refused", [EHOSTUNREACH] = "Host is unreachable",
+        [EALREADY] = "Operation already in progress",
+        [EINPROGRESS] = "Operation in progress", [ECANCELED] = "Operation canceled",
+    };
+    static char unknown[32];
+    if (errnum >= 0 && errnum < (int)(sizeof(msgs) / sizeof(*msgs)) && msgs[errnum])
+        return (char *)msgs[errnum];
+    snprintf(unknown, sizeof(unknown), "Unknown error %d", errnum);
+    return unknown;
 }
 
 int strcasecmp(const char *a, const char *b) {
@@ -156,28 +191,6 @@ int strncasecmp(const char *a, const char *b, size_t n) {
     return n == (size_t)-1 ? 0 : (unsigned char)*a - (unsigned char)*b;
 }
 
-long long strtoll(const char *s, char **endp, int base) {
-    return (long long)strtol(s, endp, base);
-}
-
-long long atoll(const char *s) {
-    return strtoll(s, 0, 10);
-}
-
-double strtod(const char *s, char **endp) {
-    long v = strtol(s, endp, 10);
-    return (double)v;
-}
-
-long double strtold(const char *s, char **endp) {
-    return (long double)strtod(s, endp);
-}
-
-int setenv(const char *name, const char *value, int overwrite) {
-    (void)name; (void)value; (void)overwrite;
-    return 0;
-}
-int unsetenv(const char *name) { (void)name; return 0; }
 int mkstemp(char *template) {
     static const char chars[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -204,26 +217,6 @@ int mkstemp(char *template) {
     return -1;
 }
 
-void qsort(void *base, size_t nmemb, size_t size,
-           int (*compar)(const void *, const void *)) {
-    char *b = base;
-    char tmp[64];
-    if (size > sizeof(tmp)) return;
-    for (size_t i = 0; i < nmemb; i++) {
-        for (size_t j = i + 1; j < nmemb; j++) {
-            char *a = b + i * size;
-            char *c = b + j * size;
-            if (compar(a, c) > 0) {
-                memcpy(tmp, a, size);
-                memcpy(a, c, size);
-                memcpy(c, tmp, size);
-            }
-        }
-    }
-}
-
-int sigsetjmp(sigjmp_buf env, int savesigs) { (void)env; (void)savesigs; return 0; }
-void siglongjmp(sigjmp_buf env, int val) { (void)env; exit(val); }
 
 int tcflush(int fd, int queue_selector) { (void)fd; (void)queue_selector; return 0; }
 int cfsetspeed(struct termios *t, speed_t speed) { (void)t; (void)speed; return 0; }
@@ -576,14 +569,6 @@ int setgroups(size_t size, const gid_t *list) {
     return chkerr(syscall2(206, (int)size, (int)list));   /* setgroups32 */
 }
 
-int regcomp(regex_t *preg, const char *regex, int cflags) { (void)preg; (void)regex; (void)cflags; return REG_NOMATCH; }
-int regexec(const regex_t *preg, const char *string, unsigned long nmatch, regmatch_t pmatch[], int eflags) {
-    (void)preg; (void)string; (void)nmatch; (void)pmatch; (void)eflags; return REG_NOMATCH;
-}
-unsigned long regerror(int errcode, const regex_t *preg, char *errbuf, unsigned long errbuf_size) {
-    (void)errcode; (void)preg; if (errbuf && errbuf_size) *errbuf = 0; return 0;
-}
-void regfree(regex_t *preg) { (void)preg; }
 
 int poll(struct pollfd *fds, unsigned long nfds, int timeout) {
     int ret = syscall3(168, (int)fds, (int)nfds, timeout);
@@ -607,44 +592,8 @@ const char *inet_ntop(int af, const void *src, char *dst, socklen_t size) {
 }
 
 time_t time(time_t *tloc) { struct timeval tv; gettimeofday(&tv, 0); if (tloc) *tloc = tv.tv_sec; return tv.tv_sec; }
-struct tm *localtime(const time_t *timep) { static struct tm tm; return localtime_r(timep, &tm); }
-struct tm *localtime_r(const time_t *timep, struct tm *result) {
-    (void)timep;
-    memset(result, 0, sizeof(*result));
-    result->tm_mday = 1;
-    result->tm_year = 70;
-    result->tm_wday = 4;
-    return result;
-}
-struct tm *gmtime(const time_t *timep) { return localtime(timep); }
-char *ctime(const time_t *timep) { (void)timep; return "Thu Jan  1 00:00:00 1970\n"; }
-unsigned long strftime(char *s, unsigned long max, const char *format, const struct tm *tm) {
-    static const char *days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-    static const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-    (void)format;
-    if (!s || !max || !tm) return 0;
-
-    int wday = (tm->tm_wday >= 0 && tm->tm_wday < 7) ? tm->tm_wday : 4;
-    int mon = (tm->tm_mon >= 0 && tm->tm_mon < 12) ? tm->tm_mon : 0;
-    int mday = tm->tm_mday > 0 ? tm->tm_mday : 1;
-    int year = tm->tm_year + 1900;
-    if (year < 1900) year = 1970;
-
-    int n = snprintf(s, max, "%s %s %2d %02d:%02d:%02d UTC %d",
-                     days[wday], months[mon], mday, tm->tm_hour, tm->tm_min,
-                     tm->tm_sec, year);
-    if (n < 0 || (unsigned long)n >= max) {
-        if (max) *s = 0;
-        return 0;
-    }
-    return (unsigned long)n;
-}
-char *strptime(const char *buf, const char *format, struct tm *tm) { (void)format; (void)tm; return (char *)buf; }
-time_t mktime(struct tm *tm) { (void)tm; return 0; }
-void tzset(void) {}
 int clock_gettime(clockid_t clk_id, struct timespec *tp) {
-    (void)clk_id; struct timeval tv; int rc = gettimeofday(&tv, 0); if (!rc) { tp->tv_sec = tv.tv_sec; tp->tv_nsec = tv.tv_usec * 1000; } return rc;
+    return chkerr(syscall2(265, clk_id, (int)tp));
 }
 int settimeofday(const struct timeval *tv, const void *tz) {
     (void)tv; (void)tz; return 0;
@@ -664,11 +613,7 @@ locale_t uselocale(locale_t locale) { return locale; }
 char *nl_langinfo(nl_item item) { (void)item; return "UTF-8"; }
 int wcwidth(wchar_t wc) { (void)wc; return 1; }
 int wcrtomb(char *s, wchar_t wc, void *ps) { (void)ps; if (s) *s = (char)wc; return 1; }
-wint_t towlower(wint_t wc) { return (wc >= 'A' && wc <= 'Z') ? wc + 32 : wc; }
-int iswspace(wint_t wc) { return wc == ' ' || wc == '\n' || wc == '\t'; }
 
-int statvfs(const char *path, struct statvfs *buf) { (void)path; memset(buf, 0, sizeof(*buf)); return 0; }
-int fstatvfs(int fd, struct statvfs *buf) { (void)fd; memset(buf, 0, sizeof(*buf)); return 0; }
 void *setmntent(const char *filename, const char *type) { (void)filename; (void)type; return 0; }
 struct mntent *getmntent(void *stream) { (void)stream; return 0; }
 int endmntent(void *stream) { (void)stream; return 0; }
@@ -694,8 +639,25 @@ void syslog(int priority, const char *format, ...) {
 }
 void closelog(void) {}
 
-long syscall(long num, ...) { (void)num; return -ENOSYS; }
+/* Anonymous memory still comes from the heap; a file mapping is the kernel's
+ * mmap2, which places mappings from 0x40000000 up (above any heap). */
+#define MMAP_BASE 0x40000000U
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, int offset) {
-    (void)addr; (void)prot; (void)flags; (void)fd; (void)offset; return malloc(length);
+    if ((flags & MAP_ANONYMOUS) || fd < 0) {
+        (void)addr; (void)prot;
+        void *p = malloc(length);
+        if (p) memset(p, 0, length);
+        return p ? p : MAP_FAILED;
+    }
+    if (offset & 4095) { errno = EINVAL; return MAP_FAILED; }
+    /* A read-only view is the same shared or private, and the initrd only
+     * backs private file mappings. */
+    if (!(prot & PROT_WRITE) && (flags & MAP_SHARED)) flags = (flags & ~MAP_SHARED) | MAP_PRIVATE;
+    long r = syscall(192, (long)addr, (long)length, prot, flags, fd, offset >> 12);
+    return r == -1 ? MAP_FAILED : (void *)r;
 }
-int munmap(void *addr, size_t length) { (void)length; free(addr); return 0; }
+int munmap(void *addr, size_t length) {
+    if ((uintptr_t)addr >= MMAP_BASE) return chkerr(syscall2(91, (int)addr, (int)length));
+    free(addr);
+    return 0;
+}

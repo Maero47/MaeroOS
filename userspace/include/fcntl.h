@@ -1,4 +1,5 @@
 #pragma once
+#include <sys/types.h>
 
 /* Linux i386 open() flags */
 #define O_RDONLY   0
@@ -37,3 +38,27 @@ struct flock {
 
 /* These alias to open() for now */
 #define creat(path, mode)  open((path), O_WRONLY | O_CREAT | O_TRUNC, (mode))
+
+#define O_NOCTTY    0x100
+#define O_DSYNC     0x1000
+#define O_SYNC      0x101000
+#define O_DIRECTORY 0x10000
+#define O_LARGEFILE 0
+#define O_NDELAY    O_NONBLOCK
+
+#ifndef AT_FDCWD
+#define AT_FDCWD            (-100)
+#endif
+#define AT_SYMLINK_NOFOLLOW 0x100
+#define AT_REMOVEDIR        0x200
+#define AT_SYMLINK_FOLLOW   0x400
+#define AT_EACCESS          0x200
+
+int posix_fallocate(int fd, off_t offset, off_t len);
+int posix_fadvise(int fd, off_t offset, off_t len, int advice);
+#define POSIX_FADV_NORMAL     0
+#define POSIX_FADV_RANDOM     1
+#define POSIX_FADV_SEQUENTIAL 2
+#define POSIX_FADV_WILLNEED   3
+#define POSIX_FADV_DONTNEED   4
+#define POSIX_FADV_NOREUSE    5

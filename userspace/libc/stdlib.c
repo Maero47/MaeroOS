@@ -143,11 +143,6 @@ void *calloc(size_t nmemb, size_t size) {
 int abs(int v) { return v < 0 ? -v : v; }
 long labs(long v) { return v < 0 ? -v : v; }
 
-/* Minimal system(): returns -1 (no /bin/sh contract on MaeroOS yet). */
-int system(const char *command) {
-    (void)command;
-    return -1;
-}
 
 double atof(const char *s) {
     double v = 0.0, frac = 0.0, div = 1.0;
@@ -167,9 +162,3 @@ double atof(const char *s) {
     return neg ? -v : v;
 }
 
-double fabs(double x) {
-    union { double d; unsigned long long u; } v;
-    v.d = x;
-    v.u &= ~(1ULL << 63);
-    return v.d;
-}
