@@ -14,12 +14,18 @@
 #define KERNEL_PHYS     0x00100000UL
 #define KSTACKSIZE      32768
 #define PAGE_SIZE       4096
-#define MAX_PROCS       128   /* Firefox w/ dom.ipc.processPrelaunch needs ~60+
-                               * threads (parent ~40 + prelaunched content ~20)
-                               * on top of ~10 system procs — 64 was the ceiling
-                               * ([proc] live procs peak=63/64) and allocation
-                               * failure mid-launch stalls Gecko in opaque ways. */
-#define MAX_FD          128   /* Firefox multiprocess + SCM_RIGHTS opens many fds */
+#define MAX_PROCS       256   /* one slot per thread.  Firefox's parent runs ~60
+                               * threads and each content process ~15-25; after
+                               * a page load (a fresh web process next to the
+                               * prelaunched and privileged ones) 128 ran out
+                               * ("[proc] table FULL (128/128)") and Gecko
+                               * crashed on the failed clone.  ptable is .bss,
+                               * which boot.asm maps within the first 12 MiB. */
+#define MAX_FD          512   /* per process.  The Firefox parent holds IPC
+                               * sockets plus a memfd per shared-memory segment;
+                               * 128 ran out on the first page load ("failed to
+                               * create read-only memfd: Too many open files").
+                               * Reported as RLIMIT_NOFILE. */
 #define HEAP_START      0xD0000000UL
 #define HEAP_MAX        0xE0000000UL
 

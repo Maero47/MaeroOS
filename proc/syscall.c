@@ -5755,6 +5755,7 @@ static int sys_getrlimit(registers_t *regs) {
     if (rl) {
         uint32_t krl[2] = { 0xFFFFFFFFU, 0xFFFFFFFFU }; /* RLIM_INFINITY */
         if (resource == 3 /*RLIMIT_STACK*/) krl[0] = 8U * 1024 * 1024;
+        if (resource == 7 /*RLIMIT_NOFILE*/) krl[0] = krl[1] = MAX_FD;
         int cr = copy_to_user(rl, krl, sizeof(krl));
         if (cr < 0) return cr;
     }
@@ -5775,6 +5776,7 @@ static int sys_setrlimit(registers_t *regs) {
  * stack as RLIMIT_STACK → bogus size → pthread_create EAGAIN.  Report a real,
  * finite RLIMIT_STACK (8 MiB) and RLIM_INFINITY for everything else. */
 #define RLIMIT_STACK 3
+#define RLIMIT_NOFILE 7      /* the fd table really is MAX_FD entries */
 #define RLIM64_INFINITY 0xFFFFFFFFFFFFFFFFULL
 static int sys_prlimit64(registers_t *regs) {
     int resource          = (int)regs->ecx;
@@ -5789,6 +5791,8 @@ static int sys_prlimit64(registers_t *regs) {
         if (resource == RLIMIT_STACK) {
             rl.cur = 8ULL * 1024 * 1024;     /* 8 MiB default stack */
             rl.max = RLIM64_INFINITY;
+        } else if (resource == RLIMIT_NOFILE) {
+            rl.cur = rl.max = MAX_FD;
         } else {
             rl.cur = RLIM64_INFINITY;
             rl.max = RLIM64_INFINITY;
@@ -5809,6 +5813,8 @@ static int sys_ugetrlimit(registers_t *regs) {
         if (resource == RLIMIT_STACK) {
             krl[0] = 8U * 1024 * 1024;       /* rlim_cur = 8 MiB */
             krl[1] = 0xFFFFFFFFU;            /* rlim_max = RLIM_INFINITY */
+        } else if (resource == RLIMIT_NOFILE) {
+            krl[0] = krl[1] = MAX_FD;
         } else {
             krl[0] = 0xFFFFFFFFU;
             krl[1] = 0xFFFFFFFFU;
