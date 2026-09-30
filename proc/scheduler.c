@@ -471,6 +471,8 @@ void proc_exit(int status) {
     /* Process-wide pending signals stay with the process; one this thread
      * would have taken is handed to a sibling that can (Linux exit_signals). */
     signal_retarget_shared(current_proc, ~0u);
+    /* If the rest of the group is stopped, this exit completes a group stop. */
+    signal_group_stop_check(current_proc);
     sigshared_put(current_proc->sigshared);
     current_proc->sigshared = (struct sigshared *)0;
 

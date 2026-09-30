@@ -132,6 +132,14 @@ struct proc {
     int              exit_status;
     int              stop_sig;      /* signal that last stopped this process */
     int              stop_reported; /* waitpid(WUNTRACED) already saw this stop */
+    /* Group stop (Linux signal->group_stop_count + JOBCTL_STOP_PENDING).  On
+     * the LEADER, group_stop is the stop signal in force for the whole thread
+     * group (0: none) and group_continued records a SIGCONT that ended one, for
+     * waitpid(WCONTINUED).  On every thread, jobctl_stop asks it to stop on its
+     * next return to user mode. */
+    int              group_stop;
+    int              group_continued;
+    int              jobctl_stop;
     int              time_slice;
     int              last_syscall;            /* diagnostic: last syscall number */
     int              kprof_bucket;            /* kprof: bucket in effect when this

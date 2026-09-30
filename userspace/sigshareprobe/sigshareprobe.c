@@ -18,6 +18,11 @@
  *   exec       both threads block SIGUSR1, kill(pid), then the NON-leader
  *              execve()s: the new image sees it pending and takes it on
  *              unblocking
+ *   stop       job control: the leader sleeps in pthread_join, a worker
+ *              spins; SIGTSTP to the process stops the WHOLE group —
+ *              waitpid(WUNTRACED) reports it and the worker makes no progress
+ *              — and SIGCONT resumes it (waitpid(WCONTINUED)); then it exits
+ *              cleanly
  *
  * Every multi-threaded case runs in a forked child so a stray signal cannot
  * take the probe down.  Prints "sigshareprobe: <case> ok" per case,
@@ -34,10 +39,13 @@
 #include "../include/pthread.h"
 #include "../include/time.h"
 #include "../include/sys/wait.h"
+#include "../include/fcntl.h"
 
 #define NR_EXIT           1
 #define NR_EXECVE         11
+#define NR_WAITPID        7
 #define NR_KILL           37
+#define NR_FCNTL          55
 #define NR_RT_SIGACTION   174
 #define NR_RT_SIGPROCMASK 175
 #define NR_RT_SIGPENDING  176
@@ -333,6 +341,84 @@ static int after_exec(void) {
     return f;
 }
 
+/* ── stop: group stop and continue ──────────────────────────────────────── */
+static int g_pipe_w;
+static volatile int g_quit;
+
+static void on_quit(int sig) { (void)sig; g_quit = 1; }
+
+static void *stop_worker(void *arg) {
+    (void)arg;
+    while (!g_quit) {
+        for (volatile int i = 0; i < 200000; i++) { }
+        char c = 'x';
+        write(g_pipe_w, &c, 1);
+    }
+    return 0;
+}
+
+static int stop_child(void) {
+    /* The shell that runs us ignores SIGTSTP, and SIG_IGN survives exec. */
+    set_act(SIGTSTP, (void (*)(int))SIG_DFL, 0, 0);
+    set_act(SIGUSR1, on_quit, 0, 0);
+    pthread_t t;
+    if (pthread_create(&t, 0, stop_worker, 0) != 0) return 1;
+    pthread_join(t, 0);                           /* the leader sleeps here */
+    return 0;
+}
+
+/* Bytes waiting in the non-blocking pipe fd (the worker's progress). */
+static int drain(int fd) {
+    char buf[256];
+    int n = 0, r;
+    while ((r = read(fd, buf, sizeof(buf))) > 0) n += r;
+    return n;
+}
+
+static void stop_case(void) {
+    int fds[2];
+    if (pipe(fds) < 0) { check("stop: pipe", 0); return; }
+    g_pipe_w = fds[1];
+    fflush(stdout);
+    int pid = fork();
+    if (pid < 0) { check("stop: fork", 0); return; }
+    if (pid == 0) {
+        close(fds[0]);
+        int f = stop_child();
+        syscall1(NR_EXIT_GROUP, f);
+    }
+    close(fds[1]);
+    char c;
+    check("stop: worker running", read(fds[0], &c, 1) == 1);
+    syscall3(NR_FCNTL, fds[0], F_SETFL, O_NONBLOCK);
+
+    int st = -1;
+    kill_(pid, SIGTSTP);
+    int r = syscall3(NR_WAITPID, pid, (int)&st, 2 /* WUNTRACED */);
+    check("stop: waitpid(WUNTRACED) reports the process stopped by SIGTSTP",
+          r == pid && (st & 0xff) == 0x7f && ((st >> 8) & 0xff) == SIGTSTP);
+    msleep(100);
+    drain(fds[0]);                                /* anything written before */
+    msleep(300);
+    check("stop: the worker thread is stopped too", drain(fds[0]) == 0);
+
+    kill_(pid, SIGCONT);
+    st = -1;
+    r = syscall3(NR_WAITPID, pid, (int)&st, 8 /* WCONTINUED */);
+    check("stop: waitpid(WCONTINUED) reports it continued",
+          r == pid && st == 0xffff);
+    int got = 0;
+    for (int i = 0; i < 200 && !got; i++) { got = drain(fds[0]); msleep(10); }
+    check("stop: the worker runs again after SIGCONT", got > 0);
+
+    kill_(pid, SIGUSR1);                          /* ask it to finish */
+    st = -1;
+    r = syscall3(NR_WAITPID, pid, (int)&st, 0);
+    check("stop: clean exit after resuming",
+          r == pid && (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0);
+    close(fds[0]);
+}
+
 static void run(const char *name, int (*fn)(void)) {
     int f = in_child(fn);
     if (f) {
@@ -356,6 +442,9 @@ int main(int argc, char **argv, char **envp) {
     run("threads", threads_child);
     run("exit", exit_child);
     run("exec", exec_child);
+    before = failures;
+    stop_case();
+    if (failures == before) printf("sigshareprobe: stop ok\n");
 
     if (failures) {
         printf("sigshareprobe FAILED (%d)\n", failures);

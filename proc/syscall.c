@@ -1217,6 +1217,7 @@ static int sys_write(registers_t *regs) {
 /* ── sys_waitpid(pid_t pid, int *status, int options) — EAX=7 ─────────── */
 #define WNOHANG    1
 #define WUNTRACED  2
+#define WCONTINUED 8
 
 /* Linux kernel/exit.c do_wait()/wait_consider_task(): the wait set is the
  * children of the calling PROCESS (real_parent == our group leader), so any
@@ -1251,8 +1252,9 @@ static int sys_waitpid(registers_t *regs) {
             if (req_pid < -1 && p->pgrp != -req_pid) continue;
             found_child = 1;
 
-            if (p->state == PROC_ZOMBIE) {
-                if (!proc_group_empty(p)) continue;        /* siblings still exiting */
+            /* A zombie leader whose siblings still run is not reapable yet, but
+             * the process can still be stopped or continued (below). */
+            if (p->state == PROC_ZOMBIE && proc_group_empty(p)) {
                 int child_pid = p->pid;
                 if (status_ptr) {
                     int status = p->exit_status;
@@ -1265,8 +1267,9 @@ static int sys_waitpid(registers_t *regs) {
 
             /* WUNTRACED: also report a stopped child — once per stop, with
              * the signal that stopped it (Linux wait_task_stopped clears the
-             * group's stop code as it reports it). */
-            if ((options & WUNTRACED) && p->state == PROC_STOPPED &&
+             * group's stop code as it reports it).  The PROCESS is stopped
+             * once every live thread of it has stopped (group stop). */
+            if ((options & WUNTRACED) && proc_group_stopped(p) &&
                 !p->stop_reported) {
                 if (status_ptr) {
                     int sig = p->stop_sig ? p->stop_sig : SIGSTOP;
@@ -1275,6 +1278,18 @@ static int sys_waitpid(registers_t *regs) {
                     if (cr < 0) return cr;
                 }
                 p->stop_reported = 1;
+                return p->pid;
+            }
+
+            /* WCONTINUED: a SIGCONT ended a stop — reported once, as 0xffff
+             * (Linux wait_task_continued). */
+            if ((options & WCONTINUED) && p->group_continued) {
+                if (status_ptr) {
+                    int status = 0xffff;
+                    int cr = copy_to_user(status_ptr, &status, sizeof(status));
+                    if (cr < 0) return cr;
+                }
+                p->group_continued = 0;
                 return p->pid;
             }
         }

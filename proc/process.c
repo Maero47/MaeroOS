@@ -280,6 +280,9 @@ struct proc *proc_create_kthread(void (*fn)(void), const char *name) {
     p->set_child_tid = 0;
     p->vm_owner    = NULL;
     p->group_exit  = 0;
+    p->group_stop  = 0;
+    p->group_continued = 0;
+    p->jobctl_stop = 0;
     p->pending_sigs = 0;
     p->blocked_sigs = 0;
     fpu_state_init(fpu_area(p));

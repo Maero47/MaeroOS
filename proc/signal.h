@@ -154,6 +154,13 @@ uint32_t signal_pending_set(struct proc *p);
  * stay pending for the process. */
 void signal_retarget_shared(struct proc *p, uint32_t which);
 
+/* Group stop (job control).  proc_group_stopped: a stop is in force for
+ * leader's thread group and every live thread of it has stopped — what
+ * waitpid(WUNTRACED) reports.  signal_group_stop_check: p's group may just have
+ * completed its stop (a thread stopped or exited); wake the waiting parent. */
+int  proc_group_stopped(struct proc *leader);
+void signal_group_stop_check(struct proc *p);
+
 /* Deliver sig to every process whose pgrp is pg (one thread per process).
  * Returns the number of processes signalled. */
 int signal_send_pgrp(int pg, int sig);
