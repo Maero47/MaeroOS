@@ -6086,6 +6086,7 @@ static int sys_wait4(registers_t *regs) {
 #define CLD_KILLED_W  2
 #define CLD_DUMPED_W  3
 #define CLD_STOPPED_W 5
+#define CLD_CONTINUED_W 6
 
 /* Fill the SIGCHLD siginfo for child `p` (i386 layout: signo, errno, code,
  * then si_pid, si_uid, si_status at 12/16/20; 128 bytes in all). */
@@ -6144,8 +6145,11 @@ static int sys_waitid(registers_t *regs) {
             if (idtype == P_PGID_W && p->pgrp != id) continue;
             found_child = 1;
 
-            if ((options & WEXITED_W) && p->state == PROC_ZOMBIE) {
-                if (!proc_group_empty(p)) continue;        /* siblings still exiting */
+            /* A zombie leader whose siblings still run is not reapable yet,
+             * but the process can still be stopped or continued (below), as
+             * in sys_waitpid. */
+            if ((options & WEXITED_W) && p->state == PROC_ZOMBIE &&
+                proc_group_empty(p)) {
                 int st = p->exit_status;
                 int code = (st & 0x7f) == 0 ? CLD_EXITED_W
                          : (st & 0x80) ? CLD_DUMPED_W : CLD_KILLED_W;
@@ -6155,12 +6159,22 @@ static int sys_waitid(registers_t *regs) {
                 if (!(options & WNOWAIT_W)) proc_release(p);
                 return 0;
             }
-            if ((options & WSTOPPED_W) && p->state == PROC_STOPPED &&
+            /* Group stop / continue: the same once-per-event reports as
+             * sys_waitpid's WUNTRACED / WCONTINUED (the process is stopped
+             * once every live thread is), except that WNOWAIT leaves the
+             * event to be reported again. */
+            if ((options & WSTOPPED_W) && proc_group_stopped(p) &&
                 !p->stop_reported) {
                 int cr = waitid_report(infop, p, CLD_STOPPED_W,
                                        p->stop_sig ? p->stop_sig : SIGSTOP);
                 if (cr < 0) return cr;
                 if (!(options & WNOWAIT_W)) p->stop_reported = 1;
+                return 0;
+            }
+            if ((options & WCONTINUED_W) && p->group_continued) {
+                int cr = waitid_report(infop, p, CLD_CONTINUED_W, SIGCONT);
+                if (cr < 0) return cr;
+                if (!(options & WNOWAIT_W)) p->group_continued = 0;
                 return 0;
             }
         }

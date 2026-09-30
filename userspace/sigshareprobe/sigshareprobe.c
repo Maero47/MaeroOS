@@ -24,8 +24,9 @@
  *              read with SIGTTIN at its default stops the reader
  *   stop       job control: the leader sleeps in pthread_join, a worker
  *              spins; SIGTSTP to the process stops the WHOLE group —
- *              waitpid(WUNTRACED) reports it and the worker makes no progress
- *              — and SIGCONT resumes it (waitpid(WCONTINUED)); then it exits
+ *              waitid(WSTOPPED|WNOWAIT) then waitpid(WUNTRACED) report it
+ *              and the worker makes no progress — and SIGCONT resumes it
+ *              (waitid/waitpid WCONTINUED); then it exits
  *              cleanly
  *
  * Every multi-threaded case runs in a forked child so a stray signal cannot
@@ -58,6 +59,7 @@
 #define NR_RT_SIGPROCMASK 175
 #define NR_RT_SIGPENDING  176
 #define NR_GETTID         224
+#define NR_WAITID         284
 #define NR_EXIT_GROUP     252
 
 #define K_SA_NODEFER      0x40000000u
@@ -383,6 +385,18 @@ static int drain(int fd) {
     return n;
 }
 
+/* waitid(P_PID, pid, infop, options, NULL); fills si[0..5] (signo, errno,
+ * code, pid, uid, status). */
+static int waitid_pid(int pid, int32_t *si, int options) {
+    int ret;
+    __asm__ volatile("int $0x80"
+        : "=a"(ret)
+        : "0"(NR_WAITID), "b"(1 /* P_PID */), "c"(pid), "d"((int)si),
+          "S"(options), "D"(0)
+        : "memory");
+    return ret;
+}
+
 static void stop_case(void) {
     int fds[2];
     if (pipe(fds) < 0) { check("stop: pipe", 0); return; }
@@ -401,8 +415,15 @@ static void stop_case(void) {
     syscall3(NR_FCNTL, fds[0], F_SETFL, O_NONBLOCK);
 
     int st = -1;
+    int32_t si[32];
     kill_(pid, SIGTSTP);
-    int r = syscall3(NR_WAITPID, pid, (int)&st, 2 /* WUNTRACED */);
+    /* waitid sees the same group stop; WNOWAIT leaves it for waitpid. */
+    memset(si, 0, sizeof si);
+    int r = waitid_pid(pid, si, 2 /* WSTOPPED */ | 0x01000000 /* WNOWAIT */);
+    check("stop: waitid(WSTOPPED|WNOWAIT) reports the group stop",
+          r == 0 && si[0] == SIGCHLD && si[2] == 5 /* CLD_STOPPED */ &&
+          si[3] == pid && si[5] == SIGTSTP);
+    r = syscall3(NR_WAITPID, pid, (int)&st, 2 /* WUNTRACED */);
     check("stop: waitpid(WUNTRACED) reports the process stopped by SIGTSTP",
           r == pid && (st & 0xff) == 0x7f && ((st >> 8) & 0xff) == SIGTSTP);
     msleep(100);
@@ -411,6 +432,11 @@ static void stop_case(void) {
     check("stop: the worker thread is stopped too", drain(fds[0]) == 0);
 
     kill_(pid, SIGCONT);
+    memset(si, 0, sizeof si);
+    r = waitid_pid(pid, si, 8 /* WCONTINUED */ | 0x01000000 /* WNOWAIT */);
+    check("stop: waitid(WCONTINUED|WNOWAIT) reports it continued",
+          r == 0 && si[2] == 6 /* CLD_CONTINUED */ && si[3] == pid &&
+          si[5] == SIGCONT);
     st = -1;
     r = syscall3(NR_WAITPID, pid, (int)&st, 8 /* WCONTINUED */);
     check("stop: waitpid(WCONTINUED) reports it continued",
