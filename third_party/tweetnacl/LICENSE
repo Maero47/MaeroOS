@@ -1,0 +1,8 @@
+TweetNaCl — https://tweetnacl.cr.yp.to/
+Daniel J. Bernstein, Bernard van Gastel, Wesley Janssen, Tanja Lange,
+Peter Schwabe, Sjaak Smetsers.
+
+"TweetNaCl is a self-contained public-domain C library, so it can easily be
+integrated into applications." (https://tweetnacl.cr.yp.to/)
+
+The files in this directory are public domain and carry no copyright.

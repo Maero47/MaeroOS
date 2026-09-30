@@ -25,7 +25,7 @@ LIBC_SRCS := libc/syscalls.c libc/stdio.c libc/stdlib.c libc/pthread.c \
 LIBC_OBJS := $(LIBC_SRCS:.c=.o)
 CRT0_OBJ  := libc/crt0.o
 
-.PHONY: all clean
+.PHONY: all clean FORCE
 
 all: $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
      $(TESTFILES)/cat $(TESTFILES)/cp $(TESTFILES)/rm \
@@ -636,8 +636,17 @@ store/store.o: store/store.c include/gui.h include/draw.h
 $(TESTFILES)/store: store/store.o $(GUIAPP_DEPS)
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) store/store.o libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o libwm/wm.o libc/libc.a
 
-PKG_OBJS := pkg/pkg.o pkg/tarx.o pkg/sha256.o
-$(PKG_OBJS): pkg/tarx.h pkg/sha256.h
+PKG_OBJS := pkg/pkg.o pkg/tarx.o pkg/sha256.o pkg/indexsig.o pkg/ed25519.o pkg/tweetnacl.o
+$(PKG_OBJS): pkg/tarx.h pkg/sha256.h pkg/indexsig.h pkg/ed25519.h
+# The repo's public signing key, from the (created-on-demand) private key
+# that tools/mkrepo.py signs index.txt with; rewritten only when it changes.
+FORCE:
+pkg/repo_pubkey.h: FORCE
+	python3 ../tools/mkrepo.py --pubkey-header $@
+pkg/pkg.o: pkg/repo_pubkey.h
+pkg/ed25519.o: CFLAGS += -I../third_party/tweetnacl
+pkg/tweetnacl.o: ../third_party/tweetnacl/tweetnacl.c
+	$(CC) $(CFLAGS) -w -c $< -o $@
 $(TESTFILES)/pkg: $(CRT0_OBJ) $(PKG_OBJS) libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) $(PKG_OBJS) libc/libc.a
 
@@ -700,7 +709,7 @@ $(TESTFILES)/browse: $(CRT0_OBJ) browse/browse.o libgui/gui.o libdraw/draw.o lib
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) browse/browse.o libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o libwm/wm.o libc/libc.a
 
 clean:
-	rm -f libc/*.o libc/libc.a \
+	rm -f libc/*.o libc/libc.a pkg/*.o pkg/repo_pubkey.h \
 	      init/init.o shell/shell.o ls/ls.o \
 	      cat/cat.o cp/cp.o rm/rm.o touch/touch.o mkdir_cmd/mkdir.o head/head.o \
 	      grep/grep.o wc/wc.o sleep/sleep.o kill_cmd/kill.o test_cmd/test.o \
