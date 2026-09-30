@@ -171,6 +171,8 @@ static int start_shell(void) {
         exit(127);
     }
     close(slave);
+    /* tools/smoke_gui.py checks that what it types runs in this shell. */
+    gui_trace("term", "shell pid=%d tty=%s", shell_pid, pts_path);
     return 0;
 }
 

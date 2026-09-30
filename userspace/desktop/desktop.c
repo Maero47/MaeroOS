@@ -815,11 +815,28 @@ static void focus_window(int id) {
     desktop_window_t *win = find_window(id);
 
     if (win) {
-        if (id != active_window) trace("focus %s", win->title);
+        /* slot=0: Console/System.  A client's title can still be the slot's
+         * previous one here (gui_open focuses before it sends the title),
+         * so the slot is what identifies the window. */
+        if (id != active_window)
+            trace("focus %s slot=%d", win->title,
+                  is_client_window(id) ? client_index_for_window(id) + 1 : 0);
         active_window = id;
         raise_window(id);
         emit_client_focus_event(id);
     }
+}
+
+/* The focused window went away: focus the topmost window still on screen,
+ * rather than raising the Console over the other open windows. */
+static void focus_next_window(void) {
+    for (int i = window_count - 1; i >= 0; i--) {
+        if (windows[i].visible && !windows[i].minimized) {
+            focus_window(windows[i].id);
+            return;
+        }
+    }
+    focus_window(WIN_TERMINAL);
 }
 
 static void clamp_window(desktop_window_t *win) {
@@ -1464,7 +1481,7 @@ static void drop_app_window(int idx) {
     if (win && win->visible) win->visible = 0;
     drop_client_pixels(idx);   /* release its shared surface */
     if (active_window == WIN_CLIENT_BASE + idx)
-        focus_window(WIN_TERMINAL);
+        focus_next_window();
 }
 
 static int poll_app_exits(void) {
@@ -1828,7 +1845,7 @@ static void hide_client_app(int idx) {
         trace("window closed: %s slot=%d", client->title, idx + 1);
     if (client) client->visible = 0;
     if (active_window == WIN_CLIENT_BASE + idx)
-        focus_window(WIN_TERMINAL);
+        focus_next_window();
     emit_client_close_event(idx);
     sprintf(status, "APP %d WINDOW HIDDEN", idx + 1);
     copy_text(client_status, sizeof(client_status), status);
@@ -3128,7 +3145,7 @@ static void close_window_like_button(desktop_window_t *win) {
     } else {
         win->visible = 0;
         if (active_window == win->id)
-            focus_window(WIN_TERMINAL);
+            focus_next_window();
     }
 }
 
@@ -3435,7 +3452,7 @@ static char key_to_char(uint16_t key) {
         [KEY_X] = 'x', [KEY_C] = 'c', [KEY_V] = 'v', [KEY_B] = 'b',
         [KEY_N] = 'n', [KEY_M] = 'm', [KEY_SPACE] = ' ',
         [KEY_COMMA] = ',', [KEY_DOT] = '.', [KEY_SLASH] = '/',
-        [KEY_SEMICOLON] = ':', [KEY_APOSTROPHE] = '\'', [KEY_LEFTBRACE] = '[',
+        [KEY_SEMICOLON] = ';', [KEY_APOSTROPHE] = '\'', [KEY_LEFTBRACE] = '[',
         [KEY_RIGHTBRACE] = ']', [KEY_BACKSLASH] = '\\', [KEY_GRAVE] = '`'
     };
     static const char shifted[] = {
@@ -3443,7 +3460,7 @@ static char key_to_char(uint16_t key) {
         [KEY_5] = '%', [KEY_6] = '^', [KEY_7] = '&', [KEY_8] = '*',
         [KEY_9] = '(', [KEY_0] = ')', [KEY_MINUS] = '_', [KEY_EQUAL] = '+',
         [KEY_COMMA] = '<', [KEY_DOT] = '>', [KEY_SLASH] = '?',
-        [KEY_SEMICOLON] = ';', [KEY_APOSTROPHE] = '"', [KEY_LEFTBRACE] = '{',
+        [KEY_SEMICOLON] = ':', [KEY_APOSTROPHE] = '"', [KEY_LEFTBRACE] = '{',
         [KEY_RIGHTBRACE] = '}', [KEY_BACKSLASH] = '|', [KEY_GRAVE] = '~'
     };
     char c = 0;

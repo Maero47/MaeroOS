@@ -13,12 +13,14 @@ serial getty, and each step takes a screendump with a region check (the
 window's area must change when it opens).
 
 Covered: the terminal from the launcher (runs a command whose output is
-checked from the serial shell), the image viewer on /disk/wallpaper.ppm
-(launched from that terminal), the file manager (enters a directory by
+checked from the serial shell, and whose $$ must be the pid of the shell the
+Terminal app started, not the desktop's built-in Console), the image viewer
+on /disk/wallpaper.ppm (launched from that terminal), the file manager (enters a directory by
 double-click), settings (picks an accent, applies it, checks desktop.conf
 and the desktop's reload), the store (verified list or the "run pkg update"
 state), the task manager (lists the running processes, including the
-desktop and the store), and closing windows with the close button and Esc.
+desktop and the store), and closing windows with the close button, Esc and
+Alt-Tab, after which the focus must pass to the topmost window left.
 
 Output goes to build/smoke-gui/: serial.log, NN-step.png per step, and on a
 failure fail.png plus the log tail.  Uses KVM when /dev/kvm is usable, else
@@ -162,7 +164,8 @@ def key(down, qcode):
 # Characters the tests type, as (qcode, shifted).
 KEYMAP = {" ": ("spc", False), "\n": ("ret", False), "-": ("minus", False),
           "_": ("minus", True), ".": ("dot", False), "/": ("slash", False),
-          ">": ("dot", True), "=": ("equal", False), ",": ("comma", False)}
+          ">": ("dot", True), "=": ("equal", False), ",": ("comma", False),
+          "$": ("4", True), ";": ("semicolon", False)}
 for _c in "abcdefghijklmnopqrstuvwxyz":
     KEYMAP[_c] = (_c, False)
 for _c in "0123456789":
@@ -368,21 +371,41 @@ class GuiSmoke:
                                  f"changed)")
         return after
 
+    def focused_slot(self):
+        """Slot of the window the desktop last reported focused (0 for the
+        Console and System windows).  Focus lines name the slot because a
+        client's title can still be the slot's previous one when it is
+        focused."""
+        text = self.con.text()
+        found = re.findall(r"\[desktop\] focus .* slot=(\d+)\n",
+                           text[:text.rfind("\n") + 1])
+        return int(found[-1]) if found else 0
+
+    def expect_focus(self, win, timeout=5.0):
+        deadline = time.time() + timeout
+        while self.focused_slot() != win["slot"]:
+            if time.time() >= deadline:
+                raise AssertionError(f"{win['title']} (slot {win['slot']}) "
+                                     f"does not have the focus (slot "
+                                     f"{self.focused_slot()} does)")
+            self.con.pump(0.1)
+
     def bring_forward(self, win):
-        """Alt-Tab until `win` has the focus (and so is on top).  Closing a
-        window hands the focus to the built-in Console, which is raised over
-        any other app window still open."""
+        """Alt-Tab until `win` has the focus (and so is on top)."""
         for _ in range(8):
             start = self.con.mark()
             self.qmp.events([key(True, "alt")])
             self.inp.press("tab")
             self.qmp.events([key(False, "alt")])
-            m = self.con.wait_re(r"\[desktop\] focus (.*)\n", start=start)
-            if m.group(1) == win["title"]:
+            m = self.con.wait_re(r"\[desktop\] focus .* slot=(\d+)\n",
+                                 start=start)
+            if int(m.group(1)) == win["slot"]:
                 return
         raise AssertionError(f"Alt-Tab never focused {win['title']}")
 
-    def close(self, win, how="button"):
+    def close(self, win, how="button", then_focus=None):
+        """Close `win`; with then_focus, the desktop must hand the focus to
+        that window (the topmost one left), not raise the Console."""
         if how == "alttab-button":
             self.bring_forward(win)
             how = "button"
@@ -394,6 +417,8 @@ class GuiSmoke:
                          % (re.escape(win["title"]), win["slot"]))
         self.con.wait_re(r"\[desktop\] app exited: slot=%d\b" % win["slot"],
                          timeout=15)
+        if then_focus:
+            self.expect_focus(then_focus)
 
     def rel(self, win, x, y):
         return win["x"] + x, win["y"] + y
@@ -415,25 +440,46 @@ class GuiSmoke:
         if colors < 50:
             raise AssertionError(f"desktop screen has only {colors} colours")
 
+    def type_in_terminal(self, win, command, proof):
+        """Type `command` into the Terminal app and prove its own shell ran
+        it: the command also writes $$ to `proof`, which must be the pid of
+        the shell the Terminal started, not of the desktop's built-in
+        Console (also a shell on a pty, which gets keys when it has the
+        focus)."""
+        self.expect_focus(win)
+        self.con.run(f"rm -f {proof}")
+        self.inp.type(f"echo $$ > {proof}; {command}\n")
+        deadline = time.time() + 20
+        while True:
+            # The console also carries kernel "[SYSCALL] exec" lines.
+            got = self.con.run(f"cat {proof}")
+            if str(win["shell_pid"]) in re.findall(r"^(\d+)\r?$", got, re.M):
+                return
+            if time.time() >= deadline:
+                raise AssertionError(
+                    f"{command!r} did not run in the Terminal's shell (pid "
+                    f"{win['shell_pid']}); {proof} holds {got!r}")
+            self.settle(0.5)
+
     def terminal(self):
         win = self.launch("term", "Terminal")
-        self.settle(1.0)                      # its shell starts up
-        self.con.run("rm -f /tmp/guismoke.term")
-        self.inp.type("echo guismoke-term-ok > /tmp/guismoke.term\n")
-        deadline = time.time() + 20
-        while "guismoke-term-ok" not in self.con.run("cat /tmp/guismoke.term"):
-            if time.time() >= deadline:
-                raise AssertionError("the command typed into the terminal "
-                                     "did not run")
-            self.settle(0.5)
+        m = self.con.wait_re(r"\[term\] shell pid=(\d+) tty=(\S+)",
+                             start=self.launched_at)
+        win["shell_pid"] = int(m.group(1))
+        self.type_in_terminal(win, "echo guismoke-term-ok > /tmp/guismoke.out",
+                              "/tmp/guismoke.term")
+        out = self.con.run("cat /tmp/guismoke.out")
+        if "guismoke-term-ok" not in out:
+            raise AssertionError(f"terminal command wrote {out!r}")
         self.shot("term-command")
         return win
 
-    def viewer(self):
+    def viewer(self, term):
         """Launch the viewer from the terminal, which still has the focus."""
         before = self.shot("before-view")
         start = self.con.mark()
-        self.inp.type("wmctl launch view /disk/wallpaper.ppm\n")
+        self.type_in_terminal(term, "wmctl launch view /disk/wallpaper.ppm",
+                              "/tmp/guismoke.view")
         # The viewer loads the image after its window is up; the two lines
         # come from different processes, so do not rely on their order.
         m = self.con.wait_re(r"\[view\] (.*)\n", timeout=30, start=start)
@@ -532,17 +578,16 @@ class GuiSmoke:
 
         step("boot", self.boot)
         term = step("terminal", self.terminal)
-        view = step("viewer", self.viewer)
-        step("close viewer (button)", self.close, view)
-        step("close terminal (Alt-Tab, button)", self.close, term,
-             "alttab-button")
+        view = step("viewer", self.viewer, term)
+        step("close viewer (button)", self.close, view, "button", term)
+        step("close terminal (button)", self.close, term)
         files = step("files", self.files)
         step("close files (button)", self.close, files)
         settings = step("settings", self.settings)
         step("close settings (Esc)", self.close, settings, "esc")
         store = step("store", self.store)
         tm = step("taskmgr", self.taskmgr)
-        step("close task manager (button)", self.close, tm)
+        step("close task manager (button)", self.close, tm, "button", store)
         step("close store (Alt-Tab, button)", self.close, store,
              "alttab-button")
         self.settle()
