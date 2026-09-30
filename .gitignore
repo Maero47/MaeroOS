@@ -92,6 +92,7 @@ testfiles/awk
 /testfiles/ifconfig
 /testfiles/init
 /testfiles/kill
+/testfiles/libctest
 /testfiles/ln
 /testfiles/login
 /testfiles/ls

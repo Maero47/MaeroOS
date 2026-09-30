@@ -2984,7 +2984,7 @@ static void launch_installed(const inst_app_t *a) {
         if (a->rawinput) {
             int pid2 = fork();
             if (pid2 == 0) {
-                int lfd = open("/tmp/app-out", O_WRONLY | O_CREAT | O_TRUNC);
+                int lfd = open("/tmp/app-out", O_WRONLY | O_CREAT | O_TRUNC, 0666);
                 if (lfd >= 0) { dup2(lfd, 1); dup2(lfd, 2);
                                 if (lfd > 2) close(lfd); }
                 char *argv[8]; int ac = 0; static char argbuf[96];
@@ -3043,7 +3043,7 @@ static void launch_installed(const inst_app_t *a) {
             }
             if (master >= 0) close(master);
             /* capture the app's output for debugging (cat /tmp/app-out) */
-            int lfd = open("/tmp/app-out", O_WRONLY | O_CREAT | O_TRUNC);
+            int lfd = open("/tmp/app-out", O_WRONLY | O_CREAT | O_TRUNC, 0666);
             if (lfd >= 0) {
                 dup2(lfd, 1);
                 dup2(lfd, 2);
@@ -4049,7 +4049,7 @@ static void note_save(void) {
     int fd;
 
     mkdir("/disk/etc", 0755);
-    fd = open("/disk/etc/notes.txt", O_WRONLY | O_CREAT | O_TRUNC);
+    fd = open("/disk/etc/notes.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) return;
     write(fd, note_text, note_len);
     close(fd);

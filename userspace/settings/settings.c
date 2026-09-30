@@ -100,7 +100,7 @@ static void apply(void) {
     if (sel_accent >= 0)
         n += snprintf(buf + n, sizeof(buf) - (size_t)n,
                       "accent=#%06x\n", (unsigned)accents[sel_accent]);
-    fd = open("/disk/etc/desktop.conf", O_WRONLY | O_CREAT | O_TRUNC);
+    fd = open("/disk/etc/desktop.conf", O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) {
         strcpy(status, "Cannot write /disk/etc/desktop.conf");
         dirty = 1;

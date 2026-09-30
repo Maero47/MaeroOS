@@ -73,7 +73,7 @@ static void load_file(void) {
 }
 
 static void save_file(void) {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     char msg[128];
 
     if (fd < 0) { set_status("Save FAILED (read-only fs?)"); return; }

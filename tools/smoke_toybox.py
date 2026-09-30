@@ -34,6 +34,11 @@ def send(proc, text):
 
 
 def main():
+    # pkg's tar/name checks are plain C: exercise them on the host first.
+    if subprocess.run([sys.executable,
+                       os.path.join(ROOT, "tools", "test_pkg_tarx.py")]).returncode:
+        raise AssertionError("tools/test_pkg_tarx.py failed")
+
     proc = subprocess.Popen(
         ["make", "run"],
         cwd=ROOT,
@@ -70,6 +75,11 @@ def main():
             # Syscall-layer regressions: long relative paths, symlink loops,
             # offsets, getdents layouts, waitpid(WUNTRACED).
             ("sysmiscprobe\n", "sysmiscprobe ok"),
+            ("whoami\n", "root"),
+            # libc regression checks (userspace/libctest)
+            ("libctest\n", "LIBCTEST PASS"),
+            # a path instead of a package name must be refused outright
+            ("pkg remove ../etc\n", "invalid package name '../etc'"),
         ]
         for command, expected in checks:
             before = len("".join(log))

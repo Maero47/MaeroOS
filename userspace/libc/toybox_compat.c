@@ -77,7 +77,7 @@ int fchown(int fd, int owner, int group) {
 int fchmodat(int dirfd, const char *path, int mode, int flags) {
     return chkerr(syscall4(306, dirfd, (int)path, mode, flags));
 }
-int umask(int mask) { (void)mask; return 0; }
+int umask(int mask) { return syscall1(60, mask & 0777); }
 int isatty(int fd) { return fd >= 0 && fd <= 2; }
 
 int fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
@@ -178,7 +178,31 @@ int setenv(const char *name, const char *value, int overwrite) {
     return 0;
 }
 int unsetenv(const char *name) { (void)name; return 0; }
-int mkstemp(char *template) { return open(template, O_RDWR | O_CREAT | O_EXCL, 0600); }
+int mkstemp(char *template) {
+    static const char chars[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    size_t len = template ? strlen(template) : 0;
+    char *x = template + len - 6;
+
+    if (len < 6 || memcmp(x, "XXXXXX", 6)) { errno = EINVAL; return -1; }
+    for (int tries = 0; tries < 100; tries++) {
+        unsigned char rnd[6];
+        if (getrandom(rnd, sizeof(rnd), 0) != (int)sizeof(rnd)) {
+            /* No entropy source: fall back to something that still differs
+             * per call so the O_EXCL retry loop can make progress. */
+            struct timeval tv;
+            gettimeofday(&tv, 0);
+            unsigned v = (unsigned)tv.tv_usec ^ ((unsigned)getpid() << 16)
+                       ^ (unsigned)tries * 2654435761u;
+            for (int i = 0; i < 6; i++) { rnd[i] = (unsigned char)v; v = v * 1103515245u + 12345u; }
+        }
+        for (int i = 0; i < 6; i++) x[i] = chars[rnd[i] % (sizeof(chars) - 1)];
+        int fd = open(template, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0 || errno != EEXIST) return fd;
+    }
+    errno = EEXIST;
+    return -1;
+}
 
 void qsort(void *base, size_t nmemb, size_t size,
            int (*compar)(const void *, const void *)) {
@@ -269,18 +293,133 @@ char *dirname(char *path) {
     return path;
 }
 
-static struct passwd root_pw = {"root", "x", 0, 0, "root", "/", "/shell"};
-static struct group root_gr = {"root", "x", 0, 0};
-struct passwd *getpwuid(uid_t uid) { return uid ? 0 : &root_pw; }
-struct passwd *getpwnam(const char *name) { return !strcmp(name, "root") ? &root_pw : 0; }
-struct group *getgrgid(gid_t gid) { return gid ? 0 : &root_gr; }
-struct group *getgrnam(const char *name) { return !strcmp(name, "root") ? &root_gr : 0; }
+/* ── /etc/passwd ────────────────────────────────────────────────────────────
+ * name:passwd:uid:gid:gecos:dir:shell.  Fields may be empty ("user::1000:..."
+ * or an empty gecos), so the line is split on every ':' — a strtok-style
+ * splitter would merge "::" and shift every later field. */
+
+/* Split `line` in place on ':' into exactly `want` fields; -1 otherwise. */
+static int pw_split(char *line, char **f, int want) {
+    int n = 0;
+    f[n++] = line;
+    for (char *p = line; *p; p++) {
+        if (*p != ':') continue;
+        if (n == want) return -1;
+        *p = 0;
+        f[n++] = p + 1;
+    }
+    return n == want ? 0 : -1;
+}
+
+static int pw_num(const char *s, unsigned *out) {
+    unsigned v = 0;
+    if (!*s) return -1;
+    for (; *s; s++) {
+        if (*s < '0' || *s > '9' || v > 429496728U) return -1;
+        v = v * 10 + (unsigned)(*s - '0');
+    }
+    *out = v;
+    return 0;
+}
+
+static FILE *pw_open(void) {
+    FILE *f = fopen("/etc/passwd", "r");
+    if (!f) f = fopen("/disk/etc/passwd", "r");   /* same fallback as login */
+    return f;
+}
+
+/* Find the entry for `name` (or `uid` when name is NULL), copying the line
+ * into buf so the returned strings live there.  0 = found, ENOENT = no such
+ * entry, ERANGE = buf too small, EIO = no passwd file. */
+static int pw_lookup(const char *name, uid_t uid, struct passwd *pw,
+                     char *buf, size_t buflen) {
+    char line[512];
+    FILE *f = pw_open();
+    int rc = ENOENT;
+
+    if (!f) return EIO;
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        char *fld[7], tmp[512];
+        unsigned u, g;
+
+        if (len && line[len - 1] != '\n' && !feof(f)) {
+            int c;   /* over-long line: skip the rest of it */
+            while ((c = fgetc(f)) != EOF && c != '\n') {}
+            continue;
+        }
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = 0;
+        if (!len || line[0] == '#') continue;
+        memcpy(tmp, line, len + 1);
+        if (pw_split(tmp, fld, 7) || pw_num(fld[2], &u) || pw_num(fld[3], &g))
+            continue;
+        if (name ? strcmp(fld[0], name) : u != (unsigned)uid) continue;
+
+        if (len + 1 > buflen) { rc = ERANGE; break; }
+        memcpy(buf, line, len + 1);
+        pw_split(buf, fld, 7);
+        pw->pw_name   = fld[0];
+        pw->pw_passwd = fld[1];
+        pw->pw_uid    = (uid_t)u;
+        pw->pw_gid    = (gid_t)g;
+        pw->pw_gecos  = fld[4];
+        pw->pw_dir    = fld[5];
+        pw->pw_shell  = fld[6];
+        rc = 0;
+        break;
+    }
+    fclose(f);
+    return rc;
+}
+
+/* With no passwd file at all (a bare initrd), root still has a name. */
+static int pw_builtin_root(const char *name, uid_t uid, struct passwd *pw,
+                           char *buf, size_t buflen) {
+    static const char line[] = "root:x:0:0:root:/:/shell";
+    char *fld[7];
+    if (name ? strcmp(name, "root") : uid != 0) return ENOENT;
+    if (sizeof(line) > buflen) return ERANGE;
+    memcpy(buf, line, sizeof(line));
+    pw_split(buf, fld, 7);
+    pw->pw_name = fld[0]; pw->pw_passwd = fld[1];
+    pw->pw_uid = 0; pw->pw_gid = 0;
+    pw->pw_gecos = fld[4]; pw->pw_dir = fld[5]; pw->pw_shell = fld[6];
+    return 0;
+}
+
+static int pw_get_r(const char *name, uid_t uid, struct passwd *pwd, char *buf,
+                    size_t buflen, struct passwd **result) {
+    int rc = pw_lookup(name, uid, pwd, buf, buflen);
+    if (rc == EIO) rc = pw_builtin_root(name, uid, pwd, buf, buflen);
+    *result = rc ? (struct passwd *)0 : pwd;
+    return rc == ENOENT ? 0 : rc;   /* "not found" is not an error */
+}
+
 int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen, struct passwd **result) {
-    (void)buf; (void)buflen; *result = getpwuid(uid); if (*result && pwd) *pwd = **result; return *result ? 0 : ENOENT;
+    return pw_get_r((const char *)0, uid, pwd, buf, buflen, result);
 }
 int getpwnam_r(const char *name, struct passwd *pwd, char *buf, size_t buflen, struct passwd **result) {
-    (void)buf; (void)buflen; *result = getpwnam(name); if (*result && pwd) *pwd = **result; return *result ? 0 : ENOENT;
+    if (!name) { *result = 0; return 0; }
+    return pw_get_r(name, 0, pwd, buf, buflen, result);
 }
+
+static struct passwd pw_static;
+static char pw_static_buf[512];
+struct passwd *getpwuid(uid_t uid) {
+    struct passwd *r;
+    getpwuid_r(uid, &pw_static, pw_static_buf, sizeof(pw_static_buf), &r);
+    return r;
+}
+struct passwd *getpwnam(const char *name) {
+    struct passwd *r;
+    getpwnam_r(name, &pw_static, pw_static_buf, sizeof(pw_static_buf), &r);
+    return r;
+}
+
+static struct group root_gr = {"root", "x", 0, 0};
+struct group *getgrgid(gid_t gid) { return gid ? 0 : &root_gr; }
+struct group *getgrnam(const char *name) { return !strcmp(name, "root") ? &root_gr : 0; }
 int getgrgid_r(gid_t gid, struct group *grp, char *buf, size_t buflen, struct group **result) {
     (void)buf; (void)buflen; *result = getgrgid(gid); if (*result && grp) *grp = **result; return *result ? 0 : ENOENT;
 }

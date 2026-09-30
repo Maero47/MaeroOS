@@ -53,6 +53,7 @@ int    fprintf(FILE *f, const char *fmt, ...);
 int    sprintf(char *buf, const char *fmt, ...);
 int    snprintf(char *buf, size_t cap, const char *fmt, ...);
 int    asprintf(char **strp, const char *fmt, ...);
+int    vasprintf(char **strp, const char *fmt, va_list ap);
 int    dprintf(int fd, const char *fmt, ...);
 
 /* Formatted input */

@@ -94,7 +94,7 @@ static int do_extract(int afd, int verbose) {
             symlink(hdr.linkname, fname);
         } else {
             /* Regular file */
-            int ofd = open(fname, 0x241);  /* O_WRONLY|O_CREAT|O_TRUNC */
+            int ofd = open(fname, 0x241, 0666);  /* O_WRONLY|O_CREAT|O_TRUNC */
             long remaining = size;
             while (remaining > 0) {
                 int to_read = (int)(remaining > 512 ? 512 : remaining);
@@ -208,7 +208,7 @@ int main(int argc, char *argv[]) {
 
     int afd;
     if (create) {
-        afd = open(archive, 0x241);  /* O_WRONLY|O_CREAT|O_TRUNC */
+        afd = open(archive, 0x241, 0666);  /* O_WRONLY|O_CREAT|O_TRUNC */
         if (afd < 0) { printf("tar: cannot create %s\n", archive); return 1; }
         int r = do_create(afd, files, nfiles);
         close(afd);

@@ -4,8 +4,12 @@
 #include "../include/pwd.h"
 
 int main(void) {
-    struct passwd *pw = getpwuid((uid_t)geteuid());
-    printf("%s\n", pw && pw->pw_name ? pw->pw_name :
-           (geteuid() == 0 ? "root" : "user"));
+    int uid = geteuid();
+    struct passwd *pw = getpwuid((uid_t)uid);
+    if (!pw || !pw->pw_name) {
+        fprintf(stderr, "whoami: cannot find name for user ID %d\n", uid);
+        return 1;
+    }
+    printf("%s\n", pw->pw_name);
     return 0;
 }

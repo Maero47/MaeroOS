@@ -56,7 +56,7 @@ all: $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
      $(TESTFILES)/sudo $(TESTFILES)/whoami $(TESTFILES)/uname $(TESTFILES)/clear $(TESTFILES)/hostname \
      $(TESTFILES)/which $(TESTFILES)/free $(TESTFILES)/uptime $(TESTFILES)/du $(TESTFILES)/df $(TESTFILES)/top $(TESTFILES)/wget $(TESTFILES)/bbwrap \
      $(TESTFILES)/maerox $(TESTFILES)/ff \
-     $(TESTFILES)/kwprobe
+     $(TESTFILES)/kwprobe $(TESTFILES)/libctest
 
 # Compile C → .o
 %.o: %.c
@@ -632,10 +632,16 @@ store/store.o: store/store.c include/gui.h include/draw.h
 $(TESTFILES)/store: store/store.o $(GUIAPP_DEPS)
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) store/store.o libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o libwm/wm.o libc/libc.a
 
-pkg/pkg.o: pkg/pkg.c
+PKG_OBJS := pkg/pkg.o pkg/tarx.o pkg/sha256.o
+$(PKG_OBJS): pkg/tarx.h pkg/sha256.h
+$(TESTFILES)/pkg: $(CRT0_OBJ) $(PKG_OBJS) libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) $(PKG_OBJS) libc/libc.a
+
+# libctest — in-guest regression test for libc (run by tools/smoke_toybox.py)
+libctest/libctest.o: libctest/libctest.c
 	$(CC) $(CFLAGS) -c $< -o $@
-$(TESTFILES)/pkg: $(CRT0_OBJ) pkg/pkg.o libc/libc.a
-	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) pkg/pkg.o libc/libc.a
+$(TESTFILES)/libctest: $(CRT0_OBJ) libctest/libctest.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) libctest/libctest.o libc/libc.a
 
 wavplay/wavplay.o: wavplay/wavplay.c
 	$(CC) $(CFLAGS) -c $< -o $@

@@ -2,7 +2,7 @@
 #include "../include/fcntl.h"
 
 static void write_file(const char *path, const char *text) {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) return;
     write(fd, text, 5);
     close(fd);

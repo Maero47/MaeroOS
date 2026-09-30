@@ -14,7 +14,7 @@ int main(int argc, char *argv[]) {
     int nfds = 0;
     for (; i < argc && nfds < 32; i++) {
         int flags = append ? (O_WRONLY | O_CREAT | O_APPEND) : (O_WRONLY | O_CREAT | O_TRUNC);
-        int fd = open(argv[i], flags);
+        int fd = open(argv[i], flags, 0666);
         if (fd < 0) { fprintf(stderr, "tee: %s: open failed\n", argv[i]); }
         else        { fds[nfds++] = fd; }
     }

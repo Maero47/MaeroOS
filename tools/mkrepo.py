@@ -13,8 +13,13 @@ pkg.conf format (key=value):
     args=-iwad /disk/apps/doom/doom1.wad  (optional launch args)
 
 index.txt line format (| separated):
-    name|version|size|tarfile|caption|exec|fullscreen|args
+    name|version|size|tarfile|caption|exec|fullscreen|args|rawinput|sha256
+
+sha256 is the hex SHA-256 of the tarball; `pkg install` refuses a download
+that does not match it.  Packages are flat: pkg only extracts plain files at
+the top level, so a recipe directory must not contain subdirectories.
 """
+import hashlib
 import os
 import sys
 import tarfile
@@ -51,12 +56,18 @@ def main():
             for fn in sorted(os.listdir(pdir)):
                 if fn == "pkg.conf":
                     continue
-                tf.add(os.path.join(pdir, fn), arcname=fn)
+                src = os.path.join(pdir, fn)
+                if os.path.islink(src) or not os.path.isfile(src):
+                    sys.exit(f"mkrepo: {name}/{fn}: packages may only "
+                             "contain regular files at the top level")
+                tf.add(src, arcname=fn)
         size = os.path.getsize(tar_path)
+        with open(tar_path, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
         index.append("|".join([
             name, conf["version"], str(size), tar_name, conf["caption"],
             conf["exec"], conf["fullscreen"], conf["args"],
-            conf["rawinput"]]))
+            conf["rawinput"], digest]))
         print(f"  {name} {conf['version']}: {size} bytes")
     with open(os.path.join(REPO, "index.txt"), "w") as f:
         f.write("\n".join(index) + "\n")

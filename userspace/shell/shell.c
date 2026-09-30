@@ -563,7 +563,7 @@ static void apply_redirs(redir_t *redirs, int nredirs) {
             close(pfd[0]);
             continue;
         }
-        int fd = open(r->file, r->open_flags);
+        int fd = open(r->file, r->open_flags, 0666);
         if (fd < 0) { printf("shell: cannot open %s\n", r->file); exit(1); }
         dup2(fd, r->target_fd);
         close(fd);

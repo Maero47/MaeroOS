@@ -26,8 +26,43 @@ int write(int fd, const void *buf, int n) {
     return __chkerr(syscall3(4, fd, (int)buf, n));
 }
 
+/* The kernel's open(5) ignores both the mode argument and O_EXCL: a created
+ * file always gets 0666 & ~umask.  So libc does the rest.  O_EXCL is checked
+ * with lstat() first (a symlink counts as existing, as POSIX requires) — this
+ * is not atomic against a concurrent creator, but it is what makes mkstemp()
+ * refuse a name that is already taken.  For a new file the umask is narrowed
+ * around the call so the kernel never creates it more open than `mode`
+ * allows, and bits 0666 cannot express (execute, setuid...) are added with
+ * fchmod() afterwards. */
 int open(const char *path, int flags, ...) {
-    return __chkerr(syscall2(5, (int)path, flags));
+    struct stat st;
+    int mode, old_mask, fd, want;
+
+    if (!(flags & O_CREAT))
+        return __chkerr(syscall3(5, (int)path, flags, 0));
+
+    __builtin_va_list ap;
+    __builtin_va_start(ap, flags);
+    mode = __builtin_va_arg(ap, int) & 07777;
+    __builtin_va_end(ap);
+
+    if (lstat(path, &st) == 0) {
+        if (flags & O_EXCL) { errno = 17; return -1; }   /* EEXIST */
+        return __chkerr(syscall3(5, (int)path, flags, mode));
+    }
+
+    old_mask = syscall1(60, 0);
+    syscall1(60, old_mask | (~mode & 0777));
+    fd = syscall3(5, (int)path, flags, mode);
+    syscall1(60, old_mask);
+    if (fd < 0) return __chkerr(fd);
+
+    want = mode & ~old_mask & 07777;
+    if (want != (want & 0666) && fstat(fd, &st) == 0 &&
+        (st.st_mode & 07777) == (unsigned)(want & 0666))
+        syscall2(94, fd, want);                          /* fchmod */
+    errno = 0;
+    return fd;
 }
 
 int close(int fd) {

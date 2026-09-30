@@ -16,7 +16,7 @@ int main(int argc, char *argv[]) {
         puts("cp: cannot open source");
         return 1;
     }
-    int dst = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC);
+    int dst = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (dst < 0) {
         puts("cp: cannot open destination");
         close(src);
