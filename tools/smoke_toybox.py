@@ -144,6 +144,32 @@ def main():
         if "Stopped" in "".join(log)[before:] or "Running" in "".join(log)[before:]:
             raise AssertionError("the resumed job did not finish")
 
+        # The same for a pipeline: ^Z must stop every stage (the console
+        # signals its foreground process group), the shell must record the
+        # job as soon as one stage reports stopped, and `fg` must resume and
+        # wait for the whole group — wc then counts what cat read.
+        before = len("".join(log))
+        send(proc, "cat | wc -c\n")
+        wait_for(proc, sel, "wc' pid=", log, start=before)
+        time.sleep(1.0)
+        before = len("".join(log))
+        send(proc, "\x1a")
+        wait_for(proc, sel, PROMPT, log, start=before)
+        before = len("".join(log))
+        send(proc, "jobs\n")
+        wait_for(proc, sel, PROMPT, log, start=before)
+        if "Stopped" not in "".join(log)[before:]:
+            raise AssertionError("^Z did not stop the foreground pipeline")
+        before = len("".join(log))
+        send(proc, "fg\n")
+        time.sleep(1.0)
+        send(proc, "abcdefghij\n")
+        time.sleep(0.5)
+        send(proc, "\x04")
+        wait_for(proc, sel, PROMPT, log, start=before)
+        if "11" not in "".join(log)[before:]:
+            raise AssertionError("the resumed pipeline did not finish with wc's count")
+
         # Log out of the console shell while a background job of its session
         # lives on; init starts a new shell in a new session.  The old
         # leader's exit must free the console so the new shell gets it (job

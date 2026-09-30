@@ -819,9 +819,17 @@ static int run_builtin(char *argv[], int argc) {
         jobs_list[idx].stopped = 0;
         job_take_terminal(pid);
         kill(-pid, 18); /* SIGCONT=18 */
-        /* Wait for it to finish or stop again */
+        /* Wait for every process of the job (a pipeline is one process
+         * group) to finish, or for it to stop again.  The status is the
+         * leader's — the first stage for a pipeline. */
         int st=0;
-        waitpid(pid, &st, 2); /* WUNTRACED=2 */
+        for (;;) {
+            int s=0;
+            int r = waitpid(-pid, &s, 2); /* WUNTRACED=2 */
+            if (r < 0) break;             /* no member left */
+            if ((s & 0xff) == 0x7f) { st = s; break; }
+            if (r == pid) st = s;
+        }
         shell_take_terminal();
         g_status = wait_status_to_exit(st);
         if ((st & 0xff) == 0x7f) {
@@ -1123,8 +1131,15 @@ static int run_pipeline(const char *cmdstr, int background) {
     if (!background) {
         job_take_terminal(pgid);
         int st=0;
+        /* ^Z stops the whole job (the terminal signals its process group):
+         * stop waiting at the first stage that reports stopped, or the wait
+         * on the next stage — stopped too — never ends and the job is not
+         * recorded for `fg`. */
         for (int i=0;i<ncmds;i++)
-            if (pids[i]>0) { int s; waitpid(pids[i],&s,2); st=s; }
+            if (pids[i]>0) {
+                int s=0; waitpid(pids[i],&s,2); st=s;
+                if ((s & 0xff) == 0x7f) break;
+            }
         shell_take_terminal();
         g_status=wait_status_to_exit(st);
         if ((st & 0xff) == 0x7f && pgid > 0 && jobs_n < MAX_JOBS) {

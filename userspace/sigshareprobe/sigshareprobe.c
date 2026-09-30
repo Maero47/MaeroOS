@@ -18,6 +18,10 @@
  *   exec       both threads block SIGUSR1, kill(pid), then the NON-leader
  *              execve()s: the new image sees it pending and takes it on
  *              unblocking
+ *   ttybg      a background process group on a pty (Linux tty_check_change):
+ *              read with SIGTTIN ignored fails with EIO at once (no restart
+ *              spin); write under TOSTOP with SIGTTOU ignored goes through;
+ *              read with SIGTTIN at its default stops the reader
  *   stop       job control: the leader sleeps in pthread_join, a worker
  *              spins; SIGTSTP to the process stops the WHOLE group —
  *              waitpid(WUNTRACED) reports it and the worker makes no progress
@@ -40,8 +44,12 @@
 #include "../include/time.h"
 #include "../include/sys/wait.h"
 #include "../include/fcntl.h"
+#include "../include/termios.h"
+#include "../include/sys/ioctl.h"
 
 #define NR_EXIT           1
+#define NR_READ           3
+#define NR_WRITE          4
 #define NR_EXECVE         11
 #define NR_WAITPID        7
 #define NR_KILL           37
@@ -419,6 +427,84 @@ static void stop_case(void) {
     close(fds[0]);
 }
 
+/* ── ttybg: background reads/writes on a pty ────────────────────────────── */
+#define K_TIOCGPTN   0x80045430U
+#define K_TIOCSPTLCK 0x40045431U
+
+/* In the background group: try the terminal with SIGTTIN/SIGTTOU ignored. */
+static int ttybg_ignored(int slave) {
+    int f = 0;
+    set_act(SIGTTIN, (void (*)(int))SIG_IGN, 0, 0);
+    char c;
+    int r = syscall3(NR_READ, slave, (int)&c, 1);
+    if (r != -5) { printf("sigshareprobe: ttybg: read, SIGTTIN ignored -> %d, want -EIO FAIL\n", r); f++; }
+    set_act(SIGTTOU, (void (*)(int))SIG_IGN, 0, 0);
+    r = syscall3(NR_WRITE, slave, (int)"x", 1);
+    if (r != 1) { printf("sigshareprobe: ttybg: write, SIGTTOU ignored -> %d, want 1 FAIL\n", r); f++; }
+    fflush(stdout);
+    return f;
+}
+
+/* Session leader owning the pty; its children are the background group. */
+static int ttybg_session(int slave) {
+    int f = 0;
+    if (setsid() < 0) return 1;
+    if (ioctl(slave, TIOCSCTTY, 0) < 0) return 1;
+    if (tcsetpgrp(slave, getpgrp()) < 0) return 1;
+    struct termios t;
+    if (tcgetattr(slave, &t) == 0) { t.c_lflag |= TOSTOP; tcsetattr(slave, 0, &t); }
+
+    int pid = fork();
+    if (pid == 0) {
+        setpgid(0, 0);                            /* background group */
+        syscall1(NR_EXIT_GROUP, ttybg_ignored(slave));
+    }
+    int st = -1;
+    if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) f++;
+
+    pid = fork();
+    if (pid == 0) {
+        setpgid(0, 0);
+        set_act(SIGTTIN, (void (*)(int))SIG_DFL, 0, 0);
+        char c;
+        syscall3(NR_READ, slave, (int)&c, 1);     /* stops here */
+        syscall1(NR_EXIT_GROUP, 9);
+    }
+    st = -1;
+    int r = syscall3(NR_WAITPID, pid, (int)&st, 2 /* WUNTRACED */);
+    if (r != pid || (st & 0xff) != 0x7f || ((st >> 8) & 0xff) != SIGTTIN) {
+        printf("sigshareprobe: ttybg: default SIGTTIN stops the reader FAIL (%x)\n", st);
+        f++;
+    }
+    kill_(pid, SIGKILL);
+    waitpid(pid, &st, 0);
+    fflush(stdout);
+    return f;
+}
+
+static void ttybg_case(void) {
+    int master = open("/dev/ptmx", O_RDWR);
+    if (master < 0) { check("ttybg: open /dev/ptmx", 0); return; }
+    int unlock = 0, n = -1;
+    ioctl(master, K_TIOCSPTLCK, &unlock);
+    if (ioctl(master, K_TIOCGPTN, &n) < 0 || n < 0) { check("ttybg: TIOCGPTN", 0); close(master); return; }
+    char path[16];
+    sprintf(path, "/dev/pts/%d", n);
+    int slave = open(path, O_RDWR);
+    if (slave < 0) { check("ttybg: open slave", 0); close(master); return; }
+    fflush(stdout);
+    int pid = fork();
+    if (pid == 0) {
+        close(master);
+        syscall1(NR_EXIT_GROUP, ttybg_session(slave));
+    }
+    close(slave);
+    int st = -1;
+    check("ttybg: background tty access follows Linux",
+          waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    close(master);
+}
+
 static void run(const char *name, int (*fn)(void)) {
     int f = in_child(fn);
     if (f) {
@@ -463,6 +549,9 @@ int main(int argc, char **argv, char **envp) {
     run("threads", threads_child);
     run("exit", exit_child);
     run("exec", exec_child);
+    before = failures;
+    ttybg_case();
+    if (failures == before) printf("sigshareprobe: ttybg ok\n");
     before = failures;
     stop_case();
     if (failures == before) printf("sigshareprobe: stop ok\n");

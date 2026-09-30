@@ -218,6 +218,14 @@ static int pgrp_in_current_session(int pgrp) {
     return 0;
 }
 
+/* Send a keyboard signal to the console's foreground process group (the
+ * reader's own group if none is set or it has gone). */
+static void console_isig(int sig) {
+    int pg = tty_fg_pgrp;
+    if (pg <= 0 || !signal_send_pgrp(pg, sig))
+        signal_send_group(current_proc, sig);
+}
+
 static uint32_t tty_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
     (void)n; (void)off;
     vfs_node_t *ctty = proc_ctty_node();
@@ -233,25 +241,24 @@ static uint32_t tty_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf
         char c = console_serial_getc();
         if (c == '\r') c = '\n';
 
-        /* ^C — SIGINT (always, regardless of termios) */
-        if (c == 0x03) {
+        /* ^C — SIGINT, ^\ — SIGQUIT, ^Z — SIGTSTP (always, regardless of
+         * termios), to the console's FOREGROUND PROCESS GROUP (Linux n_tty
+         * isig -> kill_pgrp), not just the reader: ^Z on `cat | wc` must stop
+         * wc as well, or the shell waits on it for good.
+         * The read returns -ERESTARTSYS, not 0 (which the reader takes for
+         * EOF): it is restarted when no handler runs — after SIGCONT for ^Z,
+         * straight away when the signal is ignored. */
+        if (c == 0x03 || c == 0x1C || c == 0x1A) {
+            int sig = c == 0x03 ? SIGINT : c == 0x1C ? SIGQUIT : SIGTSTP;
             if (current_proc) {
-                if (do_echo) { serial_putc('^'); serial_putc('C'); serial_putc('\n'); }
-                signal_send(current_proc, SIGINT);
+                if (do_echo) {
+                    serial_putc('^');
+                    serial_putc(c == 0x03 ? 'C' : c == 0x1C ? '\\' : 'Z');
+                    serial_putc('\n');
+                }
+                console_isig(sig);
             }
-            /* Linux n_tty_read: -ERESTARTSYS, not 0 (which the reader takes
-             * for EOF).  The call is restarted when no handler runs — after
-             * SIGCONT for ^Z, straight away when the signal is ignored. */
             return (uint32_t)-4;
-        }
-
-        /* ^Z — SIGTSTP (always) */
-        if (c == 0x1A) {
-            if (current_proc) {
-                if (do_echo) { serial_putc('^'); serial_putc('Z'); serial_putc('\n'); }
-                signal_send(current_proc, SIGTSTP);
-            }
-            return (uint32_t)-4;                     /* as for ^C */
         }
 
         /* ^D — EOF (canonical mode only) */
@@ -669,13 +676,53 @@ static uint32_t pty_master_write(vfs_node_t *n, uint32_t off,
     return pty_master_write_input((pty_pair_t *)n->private, len, buf);
 }
 
+/* Linux is_current_pgrp_orphaned(): no member of the caller's process group
+ * has a parent in another group of the same session — nobody is left who could
+ * SIGCONT it, so a job-control stop would be for ever. */
+static int current_pgrp_orphaned(void) {
+    int pg = current_proc->pgrp;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (q->state == PROC_UNUSED || q->state == PROC_ZOMBIE || q->pgrp != pg)
+            continue;
+        struct proc *par = q->parent;
+        if (par && par->state != PROC_UNUSED && par->state != PROC_ZOMBIE &&
+            par->pgrp != pg && par->sid == q->sid)
+            return 0;
+    }
+    return 1;
+}
+
+/* The calling thread ignores or blocks sig. */
+static int current_sig_ignored_or_blocked(int sig) {
+    if (current_proc->blocked_sigs & (1u << sig)) return 1;
+    return current_proc->sighand &&
+           current_proc->sighand->handlers[sig] == SIG_IGN;
+}
+
+/* Linux __tty_check_change() for a process outside the terminal's foreground
+ * group.  Returns 0 to go ahead with the I/O or a negative errno:
+ *   - SIGTTIN (read): -EIO if it is ignored or blocked or the group is
+ *     orphaned — the stop could never happen or never end, and retrying the
+ *     read would spin; else SIGTTIN to the whole group and -ERESTARTSYS.
+ *   - SIGTTOU (write under TOSTOP): the write proceeds if it is ignored or
+ *     blocked; -EIO for an orphaned group; else SIGTTOU and -ERESTARTSYS. */
+static int pty_bg_check(int sig) {
+    if (current_sig_ignored_or_blocked(sig))
+        return sig == SIGTTIN ? -5 : 0;
+    if (current_pgrp_orphaned())
+        return -5;                                            /* -EIO */
+    signal_send_pgrp(current_proc->pgrp, sig);
+    return -4;                                    /* restarted after SIGCONT */
+}
+
 static uint32_t pty_slave_read(vfs_node_t *n, uint32_t off,
                                uint32_t len, uint8_t *buf) {
     (void)off;
     pty_pair_t *p = (pty_pair_t *)n->private;
     if (pty_background_current(p)) {
-        signal_send(current_proc, SIGTTIN);
-        return (uint32_t)-4;
+        int r = pty_bg_check(SIGTTIN);
+        if (r) return (uint32_t)r;
     }
     return pty_buf_read(p, 0, len, buf);
 }
@@ -685,8 +732,8 @@ static uint32_t pty_slave_write(vfs_node_t *n, uint32_t off,
     (void)off;
     pty_pair_t *p = (pty_pair_t *)n->private;
     if ((p->termios.c_lflag & TERMIOS_TOSTOP) && pty_background_current(p)) {
-        signal_send(current_proc, SIGTTOU);
-        return (uint32_t)-4;
+        int r = pty_bg_check(SIGTTOU);
+        if (r) return (uint32_t)r;
     }
     return pty_slave_write_output(p, len, buf);
 }
