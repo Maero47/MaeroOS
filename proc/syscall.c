@@ -913,6 +913,8 @@ static void fork_abort(struct proc *child) {
     vma_clear(child);
     fdtable_put(child);
     if (child->sighand) { sighand_put(child->sighand); child->sighand = NULL; }
+    sigshared_put(child->sigshared);
+    child->sigshared = NULL;
     if (child->ctty) { vfs_close(child->ctty); child->ctty = NULL; }
     kstack_free(child->kstack);
     child->kstack = NULL;
