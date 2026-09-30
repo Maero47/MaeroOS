@@ -262,6 +262,14 @@ def main():
         recent = "".join(log)[before:]
         if "sockprobe nb ok" not in recent:
             raise AssertionError("non-blocking TCP client calls failed")
+        # 48 TCP connections and 48 UDP sockets open at once (the socket
+        # table was 32 slots with the RX rings in .bss), each then used.
+        before = len("".join(log))
+        send(proc, f"sockprobe many {http_port} 48 48")
+        wait_for(proc, sel, PROMPT, log, timeout=60.0, start=before)
+        recent = "".join(log)[before:]
+        if "sockprobe many ok 96" not in recent:
+            raise AssertionError("holding 96 sockets open at once failed")
         before = len("".join(log))
         send(proc, f"httpget 10.0.2.2 {http_port} /index.html")
         wait_for(proc, sel, PROMPT, log, timeout=15.0, start=before)

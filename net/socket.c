@@ -3,6 +3,7 @@
 #include "net.h"
 #include "firewall.h"
 #include "../lib/string.h"
+#include "../mm/heap.h"
 #include "../kernel/printk.h"
 #include "../arch/i686/cpu/pit.h"
 #include "../proc/scheduler.h"
@@ -28,7 +29,12 @@ static void net_io_sleep(uint32_t ticks) {
 #define IPPROTO_TCP_K  6
 #define IPPROTO_UDP_K 17
 
-#define MAX_NET_SOCKETS 32
+/* The table itself is small (~100 bytes a slot): the per-socket buffers, a
+ * 64 KiB RX ring for a stream socket or a 6 KiB datagram queue for a UDP one,
+ * come from the kernel heap when the socket is created and go back on its last
+ * close.  Held in the slot they made the table 2.2 MiB of .bss at 32 entries,
+ * and the kernel image must fit boot.asm's initial mapping (linker.ld). */
+#define MAX_NET_SOCKETS 128
 #define UDP_QUEUE_DEPTH 4
 #define UDP_PACKET_MAX 1536
 #define TCP_RX_SIZE 65536   /* per-socket RX ring (burst headroom) */
@@ -64,13 +70,13 @@ struct net_socket {
     int tcp_error;      /* pending error (SO_ERROR), consumed when reported */
     int was_connected;  /* the handshake completed at some point */
     int peer_fin;       /* the peer's FIN arrived: recv reports EOF */
-    uint8_t tcp_rx[TCP_RX_SIZE];
+    uint8_t *tcp_rx;    /* SOCK_STREAM: TCP_RX_SIZE bytes from kmalloc */
     uint32_t tcp_rx_head;
     uint32_t tcp_rx_tail;
     uint32_t tcp_rx_count;
     ip_addr_t remote_addr;
     uint16_t remote_port;
-    udp_packet_t queue[UDP_QUEUE_DEPTH];
+    udp_packet_t *queue;  /* SOCK_DGRAM: UDP_QUEUE_DEPTH packets from kmalloc */
     int qhead;
     int qtail;
     int qcount;
@@ -268,6 +274,25 @@ static int socket_create_locked(int domain, int type, int protocol, net_socket_t
     if (type == SOCK_STREAM_K && protocol != 0 && protocol != IPPROTO_TCP_K)
         return -93;
 
+    net_socket_t *s = NULL;
+    for (int i = 0; i < MAX_NET_SOCKETS && !s; i++)
+        if (!sockets[i].used)
+            s = &sockets[i];
+    if (!s) {
+        printk("[NET] socket: all %d sockets in use\n", MAX_NET_SOCKETS);
+        return -24;
+    }
+
+    /* kmalloc takes the heap lock with interrupts off and never sleeps, so
+     * it is safe under the caller's preempt_disable. */
+    void *buf = type == SOCK_DGRAM_K
+        ? kmalloc(UDP_QUEUE_DEPTH * sizeof(udp_packet_t))
+        : kmalloc(TCP_RX_SIZE);
+    if (!buf) {
+        printk("[NET] socket: no memory for the socket buffer\n");
+        return -12;
+    }
+
     struct udp_pcb *upcb = NULL;
     struct tcp_pcb *tpcb = NULL;
     if (type == SOCK_DGRAM_K)
@@ -277,41 +302,33 @@ static int socket_create_locked(int domain, int type, int protocol, net_socket_t
     if (!upcb && !tpcb) {
         printk("[NET] socket: lwIP has no free %s pcb\n",
                type == SOCK_DGRAM_K ? "UDP" : "TCP");
+        kfree(buf);
         return -12;
     }
 
-    for (int i = 0; i < MAX_NET_SOCKETS; i++) {
-        if (!sockets[i].used) {
-            net_socket_t *s = &sockets[i];
-            memset(s, 0, sizeof(*s));
-            s->used = 1;
-            s->refs = 1;
-            s->domain = domain;
-            s->type = type;
-            s->protocol = protocol ? protocol :
-                          (type == SOCK_DGRAM_K ? IPPROTO_UDP_K : IPPROTO_TCP_K);
-            s->udp = upcb;
-            s->tcp = tpcb;
-            if (s->udp)
-                udp_recv(s->udp, udp_recv_cb, s);
-            if (s->tcp) {
-                tcp_arg(s->tcp, s);
-                tcp_recv(s->tcp, tcp_recv_cb);
-                tcp_err(s->tcp, tcp_err_cb);
-                tcp_poll(s->tcp, tcp_poll_cb, 2);
-                s->tcp_state = TCP_STATE_NONE;
-            }
-            *out = s;
-            return 0;
-        }
+    memset(s, 0, sizeof(*s));
+    s->used = 1;
+    s->refs = 1;
+    s->domain = domain;
+    s->type = type;
+    s->protocol = protocol ? protocol :
+                  (type == SOCK_DGRAM_K ? IPPROTO_UDP_K : IPPROTO_TCP_K);
+    s->udp = upcb;
+    s->tcp = tpcb;
+    if (s->udp) {
+        s->queue = (udp_packet_t *)buf;
+        udp_recv(s->udp, udp_recv_cb, s);
     }
-
-    printk("[NET] socket: all %d sockets in use\n", MAX_NET_SOCKETS);
-    if (upcb)
-        udp_remove(upcb);
-    if (tpcb)
-        tcp_abort(tpcb);
-    return -24;
+    if (s->tcp) {
+        s->tcp_rx = (uint8_t *)buf;
+        tcp_arg(s->tcp, s);
+        tcp_recv(s->tcp, tcp_recv_cb);
+        tcp_err(s->tcp, tcp_err_cb);
+        tcp_poll(s->tcp, tcp_poll_cb, 2);
+        s->tcp_state = TCP_STATE_NONE;
+    }
+    *out = s;
+    return 0;
 }
 
 void net_socket_retain(net_socket_t *s) {
@@ -327,6 +344,10 @@ static void socket_release_locked(net_socket_t *s) {
     if (s->udp)
         udp_remove(s->udp);
     socket_detach_pcb(s, 0);
+    /* No lwIP callback can reach s any more (udp_remove, and the detach
+     * cleared the TCP pcb's arg), so the buffers can go. */
+    kfree(s->tcp_rx);
+    kfree(s->queue);
     memset(s, 0, sizeof(*s));
 }
 

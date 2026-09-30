@@ -22,6 +22,16 @@
 
 KERNEL_VMA equ 0xC0000000
 
+; The boot page tables map the first BOOT_PAGE_TABLES * 4 MiB of physical
+; memory (identity + higher half).  The whole kernel image, .bss included, must
+; lie inside it: kernel_main runs on .bss (stack included) before
+; paging_init builds the real tables.  boot_mapped_bytes is exported so
+; linker.ld can ASSERT that _kernel_phys_end fits; adding a page table here
+; (and its PDE pair below) is how to raise the limit.
+BOOT_PAGE_TABLES equ 3
+global boot_mapped_bytes
+boot_mapped_bytes equ BOOT_PAGE_TABLES * 0x400000
+
 ; ─── Multiboot 1 header ─────────────────────────────────────────────────────
 ; Must appear within the first 8 KiB of the kernel image.
 section .multiboot
@@ -94,7 +104,7 @@ _start:
     ; (the kernel image incl. BSS exceeds 8 MiB; PT3 covers 8-12 MiB)
     mov edi, (boot_page_table1 - KERNEL_VMA)
     mov esi, 0                          ; physical frame counter (0, 4096, ...)
-    mov ecx, 3072                       ; 3 page tables, contiguous in .bss
+    mov ecx, BOOT_PAGE_TABLES * 1024    ; the page tables, contiguous in .bss
 .fill_loop:
     mov edx, esi
     or  edx, 0x003                      ; Present + Read/Write
