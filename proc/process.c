@@ -25,7 +25,7 @@ static int next_pid = 1;
 
 extern void trapret(void);  /* defined in isr.asm */
 
-#if KSTACK_TEST
+#if KSTACK_TEST && KSTACK_TEST != 4
 /*
  * Kernel-stack guard self-test (`make KSTACK_TEST=n`; compiled out otherwise,
  * so no build a user runs can reach it).  A kernel thread deliberately runs
@@ -69,7 +69,7 @@ void proc_init(void) {
     for (int i = 0; i < MAX_PROCS; i++)
         ptable[i].state = PROC_UNUSED;
     printk("[PROC] Process table initialized (%d slots).\n", MAX_PROCS);
-#if KSTACK_TEST
+#if KSTACK_TEST && KSTACK_TEST != 4
     proc_create_kthread(kstack_test_thread, "kstacktest");
 #endif
 }

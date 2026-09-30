@@ -19,6 +19,7 @@
 #include "../mm/vmm.h"
 #include "../arch/i686/mm/paging.h"
 #include "../mm/heap.h"
+#include "../mm/kstack.h"
 #include "../arch/i686/cpu/pit.h"
 #include "../proc/process.h"
 #include "../proc/scheduler.h"
@@ -40,6 +41,36 @@
 #include <stdint.h>
 
 void stack_chk_seed(void);   /* kernel/stack_chk.c */
+
+#if KSTACK_TEST == 4
+/* `make KSTACK_TEST=4`: the BSP overflows the stack its scheduler loop runs
+ * on, which must hit the guard below it (see bsp_scheduler_entry). */
+static volatile uint32_t bsp_test_depth;
+
+static uint32_t __attribute__((noinline)) bsp_test_recurse(uint32_t n) {
+    volatile uint8_t frame[256];
+    frame[0] = (uint8_t)n;
+    bsp_test_depth = n;
+    if (n == 0xFFFFFFFFU) return 0;     /* never: the guard stops us first */
+    return bsp_test_recurse(n + 1) + frame[0];
+}
+#endif
+
+/* The BSP's scheduler loop, entered on a guarded stack by kernel_main. */
+static void __attribute__((noreturn)) bsp_scheduler_entry(void) {
+#if KSTACK_TEST == 4
+    uint32_t esp;
+    __asm__ volatile("mov %%esp, %0" : "=r"(esp));
+    printk("[KSTACK-TEST] mode 4: BSP scheduler stack, esp=0x%08x\n",
+           (unsigned)esp);
+    bsp_test_recurse(0);
+    printk("[KSTACK-TEST] FAILED: overflow went unnoticed (depth %u)\n",
+           (unsigned)bsp_test_depth);
+    for (;;) __asm__ volatile("hlt");
+#endif
+    scheduler_start();
+    for (;;) __asm__ volatile("hlt");   /* unreachable */
+}
 
 void kernel_main(u32 mb_magic, u32 mb_phys) {
     /* First, before any protected frame is live that will return: see
@@ -202,5 +233,24 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
      * dispatched user process releases it in forkret on its way to user mode;
      * thereafter the BKL is held only while a CPU executes kernel code. */
     bkl_acquire();
-    scheduler_start(); /* never returns */
+
+    /* Boot ran on the 16 KiB .bss stack from boot.asm, which has nothing
+     * mapped-out below it: an overflow there would silently overwrite .bss.
+     * The scheduler loop (and every interrupt taken while it idles) runs on
+     * this CPU for good, so move it to a guarded stack from the kstack window,
+     * as the APs already do (smp.c).  Nothing on the old stack is used again. */
+    void *stack = kstack_alloc();
+    if (!stack) {
+        printk("[BOOT] no guarded stack for the BSP; staying on the boot stack\n");
+        bsp_scheduler_entry();
+    }
+    printk("[BOOT] BSP scheduler stack [0x%08x,0x%08x)\n",
+           (unsigned)(uintptr_t)stack, (unsigned)(uintptr_t)stack + KSTACKSIZE);
+    __asm__ volatile("mov %0, %%esp\n\t"
+                     "xor %%ebp, %%ebp\n\t"
+                     "call *%1"
+                     :: "r"((uint32_t)(uintptr_t)stack + KSTACKSIZE),
+                        "r"(bsp_scheduler_entry)
+                     : "memory");
+    __builtin_unreachable();
 }
