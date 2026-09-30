@@ -2,6 +2,7 @@
 #include "../include/string.h"
 #include "../include/fcntl.h"
 #include "../include/unistd.h"
+#include "../include/signal.h"
 
 #define NAME_MAX_LEN 32
 
@@ -43,12 +44,17 @@ static void load_hostname(void) {
 }
 
 /* One line from the console (canonical mode, echo on).  Returns the length,
- * or -1 on EOF/error.  Overlong input is read to the newline and rejected. */
+ * -2 when the line was cancelled, or -1 on a read error.  Overlong input is
+ * read to the newline and rejected.  The console ends a read with 0 bytes
+ * for ^C, ^Z (after signalling them, which getty ignores) and ^D: that
+ * cancels the line and getty prompts again instead of exiting. */
 static int read_name(char *buf, int cap) {
     int n = 0, overlong = 0;
     char c;
     while (1) {
-        if (read(0, &c, 1) != 1) return -1;
+        int r = read(0, &c, 1);
+        if (r == 0) return -2;
+        if (r != 1) return -1;
         if (c == '\n' || c == '\r') break;
         if (n < cap - 1) buf[n++] = c;
         else overlong = 1;
@@ -78,6 +84,15 @@ int main(int argc, char *argv[]) {
     char **envp = disk_login ? disk_envp : initrd_envp;
     char name[NAME_MAX_LEN + 1];
 
+    /* ^C/^Z/^\ on the console must not kill or stop getty: a killed getty
+     * is a rapid exit to init, and a stopped one is a console nobody
+     * respawns.  login ignores them too (exec resets dispositions here). */
+    signal(SIGINT, SIG_IGN);
+    signal(SIGQUIT, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
+    signal(SIGTTIN, SIG_IGN);
+    signal(SIGTTOU, SIG_IGN);
+
     /* A session of our own, so the console becomes this login's
      * controlling terminal (and init's other children never hold it). */
     setsid();
@@ -88,6 +103,11 @@ int main(int argc, char *argv[]) {
         printf("\n%s login: ", hostname);
         fflush(stdout);
         int n = read_name(name, sizeof(name));
+        if (n == -2) {
+            /* Cancelled line; a short pause so an endless EOF cannot spin. */
+            usleep(100000);
+            continue;
+        }
         if (n < 0) {
             /* No console to read from: exit and let init respawn us. */
             usleep(500000);

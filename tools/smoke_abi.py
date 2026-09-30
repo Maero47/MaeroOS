@@ -156,20 +156,11 @@ def check_watchdogs(selected, p18_mib):
 
 
 def wait_for(proc, sel, needle, log, timeout, start=0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        for key, _ in sel.select(0.2):
-            chunk = os.read(key.fd, 4096).decode("latin1", "replace")
-            if not chunk:
-                continue
-            log.append(chunk)
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
-            if needle in "".join(log)[start:]:
-                return True
-        if proc.poll() is not None:
-            raise RuntimeError(f"QEMU exited with status {proc.returncode}")
-    return False
+    try:
+        smokelib.wait_for(proc, sel, needle, log, timeout, start)
+        return True
+    except TimeoutError:
+        return False
 
 
 def send(proc, text):

@@ -22,6 +22,9 @@ static char *disk_service_argv[] = { "/disk/shell", "-c", (char *)0, (char *)0 }
 #define MAX_SESSIONS 4
 #define SESSION_ARG_MAX 8
 #define SESSION_CMD_MAX 128
+/* A parked session is retried after this many seconds, so the console can
+ * never be switched off for good (until the next boot). */
+#define SESSION_PARK_SECS 30
 
 typedef struct service {
     int respawn;
@@ -39,6 +42,7 @@ typedef struct session {
     char *argv[SESSION_ARG_MAX + 1];
     int  fast_exits;     /* consecutive immediate failures (for respawn backoff) */
     int  disabled;       /* parked after too many rapid failures */
+    long parked_time;    /* time() when parked (to retry after a pause) */
     long start_time;     /* time() when last started (to detect instant failures) */
 } session_t;
 
@@ -635,9 +639,16 @@ static void monitor_children(char *command_shell_path, char **envp) {
         int pid = waitpid(-1, &status, WNOHANG);
         if (pid <= 0) {
             poll_initctl(command_shell_path, envp);
+            long now = (long)time((time_t *)0);
             for (int i = 0; i < session_count; i++) {
-                if (sessions[i].pid <= 0 && !sessions[i].disabled)
-                    start_session(&sessions[i], envp);
+                session_t *sess = &sessions[i];
+                if (sess->disabled && now - sess->parked_time >= SESSION_PARK_SECS) {
+                    printf("[init] Session %s unparked; retrying\n", sess->id);
+                    sess->disabled = 0;
+                    sess->fast_exits = 0;
+                }
+                if (sess->pid <= 0 && !sess->disabled)
+                    start_session(sess, envp);
             }
             /* Nothing to do but wait; do not spin against the desktop or
              * the login shell. */
@@ -666,8 +677,9 @@ static void monitor_children(char *command_shell_path, char **envp) {
             if (session->fast_exits >= 8) {
                 if (!session->disabled) {
                     session->disabled = 1;
-                    printf("[init] Session %s keeps failing instantly; parking it.\n",
-                           session->id);
+                    session->parked_time = (long)time((time_t *)0);
+                    printf("[init] Session %s keeps failing instantly; parking it for %d s.\n",
+                           session->id, SESSION_PARK_SECS);
                 }
                 write_session_status();
                 continue;   /* do not respawn — stop the CPU storm */

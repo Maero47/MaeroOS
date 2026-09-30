@@ -191,10 +191,12 @@ enabled or disabled). It opens a control FIFO at `/tmp/initctl`, writes
 `/tmp/services.status` and `/tmp/sessions.status` for `svc` and `session` to read back,
 and appends to `/var/log/init.log` when the disk root is writable. Respawn has a backoff:
 only an exit within 3 seconds counts as a rapid failure, each one adds 0.25 s of delay up
-to 1 s, and after 8 in a row the session is parked instead of restarted. The console
-session is `getty`, on the disk and on an initrd-only boot alike: it prints a
+to 1 s, and after 8 in a row the session is parked for 30 s before init tries again. The
+console session is `getty`, on the disk and on an initrd-only boot alike: it prints a
 `maeros login:` prompt and execs `login`, which asks for the password (and waits 3 s
-after a wrong one), drops to the account's ids and starts its shell; logging out ends the
+after a wrong one), drops to the account's ids and starts its shell. Both ignore ^C and
+^Z until the shell runs: at the login prompt they just cancel the line, at `Password:`
+they fail that attempt; logging out ends the
 session and init respawns getty. When a framebuffer is present, init plays a startup
 chime through `wavplay` and runs the desktop as the unprivileged user, with the console
 getty running alongside it.

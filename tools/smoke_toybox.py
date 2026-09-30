@@ -14,25 +14,11 @@ TIMEOUT = 25.0
 
 
 def wait_for(proc, sel, needle, log, timeout=TIMEOUT, start=0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        for key, _ in sel.select(0.2):
-            chunk = os.read(key.fd, 4096).decode("latin1", "replace")
-            if not chunk:
-                continue
-            log.append(chunk)
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
-            if needle in "".join(log)[start:]:
-                return
-        if proc.poll() is not None:
-            raise RuntimeError(f"QEMU exited with status {proc.returncode}")
-    raise TimeoutError(f"timed out waiting for {needle!r}")
+    return smokelib.wait_for(proc, sel, needle, log, timeout, start)
 
 
 def send(proc, text):
-    proc.stdin.write(text.encode("latin1"))
-    proc.stdin.flush()
+    smokelib.send(proc, text)
 
 
 def main():

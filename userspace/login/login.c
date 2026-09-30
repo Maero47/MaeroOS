@@ -2,6 +2,7 @@
 #include "../include/string.h"
 #include "../include/unistd.h"
 #include "../include/grp.h"
+#include "../include/signal.h"
 #include "../auth/auth.h"
 
 #define FIELD_MAX 192
@@ -156,6 +157,19 @@ static void build_env(void) {
     snprintf(env_shell, sizeof(env_shell), "SHELL=%s", shell_path);
 }
 
+/* Console job-control signals.  Until the user's shell runs they are
+ * ignored: ^C or ^Z at "Password:" must not kill login (a rapid exit init
+ * counts toward parking the console) or stop it (nobody would respawn it,
+ * and echo would stay off).  The console then ends the read with 0 bytes,
+ * and login fails with "password required".  The shell gets the defaults
+ * back. */
+static const int console_sigs[] = { SIGINT, SIGQUIT, SIGTSTP, SIGTTIN, SIGTTOU };
+
+static void set_console_sigs(void (*handler)(int)) {
+    for (unsigned i = 0; i < sizeof(console_sigs) / sizeof(console_sigs[0]); i++)
+        signal(console_sigs[i], handler);
+}
+
 /* A rejected login waits before it exits, as shadow's FAIL_DELAY does: it
  * slows password guessing on the console, and it keeps a getty session from
  * ending in under 3 seconds, which init would count as a rapid failure and,
@@ -169,6 +183,8 @@ int main(int argc, char *argv[]) {
     int forced = 0;
     const char *name = "root";
     char password[128];
+
+    set_console_sigs(SIG_IGN);
 
     if (argc > 1 && strcmp(argv[1], "--check") == 0) {
         if (argc < 4) {
@@ -251,6 +267,7 @@ int main(int argc, char *argv[]) {
     printf("login: %s accepted\n", username);
 
     char *shell_argv[] = { shell_path, (char *)0 };
+    set_console_sigs(SIG_DFL);
     execve(shell_path, shell_argv, envp);
     printf("login: failed to exec %s\n", shell_path);
     return 1;
