@@ -18,6 +18,8 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 /* Ask the kernel to dump its cycle-accounting counters (kprof, syscall 503) at
  * the instant the paint marker appears, so the profile covers exactly the
@@ -268,6 +270,19 @@ static void dump_tail(const char *path, int maxbytes) {
     close(fd);
 }
 
+static int x_listening(void) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    strcpy(a.sun_path, "/tmp/.X11-unix/X0");
+    int ok = connect(fd, (struct sockaddr *)&a,
+                     (socklen_t)(sizeof(a.sun_family) + strlen(a.sun_path))) == 0;
+    close(fd);
+    return ok;
+}
+
 int main(void) {
     char *const *envp = build_env();
     printf("Starting maeroX X server in a desktop slot...\n");
@@ -283,8 +298,11 @@ int main(void) {
         execve(a[0], a, envp);
         _exit(127);
     }
-    usleep(1000000);   /* give maeroX ~1s to start listening */
-    usleep(1000000);
+    /* Wait until maeroX accepts connections (at most 5 s) rather than a fixed
+     * 2 s: it listens within a few hundred ms.  The bound name has no node in
+     * the filesystem, so probe it with connect(). */
+    for (int i = 0; i < 100 && !x_listening(); i++)
+        usleep(50000);
 
     mkdir("/tmp/ffhome", 0755);      /* writable $HOME for .mozilla/profiles.ini */
     mkdir("/tmp/fontcache", 0777);   /* fonts.conf <cachedir>; fontconfig needs
