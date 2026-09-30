@@ -49,6 +49,8 @@ enum {
     KPE_EXT2_RA_USED,       /* read-ahead blocks later served from the cache */
     KPE_PF_FILE_SEQ,        /* file fault on the page after the previous one */
     KPE_PF_FILE_AROUND,     /* pages populated by fault-around, not faulted  */
+    KPE_KMALLOC,            /* kmalloc/kmalloc_try calls                     */
+    KPE_HEAP_WALK,          /* heap blocks first_fit stepped over            */
     KPE_MAX
 };
 

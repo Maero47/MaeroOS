@@ -4,6 +4,7 @@
 #include "../kernel/printk.h"
 #include "../arch/i686/mm/paging.h"
 #include <kernel/config.h>
+#include <kernel/kprof.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -122,7 +123,9 @@ static void *kmalloc_nolock(size_t size);
 /* First-fit scan that allocates nothing, so a caller can ask whether a request
  * can be met out of what is already mapped. */
 static block_header_t *first_fit(size_t size) {
+    kprof_count(KPE_KMALLOC);
     for (block_header_t *b = heap_head; b; b = b->next) {
+        kprof_count(KPE_HEAP_WALK);
         if (b->magic != HEAP_MAGIC) {
             printk("[HEAP] PANIC: corrupt block at 0x%08x\n", (unsigned)(uintptr_t)b);
             panic("heap corruption", NULL);
