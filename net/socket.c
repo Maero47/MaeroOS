@@ -3,6 +3,7 @@
 #include "net.h"
 #include "firewall.h"
 #include "../lib/string.h"
+#include "../kernel/printk.h"
 #include "../arch/i686/cpu/pit.h"
 #include "../proc/scheduler.h"
 #include "../proc/process.h"
@@ -255,8 +256,11 @@ static int socket_create_locked(int domain, int type, int protocol, net_socket_t
         upcb = udp_new_ip_type(IPADDR_TYPE_V4);
     else
         tpcb = tcp_new_ip_type(IPADDR_TYPE_V4);
-    if (!upcb && !tpcb)
+    if (!upcb && !tpcb) {
+        printk("[NET] socket: lwIP has no free %s pcb\n",
+               type == SOCK_DGRAM_K ? "UDP" : "TCP");
         return -12;
+    }
 
     for (int i = 0; i < MAX_NET_SOCKETS; i++) {
         if (!sockets[i].used) {
@@ -284,6 +288,7 @@ static int socket_create_locked(int domain, int type, int protocol, net_socket_t
         }
     }
 
+    printk("[NET] socket: all %d sockets in use\n", MAX_NET_SOCKETS);
     if (upcb)
         udp_remove(upcb);
     if (tpcb)

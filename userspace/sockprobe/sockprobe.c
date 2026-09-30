@@ -79,29 +79,34 @@ static int http_halfclose(int fd) {
     return n == 0 && strstr(buf, "MAEROS_HTTP_OK") != NULL;
 }
 
-/* sockprobe tcptw <port> <n>: n half-closed fetches whose fds stay open while
- * their pcbs sit in TIME_WAIT, which lwIP frees without an err callback.
- * With n = MEMP_NUM_TCP_PCB (16), the next socket's pcb can only come from
- * recycling one of them (tcp_kill_timewait).  All the old fds are closed
- * while that new connection is live; a socket that still held its freed pcb
- * would detach and close the new connection's pcb.  The new connection must
- * then complete a fetch. */
+/* sockprobe tcptw <port> <n>: n half-closed fetches, whose pcbs then sit in
+ * TIME_WAIT, which lwIP frees without an err callback.  The first KEEP of them
+ * keep their fds open (they are the oldest TIME_WAIT pcbs); the rest are
+ * closed at once.  With n = MEMP_NUM_TCP_PCB (64), the next socket's pcb can
+ * only come from recycling the oldest TIME_WAIT pcb (tcp_kill_timewait) - one
+ * whose fd is still open.  All the old fds are closed while that new
+ * connection is live; a socket that still held its freed pcb would detach and
+ * close the new connection's pcb.  The new connection must then complete a
+ * fetch.  KEEP stays below the 32-entry socket table. */
+#define TCPTW_KEEP 24
 static int tcptw(int port, int n) {
-    int fds[32];
-    if (n > 32) n = 32;
+    int fds[TCPTW_KEEP];
+    int keep = n < TCPTW_KEEP ? n : TCPTW_KEEP;
     for (int i = 0; i < n; i++) {
-        fds[i] = http_connect(port);
-        if (fds[i] < 0 || !http_halfclose(fds[i])) {
+        int fd = http_connect(port);
+        if (fd < 0 || !http_halfclose(fd)) {
             printf("sockprobe: half-closed fetch %d failed errno=%d\n", i, errno);
             return 1;
         }
+        if (i < keep) fds[i] = fd;
+        else close(fd);
     }
     int fd = http_connect(port);
     if (fd < 0) {
         printf("sockprobe: connect with the pcb pool full failed errno=%d\n", errno);
         return 1;
     }
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < keep; i++)
         close(fds[i]);
     int ok = http_halfclose(fd);
     close(fd);

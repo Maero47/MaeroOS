@@ -25,10 +25,14 @@
 #define MEM_SIZE                        (256 * 1024)
 #define MEMP_NUM_PBUF                   32
 #define MEMP_NUM_RAW_PCB                8
-#define MEMP_NUM_UDP_PCB                8
-#define MEMP_NUM_TCP_PCB                16
+#define MEMP_NUM_UDP_PCB                16
+/* Firefox keeps background TLS sessions to Mozilla services open while it
+ * loads a page, and closed connections linger in FIN_WAIT/TIME_WAIT; with 16
+ * pcbs tcp_new() failed ("[NET] socket: lwIP has no free TCP pcb") and an
+ * image on the page was never requested, in 4 of 20 smoke-firefox --web boots. */
+#define MEMP_NUM_TCP_PCB                64
 #define MEMP_NUM_TCP_PCB_LISTEN         8
-#define MEMP_NUM_TCP_SEG                64
+#define MEMP_NUM_TCP_SEG                256
 #define PBUF_POOL_SIZE                  96
 #define PBUF_POOL_BUFSIZE               1536
 
