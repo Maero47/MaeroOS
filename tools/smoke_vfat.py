@@ -464,6 +464,7 @@ def usb_session(g, man):
                    "busybox mv /usb/usb-hello.txt /usb/Yedek/ && busybox rm /usb/DOS.TXT")
     check(rc == 0, f"USB: create, copy, mkdir, rename, unlink ({out.strip()[-200:]!r})")
     raw_write_refused(g, "/dev/sdd", "USB stick mounted read-write")
+    raw_write_refused(g, "/dev/usbdisk0", "the same stick through its raw USB node")
     rc, out = g.sh("maeros-install -l")
     check(re.search(r"sdd.*\(in use\)", out) is not None and
           re.search(r"sdc.*\(in use\)", out) is None,

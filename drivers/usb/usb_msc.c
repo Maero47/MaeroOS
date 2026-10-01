@@ -224,6 +224,10 @@ static uint32_t disk_read(vfs_node_t *n, uint32_t off, uint32_t len,
 static uint32_t disk_write(vfs_node_t *n, uint32_t off, uint32_t len,
                            const uint8_t *buf) {
     (void)n;
+    /* The same stick as /dev/sdX: never written behind a mounted
+     * filesystem's back (vfs_write_user passes a negative errno through). */
+    if (blk_index >= 0 && blkpart_disk_in_use(blk_index))
+        return (uint32_t)-16;                              /* -EBUSY */
     return disk_io(off, len, 0, buf);
 }
 

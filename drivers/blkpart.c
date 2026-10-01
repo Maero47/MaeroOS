@@ -41,6 +41,10 @@ static int source_on_disk(const char *source, void *arg) {
     return p && p->dev == *(const int *)arg;
 }
 
+int blkpart_disk_in_use(int dev) {
+    return blk_disk_busy(dev) || vfs_mount_any_source(source_on_disk, &dev);
+}
+
 int blkpart_rw(blkpart_t *bp, uint64_t off, uint8_t *buf, uint32_t len, int write) {
     if (!bp) return -19;                                   /* -ENODEV */
     uint64_t size = (uint64_t)bp->nsect * 512u;
@@ -50,9 +54,7 @@ int blkpart_rw(blkpart_t *bp, uint64_t off, uint8_t *buf, uint32_t len, int writ
     /* The disk ext2 has mounted at /disk, and any disk with a mounted
      * partition (vfat, ext4; a USB stick too), is never written behind the
      * filesystem's back. */
-    if (write && (blk_disk_busy(bp->dev) ||
-                  vfs_mount_any_source(source_on_disk, &bp->dev)))
-        return -16;                                        /* -EBUSY */
+    if (write && blkpart_disk_in_use(bp->dev)) return -16; /* -EBUSY */
     uint8_t *sec = NULL;
     uint32_t done = 0;
     int err = 0;

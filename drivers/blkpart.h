@@ -56,6 +56,9 @@ int blkpart_write(blkpart_t *bp, uint32_t sector, uint32_t count, const void *bu
  * the end of the device), 0 at EOF on a read, or -errno (-ENOSPC past the end
  * on a write, -EBUSY writing to the disk mounted at /disk, -EIO). */
 int blkpart_rw(blkpart_t *bp, uint64_t off, uint8_t *buf, uint32_t len, int write);
+/* 1 when disk `dev` is the /disk disk or holds a mounted filesystem (one of
+ * its nodes is some mount's source): raw writes to it are refused. */
+int blkpart_disk_in_use(int dev);
 
 /* The partition whose GPT unique GUID is `uuid` (the usual text form, any
  * case), for root=PARTUUID=...; NULL when none. */
