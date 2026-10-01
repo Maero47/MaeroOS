@@ -5112,7 +5112,19 @@ int main(void) {
     /* The display stays in framebuffer mode after we exit (no text-mode
      * switch exists), so "returning to shell" would just freeze the screen.
      * QUIT means leave the machine: power off cleanly. */
-    /* reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, CMD_POWER_OFF) */
-    syscall3(88, (int)0xFEE1DEADu, 672274793, (int)0x4321FEDCu);
+    /* reboot(2) is root-only; the session user asks init, which owns
+     * /tmp/powerctl (writable by the session group). */
+    int pfd = open("/tmp/powerctl", O_WRONLY | O_NONBLOCK);
+    if (pfd >= 0 && write(pfd, "poweroff\n", 9) == 9) {
+        close(pfd);
+        printf("desktop: asked init to power off\n");
+        return 0;
+    }
+    if (pfd >= 0) close(pfd);
+    if (geteuid() == 0) {
+        /* reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, CMD_POWER_OFF) */
+        syscall3(88, (int)0xFEE1DEADu, 672274793, (int)0x4321FEDCu);
+    }
+    printf("desktop: cannot power off (no /tmp/powerctl)\n");
     return 0;
 }

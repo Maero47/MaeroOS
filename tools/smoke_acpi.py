@@ -9,7 +9,9 @@ For each machine type (QEMU's default i440FX/PIIX4 `pc` and the ICH9 `q35`):
   - boot again with -no-reboot, run `reboot`: QEMU must exit (a reset with
     -no-reboot ends QEMU) after the kernel's "[ACPI] restarting";
   - boot again and press the ACPI power button (monitor `system_powerdown`):
-    the SCI's fixed event reaches init as SIGUSR2 and init powers off.
+    the SCI's fixed event reaches init as SIGUSR2 and init powers off;
+  - boot again and run `halt --halt` (reboot(2) HALT): the kernel must log
+    "System halted" and QEMU must keep running, quiet.
 Machines can be narrowed with SMOKE_ACPI_MACHINES="pc" etc.; SMOKE_SMP=N adds
 -smp N.
 """
@@ -81,6 +83,13 @@ def run_case(machine, command, extra, expect_msg):
             press_power_button(mon_path)
         else:
             smokelib.send(proc, command + "\n")
+        if command.startswith("halt"):
+            if drain_until_exit(proc, sel, log, 5.0):
+                return f"{machine}: QEMU exited after `{command}`"
+            if expect_msg not in "".join(log):
+                return f"{machine}: no {expect_msg!r} after `{command}`"
+            print(f"\n[smoke-acpi] {machine}: `{command}` -> halted, QEMU still up")
+            return None
         if not drain_until_exit(proc, sel, log, EXIT_TIMEOUT):
             return f"{machine}: QEMU still running {EXIT_TIMEOUT:.0f}s after `{command}`"
         took = time.time() - start
@@ -114,7 +123,8 @@ def main():
         for command, extra, msg in (
                 ("poweroff", [], "[ACPI] powering off"),
                 ("reboot", ["-no-reboot"], "[ACPI] restarting"),
-                ("power-button", [], "[init] Power button: shutting down")):
+                ("power-button", [], "[init] Power button: shutting down"),
+                ("halt --halt", [], "[REBOOT] System halted.")):
             err = run_case(m, command, extra, msg)
             if err:
                 failures.append(err)
@@ -123,7 +133,7 @@ def main():
         for f in failures:
             print("[smoke-acpi] FAIL:", f)
         return 1
-    print(f"[smoke-acpi] PASS: poweroff, reboot and power button on {', '.join(machines)}")
+    print(f"[smoke-acpi] PASS: poweroff, reboot, power button and halt on {', '.join(machines)}")
     return 0
 
 

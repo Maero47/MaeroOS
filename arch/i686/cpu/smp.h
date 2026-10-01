@@ -11,6 +11,10 @@ uint32_t smp_boot_aps(void);
 /* Number of online CPUs (1 until smp_boot_aps reports more). */
 uint32_t smp_cpu_count(void);
 
+/* Park every other CPU for good (INIT IPI: wait-for-SIPI), for reboot(2)'s
+ * HALT.  Call with interrupts off. */
+void smp_stop_others(void);
+
 /* AP C entry point (called from the trampoline; not for direct use). */
 void ap_entry(void);
 

@@ -16,6 +16,7 @@
 #include "../drivers/vga.h"
 #include "../drivers/framebuffer.h"
 #include "../drivers/acpi.h"
+#include "../arch/i686/cpu/smp.h"
 #include "../drivers/keyboard.h"
 #include "../kernel/random.h"
 #include "../kernel/panic.h"
@@ -5494,8 +5495,8 @@ static int sys_mknodat(registers_t *regs) {
  * Linux kernel/reboot.c: magic must be LINUX_REBOOT_MAGIC1 and magic2 one of
  * the four MAGIC2 values (else -EINVAL); unknown commands are -EINVAL.  The
  * power paths live in drivers/acpi.c (S5 via \_S5, FADT reset register).
- * Note: Linux also requires CAP_SYS_BOOT; here any user may call it, because
- * the desktop (running as the session user) powers off through it. */
+ * Only root may call it (Linux CAP_SYS_BOOT, checked before the magic): the
+ * desktop, which runs as the session user, asks init through /tmp/powerctl. */
 #define LINUX_REBOOT_MAGIC1         0xFEE1DEAD
 #define LINUX_REBOOT_CMD_RESTART    0x01234567
 #define LINUX_REBOOT_CMD_HALT       0xCDEF0123
@@ -5504,6 +5505,8 @@ static int sys_mknodat(registers_t *regs) {
 #define LINUX_REBOOT_CMD_POWER_OFF  0x4321FEDC
 static int sys_reboot(registers_t *regs) {
     uint32_t magic = regs->ebx, magic2 = regs->ecx, cmd = regs->edx;
+    if (!current_proc || current_proc->euid != 0)
+        return -1;    /* -EPERM */
     if (magic != LINUX_REBOOT_MAGIC1 ||
         (magic2 != 672274793 && magic2 != 85072278 &&
          magic2 != 369367448 && magic2 != 537993216))
@@ -5515,6 +5518,10 @@ static int sys_reboot(registers_t *regs) {
     case LINUX_REBOOT_CMD_RESTART:
         acpi_reboot();
     case LINUX_REBOOT_CMD_HALT:
+        /* Linux kernel_halt(): stop the other CPUs, then this one.  Writes
+         * are already on disk (fsync/sync have nothing to flush here). */
+        __asm__ volatile("cli");
+        smp_stop_others();
         printk("[REBOOT] System halted.\n");
         for (;;) __asm__ volatile("cli; hlt");
     case LINUX_REBOOT_CMD_CAD_ON:

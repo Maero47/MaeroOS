@@ -575,29 +575,64 @@ static void handle_control_line(char *line, char *shell_path, char **envp) {
     printf("[init] Unsupported control command %s\n", cmd);
 }
 
-/* The ACPI power button (drivers/acpi.c) sends init SIGUSR2, busybox init's
- * "power off" signal.  The handler only records it; the init loops act on it
- * in poll_initctl, which every one of them calls. */
-static volatile int poweroff_requested;
+/* Power requests.  reboot(2) is root-only, so the unprivileged session asks
+ * init: the ACPI power button (drivers/acpi.c) sends SIGUSR2, busybox init's
+ * "power off" signal, and the desktop writes "poweroff" or "reboot" to
+ * /tmp/powerctl, which only root and the session group may write.  The
+ * handler only records the request; the init loops act on it in
+ * poll_initctl, which every one of them calls. */
+#define POWER_OFF_CMD 0x4321FEDC
+#define RESTART_CMD   0x01234567
+static volatile int power_request;      /* 0, or the reboot(2) command */
+static int powerctl_fd = -1;
 
 static void on_sigusr2(int sig) {
     (void)sig;
-    poweroff_requested = 1;
+    power_request = POWER_OFF_CMD;
 }
 
-static void power_off_now(void) {
-    printf("[init] Power button: shutting down\n");
-    init_log("power button: shutting down");
+static void power_now(int cmd, const char *why) {
+    printf("[init] %s: %s\n", why,
+           cmd == RESTART_CMD ? "restarting" : "shutting down");
+    init_log(cmd == RESTART_CMD ? "restarting" : "shutting down");
     kill(-1, SIGTERM);              /* every process but init */
     usleep(500000);
     kill(-1, SIGKILL);
     sync();
-    /* reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, CMD_POWER_OFF) */
-    syscall3(88, (int)0xFEE1DEADu, 672274793, (int)0x4321FEDCu);
+    /* reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, cmd) */
+    syscall3(88, (int)0xFEE1DEADu, 672274793, cmd);
+    power_request = 0;              /* only reached if reboot(2) failed */
+}
+
+static void setup_powerctl(void) {
+    mkdir("/tmp", 0755);
+    unlink("/tmp/powerctl");
+    mkfifo("/tmp/powerctl", 0600);
+    powerctl_fd = open("/tmp/powerctl", O_RDONLY);
+    if (powerctl_fd < 0) return;
+    if (fchown(powerctl_fd, 0, SESSION_GID) != 0 ||
+        fchmod(powerctl_fd, 0620) != 0)
+        printf("[init] WARNING: cannot open /tmp/powerctl to the session\n");
+}
+
+static void poll_powerctl(void) {
+    if (powerctl_fd < 0) return;
+    struct pollfd pfd;
+    pfd.fd = powerctl_fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    if (poll(&pfd, 1, 0) <= 0) return;
+    char buf[32];
+    int n = read(powerctl_fd, buf, sizeof(buf) - 1);
+    if (n <= 0) return;
+    buf[n] = '\0';
+    if (!strncmp(buf, "poweroff", 8))     power_now(POWER_OFF_CMD, "Power off requested");
+    else if (!strncmp(buf, "reboot", 6))  power_now(RESTART_CMD, "Reboot requested");
 }
 
 static void poll_initctl(char *shell_path, char **envp) {
-    if (poweroff_requested) power_off_now();
+    if (power_request) power_now(power_request, "Power button");
+    poll_powerctl();
     if (initctl_fd < 0) return;
 
     struct pollfd pfd;
@@ -761,6 +796,8 @@ int main(void) {
 
     if (disk_userland)
         load_inittab();
+
+    setup_powerctl();
 
     if (disk_userland && file_readable("/etc/services")) {
         setup_initctl();

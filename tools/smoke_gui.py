@@ -596,13 +596,16 @@ class GuiSmoke:
         return steps
 
     def power_off(self):
-        """Start menu -> Power off: the desktop exits and calls reboot(2),
-        which must enter ACPI S5 (QEMU runs with -no-shutdown, so it stays
-        up; the kernel's log line is the proof)."""
+        """Start menu -> Power off: the desktop (uid 1000, which reboot(2)
+        refuses) asks init through /tmp/powerctl, and init's reboot(2) must
+        enter ACPI S5 (QEMU runs with -no-shutdown, so it stays up; the
+        kernel's log line is the proof)."""
         self.click(*self.orb)
         m = self.con.wait_re(r"\[desktop\] launcher open settings=\d+,\d+ "
                              r"power=(\d+),(\d+)")
         self.click(int(m.group(1)), int(m.group(2)))
+        self.con.wait_re(r"\[init\] Power off requested: shutting down",
+                         timeout=15)
         self.con.wait_re(r"\[ACPI\] powering off", timeout=15)
         self.con.pump(1.0)
         if "S5 failed" in self.con.text():

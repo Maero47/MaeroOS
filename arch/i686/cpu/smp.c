@@ -159,6 +159,14 @@ static void send_ipi(uint8_t apicid, uint32_t icr_lo) {
     ipi_wait_delivery();
 }
 
+void smp_stop_others(void) {
+    if (!apic_available() || g_cpu_count < 2) return;
+    /* Destination shorthand "all excluding self", INIT, level assert. */
+    apic_write(LAPIC_REG_ICR_HI, 0);
+    apic_write(LAPIC_REG_ICR_LO, (3U << 18) | (1U << 14) | 0x500U);
+    ipi_wait_delivery();
+}
+
 /* ── AP C entry (higher half; kernel pgdir + trampoline GDT) ─────────────── */
 void ap_entry(void) {
     apic_init();                 /* per-CPU LAPIC enable (AP masks LINT0/1) */

@@ -10,7 +10,8 @@
  * suid 0, checks the saved-set-uid rules, drops for good with
  * setresuid(1000,1000,1000), and then checks that an ordinary user cannot
  * unlink, rename or truncate root's files, write through a read-only
- * descriptor, map one writable, signal init, or move another process's group.
+ * descriptor, map one writable, signal init, move another process's group,
+ * or power off, restart or halt the machine with reboot(2).
  *
  * Prints "credprobe: <case> ok" per case and "credprobe ok" at the end;
  * tools/smoke_disk.py waits for the latter and fails on "FAILED".
@@ -37,6 +38,7 @@
 #define NR_FTRUNCATE    93
 #define NR_MPROTECT     125
 #define NR_PWRITE64     181
+#define NR_REBOOT       88
 #define NR_MMAP2        192
 #define NR_MUNMAP       91
 #define NR_FCHOWN32     207
@@ -347,6 +349,15 @@ static void user_checks(void) {
     check("setpgid on parent is ESRCH", r == -ESRCH, r);
     r = syscall2(NR_SETPGID, 1, 1);
     check("setpgid on init is ESRCH", r == -ESRCH, r);
+
+    /* reboot(2) needs CAP_SYS_BOOT: with valid magic numbers, every command
+     * is EPERM for an ordinary user (a failure here ends the run loudly). */
+    r = syscall3(NR_REBOOT, (int)0xFEE1DEADu, 672274793, (int)0xCDEF0123u);
+    check("reboot(HALT) is EPERM", r == -EPERM, r);
+    r = syscall3(NR_REBOOT, (int)0xFEE1DEADu, 672274793, (int)0x4321FEDCu);
+    check("reboot(POWER_OFF) is EPERM", r == -EPERM, r);
+    r = syscall3(NR_REBOOT, (int)0xFEE1DEADu, 672274793, 0x01234567);
+    check("reboot(RESTART) is EPERM", r == -EPERM, r);
 
     /* A pipeline: the first stage leads the job's group and may have exited
      * (unreaped) before the next stage joins it.  The zombie leader still
