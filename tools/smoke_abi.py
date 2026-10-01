@@ -105,6 +105,8 @@ PROBES = {
     "p41_renameat2":           (60, ""),
     # rtnetlink and the SIOC* interface ioctls (busybox ip, ifconfig, udhcpc).
     "p42_netlink":             (60, ""),
+    "p43_lock_close_race":     (60, ""),
+    "p44_proc_fd_link":        (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

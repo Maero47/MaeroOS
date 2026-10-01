@@ -60,6 +60,8 @@ regression tests for the fixes in audit section 5.
 | P40 | `p40_flock.c`               | `flock` and `fcntl` record locks exclude, wait and go away on close (apk's database lock) | — |
 | P41 | `p41_renameat2.c`           | `renameat2` with flags 0 and `RENAME_NOREPLACE` (busybox 1.37 in Alpine 3.24) | — |
 | P42 | `p42_netlink.c`             | rtnetlink `RTM_GETLINK` dump and error ack, `SIOCGIFINDEX`/`SIOCGIFNAME`/`SIOCGIFCONF` agree (busybox `ip`, `ifconfig`, udhcpc) | — |
+| P43 | `p43_lock_close_race.c`     | a descriptor closed while `F_SETLKW`/`flock` waits leaves no lock behind (`F_SETLKW`: `EBADF`) | — |
+| P44 | `p44_proc_fd_link.c`        | `/proc/<pid>/fd/N` links name the open file (`ttyname`); another user's are `EACCES` | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the

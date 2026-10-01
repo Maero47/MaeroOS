@@ -129,16 +129,30 @@ static void unlock_all(int (*match)(const flk_t *, const void *), const void *ar
 
 /* Take a `type` lock (F_UNLCK releases) for `owner`, waiting for conflicting
  * locks to go unless `nb`. */
-static int set_lock(fkey_t k, int kind, uintptr_t owner, int type,
+/* The descriptor `f` still holds the open file it held before a wait: a
+ * thread sharing the table may have closed it (or closed it and opened
+ * something else in the slot) while we slept. */
+static int fd_unchanged(const proc_file_t *f, const vfs_node_t *node, uint32_t fid) {
+    return f->type == FD_FILE && f->node == node && f->fid == fid;
+}
+
+/* Take a `type` lock (F_UNLCK releases) for `owner` on the file `f` holds,
+ * waiting for conflicting locks to go unless `nb`.  A descriptor closed
+ * during the wait gets no lock (-EBADF, as Linux fcntl_setlk answers that
+ * race): inserted, it would belong to an owner nothing can release. */
+static int set_lock(proc_file_t *f, fkey_t k, int kind, uintptr_t owner, int type,
                     int64_t start, int64_t end, int nb) {
     if (type == F_UNLCK_K)
         return unlock_range(k, kind, owner, start, end);
+    const vfs_node_t *node = f->node;
+    uint32_t fid = f->fid;
     for (;;) {
         if (!find_conflict(k, kind, owner, type, start, end))
             break;
         if (nb) return -11;                            /* -EAGAIN */
         if (signal_interrupt_pending(current_proc)) return -4;
         sleep_on(&lock_wq);
+        if (!fd_unchanged(f, node, fid)) return -9;    /* -EBADF */
     }
     flk_t *n = (flk_t *)kmalloc(sizeof(*n));
     if (!n) return -37;
@@ -183,7 +197,7 @@ int flock_bsd(proc_file_t *f, int op) {
             unlock_range(k, LK_FLOCK, f->fid, 0, OFF_MAX);
             break;
         }
-    return set_lock(k, LK_FLOCK, f->fid, type, 0, OFF_MAX, (op & 4) != 0);
+    return set_lock(f, k, LK_FLOCK, f->fid, type, 0, OFF_MAX, (op & 4) != 0);
 }
 
 /* struct flock on i386: short l_type, l_whence; then off_t (32-bit) or
@@ -271,7 +285,9 @@ int flock_fcntl(proc_file_t *f, int cmd, void *uarg) {
     int acc = f->flags & O_ACCMODE;
     if (fl.type == F_RDLCK_K && acc == O_WRONLY) return -9;
     if (fl.type == F_WRLCK_K && acc == O_RDONLY) return -9;
-    return set_lock(k, kind, owner, fl.type, start, end, !wait);
+    /* An identity for the descriptor, so a wait can tell it was closed. */
+    if (wait && !f->fid) f->fid = fd_new_fid();
+    return set_lock(f, k, kind, owner, fl.type, start, end, !wait);
 }
 
 /* Another descriptor of the open file description `fid` is still open

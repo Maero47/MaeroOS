@@ -5720,6 +5720,11 @@ static int proc_fd_readlink(const char *abs, char *out, uint32_t cap) {
         if (!who) return 1;
     }
     if (!path_has_prefix(p, "fd/")) return 1;
+    /* Another process's descriptors are its business: root or the same
+     * user only (Linux: PTRACE_MODE_READ on proc_fd_link). */
+    if (who != current_proc && who->tgid != current_proc->tgid &&
+        current_proc->euid != 0 && current_proc->euid != who->uid)
+        return -13;                                         /* -EACCES */
     p += 3;
     int fd = 0;
     if (*p < '0' || *p > '9') return 1;
