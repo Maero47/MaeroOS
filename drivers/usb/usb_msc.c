@@ -268,14 +268,20 @@ static int disk_ready(vfs_node_t *n) {
     return 1;
 }
 
+/* A disk being attached (dev set for its SCSI commands) is not listed until
+ * its node is filled in, which is the last step. */
+static int disk_listed(const msc_disk_t *k) {
+    return k->dev && k->node.read_fn;
+}
+
 vfs_node_t *usb_msc_node_at(int unit) {
     msc_disk_t *k = unit_disk(unit);
-    return k && k->dev ? &k->node : 0;
+    return k && disk_listed(k) ? &k->node : 0;
 }
 
 vfs_node_t *usb_msc_node(const char *name) {
     for (int i = 0; i < USB_MSC_MAX_DISKS; i++)
-        if (disks[i].dev && strcmp(disks[i].name, name) == 0)
+        if (disk_listed(&disks[i]) && strcmp(disks[i].name, name) == 0)
             return &disks[i].node;
     return 0;
 }
