@@ -2,7 +2,6 @@
 #include "vfs.h"
 #include "../proc/process.h"
 #include "../drivers/pci.h"
-#include "../drivers/rtl8139.h"
 #include "../net/net.h"
 #include "../net/lwip_glue.h"
 #include "../net/firewall.h"
@@ -806,42 +805,36 @@ static uint32_t procfs_pci_read(vfs_node_t *n, uint32_t off, uint32_t len,
 static uint32_t procfs_netif_read(vfs_node_t *n, uint32_t off, uint32_t len,
                                   uint8_t *buf) {
     (void)n;
-    char content[512];
+    char content[1024];
     uint32_t pos = 0;
-    const rtl8139_info_t *rtl = rtl8139_get_info();
     net_poll_all();
 
-    if (rtl && rtl->present) {
-        netif_t *iface = net_find_interface("eth0");
-        pappend(content, &pos, sizeof(content), "eth0: rtl8139 up ");
-        pappend(content, &pos, sizeof(content), "io=0x");
-        pappend_hex(content, &pos, sizeof(content), rtl->io_base, 4);
-        pappend(content, &pos, sizeof(content), " irq=");
-        pappend_int(content, &pos, sizeof(content), rtl->irq);
-        pappend(content, &pos, sizeof(content), " mac=");
-        for (int i = 0; i < 6; i++) {
-            if (i) pappend(content, &pos, sizeof(content), ":");
-            pappend_hex(content, &pos, sizeof(content), rtl->mac[i], 2);
-        }
-        pappend(content, &pos, sizeof(content), " rx=0x");
-        pappend_hex(content, &pos, sizeof(content), rtl->rx_config, 8);
-        pappend(content, &pos, sizeof(content), " tx=0x");
-        pappend_hex(content, &pos, sizeof(content), rtl->tx_config, 8);
-        if (iface) {
-            char ipbuf[128];
-            pappend(content, &pos, sizeof(content), " txpkts=");
-            pappend_int(content, &pos, sizeof(content), iface->tx_packets);
-            pappend(content, &pos, sizeof(content), " rxpkts=");
-            pappend_int(content, &pos, sizeof(content), iface->rx_packets);
-            pappend(content, &pos, sizeof(content), " drop=");
-            pappend_int(content, &pos, sizeof(content), iface->rx_dropped);
-            if (net_lwip_ipv4(ipbuf, sizeof(ipbuf)) > 0)
-                pappend(content, &pos, sizeof(content), ipbuf);
-        }
+    /* One line per NIC: "<name>: <driver> up <driver details> txpkts=...
+     * rxpkts=... drop=...", and lwIP's address on eth0, the interface it
+     * runs on. */
+    for (int i = 0; i < net_interface_count(); i++) {
+        netif_t *iface = net_get_interface(i);
+        char tmp[160];
+        pappend(content, &pos, sizeof(content), iface->name);
+        pappend(content, &pos, sizeof(content), ": ");
+        pappend(content, &pos, sizeof(content),
+                iface->driver ? iface->driver : "nic");
+        pappend(content, &pos, sizeof(content), " up ");
+        if (iface->describe && iface->describe(iface, tmp, sizeof(tmp)) > 0)
+            pappend(content, &pos, sizeof(content), tmp);
+        pappend(content, &pos, sizeof(content), " txpkts=");
+        pappend_int(content, &pos, sizeof(content), iface->tx_packets);
+        pappend(content, &pos, sizeof(content), " rxpkts=");
+        pappend_int(content, &pos, sizeof(content), iface->rx_packets);
+        pappend(content, &pos, sizeof(content), " drop=");
+        pappend_int(content, &pos, sizeof(content), iface->rx_dropped);
+        if (strcmp(iface->name, "eth0") == 0 &&
+            net_lwip_ipv4(tmp, sizeof(tmp)) > 0)
+            pappend(content, &pos, sizeof(content), tmp);
         pappend(content, &pos, sizeof(content), "\n");
-    } else {
-        pappend(content, &pos, sizeof(content), "no network interfaces\n");
     }
+    if (pos == 0)
+        pappend(content, &pos, sizeof(content), "no network interfaces\n");
     content[pos] = '\0';
 
     if (off >= pos) return 0;

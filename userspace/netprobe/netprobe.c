@@ -26,7 +26,9 @@ int main(void) {
 
     if (read_netif(before, sizeof(before)) < 0)
         return 1;
-    if (!strstr(before, "eth0: rtl8139 up")) {
+    /* "eth0: <driver> up ..." -- rtl8139 or e1000 */
+    char *eth0 = strstr(before, "eth0: ");
+    if (!eth0 || !strstr(eth0, " up ")) {
         printf("netprobe: eth0 missing\n");
         return 1;
     }

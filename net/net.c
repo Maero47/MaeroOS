@@ -105,6 +105,7 @@ void net_receive_ethernet(netif_t *iface, const void *data, uint32_t len) {
 void knetd(void) {
     for (;;) {
         net_poll_all();
+        net_lwip_write_resolv_conf();
         current_proc->wake_tick = pit_ticks() + 5;
         sleep_on(&io_activity);
     }

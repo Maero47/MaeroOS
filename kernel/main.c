@@ -32,6 +32,7 @@
 #include "../drivers/ata.h"
 #include "../drivers/pci.h"
 #include "../drivers/rtl8139.h"
+#include "../drivers/e1000.h"
 #include "../drivers/framebuffer.h"
 #include "../drivers/keyboard.h"
 #include "../drivers/mouse.h"
@@ -156,6 +157,7 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     net_init();
     pci_init();
     rtl8139_init();
+    e1000_init();
     ac97_init();
     net_lwip_init();
     ata_init();
