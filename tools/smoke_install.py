@@ -321,7 +321,7 @@ def boot_installed(name, qemu, firmware, accel, code=None, vars_src=None,
         if m.group(2) != firmware:
             raise AssertionError(f"kernel saw {m.group(2)} firmware, expected {firmware}")
         m = con.wait_re(r"\[BOOT\] root=PARTUUID=([0-9a-f-]+) is (/dev/\w+)", timeout=60)
-        root_dev = m.group(2)
+        root_uuid, root_dev = m.group(1), m.group(2)
         if root_dev != "/dev/sda3":
             raise AssertionError(f"root is {root_dev}, expected /dev/sda3")
         con.wait_re(r"\[BOOT\] Launching /disk/init", timeout=60)
@@ -332,6 +332,16 @@ def boot_installed(name, qemu, firmware, accel, code=None, vars_src=None,
         mounts = con.run("cat /proc/mounts", timeout=20)
         if not re.search(r"^/dev/sda3 /disk ext2 ", mounts, re.M):
             raise AssertionError(f"/disk is not /dev/sda3:\n{mounts}")
+        # The ESP (FAT32 from maeros-install's own FAT writer) through the
+        # kernel's vfat driver: limine.conf must name this root.
+        esp = con.run("busybox sh -c 'busybox mkdir -p /tmp/esp && "
+                      "busybox mount -t vfat -o ro /dev/sda2 /tmp/esp && "
+                      "busybox cat /tmp/esp/boot/limine/limine.conf && "
+                      "busybox ls /tmp/esp/EFI/BOOT && busybox umount /tmp/esp'",
+                      timeout=30)
+        if f"root=PARTUUID={root_uuid}" not in esp or "BOOTX64.EFI" not in esp:
+            raise AssertionError(f"ESP /dev/sda2 through vfat: limine.conf or "
+                                 f"EFI/BOOT not as installed:\n{esp}")
         if expect is not None:
             got = con.run("cat /disk/persist.txt", timeout=20)
             if expect not in got:
@@ -351,7 +361,8 @@ def boot_installed(name, qemu, firmware, accel, code=None, vars_src=None,
         if colors < 50:
             raise AssertionError(f"desktop screen has only {colors} colours")
         poweroff(con)
-        return (f"Limine ({firmware}) -> root {root_dev}, login, desktop {fb[0]}x{fb[1]} "
+        return (f"Limine ({firmware}) -> root {root_dev}, ESP mounted as vfat, "
+                f"login, desktop {fb[0]}x{fb[1]} "
                 f"({colors} colours), {time.time() - t0:.1f}s")
     except Exception:
         print(f"\n[SMOKE-INSTALL] {name}: last serial output:\n{con.text()[-3000:]}",
