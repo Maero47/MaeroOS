@@ -45,6 +45,13 @@ Checks:
     the same names with the same data; stick A once on the hub's port; no
     transfer timeouts or errors in the log, and as many devices in use
     afterwards as before;
+  - two exFAT sticks plugged in behind the hub (QMP), mounted together
+    without -t (exfat found through /proc/filesystems, listed after vfat), a
+    file copied each way and one moved across (rename(2) between the two
+    instances is EXDEV, so mv copies); stick X unmounted and checked on the
+    host (tools/exfatimg.py and fsck.exfat -n); stick Y pulled out while
+    mounted with a reader on it: no panic, the mount can be taken down, and
+    plugged back in it mounts again with its data;
   - kusbd's CPU time over 10 idle seconds (/proc/cputime), reported.
 
 The serial console is only used to log in a root shell for those checks (the
@@ -64,6 +71,8 @@ import time
 
 import smokelib
 import smoke_gui
+import mkexfatimg
+from exfatimg import Volume
 from smoke_gui import Console, Qmp, Image, GuiSmoke, KEYMAP, key, btn
 
 ROOT = smoke_gui.ROOT
@@ -78,6 +87,8 @@ STICK_SIZE, STICK_B_SIZE = 8 << 20, 16 << 20
 WRITE_AT, WRITE_TEXT = STICK_SIZE - 3000, "written-over-usb"
 REPLUGS = 5
 LUN_SIZES = (2 << 20, 3 << 20)
+# Two exFAT sticks plugged in late, behind the hub.
+EXFAT_STICKS = (("X", "uexx", "3.4", 4 << 20), ("Y", "uexy", "3.5", 6 << 20))
 ENV = dict(os.environ, MTOOLS_SKIP_CHECK="1")
 
 
@@ -95,6 +106,24 @@ def make_stick(path, size, label, files):
         subprocess.run(["mcopy", "-i", path, src, "::" + name], check=True,
                        env=ENV)
         os.remove(src)
+
+
+def make_exfat_stick(path, size, files):
+    """An exFAT volume on the whole device (no partition table)."""
+    mkexfatimg.mkfs(path, size)
+    v = Volume(path)
+    for name, data in files.items():
+        v.add_file(name, data)
+    v.close()
+
+
+def exfat_tree(path):
+    """{name: md5} of the files on an exFAT image, and checker problems."""
+    v = Volume(path)
+    files, _, _ = v.tree()
+    problems = v.check()
+    v.close()
+    return files, problems
 
 
 def stick_file(path, name):
@@ -467,6 +496,116 @@ class UsbSmoke(GuiSmoke):
               f"of stick A in {time.time() - t0:.1f}s, no errors; "
               f"{after} devices in use before and after")
 
+    def plug_exfat(self, which, dev_id, port, size, node_name):
+        """QMP-plug exFAT stick `which`; its (usbdiskN, sdX)."""
+        con = self.con
+        start = con.mark()
+        self.qmp.cmd("blockdev-add", driver="raw", **{"node-name": node_name},
+                     file={"driver": "file", "filename": self.exfat[which]})
+        self.qmp.cmd("device_add", driver="usb-storage", drive=node_name,
+                     id=dev_id, bus="xhci.0", port=port)
+        m = con.wait_re(r"\[USB-MSC\] /dev/(usbdisk\d): .* %d blocks of 512 "
+                        r"bytes" % (size // 512), timeout=30, start=start)
+        node = m.group(1)
+        m = con.wait_re(r"\[USB-MSC\] /dev/%s is /dev/(sd[a-z])" % node,
+                        timeout=30, start=start)
+        return node, m.group(1)
+
+    def exfat_sticks(self):
+        """Two exFAT sticks mounted together; one unmounted and checked on
+        the host, the other pulled out while mounted and plugged back."""
+        con = self.con
+        start = con.mark()
+        devs = {}
+        for which, dev_id, port, size in EXFAT_STICKS:
+            devs[which] = self.plug_exfat(which, dev_id, port, size,
+                                          f"ex{which.lower()}0")
+        x, y = devs["X"][1], devs["Y"][1]
+        print(f"\n[SMOKE-USB] exFAT sticks X {devs['X']}, Y {devs['Y']}")
+        out = con.run("cat /proc/filesystems")
+        if not re.search(r"^\tvfat\r?\n\texfat\r?$", out, re.M):
+            raise AssertionError(f"/proc/filesystems: not vfat, exfat: {out!r}")
+        rc, out = self.bsh(
+            f"busybox mkdir -p /mnt/xa /mnt/xb && "
+            f"busybox mount /dev/{x} /mnt/xa && busybox mount /dev/{y} /mnt/xb && "
+            f"busybox grep -E \"^/dev/({x}|{y}) \" /proc/mounts && "
+            f"busybox cp /mnt/xa/xbig.bin /mnt/xb/ && "
+            f"busybox cp /mnt/xb/ybig.bin /mnt/xa/ && "
+            f"busybox mv /mnt/xa/x-hello.txt /mnt/xb/ && "
+            f"busybox md5sum /mnt/xa/xbig.bin /mnt/xb/xbig.bin "
+            f"/mnt/xa/ybig.bin /mnt/xb/ybig.bin && busybox ls /mnt/xa /mnt/xb",
+            timeout=120)
+        if rc != 0:
+            raise AssertionError(f"exFAT mount/copy failed ({rc}): {out!r}")
+        mounted = re.findall(r"^/dev/(sd[a-z]) /mnt/x[ab] exfat rw", out, re.M)
+        if sorted(mounted) != sorted([x, y]):
+            raise AssertionError(f"not both mounted rw as exfat: {out!r}")
+        for name in ("xbig.bin", "ybig.bin"):
+            n = out.count(md5(self.exfiles[name]))
+            if n != 2:
+                raise AssertionError(f"{name}: md5 seen {n} times, not 2: "
+                                     f"{out!r}")
+        # Stick X: unmounted cleanly, then read on the host.
+        rc, out = self.bsh("busybox sync && busybox umount /mnt/xa")
+        if rc != 0:
+            raise AssertionError(f"umount /mnt/xa failed: {out!r}")
+        files, problems = exfat_tree(self.exfat["X"])
+        want = {"xbig.bin": md5(self.exfiles["xbig.bin"]),
+                "ybig.bin": md5(self.exfiles["ybig.bin"])}
+        if files != want or problems:
+            raise AssertionError(f"stick X on the host: {files} {problems}, "
+                                 f"want {want}")
+        r = subprocess.run([mkexfatimg.tool("fsck.exfat"), "-n",
+                            self.exfat["X"]], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise AssertionError(f"fsck.exfat -n stick X: {r.stdout}{r.stderr}")
+        print(f"\n[SMOKE-USB] {x} and {y} mounted together as exfat; files "
+              f"copied and moved across; {x} unmounted, clean on the host "
+              f"(exfatimg.py, fsck.exfat)")
+        # Stick Y: pulled out while mounted, with a reader looping on it.
+        node = devs["Y"][0]
+        con.run("busybox rm -f /tmp/xstop; busybox sh -c \"while [ ! -e "
+                "/tmp/xstop ] && busybox cat /mnt/xb/ybig.bin >/dev/null "
+                "2>&1; do :; done &\"")
+        time.sleep(0.3)
+        mark = con.mark()
+        self.qmp.cmd("device_del", id="uexy")
+        con.wait_re(r"\[USB-MSC\] /dev/%s removed" % node, start=mark)
+        con.wait_re(r"\[USB\] port [\d.]+: device removed", start=mark)
+        self.settle(1.0)
+        con.run("busybox touch /tmp/xstop; busybox sleep 1")
+        con.run("busybox ls /mnt/xb >/dev/null 2>&1; echo z > /mnt/xb/z.txt; "
+                "busybox sync", timeout=30)
+        rc, out = self.bsh("busybox umount /mnt/xb || busybox umount -l /mnt/xb; "
+                           f"! busybox grep \"^/dev/{y} \" /proc/mounts",
+                           timeout=30)
+        if rc != 0:
+            raise AssertionError(f"/mnt/xb not taken down after the unplug: "
+                                 f"{out!r}")
+        for _ in range(20):
+            try:
+                self.qmp.cmd("blockdev-del", **{"node-name": "exy0"})
+                break
+            except RuntimeError:
+                time.sleep(0.2)
+        node2, y2 = self.plug_exfat("Y", "uexy", "3.5", EXFAT_STICKS[1][3],
+                                    "exy1")
+        rc, out = self.bsh(f"busybox mount -t exfat -o ro /dev/{y2} /mnt/xb && "
+                           f"busybox md5sum /mnt/xb/ybig.bin /mnt/xb/xbig.bin "
+                           f"/mnt/xb/x-hello.txt && busybox umount /mnt/xb",
+                           timeout=60)
+        if rc != 0 or out.count(md5(self.exfiles["ybig.bin"])) != 1 or \
+                out.count(md5(self.exfiles["xbig.bin"])) != 1 or \
+                md5(b"hello X\n") not in out:
+            raise AssertionError(f"stick Y after the replug ({rc}): {out!r}")
+        log = con.text()[start:]
+        bad = re.findall(r"^.*(?:PANIC|[Pp]age fault|panic).*$", log, re.M)
+        if bad:
+            raise AssertionError(f"errors around the exFAT sticks: {bad[:5]}")
+        print(f"\n[SMOKE-USB] {y} pulled out while mounted under a reader: "
+              f"no panic, the mount taken down; back as {node2}/{y2} it "
+              f"mounts with its data")
+
     def cputime(self):
         """kusbd's CPU time over 10 idle seconds."""
         def sample():
@@ -507,6 +646,7 @@ class UsbSmoke(GuiSmoke):
         step("mass storage", self.storage)
         step("two sticks mounted together", self.two_sticks)
         step("replug the sticks", self.hotplug)
+        step("two exFAT sticks, one pulled out mounted", self.exfat_sticks)
         step("idle CPU", self.cputime)
         self.settle()
         self.shot("final")
@@ -535,6 +675,15 @@ def main():
         luns.append(path)
     make_stick(stick_b, STICK_B_SIZE, "STICKB",
                {"bbig.bin": files["bbig.bin"], "b-hello.txt": b"hello B\n"})
+    exfat = {w: os.path.join(OUT, f"exfat{w.lower()}.img")
+             for w, _, _, _ in EXFAT_STICKS}
+    exfiles = {"xbig.bin": os.urandom(150 * 1024),
+               "ybig.bin": os.urandom(120 * 1024)}
+    make_exfat_stick(exfat["X"], EXFAT_STICKS[0][3],
+                     {"xbig.bin": exfiles["xbig.bin"],
+                      "x-hello.txt": b"hello X\n"})
+    make_exfat_stick(exfat["Y"], EXFAT_STICKS[1][3],
+                     {"ybig.bin": exfiles["ybig.bin"]})
     sockdir = tempfile.mkdtemp(prefix="susb")
     qmp_path = os.path.join(sockdir, "qmp")
     accel = smoke_gui.pick_accel()
@@ -577,6 +726,8 @@ def main():
         smoke.stick = stick
         smoke.stick_b = stick_b
         smoke.files = files
+        smoke.exfat = exfat
+        smoke.exfiles = exfiles
         steps = smoke.run()
         print("\n[SMOKE-USB] timings: " +
               ", ".join(f"{n} {s:.1f}s" for n, s in steps))
