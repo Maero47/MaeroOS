@@ -15,23 +15,29 @@ mount -o remount,ro /scratch
 
 Only root may mount or unmount (`EPERM` otherwise). In QEMU, extra disks go on
 the other IDE positions: `-drive file=x.img,format=raw,index=1` is `hdb`,
-`index=2` is `hdc`, `index=3` is `hdd`.
+`index=2` is `hdc`, `index=3` is `hdd`. AHCI disks are `sda`, `sdb`, ... (on
+q35 `index=N` is AHCI port N), NVMe namespaces `nvme0n1`, ...; their
+partitions are `sdb2`, `nvme0n1p5`.
 
 ## Pieces
 
 | File | Role |
 |---|---|
+| `drivers/blkdev.c` | the table of every disk (IDE, then AHCI, then NVMe) with read/write, size and dev_t; which one is the boot disk |
 | `drivers/ata.c` | probes the primary slave and the secondary channel besides the boot disk; `ata_dev_read/write(dev, ...)` with plain LBA28 PIO for them (ATAPI devices are skipped) |
-| `drivers/blkpart.c` | one `blkpart_t` per disk and partition: MBR primaries 1-4, logical partitions from 5 (walking the EBR chain), GPT entries (header and entry-array CRC32 checked, backup header as fallback); `/dev/<name>` nodes (read-only raw access) and `/proc/partitions` |
+| `drivers/blkpart.c` | one `blkpart_t` per disk and partition, a view over `blkdev.c`'s table: MBR primaries 1-4, logical partitions from 5 (walking the EBR chain), GPT entries (header and entry-array CRC32 checked, backup header as fallback); `/dev/<name>` nodes (read-only raw access) and `/proc/partitions` |
 | `fs/vfs.c` | the mount table: `vfs_mount_add/find/remove`, crossing in the path walk, the mount each lookup ends on (for `MS_RDONLY`), `/proc/mounts` |
 | `fs/mount.c` | `mount_do()`/`umount_do()`: types `ext4`/`ext3`/`ext2` (block device source), `tmpfs`, `proc`, `devtmpfs`; `MS_REMOUNT`, `MS_BIND`, propagation flags (accepted, no-op) |
 | `fs/ext4.c` | the read-only ext2/3/4 driver |
-| `proc/syscall.c` | `mount` (21), `umount` (22), `umount2` (52); `EROFS` on read-only mounts for open-for-write, create, mkdir, mknod, unlink, rmdir, rename, symlink, truncate, chmod, chown, and through descriptors for fchmod, fchown, ftruncate, fallocate |
+| `proc/syscall.c` | `mount` (21), `umount` (22), `umount2` (52); `EROFS` on read-only mounts for open-for-write, create, mkdir, mknod, unlink, rmdir, rename, symlink, link, truncate, chmod, chown, the utime family, and through descriptors for fchmod, fchown, ftruncate, fallocate, futimens |
 | `userspace/mntprobe` | bind pinning, umount-by-name after slot reuse, `EROFS`/`EBUSY` through descriptors (run by `smoke-ext4`) |
 
-`blkpart` is deliberately small: when a general block layer lands
-(`drivers/blkdev.c` on another branch), a `blkpart_t` becomes a view over it
-and only `blkpart_read`/`blkpart_write` change.
+A chrooted process (`chroot(2)`) resolves mount and umount targets, and bind
+sources, from its own root like any other path, so it can only reach mounts
+inside its jail, and `..` from a mount's root inside the jail goes back to the
+directory it is mounted on. umount's "a cwd inside keeps it busy" check
+resolves each process's cwd from that process's root (`smoke-alpine` tests
+this inside the Alpine chroot).
 
 ### Mount table semantics
 
