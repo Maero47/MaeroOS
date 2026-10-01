@@ -523,7 +523,7 @@ static int rw_bind(void *x, const void *addr, uint32_t alen) {
     if (sa.family != AF_INET_K) return -97;
     if (!net_lwip_addr_is_local(sa.addr)) return -99;
     ip_addr_t a;
-    ip_addr_set_ip4_u32(&a, sa.addr);
+    ip_addr_set_ip4_u32_val(a, sa.addr);
     return raw_bind(s->pcb, &a) == ERR_OK ? 0 : -22;
 }
 
@@ -571,7 +571,7 @@ static int rw_send(void *x, const void *buf, uint32_t len,
     if (!p) return -105;
     pbuf_take(p, buf, (u16_t)len);
     ip_addr_t a;
-    ip_addr_set_ip4_u32(&a, dst);
+    ip_addr_set_ip4_u32_val(a, dst);
     raw_setflags(s->pcb, s->hdrincl ? RAW_FLAGS_HDRINCL : 0);
     err_t e = raw_sendto(s->pcb, p, &a);
     pbuf_free(p);
@@ -655,4 +655,307 @@ int rawip_create(int protocol, const xsock_ops_t **ops, void **x) {
     *ops = &rw_ops;
     *x = s;
     return 0;
+}
+
+/* ── AF_INET6 SOCK_RAW and ICMP echo "ping sockets" ─────────────────────────
+ *
+ * One lwIP raw pcb each.  An AF_INET6 SOCK_RAW socket reads and writes the
+ * payload after the IPv6 header (Linux raw(7)/ipv6(7)): for IPPROTO_ICMPV6
+ * the kernel fills in the checksum, which needs the pseudo-header.  A ping
+ * socket (Linux net/ipv4/ping.c semantics, RFC 792 / RFC 4443 messages)
+ * sends ICMP echo requests whose identifier is the socket's "port" and
+ * receives only the echo replies carrying it, as ICMP header plus data, with
+ * the checksum computed by the kernel; no privilege is needed.
+ */
+
+#include "lwip/inet_chksum.h"
+#include "lwip/ip6_addr.h"
+
+#define AF_INET6_K        10
+#define IPPROTO_ICMP_K     1
+#define IPPROTO_ICMPV6_K  58
+#define IPPROTO_IPV6_K    41
+#define IPV6_CHECKSUM_K    7
+#define ICMP_RING          16
+
+typedef struct {
+    uint16_t len;
+    ip_addr_t src;
+    uint8_t data[FRAME_MAX];
+} ipkt_t;
+
+typedef struct {
+    struct raw_pcb *pcb;
+    int domain;            /* AF_INET (ping only) or AF_INET6 */
+    int proto;
+    int ping;              /* SOCK_DGRAM echo socket */
+    uint16_t ident;        /* ping: the echo identifier, host order */
+    int connected;
+    ip_addr_t peer;
+    ipkt_t *ring;
+    int head, count;
+} isock_t;
+
+typedef struct {
+    uint16_t family, port;
+    uint32_t flowinfo;
+    uint8_t  addr[16];
+    uint32_t scope_id;
+} sockaddr_in6_k;
+
+static uint16_t ping_next_ident = 0x4d31;
+
+static int is_v4mapped6(const uint8_t *a) {
+    static const uint8_t pfx[12] = { 0,0,0,0, 0,0,0,0, 0,0,0xff,0xff };
+    return memcmp(a, pfx, 12) == 0;
+}
+
+/* The caller's name into an lwIP address of the socket's family. */
+static int isock_addr_in(isock_t *s, const void *addr, uint32_t alen,
+                         ip_addr_t *ip, uint16_t *port) {
+    uint16_t fam;
+    if (alen < 2) return -22;
+    memcpy(&fam, addr, 2);
+    if (s->domain == AF_INET_K) {
+        sockaddr_in_k sa;
+        if (alen < sizeof(sa)) return -22;
+        memcpy(&sa, addr, sizeof(sa));
+        if (sa.family != AF_INET_K) return -97;
+        ip_addr_set_ip4_u32(ip, sa.addr);
+        if (port) *port = bswap16(sa.port);
+        return 0;
+    }
+    sockaddr_in6_k sa;
+    memset(&sa, 0, sizeof(sa));
+    if (alen < 24) return -22;
+    memcpy(&sa, addr, alen < sizeof(sa) ? alen : sizeof(sa));
+    if (sa.family != AF_INET6_K) return -97;
+    if (is_v4mapped6(sa.addr)) return -101;
+    ip_addr_set_zero_ip6(ip);
+    memcpy(ip_2_ip6(ip)->addr, sa.addr, 16);
+    ip6_addr_clear_zone(ip_2_ip6(ip));
+    if (ip6_addr_islinklocal(ip_2_ip6(ip)) || ip6_addr_ismulticast_linklocal(ip_2_ip6(ip)))
+        ip6_addr_set_zone(ip_2_ip6(ip),
+                          (u8_t)(sa.scope_id ? sa.scope_id : (uint32_t)net_lwip_eth_zone()));
+    if (port) *port = bswap16(sa.port);
+    return 0;
+}
+
+static void isock_addr_out(isock_t *s, const ip_addr_t *ip, uint16_t port,
+                           void *addr, uint32_t *alen) {
+    if (s->domain == AF_INET_K) {
+        sockaddr_in_k sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.family = AF_INET_K;
+        sa.port = bswap16(port);
+        if (ip && IP_IS_V4(ip)) sa.addr = ip4_addr_get_u32(ip_2_ip4(ip));
+        memcpy(addr, &sa, sizeof(sa));
+        *alen = sizeof(sa);
+        return;
+    }
+    sockaddr_in6_k sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.family = AF_INET6_K;
+    sa.port = bswap16(port);
+    if (ip && IP_IS_V6(ip)) {
+        memcpy(sa.addr, ip_2_ip6(ip)->addr, 16);
+        if (ip6_addr_has_zone(ip_2_ip6(ip)))
+            sa.scope_id = ip6_addr_zone(ip_2_ip6(ip));
+    }
+    memcpy(addr, &sa, sizeof(sa));
+    *alen = sizeof(sa);
+}
+
+static u8_t isock_recv_cb(void *arg, struct raw_pcb *pcb, struct pbuf *p,
+                          const ip_addr_t *addr) {
+    (void)pcb;
+    isock_t *s = (isock_t *)arg;
+    /* p starts at the IP header: skip it (the protocol matched the first
+     * next-header, so an IPv6 packet has no extension headers here). */
+    uint16_t hl = 40;
+    if (s->domain == AF_INET_K) {
+        uint8_t vihl;
+        if (pbuf_copy_partial(p, &vihl, 1, 0) != 1) return 0;
+        hl = (uint16_t)((vihl & 0x0F) * 4);
+    }
+    if (p->tot_len < hl) return 0;
+    uint16_t n = (uint16_t)(p->tot_len - hl);
+    if (s->ping) {
+        uint8_t h[8];
+        if (n < 8 || pbuf_copy_partial(p, h, 8, hl) != 8) return 0;
+        uint8_t reply = s->domain == AF_INET_K ? 0 : 129;
+        uint16_t id = (uint16_t)(h[4] << 8 | h[5]);
+        if (h[0] != reply || id != s->ident) return 0;
+    }
+    if (s->count >= ICMP_RING) return 0;
+    ipkt_t *k = &s->ring[(s->head + s->count) % ICMP_RING];
+    if (n > FRAME_MAX) n = FRAME_MAX;
+    pbuf_copy_partial(p, k->data, n, hl);
+    k->len = n;
+    ip_addr_copy(k->src, *addr);
+    s->count++;
+    io_wake();
+    return 0;      /* not eaten: lwIP's ICMP still answers echo requests */
+}
+
+static int is_bind(void *x, const void *addr, uint32_t alen) {
+    isock_t *s = (isock_t *)x;
+    ip_addr_t a;
+    uint16_t port = 0;
+    int r = isock_addr_in(s, addr, alen, &a, &port);
+    if (r < 0) return r;
+    if (IP_IS_V4(&a) ? !net_lwip_addr_is_local(ip4_addr_get_u32(ip_2_ip4(&a)))
+                        : !net_lwip_addr6_is_local((const uint8_t *)ip_2_ip6(&a)->addr))
+        return -99;
+    if (s->ping && port) s->ident = port;
+    return raw_bind(s->pcb, &a) == ERR_OK ? 0 : -22;
+}
+
+static int is_connect(void *x, const void *addr, uint32_t alen) {
+    isock_t *s = (isock_t *)x;
+    ip_addr_t a;
+    int r = isock_addr_in(s, addr, alen, &a, NULL);
+    if (r < 0) return r;
+    ip_addr_copy(s->peer, a);
+    s->connected = 1;
+    return 0;
+}
+
+static int is_getname(void *x, int peer, void *addr, uint32_t *alen) {
+    isock_t *s = (isock_t *)x;
+    if (peer) {
+        if (!s->connected) return -107;
+        isock_addr_out(s, &s->peer, 0, addr, alen);
+    } else {
+        isock_addr_out(s, &s->pcb->local_ip, s->ping ? s->ident : 0, addr, alen);
+    }
+    return 0;
+}
+
+static int is_send(void *x, const void *buf, uint32_t len,
+                   const void *addr, uint32_t alen) {
+    isock_t *s = (isock_t *)x;
+    ip_addr_t dst;
+    if (addr && alen) {
+        int r = isock_addr_in(s, addr, alen, &dst, NULL);
+        if (r < 0) return r;
+    } else if (s->connected) {
+        ip_addr_copy(dst, s->peer);
+    } else {
+        return -89;                                      /* -EDESTADDRREQ */
+    }
+    if (len > 65535 - 48) return -90;
+    if (s->ping) {
+        uint8_t req = s->domain == AF_INET_K ? 8 : 128;
+        if (len < 8 || ((const uint8_t *)buf)[0] != req ||
+            ((const uint8_t *)buf)[1] != 0)
+            return -22;
+    }
+    struct pbuf *p = pbuf_alloc(PBUF_IP, (u16_t)len, PBUF_RAM);
+    if (!p) return -105;
+    pbuf_take(p, buf, (u16_t)len);
+    uint8_t *h = (uint8_t *)p->payload;
+    if (s->ping) {
+        h[4] = (uint8_t)(s->ident >> 8);
+        h[5] = (uint8_t)s->ident;
+    }
+    if (s->ping || s->proto == IPPROTO_ICMPV6_K) {
+        h[2] = h[3] = 0;           /* ICMPv6: lwIP sums with the pseudo-header */
+        if (s->domain == AF_INET_K) {
+            u16_t c = inet_chksum(h, (u16_t)len);
+            memcpy(h + 2, &c, 2);
+        }
+    }
+    err_t e = raw_sendto(s->pcb, p, &dst);
+    pbuf_free(p);
+    net_lwip_kick();
+    if (e == ERR_RTE) return -101;                     /* -ENETUNREACH */
+    return e == ERR_OK ? (int)len : -105;
+}
+
+static int is_recv(void *x, void *buf, uint32_t len, void *addr,
+                   uint32_t *alen, int peek) {
+    isock_t *s = (isock_t *)x;
+    if (!s->count) return -11;
+    ipkt_t *k = &s->ring[s->head];
+    uint32_t n = k->len < len ? k->len : len;
+    memcpy(buf, k->data, n);
+    if (addr)
+        isock_addr_out(s, &k->src, 0, addr, alen);
+    int full = k->len;
+    if (!peek) {
+        s->head = (s->head + 1) % ICMP_RING;
+        s->count--;
+    }
+    return full;
+}
+
+static int is_read_ready(void *x) {
+    return ((isock_t *)x)->count > 0;
+}
+
+static int is_setopt(void *x, int level, int name, const void *val, uint32_t len) {
+    (void)x; (void)val; (void)len;
+    /* IPV6_CHECKSUM on ICMPv6 is always on (Linux refuses to change it);
+     * the rest (ICMP6_FILTER, hop limits, IP_RECVTTL...) are accepted and
+     * ignored. */
+    if (level == IPPROTO_IPV6_K && name == IPV6_CHECKSUM_K)
+        return 0;
+    return 1;
+}
+
+static int is_getopt(void *x, int level, int name, void *val, uint32_t *len) {
+    (void)x; (void)level; (void)name; (void)val; (void)len;
+    return 1;
+}
+
+static void is_release(void *x) {
+    isock_t *s = (isock_t *)x;
+    raw_remove(s->pcb);
+    kfree(s->ring);
+    kfree(s);
+}
+
+static const xsock_ops_t is_ops = {
+    is_bind, is_connect, is_getname, is_send, is_recv, is_read_ready,
+    is_setopt, is_getopt, is_release,
+};
+
+static int isock_create(int domain, int protocol, int ping,
+                        const xsock_ops_t **ops, void **x) {
+    isock_t *s = (isock_t *)kmalloc(sizeof(*s));
+    if (!s) return -12;
+    memset(s, 0, sizeof(*s));
+    s->ring = (ipkt_t *)kmalloc(ICMP_RING * sizeof(ipkt_t));
+    if (!s->ring) { kfree(s); return -12; }
+    s->domain = domain;
+    s->proto = protocol;
+    s->ping = ping;
+    s->pcb = raw_new_ip_type(domain == AF_INET_K ? IPADDR_TYPE_V4 : IPADDR_TYPE_V6,
+                             (u8_t)protocol);
+    if (!s->pcb) { kfree(s->ring); kfree(s); return -12; }
+    if (domain == AF_INET6_K && protocol == IPPROTO_ICMPV6_K) {
+        s->pcb->chksum_reqd = 1;
+        s->pcb->chksum_offset = 2;
+    }
+    if (ping) {
+        s->ident = ping_next_ident;
+        ping_next_ident = (uint16_t)(ping_next_ident * 75u + 74u);
+        if (!ping_next_ident) ping_next_ident = 1;
+    }
+    raw_recv(s->pcb, isock_recv_cb, s);
+    *ops = &is_ops;
+    *x = s;
+    return 0;
+}
+
+int rawip6_create(int protocol, const xsock_ops_t **ops, void **x) {
+    if (!is_root()) return -1;                         /* -EPERM */
+    if (protocol <= 0 || protocol > 255) return -93;
+    return isock_create(AF_INET6_K, protocol, 0, ops, x);
+}
+
+int ping_create(int domain, const xsock_ops_t **ops, void **x) {
+    return isock_create(domain, domain == AF_INET_K ? IPPROTO_ICMP_K
+                                                    : IPPROTO_ICMPV6_K, 1, ops, x);
 }

@@ -95,6 +95,14 @@ LWIP_SRCS := \
 	third_party/lwip/src/core/ipv4/ip4.c \
 	third_party/lwip/src/core/ipv4/ip4_addr.c \
 	third_party/lwip/src/core/ipv4/ip4_frag.c \
+	third_party/lwip/src/core/ipv6/ethip6.c \
+	third_party/lwip/src/core/ipv6/icmp6.c \
+	third_party/lwip/src/core/ipv6/inet6.c \
+	third_party/lwip/src/core/ipv6/ip6.c \
+	third_party/lwip/src/core/ipv6/ip6_addr.c \
+	third_party/lwip/src/core/ipv6/ip6_frag.c \
+	third_party/lwip/src/core/ipv6/mld6.c \
+	third_party/lwip/src/core/ipv6/nd6.c \
 	third_party/lwip/src/netif/ethernet.c
 
 LWIP_OBJS := $(LWIP_SRCS:.c=.o)
@@ -141,7 +149,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-ext4 smoke-ext2rw smoke-vfat smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-alpine-net smoke-audio disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-net6 smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-ext4 smoke-ext2rw smoke-vfat smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-alpine-net smoke-audio disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched
 
 all: $(TARGET)
 
@@ -345,6 +353,12 @@ smoke-net-e1000: $(TARGET) initrd disk
 smoke-tcpsrv: $(TARGET) initrd
 	python3 tools/smoke_tcpsrv.py $(SMOKE_TCPSRV_ARGS)
 
+# Loopback and IPv6 (QEMU user-net with ipv4=on,ipv6=on): SLAAC, TCP/UDP over
+# 127.0.0.1 and [::1], dual-stack and IPV6_V6ONLY listeners, ping sockets,
+# wget from a host server over IPv6, getaddrinfo AAAA+A from a DNS responder.
+smoke-net6: $(TARGET) initrd disk
+	python3 tools/smoke_net6.py
+
 smoke-fw: $(TARGET) initrd
 	python3 tools/smoke_fw.py
 
@@ -450,7 +464,7 @@ smoke-pc: $(TARGET) iso disk
 # timeouts assume the guest has a host core to itself.  The suites start QEMU
 # with -display none (tools/smokelib.py), so no display is needed.
 # Pick a subset with CHECK_SUITES="smoke smoke-x".
-CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-net-e1000 smoke-tcpsrv \
+CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-net-e1000 smoke-net6 smoke-tcpsrv \
                  smoke-fw smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui smoke-ext4 smoke-ext2rw smoke-vfat smoke-uefi \
                  smoke-install smoke-hda smoke-acpi smoke-ahci smoke-nvme smoke-usb smoke-pc
 CHECK_LOG_DIR ?= build/check

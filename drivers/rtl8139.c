@@ -163,6 +163,10 @@ static void rtl_hw_start(void) {
     uint32_t rcr = RTL_RCR_MXDMA_UNL | RTL_RCR_RBLEN_32K |
                    RTL_RCR_AB | RTL_RCR_AM | RTL_RCR_APM | RTL_RCR_WRAP;
     rtl_outl(RTL_REG_RCR, rcr);
+    /* MAR0-7 (0x08): accept every multicast hash, so IPv6 neighbour
+     * discovery (all-nodes and solicited-node groups) reaches lwIP. */
+    rtl_outl(0x08, 0xFFFFFFFFU);
+    rtl_outl(0x0C, 0xFFFFFFFFU);
 
     info.rx_offset = 0;
     info.tx_index = 0;

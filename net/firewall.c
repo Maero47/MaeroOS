@@ -69,8 +69,10 @@ int firewall_check(int dir, int proto, uint32_t remote_ip, uint16_t port) {
 /* Parse just enough of the IPv4 header to apply rules; on short/odd packets
  * fall back to the inbound policy.  Returns 1 = consumed (dropped). */
 int firewall_ip4_input_hook(struct pbuf *p, struct netif *inp) {
-    (void)inp;
     if (!fw_enabled || !p || p->len < 20)
+        return 0;
+    /* lo is always open (127.0.0.0/8 and our own addresses looped back). */
+    if (inp && inp->name[0] == 'l' && inp->name[1] == 'o')
         return 0;
 
     const uint8_t *ip = (const uint8_t *)p->payload;

@@ -35,6 +35,12 @@ typedef struct xsock_ops {
 int netlink_create(int type, int protocol, const xsock_ops_t **ops, void **x);
 int packet_create(int type, int protocol, const xsock_ops_t **ops, void **x);
 int rawip_create(int protocol, const xsock_ops_t **ops, void **x);
+/* AF_INET6 SOCK_RAW (IPPROTO_ICMPV6 and others: payload without the IPv6
+ * header, as on Linux; ICMPv6 checksums filled in by the kernel). */
+int rawip6_create(int protocol, const xsock_ops_t **ops, void **x);
+/* ICMP echo "ping sockets": AF_INET/IPPROTO_ICMP or AF_INET6/IPPROTO_ICMPV6
+ * SOCK_DGRAM, unprivileged (Linux ping_group_range open to all). */
+int ping_create(int domain, const xsock_ops_t **ops, void **x);
 
 /* A frame received (outgoing = 0, before lwIP sees it) or sent (1) on
  * iface: a copy for every AF_PACKET socket that asked for it. */
@@ -48,6 +54,7 @@ int netdev_ioctl(uint32_t req, void *uarg);
 /* /proc/net/dev and /proc/net/route. */
 uint32_t netdev_proc_dev(char *buf, uint32_t cap);
 uint32_t netdev_proc_route(char *buf, uint32_t cap);
+uint32_t netdev_proc_if_inet6(char *buf, uint32_t cap);
 
 /* Interface index (1-based position in net.c's table) <-> interface. */
 struct maero_netif;

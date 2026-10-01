@@ -14,6 +14,14 @@ static int ninterfaces;
 void net_init(void) {
     memset(interfaces, 0, sizeof(interfaces));
     ninterfaces = 0;
+    /* lo first, as on Linux (ifindex 1; the NICs follow from 2).  It has no
+     * driver: lwIP's loop netif carries its traffic (net/lwip_glue.c). */
+    static const uint8_t zero_mac[6];
+    netif_t *lo = net_register("lo", zero_mac, 65536, NULL, NULL, NULL);
+    if (lo) {
+        lo->loopback = 1;
+        lo->driver = "loopback";
+    }
     net_sockets_init();
 }
 

@@ -141,6 +141,7 @@ testfiles/awk
 /testfiles/sleep
 /testfiles/sockprobe
 /testfiles/srvprobe
+/testfiles/net6probe
 /testfiles/sort
 /testfiles/statprobe
 /testfiles/store
