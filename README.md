@@ -38,6 +38,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | Native coreutils-style commands, user faults | `kwprobe ok` (a user write to kernel memory dies of SIGSEGV, a user `int3` of SIGTRAP), then `uname`, `whoami`, `hostname`, `free`, `df`, `uptime`, `which` | `make smoke-cmds` |
 | ext2 disk, symlinks, login/passwd/doas, permissions, init services, sessions | 169 checks including `passwd` keeping `/etc/shadow` root-only 0600, `login` dropping to `uid=1000`, `doas` ignoring a planted `./ls`, `credprobe ok`, `fsprobe ok`, `symprobe ok` (ext2 symlinks, checked on the image with `debugfs` too) and `svc` state transitions | `make smoke-disk` |
 | SATA AHCI disk (pc + `-device ahci`, then `-M q35`), no IDE disk | `/disk` mounted from `ahci0`, `diskprobe ok`, `fsprobe ok`, `symprobe ok`, a 3 MiB random file read and copied with matching md5 in the guest and on the host (`debugfs`), persistence across a reboot onto q35, `e2fsck -fn` showing no new damage, `reboot`/`poweroff` ending QEMU | `make smoke-ahci` |
+| NVMe disk (pc + `-device nvme`, then `-M q35` with MDTS=2 and two namespaces), no IDE/AHCI disk | `/disk` mounted from `nvme0`, both namespaces found, `diskprobe ok`, `fsprobe ok`, a 3 MiB random file read and copied with matching md5 in the guest and on the host, transfers using PRP lists and split at MDTS (driver counters at shutdown), persistence across a reboot, `e2fsck -fn` clean of new damage, `reboot`/`poweroff` ending QEMU | `make smoke-nvme` |
 | `pkg` and the signed repo index | `tools/test_pkg_sign.py` runs the RFC 8032 vectors through the Python signer and the C verifier and rejects altered, unsigned and foreign-key indexes; in the guest, `pkg update` rejects unsigned, tampered and rolled-back indexes, installs and runs busybox, and `install` rejects a tarball whose SHA-256 does not match | `make smoke-pkg` |
 | TCP/IP over lwIP and RTL8139 | `MAEROS_HTTP_OK` fetched from a host HTTP server; `sockprobe` checks that `send` after `shutdown(SHUT_WR)` fails with `EPIPE`, a two-step shutdown ends in a FIN and no RST, closing TIME_WAIT sockets keeps TCP working, and a non-blocking client gets `EINPROGRESS`, `SO_ERROR`, `EAGAIN`, `ECONNREFUSED` and both socket names; `abi2probe net` checks `MSG_NOSIGNAL` and `EPIPE` after a reset | `make smoke-net` |
 | Intel e1000, DHCP DNS, name resolution | the same suite on an e1000; the DHCP lease's DNS server is in `/etc/resolv.conf`; against a DNS responder in the harness, `getent` resolves A, AAAA, a CNAME, a PTR and an NXDOMAIN, `/etc/hosts` wins over DNS, and `httpget`, `toybox wget` and `toybox nc` connect by name | `make smoke-net-e1000` |
@@ -213,8 +214,9 @@ without userspace polling.
 ### Drivers
 
 ATA with bus-master DMA reads and PIO writes (`ata.c`), SATA AHCI with DMA reads and writes on every
-controller and port (`ahci.c`; `/disk` mounts from the IDE master if there is one, else the first AHCI
-disk, via `blkdev.c`), PCI enumeration (`pci.c`), RTL8139 (`rtl8139.c`), Intel 8254x e1000 (`e1000.c`), Intel 82801AA AC'97
+controller and port (`ahci.c`), NVMe with one polled I/O queue pair per controller and every 512-byte
+namespace as a disk (`nvme.c`; `/disk` mounts from the IDE master if there is one, else the first AHCI
+disk, else the first NVMe namespace, via `blkdev.c`), PCI enumeration (`pci.c`), RTL8139 (`rtl8139.c`), Intel 8254x e1000 (`e1000.c`), Intel 82801AA AC'97
 audio (`ac97.c`), Multiboot VBE framebuffer (`framebuffer.c`), VGA text (`vga.c`), PS/2
 keyboard and mouse (`keyboard.c`, `mouse.c`), CMOS RTC (`rtc.c`) and 16550 serial
 (`serial.c`).
@@ -494,6 +496,7 @@ make smoke-cmds     # native uname/whoami/hostname/free/df/uptime/which
 make smoke-toybox   # toybox as a static guest binary
 make smoke-disk     # ext2, login/passwd, init sessions, service supervision, overlay
 make smoke-ahci     # /disk on a SATA AHCI controller only (pc and q35)
+make smoke-nvme     # /disk on an NVMe namespace only (pc and q35)
 make smoke-net      # DHCP, TCP, HTTP GET from the host
 make smoke-net-e1000  # the same on an e1000, plus resolv.conf from DHCP and DNS lookups
 make smoke-pkg      # pkg against a host repo: signed index, install, rollback
@@ -578,7 +581,7 @@ there: QEMU, started without `-no-shutdown`, must exit through ACPI S5.
 `smoke-cmds`, `smoke-toybox`, `smoke-disk`, `smoke-net`, `smoke-net-e1000`, `smoke-fw`,
 `smoke-dyn`, `smoke-dynlib`, `smoke-x`, `smoke-pkg` (which first builds `repo/` and, on a
 host without one, a repo signing key), `smoke-gui` (which needs the ISO, so `check`
-builds it), `smoke-acpi`, `smoke-ahci`, `smoke-usb` and `smoke-pc`. It runs them one after another, writes each suite's
+builds it), `smoke-acpi`, `smoke-ahci`, `smoke-nvme`, `smoke-usb` and `smoke-pc`. It runs them one after another, writes each suite's
 console to `build/check/<suite>.log`, prints the tail of the log for any suite that
 fails, carries on with the rest and exits non-zero at the end. `CHECK_SUITES="smoke
 smoke-x" make check` runs a subset.
@@ -638,7 +641,7 @@ A wedged boot prints nothing, so three things exist to make one visible.
 | Path | Contents |
 |---|---|
 | `arch/i686/` | boot and AP trampoline assembly, GDT/IDT/TSS/PIC/PIT, LAPIC, SMP, BKL, paging |
-| `drivers/` | ATA, AHCI, PCI, RTL8139, e1000, AC'97, framebuffer, VGA, keyboard, mouse, RTC, serial, ACPI (uACPI glue) |
+| `drivers/` | ATA, AHCI, NVMe, PCI, RTL8139, e1000, AC'97, framebuffer, VGA, keyboard, mouse, RTC, serial, ACPI (uACPI glue) |
 | `fs/` | VFS, ustar initrd, ext2, tmpfs, devfs, procfs |
 | `include/kernel/` | `config.h`, `types.h`, `multiboot.h`, `assert.h` |
 | `kernel/` | `main.c`, `printk`, ring-buffer `klog`, `panic`, RNG, stack protector |

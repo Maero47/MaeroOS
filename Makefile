@@ -137,7 +137,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-fw smoke-disk smoke-ahci smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web repo repo-serve start resolutions icons
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web repo repo-serve start resolutions icons
 
 all: $(TARGET)
 
@@ -347,6 +347,11 @@ smoke-disk: $(TARGET) initrd disk
 smoke-ahci: $(TARGET) initrd disk
 	python3 tools/smoke_ahci.py
 
+# The disk as an NVMe namespace only (pc + -device nvme, then q35 with
+# MDTS=2 and a second namespace), on a scratch copy in build/smoke-nvme/.
+smoke-nvme: $(TARGET) initrd disk
+	python3 tools/smoke_nvme.py
+
 # pkg against a host HTTP repo: signed-index checks, install, rollback.
 smoke-pkg: $(TARGET) initrd disk repo
 	python3 tools/smoke_pkg.py
@@ -401,7 +406,7 @@ smoke-pc: $(TARGET) iso disk
 # Pick a subset with CHECK_SUITES="smoke smoke-x".
 CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-net-e1000 smoke-fw \
                  smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui smoke-acpi \
-                 smoke-ahci smoke-usb smoke-pc
+                 smoke-ahci smoke-nvme smoke-usb smoke-pc
 CHECK_LOG_DIR ?= build/check
 
 # repo: smoke-pkg serves packages from repo/ (see the smoke-pkg target).

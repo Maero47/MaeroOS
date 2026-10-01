@@ -18,6 +18,7 @@
 #include "../drivers/acpi.h"
 #include "../arch/i686/cpu/smp.h"
 #include "../drivers/keyboard.h"
+#include "../drivers/nvme.h"
 #include "../kernel/random.h"
 #include "../kernel/panic.h"
 #include "../arch/i686/cpu/pit.h"
@@ -5511,6 +5512,10 @@ static int sys_reboot(registers_t *regs) {
         (magic2 != 672274793 && magic2 != 85072278 &&
          magic2 != 369367448 && magic2 != 537993216))
         return -22;   /* -EINVAL */
+
+    /* NVMe asks for an orderly shutdown notification before power goes. */
+    if (cmd == LINUX_REBOOT_CMD_POWER_OFF || cmd == LINUX_REBOOT_CMD_RESTART)
+        nvme_shutdown();
 
     switch (cmd) {
     case LINUX_REBOOT_CMD_POWER_OFF:
