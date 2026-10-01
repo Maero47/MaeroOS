@@ -205,7 +205,17 @@ through QEMU `sendkey`, and PASSes only when the image is requested **and**
 its red block shows up in a screendump **and** the page's text checks pass.
 `summary.txt` gets `web` lines with every request and the time from Enter to
 it, and `screen-web.png` is the frame the block was found in, taken again
-once the text is drawn. On the current tree a load takes 1-3 s.
+once the text is drawn. On the current tree a load takes 1-3 s. `--pcap`
+also records the NIC's traffic to `net.pcap` in the artifacts.
+
+The guest reaches the real internet through slirp, so Firefox talks to
+Mozilla's services during the run. App updates are turned off by policy,
+`testfiles/etc/firefox/policies/policies.json` (`DisableAppUpdate`; the
+`app.update.enabled` pref in `user.js` has been ignored since Firefox 63). Without
+it Firefox asks `aus5.mozilla.org` at startup, is offered a newer ESR that it
+cannot install (it has no write access to `/disk/firefox`), and opens an "Update
+available" panel. The panel takes the keyboard while the URL is typed and keeps
+the single CPU busy redrawing. The harness refuses to start without the policy.
 
 The same page carries a font test: one row per family (`sans-serif`,
 `serif`, `monospace`, `system-ui`, example.com's `-apple-system ... Arial,

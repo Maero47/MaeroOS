@@ -1215,6 +1215,20 @@ def site_row_text(r):
     return " | ".join(parts)
 
 
+# Firefox's enterprise policies, /etc/firefox/policies/policies.json on the
+# disk.  user.js's app.update.enabled has been ignored since Firefox 63; only
+# the DisableAppUpdate policy keeps the run off Mozilla's update server.
+FF_POLICIES = os.path.join("testfiles", "etc", "firefox", "policies", "policies.json")
+
+
+def app_update_disabled():
+    try:
+        with open(FF_POLICIES) as f:
+            return json.load(f).get("policies", {}).get("DisableAppUpdate") is True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--accel", default=None, help="kvm, tcg, or any QEMU -accel value (default: kvm if usable else tcg)")
@@ -1268,6 +1282,9 @@ def main():
                          "via quick find. LIST is 'default' or a comma list of URL[|link text]")
     ap.add_argument("--site-timeout", type=float, default=150.0,
                     help="seconds to wait for a site's frame to settle (default 150)")
+    ap.add_argument("--pcap", action="store_true",
+                    help="(with --net/--web) record the NIC's traffic to net.pcap in the "
+                         "artifact directory (QEMU filter-dump; read it with tcpdump -r)")
     ap.add_argument("-v", "--verbose", action="store_true", help="echo every serial line")
     args = ap.parse_args()
 
@@ -1297,6 +1314,10 @@ def main():
         problems.append("%s missing (make disk-ff)" % args.disk)
     if not os.path.exists(os.path.join("testfiles", "ffauto")):
         problems.append("testfiles/ffauto missing: the desktop auto-launches ff only when /disk/ffauto exists on the disk")
+    if not app_update_disabled():
+        problems.append("%s does not set DisableAppUpdate: Firefox then asks aus5.mozilla.org for "
+                        "an update at startup and, unable to apply it, opens an 'Update available' "
+                        "panel that takes the keyboard and keeps the guest busy" % FF_POLICIES)
     if is_kvm and not kvm_usable():
         problems.append("--accel kvm requested but /dev/kvm is not writable")
     if problems:
@@ -1324,6 +1345,9 @@ def main():
         cmd[1:1] = ["-cpu", args.cpu]
     if args.net:
         cmd += ["-netdev", "user,id=n0", "-device", "%s,netdev=n0" % args.nic]
+        if args.pcap:
+            cmd += ["-object", "filter-dump,id=pcap0,netdev=n0,file=%s"
+                    % os.path.join(args.outdir, "net.pcap")]
     else:
         # QEMU's pc machine adds an e1000 unless told not to, and the kernel
         # drives it (drivers/e1000.c): keep the no-network run NIC-less.
