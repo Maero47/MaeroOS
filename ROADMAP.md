@@ -35,11 +35,11 @@ Each is covered by the test named, which README.md's status table describes.
 
 What still stands between MaeroOS and daily use on real hardware:
 
-- **ext4 writes.** Journaled writes (extent allocation, bitmaps and group
-  descriptors with checksums, jbd2 transactions) so a typical ext4 can be
-  mounted read-write; today only ext2, and ext3/ext4 without incompatible
-  features and with an empty journal, are (`docs/ext4.md`). The installed root
-  is ext2.
+- **ext4 writes, the rest.** A default `mkfs.ext4` filesystem mounts read-write
+  with jbd2 journaling (`make smoke-ext4rw`, `docs/ext4.md`); still missing are
+  htree insertion (new directories are linear), the orphan file, `meta_bg`,
+  `inline_data`, `bigalloc`, quotas and filesystems past 2^32 blocks. The
+  installed root is ext2.
 - **SMP scaling.** Replace the single Big Kernel Lock with finer locking.
 - **Networking hardware.** Wi-Fi (an 802.11 stack and a driver), Realtek
   r8169 and virtio-net; today only RTL8139 and e1000 are supported.

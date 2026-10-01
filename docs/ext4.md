@@ -5,9 +5,11 @@
 ```sh
 cat /proc/partitions                   # hda, hdb, hdb1, hdb2, hdc5, ...
 mkdir -p /mnt
-mount -t ext4 /dev/hdb2 /mnt           # busybox: "is write-protected, mounting read-only"
-mount -t ext2 /dev/sdb1 /data          # read-write (fs/ext2.c), see "Read-write" below
-mount -o ro -t ext4 /dev/hdc5 /mnt2    # the same, without the retry
+mount -t ext4 /dev/hdb2 /mnt           # read-write (fs/ext2.c), see "Read-write" below;
+                                       # a feature it cannot write: busybox retries read-only
+mount -t ext2 /dev/sdb1 /data          # read-write ext2
+mount -o ro -t ext4 /dev/hdc5 /mnt2    # read-only (fs/ext4.c)
+sync                                   # commits ext3/ext4 journals now (else within 1 s)
 cat /proc/mounts
 umount /mnt
 mount -t tmpfs none /scratch           # also: proc, devtmpfs, --bind
@@ -106,56 +108,79 @@ matter to a reader.
 
 A read-write mount request of type `ext2`, `ext3` or `ext4` goes to
 `fs/ext2.c`, the driver behind `/disk`, which keeps one instance per mounted
-filesystem (geometry, block cache, node cache, open-inode table). It takes the
-filesystem when:
+filesystem (geometry, block cache, node cache, open-inode table). It writes
+ext2, ext3 and a typical ext4 as `mke2fs -t ext4` makes it today:
 
-* the only incompatible feature is `filetype` (no `extent`, `64bit`,
-  `flex_bg`, `meta_bg`, `inline_data`, ...), and `needs_recovery` is not set;
-* every read-only-compatible feature is one it keeps intact: `sparse_super`,
-  `large_file`, `btree_dir`, `dir_nlink`. Others (`metadata_csum`,
-  `gdt_csum`/`uninit_bg`, `huge_file`, `extra_isize`, ...) would be left
-  inconsistent by its writes.
+| feature | what the driver does |
+|---|---|
+| `extent` | files and directories it creates get extent trees; lookups walk the tree; an append contiguous on the disk lengthens the last extent in place; anything else (a hole filled, an unwritten extent written, a truncate) rebuilds the tree from its extent list at the smallest depth that holds it, reusing the old tree blocks |
+| `metadata_csum`, `metadata_csum_seed` | crc32c of the superblock, group descriptors, block and inode bitmaps (in the descriptors), inodes, extent blocks and directory leaf blocks (the 12-byte tail), recomputed on every write |
+| `64bit` | 64-byte group descriptors; filesystems of 2^32 blocks or more are refused (i686: block numbers are 32-bit here) |
+| `flex_bg`, `uninit_bg` semantics | allocation follows the descriptors' bitmap and table locations; `BLOCK_UNINIT` bitmaps are built from the layout (and checked against the free count) on first use, `INODE_UNINIT` ones start empty, `bg_itable_unused` moves past each inode handed out |
+| `dir_index` | lookups are linear; changing an htree directory drops its index (as Linux's ext2 does), turning the index blocks into plain checksummed leaf blocks; new directories are linear |
+| `huge_file`, `extra_isize`, `dir_nlink`, `large_file`, `sparse_super`, `orphan_file` (empty), `resize_inode` | kept intact; new inodes get `i_extra_isize` and a creation time |
+| `has_journal` | jbd2, below |
 
-So plain ext2 and ext3 (an empty journal is written around, as Linux's ext2
-driver does) mount read-write; a modern ext4 gets `EROFS` and busybox retries
-read-only, which is this driver's. `mount -t ext2 -o ro` stays with the ext2
-driver when it can read the filesystem, so `remount,rw` works there.
+Refused for writing (`EROFS`, busybox retries read-only and `fs/ext4.c`
+serves it): `meta_bg`, `inline_data`, `encrypt`, `casefold`, `bigalloc`,
+`quota`, `project`, `sparse_super2`, `gdt_csum` without `metadata_csum`, an
+orphan file with entries (`orphan_present`), an external journal, a journal
+with v1 checksums. `mount -t ext2 -o ro` stays with the ext2 driver when it
+can read the filesystem, so `remount,rw` works there.
 
-While mounted read-write the superblock is marked not clean (mount count and
-time updated) and marked clean again at `umount` or `remount,ro`; writes are
-synchronous (the disk drivers flush every write), so that is all `umount` has
-to sync. A directory with an htree index loses its index flag when the driver
-changes it (it stays a valid linear directory; Linux's ext2 does the same),
-deleting an inode releases its extended-attribute block, and `mkdir`/`rmdir`
-keep the group's directory count. `umount` is `EBUSY` while a file or
-directory of the instance is open. Raw writes through `/dev/<name>` to a
-mounted device, or to a disk or partition overlapping one, are `EBUSY`, as
-they are for `/disk`'s disk.
+**The journal.** Every metadata block an operation changes goes into the
+running transaction (and the block cache), not to its place; file data goes
+to its place at once (ordered mode). A transaction commits once a second
+(at the end of an operation, or from the `kjournald` thread when nothing else
+happens), when it is as large as the journal allows (half the log, at most
+1024 blocks), at `sync`/`fsync`/`syncfs`, at `umount`/`remount,ro`/power-off,
+and before the allocator reuses blocks it freed: the journal superblock is
+pointed at the log, then descriptor blocks with the tags and the block copies
+(escaped when they start with the jbd2 magic), then the commit block; only
+then are the blocks written in place and the journal marked empty again. The
+format follows the journal's own features: checksum v3 (what Linux turns on
+for a `metadata_csum` filesystem) or v2, `64bit` tags, or none. While
+mounted read-write the superblock carries `needs_recovery`, as Linux has it,
+so a log left behind by a crash is replayed rather than discarded.
+
+**Replay.** A read-write mount whose journal is not empty (or that says
+`needs_recovery`) replays it first: the log is scanned from `s_start` for
+transactions closed by a commit block (whose checksum must match), revoke
+records are collected, and every logged block that is not revoked by its own
+or a later transaction and whose tag checksum matches is written to its
+place. A read-only mount of such a filesystem is refused (`EUCLEAN`), so it
+never shows a state the journal would change.
+
+While mounted read-write the superblock is marked not clean and marked clean
+again at `umount`, `remount,ro` or power-off. Deleting an inode releases its
+extended-attribute block, `mkdir`/`rmdir` keep the group's directory count.
+`umount` is `EBUSY` while a file or directory of the instance is open. Raw
+writes through `/dev/<name>` to a mounted device, or to a disk or partition
+overlapping one, are `EBUSY`, as they are for `/disk`'s disk.
+
+`mount -o x4crash` is a test hook: the commit that ends the next `write(2)`
+stops before writing anything in place and the instance then refuses all
+writes, as if the power had gone; `smoke-ext4rw` has `e2fsck` replay the log.
 
 `make smoke-ext2rw` (`tools/smoke_ext2rw.py`, images in `build/ext2rw/`)
-mounts an ext2 on AHCI and an ext3 on NVMe read-write together and checks the
-result on the host with `e2fsck -fn` and `debugfs`.
+mounts an ext2 on AHCI and an ext3 on NVMe read-write together;
+`make smoke-ext4rw` (`tools/smoke_ext4rw.py`, `build/ext4rw/`) does the same
+for `mkfs.ext4` filesystems with and without a journal, a dirty journal and
+the simulated power loss. Both check the result on the host with
+`e2fsck -fn` and `debugfs`.
 
-### Why the ext4 driver is read-only
+Not done: htree insertion (directories made here stay linear, which Linux
+and e2fsck accept), the orphan file (a file unlinked while open is released
+when it is closed; after a crash in between it is lost space until `e2fsck`),
+fast commits, and per-file `fsync` (it commits everything).
 
-Every Linux ext4 filesystem made by a distribution has a journal
-(`has_journal`). Writing to it correctly needs either jbd2 transactions or
-the guarantee that the journal is empty and stays consistent with metadata
-written around it (which is what the ext2 driver relies on for ext3, above). Writing directly and clearing `has_journal` would change
-the filesystem behind the owner's back; writing without updating the
-metadata checksums (`metadata_csum` is the default) would corrupt it. Neither
-is acceptable, so the driver never issues a write: a read-write mount request
-gets `EROFS` (busybox `mount` then retries read-only), `remount,rw` gets
-`EROFS`, and every mutating operation on its nodes returns `EROFS` as well.
-`smoke-ext4` checks afterwards that both test filesystems are byte-identical
-to the images they were copied from.
+### The read-only driver
 
-What write support would need, in order: block and inode bitmap allocation
-with group-descriptor and bitmap checksums (crc32c, already here), extent
-insertion and splitting with extent-block checksums, directory entry insertion
-in linear and htree directories (with leaf splitting and the dx tail
-checksum), orphan handling, and jbd2 transactions (descriptor, data and commit
-blocks, with the v3 checksums) so that a crash leaves a replayable journal.
+`fs/ext4.c` never issues a write: it serves `mount -o ro` of ext2/3/4 and
+the read-only fallback for what the ext2 driver will not write; a read-write
+mount request it gets is `EROFS`, as are `remount,rw` and every mutating
+operation on its nodes. `smoke-ext4` checks afterwards that both of its test
+filesystems are byte-identical to the images they were copied from.
 
 ### Sources
 
@@ -163,9 +188,11 @@ Written from the on-disk format as documented by the Linux kernel's
 `Documentation/filesystems/ext4/` (kernel.org, "ext4 Data Structures and
 Algorithms"; documentation, not code), the UEFI specification (GPT) and RFC
 1320 (MD4, which the half-MD4 directory hash shortens to three rounds over
-eight words). FreeBSD `sys/fs/ext2fs` (BSD-2-Clause) and HelenOS
+eight words), and for the journal `Documentation/filesystems/ext4/journal.rst`
+("Journal (jbd2)"). FreeBSD `sys/fs/ext2fs` (BSD-2-Clause) and HelenOS
 `uspace/lib/ext4` (BSD-3-Clause) were read for layout details only. No code
 was copied from any source; in particular nothing from Linux or lwext4 (GPL).
+The crc32c table is generated at run time from the Castagnoli polynomial.
 
 ## Tests
 

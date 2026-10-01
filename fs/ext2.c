@@ -3329,6 +3329,17 @@ static int ext2_truncate_do(vfs_node_t *node, uint32_t new_size) {
          * exactly like unlink did. */
         ext2_free_blocks_from(fs, priv->ino, &inode, new_blocks);
     }
+    /* The rest of a block cut in the middle reads as zeroes if the file
+     * grows over it again (and holds nothing of the old contents). */
+    if (new_size < inode.i_size && (new_size % bs) && !ext2_is_fast_symlink(fs, &inode)) {
+        uint32_t blk = ext2_file_blk(fs, &inode, new_size / bs);
+        uint8_t *tb = blk ? (uint8_t *)kmalloc(bs) : (uint8_t *)0;
+        if (tb && ext2_read_block(fs, blk, tb) == 0) {
+            memset(tb + new_size % bs, 0, bs - new_size % bs);
+            ext2_write_data(fs, blk, tb);
+        }
+        if (tb) kfree(tb);
+    }
     inode.i_size = new_size;
     inode.i_mtime = ext2_now();
     inode.i_ctime = inode.i_mtime;

@@ -95,6 +95,10 @@ def big_bytes():
     return mib * (BIG // 1048576)
 
 
+def trunc_bytes():
+    return "".join(f"{i}\n" for i in range(1, 50001)).encode()[:5000] + bytes(3000)
+
+
 def frag_bytes():
     """What the guest's frag.bin holds: 4 KiB blocks 2*i (i = 0..9) written
     with byte 'A'+i, holes between, then block 5 filled with 'z'."""
@@ -268,10 +272,13 @@ def common_ops(g, m, name):
     rc, out = g.sh(f"busybox rm {m}/d1/many/f500 {m}/d1/many/f999 && "
                    f"busybox mv {m}/d1/many/f1 {m}/d1/many/first && busybox ls {m}/d1/many | busybox wc -l")
     check(rc == 0 and out.strip().endswith("998"), f"{name}: deletes/renames in it ({out.strip()!r})")
-    # truncate: blob down to 5000 bytes, new.txt up to 100000 (a hole)
+    # truncate: trunc.txt down to 5000 bytes and back up to 8000 (the cut
+    # block's tail and the rest read as zeroes), new.txt up to 100000 (a hole)
     rc, out = g.sh(f"busybox seq 1 50000 > {m}/trunc.txt && busybox truncate -s 5000 {m}/trunc.txt && "
+                   f"busybox truncate -s 8000 {m}/trunc.txt && "
                    f"busybox truncate -s 100000 {m}/new.txt && busybox ls -l {m}/trunc.txt {m}/new.txt")
-    check(rc == 0 and "5000" in out and "100000" in out, f"{name}: truncate shrink/grow ({out.strip()!r})")
+    check(rc == 0 and "8000" in out and "100000" in out, f"{name}: truncate shrink/grow ({out.strip()!r})")
+    check(md5_of(g, f"{m}/trunc.txt") == md5(trunc_bytes()), f"{name}: truncated file reads back")
     rc, out = g.sh(f"busybox mkdir {m}/gone && busybox rmdir {m}/gone && echo x > {m}/gone2 && "
                    f"busybox rm {m}/gone2")
     check(rc == 0, f"{name}: rmdir and unlink")
@@ -300,8 +307,9 @@ def guest_tests(g, info):
 
     t0 = time.time()
     rc, out = g.sh(f"busybox yes \"{BIG_LINE.decode().strip()}\" | busybox head -c 1048576 > /tmp/pat1m && "
-                   f"for i in $(busybox seq 1 {BIG // 1048576}); do busybox cat /tmp/pat1m; done "
-                   "> /mnt/a/big50.bin && busybox sync && busybox ls -l /mnt/a/big50.bin", timeout=600.0)
+                   ": > /mnt/a/big50.bin && "
+                   f"for i in $(busybox seq 1 {BIG // 1048576}); do busybox cat /tmp/pat1m >> /mnt/a/big50.bin; done "
+                   "&& busybox sync && busybox ls -l /mnt/a/big50.bin", timeout=600.0)
     print(f"\n[SMOKE-EXT4RW] 50 MiB written and synced in {time.time() - t0:.1f}s")
     check(rc == 0 and str(BIG) in out, f"sdb: 50 MiB file written ({out.strip()[-200:]!r})")
     big_md5 = md5(big_bytes())
@@ -370,6 +378,7 @@ def host_checks(a_img, b_img, c_img, d_img, info):
         check(len(re.findall(r"\bf\d+\b", many)) == 997 and "first" in many,
               f"debugfs: {name} /d1/many has 998 entries")
         check(debugfs_cat(img, "/victim.txt") == b"replacement\n", f"debugfs: {name} rename over existing")
+        check(debugfs_cat(img, "/trunc.txt") == trunc_bytes(), f"debugfs: {name} truncated file")
         check(debugfs_cat(img, "/at-poweroff.txt") == b"at-poweroff\n",
               f"debugfs: {name} at-poweroff.txt, written just before poweroff")
         st = debugfs(img, "stat /sparse.bin")
