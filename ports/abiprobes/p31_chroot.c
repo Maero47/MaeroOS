@@ -11,6 +11,13 @@
  * was a stub, so toybox chroot failed.  Alpine Linux is run from a directory
  * on the disk with `chroot /disk/alpine` (ports/alpine/README.md).
  *
+ * Review round 1: the root was first kept as a path and looked up again on
+ * every lookup, so renaming the jail directory (or putting a symlink to /
+ * where it was) moved a running jail; Linux pins the directory.  And a
+ * symlink inside the jail to /proc/.. or /dev/.. (which MaeroOS passes
+ * through to the global /proc and /dev) led to the real root.  Both are
+ * checked below: the jail lives in a child while the parent renames it.
+ *
  * On a Linux host this needs root (else SKIP).  MaeroOS keeps /dev and /proc
  * reachable inside a chroot (nothing can mount them there); Linux does not,
  * so that is not checked here but in tools/smoke_alpine.py.
@@ -21,6 +28,7 @@
 #include <sys/wait.h>
 
 #define TOP "/tmp/p31root"
+#define OUTER "/tmp/p31outer"
 
 static void put(const char *path, const char *text)
 {
@@ -76,6 +84,77 @@ int main(void)
         probe_info("cannot become uid 1000 here, EPERM check skipped");
     else if (WEXITSTATUS(st) != 0)
         probe_fail("chroot as uid 1000 was not refused with EPERM");
+
+    /* A jail whose path is renamed and replaced by a symlink to / after the
+     * chroot: the jailed child keeps its directory. */
+    mkdir(OUTER, 0755);
+    char stale[64];                       /* leftovers of an earlier run */
+    snprintf(stale, sizeof stale, OUTER "/stale.%d", (int)getpid());
+    rename(OUTER "/jail.old", stale);
+    unlink(OUTER "/jail");
+    mkdir(OUTER "/jail", 0755);
+    mkdir(OUTER "/jail/etc", 0755);
+    mkdir(OUTER "/jail/proc", 0755);
+    mkdir(OUTER "/jail/dev", 0755);
+    put(OUTER "/jail/etc/hello", "jailed");
+    unlink(OUTER "/jail/esc1");
+    unlink(OUTER "/jail/esc2");
+    if (symlink("/proc/..", OUTER "/jail/esc1") != 0 ||
+        symlink("/dev/../etc", OUTER "/jail/esc2") != 0)
+        probe_fail("symlink in the jail: %s", strerror(errno));
+    int go[2], done[2];
+    if (pipe(go) != 0 || pipe(done) != 0)
+        probe_fail("pipe: %s", strerror(errno));
+    pid = fork();
+    if (pid == 0) {
+        char c;
+        char b[16] = {0};
+        int fd;
+        if (chroot(OUTER "/jail") != 0 || chdir("/") != 0)
+            _exit(10);
+        memset(b, 0, sizeof b);
+        fd = open("/esc1/etc/hello", O_RDONLY);
+        if (fd < 0 || read(fd, b, 6) != 6 || strcmp(b, "jailed") != 0)
+            _exit(14);                    /* /proc/.. left the root */
+        close(fd);
+        memset(b, 0, sizeof b);
+        fd = open("/esc2/hello", O_RDONLY);
+        if (fd < 0 || read(fd, b, 6) != 6 || strcmp(b, "jailed") != 0)
+            _exit(15);                    /* /dev/../etc left the root */
+        close(fd);
+        if (write(done[1], "c", 1) != 1 || read(go[0], &c, 1) != 1)
+            _exit(11);
+        memset(b, 0, sizeof b);
+        fd = open("/etc/hello", O_RDONLY);
+        if (fd < 0)
+            _exit(12);                    /* lost its root after the rename */
+        if (read(fd, b, 6) != 6 || strcmp(b, "jailed") != 0)
+            _exit(13);                    /* followed the symlink to / */
+        close(fd);
+        _exit(0);
+    }
+    char c;
+    close(done[1]);
+    close(go[0]);
+    if (read(done[0], &c, 1) == 1) {      /* else it exited early: see below */
+        if (rename(OUTER "/jail", OUTER "/jail.old") != 0)
+            probe_fail("rename the jail: %s", strerror(errno));
+        if (symlink("/", OUTER "/jail") != 0)
+            probe_fail("symlink %s -> /: %s", OUTER "/jail", strerror(errno));
+        if (write(go[1], "g", 1) != 1)
+            probe_fail("pipe write: %s", strerror(errno));
+    }
+    if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st))
+        probe_fail("jailed child status %#x", st);
+    switch (WEXITSTATUS(st)) {
+    case 0: break;
+    case 12: probe_fail("after the jail was renamed, /etc/hello is gone inside it");
+    case 13: probe_fail("after the jail path became a symlink to /, the jail sees the real root");
+    case 14: probe_fail("a symlink to /proc/.. inside the jail leads out of it");
+    case 15: probe_fail("a symlink to /dev/../etc inside the jail leads out of it");
+    default: probe_fail("jailed child failed (exit %d)", WEXITSTATUS(st));
+    }
+    unlink(OUTER "/jail");
 
     if (chdir(TOP) != 0 || chroot(".") != 0)
         probe_fail("chdir+chroot(\".\"): %s", strerror(errno));

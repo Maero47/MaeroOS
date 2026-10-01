@@ -446,7 +446,7 @@ static int path_is_root(const char *path) {
 static vfs_node_t *vfs_open_parent_at(const char *full_path,
                                       const char *dir_path) {
     if (full_path && full_path[0] == '/' && path_is_root(dir_path) &&
-        !current_proc->root[0] && vfs_path_uses_root_overlay(full_path)) {
+        !current_proc->root_node && vfs_path_uses_root_overlay(full_path)) {
         vfs_node_t *overlay = vfs_get_root_overlay();
         if (overlay) return overlay;
     }
@@ -917,6 +917,7 @@ static void fork_abort(struct proc *child) {
     sigshared_put(child->sigshared);
     child->sigshared = NULL;
     if (child->ctty) { vfs_close(child->ctty); child->ctty = NULL; }
+    if (child->root_node) { vfs_close(child->root_node); child->root_node = NULL; }
     kstack_free(child->kstack);
     child->kstack = NULL;
     child->state = PROC_UNUSED;
@@ -970,7 +971,8 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
                 fowner = &ptable[i]; break;
             }
     __builtin_memcpy(child->cwd, parent->cwd, sizeof(parent->cwd));
-    __builtin_memcpy(child->root, parent->root, sizeof(parent->root));
+    child->root_node = parent->root_node;
+    if (child->root_node) vfs_retain(child->root_node);
     child->heap_end  = fowner->heap_end;
     child->umask     = parent->umask;
     child->uid = parent->uid; child->gid = parent->gid;
@@ -2617,11 +2619,15 @@ static int sys_chdir(registers_t *regs) {
 }
 
 /* ── sys_chroot(path) — EAX=61 ───────────────────────────────────────────── */
-/* The new root is stored as a global path in current_proc->root and applied
- * by vfs_lookup(); /dev and /proc stay the global ones inside it (there is no
- * bind mount to put them there).  The cwd, a string relative to the root, is
- * reset to "/": Linux leaves the cwd outside the new root, but here the old
- * string would name a different directory inside it. */
+/* The directory `path` names now (resolved inside the current root, symlinks
+ * followed) becomes this process's root node, pinned with vfs_retain like an
+ * open descriptor's node: later renames, or a symlink put where the path
+ * was, do not move it.  /dev and /proc stay the global ones inside it (there
+ * is no bind mount to put them there).  The cwd, a string relative to the
+ * root, is reset to "/": Linux leaves the cwd outside the new root, but here
+ * the old string would name a different directory inside it.  For the same
+ * reason a descriptor opened before chroot() is resolved by its path string
+ * inside the new root; it cannot reach the old one. */
 static int sys_chroot(registers_t *regs) {
     char path[256];
     if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0)
@@ -2631,14 +2637,12 @@ static int sys_chroot(registers_t *regs) {
     vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
     if (!n) return lerr;
     if (!(n->flags & VFS_FLAG_DIR)) return -20;        /* -ENOTDIR */
-    char canonical[256];
-    int cr = canonicalize_path_at_cwd(path, canonical, sizeof(canonical));
-    if (cr < 0) return cr;
-    if (path_is_root(canonical)) return 0;             /* chroot("/"), "." at / */
-    uint32_t rlen = (uint32_t)__builtin_strlen(current_proc->root);
-    uint32_t clen = (uint32_t)__builtin_strlen(canonical);
-    if (rlen + clen + 1 > sizeof(current_proc->root)) return -36;
-    __builtin_memcpy(current_proc->root + rlen, canonical, clen + 1);
+    if (n == current_proc->root_node) return 0;        /* chroot("/"), "." at / */
+    vfs_node_t *old = current_proc->root_node;
+    if (n == vfs_root && !old) return 0;               /* the global root */
+    vfs_retain(n);
+    current_proc->root_node = n;
+    if (old) vfs_close(old);
     current_proc->cwd[0] = '/';
     current_proc->cwd[1] = '\0';
     return 0;
@@ -6939,7 +6943,7 @@ static uint32_t statfs_magic(const char *path) {
     first[i] = '\0';
     if (__builtin_strcmp(first, "proc") == 0) return 0x9FA0;   /* PROC_SUPER_MAGIC */
     if (__builtin_strcmp(first, "dev") == 0 ||
-        (__builtin_strcmp(first, "tmp") == 0 && !current_proc->root[0]))
+        (__builtin_strcmp(first, "tmp") == 0 && !current_proc->root_node))
         return 0x01021994;                                       /* TMPFS_MAGIC */
     return 0xEF53;                                               /* EXT2_SUPER_MAGIC */
 }
@@ -8081,7 +8085,8 @@ static int sys_clone(registers_t *regs) {
                          sizeof(child->sighand->mask));
     }
     __builtin_memcpy(child->cwd, parent->cwd, sizeof(parent->cwd));
-    __builtin_memcpy(child->root, parent->root, sizeof(parent->root));
+    child->root_node = parent->root_node;
+    if (child->root_node) vfs_retain(child->root_node);
     child->heap_end  = parent->heap_end;
     child->umask     = parent->umask;
     child->uid = parent->uid; child->gid = parent->gid;

@@ -198,7 +198,8 @@ enum { WALK_FOUND, WALK_MISS, WALK_RESTART };
  * that is the prefix a relative target is resolved against.
  */
 static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
-                    int may_follow, char *alt, vfs_node_t **out, int *err) {
+                    int may_follow, int top_restarts, char *alt,
+                    vfs_node_t **out, int *err) {
     const char *p = path + 1;
     vfs_node_t *cur = root;
     vfs_node_t *parents[64];
@@ -231,6 +232,17 @@ static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
                 cur = parents[--depth];
             else
                 cur = root;
+            /* A chrooted walk through /dev or /proc that climbs back to the
+             * top is at the chroot's "/", not the global one: start over
+             * with the rest of the path there (a symlink to /proc/.. must
+             * not lead out of the root). */
+            if (top_restarts && depth == 0) {
+                uint32_t rlen = (uint32_t)strlen(after_component);
+                if (rlen + 2 > VFS_PATH_MAX) { *err = -36; return WALK_MISS; }
+                alt[0] = '/';
+                memcpy(alt + 1, after_component, rlen + 1);
+                return WALK_RESTART;
+            }
             if (alen > 0) {
                 while (alen > 0 && alt[alen - 1] != '/') alen--;
                 if (alen > 0) alen--;
@@ -321,14 +333,14 @@ static vfs_node_t *vfs_lookup_in(vfs_node_t *croot, const char *path,
         if (croot && !vfs_path_skips_chroot(pth)) {
             /* ".." at the top stays at croot, and an absolute symlink target
              * comes back through here, so neither leaves the new root. */
-            r = vfs_walk(croot, pth, follow_final, may_follow, alt, &node, &e);
+            r = vfs_walk(croot, pth, follow_final, may_follow, 0, alt, &node, &e);
         } else {
             if (vfs_root_overlay && vfs_path_uses_root_overlay(pth))
                 r = vfs_walk(vfs_root_overlay, pth, follow_final, may_follow,
-                             alt, &node, &e);
+                             0, alt, &node, &e);
             if (r == WALK_MISS) {
                 r = vfs_walk(vfs_root, pth, follow_final, may_follow,
-                             alt, &node, &e2);
+                             croot != NULL, alt, &node, &e2);
                 if (e == -2) e = e2;     /* report a loop over a plain miss */
             }
         }
@@ -344,13 +356,8 @@ static vfs_node_t *vfs_lookup_in(vfs_node_t *croot, const char *path,
 
 vfs_node_t *vfs_lookup(const char *path, int follow_final, int *err) {
     struct proc *p = current_proc;
-    vfs_node_t *croot = NULL;
-    if (p && p->root[0]) {
-        /* The root is a global path (sys_chroot): resolve it unchrooted. */
-        croot = vfs_lookup_in(NULL, p->root, 1, err);
-        if (!croot) return NULL;
-    }
-    return vfs_lookup_in(croot, path, follow_final, err);
+    /* A chrooted process walks from the node sys_chroot pinned. */
+    return vfs_lookup_in(p ? p->root_node : NULL, path, follow_final, err);
 }
 
 vfs_node_t *vfs_open(const char *path) {

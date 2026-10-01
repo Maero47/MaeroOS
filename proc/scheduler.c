@@ -469,6 +469,10 @@ void proc_exit(int status) {
         vfs_close(current_proc->ctty);
         current_proc->ctty = (void *)0;
     }
+    if (current_proc->root_node) {           /* chroot(2)'s pinned root */
+        vfs_close(current_proc->root_node);
+        current_proc->root_node = (void *)0;
+    }
     /* Likewise the shared handler table. */
     sighand_put(current_proc->sighand);
     current_proc->sighand = (struct sighand *)0;

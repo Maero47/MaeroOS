@@ -36,23 +36,34 @@ apk-tools also calls itself (`chroot(".")` around package scripts with
 How the chroot works (`proc/syscall.c` `sys_chroot`, `fs/vfs.c`
 `vfs_lookup`):
 
-- Each process stores its root as a global path (`proc->root`, empty when
-  it is not chrooted). Every path the process passes in is relative to
-  that root, and so are its cwd and fd paths. `vfs_lookup()` starts the
-  walk at the root's node. `..` at the top stays there, and absolute
-  symlink targets go back through the same lookup, so neither one leaves
-  the root.
+- `chroot()` resolves the directory once and pins its node (`proc->root_node`,
+  held with `vfs_retain` like an open file's node). Renaming the
+  directory afterwards, or putting a symlink to `/` where it was, does
+  not move a running jail. fork and clone take their own reference, and
+  exit releases it.
+- Every path the process passes in is relative to that node, and so are
+  its cwd and fd paths. `vfs_lookup()` starts the walk there. `..` at the
+  top stays there, and absolute symlink targets go back through the same
+  lookup, so neither one leaves the root.
 - `/dev` and `/proc` inside a chroot are the global ones. MaeroOS has no
   mount namespaces or bind mounts to put them there, and apk, python and
-  ssh need `/dev/urandom`, `/dev/null` and `/proc/self`. The Alpine root's
-  own `/tmp` is a directory on the disk.
+  ssh need `/dev/urandom`, `/dev/null` and `/proc/self`. A `..` that
+  climbs out of them comes back to the chroot's `/`, not the global one,
+  so a symlink to `/proc/..` cannot lead out. The Alpine root's own `/tmp`
+  is a directory on the disk.
 - `chroot()` resets the cwd to `/`. Linux leaves the cwd where it was, but
   here the cwd is a path string, and the old string would name a
-  different directory inside the new root. Nested chroots append to the
-  root path. Only euid 0 may chroot (EPERM otherwise).
-- Known gap: a descriptor opened *before* `chroot()` keeps its old path
-  string, so a later `fchdir`/`*at` call through it is resolved inside the
-  new root.
+  different directory inside the new root. A nested `chroot()` resolves
+  its argument inside the current root. Only euid 0 may chroot (EPERM
+  otherwise).
+- Unlike Linux, a descriptor opened *before* `chroot()` does not reach
+  the old tree: `fchdir`/`*at` calls resolve it by its path string, inside
+  the new root. This is stricter than Linux, where such a descriptor is
+  the classic chroot escape.
+
+Probe `p31_chroot` covers all of this, including a rename and a symlink to
+`/` under a running jail and symlinks to `/proc/..` and `/dev/../etc`
+inside one.
 
 ## How the image is built (`prepare.py`)
 
