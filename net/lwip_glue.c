@@ -162,7 +162,16 @@ void net_lwip_write_resolv_conf(void) {
         return;
     }
 
+    /* Same servers as the file already names (every boot on the same
+     * network): leave the disk alone. */
     uint32_t len = (uint32_t)strlen(resolv_text);
+    char cur[sizeof(resolv_text)];
+    if (node->size == len &&
+        vfs_read(node, 0, len, (uint8_t *)cur) == len &&
+        memcmp(cur, resolv_text, len) == 0) {
+        vfs_close(node);
+        return;
+    }
     if (vfs_truncate(node, 0) < 0 ||
         vfs_write(node, 0, len, (const uint8_t *)resolv_text) != len)
         printk("[NET] writing /etc/resolv.conf failed\n");

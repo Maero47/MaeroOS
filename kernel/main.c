@@ -198,11 +198,6 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
      * wall time (arch/i686/cpu/tsc.c). */
     tsc_init();
 
-    /* Network bottom-half: keeps DHCP/TCP alive without userspace polling */
-    if (net_find_interface("eth0"))
-        proc_create_kthread(knetd, "knetd");
-    ac97_start_thread();
-
     __asm__ volatile("sti");
 
     /* ── SMP S2: bring up application processors (needs heap, LAPIC, PIT for
@@ -229,6 +224,13 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
             for (;;) __asm__ volatile("hlt");
         }
     }
+
+    /* Kernel threads come after init, so init is pid 1 (ps -p 1, kill -1
+     * semantics).  QEMU's default NIC is an e1000, so most boots have one. */
+    /* Network bottom-half: keeps DHCP/TCP alive without userspace polling */
+    if (net_find_interface("eth0"))
+        proc_create_kthread(knetd, "knetd");
+    ac97_start_thread();
 
     printk("[BOOT] Jumping to scheduler.\n");
     /* The process table is now fully built — release the APs so they can scan

@@ -1253,6 +1253,8 @@ def main():
                     help="attach an rtl8139 on QEMU user networking, so the guest can reach "
                          "the host as 10.0.2.2 (e.g. --type 'http://10.0.2.2:8000/'). "
                          "Off by default: the default run has no NIC.")
+    ap.add_argument("--nic", default="rtl8139", choices=["rtl8139", "e1000"],
+                    help="the NIC model --net attaches (default rtl8139)")
     ap.add_argument("--web", action="store_true",
                     help="after the paint verdict, load a page served from the host "
                          "(implies --net) and require its image on screen; see above")
@@ -1321,7 +1323,11 @@ def main():
     if args.cpu:
         cmd[1:1] = ["-cpu", args.cpu]
     if args.net:
-        cmd += ["-netdev", "user,id=n0", "-device", "rtl8139,netdev=n0"]
+        cmd += ["-netdev", "user,id=n0", "-device", "%s,netdev=n0" % args.nic]
+    else:
+        # QEMU's pc machine adds an e1000 unless told not to, and the kernel
+        # drives it (drivers/e1000.c): keep the no-network run NIC-less.
+        cmd += ["-nic", "none"]
     with open(os.path.join(args.outdir, "qemu-cmdline.txt"), "w") as f:
         f.write(" ".join(cmd) + "\n")
 
