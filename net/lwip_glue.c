@@ -156,7 +156,7 @@ void net_lwip_write_resolv_conf(void) {
             vfs_close(dir);
     }
     if (!node || !node->write_fn || !node->truncate_fn) {
-        printk("[NET] /etc/resolv.conf is read-only; DHCP DNS not written\n");
+        printk_klog("[NET] /etc/resolv.conf is read-only; DHCP DNS not written\n");
         if (node)
             vfs_close(node);
         return;
@@ -174,9 +174,9 @@ void net_lwip_write_resolv_conf(void) {
     }
     if (vfs_truncate(node, 0) < 0 ||
         vfs_write(node, 0, len, (const uint8_t *)resolv_text) != len)
-        printk("[NET] writing /etc/resolv.conf failed\n");
+        printk_klog("[NET] writing /etc/resolv.conf failed\n");
     else
-        printk("[NET] /etc/resolv.conf written from DHCP\n");
+        printk_klog("[NET] /etc/resolv.conf written from DHCP\n");
     vfs_close(node);
 }
 
@@ -191,7 +191,7 @@ void net_lwip_poll(void) {
         char b[80];
         bound = 1;
         net_lwip_ipv4(b, sizeof(b));
-        printk("[LWIP] eth0 bound%s\n", b);
+        printk_klog("[LWIP] eth0 bound%s\n", b);
     }
     resolv_check();
 }

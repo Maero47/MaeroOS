@@ -22,3 +22,14 @@ void printk(const char *fmt, ...) {
     vprintk(fmt, args);
     va_end(args);
 }
+
+void printk_klog(const char *fmt, ...) {
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    if (n < 0) n = 0;
+    if ((size_t)n >= sizeof(buf)) n = (int)sizeof(buf) - 1;
+    klog_write(buf, (size_t)n);
+}

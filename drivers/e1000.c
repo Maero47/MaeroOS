@@ -17,6 +17,7 @@
 #include "e1000.h"
 #include "pci.h"
 #include "../arch/i686/cpu/irq.h"
+#include "../arch/i686/cpu/pit.h"
 #include "../arch/i686/cpu/pic.h"
 #include "../arch/i686/include/io.h"
 #include "../arch/i686/mm/paging.h"
@@ -251,7 +252,6 @@ static void tx_setup(void) {
     for (int i = 0; i < TX_DESCS; i++) {
         memset(&tx_ring[i], 0, sizeof(tx_ring[i]));
         tx_ring[i].addr = virt_to_phys(tx_bufs[i]);
-        tx_ring[i].status = TXD_STAT_DD;   /* free */
     }
     wr32(REG_TDBAL, virt_to_phys(tx_ring));
     wr32(REG_TDBAH, 0);
@@ -259,10 +259,63 @@ static void tx_setup(void) {
     wr32(REG_TDH, 0);
     wr32(REG_TDT, 0);
     info.tx_next = 0;
+    info.tx_clean = 0;
+    info.tx_stall_tick = 0;
     /* Recommended values for full duplex copper (SDM 13.4.33/13.4.34). */
     wr32(REG_TCTL, TCTL_EN | TCTL_PSP | TCTL_CT(0x0F) | TCTL_COLD(0x40) |
                    TCTL_RTLC);
     wr32(REG_TIPG, 10U | (8U << 10) | (6U << 20));
+}
+
+/*
+ * TX ring bookkeeping.  Slots tx_clean .. tx_next-1 are posted to the chip;
+ * tx_reclaim() walks tx_clean forward over the ones it has finished (DD set).
+ * One slot always stays empty: TDT == TDH means "ring empty" to the chip
+ * (SDM 3.3.1), so a ring filled to the last slot would look empty to it and
+ * the frames in it would never go out -- nor would any later ones.
+ */
+static uint32_t tx_reclaim(void) {
+    uint32_t freed = 0;
+    while (info.tx_clean != info.tx_next &&
+           (((volatile struct e1000_tx_desc *)&tx_ring[info.tx_clean])->status &
+            TXD_STAT_DD)) {
+        info.tx_clean = (info.tx_clean + 1) % TX_DESCS;
+        freed++;
+    }
+    return freed;
+}
+
+static int tx_full(void) {
+    return (info.tx_next + 1) % TX_DESCS == info.tx_clean;
+}
+
+/*
+ * TX watchdog: posted frames that make no progress for 2 s mean the chip
+ * stopped transmitting (link down on real hardware, a hung DMA engine).
+ * Reset the transmit unit with an empty ring, as Linux's e1000 watchdog does
+ * (dropping what was queued; TCP retransmits).  Called with the ring idle or
+ * from send/poll, both in process context under preempt_disable().
+ */
+#define TX_STALL_TICKS 200   /* PIT at 100 Hz */
+
+static void tx_watchdog(void) {
+    if (tx_reclaim() || info.tx_clean == info.tx_next) {
+        info.tx_stall_tick = 0;
+        return;
+    }
+    uint32_t now = pit_ticks();
+    if (!info.tx_stall_tick) {
+        info.tx_stall_tick = now ? now : 1;
+        return;
+    }
+    if (now - info.tx_stall_tick < TX_STALL_TICKS)
+        return;
+    info.tx_resets++;
+    printk_klog("[E1000] transmit stalled (%u frames queued, link %s); resetting TX\n",
+                (unsigned)((info.tx_next + TX_DESCS - info.tx_clean) % TX_DESCS),
+                (rd32(REG_STATUS) & STATUS_LU) ? "up" : "down");
+    wr32(REG_TCTL, 0);
+    tx_setup();
 }
 
 int e1000_send(const void *data, uint32_t len) {
@@ -271,16 +324,21 @@ int e1000_send(const void *data, uint32_t len) {
     if (!data || len == 0 || len > BUF_SIZE)
         return -22;
 
+    /* Ring full: give the chip a moment to finish a frame before giving up
+     * (the caller drops this one; the watchdog deals with a dead chip). */
+    tx_reclaim();
+    for (int i = 0; i < 100000 && tx_full(); i++) {
+        __asm__ volatile("pause");
+        tx_reclaim();
+    }
+    if (tx_full()) {
+        tx_watchdog();
+        if (tx_full())
+            return -11;
+    }
+
     uint32_t idx = info.tx_next;
     volatile struct e1000_tx_desc *d = &tx_ring[idx];
-
-    /* The ring is full only if the chip has not finished the frame that sat
-     * in this slot TX_DESCS sends ago; give it a moment before giving up. */
-    for (int i = 0; i < 100000 && !(d->status & TXD_STAT_DD); i++)
-        __asm__ volatile("pause");
-    if (!(d->status & TXD_STAT_DD))
-        return -11;
-
     memcpy(tx_bufs[idx], data, len);
     d->length = (uint16_t)len;
     d->cso = 0;
@@ -298,6 +356,8 @@ int e1000_send(const void *data, uint32_t len) {
 int e1000_poll(void) {
     if (!info.present)
         return 0;
+
+    tx_watchdog();
 
     int packets = 0;
     for (;;) {
@@ -475,7 +535,7 @@ int e1000_describe(char *buf, uint32_t cap) {
         return 0;
     uint32_t status = rd32(REG_STATUS);
     return snprintf(buf, cap,
-                    "mmio=0x%08x irq=%u mac=%02x:%02x:%02x:%02x:%02x:%02x link=%s%s rdh=%u rdt=%u tdh=%u tdt=%u rctl=0x%x",
+                    "mmio=0x%08x irq=%u mac=%02x:%02x:%02x:%02x:%02x:%02x link=%s%s rdh=%u rdt=%u tdh=%u tdt=%u rctl=0x%x txresets=%u",
                     (unsigned)info.mmio_phys, (unsigned)info.irq,
                     info.mac[0], info.mac[1], info.mac[2],
                     info.mac[3], info.mac[4], info.mac[5],
@@ -483,7 +543,7 @@ int e1000_describe(char *buf, uint32_t cap) {
                     (status & STATUS_LU) ? ((status & STATUS_FD) ? "/fd" : "/hd") : "",
                     (unsigned)rd32(REG_RDH), (unsigned)rd32(REG_RDT),
                     (unsigned)rd32(REG_TDH), (unsigned)rd32(REG_TDT),
-                    (unsigned)rd32(REG_RCTL));
+                    (unsigned)rd32(REG_RCTL), (unsigned)info.tx_resets);
 }
 
 const e1000_info_t *e1000_get_info(void) {

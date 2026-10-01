@@ -346,10 +346,26 @@ def main():
 
     try:
         smokelib.login(proc, sel, log, timeout=25.0)
-        # The DHCP lease is logged once lwIP binds; with the e1000 QEMU drops
-        # the first OFFER while the receiver settles, so the retransmit a
-        # second later is the one that binds.
-        wait_for(proc, sel, "[LWIP] eth0 bound ip=10.0.2.15", log, timeout=15.0)
+        # The DHCP lease: with the e1000 QEMU drops the first OFFER while the
+        # receiver settles, so the retransmit a second later binds.  The
+        # kernel logs it to dmesg only (not the console, where it would land
+        # in the middle of a command's output).
+        deadline = time.time() + 20
+        while "ip=10.0.2.15" not in run(proc, sel, log, "ifconfig"):
+            if time.time() > deadline:
+                raise AssertionError("no DHCP lease within 20 s")
+            time.sleep(0.5)
+        want = ["[LWIP] eth0 bound ip=10.0.2.15"]
+        if nic == "e1000":
+            want.append("[NET] /etc/resolv.conf written from DHCP")
+        deadline = time.time() + 10
+        while True:
+            out = run(proc, sel, log, "dmesg")
+            if all(w in out for w in want):
+                break
+            if time.time() > deadline:
+                raise AssertionError(f"dmesg lacks {want}")
+            time.sleep(0.5)
         before = len("".join(log))
         send(proc, "lspci")
         wait_for(proc, sel, PROMPT, log, timeout=10.0, start=before)
