@@ -159,6 +159,8 @@ static spinlock_t verb_lock;
 
 static volatile int playing;
 static uint32_t play_abs, write_abs, last_lpib, underruns;
+static volatile int drop_req;    /* hda_drop() -> pump(): discard queued PCM */
+static int drop_chan;                             /* its sleep channel */
 
 /* output paths: the node to put the volume on, and that node's step count */
 #define MAX_OUTS 4
@@ -570,6 +572,19 @@ static void pump(void) {
 
     if (!present) return;
 
+    if (drop_req) {
+        /* Everything queued goes: the ring, and the real PCM ahead of the
+         * engine in the cyclic buffer (the guard bytes it may have fetched
+         * already stay).  The end-of-data test below then stops the stream. */
+        ring_tail = ring_head;
+        if (playing && write_abs > play_abs + WRITE_GUARD) {
+            zero_range(play_abs + WRITE_GUARD, write_abs);
+            write_abs = play_abs + WRITE_GUARD;
+        }
+        drop_req = 0;
+        wake_up(&drop_chan);
+    }
+
     if (!playing) {
         uint32_t used = ring_used();
         /* start with a cushion, or with whatever there is once the writer
@@ -656,6 +671,29 @@ int hda_set_volume(int percent) {
     volume = percent;
     apply_volume();
     return 0;
+}
+
+/* PCM bytes accepted but not yet played: the ring plus the real data ahead
+ * of the engine in the cyclic buffer (as of the last pump, <= 20 ms old). */
+uint32_t hda_queued(void) {
+    uint32_t q;
+
+    if (!present) return 0;
+    q = ring_used();
+    if (playing && write_abs > play_abs)
+        q += write_abs - play_abs;
+    return q;
+}
+
+/* Throw away everything queued (ALSA drop); returns once khdad has done it. */
+void hda_drop(void) {
+    if (!present) return;
+    drop_req = 1;
+    io_wake();
+    while (drop_req) {
+        current_proc->wake_tick = pit_ticks() + 1;
+        sleep_on(&drop_chan);
+    }
 }
 
 /* Blocking PCM write (48kHz S16LE stereo); same contract as ac97_write. */

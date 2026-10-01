@@ -48,6 +48,7 @@
 #include "../kernel/random.h"
 #include "../net/net.h"
 #include "../net/lwip_glue.h"
+#include "../drivers/alsa.h"
 #include <stdint.h>
 
 void stack_chk_seed(void);   /* kernel/stack_chk.c */
@@ -174,6 +175,7 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     ac97_init();
     xhci_init();
     hda_init();
+    alsa_init();          /* /dev/snd on whichever of the two is up */
     net_lwip_init();
     ata_init();
     ahci_init();

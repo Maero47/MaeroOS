@@ -61,6 +61,9 @@ typedef struct {
 
 static bdl_entry_t bdl[NUM_BUFS] __attribute__((aligned(8)));
 static uint8_t dma_buf[NUM_BUFS][BUF_BYTES] __attribute__((aligned(4)));
+static uint16_t buf_len[NUM_BUFS];               /* PCM bytes in each (rest 0) */
+static volatile int drop_req;                     /* ac97_drop() -> pump() */
+static int drop_chan;                             /* its sleep channel */
 
 /* PCM byte ring fed by /dev/dsp writes, drained into DMA buffers. */
 #define RING_BYTES (256 * 1024)
@@ -96,6 +99,7 @@ static void fill_buf(int idx) {
     for (uint32_t i = 0; i < n; i++)
         dma_buf[idx][i] = ring[(ring_tail + i) % RING_BYTES];
     ring_tail += n;
+    buf_len[idx] = (uint16_t)n;
     if (n < BUF_BYTES)
         memset(dma_buf[idx] + n, 0, BUF_BYTES - n);
     bdl[idx].addr = virt_to_phys(dma_buf[idx]);
@@ -105,14 +109,44 @@ static void fill_buf(int idx) {
         wake_up(&ring_waiters);
 }
 
+/* PCM bytes in the DMA buffers the engine has not played yet: what is left
+ * of the current one (PICB counts its samples to go) and the buffers ahead
+ * of it that the pump has not refilled since they played. */
+static uint32_t dma_queued(uint8_t civ) {
+    uint32_t left = (uint32_t)inw((uint16_t)(nabm_base + PO_PICB)) * 2;
+    uint32_t played = left < BUF_BYTES ? BUF_BYTES - left : 0;
+    uint32_t q = buf_len[civ] > played ? buf_len[civ] - played : 0;
+    uint32_t ahead = (uint32_t)(next_buf - civ - 1 + 2 * NUM_BUFS) % NUM_BUFS;
+
+    for (uint32_t j = 1; j <= ahead; j++)
+        q += buf_len[(civ + j) % NUM_BUFS];
+    return q;
+}
+
 /* Advance playback: refill completed buffers, start/stop the engine. */
 static void pump(void) {
     if (!present) return;
+
+    if (drop_req) {
+        /* Discard the ring and every buffer ahead of the current one. */
+        ring_tail = ring_head;
+        if (playing) {
+            uint8_t civ = inb((uint16_t)(nabm_base + PO_CIV));
+            for (int j = 1; j < NUM_BUFS; j++) {
+                int idx = (civ + j) % NUM_BUFS;
+                memset(dma_buf[idx], 0, BUF_BYTES);
+                buf_len[idx] = 0;
+            }
+        }
+        drop_req = 0;
+        wake_up(&drop_chan);
+    }
 
     if (!playing) {
         int primed = 0;
 
         if (ring_used() == 0) return;
+        memset(buf_len, 0, sizeof(buf_len));
         /* Prime only buffers that have data; LVI marks the last one. */
         next_buf = 0;
         while (primed < NUM_BUFS && ring_used() > 0) {
@@ -139,17 +173,19 @@ static void pump(void) {
                 last_filled = next_buf;
             } else {
                 memset(dma_buf[next_buf], 0, BUF_BYTES);
+                buf_len[next_buf] = 0;
             }
             next_buf = (uint8_t)((next_buf + 1) % NUM_BUFS);
         }
         outb((uint16_t)(nabm_base + PO_LVI), last_filled);
 
         /* QEMU's engine does not reliably halt at LVI — stop ourselves
-         * once the last data buffer has completed (civ just past it). */
+         * once no buffer holds PCM still to play.  (Judging that from civ
+         * against last_filled alone stopped early whenever the ring ran dry
+         * exactly at the end of a refill: last_filled is then civ - 1 with
+         * up to NUM_BUFS - 1 buffers of PCM still ahead.) */
         if (ring_used() == 0) {
-            uint8_t delta = (uint8_t)((civ - last_filled + NUM_BUFS)
-                                      % NUM_BUFS);
-            if (delta >= 1 && delta <= 8) {
+            if (dma_queued(civ) == 0) {
                 outb((uint16_t)(nabm_base + PO_CR), 0);
                 outw((uint16_t)(nabm_base + PO_SR),
                      SR_LVBCI | SR_BCIS | SR_FIFOE);
@@ -196,6 +232,28 @@ void ac97_start_thread(void) {
 
 uint32_t ac97_irq_count(void) {
     return irq_count;
+}
+
+/* PCM bytes written but not yet played (ring + DMA buffers). */
+uint32_t ac97_queued(void) {
+    uint32_t q;
+
+    if (!present) return 0;
+    q = ring_used();
+    if (playing)
+        q += dma_queued(inb((uint16_t)(nabm_base + PO_CIV)));
+    return q;
+}
+
+/* Throw away everything queued (ALSA drop); returns once ksoundd has. */
+void ac97_drop(void) {
+    if (!present) return;
+    drop_req = 1;
+    io_wake();
+    while (drop_req) {
+        current_proc->wake_tick = pit_ticks() + 1;
+        sleep_on(&drop_chan);
+    }
 }
 
 /* Blocking PCM write (48kHz S16LE stereo).  EINTR-aware like the pipes. */

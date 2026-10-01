@@ -2,6 +2,7 @@
 #include "../drivers/blkpart.h"
 #include "../drivers/ac97.h"
 #include "../drivers/hda.h"
+#include "../drivers/alsa.h"
 #include "vfs.h"
 #include "tmpfs.h"
 #include "../drivers/framebuffer.h"
@@ -993,6 +994,7 @@ static vfs_node_t *devdir_finddir(vfs_node_t *node, const char *name) {
     if (strcmp(name, "pts")     == 0) return &dev_pts_dir;
     if (strcmp(name, "urandom") == 0) return &dev_urandom;
     if (strcmp(name, "dsp") == 0) return &dev_dsp;
+    if (strcmp(name, "snd")     == 0) return alsa_dev_dir();   /* or NULL */
     if (strcmp(name, "fb0")     == 0 && framebuffer_available()) return &dev_fb0;
     if (strcmp(name, "input")   == 0) return &dev_input_dir;
     if (strcmp(name, "shm")     == 0) return dev_shm_root;
@@ -1012,16 +1014,19 @@ static int devdir_readdir(vfs_node_t *node, uint32_t idx, vfs_dirent_t *out) {
     (void)node;
     static const char *names[] = { "null", "zero", "tty", "urandom", "dsp",
                                     "fb0", "input", "ptmx", "pts", "shm",
-                                    "stdin", "stdout", "stderr", "usbdisk0" };
+                                    "stdin", "stdout", "stderr", "usbdisk0",
+                                    "snd" };
     uint32_t out_idx = 0;
     for (uint32_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         if (i == 5 && !framebuffer_available()) continue;   /* "fb0" */
         if (i == 13 && !usb_msc_node()) continue;           /* "usbdisk0" */
+        if (i == 14 && !alsa_dev_dir()) continue;           /* "snd" */
         if (out_idx == idx) {
             out->ino  = (uint32_t)(idx + 1);
             out->type = (strcmp(names[i], "input") == 0 ||
                          strcmp(names[i], "pts") == 0 ||
-                         strcmp(names[i], "shm") == 0) ? VFS_FLAG_DIR
+                         strcmp(names[i], "shm") == 0 ||
+                         strcmp(names[i], "snd") == 0) ? VFS_FLAG_DIR
                                                         : VFS_FLAG_CHARDEV;
             strncpy(out->name, names[i], 255);
             out->name[255] = '\0';

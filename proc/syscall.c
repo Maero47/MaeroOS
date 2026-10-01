@@ -39,6 +39,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <kernel/kprof.h>
+#include "../drivers/alsa.h"
 
 /* ── Kernel-internal ABI structs (matching Linux i386 userspace layout) ──── */
 
@@ -3007,6 +3008,12 @@ static int sys_ioctl(registers_t *regs) {
 
     if (fd < 0 || fd >= MAX_FD) return -9;
     proc_file_t *f = &current_proc->ofile[fd];
+    /* ALSA: dozens of requests with structures up to 604 bytes, one of them
+     * (WRITEI_FRAMES) carrying a further user pointer; drivers/alsa.c does
+     * its own copying and needs the descriptor's O_NONBLOCK. */
+    if (f->type == FD_FILE && f->node && alsa_node(f->node))
+        return alsa_ioctl(f->node, (uint32_t)req, (void *)(uintptr_t)regs->edx,
+                          (f->flags & O_NONBLOCK) != 0);
     if (f->type == FD_FILE && f->node && f->node->ioctl_fn) {
         /* Drivers read and write their argument with plain loads and stores,
          * which fault (and panic, not being in __ex_table) on a read-only or
@@ -4535,6 +4542,9 @@ static int sys_mmap2(registers_t *regs) {
             !current_proc->ofile[fd].node)
             return -9;
         fnode = current_proc->ofile[fd].node;
+        /* ALSA status/control/data pages are not mappable here; alsa-lib
+         * falls back to SYNC_PTR and RW access. */
+        if (alsa_node(fnode)) return -6;                          /* -ENXIO */
         /* Linux do_mmap(): every file mapping needs a descriptor open for
          * reading; a shared writable one needs it open read-write, or a
          * read-only descriptor would write the file through the mapping. */
