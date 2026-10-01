@@ -28,6 +28,8 @@ user_pref("accessibility.force_disabled", 1);
 user_pref("toolkit.telemetry.enabled", false);
 user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("browser.startup.homepage", "about:blank");
+/* Ignored since Firefox 63: updates are off through the DisableAppUpdate
+ * policy in /etc/firefox/policies/policies.json (README-BROWSER.md). */
 user_pref("app.update.enabled", false);
 /* Suppress startup UI that crash-loops on this minimal GTK (no icon theme):
  * crash-recovery / session-restore prompt, first-run welcome, "what's new". A
