@@ -53,6 +53,10 @@ typedef struct {
                                * first copy (fd_copy) or EPOLL_CTL_ADD; every
                                * copy shares it, close clears it; 0 = none */
     char             path[256]; /* FD_FILE: canonical opened path */
+    /* The mount(2) mount the file was opened on (NULL: the boot tree) and
+     * its number, for EROFS on descriptor-based changes (fchmod, ...). */
+    struct vfs_mnt  *mnt;
+    uint32_t         mnt_seq;
 } proc_file_t;
 
 /* Shared, reference-counted file-descriptor table.  Threads of a process

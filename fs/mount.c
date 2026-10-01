@@ -76,6 +76,20 @@ static int mount_remount(const char *target, uint32_t flags) {
     int want_ro = (flags & VFS_MS_RDONLY) != 0;
     if (!want_ro && (m->flags & VFS_MS_RDONLY) && is_ext_type(m->fstype))
         return -30;                                           /* -EROFS */
+    /* Linux: going read-only while a file of the mount is open for writing
+     * is -EBUSY, so no descriptor can write to a read-only mount. */
+    if (want_ro && !(m->flags & VFS_MS_RDONLY)) {
+        for (int i = 0; i < MAX_PROCS; i++) {
+            struct proc *p = &ptable[i];
+            if (p->state == PROC_UNUSED) continue;
+            for (int fd = 0; fd < MAX_FD; fd++) {
+                proc_file_t *f = &p->ofile[fd];
+                if (f->type != FD_NONE && f->mnt == m && f->mnt_seq == m->seq &&
+                    (f->flags & O_ACCMODE) != O_RDONLY)
+                    return -16;                               /* -EBUSY */
+            }
+        }
+    }
     m->flags = flags & MS_KEEP;
     return 0;
 }
@@ -100,11 +114,13 @@ int mount_do(const char *source, const char *target, const char *fstype,
         /* A bind mount shows an existing directory at a second place. */
         if (!source) return -22;
         int err;
-        vfs_node_t *src = vfs_lookup(source, 1, &err);
+        vfs_mnt_t *src_m = NULL;
+        vfs_node_t *src = vfs_lookup_mnt(source, 1, &err, &src_m);
         if (!src) return err;
         if (src->flags != VFS_FLAG_DIR) return -20;           /* -ENOTDIR */
         vfs_mnt_t t;
         memset(&t, 0, sizeof(t));
+        t.src = src_m;        /* pins the mount the source lives on */
         strncpy(t.source, source, sizeof(t.source) - 1);
         strncpy(t.fstype, "none", sizeof(t.fstype) - 1);
         t.flags = flags & MS_KEEP;

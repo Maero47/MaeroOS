@@ -238,6 +238,10 @@ typedef struct vfs_mnt {
     vfs_node_t  *root;          /* the mounted filesystem's root */
     struct vfs_mnt *parent;     /* mount `mp` lives on, NULL for the boot tree */
     uint32_t     flags;         /* VFS_MS_* */
+    uint32_t     seq;           /* mount order (newer = larger), never reused */
+    /* Bind mounts: the mount the source directory lives on.  It cannot be
+     * unmounted while this entry exists (its nodes would be freed under us). */
+    struct vfs_mnt *src;
     char         source[64];
     char         target[256];
     char         fstype[16];
@@ -261,6 +265,13 @@ vfs_node_t *vfs_lookup_mnt(const char *path, int follow_final, int *err,
  * 0 or -errno: -ENOENT, -ENOTDIR, -EBUSY (already a mount root of the same
  * instance), -ENOMEM (table full). */
 int vfs_mount_add(const char *target, vfs_node_t *root, const vfs_mnt_t *tmpl);
+
+/* Nonzero while any mount(2) mount exists. */
+int vfs_mounts_active(void);
+
+/* 1 when `m` is still the mount numbered `seq` and is read-only (open files
+ * keep both, so a slot reused after umount is not mistaken for theirs). */
+int vfs_mnt_rdonly(const vfs_mnt_t *m, uint32_t seq);
 
 /* The mount whose root `path` names, or NULL (with *err set). */
 vfs_mnt_t *vfs_mount_find(const char *path, int *err);

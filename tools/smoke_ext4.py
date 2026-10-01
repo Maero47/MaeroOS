@@ -259,6 +259,10 @@ def main():
         rc, out = g.sh("busybox umount /mnt")
         check(rc == 0, "umount hdb1")
 
+        # ── Bind pinning, umount by name, EROFS through descriptors ─────
+        rc, out = g.sh("/disk/mntprobe /dev/hdb1", timeout=120.0)
+        check(rc == 0 and "mntprobe ok" in out, f"mntprobe ({out.strip()[-300:]!r})")
+
         # ── Pseudo filesystems, flags, permissions ──────────────────────
         rc, out = g.sh("busybox mount -t tmpfs none /mnt && echo hi > /mnt/t && busybox cat /mnt/t")
         check(rc == 0 and "hi" in out, "tmpfs mounted on /mnt and writable")

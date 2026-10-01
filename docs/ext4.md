@@ -26,7 +26,8 @@ the other IDE positions: `-drive file=x.img,format=raw,index=1` is `hdb`,
 | `fs/vfs.c` | the mount table: `vfs_mount_add/find/remove`, crossing in the path walk, the mount each lookup ends on (for `MS_RDONLY`), `/proc/mounts` |
 | `fs/mount.c` | `mount_do()`/`umount_do()`: types `ext4`/`ext3`/`ext2` (block device source), `tmpfs`, `proc`, `devtmpfs`; `MS_REMOUNT`, `MS_BIND`, propagation flags (accepted, no-op) |
 | `fs/ext4.c` | the read-only ext2/3/4 driver |
-| `proc/syscall.c` | `mount` (21), `umount` (22), `umount2` (52); `EROFS` on read-only mounts for open-for-write, create, mkdir, mknod, unlink, rmdir, rename, symlink, truncate, chmod, chown |
+| `proc/syscall.c` | `mount` (21), `umount` (22), `umount2` (52); `EROFS` on read-only mounts for open-for-write, create, mkdir, mknod, unlink, rmdir, rename, symlink, truncate, chmod, chown, and through descriptors for fchmod, fchown, ftruncate, fallocate |
+| `userspace/mntprobe` | bind pinning, umount-by-name after slot reuse, `EROFS`/`EBUSY` through descriptors (run by `smoke-ext4`) |
 
 `blkpart` is deliberately small: when a general block layer lands
 (`drivers/blkdev.c` on another branch), a `blkpart_t` becomes a view over it
@@ -48,6 +49,15 @@ and only `blkpart_read`/`blkpart_write` change.
 * The boot mounts (`/disk`, `/tmp`, `/dev`, `/proc`, made by `vfs_mount()`)
   are listed in `/proc/mounts` but cannot be unmounted.
 * `rmdir`/`unlink` of a mountpoint is `EBUSY`.
+* A bind mount pins the mount its source directory lives on: that mount is
+  `EBUSY` to unmount while the bind exists.
+* `umount <path>` removes the mount the path walk crossed last to reach
+  `<path>` (mounts are numbered in the order they are made), so a bind of a
+  mounted root is told apart from the mount itself.
+* Open files remember the mount they were opened on: `fchmod`, `fchown`,
+  `ftruncate` and `fallocate` through a descriptor are `EROFS` on a
+  read-only mount, and `remount,ro` is `EBUSY` while a file of the mount is
+  open for writing (as on Linux), so no descriptor can write to it.
 
 ## The ext4 driver
 

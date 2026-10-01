@@ -191,13 +191,17 @@ enum { WALK_FOUND, WALK_MISS, WALK_RESTART };
  */
 static vfs_mnt_t g_mnt[VFS_MNT_MAX];
 static int g_mnt_active;          /* entries that are crossed (not boot notes) */
+static uint32_t g_mnt_seq;        /* last mount number handed out */
 
-/* The mount whose mountpoint is `n`, newest first. */
+/* The newest mount whose mountpoint is `n` (by mount order, not by slot: a
+ * slot freed by umount is reused by a later mount). */
 static vfs_mnt_t *mnt_on(vfs_node_t *n) {
-    for (int i = VFS_MNT_MAX - 1; i >= 0; i--)
-        if (g_mnt[i].used && !g_mnt[i].boot && g_mnt[i].mp == n)
-            return &g_mnt[i];
-    return NULL;
+    vfs_mnt_t *best = NULL;
+    for (int i = 0; i < VFS_MNT_MAX; i++)
+        if (g_mnt[i].used && !g_mnt[i].boot && g_mnt[i].mp == n &&
+            (!best || g_mnt[i].seq > best->seq))
+            best = &g_mnt[i];
+    return best;
 }
 
 /* Step from a mountpoint to the root mounted on it, through stacked mounts. */
@@ -513,6 +517,7 @@ int vfs_mount_add(const char *target, vfs_node_t *root, const vfs_mnt_t *tmpl) {
     m->mp     = mp;
     m->root   = root;
     m->parent = pm;
+    m->seq    = ++g_mnt_seq;
     mnt_copy_str(m->target, target, sizeof(m->target));
     mnt_copy_str(m->source, tmpl->source, sizeof(m->source));
     mnt_copy_str(m->fstype, tmpl->fstype, sizeof(m->fstype));
@@ -522,19 +527,33 @@ int vfs_mount_add(const char *target, vfs_node_t *root, const vfs_mnt_t *tmpl) {
 }
 
 vfs_mnt_t *vfs_mount_find(const char *path, int *err) {
-    vfs_node_t *n = vfs_lookup_mnt(path, 1, err, NULL);
+    /* The walk reports the mount it crossed last to reach the result: that
+     * is the one `path` names, even when two mounts share a root node (a
+     * bind of a mounted root). */
+    vfs_mnt_t *m = NULL;
+    vfs_node_t *n = vfs_lookup_mnt(path, 1, err, &m);
     if (!n) return NULL;
-    for (int i = VFS_MNT_MAX - 1; i >= 0; i--)
-        if (g_mnt[i].used && !g_mnt[i].boot && g_mnt[i].root == n)
-            return &g_mnt[i];
+    if (m && m->used && !m->boot && m->root == n) return m;
     if (err) *err = -22;                                      /* -EINVAL */
     return NULL;
 }
 
+int vfs_mounts_active(void) {
+    return g_mnt_active;
+}
+
+int vfs_mnt_rdonly(const vfs_mnt_t *m, uint32_t seq) {
+    return m && m->used && !m->boot && m->seq == seq &&
+           (m->flags & VFS_MS_RDONLY);
+}
+
 int vfs_mount_remove(vfs_mnt_t *m, uint32_t flags) {
     if (!m || !m->used || m->boot) return -22;
+    /* Busy while a mount sits inside it, or a bind mount shows one of its
+     * directories elsewhere. */
     for (int i = 0; i < VFS_MNT_MAX; i++)
-        if (g_mnt[i].used && g_mnt[i].parent == m) return -16;   /* -EBUSY */
+        if (g_mnt[i].used && (g_mnt[i].parent == m || g_mnt[i].src == m))
+            return -16;                                           /* -EBUSY */
     int busy = m->busy ? m->busy(m->fs) : 0;
     if (busy && !(flags & VFS_MNT_DETACH)) return -16;            /* -EBUSY */
     void (*release)(void *) = m->release;
@@ -542,6 +561,7 @@ int vfs_mount_remove(vfs_mnt_t *m, uint32_t flags) {
     preempt_disable();
     m->used = 0;
     m->mp = m->root = NULL;
+    m->src = NULL;
     g_mnt_active--;
     preempt_enable();
     /* A lazily detached instance that still has open files is left alive:
@@ -579,21 +599,31 @@ uint32_t vfs_mounts_format(char *buf, uint32_t size) {
     uint32_t pos = 0;
     if (!size) return 0;
     buf[0] = '\0';
-    /* Boot notes first, then mounts in the order they were made: a slot
-     * reused after an umount would otherwise list a child before its parent. */
-    for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < VFS_MNT_MAX && pos + 1 < size; i++) {
-            vfs_mnt_t *m = &g_mnt[i];
-            if (!m->used || m->boot != (pass == 0)) continue;
-            pos += (uint32_t)snprintf(buf + pos, size - pos,
-                                      "%s %s %s %s%s%s%s 0 0\n",
-                                      m->source, m->target, m->fstype,
-                                      (m->flags & VFS_MS_RDONLY) ? "ro" : "rw",
-                                      (m->flags & VFS_MS_NOSUID) ? ",nosuid" : "",
-                                      (m->flags & VFS_MS_NODEV) ? ",nodev" : "",
-                                      (m->flags & VFS_MS_NOEXEC) ? ",noexec" : "");
-            if (pos >= size) pos = size - 1;
+    /* Boot notes first (slot order), then mounts in the order they were
+     * made, so a parent is always listed before what is mounted inside it. */
+    uint32_t last = 0;
+    for (int i = 0; ; i++) {
+        vfs_mnt_t *m = NULL;
+        if (i < VFS_MNT_MAX) {
+            if (!g_mnt[i].used || !g_mnt[i].boot) continue;
+            m = &g_mnt[i];
+        } else {
+            for (int j = 0; j < VFS_MNT_MAX; j++)
+                if (g_mnt[j].used && !g_mnt[j].boot && g_mnt[j].seq > last &&
+                    (!m || g_mnt[j].seq < m->seq))
+                    m = &g_mnt[j];
+            if (!m) break;
+            last = m->seq;
         }
+        if (pos + 1 >= size) break;
+        pos += (uint32_t)snprintf(buf + pos, size - pos,
+                                  "%s %s %s %s%s%s%s 0 0\n",
+                                  m->source, m->target, m->fstype,
+                                  (m->flags & VFS_MS_RDONLY) ? "ro" : "rw",
+                                  (m->flags & VFS_MS_NOSUID) ? ",nosuid" : "",
+                                  (m->flags & VFS_MS_NODEV) ? ",nodev" : "",
+                                  (m->flags & VFS_MS_NOEXEC) ? ",noexec" : "");
+        if (pos >= size) pos = size - 1;
     }
     return pos;
 }

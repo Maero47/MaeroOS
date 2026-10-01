@@ -762,6 +762,25 @@ static inline int fd_writable(const proc_file_t *f) {
     return m == O_WRONLY || m == O_RDWR;
 }
 
+/* Remember which mount(2) mount the file `path` names lives on. */
+static void fd_set_mnt(proc_file_t *f, const char *path) {
+    f->mnt = NULL;
+    f->mnt_seq = 0;
+    if (!vfs_mounts_active() || !path || path[0] != '/') return;
+    int err;
+    vfs_mnt_t *m = NULL;
+    if (vfs_lookup_mnt(path, 1, &err, &m) && m) {
+        f->mnt = m;
+        f->mnt_seq = m->seq;
+    }
+}
+
+/* Changes made through a descriptor (fchmod, fchown, ftruncate, fallocate)
+ * are -EROFS on a read-only mount, as the path-based ones are. */
+static int fd_rofs(const proc_file_t *f) {
+    return f->type != FD_NONE && vfs_mnt_rdonly(f->mnt, f->mnt_seq);
+}
+
 /* Permission check of `node` for the caller's effective ids and supplementary
  * groups (Linux inode_permission with current_fsuid()/in_group_p()). */
 static int proc_access_check(vfs_node_t *node, int want) {
@@ -830,6 +849,8 @@ void fd_release(proc_file_t *f) {
     f->cloexec = 0;
     f->fid     = 0;
     f->path[0] = '\0';
+    f->mnt     = NULL;
+    f->mnt_seq = 0;
 }
 
 /* ── Shared, reference-counted fd table ──────────────────────────────────────
@@ -1496,6 +1517,7 @@ static int sys_open_kernel_path(const char *path, int flags, uint32_t mode) {
                 current_proc->ofile[i].cloexec = (flags & O_CLOEXEC) ? 1 : 0;
                 __builtin_memcpy(current_proc->ofile[i].path, path,
                                  __builtin_strlen(path) + 1);
+                fd_set_mnt(&current_proc->ofile[i], path);
                 return i;
             }
         }
@@ -1535,6 +1557,7 @@ static int sys_open_kernel_path(const char *path, int flags, uint32_t mode) {
             current_proc->ofile[i].cloexec = (flags & O_CLOEXEC) ? 1 : 0;
             __builtin_memcpy(current_proc->ofile[i].path, path,
                              __builtin_strlen(path) + 1);
+            fd_set_mnt(&current_proc->ofile[i], path);
             return i;
         }
     }
@@ -5678,6 +5701,7 @@ static int sys_ftruncate(registers_t *regs) {
     /* Linux do_sys_ftruncate(): -EINVAL unless the descriptor was opened for
      * writing (the permission was checked when it was opened). */
     if (!fd_writable(f)) return -22;
+    if (fd_rofs(f)) return -30;                    /* -EROFS */
     /* A negative length is -EINVAL (93 takes a signed 32-bit off_t; 194
      * reaches here with the non-negative low word of a 64-bit one). */
     if ((int32_t)regs->ecx < 0 && regs->eax == 93) return -22;
@@ -5716,6 +5740,7 @@ static int sys_fallocate(registers_t *regs) {
     proc_file_t *f = &current_proc->ofile[fd];
     if (f->type != FD_FILE || !f->node) return -9;
     if (!fd_writable(f)) return -9;                /* Linux vfs_fallocate: -EBADF */
+    if (fd_rofs(f)) return -30;                    /* -EROFS */
     uint32_t want = offset + len;
     if (want < offset) return -22;                 /* -EINVAL: overflow */
     if (want > f->node->size)
@@ -7599,6 +7624,7 @@ static int sys_fchmod(registers_t *regs) {
     int fd = (int)regs->ebx;
     if (fd < 0 || fd >= MAX_FD) return -9;
     if (current_proc->ofile[fd].type == FD_NONE) return -9;
+    if (fd_rofs(&current_proc->ofile[fd])) return -30;     /* -EROFS */
     return do_chmod_node(current_proc->ofile[fd].node, (uint32_t)regs->ecx);
 }
 
@@ -7617,6 +7643,7 @@ static int sys_fchown(registers_t *regs) {
     int fd = (int)regs->ebx;
     if (fd < 0 || fd >= MAX_FD) return -9;
     if (current_proc->ofile[fd].type == FD_NONE) return -9;
+    if (fd_rofs(&current_proc->ofile[fd])) return -30;     /* -EROFS */
     return do_chown_node(current_proc->ofile[fd].node, (uint32_t)regs->ecx,
                          (uint32_t)regs->edx);
 }
@@ -7644,6 +7671,7 @@ static int sys_fchownat(registers_t *regs) {
         if (!(flags & 0x1000)) return -2;
         if (fd < 0 || fd >= MAX_FD || current_proc->ofile[fd].type == FD_NONE)
             return -9;
+        if (fd_rofs(&current_proc->ofile[fd])) return -30;  /* -EROFS */
         return do_chown_node(current_proc->ofile[fd].node, (uint32_t)regs->edx,
                              (uint32_t)regs->esi);
     }
