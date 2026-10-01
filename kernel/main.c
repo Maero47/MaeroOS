@@ -41,6 +41,7 @@
 #include "../drivers/acpi.h"
 #include "../drivers/rtl8139.h"
 #include "../drivers/e1000.h"
+#include "../drivers/r8169.h"
 #include "../drivers/framebuffer.h"
 #include "../drivers/keyboard.h"
 #include "../drivers/mouse.h"
@@ -232,6 +233,7 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     pci_init();
     rtl8139_init();
     e1000_init();
+    r8169_init();
     ac97_init();
     xhci_init();
     hda_init();

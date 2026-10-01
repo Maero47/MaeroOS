@@ -892,7 +892,7 @@ static uint32_t procfs_netif_read(vfs_node_t *n, uint32_t off, uint32_t len,
      * runs on. */
     for (int i = 0; i < net_interface_count(); i++) {
         netif_t *iface = net_get_interface(i);
-        char tmp[160];
+        char tmp[256];       /* driver details run to ~200 bytes */
         pappend(content, &pos, sizeof(content), iface->name);
         pappend(content, &pos, sizeof(content), ": ");
         pappend(content, &pos, sizeof(content),
