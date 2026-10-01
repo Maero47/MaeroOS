@@ -125,6 +125,9 @@ struct proc *allocproc(void) {
     p->ctty          = NULL;
     p->exe[0]        = '\0';
     p->utime_ticks   = 0;
+    p->run_us        = 0;
+    p->run_ns_rem    = 0;
+    p->run_us_mark   = 0;
     p->sched_count   = 0;
     p->no_preempt    = 0;
     p->tgid          = p->pid;
@@ -268,6 +271,9 @@ struct proc *proc_create_kthread(void (*fn)(void), const char *name) {
     p->sid         = p->pid;
 
     p->utime_ticks = 0;
+    p->run_us      = 0;
+    p->run_ns_rem  = 0;
+    p->run_us_mark = 0;
     p->sched_count = 0;
     p->no_preempt  = 0;
     p->tgid        = p->pid;

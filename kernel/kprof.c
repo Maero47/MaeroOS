@@ -4,6 +4,7 @@
 #include "../arch/i686/cpu/pit.h"
 #include "../mm/heap.h"
 #include <kernel/config.h>
+#include "../proc/process.h"
 
 /*
  * See include/kernel/kprof.h for the model.  Everything here is plain 64-bit
@@ -231,6 +232,52 @@ void kprof_dump(const char *tag) {
     }
 }
 
+/* Per-thread CPU over the last dump window, summed by process name (a
+ * browser's threads share one), from the scheduler's exact on-CPU time:
+ *   [kprof] cpu window=10000ms idle=8123ms desktop=1200ms maerox=310ms ...
+ * The busiest names first; what a compositor or X server costs while
+ * something animates is read straight off this line. */
+extern uint32_t sched_idle_us;
+static void kprof_dump_threads(void) {
+    enum { NAMES = 24, SHOW = 10 };
+    static const char *name[NAMES];
+    static uint32_t us[NAMES];
+    static uint32_t idle_mark, mono_mark_ms;
+    int n = 0;
+    uint32_t s, ns;
+    clock_mono(&s, &ns);
+    uint32_t now_ms = s * 1000U + ns / 1000000U;
+
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *p = &ptable[i];
+        if (p->state == PROC_UNUSED) continue;
+        uint32_t d = p->run_us - p->run_us_mark;
+        p->run_us_mark = p->run_us;
+        if (!d) continue;
+        const char *nm = p->name[0] ? p->name : "?";
+        int k = 0;
+        while (k < n && __builtin_strcmp(name[k], nm) != 0) k++;
+        if (k == n) {
+            if (n == NAMES) continue;
+            name[n] = nm; us[n] = 0; n++;
+        }
+        us[k] += d;
+    }
+    printk("[kprof] cpu window=%ums idle=%ums", (unsigned)(now_ms - mono_mark_ms),
+           (unsigned)((sched_idle_us - idle_mark) / 1000U));
+    idle_mark = sched_idle_us;
+    mono_mark_ms = now_ms;
+    for (int shown = 0; shown < SHOW; shown++) {
+        int best = -1;
+        for (int k = 0; k < n; k++)
+            if (us[k] && (best < 0 || us[k] > us[best])) best = k;
+        if (best < 0) break;
+        printk(" %s=%ums", name[best], (unsigned)(us[best] / 1000U));
+        us[best] = 0;
+    }
+    printk("\n");
+}
+
 void kprof_tick(void) {
     if (!KTRACE) return;                      /* periodic dump: KTRACE=1 only */
     static uint32_t last = 0;
@@ -246,5 +293,6 @@ void kprof_tick(void) {
     }
     uint64_t d0 = kprof_probe_begin();
     kprof_dump("periodic");
+    kprof_dump_threads();
     kprof_probe_end(KPP_DUMP, d0);
 }

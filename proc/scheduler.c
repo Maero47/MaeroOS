@@ -15,6 +15,7 @@ extern void vma_clear(struct proc *p);   /* free demand-paged VMAs (syscall.c) *
 #include "../arch/i686/cpu/gdt.h"
 #include "../arch/i686/cpu/fpu.h"
 #include "../arch/i686/cpu/pit.h"
+#include "../arch/i686/cpu/tsc.h"
 #include "../arch/i686/cpu/percpu.h"
 #include "../arch/i686/mm/paging.h"
 #include "../mm/heap.h"
@@ -40,6 +41,19 @@ extern void swtch(struct context **old, struct context *new_ctx);
 
 void scheduler_init(void) {
     /* Nothing to initialize — ptable is already set up by proc_init */
+}
+
+/* Time the CPUs spent halted with nothing to run, in us (/proc/cputime). */
+uint32_t sched_idle_us;
+static uint32_t sched_idle_ns_rem;
+
+/* Add an interval to a us counter, carrying the sub-us part.  32-bit only:
+ * one interval is a time slice or one idle halt, far below 4 s. */
+static void add_ns(uint32_t *us, uint32_t *rem, uint64_t ns) {
+    uint32_t n = ns > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (uint32_t)ns;
+    uint32_t q = n / 1000U, r = n % 1000U + *rem;
+    *us += q + r / 1000U;
+    *rem = r % 1000U;
 }
 
 void scheduler_start(void) {
@@ -80,7 +94,9 @@ void scheduler_start(void) {
             kprof_probe_end(KPP_SCHED_DISP, disp_t0);
             kprof_count(KPE_CTXSW);
             kprof_switch(p->kprof_bucket);   /* charge the dispatch to KPB_SCHED */
+            uint64_t run_t0 = clock_mono_ns();
             swtch(&scheduler_ctx, p->context);
+            add_ns(&p->run_us, &p->run_ns_rem, clock_mono_ns() - run_t0);
             /* Back in the scheduler: the outgoing thread already parked its own
              * bucket and left KPB_SCHED current (see kprof_park below). */
             uint64_t s_f = kprof_probe_begin();
@@ -109,6 +125,7 @@ void scheduler_start(void) {
          * ptable. */
         if (!ran) {
             int kp_old = kprof_switch(KPB_IDLE);
+            uint64_t idle_t0 = clock_mono_ns();
             bkl_release();
             if (this_cpu_id() == 0) {
                 /* BSP: woken by the PIT/keyboard/IRQ (all routed here via the
@@ -125,6 +142,7 @@ void scheduler_start(void) {
                 }
             }
             bkl_acquire();
+            add_ns(&sched_idle_us, &sched_idle_ns_rem, clock_mono_ns() - idle_t0);
             kprof_switch(kp_old);
         }
     }

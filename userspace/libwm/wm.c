@@ -35,8 +35,10 @@ int wm_command(wm_client_t *wm, const char *fmt, ...) {
     len = vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
     if (len < 0 || len + 1 >= (int)sizeof(line)) return -1;
+    /* One write per command: the line and its newline land in the FIFO
+     * together, so the compositor never wakes for half a command. */
+    line[len++] = '\n';
     if (write(wm->fd, line, len) != len) return -1;
-    if (write(wm->fd, "\n", 1) != 1) return -1;
     return 0;
 }
 
@@ -123,6 +125,12 @@ int wm_surface(wm_client_t *wm, int slot, int shmid, int w, int h) {
 int wm_commit(wm_client_t *wm, int slot) {
     if (!valid_slot(slot)) return -1;
     return wm_command(wm, "commit %d", slot);
+}
+
+int wm_commit_rect(wm_client_t *wm, int slot, int x, int y, int w, int h) {
+    if (!valid_slot(slot)) return -1;
+    if (w <= 0 || h <= 0) return 0;
+    return wm_command(wm, "commit %d %d %d %d %d", slot, x, y, w, h);
 }
 
 int wm_open_events(wm_event_client_t *events, int slot) {

@@ -65,7 +65,7 @@ USER_BINS := $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
      $(TESTFILES)/reboot $(TESTFILES)/shutdown $(TESTFILES)/poweroff $(TESTFILES)/halt \
      $(TESTFILES)/sudo $(TESTFILES)/whoami $(TESTFILES)/uname $(TESTFILES)/clear $(TESTFILES)/hostname \
      $(TESTFILES)/which $(TESTFILES)/free $(TESTFILES)/uptime $(TESTFILES)/du $(TESTFILES)/df $(TESTFILES)/top $(TESTFILES)/wget $(TESTFILES)/bbwrap \
-     $(TESTFILES)/maerox $(TESTFILES)/ff \
+     $(TESTFILES)/maerox $(TESTFILES)/ff $(TESTFILES)/gfxbench \
      $(TESTFILES)/kwprobe $(TESTFILES)/libctest $(TESTFILES)/wxprobe
 
 all: $(USER_BINS) $(MUSL_BINS)
@@ -704,6 +704,11 @@ maerox/maerox.o: maerox/maerox.c include/gui.h include/draw.h
 	$(CC) $(CFLAGS) -c $< -o $@
 $(TESTFILES)/maerox: maerox/maerox.o $(GUIAPP_DEPS)
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) maerox/maerox.o libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o libwm/wm.o libc/libc.a
+
+gfxbench/gfxbench.o: gfxbench/gfxbench.c include/gui.h include/wm.h include/draw.h
+	$(CC) $(CFLAGS) -c $< -o $@
+$(TESTFILES)/gfxbench: gfxbench/gfxbench.o $(GUIAPP_DEPS)
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) gfxbench/gfxbench.o libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o libwm/wm.o libc/libc.a
 
 settings/settings.o: settings/settings.c include/gui.h include/draw.h
 	$(CC) $(CFLAGS) -c $< -o $@

@@ -716,6 +716,7 @@ static vfs_node_t proc_pci_node;
 static vfs_node_t proc_netif_node;
 static vfs_node_t proc_firewall_node;
 static vfs_node_t proc_processes_node;
+static vfs_node_t proc_cputime_node;
 static vfs_node_t proc_kmsg_node;
 static vfs_node_t proc_mounts_node;
 static vfs_node_t proc_partitions_node;
@@ -1017,6 +1018,51 @@ static uint32_t procfs_processes_read(vfs_node_t *n, uint32_t off,
     return avail;
 }
 
+/* Append an unsigned decimal. */
+static void pappend_uint(char *buf, uint32_t *pos, uint32_t cap, uint32_t val) {
+    char tmp[12];
+    int i = 0;
+    do { tmp[i++] = (char)('0' + val % 10u); val /= 10u; } while (val);
+    while (i > 0 && *pos + 1 < cap) buf[(*pos)++] = tmp[--i];
+}
+
+/* ── /proc/cputime ───────────────────────────────────────────────────────────
+ * Exact CPU time per thread, in microseconds, from the scheduler's dispatch
+ * timestamps (not tick sampling), plus the time the CPUs sat idle:
+ *   idle <us>
+ *   <pid> <tgid> <us> <name>
+ * tools/bench_gfx.py reads it to split CPU between the desktop, maeroX and a
+ * client; the counters only grow, so readers take differences. */
+extern uint32_t sched_idle_us;
+
+static uint32_t procfs_cputime_read(vfs_node_t *n, uint32_t off,
+                                    uint32_t len, uint8_t *buf) {
+    (void)n;
+    enum { CAP = 8192 };
+    char *content = (char *)kmalloc(CAP);
+    uint32_t pos = 0;
+    if (!content) return 0;
+    pappend(content, &pos, CAP, "idle ");
+    pappend_uint(content, &pos, CAP, sched_idle_us);
+    pappend(content, &pos, CAP, "\n");
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *p = &ptable[i];
+        if (p->state == PROC_UNUSED) continue;
+        pappend_int(content, &pos, CAP, p->pid);
+        pappend(content, &pos, CAP, " ");
+        pappend_int(content, &pos, CAP, p->tgid);
+        pappend(content, &pos, CAP, " ");
+        pappend_uint(content, &pos, CAP, p->run_us);
+        pappend(content, &pos, CAP, " ");
+        pappend(content, &pos, CAP, p->name);
+        pappend(content, &pos, CAP, "\n");
+    }
+    if (pos >= CAP) pos = CAP - 1;
+    uint32_t avail = procfs_copy_blob((const uint8_t *)content, pos, off, len, buf);
+    kfree(content);
+    return avail;
+}
+
 /* readdir for /proc: enumerate fixed pseudo-files */
 /* ── /proc/sys/vm/overcommit_memory ──────────────────────────────────────────
  * glibc's malloc and some allocators read this; "0" = heuristic overcommit
@@ -1120,6 +1166,7 @@ static int procfs_root_readdir(vfs_node_t *node, uint32_t idx,
         { "mounts",  VFS_FLAG_FILE, 11 },
         { "partitions", VFS_FLAG_FILE, 12 },
         { "net",     VFS_FLAG_DIR,  83 },
+        { "cputime", VFS_FLAG_FILE, 19 },
     };
     static const uint32_t nentries =
         sizeof(entries) / sizeof(entries[0]);
@@ -1162,6 +1209,7 @@ static vfs_node_t *procfs_root_finddir(vfs_node_t *node, const char *name) {
     if (strcmp(name, "netif")   == 0) return &proc_netif_node;
     if (strcmp(name, "firewall") == 0) return &proc_firewall_node;
     if (strcmp(name, "processes") == 0) return &proc_processes_node;
+    if (strcmp(name, "cputime") == 0) return &proc_cputime_node;
     if (strcmp(name, "kmsg")    == 0) return &proc_kmsg_node;
     if (strcmp(name, "mounts")  == 0) return &proc_mounts_node;
     if (strcmp(name, "partitions") == 0) return &proc_partitions_node;
@@ -1322,6 +1370,13 @@ vfs_node_t *procfs_mount(void) {
     proc_processes_node.flags   = VFS_FLAG_FILE;
     proc_processes_node.inode   = 7;
     proc_processes_node.read_fn = procfs_processes_read;
+
+    /* /proc/cputime */
+    memset(&proc_cputime_node, 0, sizeof(proc_cputime_node));
+    strncpy(proc_cputime_node.name, "cputime", 255);
+    proc_cputime_node.flags   = VFS_FLAG_FILE;
+    proc_cputime_node.inode   = 19;
+    proc_cputime_node.read_fn = procfs_cputime_read;
 
     /* /proc/kmsg */
     memset(&proc_kmsg_node, 0, sizeof(proc_kmsg_node));

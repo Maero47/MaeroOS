@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <syscall.h>
 #include <unistd.h>
@@ -159,7 +160,61 @@ static uint32_t *backbuf;
  * app), which forces the next present to be a full blit. */
 static uint32_t *shadow;
 static int       shadow_valid;
-static void present_invalidate(void) { shadow_valid = 0; }
+/*
+ * Damage: which part of the screen the next frame must recomposite.
+ *
+ * Kept per scanline as one column span [dmg_lo, dmg_hi) (empty when lo >= hi),
+ * so separate damaged areas cost only their own rows, and the union stays
+ * exact in the common case of one rectangle per row.  render() recomposites
+ * only damaged rows (every layer of them, back to front, so shadows, glass and
+ * overlapping windows come out exactly as in a full frame) and present()
+ * writes only the damaged span of each.  A client commit with a rectangle
+ * (wm_commit_rect) damages just that part of its window; everything else -
+ * input, window management, the clock, animations - damages the whole screen,
+ * as every event used to.  This is the Wayland/weston model in miniature:
+ * surface damage in, output damage out.
+ */
+static int *dmg_lo, *dmg_hi;      /* fb_h entries each; NULL = always full */
+static int  dmg_pending;          /* any span non-empty */
+
+static void damage_rect(int x, int y, int w, int h) {
+    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int x1 = x + w, y1 = y + h;
+
+    dmg_pending = 1;
+    if (!dmg_lo) return;
+    if (x1 > (int)fb_w) x1 = (int)fb_w;
+    if (y1 > (int)fb_h) y1 = (int)fb_h;
+    if (x0 >= x1 || y0 >= y1) return;
+    for (int yy = y0; yy < y1; yy++) {
+        if (dmg_lo[yy] >= dmg_hi[yy]) {
+            dmg_lo[yy] = x0;
+            dmg_hi[yy] = x1;
+        } else {
+            if (x0 < dmg_lo[yy]) dmg_lo[yy] = x0;
+            if (x1 > dmg_hi[yy]) dmg_hi[yy] = x1;
+        }
+    }
+}
+
+static void damage_all(void) { damage_rect(0, 0, (int)fb_w, (int)fb_h); }
+
+static unsigned now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned)ts.tv_sec * 1000000u + (unsigned)(ts.tv_nsec / 1000);
+}
+
+/* Frame pacing: at most one composite per FRAME_US, like a 60 Hz vblank.  A
+ * client that commits faster than that has its damage accumulated into the
+ * next frame instead of paying a composite per commit. */
+#define FRAME_US 16000u
+
+static int row_damaged(unsigned y) {
+    return !dmg_lo || dmg_lo[y] < dmg_hi[y];
+}
+
+static void present_invalidate(void) { shadow_valid = 0; damage_all(); }
 /* Desktop event log (shown in the System window). */
 static char log_lines[MAX_LOG][LOG_MAX];
 static int log_count;
@@ -2135,11 +2190,78 @@ static void set_client_line_at(int idx, const char *arg) {
     copy_text(client_status, sizeof(client_status), "APP TEXT UPDATED");
 }
 
+/* Compositor counters, printed by the "stats" command (tools/bench_gfx.py). */
+static unsigned st_frames, st_rows, st_commits, st_fast_rows;
+static int gfx_stats;   /* /disk/gfxstats exists: trace the counters */
+static unsigned long long st_present_bytes, st_render_us;
+
+static void trace_stats(void) {
+    trace("stats frames=%u rows=%u commits=%u present_kb=%u render_ms=%u fast_rows=%u",
+          st_frames, st_rows, st_commits,
+          (unsigned)(st_present_bytes / 1024), (unsigned)(st_render_us / 1000),
+          st_fast_rows);
+}
+
+/* commit SLOT [X Y W H] — the client's surface changed (in that rectangle of
+ * it, or all of it).  The pixels already live in the shared buffer, so this
+ * only damages the part of the screen showing them; a window that is hidden,
+ * minimized or scrolled off adds nothing. */
+static void commit_client(const char *arg) {
+    int idx = parse_client_index(&arg);
+    int rx = 0, ry = 0, rw = 0x7fff, rh = 0x7fff;
+    desktop_window_t *win;
+    client_surface_t *cs;
+
+    if (idx < 0) return;
+    st_commits++;
+    if (*arg && (parse_int_arg(&arg, &rx) < 0 || parse_int_arg(&arg, &ry) < 0 ||
+                 parse_int_arg(&arg, &rw) < 0 || parse_int_arg(&arg, &rh) < 0)) {
+        rx = ry = 0;                 /* malformed rectangle: the whole surface */
+        rw = rh = 0x7fff;
+    }
+    win = find_window(WIN_CLIENT_BASE + idx);
+    if (!win || !win->visible || win->minimized) return;
+    if (thumb_win_id == win->id) {   /* the taskbar preview shows it too */
+        damage_all();
+        return;
+    }
+    cs = &client_surfaces[idx];
+    if (!cs->surf) {                 /* retained-mode client: whole window */
+        damage_rect(win->x, win->y, win->w, win->h);
+        return;
+    }
+    /* Clip to the visible body (draw_window_content_on_row's blit area). */
+    {
+        int pw = win->w - 2, ph = win->h - TITLEBAR_H - 1;
+        if (pw > cs->surf_w) pw = cs->surf_w;
+        if (ph > cs->surf_h) ph = cs->surf_h;
+        if (rx < 0) { rw += rx; rx = 0; }
+        if (ry < 0) { rh += ry; ry = 0; }
+        if (rw > pw - rx) rw = pw - rx;
+        if (rh > ph - ry) rh = ph - ry;
+        if (rw <= 0 || rh <= 0) return;
+        damage_rect(win->x + 1 + rx, win->y + TITLEBAR_H + ry, rw, rh);
+    }
+}
+
 static void handle_wmctl_line(char *line) {
     const char *arg;
 
     while (*line == ' ') line++;
     if (!*line) return;
+
+    /* The hot path: a client presenting a frame. */
+    arg = command_arg(line, "commit");
+    if (arg) {
+        commit_client(arg);
+        return;
+    }
+    if (!strcmp(line, "stats")) {
+        trace_stats();
+        return;
+    }
+    /* Anything else may change what any part of the screen shows. */
+    damage_all();
 
     arg = command_arg(line, "log");
     if (arg) {
@@ -2244,12 +2366,6 @@ static void handle_wmctl_line(char *line) {
         else add_log("WMCTL BAD APP ID");
         return;
     }
-    arg = command_arg(line, "commit");
-    if (arg) {
-        /* Content already lives in the shared buffer; the dirty flag set by
-         * command arrival triggers the recomposite. */
-        return;
-    }
     arg = command_arg(line, "icondef");
     if (arg) {
         int idx = parse_client_index(&arg);
@@ -2339,16 +2455,19 @@ static void handle_wmctl_line(char *line) {
 }
 
 static void handle_wmctl_input(void) {
-    char c;
+    char buf[4096];
+    int n;
 
     if (wm_fd < 0) return;
     /*
-     * Drain every byte currently buffered in the FIFO and apply all complete
+     * Drain everything currently buffered in the FIFO and apply all complete
      * command lines, so a client's whole draw burst is processed before the
-     * single render this loop iteration performs — rather than one byte (and a
-     * full-screen render) per loop pass. pipe reads block for exactly the
-     * requested length and ignore O_NONBLOCK, so we poll(timeout 0) to detect
-     * when the FIFO is empty and stop.
+     * single render this loop iteration performs.  A pipe read returns what
+     * is there (up to the size asked), so read in blocks: one poll + one read
+     * per 4 KiB rather than per byte - a busy client's commits used to cost
+     * the compositor two syscalls for every character of every command.  The
+     * poll(0) guards the read, which would block on an empty FIFO (we hold a
+     * keepalive writer, so it never sees EOF).
      */
     for (;;) {
         struct pollfd p;
@@ -2356,16 +2475,21 @@ static void handle_wmctl_input(void) {
         p.events = POLLIN;
         p.revents = 0;
         if (poll(&p, 1, 0) <= 0 || !(p.revents & POLLIN)) break;
-        if (read(wm_fd, &c, 1) <= 0) break;
-        if (c == '\r') continue;
-        if (c == '\n') {
-            wm_line[wm_line_used] = 0;
-            handle_wmctl_line(wm_line);
-            wm_line_used = 0;
-            continue;
+        n = read(wm_fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        for (int i = 0; i < n; i++) {
+            char c = buf[i];
+            if (c == '\r') continue;
+            if (c == '\n') {
+                wm_line[wm_line_used] = 0;
+                handle_wmctl_line(wm_line);
+                wm_line_used = 0;
+                continue;
+            }
+            if (wm_line_used + 1 < (int)sizeof(wm_line))
+                wm_line[wm_line_used++] = c;
         }
-        if (wm_line_used + 1 < (int)sizeof(wm_line))
-            wm_line[wm_line_used++] = c;
+        if (n < (int)sizeof(buf)) break;     /* drained */
     }
 }
 
@@ -4080,8 +4204,8 @@ static void draw_window_content_on_row(unsigned y, const desktop_window_t *win,
                 int x1 = px0 + pw;
                 if (x1 > (int)fb_w) x1 = (int)fb_w;
                 if (x1 > MAX_W) x1 = MAX_W;
-                for (int dx = x0; dx < x1; dx++)
-                    row[dx] = src[dx - px0];
+                if (x1 > x0)        /* opaque body: a straight copy */
+                    memcpy(row + x0, src + (x0 - px0), (size_t)(x1 - x0) * 4);
             }
             return;
         }
@@ -4867,16 +4991,19 @@ static void blank_framebuffer(void) {
     present();
 }
 
-/* Copy `rows` scanlines starting at `y0` from the back buffer to the screen. */
-static int present_rows(unsigned y0, unsigned rows) {
-    if (fb_pitch == fb_w * 4) {          /* rows are contiguous: one write */
-        lseek(fb_fd, (int)(y0 * fb_pitch), 0);
-        return write(fb_fd, backbuf + (size_t)y0 * fb_w,
-                     (int)(rows * fb_w * 4)) < 0 ? -1 : 0;
+/* Write columns [x0, x1) of scanlines [y0, y0 + rows) from the back buffer to
+ * the screen.  Full-width runs on a packed framebuffer are one write; anything
+ * narrower is one pwrite per scanline of just that span. */
+static int present_span(unsigned y0, unsigned rows, unsigned x0, unsigned x1) {
+    if (x0 == 0 && x1 == fb_w && fb_pitch == fb_w * 4) {
+        st_present_bytes += (unsigned long long)rows * fb_w * 4;
+        return pwrite(fb_fd, backbuf + (size_t)y0 * fb_w, (size_t)rows * fb_w * 4,
+                      (off_t)(y0 * fb_pitch)) < 0 ? -1 : 0;
     }
     for (unsigned y = y0; y < y0 + rows; y++) {
-        lseek(fb_fd, (int)(y * fb_pitch), 0);
-        if (write(fb_fd, backbuf + (size_t)y * fb_w, (int)(fb_w * 4)) < 0)
+        st_present_bytes += (x1 - x0) * 4;
+        if (pwrite(fb_fd, backbuf + (size_t)y * fb_w + x0, (size_t)(x1 - x0) * 4,
+                   (off_t)(y * fb_pitch + x0 * 4)) < 0)
             return -1;
     }
     return 0;
@@ -4886,30 +5013,25 @@ static int present_rows(unsigned y0, unsigned rows) {
  * Present the composited frame.
  *
  * The screen is device memory, so a full-screen blit runs at MMIO speed rather
- * than RAM speed: 4 MiB at 1280x800 costs ~10 ms, and the compositor recomposes
- * and presents every frame even when only a few scanlines changed.  Measured
- * over a Firefox startup that was ~80 s of the ~185 s to first paint - the
- * single largest cost in the system.
- *
- * So keep a shadow of the last frame actually presented, in ordinary cached
- * memory, and write only the runs of scanlines that differ.  Comparing 4 MiB of
- * cached RAM is roughly an order of magnitude cheaper than writing it to the
- * framebuffer, and during a browser startup almost every row is identical from
- * frame to frame.  Contiguous dirty rows are coalesced into one write so the
- * syscall count stays low.
+ * than RAM speed: 4 MiB at 1280x800 costs ~10 ms.  Only damaged scanlines
+ * were recomposited (see damage_rect), and only their damaged spans are
+ * written.  Within those, a shadow of the last frame actually presented (in
+ * ordinary cached memory) still filters out spans that came out identical -
+ * the common case for a full-screen damage caused by, say, a mouse move or
+ * the clock - and contiguous changed full-width rows are coalesced into one
+ * write so the syscall count stays low.
  *
  * The shadow is only valid while the desktop is the only thing drawing.  A
  * fullscreen app owns the screen directly, so blank_framebuffer() (the handoff)
  * and the app's exit both invalidate it and the next present is a full blit.
- * If the shadow cannot be allocated, every present is a full blit - the
- * behaviour this replaced.
+ * If the shadow cannot be allocated, every damaged span is written.
  */
 static int present(void) {
     if (!backbuf) return 0;
     const unsigned rowpx = fb_w;
 
     if (!shadow || !shadow_valid) {
-        if (present_rows(0, fb_h) < 0) return -1;
+        if (present_span(0, fb_h, 0, fb_w) < 0) return -1;
         if (shadow) {
             memcpy(shadow, backbuf, (size_t)fb_w * fb_h * 4);
             shadow_valid = 1;
@@ -4917,21 +5039,77 @@ static int present(void) {
         return 0;
     }
 
-    for (unsigned y = 0; y < fb_h; ) {
-        if (memcmp(backbuf + (size_t)y * rowpx, shadow + (size_t)y * rowpx,
-                   rowpx * 4) == 0) {
-            y++;
+    unsigned run_start = 0, run_len = 0;     /* pending full-width rows */
+    for (unsigned y = 0; y < fb_h; y++) {
+        if (!row_damaged(y)) continue;
+        unsigned x0 = dmg_lo ? (unsigned)dmg_lo[y] : 0;
+        unsigned x1 = dmg_lo ? (unsigned)dmg_hi[y] : fb_w;
+        uint32_t *b = backbuf + (size_t)y * rowpx + x0;
+        uint32_t *sh = shadow + (size_t)y * rowpx + x0;
+        size_t bytes = (size_t)(x1 - x0) * 4;
+        if (memcmp(b, sh, bytes) == 0) continue;
+        memcpy(sh, b, bytes);
+        if (x0 == 0 && x1 == fb_w) {
+            if (run_len && run_start + run_len == y) { run_len++; continue; }
+            if (run_len && present_span(run_start, run_len, 0, fb_w) < 0) return -1;
+            run_start = y;
+            run_len = 1;
             continue;
         }
-        unsigned start = y;
-        while (y < fb_h &&
-               memcmp(backbuf + (size_t)y * rowpx, shadow + (size_t)y * rowpx,
-                      rowpx * 4) != 0) {
-            memcpy(shadow + (size_t)y * rowpx, backbuf + (size_t)y * rowpx,
-                   rowpx * 4);
-            y++;
+        if (present_span(y, 1, x0, x1) < 0) return -1;
+    }
+    if (run_len && present_span(run_start, run_len, 0, fb_w) < 0) return -1;
+    return 0;
+}
+
+/*
+ * Fast path for one damaged scanline: when its damaged span lies inside the
+ * opaque body of a client window with a pixel surface, and nothing is drawn
+ * over that span on this row (no window above it, nor its shadow; no menu,
+ * calendar, preview, animation, taskbar or cursor), the composited result is
+ * exactly the client's pixels - every layer below is overwritten by the
+ * body's blit.  Copy those straight in and skip the layer stack.  This is what
+ * keeps an animating client cheap: its damage is a plain memcpy per row.
+ * Returns 1 when the row was produced this way.
+ */
+static int fast_client_row(unsigned y) {
+    int lo, hi;
+
+    if (!dmg_lo || !backbuf) return 0;
+    lo = dmg_lo[y];
+    hi = dmg_hi[y];
+    if (launcher_open || ctx_open || cal_open || thumb_win_id >= 0 ||
+        win_anim.active || !running)
+        return 0;
+    if ((int)y >= (int)fb_h - TASKBAR_H - ORB_SIZE) return 0;   /* taskbar, orb */
+    if (mouse_fd >= 0 && (int)y >= mouse_y - 1 && (int)y < mouse_y + 17 &&
+        hi > mouse_x - 1 && lo < mouse_x + 17)
+        return 0;                                           /* cursor */
+    for (int i = window_count - 1; i >= 0; i--) {
+        const desktop_window_t *win = &windows[i];
+        if (!win->visible || win->minimized) continue;
+        /* Everything draw_window_on_row can touch, shadow included. */
+        int ex0 = win->x - SHADOW_R, ex1 = win->x + win->w + SHADOW_R;
+        int ey0 = win->y + 3 - SHADOW_R, ey1 = win->y + 3 + win->h + SHADOW_R;
+        if (ey0 > win->y) ey0 = win->y;
+        if ((int)y < ey0 || (int)y >= ey1 || hi <= ex0 || lo >= ex1) continue;
+        /* The topmost window that reaches the span: it must cover all of it
+         * with surface pixels (draw_window_content_on_row's blit area). */
+        if (!is_client_window(win->id)) return 0;
+        {
+            client_surface_t *cs = &client_surfaces[client_index_for_window(win->id)];
+            int px0 = win->x + 1, py0 = win->y + TITLEBAR_H;
+            int pw = win->w - 2, ph = win->h - TITLEBAR_H - 1;
+            int sy = (int)y - py0;
+            if (!cs->surf) return 0;
+            if (pw > cs->surf_w) pw = cs->surf_w;
+            if (ph > cs->surf_h) ph = cs->surf_h;
+            if (sy < 0 || sy >= ph || lo < px0 || hi > px0 + pw) return 0;
+            memcpy(backbuf + (size_t)y * fb_w + lo,
+                   cs->surf + (size_t)sy * cs->surf_w + (lo - px0),
+                   (size_t)(hi - lo) * 4);
+            return 1;
         }
-        if (present_rows(start, y - start) < 0) return -1;
     }
     return 0;
 }
@@ -4963,9 +5141,23 @@ static int render(void) {
     }
 
     update_cursor_shape();
-    update_thumbnail();
+    {
+        int was = thumb_win_id;
+        update_thumbnail();
+        if (thumb_win_id != was) damage_all();   /* preview shown or hidden */
+    }
+
+    /* No back buffer: every frame is drawn straight to the screen, whole. */
+    if (!backbuf) damage_all();
+    unsigned t_render0 = now_us();
+    st_frames++;
 
     for (unsigned y = 0; y < fb_h; y++) {
+        /* Only damaged scanlines are recomposited; the rest of the back
+         * buffer already holds this frame. */
+        if (!row_damaged(y)) continue;
+        st_rows++;
+        if (fast_client_row(y)) { st_fast_rows++; continue; }
         /* Aim drawing at this scanline of the back buffer (or fallback row). */
         row = backbuf ? backbuf + (size_t)y * fb_w : fallback_row;
 
@@ -5013,7 +5205,12 @@ static int render(void) {
         }
     }
     tick_win_anim();
-    return backbuf ? present() : 0;
+    int rc = backbuf ? present() : 0;
+    if (dmg_lo)
+        for (unsigned y = 0; y < fb_h; y++) dmg_lo[y] = dmg_hi[y] = 0;
+    dmg_pending = 0;
+    st_render_us += now_us() - t_render0;
+    return rc;
 }
 
 int main(void) {
@@ -5059,6 +5256,12 @@ int main(void) {
      * heap can't satisfy it so the desktop still boots on tight memory. */
     backbuf = (uint32_t *)malloc((size_t)fb_w * fb_h * 4);
     shadow  = backbuf ? (uint32_t *)malloc((size_t)fb_w * fb_h * 4) : 0;
+    if (backbuf) {
+        dmg_lo = (int *)malloc(fb_h * sizeof(int));
+        dmg_hi = (int *)malloc(fb_h * sizeof(int));
+        if (!dmg_lo || !dmg_hi) dmg_lo = dmg_hi = 0;   /* always full frames */
+        else for (unsigned y = 0; y < fb_h; y++) dmg_lo[y] = dmg_hi[y] = 0;
+    }
     shadow_valid = 0;
     load_desktop_conf();
     load_wallpaper();
@@ -5076,6 +5279,7 @@ int main(void) {
     setup_wmctl();
     setup_wmevents();
     start_shell();
+    damage_all();
     if (render() < 0) {
         printf("desktop: framebuffer write failed\n");
         close_wm_channels();
@@ -5091,16 +5295,18 @@ int main(void) {
      * launcher once the wm is up, so the X-protocol trace can be captured
      * without GUI interaction.  Remove the marker file to disable. */
     static int ff_auto = -1, ff_tick = 0;
+    gfx_stats = access("/disk/gfxstats", 0) == 0;
     if (ff_auto < 0) {
         if      (access("/disk/gtkauto", 0) == 0) ff_auto = 2;  /* run gtkprobe */
         else if (access("/disk/ffauto",  0) == 0) ff_auto = 1;  /* run Firefox  */
         else                                       ff_auto = 0;
     }
 
+    unsigned last_frame_us = now_us() - FRAME_US;
     while (running) {
         struct input_event ev;
         int n;
-        int dirty = 0;
+        int dirty = 0;      /* something changed the whole screen */
 
         if (ff_auto > 0 && ++ff_tick == 120) {   /* ~a few seconds in, once */
             int which = ff_auto; ff_auto = 0;
@@ -5147,8 +5353,14 @@ int main(void) {
             nfds++;
         }
 
-        if (poll(pfds, nfds, win_anim.active ? 16 :
-                 (shell_pid >= 0 || any_client_running()) ? 50 : 1000) < 0) {
+        int timeout = win_anim.active ? 16 :
+                      (shell_pid >= 0 || any_client_running()) ? 50 : 1000;
+        if (dmg_pending && fullscreen_pid <= 0) {   /* a frame is owed */
+            unsigned since = now_us() - last_frame_us;
+            int left = since >= FRAME_US ? 0 : (int)((FRAME_US - since + 999) / 1000);
+            if (left < timeout) timeout = left;
+        }
+        if (poll(pfds, nfds, timeout) < 0) {
             printf("desktop: poll failed\n");
             close_wm_channels();
             if (mouse_fd >= 0) close(mouse_fd);
@@ -5171,15 +5383,31 @@ int main(void) {
             (pfds[mouse_idx].revents & POLLIN)) {
             while ((n = read(mouse_fd, &ev, sizeof(ev))) == (int)sizeof(ev)) {
                 if (ev.type == EV_REL || ev.type == EV_KEY) {
+                    int ox = mouse_x, oy = mouse_y;
+                    /* A plain pointer move (no button, no drag, no menu or
+                     * preview that tracks hover) changes only the cursor
+                     * and, near the bottom, the taskbar's hover states. */
+                    int motion = ev.type == EV_REL &&
+                                 (ev.code == REL_X || ev.code == REL_Y) &&
+                                 !mouse_buttons && !drag_mode && !client_drag_slot &&
+                                 !launcher_open && !ctx_open && thumb_win_id < 0;
                     handle_mouse(&ev);
-                    dirty = 1;
+                    if (motion) {
+                        int band = (int)fb_h - TASKBAR_H - ORB_SIZE;
+                        damage_rect(ox - 1, oy - 1, 18, 18);
+                        damage_rect(mouse_x - 1, mouse_y - 1, 18, 18);
+                        if (oy >= band || mouse_y >= band)
+                            damage_rect(0, band, (int)fb_w, (int)fb_h - band);
+                    } else {
+                        dirty = 1;
+                    }
                 }
             }
         }
-        if (wm_fd >= 0 && (pfds[wm_idx].revents & POLLIN)) {
+        /* wmctl commands damage what they change themselves: a commit only
+         * its rectangle, anything else the whole screen. */
+        if (wm_fd >= 0 && (pfds[wm_idx].revents & POLLIN))
             handle_wmctl_input();
-            dirty = 1;
-        }
         if (shell_fd >= 0) {
             if (pfds[shell_idx].revents) {
                 handle_shell_output(pfds[shell_idx].revents);
@@ -5198,7 +5426,15 @@ int main(void) {
             struct timeval tv;
             if (gettimeofday(&tv, 0) == 0 && (int)tv.tv_sec != clock_secs) {
                 clock_secs = (int)tv.tv_sec;
-                dirty = 1;
+                /* Only the clocks change: the taskbar (time and date) and
+                 * the analog clock gadget - unless the calendar popup is
+                 * open, which marks the day. */
+                damage_rect(0, (int)fb_h - TASKBAR_H, (int)fb_w, TASKBAR_H);
+                damage_rect(GADGET_X - 4, 0, GADGET_W + 8, 24 + GADGET_W + 8);
+                if (cal_open) dirty = 1;
+                /* Benchmark runs (smoke_firefox.py --scroll) put the marker
+                 * on the disk: the compositor counters every 10 s. */
+                if (gfx_stats && clock_secs % 10 == 0) trace_stats();
             }
         }
         /* Fullscreen app owns the screen: forward keys, skip rendering. */
@@ -5287,7 +5523,11 @@ int main(void) {
             }
         }
         if (win_anim.active) dirty = 1;   /* keep animation frames flowing */
-        if (dirty && render() < 0) {
+        if (dirty) damage_all();
+        if (!dmg_pending) continue;
+        if (now_us() - last_frame_us < FRAME_US) continue;   /* paced */
+        last_frame_us = now_us();
+        if (render() < 0) {
             printf("desktop: framebuffer write failed\n");
             close_wm_channels();
             if (mouse_fd >= 0) close(mouse_fd);
@@ -5296,6 +5536,7 @@ int main(void) {
             return 1;
         }
     }
+    damage_all();
     render();
     struct timespec ts = {0, 250000000};
     nanosleep(&ts, 0);

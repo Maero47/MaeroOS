@@ -244,6 +244,13 @@ struct proc {
 
     /* CPU accounting */
     uint32_t         utime_ticks;   /* PIT ticks spent running */
+    /* Exact on-CPU time (dispatch to switch-back, monotonic clock), in us
+     * plus the sub-us remainder carried between dispatches: what
+     * /proc/cputime reports.  Tick sampling cannot see work that wakes on a
+     * tick and finishes before the next one - a 60 Hz compositor frame. */
+    uint32_t         run_us;
+    uint32_t         run_ns_rem;
+    uint32_t         run_us_mark;   /* run_us at the last KTRACE cpu dump */
     uint32_t         sched_count;   /* times scheduled */
 
     /* Non-zero: the PIT tick must not preempt this process (it is inside a

@@ -90,6 +90,10 @@ int wm_icon(wm_client_t *wm, int slot, int index, int x, int y);
  */
 int wm_surface(wm_client_t *wm, int slot, int shmid, int w, int h);
 int wm_commit(wm_client_t *wm, int slot);
+/* Commit with damage: only the surface rectangle (x,y,w,h) changed since the
+ * last commit, so the compositor recomposites just that part of the screen.
+ * A plain wm_commit() damages the whole surface. */
+int wm_commit_rect(wm_client_t *wm, int slot, int x, int y, int w, int h);
 /* Open this slot's private event channel (/tmp/wmevents<slot>). */
 int wm_open_events(wm_event_client_t *events, int slot);
 void wm_close_events(wm_event_client_t *events);
