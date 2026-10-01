@@ -218,31 +218,42 @@ static void keyboard_irq(registers_t *regs) {
         uint16_t key = got_e0 ? e0_keys[base] : set1_keys[base];
         got_e0 = 0;
         if (!key) continue;
-
-        /* Track Ctrl/Alt for the emergency kill hotkey. */
-        if (key == 29 /*KEY_LEFTCTRL*/ || key == 97 /*KEY_RIGHTCTRL*/)
-            kbd_ctrl_down = !release;
-        else if (key == 56 /*KEY_LEFTALT*/ || key == 100 /*KEY_RIGHTALT*/)
-            kbd_alt_down = !release;
-        else if (!release && key == 14 /*KEY_BACKSPACE*/ &&
-                 kbd_ctrl_down && kbd_alt_down && kbd_kill_target_pid > 0) {
-            /* Ctrl+Alt+Backspace: SIGKILL the registered fullscreen app.
-             * Works no matter who is reading /dev/input/event0 (DOOM). */
-            for (int i = 0; i < MAX_PROCS; i++) {
-                if (ptable[i].state != PROC_UNUSED &&
-                    ptable[i].pid == kbd_kill_target_pid) {
-                    signal_send(&ptable[i], SIGKILL);
-                    break;
-                }
-            }
-            kbd_kill_target_pid = -1;
-            /* Don't deliver the Backspace itself. */
-            continue;
-        }
-
-        push_event(EV_KEY, key, release ? 0 : 1);
-        push_event(EV_SYN, SYN_REPORT, 0);
+        keyboard_input_key(key, !release);
     }
+}
+
+/* One key press or release from any keyboard (PS/2 above, USB HID in
+ * drivers/usb/usb_hid.c), as a Linux evdev key code.  Runs with interrupts
+ * off: the PS/2 IRQ and a USB poll may both be feeding the ring. */
+void keyboard_input_key(uint16_t key, int pressed) {
+    uint32_t fl;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+    int release = !pressed;
+    /* Track Ctrl/Alt for the emergency kill hotkey. */
+    if (key == 29 /*KEY_LEFTCTRL*/ || key == 97 /*KEY_RIGHTCTRL*/)
+        kbd_ctrl_down = !release;
+    else if (key == 56 /*KEY_LEFTALT*/ || key == 100 /*KEY_RIGHTALT*/)
+        kbd_alt_down = !release;
+    else if (!release && key == 14 /*KEY_BACKSPACE*/ &&
+             kbd_ctrl_down && kbd_alt_down && kbd_kill_target_pid > 0) {
+        /* Ctrl+Alt+Backspace: SIGKILL the registered fullscreen app.
+         * Works no matter who is reading /dev/input/event0 (DOOM). */
+        for (int i = 0; i < MAX_PROCS; i++) {
+            if (ptable[i].state != PROC_UNUSED &&
+                ptable[i].pid == kbd_kill_target_pid) {
+                signal_send(&ptable[i], SIGKILL);
+                break;
+            }
+        }
+        kbd_kill_target_pid = -1;
+        /* Don't deliver the Backspace itself. */
+        goto out;
+    }
+
+    push_event(EV_KEY, key, release ? 0 : 1);
+    push_event(EV_SYN, SYN_REPORT, 0);
+out:
+    if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
 }
 
 void keyboard_init(void) {

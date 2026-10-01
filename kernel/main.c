@@ -38,6 +38,7 @@
 #include "../drivers/framebuffer.h"
 #include "../drivers/keyboard.h"
 #include "../drivers/mouse.h"
+#include "../drivers/usb/xhci.h"
 #include "../kernel/random.h"
 #include "../net/net.h"
 #include "../net/lwip_glue.h"
@@ -160,6 +161,7 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     pci_init();
     rtl8139_init();
     ac97_init();
+    xhci_init();
     net_lwip_init();
     ata_init();
     ahci_init();
@@ -209,6 +211,7 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     if (net_find_interface("eth0"))
         proc_create_kthread(knetd, "knetd");
     ac97_start_thread();
+    xhci_start_thread();
 
     __asm__ volatile("sti");
 
