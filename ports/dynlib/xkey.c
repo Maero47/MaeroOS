@@ -81,15 +81,25 @@ static int handshake(void){
     if((unsigned)rd(X,body,extra)!=extra)return -1;
     id_base=u32(body+4); id_mask=u32(body+8);
     min_kc=body[26]; max_kc=body[27];
-    unsigned vlen=u16(body+16), off=32+((vlen+3)&~3u)+2*8;
+    unsigned vlen=u16(body+16), off=32+((vlen+3)&~3u)+body[21]*8;   /* pixmap formats: 8 bytes each */
     root=u32(body+off); visual=u32(body+off+32); return 0;
 }
-static void create_window_on(unsigned wid,unsigned parent,int x,int y,int w,int h){
-    unsigned char b[64],*p=b; w8(&p,1); w8(&p,24); w16(&p,8);
+/* Events are delivered only to clients that selected them (event-mask in the
+ * CreateWindow value list).  Toplevels take the keyboard, focus and button
+ * events; a child takes only the buttons, so a key typed while the pointer is
+ * over it propagates to its toplevel, as it does for a GTK client window. */
+#define TOP_EVENTS   0x0020000Fu   /* KeyPress|KeyRelease|ButtonPress|ButtonRelease|FocusChange */
+#define CHILD_EVENTS 0x0000000Cu   /* ButtonPress|ButtonRelease */
+static void create_window_ev(unsigned wid,unsigned parent,int x,int y,int w,int h,unsigned ev){
+    unsigned char b[64],*p=b; w8(&p,1); w8(&p,24); w16(&p,9);
     w32(&p,wid); w32(&p,parent); w16(&p,x); w16(&p,y); w16(&p,w); w16(&p,h);
-    w16(&p,0); w16(&p,1); w32(&p,visual); w32(&p,0); write(X,b,p-b);
+    w16(&p,0); w16(&p,1); w32(&p,visual); w32(&p,0x800 /* CWEventMask */); w32(&p,ev);
+    write(X,b,p-b);
 }
-static void create_window(unsigned wid,int x,int y,int w,int h){ create_window_on(wid,root,x,y,w,h); }
+static void create_window_on(unsigned wid,unsigned parent,int x,int y,int w,int h){
+    create_window_ev(wid,parent,x,y,w,h,CHILD_EVENTS);
+}
+static void create_window(unsigned wid,int x,int y,int w,int h){ create_window_ev(wid,root,x,y,w,h,TOP_EVENTS); }
 static void map_window(unsigned wid){ unsigned char b[8],*p=b; w8(&p,8); w8(&p,0); w16(&p,2); w32(&p,wid); write(X,b,p-b); }
 static void unmap_window(unsigned wid){ unsigned char b[8],*p=b; w8(&p,10); w8(&p,0); w16(&p,2); w32(&p,wid); write(X,b,p-b); }
 /* A pixmap exists here only to occupy a resource slot and then give it back:

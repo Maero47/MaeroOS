@@ -100,7 +100,7 @@ static int handshake(int X){
     if (rd_to(X,body,(int)extra,5000)!=(int)extra) return -1;
     id_base = u32(body+4); id_mask = u32(body+8);
     unsigned vlen=u16(body+16);
-    unsigned off = 32 + ((vlen+3)&~3u) + 2*8;
+    unsigned off = 32 + ((vlen+3)&~3u) + body[21]*8;   /* pixmap formats: 8 bytes each */
     root   = u32(body+off);
     visual = u32(body+off+32);
     return 0;

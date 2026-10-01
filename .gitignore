@@ -208,3 +208,4 @@ __pycache__/
 ports/alpine/cache/
 build/
 disk-alpine.img
+disk-alpinex.img

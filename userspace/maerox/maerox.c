@@ -1,21 +1,36 @@
 /*
- * maeroX — a minimal X11 server for MaeroOS (Firefox road, Phase 33).
+ * maeroX — the X11 server of MaeroOS.
  *
- * A native libgui application: owns a desktop window + composited surface,
- * listens on AF_UNIX /tmp/.X11-unix/X0, and speaks the X11 wire protocol to
- * clients (raw probes now; libX11/GTK/Firefox later).
+ * A libgui application: it owns one desktop window, whose body is the X
+ * screen (the root window), listens on AF_UNIX /tmp/.X11-unix/X0 and serves
+ * the X11 protocol to clients — Firefox, GTK 3 applications, Xt/Xaw programs
+ * such as xterm, xeyes and xclock — from MaeroOS or from the Alpine chroot.
  *
- *   33a — connection-setup handshake (done).
- *   33b — request loop: CreateWindow/GC, MapWindow, PolyFillRectangle, PutImage
- *         + the startup queries Xlib emits; mapped windows composite into the
- *         desktop surface.
+ * This file holds the connections and the request loop, the window manager
+ * (placement, focus, frames with a title bar and a close button, dragging),
+ * compositing the window tree onto the desktop surface, and the input the
+ * desktop forwards (pointer stream, uncooked keys, wheel).  The protocol
+ * itself lives in xcore.c (core), xdraw.c (drawing), xfont.c (fonts) and
+ * xrender.c (RENDER); see xs.h.
+ *
+ * Options:
+ *   <slot>   desktop window slot (the desktop passes it)
+ *   -H       headless: no desktop window, a 1280x800 screen (tests)
+ *   -k       kiosk: a large toplevel fills the screen, no frames (Firefox);
+ *            implied by -H
+ *   -g WxH   initial window body size
+ *   -K       headless only: the test injection FIFO /tmp/.maerox-keys
+ *   -T       trace to /dev/tty;  -D also dumps frames there (base64)
+ *   -L file  log (QueryExtension answers, unimplemented requests...);
+ *            default /tmp/maerox.log
+ *   -d       daemonize after binding the socket
  */
 #include <draw.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <gui.h>
-#include <signal.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,192 +40,42 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include "xs.h"
 
 #define X_SOCKET_DIR  "/tmp/.X11-unix"
 #define X_SOCKET_PATH "/tmp/.X11-unix/X0"
-#define MAX_XCLIENTS  8
-#define MAX_RES       128
-/* Big enough for the LARGEST request the setup reply allows: we advertise
- * maximum-request-length = 65535 (units of 4 bytes), so Xlib chunks a big
- * PutImage into pieces of up to 65535*4 = 262140 bytes and expects the server
- * to take them.  With a 64 KiB buffer any request over 64 KiB wedged the
- * connection: process_client() would call read() with zero space left, read()
- * returns 0, and 0 is our "client closed" signal — so the first full-window
- * PutImage (818*531*4 = 1.7 MB, chunked to 256 KiB pieces) disconnected
- * Firefox instead of painting. */
-#define INBUF_SIZE    270336   /* 264 KiB >= 65535 * 4 */
-/* Replies and events a client has not read yet are queued per client instead
- * of being pushed with a blocking retry loop: the server is single-threaded, so
- * one client that stops reading used to freeze every client and the display.
- * The cap is the largest GetImage reply we produce (1<<22 pixels * 4) plus
- * slack; a client that lets more than this pile up is disconnected. */
-#define OUTBUF_MAX    (20u << 20)
+#define FRAME_MS      16
 
-#define ROOT_WINDOW   0x00000001u
-#define ROOT_COLORMAP 0x00000020u
-#define ROOT_VISUAL   0x00000021u
-
-/* X11 resource kinds. */
-enum { R_NONE = 0, R_WINDOW, R_GC, R_PIXMAP, R_PICTURE, R_GLYPHSET };
-
-typedef struct {
-    uint32_t xid;
-    int      kind;
-    /* window / pixmap */
-    int      x, y, w, h;
-    uint32_t *px;          /* backing pixels (w*h), NULL for GC */
-    uint32_t parent;       /* window: the CreateWindow parent (ROOT = toplevel) */
-    int      mapped;
-    int      maximized;    /* kiosk WM: main toplevel resized to fill the screen */
-    /* gc */
-    uint32_t fg, bg;
-    /* picture (XRender): wraps a drawable + format, or a solid colour source */
-    uint32_t pic_drawable; /* the window/pixmap this picture renders to/from */
-    uint32_t pic_format;   /* PICTFORMAT id */
-    int      pic_solid;    /* 1 = 1x1 solid colour source (colour in fg) */
-    /* glyphset (XRender text): A8 coverage bitmaps keyed by glyph id */
-    void    *gset;         /* glyphset_t* for R_GLYPHSET */
-    /* Creation order, used as the stacking order when compositing.  The slot
-     * index cannot serve: res_new() reuses the first free slot, and pixmaps and
-     * GCs are created and freed constantly, so a window created later can land
-     * in a lower slot than one created earlier. */
-    unsigned create_seq;
-    /* Set the first time anything is drawn into this window.  A mapped window
-     * that has never been drawn into must not be composited: X gives such a
-     * window no contents of its own (GTK creates the MozContainer that Firefox
-     * renders into with no background so the parent shows through), and
-     * painting maeroX's placeholder colour over the parent hid the browser
-     * chrome that had been drawn into the toplevel underneath. */
-    int      painted;
-} xres_t;
-
-/* XRender glyph storage: each glyph is an A8 coverage bitmap + metrics. */
-typedef struct {
-    uint32_t id;
-    int      w, h, x, y, xoff, yoff;
-    uint8_t *bits;         /* w*h A8 coverage (we store unpadded) */
-} xglyph_t;
-typedef struct { xglyph_t *g; int n, cap; } glyphset_t;
-
-/* XRender extension: we advertise it under this major opcode (clients use the
- * value we return from QueryExtension, so any value > 127 works). */
-#define RENDER_MAJOR  139
-#define RENDER_ERROR_BASE 142
-/* PICTFORMAT ids we advertise. */
-#define PICTFMT_RGB24  0x30
-#define PICTFMT_ARGB32 0x31
-#define PICTFMT_A8     0x33
-#define PICTFMT_A1     0x34
-
-typedef struct {
-    int      used;
-    int      fd;
-    int      setup_done;
-    uint8_t  inbuf[INBUF_SIZE];
-    int      inlen;
-    uint16_t seq;
-    xres_t   res[MAX_RES];
-    int      nres;
-    uint8_t *out;          /* bytes queued for the client (see out_write) */
-    size_t   outoff, outlen, outcap;
-    int      dead;         /* write failed / protocol violation: close it */
-    uint8_t  cur_major, cur_minor;   /* request being dispatched (for errors) */
-} xclient_t;
+client_t clients[MAX_XCLIENTS];
+int      scr_w = 1280, scr_h = 800;
+int      kiosk;
+int      render_major = 139;
 
 static gui_window_t gui;
 static int       headless;
-static int       xdbg;
-static int       dumpmode;       /* -D: composite off-screen + dump painted frame
-                                  * over /dev/tty so the headless (-kernel, no
-                                  * framebuffer) path is visually capturable. */
-static int       dumps_done;
 static int       listen_fd = -1;
-static xclient_t clients[MAX_XCLIENTS];
-static int       dirty = 1;      /* the whole surface needs repainting */
+static int       dirty = 1;
+static int       pd_x0, pd_y0, pd_x1, pd_y1;
 static unsigned  last_render_ms;
-#define FRAME_MS      16
-#define STATUS_BAND_H 40          /* the status line's rows at the top */
-static unsigned  res_seq;      /* monotonic; stamped on every window created */
+static int       trace_fd = -1;
+static int       log_fd = -1;
+static int       dumpmode, dumps_done;
+static uint32_t  pending_focus;      /* toplevel to focus after its map */
 
-/* ── A0 diagnostic trace ─────────────────────────────────────────────────────
- * Firefox's X requests are the key to why nothing paints, but maeroX's stdout
- * goes to the GUI console (not the host serial).  Route a compact trace to
- * /dev/tty, which the kernel forwards to COM1 → the host serial log, so the
- * request profile is readable from the host.  Enabled with -T. */
-static int      trace_fd = -1;
-static unsigned op_hist[256];
-static unsigned putimage_n, copyarea_n, render_n;
-static uint8_t  op_ring[32];     /* last opcodes in order (stall diag) */
-static unsigned op_ring_n;
-static void xt(const char *fmt, ...) {
-    if (trace_fd < 0) return;
+void core_resize_root(int w, int h);
+
+/* ── logging ─────────────────────────────────────────────────────────────── */
+void xlog(const char *fmt, ...) {
     char buf[256];
-    va_list ap; va_start(ap, fmt);
+    va_list ap;
+    va_start(ap, fmt);
     int n = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (n > 0) write(trace_fd, buf, n > (int)sizeof(buf) ? (int)sizeof(buf) : n);
+    if (n <= 0) return;
+    if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
+    if (log_fd >= 0) write(log_fd, buf, (size_t)n);
+    if (trace_fd >= 0) { write(trace_fd, "XT ", 3); write(trace_fd, buf, (size_t)n); }
 }
-static void xt_dump_hist(void) {
-    if (trace_fd < 0) return;
-    xt("XT hist: ");
-    for (int i = 0; i < 256; i++)
-        if (op_hist[i]) xt("op%d=%u ", i, op_hist[i]);
-    xt("| putimg=%u copy=%u render=%u\n", putimage_n, copyarea_n, render_n);
-    /* Why is a painted toplevel not on screen?  composite_windows() only draws
-     * a window that is mapped, has a backing buffer and lands inside the
-     * surface, so print exactly those facts for every window big enough to be
-     * a toplevel. */
-    for (int ci = 0; ci < MAX_XCLIENTS; ci++) {
-        if (!clients[ci].used) continue;
-        for (int i = 0; i < clients[ci].nres; i++) {
-            xres_t *w = &clients[ci].res[i];
-            if (w->kind != R_WINDOW || w->w < 400) continue;
-            xt("XT win c%d slot%d xid=0x%x %dx%d @%d,%d mapped=%d px=%d max=%d seq=%u\n",
-               ci, i, (unsigned)w->xid, w->w, w->h, w->x, w->y,
-               w->mapped, w->px ? 1 : 0, w->maximized, w->create_seq);
-        }
-    }
-    xt("XT lastops: ");
-    int n = op_ring_n < 32 ? (int)op_ring_n : 32;
-    int base = op_ring_n < 32 ? 0 : (int)(op_ring_n & 31);
-    for (int i = 0; i < n; i++) xt("%d ", op_ring[(base + i) & 31]);
-    xt("\n");
-}
-
-/* ── Atom registry (server-global) ───────────────────────────────────────────
- * X11 atoms are server-global names with stable integer ids.  GDK interns the
- * same name repeatedly and REQUIRES the same id back each time, and round-trips
- * via GetAtomName — the old "return a fresh counter every call" stub gave a new
- * id per InternAtom, corrupting GDK's atom cache.  Dynamic ids start at 100 to
- * stay clear of the predefined atom range (1..68) that Xlib uses by value. */
-#define MAX_ATOMS 256
-static struct { char name[64]; } atoms[MAX_ATOMS];
-static int next_atom = 100;
-
-/* Intern `name` (len chars): return its id, allocating one if new.  If
- * only_if_exists and the name is unknown, return 0 (None). */
-static uint32_t atom_intern(const char *name, int len, int only_if_exists) {
-    if (len <= 0 || len > 63) return 0;
-    for (int i = 1; i < next_atom && i < MAX_ATOMS; i++)
-        if (atoms[i].name[0] &&
-            (int)strlen(atoms[i].name) == len &&
-            memcmp(atoms[i].name, name, (size_t)len) == 0)
-            return (uint32_t)i;
-    if (only_if_exists || next_atom >= MAX_ATOMS) return 0;
-    int id = next_atom++;
-    memcpy(atoms[id].name, name, (size_t)len);
-    atoms[id].name[len] = '\0';
-    return (uint32_t)id;
-}
-static const char *atom_name(uint32_t id, int *len) {
-    if (id >= 1 && id < (uint32_t)next_atom && id < MAX_ATOMS && atoms[id].name[0]) {
-        *len = (int)strlen(atoms[id].name);
-        return atoms[id].name;
-    }
-    *len = 0;
-    return "";
-}
-static char      status[96] = "maeroX :0 - listening, 0 clients";
 
 static unsigned now_ms(void) {
     struct timespec ts;
@@ -218,64 +83,26 @@ static unsigned now_ms(void) {
     return (unsigned)ts.tv_sec * 1000u + (unsigned)(ts.tv_nsec / 1000000L);
 }
 
-/* Sleep until an X client sends something, a client connects, a client with
- * queued output can take more of it, or ms pass.
- * A request that needs a reply (InternAtom, GetProperty, QueryExtension, a
- * sync) blocks its client until we answer, and GTK starts up on hundreds of
- * them: sleeping a fixed 12 ms per loop made every one of them wait out the
- * rest of that sleep (two 10 ms ticks, rounded up).  The desktop's event FIFO
- * stays on the timeout — a FIFO whose writer is not open polls readable. */
-static void wait_for_clients(int ms) {
-    struct pollfd pfd[1 + MAX_XCLIENTS];
-    int n = 0;
-    if (listen_fd >= 0) { pfd[n].fd = listen_fd; pfd[n].events = POLLIN; pfd[n].revents = 0; n++; }
-    for (int i = 0; i < MAX_XCLIENTS; i++) {
-        xclient_t *c = &clients[i];
-        if (!c->used || c->dead) continue;
-        short ev = 0;
-        if (c->inlen < INBUF_SIZE) ev |= POLLIN;
-        if (c->outlen > 0) ev |= POLLOUT;     /* out_flush can make progress */
-        if (!ev) continue;
-        pfd[n].fd = c->fd; pfd[n].events = ev; pfd[n].revents = 0; n++;
-    }
-    poll(pfd, (unsigned long)n, ms);
+uint32_t x_time(void) {
+    uint32_t t = now_ms();
+    return t ? t : 1;
 }
 
-/* ── little-endian readers (clients are LSBFirst on x86) ─────────────────── */
-static uint32_t r16(const uint8_t *p) { return p[0] | (p[1] << 8); }
-static int      rs16(const uint8_t *p) { return (int)(int16_t)(p[0] | (p[1] << 8)); }
-static uint32_t r32(const uint8_t *p) {
-    return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-/* ── little-endian byte appender (setup reply) ───────────────────────────── */
-typedef struct { uint8_t *p; int n, cap; } buf_t;
-static void b8(buf_t *b, uint32_t v)  { if (b->n < b->cap) b->p[b->n] = (uint8_t)v; b->n++; }
-static void b16(buf_t *b, uint32_t v) { b8(b, v); b8(b, v >> 8); }
-static void b32(buf_t *b, uint32_t v) { b8(b, v); b8(b, v >> 8); b8(b, v >> 16); b8(b, v >> 24); }
-static void bpad(buf_t *b, int n)     { while (n-- > 0) b8(b, 0); }
-
-/* ── output ──────────────────────────────────────────────────────────────────
- * Every byte for a client goes through out_write().  It never blocks: what the
- * socket takes now is sent, the rest waits in the client's queue and
- * out_flush() pushes it from the main loop.  A client that has gone away (EPIPE
- * — sent with MSG_NOSIGNAL and SIGPIPE is ignored too, so it cannot kill the
- * server) or that lets OUTBUF_MAX pile up is marked dead and closed by the
- * main loop, never from inside a request handler. */
-static int out_send(xclient_t *c, const uint8_t *p, size_t n) {
+/* ── output ──────────────────────────────────────────────────────────────── */
+static int out_send(client_t *c, const uint8_t *p, size_t n) {
     size_t off = 0;
     while (off < n) {
         int w = send(c->fd, p + off, n - off, MSG_NOSIGNAL);
         if (w > 0) { off += (size_t)w; continue; }
         if (w < 0 && errno == EINTR) continue;
         if (w < 0 && errno == EAGAIN) break;
-        c->dead = 1;                          /* EPIPE, EBADF, ... */
+        c->dead = 1;
         break;
     }
     return (int)off;
 }
 
-static void out_flush(xclient_t *c) {
+static void out_flush(client_t *c) {
     if (c->dead || c->outlen == 0) return;
     size_t w = (size_t)out_send(c, c->out + c->outoff, c->outlen);
     c->outoff += w;
@@ -283,17 +110,19 @@ static void out_flush(xclient_t *c) {
     if (c->outlen == 0) c->outoff = 0;
 }
 
-static void out_write(xclient_t *c, const void *data, size_t n) {
+/* Never blocks: what the socket does not take now is queued, and a client
+ * that lets more than OUTBUF_MAX pile up is dropped. */
+void out_write(client_t *c, const void *data, size_t n) {
     const uint8_t *p = (const uint8_t *)data;
     if (c->dead || n == 0) return;
-    if (c->outlen == 0) {                      /* nothing queued: try direct */
+    if (c->outlen == 0) {
         size_t w = (size_t)out_send(c, p, n);
         if (c->dead) return;
         p += w; n -= w;
         if (n == 0) return;
     }
     if (c->outlen + n > OUTBUF_MAX) {
-        xt("XT client output queue over %u bytes, disconnecting\n", OUTBUF_MAX);
+        xlog("client %d output queue over %u bytes, disconnecting\n", c->index, OUTBUF_MAX);
         c->dead = 1;
         return;
     }
@@ -305,7 +134,7 @@ static void out_write(xclient_t *c, const void *data, size_t n) {
         size_t cap = c->outcap ? c->outcap : 4096;
         while (cap < c->outlen + n) cap *= 2;
         if (cap > OUTBUF_MAX) cap = OUTBUF_MAX;
-        uint8_t *np = (uint8_t *)realloc(c->out, cap);
+        uint8_t *np = realloc(c->out, cap);
         if (!np) { c->dead = 1; return; }
         c->out = np;
         c->outcap = cap;
@@ -314,1690 +143,613 @@ static void out_write(xclient_t *c, const void *data, size_t n) {
     c->outlen += n;
 }
 
-/* X error codes (core protocol). */
-#define BadValue     2
-#define BadPixmap    4
-#define BadAlloc    11
-#define BadGC       13
-#define BadIDChoice 14
-#define BadLength   16
-
-static void put32(uint8_t *p, uint32_t v);
-static void put16(uint8_t *p, uint32_t v);
-
-/* An X error for the request being dispatched (c->seq, c->cur_major/minor).
- *
- * Errors are sent only for requests a well-formed client never issues —
- * short or truncated requests, reused ids, a GC request on a window — because
- * Xlib's default handler, GDK's and Firefox's treat an unexpected error as
- * fatal: a case maeroX merely does not implement stays a silent no-op. */
-static void x_error(xclient_t *c, int code, uint32_t bad) {
+void x_error(client_t *c, int code, uint32_t bad) {
     uint8_t e[32];
     memset(e, 0, sizeof(e));
-    e[0] = 0;                           /* Error */
     e[1] = (uint8_t)code;
     put16(e + 2, c->seq);
     put32(e + 4, bad);
     put16(e + 8, c->cur_minor);
     e[10] = c->cur_major;
     out_write(c, e, 32);
-    xt("XT error %d op=%d.%d seq=%d bad=0x%x\n", code, c->cur_major,
-       c->cur_minor, c->seq, (unsigned)bad);
+    if (trace_fd >= 0) xlog("error %d op=%d.%d seq=%d bad=0x%x\n", code, c->cur_major,
+                            c->cur_minor, c->seq, (unsigned)bad);
 }
 
-/* ── resources ───────────────────────────────────────────────────────────── */
-static xres_t *res_find(xclient_t *c, uint32_t xid) {
-    if (xid == ROOT_WINDOW) return NULL;        /* root is implicit */
-    for (int i = 0; i < c->nres; i++)
-        if (c->res[i].kind && c->res[i].xid == xid) return &c->res[i];
-    return NULL;
-}
-
-/* Release everything a resource owns and free its slot. */
-static void res_free(xres_t *r) {
-    if (r->kind == R_WINDOW && r->mapped) dirty = 1;   /* it leaves the screen */
-    if (r->px) { free(r->px); r->px = NULL; }
-    if (r->gset) {
-        glyphset_t *gs = (glyphset_t *)r->gset;
-        for (int k = 0; k < gs->n; k++)
-            if (gs->g[k].bits) free(gs->g[k].bits);
-        free(gs->g);
-        free(gs);
-        r->gset = NULL;
-    }
-    r->kind = R_NONE;
-}
-
-/* A new resource.  An id this client already uses is BadIDChoice: silently
- * re-initialising the slot dropped its pixel buffer and glyphs on the floor. */
-static xres_t *res_new(xclient_t *c, uint32_t xid, int kind) {
-    if (xid == ROOT_WINDOW || res_find(c, xid)) {
-        x_error(c, BadIDChoice, xid);
-        return NULL;
-    }
-    xres_t *r = NULL;
-    for (int i = 0; i < MAX_RES; i++)
-        if (!c->res[i].kind) { r = &c->res[i]; if (i >= c->nres) c->nres = i + 1; break; }
-    if (!r) return NULL;   /* table full: stays silent, see x_error() */
-    memset(r, 0, sizeof(*r));
-    r->xid = xid;
-    r->kind = kind;
-    return r;
-}
-
-/* ── the X11 connection-setup success reply ──────────────────────────────── */
-static int build_setup_reply(uint8_t *out, int cap, int scr_w, int scr_h) {
-    buf_t b = { out, 0, cap };
-    const char *vendor = "MaeroX";
-    int vlen = (int)strlen(vendor);
-    int vpad = (4 - (vlen & 3)) & 3;
-    int extra = 32 + (vlen + vpad) + 2 * 8 + (40 + 8 + 24);
-
-    b8(&b, 1); b8(&b, 0); b16(&b, 11); b16(&b, 0); b16(&b, extra / 4);
-
-    b32(&b, 1);                /* release */
-    b32(&b, 0x00200000);       /* resource-id-base */
-    b32(&b, 0x001FFFFF);       /* resource-id-mask */
-    b32(&b, 0);                /* motion-buffer-size */
-    b16(&b, vlen);             /* vendor length */
-    b16(&b, 65535);            /* maximum-request-length */
-    b8(&b, 1);                 /* screens */
-    b8(&b, 2);                 /* pixmap formats */
-    b8(&b, 0); b8(&b, 0);      /* image-byte-order LSB, bit-order LSB */
-    b8(&b, 32); b8(&b, 32);    /* scanline unit / pad */
-    b8(&b, 8); b8(&b, 255);    /* min/max keycode */
-    bpad(&b, 4);
-
-    for (int i = 0; i < vlen; i++) b8(&b, (uint8_t)vendor[i]);
-    bpad(&b, vpad);
-
-    b8(&b, 1);  b8(&b, 1);  b8(&b, 32); bpad(&b, 5);    /* FORMAT depth 1 */
-    b8(&b, 24); b8(&b, 32); b8(&b, 32); bpad(&b, 5);    /* FORMAT depth 24 */
-
-    b32(&b, ROOT_WINDOW); b32(&b, ROOT_COLORMAP);
-    b32(&b, 0x00FFFFFF); b32(&b, 0x00000000);           /* white / black */
-    b32(&b, 0);                                         /* input-masks */
-    b16(&b, scr_w); b16(&b, scr_h);
-    b16(&b, scr_w * 264 / 1000); b16(&b, scr_h * 264 / 1000);
-    b16(&b, 1); b16(&b, 1);
-    b32(&b, ROOT_VISUAL);
-    b8(&b, 0); b8(&b, 0); b8(&b, 24); b8(&b, 1);        /* backing/saveunder/depth/ndepths */
-
-    b8(&b, 24); b8(&b, 0); b16(&b, 1); bpad(&b, 4);     /* DEPTH 24, 1 visual */
-    b32(&b, ROOT_VISUAL); b8(&b, 4); b8(&b, 8); b16(&b, 256);
-    b32(&b, 0x00FF0000); b32(&b, 0x0000FF00); b32(&b, 0x000000FF); bpad(&b, 4);
-
-    return b.n;
-}
-
-/* Build + send a 32-byte reply with `data` (24 bytes after the 8-byte head). */
-static void put32(uint8_t *p, uint32_t v) {
-    p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
-}
-static void put16(uint8_t *p, uint32_t v) { p[0] = v; p[1] = v >> 8; }
-
-static void send_reply(xclient_t *c, uint8_t b1, const uint8_t data24[24]) {
-    uint8_t r[32];
-    memset(r, 0, sizeof(r));
-    r[0] = 1;                  /* reply */
-    r[1] = b1;
-    r[2] = c->seq & 0xFF;
-    r[3] = (c->seq >> 8) & 0xFF;
-    /* r[4..7] reply-length = 0 (no extra) */
-    if (data24) memcpy(r + 8, data24, 24);
-    out_write(c, r, 32);
-    if (xdbg) printf("maerox: reply seq=%d b1=%d sent\n", c->seq, b1);
-}
-
-/* Variable reply: 32-byte head (with reply-length = extra_words) + extra data. */
-static void send_reply_var(xclient_t *c, uint8_t b1, const uint8_t data24[24],
-                           const uint8_t *extra, int extra_len) {
+void send_reply(client_t *c, uint8_t b1, const uint8_t data24[24]) {
     uint8_t r[32];
     memset(r, 0, sizeof(r));
     r[0] = 1; r[1] = b1;
-    r[2] = c->seq & 0xFF; r[3] = (c->seq >> 8) & 0xFF;
+    put16(r + 2, c->seq);
+    if (data24) memcpy(r + 8, data24, 24);
+    out_write(c, r, 32);
+}
+
+void send_reply_var(client_t *c, uint8_t b1, const uint8_t data24[24],
+                    const uint8_t *extra, int extra_len) {
+    uint8_t r[32];
+    memset(r, 0, sizeof(r));
+    r[0] = 1; r[1] = b1;
+    put16(r + 2, c->seq);
     int words = (extra_len + 3) / 4;
     put32(r + 4, (uint32_t)words);
     if (data24) memcpy(r + 8, data24, 24);
     out_write(c, r, 32);
     if (extra_len > 0) {
-        out_write(c, extra, extra_len);
+        out_write(c, extra, (size_t)extra_len);
         int pad = words * 4 - extra_len;
-        if (pad > 0) { uint8_t z[4] = {0,0,0,0}; out_write(c, z, pad); }
+        if (pad > 0) { uint8_t z[4] = { 0, 0, 0, 0 }; out_write(c, z, (size_t)pad); }
     }
 }
 
-/* Core X requests that generate a reply — the client blocks until it arrives,
- * so maeroX must answer every one of these even if only with empty data. */
-static int req_expects_reply(int op) {
-    switch (op) {
-    case 3: case 14: case 15: case 16: case 17: case 20: case 21:
-    case 23: case 26: case 31: case 38: case 39: case 40: case 43:
-    case 44: case 47: case 48: case 49: case 50: case 52: case 73:
-    case 83: case 84: case 85: case 91: case 92: case 97: case 98:
-    case 99: case 101: case 103: case 106: case 108: case 110:
-    case 116: case 117: case 119:
-        return 1;
-    default: return 0;
-    }
+void send_event(client_t *c, uint8_t ev[32]) {
+    if (!c->used || c->dead || !c->setup_done) return;
+    if ((ev[0] & 0x7F) != KeymapNotify) put16(ev + 2, c->seq);
+    out_write(c, ev, 32);
 }
 
-/* ── X11 events (32 bytes; byte 0 = type, byte 1 = detail) ───────────────── */
-
-/* Expose: tell the client (a region of) its window needs repainting. */
-static void send_expose(xclient_t *c, xres_t *w) {
-    uint8_t e[32];
-    memset(e, 0, sizeof(e));
-    e[0] = 12;                          /* Expose */
-    put16(e + 2, c->seq);
-    put32(e + 4, w->xid);               /* window */
-    put16(e + 8, 0); put16(e + 10, 0);  /* x, y */
-    put16(e + 12, w->w); put16(e + 14, w->h);
-    put16(e + 16, 0);                   /* count */
-    out_write(c, e, 32);
-}
-
-/* MapNotify: tell the client its window is now mapped/viewable.  GDK keeps the
- * window in an unmapped state — and never paints — until it sees this. */
-static void send_map_notify(xclient_t *c, xres_t *w) {
-    uint8_t e[32];
-    memset(e, 0, sizeof(e));
-    e[0] = 19;                          /* MapNotify */
-    put16(e + 2, c->seq);
-    put32(e + 4, w->xid);               /* event window */
-    put32(e + 8, w->xid);               /* window */
-    e[12] = 0;                          /* override-redirect = False */
-    out_write(c, e, 32);
-}
-
-/* ConfigureNotify: report the window's geometry after mapping. */
-static void send_configure(xclient_t *c, xres_t *w) {
-    uint8_t e[32];
-    memset(e, 0, sizeof(e));
-    e[0] = 22;                          /* ConfigureNotify */
-    put16(e + 2, c->seq);
-    put32(e + 4, w->xid);               /* event */
-    put32(e + 8, w->xid);               /* window */
-    put32(e + 12, 0);                   /* above-sibling = None */
-    put16(e + 16, w->x); put16(e + 18, w->y);
-    put16(e + 20, w->w); put16(e + 22, w->h);
-    out_write(c, e, 32);
-}
-
-/* X TIMESTAMPs are milliseconds since server start.  Zero is reserved
- * (CurrentTime), and GDK compares the value it gets back from
- * gdk_x11_get_server_time() against its own monotonic clock, so hand out a real
- * monotonically increasing millisecond count. */
-static uint32_t x_time(void) {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 1;
-    uint32_t ms = (uint32_t)ts.tv_sec * 1000u + (uint32_t)(ts.tv_nsec / 1000000);
-    return ms ? ms : 1;
-}
-
-/* PropertyNotify: a property on a window changed (state 0) or was deleted
- * (state 1).
- *
- * This event is what unblocks gdk_x11_get_server_time() (GTK 3.24,
- * gdk/x11/gdkwindow-x11.c:5624-5648): it writes a one-byte GDK_TIMESTAMP_PROP
- * property and then sits in XIfEvent() until a PropertyNotify for that window
- * and atom arrives — "The window must have GDK_PROPERTY_CHANGE_MASK in its
- * events mask or a hang will result", says its own doc comment.  Without this
- * event the Firefox main thread parked in that XIfEvent forever, which is why
- * the browser window was never shown.
- *
- * Like every other event maeroX sends (Expose, MapNotify, ConfigureNotify) this
- * ignores the window's event mask, which maeroX does not track. */
-static void send_property_notify(xclient_t *c, uint32_t window, uint32_t atom,
-                                 int deleted) {
-    uint8_t e[32];
-    memset(e, 0, sizeof(e));
-    e[0] = 28;                          /* PropertyNotify */
-    put16(e + 2, c->seq);
-    put32(e + 4, window);
-    put32(e + 8, atom);
-    put32(e + 12, x_time());            /* time */
-    e[16] = (uint8_t)(deleted ? 1 : 0); /* state: 0 NewValue, 1 Deleted */
-    out_write(c, e, 32);
-}
-
-/* A pointer event (ButtonPress/Release/Motion) relative to a window. */
-static void send_pointer(xclient_t *c, xres_t *w, int type, int detail,
-                         int ex, int ey) {
-    uint8_t e[32];
-    memset(e, 0, sizeof(e));
-    e[0] = type;
-    e[1] = detail;
-    put16(e + 2, c->seq);
-    put32(e + 4, x_time());             /* time */
-    put32(e + 8, 0x00000001);           /* root window */
-    put32(e + 12, w->xid);              /* event window */
-    put32(e + 16, 0);                   /* child = None */
-    put16(e + 20, w->x + ex); put16(e + 22, w->y + ey);  /* root-x/y */
-    put16(e + 24, ex); put16(e + 26, ey);                /* event-x/y */
-    put16(e + 28, 0);                  /* state */
-    e[30] = 1;                          /* same-screen */
-    out_write(c, e, 32);
-}
-
-/* ── keyboard ────────────────────────────────────────────────────────────────
- * Three separate things have to line up before a client turns a key press into
- * a character, and all three live here.
- *
- * 1. KEYCODES.  The desktop hands maeroX the Linux input-event code from
- *    drivers/keyboard.c (KEY_A = 30, KEY_ENTER = 28 ...).  X11 on Linux numbers
- *    the same key eight higher — the protocol reserves keycodes 0-7 — and the
- *    setup reply already advertises min-keycode 8 / max-keycode 255.  So the
- *    single conversion in the whole server is:  X keycode = Linux keycode + 8.
- * 2. THE KEYMAP.  GetKeyboardMapping has to answer with real KEYSYMs from
- *    X11's keysymdef.h, two per keycode (column 0 unshifted, column 1 shifted),
- *    or a toolkit has nothing to translate a keycode into.  us_keysyms[] below
- *    is the US layout, indexed by LINUX keycode.
- * 3. MODIFIERS.  GetModifierMapping has to name the keycodes that act as
- *    Shift/Lock/Control/Mod1, or the `state` mask in a KeyPress means nothing
- *    to the client.  The mask itself needs no translation: wm.h's WM_MOD_*
- *    values ARE X11's ShiftMask/LockMask/ControlMask/Mod1Mask.
- */
-#define X_KEYCODE_BASE 8       /* X keycode = Linux keycode + 8 */
-#define KEYMAP_MAX     128     /* Linux keycodes we describe (0..127) */
-#define KEYSYMS_PER_KEYCODE 2  /* column 0 = unshifted, column 1 = shifted */
-
-/* Linux keycodes of the keys that carry a modifier (see drivers/keyboard.c). */
-#define LK_LEFTCTRL 29
-#define LK_LEFTSHIFT 42
-#define LK_RIGHTSHIFT 54
-#define LK_LEFTALT 56
-#define LK_CAPSLOCK 58
-#define LK_NUMLOCK 69
-#define LK_RIGHTCTRL 97
-#define LK_RIGHTALT 100
-#define LK_LEFTMETA 125
-#define LK_RIGHTMETA 126
-
-/* US layout, indexed by Linux keycode: { unshifted keysym, shifted keysym }.
- * Values are keysymdef.h constants (Latin-1 characters are their own code
- * point; XK_* function keys live in the 0xff00 page). */
-static const uint32_t us_keysyms[KEYMAP_MAX][KEYSYMS_PER_KEYCODE] = {
-    [1]  = { 0xff1b, 0xff1b },   /* Escape */
-    [2]  = { '1', '!' },  [3]  = { '2', '@' },  [4]  = { '3', '#' },
-    [5]  = { '4', '$' },  [6]  = { '5', '%' },  [7]  = { '6', '^' },
-    [8]  = { '7', '&' },  [9]  = { '8', '*' },  [10] = { '9', '(' },
-    [11] = { '0', ')' },  [12] = { '-', '_' },  [13] = { '=', '+' },
-    [14] = { 0xff08, 0xff08 },   /* BackSpace */
-    [15] = { 0xff09, 0xfe20 },   /* Tab / ISO_Left_Tab */
-    [16] = { 'q', 'Q' },  [17] = { 'w', 'W' },  [18] = { 'e', 'E' },
-    [19] = { 'r', 'R' },  [20] = { 't', 'T' },  [21] = { 'y', 'Y' },
-    [22] = { 'u', 'U' },  [23] = { 'i', 'I' },  [24] = { 'o', 'O' },
-    [25] = { 'p', 'P' },  [26] = { '[', '{' },  [27] = { ']', '}' },
-    [28] = { 0xff0d, 0xff0d },   /* Return */
-    [29] = { 0xffe3, 0xffe3 },   /* Control_L */
-    [30] = { 'a', 'A' },  [31] = { 's', 'S' },  [32] = { 'd', 'D' },
-    [33] = { 'f', 'F' },  [34] = { 'g', 'G' },  [35] = { 'h', 'H' },
-    [36] = { 'j', 'J' },  [37] = { 'k', 'K' },  [38] = { 'l', 'L' },
-    [39] = { ';', ':' },  [40] = { '\'', '"' }, [41] = { '`', '~' },
-    [42] = { 0xffe1, 0xffe1 },   /* Shift_L */
-    [43] = { '\\', '|' },
-    [44] = { 'z', 'Z' },  [45] = { 'x', 'X' },  [46] = { 'c', 'C' },
-    [47] = { 'v', 'V' },  [48] = { 'b', 'B' },  [49] = { 'n', 'N' },
-    [50] = { 'm', 'M' },  [51] = { ',', '<' },  [52] = { '.', '>' },
-    [53] = { '/', '?' },
-    [54] = { 0xffe2, 0xffe2 },   /* Shift_R */
-    [55] = { 0xffaa, 0xffaa },   /* KP_Multiply */
-    [56] = { 0xffe9, 0xffe9 },   /* Alt_L */
-    [57] = { ' ', ' ' },         /* space */
-    [58] = { 0xffe5, 0xffe5 },   /* Caps_Lock */
-    [59] = { 0xffbe, 0xffbe }, [60] = { 0xffbf, 0xffbf },   /* F1  F2  */
-    [61] = { 0xffc0, 0xffc0 }, [62] = { 0xffc1, 0xffc1 },   /* F3  F4  */
-    [63] = { 0xffc2, 0xffc2 }, [64] = { 0xffc3, 0xffc3 },   /* F5  F6  */
-    [65] = { 0xffc4, 0xffc4 }, [66] = { 0xffc5, 0xffc5 },   /* F7  F8  */
-    [67] = { 0xffc6, 0xffc6 }, [68] = { 0xffc7, 0xffc7 },   /* F9  F10 */
-    [69] = { 0xff7f, 0xff7f },   /* Num_Lock    */
-    [70] = { 0xff14, 0xff14 },   /* Scroll_Lock */
-    [71] = { 0xffb7, 0xffb7 }, [72] = { 0xffb8, 0xffb8 }, [73] = { 0xffb9, 0xffb9 },
-    [74] = { 0xffad, 0xffad },   /* KP_Subtract */
-    [75] = { 0xffb4, 0xffb4 }, [76] = { 0xffb5, 0xffb5 }, [77] = { 0xffb6, 0xffb6 },
-    [78] = { 0xffab, 0xffab },   /* KP_Add */
-    [79] = { 0xffb1, 0xffb1 }, [80] = { 0xffb2, 0xffb2 }, [81] = { 0xffb3, 0xffb3 },
-    [82] = { 0xffb0, 0xffb0 },   /* KP_0 */
-    [83] = { 0xffae, 0xffae },   /* KP_Decimal */
-    [87] = { 0xffc8, 0xffc8 }, [88] = { 0xffc9, 0xffc9 },   /* F11 F12 */
-    [96] = { 0xff8d, 0xff8d },   /* KP_Enter  */
-    [97] = { 0xffe4, 0xffe4 },   /* Control_R */
-    [98] = { 0xffaf, 0xffaf },   /* KP_Divide */
-    [100] = { 0xffea, 0xffea },  /* Alt_R  */
-    [102] = { 0xff50, 0xff50 },  /* Home   */
-    [103] = { 0xff52, 0xff52 },  /* Up     */
-    [104] = { 0xff55, 0xff55 },  /* Prior  */
-    [105] = { 0xff51, 0xff51 },  /* Left   */
-    [106] = { 0xff53, 0xff53 },  /* Right  */
-    [107] = { 0xff57, 0xff57 },  /* End    */
-    [108] = { 0xff54, 0xff54 },  /* Down   */
-    [109] = { 0xff56, 0xff56 },  /* Next   */
-    [110] = { 0xff63, 0xff63 },  /* Insert */
-    [111] = { 0xffff, 0xffff },  /* Delete */
-    [125] = { 0xffeb, 0xffeb },  /* Super_L */
-    [126] = { 0xffec, 0xffec },  /* Super_R */
-    [127] = { 0xff67, 0xff67 },  /* Menu    */
-};
-
-/* GetModifierMapping's answer: 8 rows (Shift, Lock, Control, Mod1..Mod5) of
- * KEYCODES_PER_MODIFIER X keycodes, 0 where a slot is unused.
- *
- * Every keycode named here must be one the window manager actually tracks, or
- * the client is told a combination exists that can never be produced.  These
- * rows pair with wm.h's WM_MOD_* and with the tracking in the desktop's
- * current_mods(); change one and change all three. */
-#define KEYCODES_PER_MODIFIER 2
-static const uint8_t modifier_linux_keys[8][KEYCODES_PER_MODIFIER] = {
-    { LK_LEFTSHIFT, LK_RIGHTSHIFT },   /* Shift */
-    { LK_CAPSLOCK,  0 },               /* Lock  */
-    { LK_LEFTCTRL,  LK_RIGHTCTRL },    /* Control */
-    { LK_LEFTALT,   LK_RIGHTALT },     /* Mod1 = Alt */
-    { LK_NUMLOCK,   0 },               /* Mod2 = NumLock */
-    { 0, 0 },                          /* Mod3 unused */
-    { LK_LEFTMETA,  LK_RIGHTMETA },    /* Mod4 = Super */
-    { 0, 0 },                          /* Mod5 unused */
-};
-
-/* ── stacking order ──────────────────────────────────────────────────────────
- * "Which window is on top" has exactly ONE definition in maeroX, and this is
- * it: the one created last.  The resource array cannot answer the question —
- * res_new() reuses the first free slot and pixmaps and GCs are created and
- * freed constantly, so a window's slot index says nothing about where it sits.
- * Firefox is the case that punishes a second opinion: it maps a blank toplevel
- * and a same-size MozContainer child, and which of the two lands in the higher
- * slot is a coin flip from one boot to the next.  The compositor, the click
- * hit-test and the key-target fallback all ask here, so they cannot disagree
- * about what the user is looking at. */
-static int win_above(const xres_t *a, const xres_t *b) {
-    return a->create_seq > b->create_seq;
-}
-
-/* The top-most mapped window, or with hit_test the top-most one containing
- * (x, y).  NULL (and *out_c NULL) when nothing qualifies. */
-static xres_t *topmost_window(int hit_test, int x, int y, xclient_t **out_c) {
-    xclient_t *bc = NULL; xres_t *bw = NULL;
-    for (int ci = 0; ci < MAX_XCLIENTS; ci++) {
-        if (!clients[ci].used) continue;
-        for (int i = 0; i < clients[ci].nres; i++) {
-            xres_t *w = &clients[ci].res[i];
-            if (w->kind != R_WINDOW || !w->mapped) continue;
-            if (hit_test && (x < w->x || x >= w->x + w->w ||
-                             y < w->y || y >= w->y + w->h)) continue;
-            if (!bw || win_above(w, bw)) { bw = w; bc = &clients[ci]; }
-        }
-    }
-    *out_c = bc;
-    return bw;
-}
-
-/* ── input focus ─────────────────────────────────────────────────────────────
- * Keys go to one window.  maeroX picks it the way a kiosk WM would — the last
- * real top-level to be mapped — and then defers to the client the moment it
- * asks for something else with SetInputFocus, which is what GTK does when it
- * shows or activates a window.  GetInputFocus answers with the same window, so
- * a toolkit that reads back what it set sees its own value. */
-static int      focus_ci = -1;         /* index into clients[], -1 = none */
-static uint32_t focus_xid;             /* 0 = none */
-static int      focus_explicit;        /* a client called SetInputFocus */
-static uint8_t  focus_revert = 1;      /* RevertToPointerRoot */
-
-/* FocusIn (9) / FocusOut (10).  GTK needs these to mark a toplevel active;
- * without them a text widget never shows a caret and drops key events even
- * when they arrive. */
-static void send_focus(xclient_t *c, uint32_t window, int in) {
-    uint8_t e[32];
-    memset(e, 0, sizeof(e));
-    e[0] = (uint8_t)(in ? 9 : 10);
-    e[1] = 0;                           /* detail = NotifyAncestor */
-    put16(e + 2, c->seq);
-    put32(e + 4, window);               /* event window */
-    e[8] = 0;                           /* mode = NotifyNormal */
-    out_write(c, e, 32);
-}
-
-static void xfocus_set(int ci, uint32_t xid) {
-    if (ci == focus_ci && xid == focus_xid) return;
-    if (focus_ci >= 0 && focus_ci < MAX_XCLIENTS && clients[focus_ci].used &&
-        focus_xid)
-        send_focus(&clients[focus_ci], focus_xid, 0);
-    focus_ci = ci;
-    focus_xid = xid;
-    if (ci >= 0 && ci < MAX_XCLIENTS && clients[ci].used && xid)
-        send_focus(&clients[ci], xid, 1);
-    xt("XT focus -> c%d xid=0x%x\n", ci, (unsigned)xid);
-}
-
-static int client_index(const xclient_t *c) {
-    return (int)(c - clients);
-}
-
-/* The kiosk focus policy, in one place.  A window is offered the keyboard when
- * it is a real top-level — parented to the root and wide enough not to be a
- * 1x1/10x10 helper or a small popup — and only while no client has taken
- * charge of focus itself; a SetInputFocus (which is what GTK issues when it
- * shows or activates a window) sets focus_explicit and wins from then on.  The
- * only exception is that somebody must hold the keyboard: with no focus at all
- * any window will do.
- *
- * Both the map path and the click path come through here.  They used to decide
- * separately, and the click path decided with no guards at all: clicking in a
- * Firefox page handed the keyboard to the MozContainer child, GDK discarded
- * the FocusIn (it only tracks focus on toplevels) but processed the toplevel's
- * FocusOut, and from then on the browser had keys addressed to a window it did
- * not believe was focused. */
-static void focus_offer(xclient_t *c, xres_t *w) {
-    if (!focus_explicit && w->parent == ROOT_WINDOW && w->w >= 400)
-        xfocus_set(client_index(c), w->xid);
-    else if (focus_xid == 0)
-        xfocus_set(client_index(c), w->xid);
-}
-
-/* The window a key event is addressed to: the focus window while it is still a
- * mapped window of a live client, else the top-most mapped window (same
- * creation-order rule the compositor uses, so keys follow what is on screen). */
-static xres_t *key_target(xclient_t **out_c) {
-    if (focus_ci >= 0 && focus_ci < MAX_XCLIENTS && clients[focus_ci].used) {
-        xres_t *w = res_find(&clients[focus_ci], focus_xid);
-        if (w && w->kind == R_WINDOW && w->mapped) {
-            *out_c = &clients[focus_ci];
-            return w;
-        }
-    }
-    return topmost_window(0, 0, 0, out_c);
-}
-
-/* A KeyPress (2) / KeyRelease (3).  Byte-for-byte the same 32-byte layout as a
- * pointer event: detail is the KEYCODE, state the modifier mask that was in
- * effect just before the event. */
-static void send_key(xclient_t *c, xres_t *w, int type, int keycode, int state) {
-    uint8_t e[32];
-    memset(e, 0, sizeof(e));
-    e[0] = (uint8_t)type;
-    e[1] = (uint8_t)keycode;            /* detail = keycode */
-    put16(e + 2, c->seq);
-    put32(e + 4, x_time());             /* time */
-    put32(e + 8, ROOT_WINDOW);          /* root */
-    put32(e + 12, w->xid);              /* event window */
-    put32(e + 16, 0);                   /* child = None */
-    put16(e + 20, w->x); put16(e + 22, w->y);   /* root-x/y  */
-    put16(e + 24, 0);    put16(e + 26, 0);      /* event-x/y */
-    put16(e + 28, (uint32_t)state);     /* state */
-    e[30] = 1;                          /* same-screen */
-    out_write(c, e, 32);
-}
-
-static unsigned key_events_sent;
-
-/* ── the pairing rule ────────────────────────────────────────────────────────
- * A KeyRelease goes to the window that received the KeyPress, or it goes
- * nowhere.  The focus can move between the two edges of a keystroke — a click,
- * a SetInputFocus, a window unmapping — and re-deciding the target at release
- * time would leave one client holding a key forever and hand another a release
- * for a key it never saw.  So the press records its target, the release reads
- * it back, and a release with no recorded press is dropped.
- *
- * Indexed by Linux keycode; the client index is stored +1 so 0 means "no press
- * was delivered for this key". */
-static struct { unsigned char ci1; uint32_t xid; } key_down[KEYMAP_MAX + 128];
-
-/* One key from the desktop (or from the test channel): a Linux keycode, 1 for
- * press / 0 for release, and the WM_MOD_* mask, which is already the X mask. */
-static void on_x_key(gui_window_t *g, int code, int value, int mods) {
-    (void)g;
-    /* Keep the result inside the keycode range the setup reply advertises
-     * (min 8, max 255); anything else is not a key this server can name. */
-    if (code <= 0 || code + X_KEYCODE_BASE > 255) return;
-    xclient_t *c = NULL;
-    xres_t *w = NULL;
-
-    if (value) {
-        w = key_target(&c);
-        if (!c || !w) return;
-        key_down[code].ci1 = (unsigned char)(client_index(c) + 1);
-        key_down[code].xid = w->xid;
-    } else {
-        int ci = (int)key_down[code].ci1 - 1;
-        uint32_t xid = key_down[code].xid;
-        key_down[code].ci1 = 0;
-        key_down[code].xid = 0;
-        if (ci < 0 || ci >= MAX_XCLIENTS || !clients[ci].used) return;
-        c = &clients[ci];
-        w = res_find(c, xid);
-        if (!w || w->kind != R_WINDOW) return;
-    }
-    send_key(c, w, value ? 2 : 3, code + X_KEYCODE_BASE, mods);
-    key_events_sent++;
-    if (key_events_sent <= 256)
-        xt("XT key code=%d(x%d) %s state=0x%x -> win=0x%x\n", code,
-           code + X_KEYCODE_BASE, value ? "press" : "release", mods,
-           (unsigned)w->xid);
-}
-
-/* ── test input channel (-K, headless only) ─────────────────────────────────
- * Real keys and clicks arrive over the desktop's window-manager event channel,
- * which only exists when maeroX runs inside the desktop.  A headless server has
- * no desktop, so with -K it also reads injections from a FIFO — the XTEST
- * extension's job, done with a few bytes of shell-visible protocol:
- *     printf 'k <linux-keycode> <1 press|0 release> <modmask>\n' > /tmp/.maerox-keys
- *     printf 'c <x> <y>\n'                                      > /tmp/.maerox-keys
- * Injections go through on_x_key() and on_x_click(), so a test exercises the
- * same keycode conversion, hit-test, focus policy and event encoding a real
- * key or a real click does.
- *
- * IT MUST NOT EXIST OUTSIDE THE TESTS.  Anything that can open this FIFO can
- * synthesise a KeyPress straight onto the focused client — the browser —
- * without passing the desktop's focus tracking, the keys the desktop keeps for
- * itself, or the press/release pairing rule.  So it takes an explicit flag AND
- * refuses to open in a windowed server: the desktop build has no such channel
- * at all, and a session cannot acquire one by accident.  keyfifo_open() is the
- * only place the decision is made; everything downstream keys off keyfifo_fd,
- * which stays -1 when the channel was refused. */
-#define KEYFIFO_PATH "/tmp/.maerox-keys"
-static int  test_keys;                 /* -K: the injection channel was asked for */
-static int  keyfifo_fd = -1;
-static char keyfifo_line[64];
-static int  keyfifo_used;
-
-static void keyfifo_open(void) {
-    if (!test_keys) return;
-    if (!headless) {                   /* a windowed server has a real keyboard */
-        printf("maerox: -K refused: the key-injection channel is headless-only\n");
-        return;
-    }
-    unlink(KEYFIFO_PATH);
-    if (mkfifo(KEYFIFO_PATH, 0600) != 0) return;
-    /* This kernel's mknod(2) keeps only the type bits and drops the permission
-     * bits (do_mknod in proc/syscall.c), and vfs_access_check() reads a FIFO
-     * with no mode as 0666 — so the mode above is advisory and the chmod is
-     * what actually makes the node owner-only.  Not fatal if it fails: the
-     * headless+flag gate is what keeps this out of a real session. */
-    if (chmod(KEYFIFO_PATH, 0600) != 0)
-        printf("maerox: warning: could not restrict " KEYFIFO_PATH " to 0600\n");
-    keyfifo_fd = open(KEYFIFO_PATH, O_RDONLY | O_NONBLOCK);
-}
-
-static void on_x_click(gui_window_t *g, int x, int y);   /* fwd: click injection */
-
-static void keyfifo_poll(void) {
-    char ch;
-    if (keyfifo_fd < 0) return;        /* not opened = channel refused or off */
-    while (read(keyfifo_fd, &ch, 1) == 1) {
-        if (ch == '\r') continue;
-        if (ch != '\n') {
-            if (keyfifo_used + 1 < (int)sizeof(keyfifo_line))
-                keyfifo_line[keyfifo_used++] = ch;
-            continue;
-        }
-        keyfifo_line[keyfifo_used] = '\0';
-        keyfifo_used = 0;
-        int code = 0, value = 0, mods = 0;
-        if (keyfifo_line[0] == 'k' &&
-            sscanf(keyfifo_line + 1, "%d %d %d", &code, &value, &mods) == 3)
-            on_x_key(NULL, code, value, mods);
-        else if (keyfifo_line[0] == 'c' &&
-                 sscanf(keyfifo_line + 1, "%d %d", &code, &value) == 2)
-            on_x_click(NULL, code, value);
-    }
-}
-
-/* ── clipping ────────────────────────────────────────────────────────────────
- * Widths and heights are 16-bit client values, so a drawing loop that walks the
- * whole requested rectangle and skips pixels outside the drawable costs up to
- * 65535^2 iterations for a single rectangle.  Every loop clips first and then
- * walks only the intersection.
- *
- * clip_span() clips one axis of a copy: the run of *n pixels starting at *d in
- * a destination of size dl and — unless s is NULL — at *s in a source of size
- * sl.  It advances both starts by the same amount, shrinks *n, stores how many
- * leading pixels were cut in *skip (if non-NULL), and returns 0 when nothing
- * is left. */
-static int clip_span(int *d, int *s, int *n, int dl, int sl, int *skip) {
-    long lo = 0, hi = *n;
-    if (*d < 0 && -(long)*d > lo) lo = -(long)*d;
-    if ((long)dl - *d < hi) hi = (long)dl - *d;
-    if (s) {
-        if (*s < 0 && -(long)*s > lo) lo = -(long)*s;
-        if ((long)sl - *s < hi) hi = (long)sl - *s;
-    }
-    if (hi <= lo) return 0;
-    *d += (int)lo;
-    if (s) *s += (int)lo;
-    *n = (int)(hi - lo);
-    if (skip) *skip = (int)lo;
-    return 1;
-}
-
-/* ── damage ──────────────────────────────────────────────────────────────────
- * What the next render() must put back on screen, in surface coordinates.
- * `dirty` means everything (a window mapped, moved, restacked or destroyed, a
- * client came or went, the desktop sent an event); otherwise the bounding box
- * below collects what drawing requests touched in mapped windows.  Drawing
- * into a pixmap damages nothing: it reaches the screen only through a later
- * CopyArea/Composite into a window, which damages its destination.  This is
- * the X Damage extension's model (accumulate, then report a region), with the
- * report being the rectangle handed to wm_commit_rect(). */
-static int pd_x0, pd_y0, pd_x1, pd_y1;   /* empty when pd_x0 >= pd_x1 */
-
+/* ── damage ──────────────────────────────────────────────────────────────── */
 static void damage_surface(int x, int y, int w, int h) {
     if (w <= 0 || h <= 0) return;
-    if (pd_x0 >= pd_x1) {
-        pd_x0 = x; pd_y0 = y; pd_x1 = x + w; pd_y1 = y + h;
-        return;
-    }
+    if (pd_x0 >= pd_x1) { pd_x0 = x; pd_y0 = y; pd_x1 = x + w; pd_y1 = y + h; return; }
     if (x < pd_x0) pd_x0 = x;
     if (y < pd_y0) pd_y0 = y;
     if (x + w > pd_x1) pd_x1 = x + w;
     if (y + h > pd_y1) pd_y1 = y + h;
 }
 
-/* Drawn: the (already clipped) rectangle x,y,w,h of drawable d. */
-static void damage_drawable(xres_t *d, int x, int y, int w, int h) {
-    if (d && d->kind == R_WINDOW && d->mapped)
-        damage_surface(d->x + x, d->y + y, w, h);
+void damage_all(void) { dirty = 1; }
+
+void damage_window(window_t *w, int x, int y, int ww, int hh) {
+    if (dirty || !window_viewable(w)) return;
+    int ax, ay;
+    window_abs(w, &ax, &ay);
+    damage_surface(ax + x, ay + y, ww, hh);
 }
 
-/* The first drawing into a window makes all of it composited (see `painted`),
- * not just the part drawn. */
-static void mark_painted(xres_t *d) {
-    if (!d->painted) {
-        d->painted = 1;
-        damage_drawable(d, 0, 0, d->w, d->h);
+/* ── window manager ──────────────────────────────────────────────────────── */
+#define TITLE_H 22
+#define FRAME_B 1
+static int cascade_n;
+
+static int wm_framed(window_t *w) {
+    return !kiosk && w->parent == root && !w->override_redirect && w->cls != 2 && w->wm_placed;
+}
+
+static void wm_frame_rect(window_t *w, int *x, int *y, int *fw, int *fh) {
+    *x = w->x - FRAME_B;
+    *y = w->y - TITLE_H - FRAME_B;
+    *fw = w->d.w + 2 * w->bw + 2 * FRAME_B;
+    *fh = w->d.h + 2 * w->bw + TITLE_H + 2 * FRAME_B;
+}
+
+static uint32_t A(const char *n) { return atom_intern(n, (int)strlen(n), 0); }
+
+/* The first toplevel window of client c other than w, for dialogs without
+ * WM_TRANSIENT_FOR. */
+static window_t *transient_parent(window_t *w) {
+    prop_t *p = prop_find(w, 68 /* WM_TRANSIENT_FOR */);
+    if (p && p->format == 32 && p->n >= 1) {
+        window_t *t = lookup_window(r32(p->data));
+        if (t) return window_toplevel(t);
     }
-}
-
-/* Fill n pixels with one value: `rep stosl`, a dword per step. */
-static inline void fill32(uint32_t *p, uint32_t v, int n) {
-    if (n <= 0) return;
-    __asm__ volatile("rep stosl" : "+D"(p), "+c"(n) : "a"(v) : "memory");
-}
-
-/* ── drawing into a drawable's backing buffer ────────────────────────────── */
-static void fill_rect(xres_t *d, int x, int y, int w, int h, uint32_t color) {
-    if (!d || !d->px) return;
-    mark_painted(d);
-    if (!clip_span(&x, NULL, &w, d->w, 0, NULL) ||
-        !clip_span(&y, NULL, &h, d->h, 0, NULL)) return;
-    for (int yy = y; yy < y + h; yy++)
-        fill32(d->px + (size_t)yy * d->w + x, color, w);
-    damage_drawable(d, x, y, w, h);
-}
-
-/* ── XRender ─────────────────────────────────────────────────────────────────
- * Modern GTK3/cairo render EVERYTHING through XRender: a window's cairo surface
- * is an XRender Picture, and drawing is RenderComposite / RenderFillRectangles /
- * glyph compositing.  Without it cairo can't create a renderable surface and the
- * window never paints.  We implement the subset cairo actually issues. */
-
-/* Premultiplied "Over": dst = src + dst*(1-alpha).  src is ARGB premultiplied. */
-static uint32_t blend_over(uint32_t s, uint32_t d) {
-    uint32_t a = (s >> 24) & 0xff;
-    if (a == 0xff) return s & 0x00FFFFFF;
-    if (a == 0)    return d & 0x00FFFFFF;
-    uint32_t ia = 255 - a;
-    uint32_t sr = (s >> 16) & 0xff, sg = (s >> 8) & 0xff, sb = s & 0xff;
-    uint32_t dr = (d >> 16) & 0xff, dg = (d >> 8) & 0xff, db = d & 0xff;
-    uint32_t rr = sr + dr * ia / 255; if (rr > 255) rr = 255;
-    uint32_t rg = sg + dg * ia / 255; if (rg > 255) rg = 255;
-    uint32_t rb = sb + db * ia / 255; if (rb > 255) rb = 255;
-    return (rr << 16) | (rg << 8) | rb;
-}
-
-/* Append a PICTFORMINFO (28 bytes) to a buffer for QueryPictFormats. */
-static int put_pictform(uint8_t *b, uint32_t id, int depth,
-                        int rs, int rm, int gs, int gm,
-                        int bs, int bm, int as, int am) {
-    memset(b, 0, 28);
-    put32(b + 0, id); b[4] = 1 /*Direct*/; b[5] = (uint8_t)depth;
-    put16(b + 8, rs);  put16(b + 10, rm);
-    put16(b + 12, gs); put16(b + 14, gm);
-    put16(b + 16, bs); put16(b + 18, bm);
-    put16(b + 20, as); put16(b + 22, am);
-    return 28;
-}
-
-/* ── XRender glyph storage (text) ───────────────────────────────────────── */
-static glyphset_t *gset_of(xres_t *r) {
-    if (!r || r->kind != R_GLYPHSET) return NULL;
-    if (!r->gset) r->gset = calloc(1, sizeof(glyphset_t));
-    return (glyphset_t *)r->gset;
-}
-static xglyph_t *glyph_find(glyphset_t *gs, uint32_t id) {
-    if (!gs) return NULL;
-    for (int i = 0; i < gs->n; i++) if (gs->g[i].id == id) return &gs->g[i];
     return NULL;
 }
-/* Blit one A8 glyph (coverage) in colour `col` onto drawable dd at pen (px,py). */
-static void glyph_blit(xres_t *dd, xglyph_t *g, int px, int py, uint32_t col) {
-    if (!g || !g->bits || !dd || !dd->px) return;
-    mark_painted(dd);
-    int ox = px - g->x, oy = py - g->y;
-    int gx = 0, gy = 0, w = g->w, h = g->h;
-    if (!clip_span(&ox, &gx, &w, dd->w, g->w, NULL) ||
-        !clip_span(&oy, &gy, &h, dd->h, g->h, NULL)) return;
-    damage_drawable(dd, ox, oy, w, h);
-    uint32_t cr = (col >> 16) & 0xff, cg = (col >> 8) & 0xff, cb = col & 0xff;
-    for (int yy = 0; yy < h; yy++) {
-        int ty = oy + yy;
-        for (int xx = 0; xx < w; xx++) {
-            int tx = ox + xx;
-            int cov = g->bits[(gy + yy) * g->w + gx + xx];
-            if (!cov) continue;
-            /* premultiplied src for blend_over */
-            uint32_t s = ((uint32_t)cov << 24) | ((cr * cov / 255) << 16) |
-                         ((cg * cov / 255) << 8) | (cb * cov / 255);
-            uint32_t *dp = &dd->px[(size_t)ty * dd->w + tx];
-            *dp = blend_over(s, *dp);
-        }
+
+void wm_map_toplevel(client_t *c, window_t *w) {
+    (void)c;
+    if (w->wm_placed) {
+        raise_window(w);
+        pending_focus = w->d.o.id;
+        return;
     }
+    w->wm_placed = 1;
+    int x = w->x, y = w->y, ww = w->d.w, hh = w->d.h;
+    if (kiosk) {
+        if (ww >= 400) { x = 0; y = 0; ww = scr_w; hh = scr_h; w->wm_max = 1; }
+    } else {
+        int avail_w = scr_w - 2 * FRAME_B, avail_h = scr_h - TITLE_H - 2 * FRAME_B;
+        if (ww > avail_w) ww = avail_w;
+        if (hh > avail_h) hh = avail_h;
+        /* WM_NORMAL_HINTS with USPosition/PPosition: honour the position. */
+        prop_t *nh = prop_find(w, 40 /* WM_NORMAL_HINTS */);
+        int has_pos = nh && nh->format == 32 && nh->n >= 1 && (r32(nh->data) & 3) && (x || y);
+        window_t *tp = transient_parent(w);
+        if (tp && tp != w) {
+            x = tp->x + (tp->d.w - ww) / 2;
+            y = tp->y + (tp->d.h - hh) / 2;
+        } else if (!has_pos) {
+            x = 24 + 28 * (cascade_n % 8);
+            y = TITLE_H + 16 + 28 * (cascade_n % 8);
+            cascade_n++;
+        }
+        if (x + ww + FRAME_B > scr_w) x = scr_w - ww - FRAME_B;
+        if (y + hh + FRAME_B > scr_h) y = scr_h - hh - FRAME_B;
+        if (x < FRAME_B) x = FRAME_B;
+        if (y < TITLE_H + FRAME_B) y = TITLE_H + FRAME_B;
+    }
+    if (x != w->x || y != w->y || ww != w->d.w || hh != w->d.h)
+        configure_window(w, x, y, ww, hh, w->bw, 1);
+    raise_window(w);
+    pending_focus = w->d.o.id;
+    damage_all();
 }
 
-/* Fixed-part size in bytes of each RENDER request maeroX reads fields from;
- * anything shorter is BadLength instead of being parsed out of the bytes that
- * follow it in the input buffer. */
-static int render_min_len(int minor) {
-    switch (minor) {
-    case 0:  return 12;   /* QueryVersion */
-    case 2:  return 8;    /* QueryPictIndexValues */
-    case 4:  return 20;   /* CreatePicture */
-    case 5:  return 12;   /* ChangePicture */
-    case 6:  return 12;   /* SetPictureClipRectangles */
-    case 7:  return 8;    /* FreePicture */
-    case 8:  return 36;   /* Composite */
-    case 10: case 11: return 24;   /* Trapezoids / Triangles */
-    case 17: return 12;   /* CreateGlyphSet */
-    case 18: return 12;   /* ReferenceGlyphSet */
-    case 19: return 8;    /* FreeGlyphSet */
-    case 20: return 12;   /* AddGlyphs */
-    case 22: return 8;    /* FreeGlyphs */
-    case 23: case 24: case 25: return 28;   /* CompositeGlyphs8/16/32 */
-    case 26: return 20;   /* FillRectangles */
-    case 33: return 16;   /* CreateSolidFill */
-    default: return 4;
-    }
+void wm_window_gone(window_t *w);
+static uint32_t drag_win;
+static int drag_dx, drag_dy;
+
+void wm_window_gone(window_t *w) {
+    if (drag_win == w->d.o.id) drag_win = 0;
+    if (pending_focus == w->d.o.id) pending_focus = 0;
+    damage_all();
 }
 
-/* Remove glyph `id` from a set (FreeGlyphs); order in the set is irrelevant. */
-static void glyph_remove(glyphset_t *gs, uint32_t id) {
-    for (int i = 0; i < gs->n; i++)
-        if (gs->g[i].id == id) {
-            free(gs->g[i].bits);
-            gs->g[i] = gs->g[--gs->n];
-            return;
-        }
+void wm_restacked(void) { damage_all(); }
+
+void wm_property_changed(window_t *w, uint32_t atom) {
+    if (w->parent == root && (atom == 39 /* WM_NAME */ || atom == A("_NET_WM_NAME")))
+        damage_all();
 }
 
-static void dispatch_render(xclient_t *c, const uint8_t *q, int qlen) {
-    int minor = q[1];
-    c->cur_minor = (uint8_t)minor;
-    if (qlen < render_min_len(minor)) { x_error(c, BadLength, 0); return; }
-    switch (minor) {
-    case 0: {        /* QueryVersion */
-        uint8_t data[24]; memset(data, 0, sizeof(data));
-        put32(data + 0, 0);   /* major */
-        put32(data + 4, 11);  /* minor */
-        send_reply(c, 0, data);
-        break;
-    }
-    case 1: {        /* QueryPictFormats — cairo maps visuals→formats from this */
-        uint8_t extra[256]; int n = 0;
-        n += put_pictform(extra + n, PICTFMT_RGB24, 24, 16,0xff, 8,0xff, 0,0xff, 0,0x00);
-        n += put_pictform(extra + n, PICTFMT_ARGB32,32, 16,0xff, 8,0xff, 0,0xff, 24,0xff);
-        n += put_pictform(extra + n, PICTFMT_A8,     8,  0,0,    0,0,    0,0,    0,0xff);
-        n += put_pictform(extra + n, PICTFMT_A1,     1,  0,0,    0,0,    0,0,    0,0x01);
-        /* one screen */
-        put32(extra + n, 1); n += 4;               /* numDepths in this screen */
-        put32(extra + n, PICTFMT_RGB24); n += 4;   /* fallback format */
-        extra[n] = 24; extra[n+1] = 0; put16(extra + n + 2, 1);    /* PICTDEPTH d=24 */
-        put32(extra + n + 4, 0); n += 8;
-        put32(extra + n, ROOT_VISUAL);   n += 4;   /* PICTVISUAL: visual→format */
-        put32(extra + n, PICTFMT_RGB24); n += 4;
-        put32(extra + n, 0); n += 4;               /* 1 subpixel order = Unknown */
-        uint8_t data[24]; memset(data, 0, sizeof(data));
-        put32(data + 0, 4);   /* numFormats */
-        put32(data + 4, 1);   /* numScreens */
-        put32(data + 8, 1);   /* numDepths  */
-        put32(data + 12, 1);  /* numVisuals */
-        put32(data + 16, 1);  /* numSubpixels */
-        send_reply_var(c, 0, data, extra, n);
-        break;
-    }
-    case 4: {        /* CreatePicture(pid, drawable, format, mask, values...) */
-        xres_t *p = res_new(c, r32(q + 4), R_PICTURE);
-        if (p) { p->pic_drawable = r32(q + 8); p->pic_format = r32(q + 12);
-                 p->pic_solid = 0; }
-        break;
-    }
-    case 5: break;   /* ChangePicture — accept (we ignore most attributes) */
-    case 6: break;   /* SetPictureClipRectangles — accept (no clip tracking) */
-    case 7: {        /* FreePicture */
-        xres_t *p = res_find(c, r32(q + 4));
-        if (p && p->kind == R_PICTURE) res_free(p);
-        break;
-    }
-    case 8: {        /* Composite(op, src, mask, dst, sx,sy, mx,my, dx,dy, w,h) */
-        int op = q[4];
-        xres_t *srcp = res_find(c, r32(q + 8));
-        xres_t *dstp = res_find(c, r32(q + 16));
-        int sx = rs16(q + 20), sy = rs16(q + 22);
-        int dx = rs16(q + 28), dy = rs16(q + 30);
-        int w  = (int)r16(q + 32), h = (int)r16(q + 34);
-        if (!dstp || dstp->kind != R_PICTURE) break;
-        xres_t *dd = res_find(c, dstp->pic_drawable);
-        if (!dd || !dd->px) break;
-        mark_painted(dd);
-        int    solid = (srcp && srcp->kind == R_PICTURE && srcp->pic_solid);
-        uint32_t sc  = solid ? srcp->fg : 0;
-        xres_t *sd   = (!solid && srcp && srcp->kind == R_PICTURE)
-                     ? res_find(c, srcp->pic_drawable) : NULL;
-        int has_alpha = solid || (srcp && srcp->pic_format == PICTFMT_ARGB32);
-        int have_src = solid || (sd && sd->px);
-        /* Clip to the destination and, for a drawable source, to the source:
-         * pixels outside either are left alone. */
-        if (have_src &&
-            clip_span(&dx, solid ? NULL : &sx, &w, dd->w, solid ? 0 : sd->w, NULL) &&
-            clip_span(&dy, solid ? NULL : &sy, &h, dd->h, solid ? 0 : sd->h, NULL)) {
-            damage_drawable(dd, dx, dy, w, h);
-            for (int yy = 0; yy < h; yy++) {
-                uint32_t *drow = dd->px + (size_t)(dy + yy) * dd->w + dx;
-                const uint32_t *srow = solid ? NULL
-                                     : sd->px + (size_t)(sy + yy) * sd->w + sx;
-                for (int xx = 0; xx < w; xx++) {
-                    uint32_t sp = solid ? sc : srow[xx];
-                    uint32_t *dp = &drow[xx];
-                    if (op == 1 || !has_alpha) *dp = sp & 0x00FFFFFF;   /* Src */
-                    else                        *dp = blend_over(sp, *dp); /* Over */
-                }
-            }
-        }
-        render_n++;
-        if (render_n <= 8) xt("XT Composite op=%d dst-win=0x%x %dx%d @%d,%d\n",
-                              op, (unsigned)dstp->pic_drawable, w, h, dx, dy);
-        break;
-    }
-    case 26: {       /* FillRectangles(op, dst, color[4xCARD16], rects...) */
-        int op = q[4];
-        xres_t *dstp = res_find(c, r32(q + 8));
-        uint32_t cr = r16(q + 12) >> 8, cg = r16(q + 14) >> 8,
-                 cb = r16(q + 16) >> 8, ca = r16(q + 18) >> 8;
-        uint32_t color = (ca << 24) | (cr << 16) | (cg << 8) | cb;
-        if (!dstp || dstp->kind != R_PICTURE) break;
-        xres_t *dd = res_find(c, dstp->pic_drawable);
-        if (!dd || !dd->px) break;
-        mark_painted(dd);
-        int nr = (qlen - 20) / 8;
-        for (int i = 0; i < nr; i++) {
-            const uint8_t *rr = q + 20 + i * 8;
-            int x = rs16(rr), y = rs16(rr + 2);
-            int rw = (int)r16(rr + 4), rh = (int)r16(rr + 6);
-            if (!clip_span(&x, NULL, &rw, dd->w, 0, NULL) ||
-                !clip_span(&y, NULL, &rh, dd->h, 0, NULL)) continue;
-            if (op != 1 && ca == 0) continue;            /* Over, transparent */
-            damage_drawable(dd, x, y, rw, rh);
-            for (int yy = 0; yy < rh; yy++) {
-                uint32_t *dp = &dd->px[(size_t)(y + yy) * dd->w + x];
-                if (op == 1 || ca == 255) { fill32(dp, color & 0x00FFFFFF, rw); continue; }
-                for (int xx = 0; xx < rw; xx++) dp[xx] = blend_over(color, dp[xx]);
-            }
-        }
-        break;
-    }
-    case 33: {       /* CreateSolidFill(pid, color[4xCARD16]) */
-        xres_t *p = res_new(c, r32(q + 4), R_PICTURE);
-        if (p) {
-            uint32_t cr = r16(q + 8) >> 8, cg = r16(q + 10) >> 8,
-                     cb = r16(q + 12) >> 8, ca = r16(q + 14) >> 8;
-            p->pic_solid = 1; p->pic_format = PICTFMT_ARGB32;
-            p->fg = (ca << 24) | (cr << 16) | (cg << 8) | cb;
-        }
-        break;
-    }
-    case 17: {       /* CreateGlyphSet — track as a resource so FreeGlyphSet works */
-        xres_t *g = res_new(c, r32(q + 4), R_GLYPHSET); (void)g;
-        break;
-    }
-    case 18: break;  /* ReferenceGlyphSet — accept (glyphsets are not shared) */
-    case 19: {       /* FreeGlyphSet */
-        xres_t *g = res_find(c, r32(q + 4));
-        if (g && g->kind == R_GLYPHSET) res_free(g);
-        break;
-    }
-    case 20: {       /* AddGlyphs(glyphset, nglyphs, ids[], infos[], A8 images) */
-        xres_t *gr = res_find(c, r32(q + 4));
-        glyphset_t *gs = gset_of(gr);
-        if (!gs) break;
-        uint32_t ng = r32(q + 8);
-        if (ng > 8192) { x_error(c, BadLength, 0); break; }
-        if (12 + (size_t)ng * 16 > (size_t)qlen) { x_error(c, BadLength, 0); break; }
-        const uint8_t *ids   = q + 12;
-        const uint8_t *infos = ids + (size_t)ng * 4;
-        const uint8_t *img   = infos + (size_t)ng * 12;
-        size_t imgoff = 0;
-        for (uint32_t i = 0; i < ng; i++) {
-            const uint8_t *gi = infos + (size_t)i * 12;
-            int gw = (int)r16(gi),     gh = (int)r16(gi + 2);
-            int gx = rs16(gi + 4),     gy = rs16(gi + 6);
-            int xo = rs16(gi + 8),     yo = rs16(gi + 10);
-            if (gw < 0 || gh < 0 || gw > 1024 || gh > 1024) break;
-            int stride = (gw + 3) & ~3;                 /* A8 scanline pad 4 */
-            if ((size_t)((img - q) + imgoff + (size_t)stride * gh) > (size_t)qlen) break;
-            uint8_t *bits = (uint8_t *)malloc((size_t)(gw ? gw : 1) * (gh ? gh : 1));
-            if (bits)
-                for (int yy = 0; yy < gh; yy++)
-                    for (int xx = 0; xx < gw; xx++)
-                        bits[yy * gw + xx] = img[imgoff + (size_t)yy * stride + xx];
-            imgoff += (size_t)stride * gh;
-            if (!bits) continue;
-            /* An id already in the set is replaced: cairo frees glyph ids and
-             * reuses them, and appending left glyph_find() returning the stale
-             * (older) bitmap. */
-            uint32_t gid = r32(ids + (size_t)i * 4);
-            xglyph_t *gg = glyph_find(gs, gid);
-            if (gg) {
-                free(gg->bits);
-            } else {
-                if (gs->n >= gs->cap) {
-                    int ncap = gs->cap ? gs->cap * 2 : 128;
-                    xglyph_t *ng2 = (xglyph_t *)realloc(gs->g,
-                                        (size_t)ncap * sizeof(xglyph_t));
-                    if (!ng2) { free(bits); continue; }
-                    gs->g = ng2;
-                    gs->cap = ncap;
-                }
-                gg = &gs->g[gs->n++];
-            }
-            gg->id = gid;
-            gg->w = gw; gg->h = gh; gg->x = gx; gg->y = gy;
-            gg->xoff = xo; gg->yoff = yo; gg->bits = bits;
-        }
-        break;
-    }
-    case 21: break;  /* AddGlyphsFromPicture — accept */
-    case 22: {       /* FreeGlyphs(glyphset, glyph ids...) */
-        glyphset_t *gs = gset_of(res_find(c, r32(q + 4)));
-        if (!gs) break;
-        for (int off = 8; off + 4 <= qlen; off += 4) glyph_remove(gs, r32(q + off));
-        break;
-    }
-    case 23: case 24: case 25: {   /* CompositeGlyphs 8/16/32 — render text */
-        int idsz = (minor == 23) ? 1 : (minor == 24) ? 2 : 4;
-        xres_t *srcp = res_find(c, r32(q + 8));
-        xres_t *dstp = res_find(c, r32(q + 12));
-        xres_t *gr   = res_find(c, r32(q + 20));
-        glyphset_t *gs = gset_of(gr);
-        if (!dstp || dstp->kind != R_PICTURE) break;
-        xres_t *dd = res_find(c, dstp->pic_drawable);
-        if (!dd || !dd->px) break;
-        mark_painted(dd);
-        uint32_t col = (srcp && srcp->kind == R_PICTURE && srcp->pic_solid)
-                     ? srcp->fg : 0xFF000000;          /* default opaque black */
-        int penx = 0, peny = 0, off = 28;              /* glyph-element list */
-        int drew = 0;
-        while (off + 8 <= qlen) {
-            int count = q[off];
-            if (count == 255) {                        /* glyphset switch */
-                gr = res_find(c, r32(q + off + 4)); gs = gset_of(gr);
-                off += 8; continue;
-            }
-            penx += rs16(q + off + 4);                 /* deltax (1st elt = origin) */
-            peny += rs16(q + off + 6);
-            off += 8;
-            for (int i = 0; i < count; i++) {
-                if (off + idsz > qlen) break;
-                uint32_t gid = idsz == 1 ? q[off] :
-                               idsz == 2 ? r16(q + off) : r32(q + off);
-                off += idsz;
-                xglyph_t *g = glyph_find(gs, gid);
-                if (g) { glyph_blit(dd, g, penx, peny, col); penx += g->xoff; peny += g->yoff; drew++; }
-            }
-            off = (off + 3) & ~3;                       /* pad to 4 */
-        }
-        (void)drew;                    /* glyph_blit() damaged what it drew */
-        render_n++;
-        if (render_n <= 8) xt("XT CompositeGlyphs dst-win=0x%x drew=%d\n",
-                              (unsigned)dstp->pic_drawable, drew);
-        break;
-    }
-    case 10: case 11: break;   /* Trapezoids/Triangles — accept (no AA shapes yet) */
-    default:
-        /* QueryPictIndexValues(2) and a few others expect replies; give empty. */
-        if (minor == 2) { uint8_t d[24]; memset(d,0,sizeof(d)); send_reply(c,0,d); }
-        break;
-    }
+static void wm_activate(window_t *w) {
+    if (!w || !w->mapped) return;
+    raise_window(w);
+    if (window_has_protocol(w, "WM_TAKE_FOCUS"))
+        send_client_message(w, A("WM_PROTOCOLS"), A("WM_TAKE_FOCUS"), x_time());
+    set_focus(w, 2);
 }
 
-/* ── per-request dispatch ────────────────────────────────────────────────── */
-/* Fixed-part size in bytes of each core request maeroX reads fields from.  A
- * shorter request is answered with BadLength instead of having its missing
- * fields read out of the next request (or stale bytes) in the input buffer. */
-static int core_min_len(int op) {
-    switch (op) {
-    case 1:  return 32;   /* CreateWindow */
-    case 2:  return 12;   /* ChangeWindowAttributes */
-    case 3:  return 8;    /* GetWindowAttributes */
-    case 8:  return 8;    /* MapWindow */
-    case 10: return 8;    /* UnmapWindow */
-    case 12: return 12;   /* ConfigureWindow */
-    case 14: return 8;    /* GetGeometry */
-    case 15: return 8;    /* QueryTree */
-    case 16: return 8;    /* InternAtom */
-    case 17: return 8;    /* GetAtomName */
-    case 18: return 24;   /* ChangeProperty */
-    case 19: return 12;   /* DeleteProperty */
-    case 20: return 24;   /* GetProperty */
-    case 23: return 8;    /* GetSelectionOwner */
-    case 38: return 8;    /* QueryPointer */
-    case 42: return 12;   /* SetInputFocus */
-    case 53: return 16;   /* CreatePixmap */
-    case 54: return 8;    /* FreePixmap */
-    case 55: return 16;   /* CreateGC */
-    case 56: return 12;   /* ChangeGC */
-    case 60: return 8;    /* FreeGC */
-    case 61: return 16;   /* ClearArea */
-    case 62: return 28;   /* CopyArea */
-    case 67: return 12;   /* PolyRectangle */
-    case 70: return 12;   /* PolyFillRectangle */
-    case 72: return 24;   /* PutImage */
-    case 73: return 20;   /* GetImage */
-    case 78: return 16;   /* CreateColormap */
-    case 98: return 8;    /* QueryExtension */
-    case 101: return 8;   /* GetKeyboardMapping */
-    case RENDER_MAJOR: return 4;   /* minor checked in dispatch_render */
-    default: return 4;
-    }
+static void wm_close_window(window_t *w) {
+    if (window_has_protocol(w, "WM_DELETE_WINDOW"))
+        send_client_message(w, A("WM_PROTOCOLS"), A("WM_DELETE_WINDOW"), x_time());
+    else if (w->d.o.owner >= 0)
+        kill_client_windows(w->d.o.owner);
 }
 
-/* Count the set bits of a value-list mask: the number of CARD32 values that
- * follow a CreateGC/ChangeGC/ConfigureWindow header. */
-static int mask_bits(uint32_t m) {
+static void wm_maximize(window_t *w, int on) {
+    if (on && !w->wm_max) {
+        w->wm_max = 1;
+        configure_window(w, FRAME_B, TITLE_H + FRAME_B, scr_w - 2 * FRAME_B,
+                         scr_h - TITLE_H - 2 * FRAME_B, w->bw, 1);
+    } else if (!on && w->wm_max) {
+        w->wm_max = 0;
+        configure_window(w, 60, TITLE_H + 40, scr_w * 2 / 3, scr_h * 2 / 3, w->bw, 1);
+    }
+    damage_all();
+}
+
+/* EWMH/ICCCM messages a client sends the window manager through the root. */
+int wm_client_message_to_root(client_t *c, const uint8_t *ev) {
+    (void)c;
+    window_t *w = lookup_window(r32(ev + 4));
+    uint32_t type = r32(ev + 8);
+    if (!w) return 0;
+    if (type == A("_NET_ACTIVE_WINDOW")) {
+        wm_activate(window_toplevel(w));
+    } else if (type == A("_NET_CLOSE_WINDOW")) {
+        wm_close_window(w);
+    } else if (type == A("_NET_WM_STATE")) {
+        uint32_t action = r32(ev + 12), a1 = r32(ev + 16), a2 = r32(ev + 20);
+        uint32_t mh = A("_NET_WM_STATE_MAXIMIZED_HORZ"), mv = A("_NET_WM_STATE_MAXIMIZED_VERT");
+        uint32_t fs = A("_NET_WM_STATE_FULLSCREEN");
+        if (a1 == mh || a1 == mv || a2 == mh || a2 == mv || a1 == fs)
+            wm_maximize(w, action == 2 ? !w->wm_max : action == 1);
+    } else if (type == A("WM_CHANGE_STATE")) {
+        /* IconicState: no icons here; leave the window as it is. */
+    }
+    return 1;
+}
+
+static void title_of(window_t *w, char *out, int cap) {
+    prop_t *p = prop_find(w, A("_NET_WM_NAME"));
+    if (!p || p->format != 8 || !p->n) p = prop_find(w, 39);
+    out[0] = 0;
+    if (!p || p->format != 8) return;
+    int n = (int)p->n < cap - 1 ? (int)p->n : cap - 1;
+    memcpy(out, p->data, (size_t)n);
+    out[n] = 0;
+}
+
+/* Is (x, y) on the frame of a framed toplevel?  Returns it, *part 1 title,
+ * 2 close button. */
+static window_t *wm_frame_hit(int x, int y, int *part) {
+    for (window_t *t = root->top; t; t = t->below) {
+        if (!t->mapped) continue;
+        int fx, fy, fw, fh;
+        if (wm_framed(t)) {
+            wm_frame_rect(t, &fx, &fy, &fw, &fh);
+            if (x >= fx && y >= fy && x < fx + fw && y < fy + TITLE_H + FRAME_B) {
+                *part = (x >= fx + fw - TITLE_H) ? 2 : 1;
+                return t;
+            }
+        }
+        if (x >= t->x && y >= t->y && x < t->x + t->d.w + 2 * t->bw &&
+            y < t->y + t->d.h + 2 * t->bw)
+            return NULL;                     /* inside a window above */
+    }
+    return NULL;
+}
+
+/* ── compositing ─────────────────────────────────────────────────────────── */
+static void blit_rect(draw_surface_t *s, const uint32_t *src, int sw, int sh,
+                      int ax, int ay, int cx0, int cy0, int cx1, int cy1) {
+    int x0 = imax(ax, cx0), y0 = imax(ay, cy0), x1 = imin(ax + sw, cx1), y1 = imin(ay + sh, cy1);
+    for (int y = y0; y < y1; y++)
+        memcpy(s->px + (size_t)y * s->w + x0, src + (size_t)(y - ay) * sw + (x0 - ax),
+               (size_t)(x1 - x0) * 4);
+}
+
+static void fill_clip(draw_surface_t *s, int x, int y, int w, int h, uint32_t col,
+                      int cx0, int cy0, int cx1, int cy1) {
+    int x0 = imax(x, cx0), y0 = imax(y, cy0), x1 = imin(x + w, cx1), y1 = imin(y + h, cy1);
+    for (int yy = y0; yy < y1; yy++) fill32(s->px + (size_t)yy * s->w + x0, col, x1 - x0);
+}
+
+static void paint_frame(draw_surface_t *s, window_t *w, int cx0, int cy0, int cx1, int cy1) {
+    int fx, fy, fw, fh;
+    wm_frame_rect(w, &fx, &fy, &fw, &fh);
+    int focused = focus_window() && window_toplevel(focus_window()) == w;
+    uint32_t edge = focused ? draw_rgb(58, 121, 200) : draw_rgb(70, 74, 84);
+    uint32_t bar = focused ? draw_rgb(44, 62, 92) : draw_rgb(48, 52, 60);
+    fill_clip(s, fx, fy, fw, FRAME_B, edge, cx0, cy0, cx1, cy1);
+    fill_clip(s, fx, fy + fh - FRAME_B, fw, FRAME_B, edge, cx0, cy0, cx1, cy1);
+    fill_clip(s, fx, fy, FRAME_B, fh, edge, cx0, cy0, cx1, cy1);
+    fill_clip(s, fx + fw - FRAME_B, fy, FRAME_B, fh, edge, cx0, cy0, cx1, cy1);
+    fill_clip(s, fx + FRAME_B, fy + FRAME_B, fw - 2 * FRAME_B, TITLE_H, bar, cx0, cy0, cx1, cy1);
+    /* close box */
+    int bx = fx + fw - TITLE_H, by = fy + FRAME_B;
+    fill_clip(s, bx + 3, by + 3, TITLE_H - 6, TITLE_H - 6, draw_rgb(176, 64, 64), cx0, cy0, cx1, cy1);
+    if (fy + TITLE_H < cy0 || fy > cy1) return;
+    /* Title text: drawn into a strip, then clipped onto the surface. */
+    char title[128];
+    title_of(w, title, sizeof(title));
+    int tw = fw - TITLE_H - 12;
+    if (tw <= 0 || !title[0]) return;
+    uint32_t *strip = malloc((size_t)tw * TITLE_H * 4);
+    if (!strip) return;
+    draw_surface_t t = { strip, tw, TITLE_H };
+    draw_fill(&t, bar);
+    draw_text_aa(&t, 0, 4, title, draw_rgb(225, 230, 240), &draw_font_ui);
+    blit_rect(s, strip, tw, TITLE_H, fx + 8, fy + FRAME_B, cx0, cy0, cx1, cy1);
+    free(strip);
+}
+
+static void draw_window(draw_surface_t *s, window_t *w, int px, int py,
+                        int cx0, int cy0, int cx1, int cy1) {
+    if (!w->mapped) return;
+    int ox = px + w->x, oy = py + w->y;          /* outer corner */
+    int ax = ox + w->bw, ay = oy + w->bw;        /* inside */
+    if (w->parent == root && wm_framed(w)) paint_frame(s, w, cx0, cy0, cx1, cy1);
+    if (w->bw > 0 && w->cls != 2) {
+        int ow = w->d.w + 2 * w->bw, oh = w->d.h + 2 * w->bw;
+        uint32_t bc = w->border_pixel & 0xFFFFFF;
+        fill_clip(s, ox, oy, ow, w->bw, bc, cx0, cy0, cx1, cy1);
+        fill_clip(s, ox, oy + oh - w->bw, ow, w->bw, bc, cx0, cy0, cx1, cy1);
+        fill_clip(s, ox, oy, w->bw, oh, bc, cx0, cy0, cx1, cy1);
+        fill_clip(s, ox + ow - w->bw, oy, w->bw, oh, bc, cx0, cy0, cx1, cy1);
+    }
+    int ix0 = imax(ax, cx0), iy0 = imax(ay, cy0);
+    int ix1 = imin(ax + w->d.w, cx1), iy1 = imin(ay + w->d.h, cy1);
+    if (ix0 >= ix1 || iy0 >= iy1) return;
+    if (w->cls != 2 && w->d.px && (w->painted || w->bg_mode != BG_NONE))
+        blit_rect(s, w->d.px, w->d.w, w->d.h, ax, ay, ix0, iy0, ix1, iy1);
+    for (window_t *ch = w->bottom; ch; ch = ch->above)
+        draw_window(s, ch, ax, ay, ix0, iy0, ix1, iy1);
+}
+
+static void composite(draw_surface_t *s, int x0, int y0, int x1, int y1) {
+    if (x1 > s->w) x1 = s->w;
+    if (y1 > s->h) y1 = s->h;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x0 >= x1 || y0 >= y1) return;
+    blit_rect(s, root->d.px, root->d.w, root->d.h, 0, 0, x0, y0, x1, y1);
+    for (window_t *w = root->bottom; w; w = w->above) draw_window(s, w, 0, 0, x0, y0, x1, y1);
+}
+
+static int count_clients(void) {
     int n = 0;
-    for (; m; m &= m - 1) n++;
+    for (int i = 0; i < MAX_XCLIENTS; i++) if (clients[i].used) n++;
     return n;
 }
 
-static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
-    int op = q[0];
-    c->seq++;
-    c->cur_major = (uint8_t)op;
-    c->cur_minor = 0;
-    op_hist[op & 0xFF]++;
-    op_ring[op_ring_n++ & 31] = (uint8_t)op;
-    if (xdbg) printf("maerox: req op=%d seq=%d len=%d\n", op, c->seq, qlen);
-    if (qlen < core_min_len(op)) { x_error(c, BadLength, 0); return; }
+/* The root's background with a status line in its bottom-left corner. */
+static int status_clients = -1;
+static void paint_root_status(void) {
+    int n = count_clients();
+    if (n == status_clients) return;
+    status_clients = n;
+    fill_background(root, 0, root->d.h - 24, root->d.w, 24);
+    char line[96];
+    snprintf(line, sizeof(line), "maeroX  DISPLAY=:0  %d client%s", n, n == 1 ? "" : "s");
+    draw_surface_t t = { root->d.px, root->d.w, root->d.h };
+    draw_text_aa(&t, 10, root->d.h - 20, line, draw_rgb(120, 140, 170), &draw_font_ui);
+    damage_window(root, 0, root->d.h - 24, root->d.w, 24);
+}
 
-    switch (op) {
-    case RENDER_MAJOR:           /* XRender extension requests */
-        dispatch_render(c, q, qlen);
-        break;
-    case 1: {  /* CreateWindow */
-        uint32_t wid = r32(q + 4);
-        xres_t *w = res_new(c, wid, R_WINDOW);
-        if (!w) return;
-        w->create_seq = ++res_seq;
-        w->parent = r32(q + 8);
-        w->x = rs16(q + 12); w->y = rs16(q + 14);
-        w->w = (int)r16(q + 16); w->h = (int)r16(q + 18);
-        if (w->w < 1) w->w = 1;
-        if (w->h < 1) w->h = 1;
-        if (w->w > 4096) w->w = 4096;
-        if (w->h > 4096) w->h = 4096;
-        w->px = (uint32_t *)malloc((size_t)w->w * w->h * 4);
-        if (w->px) for (int i = 0; i < w->w * w->h; i++) w->px[i] = 0x00202830;
-        printf("maerox: CreateWindow xid=0x%x %dx%d @%d,%d\n",
-               (unsigned)wid, w->w, w->h, w->x, w->y);
-        break;
+static void render(void) {
+    draw_surface_t *s = &gui.surf;
+    if (!s->px) return;
+    paint_root_status();
+    int x0 = 0, y0 = 0, x1 = s->w, y1 = s->h;
+    if (!dirty) {
+        if (pd_x0 >= pd_x1) return;
+        x0 = pd_x0; y0 = pd_y0; x1 = pd_x1; y1 = pd_y1;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > s->w) x1 = s->w;
+        if (y1 > s->h) y1 = s->h;
     }
-    case 2: break;   /* ChangeWindowAttributes — accept */
-    case 18: {       /* ChangeProperty — log 8-bit string props (WM_NAME /
-                      * WM_CLASS / _NET_WM_NAME) so we can identify what window
-                      * a client is naming (e.g. which modal dialog opens). */
-        uint32_t wid  = r32(q + 4);
-        uint32_t prop = r32(q + 8);
-        uint8_t  fmt  = q[16];
-        uint32_t dlen = r32(q + 20);
-        if (fmt == 8 && dlen > 0 && dlen < 128 && 24 + dlen <= (uint32_t)qlen) {
-            char s[130];
-            memcpy(s, q + 24, dlen); s[dlen] = '\0';
-            for (uint32_t i = 0; i < dlen; i++) if (s[i] == '\0') s[i] = '|';
-            int anlen = 0;
-            const char *an = atom_name(prop, &anlen);
-            char nm[64];
-            if (anlen > 63) anlen = 63;
-            memcpy(nm, an, (size_t)anlen); nm[anlen] = '\0';
-            printf("maerox: ChangeProperty xid=0x%x atom=%u(%s) str='%s'\n",
-                   (unsigned)wid, (unsigned)prop, nm, s);
-        }
-        /* Every property change generates a PropertyNotify; GTK's
-         * gdk_x11_get_server_time() blocks in XIfEvent until it sees one. */
-        send_property_notify(c, wid, prop, 0);
-        break;
+    pd_x0 = pd_x1 = 0;
+    if (x0 < x1 && y0 < y1) {
+        composite(s, x0, y0, x1, y1);
+        if (dirty) wm_commit(&gui.wm, gui.slot);
+        else wm_commit_rect(&gui.wm, gui.slot, x0, y0, x1 - x0, y1 - y0);
     }
-    case 19: {       /* DeleteProperty */
-        send_property_notify(c, r32(q + 4), r32(q + 8), 1);
-        break;
+    dirty = 0;
+    last_render_ms = now_ms();
+}
+
+static int render_due(void) {
+    if (!dirty && pd_x0 >= pd_x1) return 0;
+    return now_ms() - last_render_ms >= FRAME_MS;
+}
+
+/* ── frame dump (-D): the composited screen, half size, base64 on /dev/tty ── */
+static void b64_write(int fd, const uint8_t *in, int len) {
+    static const char *T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char line[80];
+    int col = 0;
+    for (int i = 0; i < len; i += 3) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        if (i + 1 < len) v |= (uint32_t)in[i + 1] << 8;
+        if (i + 2 < len) v |= in[i + 2];
+        line[col++] = T[(v >> 18) & 63];
+        line[col++] = T[(v >> 12) & 63];
+        line[col++] = (i + 1 < len) ? T[(v >> 6) & 63] : '=';
+        line[col++] = (i + 2 < len) ? T[v & 63] : '=';
+        if (col >= 76) { line[col++] = '\n'; write(fd, line, (size_t)col); col = 0; }
     }
-    case 12: {       /* ConfigureWindow — GDK resizes/moves the window */
-        xres_t *w = res_find(c, r32(q + 4));
-        if (w && w->kind == R_WINDOW) {
-            uint32_t mask = r16(q + 8);
-            int off = 12;               /* value list follows the 12-byte header */
-            if (12 + 4 * mask_bits(mask & 0x7F) > qlen) { x_error(c, BadLength, 0); break; }
-            int nx = w->x, ny = w->y, nw = w->w, nh = w->h;
-            if (mask & 0x01) { nx = rs16(q + off); off += 4; }   /* x */
-            if (mask & 0x02) { ny = rs16(q + off); off += 4; }   /* y */
-            if (mask & 0x04) { nw = (int)r16(q + off); off += 4; }/* width */
-            if (mask & 0x08) { nh = (int)r16(q + off); off += 4; }/* height */
-            if (nw < 1) nw = 1;
-            if (nh < 1) nh = 1;
-            if (nw > 4096) nw = 4096;
-            if (nh > 4096) nh = 4096;
-            w->x = nx; w->y = ny;
-            if (nw != w->w || nh != w->h) {   /* reallocate the backing buffer */
-                uint32_t *np = (uint32_t *)malloc((size_t)nw * nh * 4);
-                if (np) {
-                    for (int i = 0; i < nw * nh; i++) np[i] = 0x00202830;
-                    /* Carry the overlapping region across.  X leaves a resized
-                     * window's contents undefined and we do send an Expose, but
-                     * Firefox composites damage rather than redrawing on a bare
-                     * Expose, so throwing the pixels away left the browser
-                     * permanently blank whenever a ConfigureWindow arrived after
-                     * the last PutImage — a run could report a real paint
-                     * (putimg=25) and still show an empty window. */
-                    if (w->px) {
-                        int cw = w->w < nw ? w->w : nw;
-                        int ch = w->h < nh ? w->h : nh;
-                        for (int y = 0; y < ch; y++)
-                            memcpy(np + (size_t)y * nw, w->px + (size_t)y * w->w,
-                                   (size_t)cw * 4);
-                        free(w->px);
-                    }
-                    w->px = np; w->w = nw; w->h = nh;
-                }
+    if (col) { line[col++] = '\n'; write(fd, line, (size_t)col); }
+}
+
+static void frame_dump(void) {
+    if (trace_fd < 0) return;
+    draw_surface_t s;
+    s.w = scr_w; s.h = scr_h;
+    s.px = malloc((size_t)scr_w * scr_h * 4);
+    if (!s.px) return;
+    composite(&s, 0, 0, s.w, s.h);
+    int dw = scr_w / 2, dh = scr_h / 2;
+    uint8_t *rgb = malloc((size_t)dw * dh * 3);
+    if (rgb) {
+        for (int y = 0; y < dh; y++)
+            for (int x = 0; x < dw; x++) {
+                uint32_t p = s.px[(size_t)(y * 2) * scr_w + x * 2];
+                uint8_t *o = rgb + ((size_t)y * dw + x) * 3;
+                o[0] = (uint8_t)(p >> 16); o[1] = (uint8_t)(p >> 8); o[2] = (uint8_t)p;
             }
-            dirty = 1;
-            if (w->mapped) { send_configure(c, w); send_expose(c, w); }
+        char hdr[48];
+        int n = snprintf(hdr, sizeof(hdr), "\nFFDUMP %d %d\n", dw, dh);
+        write(trace_fd, hdr, (size_t)n);
+        b64_write(trace_fd, rgb, dw * dh * 3);
+        write(trace_fd, "FFDUMPEND\n", 10);
+        free(rgb);
+    }
+    free(s.px);
+}
+
+/* ── input from the desktop ──────────────────────────────────────────────── */
+static unsigned desk_buttons;            /* desktop mask: 1 left, 2 right, 4 middle */
+
+/* A press on the content of a toplevel brings it forward and gives it the
+ * keyboard, unless the client manages the focus itself and already has it
+ * inside that toplevel. */
+static void click_to_focus(void) {
+    window_t *sp = sprite_window();
+    window_t *top = sp ? window_toplevel(sp) : NULL;
+    if (!top || top->override_redirect) return;
+    window_t *f = focus_window();
+    if (f && window_toplevel(f) == top) {
+        if (root->top != top) raise_window(top);
+        return;
+    }
+    wm_activate(top);
+}
+
+static void on_pointer(int x, int y, unsigned buttons) {
+    int part = 0;
+    unsigned pressed = buttons & ~desk_buttons, released = desk_buttons & ~buttons;
+    if (drag_win) {                          /* moving a toplevel by its title */
+        window_t *w = lookup_window(drag_win);
+        if (w && (x != ptr_x || y != ptr_y))
+            configure_window(w, x - drag_dx, y - drag_dy, w->d.w, w->d.h, w->bw, 1);
+        ptr_x = x; ptr_y = y;
+        if (!(buttons & 1)) drag_win = 0;
+        desk_buttons = buttons;
+        return;
+    }
+    if ((pressed & 1) && !(ptr_buttons & 0x1F00)) {
+        window_t *t = wm_frame_hit(x, y, &part);
+        if (t) {
+            wm_activate(t);
+            if (part == 2) wm_close_window(t);
+            else { drag_win = t->d.o.id; drag_dx = x - t->x; drag_dy = y - t->y; }
+            desk_buttons = buttons;
+            ptr_x = x; ptr_y = y;
+            return;
         }
-        break;
     }
-    case 8: {        /* MapWindow */
-        xres_t *w = res_find(c, r32(q + 4));
-        if (w && w->kind == R_WINDOW) {
-            /* Kiosk WM: GTK leaves the main browser window tiny (it expects a
-             * sizing window-manager).  When a real top-level (not a 1x1/10x10
-             * helper or a small popup) is first mapped, resize it to fill the
-             * screen and report that geometry — gives Firefox a full content
-             * area to render the page into (without this it configures to 1x1
-             * and only the chrome paints). */
-            int sw = (!headless && gui.surf.w > 0) ? gui.surf.w : 1280;
-            int sh = (!headless && gui.surf.h > 0) ? gui.surf.h : 800;
-            if (!w->maximized && w->w >= 400 && (w->w < sw || w->h < sh)) {
-                uint32_t *np = (uint32_t *)malloc((size_t)sw * sh * 4);
-                if (np) {
-                    for (int i = 0; i < sw * sh; i++) np[i] = 0x00FFFFFF;
-                    if (w->px) free(w->px);
-                    w->px = np; w->w = sw; w->h = sh; w->x = 0; w->y = 0;
-                }
-                w->maximized = 1;
-            }
-            w->mapped = 1;
-            dirty = 1;
-            printf("maerox: MapWindow xid=0x%x %dx%d\n",
-                   (unsigned)w->xid, w->w, w->h);
-            xt("XT MapWindow xid=0x%x %dx%d @%d,%d\n",
-               (unsigned)w->xid, w->w, w->h, w->x, w->y);
-            send_map_notify(c, w);      /* mark viewable → GDK will paint */
-            send_configure(c, w);       /* report geometry */
-            send_expose(c, w);          /* ask the client to paint */
-            focus_offer(c, w);          /* kiosk focus policy — one copy of it */
+    if (x != ptr_x || y != ptr_y) {
+        ptr_x = x; ptr_y = y;
+        pointer_moved();
+    }
+    static const int xbtn[3] = { 1, 3, 2 };   /* left, right, middle */
+    for (int b = 0; b < 3; b++) {
+        if (pressed & (1u << b)) {
+            if (!(ptr_buttons & 0x1F00)) click_to_focus();
+            pointer_button(xbtn[b], 1);
         }
-        break;
+        if (released & (1u << b)) pointer_button(xbtn[b], 0);
     }
-    case 10: {       /* UnmapWindow */
-        xres_t *w = res_find(c, r32(q + 4));
-        if (w && w->kind == R_WINDOW) { w->mapped = 0; dirty = 1; }
-        break;
+    desk_buttons = buttons;
+}
+
+static void on_ptr(gui_window_t *g, int x, int y, int buttons, int inside) {
+    (void)g; (void)inside;
+    on_pointer(x, y, (unsigned)buttons & 7);
+}
+
+static void on_rawkey(gui_window_t *g, int code, int value, int mods) {
+    (void)g;
+    if (code <= 0 || code + 8 > 255) return;
+    key_mods = (unsigned)mods & 0xFF;
+    key_event(code + 8, value);
+}
+
+static void on_scroll(gui_window_t *g, int delta) {
+    (void)g;
+    scroll_event(delta);
+}
+
+/* ── test injection channel (-K, headless only) ──────────────────────────── */
+#define KEYFIFO_PATH "/tmp/.maerox-keys"
+static int  test_keys;
+static int  keyfifo_fd = -1;
+static char keyfifo_line[64];
+static int  keyfifo_used;
+
+/* Real input arrives from the desktop; a headless server has none, so the
+ * smoke tests inject through a FIFO: "k <linux keycode> <1|0> <mods>" and
+ * "c <x> <y>" (a left click).  It needs -K AND headless, so a desktop
+ * session never has the channel. */
+static void keyfifo_open(void) {
+    if (!test_keys) return;
+    if (!headless) {
+        printf("maerox: -K refused: the key-injection channel is headless-only\n");
+        return;
     }
-    case 53: {       /* CreatePixmap */
-        uint32_t pid = r32(q + 4);
-        xres_t *p = res_new(c, pid, R_PIXMAP);
-        if (!p) return;
-        p->w = (int)r16(q + 12); p->h = (int)r16(q + 14);
-        if (p->w < 1) p->w = 1;
-        if (p->h < 1) p->h = 1;
-        if (p->w > 4096) p->w = 4096;
-        if (p->h > 4096) p->h = 4096;
-        p->px = (uint32_t *)malloc((size_t)p->w * p->h * 4);
-        if (p->px) memset(p->px, 0, (size_t)p->w * p->h * 4);
-        break;
-    }
-    case 54: {       /* FreePixmap */
-        xres_t *p = res_find(c, r32(q + 4));
-        if (p && p->kind == R_PIXMAP) res_free(p);
-        else if (p) x_error(c, BadPixmap, r32(q + 4));   /* a window, GC, ... */
-        break;
-    }
-    case 62: {       /* CopyArea (pixmap/window → window) — how GTK/Cairo paint */
-        xres_t *src = res_find(c, r32(q + 4));
-        xres_t *dst = res_find(c, r32(q + 8));
-        copyarea_n++;
-        if (copyarea_n <= 8) xt("XT CopyArea src=0x%x dst=0x%x\n",
-                                (unsigned)r32(q + 4), (unsigned)r32(q + 8));
-        if (src && src->px && dst && dst->px) {
-            mark_painted(dst);
-            int sx = rs16(q + 16), sy = rs16(q + 18);
-            int dx = rs16(q + 20), dy = rs16(q + 22);
-            int w  = (int)r16(q + 24), h = (int)r16(q + 26);
-            if (clip_span(&dx, &sx, &w, dst->w, src->w, NULL) &&
-                clip_span(&dy, &sy, &h, dst->h, src->h, NULL)) {
-                /* Row-wise memmove; a scroll within one drawable that moves
-                 * content down must copy bottom-up so rows are read before
-                 * they are overwritten. */
-                int down = (src == dst && dy > sy);
-                for (int i = 0; i < h; i++) {
-                    int yy = down ? h - 1 - i : i;
-                    memmove(dst->px + (size_t)(dy + yy) * dst->w + dx,
-                            src->px + (size_t)(sy + yy) * src->w + sx,
-                            (size_t)w * 4);
-                }
-                damage_drawable(dst, dx, dy, w, h);
-            }
+    unlink(KEYFIFO_PATH);
+    if (mkfifo(KEYFIFO_PATH, 0600) != 0) return;
+    chmod(KEYFIFO_PATH, 0600);
+    keyfifo_fd = open(KEYFIFO_PATH, O_RDONLY | O_NONBLOCK);
+}
+
+static void keyfifo_poll(void) {
+    char ch;
+    if (keyfifo_fd < 0) return;
+    while (read(keyfifo_fd, &ch, 1) == 1) {
+        if (ch == '\r') continue;
+        if (ch != '\n') {
+            if (keyfifo_used + 1 < (int)sizeof(keyfifo_line)) keyfifo_line[keyfifo_used++] = ch;
+            continue;
         }
-        break;
-    }
-    case 55:         /* CreateGC */
-    case 56: {       /* ChangeGC */
-        uint32_t gid  = r32(q + 4);
-        int      voff = (op == 55) ? 16 : 12;
-        uint32_t mask = r32(q + (op == 55 ? 12 : 8));
-        if (voff + 4 * mask_bits(mask & 0x7FFFFF) > qlen) {
-            x_error(c, BadLength, 0);
-            break;
+        keyfifo_line[keyfifo_used] = 0;
+        keyfifo_used = 0;
+        int a = 0, b = 0, m = 0;
+        if (keyfifo_line[0] == 'k' && sscanf(keyfifo_line + 1, "%d %d %d", &a, &b, &m) == 3) {
+            on_rawkey(NULL, a, b, m);
+        } else if (keyfifo_line[0] == 'c' && sscanf(keyfifo_line + 1, "%d %d", &a, &b) == 2) {
+            on_pointer(a, b, desk_buttons);
+            on_pointer(a, b, desk_buttons | 1);
+            on_pointer(a, b, desk_buttons & ~1u);
+        } else if (keyfifo_line[0] == 'p' && sscanf(keyfifo_line + 1, "%d %d %d", &a, &b, &m) == 3) {
+            on_pointer(a, b, (unsigned)m);
         }
-        xres_t *g = (op == 55) ? res_new(c, gid, R_GC) : res_find(c, gid);
-        if (!g) break;
-        /* ChangeGC on a window or pixmap used to retype it to a GC, leaking
-         * its pixels; the kind is only ever set by CreateGC. */
-        if (op == 55) g->kind = R_GC;
-        else if (g->kind != R_GC) { x_error(c, BadGC, gid); break; }
-        for (int bit = 0; bit < 23; bit++) {
-            if (!(mask & (1u << bit))) continue;
-            uint32_t val = r32(q + voff);
-            voff += 4;
-            if (bit == 2) g->fg = val;       /* GCForeground */
-            else if (bit == 3) g->bg = val;  /* GCBackground */
-        }
-        break;
-    }
-    case 60: {       /* FreeGC */
-        xres_t *g = res_find(c, r32(q + 4));
-        if (g && g->kind == R_GC) res_free(g);
-        else if (g) x_error(c, BadGC, r32(q + 4));
-        break;
-    }
-    case 70: {       /* PolyFillRectangle */
-        xres_t *d = res_find(c, r32(q + 4));
-        xres_t *g = res_find(c, r32(q + 8));
-        uint32_t fg = (g && g->kind == R_GC) ? g->fg : 0x00FFFFFF;
-        int nrects = (qlen - 12) / 8;
-        for (int i = 0; i < nrects; i++) {
-            const uint8_t *rr = q + 12 + i * 8;
-            fill_rect(d, rs16(rr), rs16(rr + 2), (int)r16(rr + 4), (int)r16(rr + 6), fg);
-        }
-        break;
-    }
-    case 67: {       /* PolyRectangle (outline) */
-        xres_t *d = res_find(c, r32(q + 4));
-        xres_t *g = res_find(c, r32(q + 8));
-        uint32_t fg = (g && g->kind == R_GC) ? g->fg : 0x00FFFFFF;
-        int nrects = (qlen - 12) / 8;
-        for (int i = 0; i < nrects; i++) {
-            const uint8_t *rr = q + 12 + i * 8;
-            int x = rs16(rr), y = rs16(rr + 2), w = (int)r16(rr + 4), h = (int)r16(rr + 6);
-            fill_rect(d, x, y, w, 1, fg); fill_rect(d, x, y + h, w + 1, 1, fg);
-            fill_rect(d, x, y, 1, h, fg); fill_rect(d, x + w, y, 1, h, fg);
-        }
-        break;
-    }
-    case 72: {       /* PutImage (ZPixmap, depth 24/32) */
-        xres_t *d = res_find(c, r32(q + 4));
-        int iw = (int)r16(q + 12), ih = (int)r16(q + 14);
-        int dx = rs16(q + 16), dy = rs16(q + 18);
-        int depth = q[21];
-        int format = q[1];
-        putimage_n++;
-        if (putimage_n <= 8) xt("XT PutImage win=0x%x %dx%d @%d,%d depth=%d\n",
-                                (unsigned)r32(q + 4), iw, ih, dx, dy, depth);
-        /* Drop a "Firefox painted" marker the ff watchdog polls.  Re-created
-         * after each launch (the launcher deletes it first), so check-then-create
-         * makes it reappear on the first PutImage of a launch that reaches paint. */
-        /* At most once a second, though: a path lookup per PutImage was a
-         * syscall per request on a browser's hottest path. */
-        {
-            static unsigned last_mark;
-            unsigned t = now_ms();
-            if (putimage_n == 1 || t - last_mark >= 1000) {
-                last_mark = t;
-                if (access("/tmp/ff_painted", F_OK) != 0) {
-                    int mfd = open("/tmp/ff_painted", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                    if (mfd >= 0) close(mfd);
-                }
-            }
-        }
-        /* Only ZPixmap at 24/32 bpp is drawn; bitmaps and XY formats stay a
-         * silent no-op as before.  The image must fit inside the request: the
-         * row pointer used to be computed from the header alone, so a short
-         * request with a large height read past the input buffer into other
-         * clients' state. */
-        if (format == 2 && (depth == 24 || depth == 32)) {
-            size_t stride = (size_t)iw * 4;           /* 32 bpp: already padded */
-            if (24 + (uint64_t)stride * ih > (uint64_t)qlen) {
-                x_error(c, BadLength, 0);
-                break;
-            }
-            if (d && d->px) {
-                mark_painted(d);
-                const uint8_t *img = q + 24;
-                int ix = 0, iy = 0, cw = iw, ch = ih;
-                if (clip_span(&dx, &ix, &cw, d->w, iw, NULL) &&
-                    clip_span(&dy, &iy, &ch, d->h, ih, NULL)) {
-                    /* Clients are LSBFirst on x86 (see r32), so a ZPixmap row
-                     * is already our pixel layout: copy dwords, dropping the
-                     * pad byte, instead of assembling every pixel from bytes. */
-                    for (int yy = 0; yy < ch; yy++) {
-                        const uint32_t *in = (const uint32_t *)(const void *)
-                            (img + (size_t)(iy + yy) * stride + (size_t)ix * 4);
-                        uint32_t *out = d->px + (size_t)(dy + yy) * d->w + dx;
-                        for (int xx = 0; xx < cw; xx++)
-                            out[xx] = in[xx] & 0x00FFFFFF;
-                    }
-                    damage_drawable(d, dx, dy, cw, ch);
-                }
-            }
-        }
-        break;
-    }
-    case 61: {       /* ClearArea */
-        xres_t *d = res_find(c, r32(q + 4));
-        fill_rect(d, rs16(q + 8), rs16(q + 10), (int)r16(q + 12), (int)r16(q + 14), 0x00202830);
-        break;
-    }
-    case 73: {       /* GetImage → return the drawable's pixels (ZPixmap) */
-        xres_t *d = res_find(c, r32(q + 4));
-        int ix = rs16(q + 8), iy = rs16(q + 10);
-        int iw = (int)r16(q + 12), ih = (int)r16(q + 14);
-        uint8_t data[24]; memset(data, 0, sizeof(data));
-        put32(data + 0, ROOT_VISUAL);          /* visual */
-        /* The size check is 64-bit: in int, iw*ih for e.g. 46341x46341 wrapped
-         * negative, passed, and the reply buffer came out a few KB long. */
-        if ((uint64_t)iw * ih > (1u << 22)) { x_error(c, BadAlloc, 0); break; }
-        if (d && d->px && iw > 0 && ih > 0) {
-            /* Stream the reply a row at a time straight into the output queue
-             * instead of materialising up to 16 MiB first. */
-            size_t n = (size_t)iw * ih * 4;
-            uint8_t head[32];
-            memset(head, 0, sizeof(head));
-            head[0] = 1; head[1] = 24;          /* reply, depth */
-            put16(head + 2, c->seq);
-            put32(head + 4, (uint32_t)(n / 4));
-            memcpy(head + 8, data, 24);
-            out_write(c, head, 32);
-            uint8_t *row = (uint8_t *)malloc((size_t)iw * 4);
-            if (!row) { c->dead = 1; break; }  /* reply half-sent: must drop */
-            for (int yy = 0; yy < ih && !c->dead; yy++) {
-                memset(row, 0, (size_t)iw * 4);
-                int sy = iy + yy, sx = ix, cw = iw, skip = 0;
-                if (sy >= 0 && sy < d->h &&
-                    clip_span(&sx, NULL, &cw, d->w, 0, &skip)) {
-                    const uint32_t *src = d->px + (size_t)sy * d->w + sx;
-                    for (int xx = 0; xx < cw; xx++)
-                        put32(row + (size_t)(skip + xx) * 4, src[xx]);
-                }
-                out_write(c, row, (size_t)iw * 4);
-            }
-            free(row);
-            break;
-        }
-        send_reply_var(c, 24, data, NULL, 0);
-        break;
-    }
-    case 14: {       /* GetGeometry → reply */
-        xres_t *d = res_find(c, r32(q + 4));
-        uint8_t data[24];
-        memset(data, 0, sizeof(data));
-        /* root */ data[0] = ROOT_WINDOW & 0xFF;
-        if (d) {
-            data[4] = d->x & 0xFF; data[5] = (d->x >> 8) & 0xFF;
-            data[6] = d->y & 0xFF; data[7] = (d->y >> 8) & 0xFF;
-            data[8] = d->w & 0xFF; data[9] = (d->w >> 8) & 0xFF;
-            data[10] = d->h & 0xFF; data[11] = (d->h >> 8) & 0xFF;
-        }
-        send_reply(c, 24 /* depth */, data);
-        break;
-    }
-    case 16: {       /* InternAtom → stable id per name (GDK round-trips these) */
-        int only_if_exists = q[1];
-        int nlen = (int)r16(q + 4);
-        const char *name = (const char *)(q + 8);
-        if (8 + nlen > qlen) { x_error(c, BadLength, 0); break; }
-        if (nlen > 63) nlen = 0;
-        uint32_t a = atom_intern(name, nlen, only_if_exists);
-        uint8_t data[24]; memset(data, 0, sizeof(data));
-        put32(data + 0, a);
-        send_reply(c, 0, data);
-        break;
-    }
-    case 17: {       /* GetAtomName → return the interned name */
-        uint32_t a = r32(q + 4);
-        int nlen = 0;
-        const char *nm = atom_name(a, &nlen);
-        uint8_t data[24]; memset(data, 0, sizeof(data));
-        put16(data + 0, (uint32_t)nlen);            /* name length */
-        send_reply_var(c, 0, data, (const uint8_t *)nm, nlen);
-        break;
-    }
-    case 15: {       /* QueryTree → root + parent + children */
-        uint32_t wid = r32(q + 4);
-        uint8_t data[24]; memset(data, 0, sizeof(data));
-        put32(data + 0, ROOT_WINDOW);               /* root */
-        /* Top-level client windows are children of root; root has no parent. */
-        put32(data + 4, (wid == ROOT_WINDOW) ? 0 : ROOT_WINDOW);  /* parent */
-        put16(data + 8, 0);                         /* number of children */
-        send_reply(c, 0, data);
-        break;
-    }
-    case 20: {       /* GetProperty → empty */
-        uint8_t data[24];
-        memset(data, 0, sizeof(data));   /* type=None, bytes-after=0, len=0 */
-        send_reply(c, 0, data);
-        break;
-    }
-    case 42: {       /* SetInputFocus — the client claims the keyboard */
-        uint32_t wid = r32(q + 4);
-        focus_revert = q[1];
-        /* None (0) and PointerRoot (1) are not windows; treat either as "no
-         * window wants the keyboard" and fall back to the kiosk policy. */
-        if (wid > 1) {
-            focus_explicit = 1;
-            xfocus_set(client_index(c), wid);
-        } else {
-            focus_explicit = 0;
-            xfocus_set(-1, 0);
-        }
-        break;
-    }
-    case 43: {       /* GetInputFocus → the window SetInputFocus/the WM chose */
-        uint8_t data[24];
-        memset(data, 0, sizeof(data));
-        put32(data + 0, focus_xid ? focus_xid : ROOT_WINDOW);
-        send_reply(c, focus_revert, data);
-        break;
-    }
-    case 98: {       /* QueryExtension */
-        int nlen = (int)r16(q + 4);
-        char nm[40]; nm[0] = '\0';
-        if (8 + nlen > qlen) { x_error(c, BadLength, 0); break; }
-        if (nlen > 0 && nlen < 40) {
-            memcpy(nm, q + 8, (size_t)nlen); nm[nlen] = '\0';
-        }
-        uint8_t data[24];
-        memset(data, 0, sizeof(data));
-        if (strcmp(nm, "RENDER") == 0) {   /* advertise XRender so GTK/cairo draw */
-            data[0] = 1;                   /* present */
-            data[1] = RENDER_MAJOR;        /* major-opcode */
-            data[2] = 0;                   /* first-event */
-            data[3] = RENDER_ERROR_BASE;   /* first-error */
-            printf("maerox: QueryExtension 'RENDER' -> present (major %d)\n",
-                   RENDER_MAJOR);
-            xt("XT QueryExtension 'RENDER' -> PRESENT\n");
-        } else {
-            printf("maerox: QueryExtension '%s' -> not present\n", nm);
-            xt("XT QueryExtension '%s' -> not present\n", nm);
-        }
-        send_reply(c, 0, data);
-        break;
-    }
-    case 3: {        /* GetWindowAttributes → reply (44 bytes: 3 extra words) */
-        uint32_t wid = r32(q + 4);
-        xres_t *w = res_find(c, wid);            /* NULL for root or unknown */
-        uint8_t data[24]; memset(data, 0, sizeof(data));
-        uint8_t extra[12]; memset(extra, 0, sizeof(extra));
-        put32(data + 0, ROOT_VISUAL);            /* the single TrueColor visual */
-        data[4] = 1; data[5] = 0;                /* class = InputOutput */
-        /* map-state: 0=Unmapped, 2=Viewable.  Report the window's real state so
-         * GDK's view of mapped-ness matches the server. */
-        int viewable = (wid == ROOT_WINDOW) || (w && w->mapped);
-        data[16] = (uint8_t)(viewable ? 2 : 0);  /* map-state */
-        /* extra: all-event-masks, your-event-mask, do-not-propagate, pad */
-        send_reply_var(c, 0, data, extra, 12);
-        break;
-    }
-    case 23: {       /* GetSelectionOwner → owner = None */
-        uint8_t data[24]; memset(data, 0, sizeof(data));
-        send_reply(c, 0, data);            /* owner window = 0 (None) */
-        break;
-    }
-    case 38: {       /* QueryPointer → reply */
-        uint8_t data[24]; memset(data, 0, sizeof(data));
-        put32(data + 0, ROOT_WINDOW);      /* root */
-        data[20] = 1;                      /* same-screen = True */
-        /* b1 (sameScreen) handled as detail; report pointer at 0,0 */
-        send_reply(c, 1, data);
-        break;
-    }
-    case 101: {      /* GetKeyboardMapping → the US layout, 2 keysyms/keycode */
-        int first = q[4], count = q[5];
-        if (count < 1) count = 1;
-        if (first < X_KEYCODE_BASE || first + count - 1 > 255) {
-            x_error(c, BadValue, (uint32_t)first);
-            break;
-        }
-        int per = KEYSYMS_PER_KEYCODE;
-        int n = count * per;
-        uint8_t *ks = (uint8_t *)malloc((size_t)n * 4);
-        if (ks) {
-            for (int i = 0; i < count; i++) {
-                int lk = first + i - X_KEYCODE_BASE;   /* back to a Linux code */
-                for (int j = 0; j < per; j++) {
-                    uint32_t sym = (lk >= 0 && lk < KEYMAP_MAX)
-                                 ? us_keysyms[lk][j] : 0;   /* 0 = NoSymbol */
-                    put32(ks + (i * per + j) * 4, sym);
-                }
-            }
-            send_reply_var(c, (uint8_t)per, NULL, ks, n * 4);
-            free(ks);
-        } else {
-            uint8_t d[24]; memset(d,0,sizeof(d)); send_reply(c, 1, d);
-        }
-        break;
-    }
-    case 119: {      /* GetModifierMapping → the real Shift/Lock/Control/Alt keys */
-        uint8_t extra[8 * KEYCODES_PER_MODIFIER];
-        memset(extra, 0, sizeof(extra));
-        for (int m = 0; m < 8; m++)
-            for (int k = 0; k < KEYCODES_PER_MODIFIER; k++) {
-                uint8_t lk = modifier_linux_keys[m][k];
-                extra[m * KEYCODES_PER_MODIFIER + k] =
-                    lk ? (uint8_t)(lk + X_KEYCODE_BASE) : 0;
-            }
-        send_reply_var(c, KEYCODES_PER_MODIFIER, NULL, extra, sizeof(extra));
-        break;
-    }
-    case 78: break;  /* CreateColormap — accept */
-    case 127: break; /* NoOperation */
-    default:
-        /* Any other reply-expecting request gets a generic empty reply so the
-         * client doesn't block forever; non-reply requests are ignored. */
-        if (req_expects_reply(op)) {
-            uint8_t data[24]; memset(data, 0, sizeof(data));
-            send_reply(c, 0, data);
-            if (op_hist[op & 0xFF] <= 2) xt("XT generic-reply op=%d len=%d\n", op, qlen);
-            if (xdbg) printf("maerox: generic-reply op=%d seq=%d\n", op, c->seq);
-        } else {
-            if (op_hist[op & 0xFF] <= 2) xt("XT ignored op=%d len=%d\n", op, qlen);
-            if (xdbg) printf("maerox: ignored op=%d seq=%d len=%d\n", op, c->seq, qlen);
-        }
-        break;
     }
 }
 
-/* Drain a client's buffered bytes: first the setup request, then requests. */
-/* Free everything a disconnecting client owns.  Firefox attempts are killed by
- * the ff watchdog many times per session; without this every dead client leaked
- * its window/pixmap pixel buffers (MBs per attempt) and glyphsets, degrading
- * later attempts monotonically. */
-static void client_free_resources(xclient_t *c) {
-    if (focus_ci == client_index(c)) { focus_ci = -1; focus_xid = 0; focus_explicit = 0; }
-    /* Held keys belonging to this client die with it; the slot is reused. */
-    for (int i = 0; i < (int)(sizeof(key_down) / sizeof(key_down[0])); i++)
-        if (key_down[i].ci1 == (unsigned char)(client_index(c) + 1))
-            { key_down[i].ci1 = 0; key_down[i].xid = 0; }
-    for (int i = 0; i < c->nres; i++)
-        if (c->res[i].kind != R_NONE) res_free(&c->res[i]);
-    c->nres = 0;
+/* ── connections ─────────────────────────────────────────────────────────── */
+static int build_setup_reply(uint8_t *out, int cap, int ci) {
+    (void)cap;
+    uint8_t *p = out;
+    const char *vendor = "MaeroOS maeroX";
+    int vlen = (int)strlen(vendor), vpad = (4 - (vlen & 3)) & 3;
+    /* pixmap formats: depth 1, 4, 8, 24, 32 */
+    static const uint8_t fmts[5][3] = { { 1, 1, 32 }, { 4, 8, 32 }, { 8, 8, 32 }, { 24, 32, 32 }, { 32, 32, 32 } };
+    int nfmt = 5;
+    /* screen: 40 bytes + depths: 24 (1 visual: 8 + 24) and 1, 4, 8, 32 (none, 8 each) */
+    int screen_len = 40 + (8 + 24) + 4 * 8;
+    int extra = 32 + vlen + vpad + 8 * nfmt + screen_len;
+    memset(out, 0, (size_t)(8 + extra));
+    p[0] = 1;
+    put16(p + 2, 11); put16(p + 4, 0); put16(p + 6, (uint32_t)(extra / 4));
+    p += 8;
+    put32(p + 0, 12101004);                      /* release */
+    put32(p + 4, (uint32_t)(ci + 1) << CLIENT_ID_SHIFT);
+    put32(p + 8, CLIENT_ID_MASK);
+    put32(p + 12, 256);                          /* motion buffer */
+    put16(p + 16, (uint32_t)vlen);
+    put16(p + 18, 65535);                        /* maximum request length */
+    p[20] = 1;                                   /* screens */
+    p[21] = (uint8_t)nfmt;
+    p[22] = 0; p[23] = 0;                        /* LSBFirst image and bitmap */
+    p[24] = 32; p[25] = 32;                      /* bitmap scanline unit/pad */
+    p[26] = 8; p[27] = 255;                      /* keycodes */
+    p += 32;
+    memcpy(p, vendor, (size_t)vlen);
+    p += vlen + vpad;
+    for (int i = 0; i < nfmt; i++) { p[0] = fmts[i][0]; p[1] = fmts[i][1]; p[2] = fmts[i][2]; p += 8; }
+    put32(p + 0, ROOT_WINDOW);
+    put32(p + 4, ROOT_COLORMAP);
+    put32(p + 8, 0xFFFFFF);                      /* white */
+    put32(p + 12, 0);                            /* black */
+    put32(p + 16, 0);                            /* current input masks */
+    put16(p + 20, (uint32_t)scr_w); put16(p + 22, (uint32_t)scr_h);
+    put16(p + 24, (uint32_t)(scr_w * 254 / 960)); put16(p + 26, (uint32_t)(scr_h * 254 / 960));
+    put16(p + 28, 1); put16(p + 30, 1);          /* installed maps */
+    put32(p + 32, ROOT_VISUAL);
+    p[36] = 0; p[37] = 0; p[38] = 24; p[39] = 5; /* backing, save-unders, root depth, depths */
+    p += 40;
+    p[0] = 24; put16(p + 2, 1); p += 8;          /* DEPTH 24, one visual */
+    put32(p, ROOT_VISUAL); p[4] = 4; p[5] = 8; put16(p + 6, 256);
+    put32(p + 8, 0xFF0000); put32(p + 12, 0x00FF00); put32(p + 16, 0x0000FF);
+    p += 24;
+    static const uint8_t other[4] = { 1, 4, 8, 32 };
+    for (int i = 0; i < 4; i++) { p[0] = other[i]; p += 8; }
+    return (int)(p - out);
 }
 
-static void client_close(xclient_t *c) {
-    xt("XT client disconnected (last seq=%d%s)\n", c->seq, c->dead ? ", dropped" : "");
-    close(c->fd);
-    client_free_resources(c);
-    free(c->out);
-    c->out = NULL;
-    c->outoff = c->outlen = c->outcap = 0;
-    c->used = 0;
-    dirty = 1;
-}
-
-/* Refuse a connection whose setup we cannot serve, with a setup Failed reply
- * in the byte order the client asked for, then drop it. */
-static void setup_refuse(xclient_t *c, int msb, const char *why) {
+static void setup_refuse(client_t *c, int msb, const char *why) {
     uint8_t r[8 + 64];
     int n = (int)strlen(why), words = (n + 3) / 4;
     memset(r, 0, sizeof(r));
-    r[0] = 0;                              /* Failed */
     r[1] = (uint8_t)n;
-    if (msb) { r[3] = 11; r[7] = (uint8_t)words; }   /* major 11, length */
-    else     { r[2] = 11; r[6] = (uint8_t)words; }
+    if (msb) { r[3] = 11; r[7] = (uint8_t)words; }
+    else { r[2] = 11; r[6] = (uint8_t)words; }
     memcpy(r + 8, why, (size_t)n);
     out_write(c, r, 8 + (size_t)words * 4);
     c->dead = 1;
 }
 
-static void process_client(xclient_t *c) {
-    /* Only read when there is room: read(fd, p, 0) returns 0, which is also how
-     * a closed connection reports itself, so a full buffer would look like a
-     * disconnect. */
+static void client_close(client_t *c) {
+    xlog("client %d disconnected (seq %d%s)\n", c->index, c->seq, c->dead ? ", dropped" : "");
+    close(c->fd);
+    core_client_gone(c);
+    free(c->out);
+    free(c->inbuf);
+    memset(c, 0, sizeof(*c));
+    damage_all();
+}
+
+static void dispatch(client_t *c, const uint8_t *q, int qlen) {
+    c->seq++;
+    c->cur_major = q[0];
+    c->cur_minor = 0;
+    core_dispatch(c, q, qlen);
+}
+
+static void process_client(client_t *c) {
     if (c->dead) return;
     if (c->inlen < INBUF_SIZE) {
-        int r = read(c->fd, c->inbuf + c->inlen, INBUF_SIZE - c->inlen);
-        if (r == 0) { client_close(c); return; }            /* closed */
+        int r = read(c->fd, c->inbuf + c->inlen, (size_t)(INBUF_SIZE - c->inlen));
+        if (r == 0) { c->dead = 1; return; }
         if (r < 0 && errno != EAGAIN && errno != EINTR) { c->dead = 1; return; }
         if (r > 0) c->inlen += r;
     }
-
     if (!c->setup_done) {
         if (c->inlen < 1) return;
-        /* Every field is parsed little-endian; an MSB-first client would be
-         * misparsed from the first request on, so it is refused up front. */
         if (c->inbuf[0] != 'l') {
             setup_refuse(c, c->inbuf[0] == 'B', "maeroX serves LSBFirst clients only");
             return;
@@ -2007,301 +759,40 @@ static void process_client(xclient_t *c) {
         int need = 12 + ((nauth + 3) & ~3) + ((dauth + 3) & ~3);
         if (c->inlen < need) return;
         uint8_t reply[512];
-        int sw = (!headless && gui.surf.w > 0) ? gui.surf.w : 1280;
-        int sh = (!headless && gui.surf.h > 0) ? gui.surf.h : 800;
-        int len = build_setup_reply(reply, sizeof(reply), sw, sh);
+        int len = build_setup_reply(reply, sizeof(reply), c->index);
         out_write(c, reply, (size_t)len);
         c->setup_done = 1;
-        memmove(c->inbuf, c->inbuf + need, c->inlen - need);
+        memmove(c->inbuf, c->inbuf + need, (size_t)(c->inlen - need));
         c->inlen -= need;
-        printf("maerox: client handshake complete (screen %dx%d headless=%d surf=%dx%d)\n",
-               sw, sh, headless, gui.surf.w, gui.surf.h);
+        xlog("client %d connected (screen %dx%d)\n", c->index, scr_w, scr_h);
     }
-
-    /* Process complete requests.  They are consumed by offset and the
-     * leftover moved down once: a memmove per request made a buffer of 65536
-     * NoOperations cost ~8 GB of copying. */
     int pos = 0;
     while (c->setup_done && !c->dead && c->inlen - pos >= 4) {
         const uint8_t *q = c->inbuf + pos;
         int qlen = (int)r16(q + 2) * 4;
         if (qlen < 4) {
-            /* Length 0 means BIG-REQUESTS, which is not advertised: there is
-             * no way to find where the next request starts, so the stream
-             * cannot be resynchronised.  Report it and drop the client. */
+            /* Length 0 would be BIG-REQUESTS, which is not offered: the
+             * stream cannot be resynchronised, so report and drop. */
             c->seq++;
             c->cur_major = q[0]; c->cur_minor = 0;
             x_error(c, BadLength, 0);
             c->dead = 1;
             break;
         }
-        /* qlen <= 65535*4 < INBUF_SIZE, so every request can complete. */
-        if (c->inlen - pos < qlen) break;            /* wait for the rest */
+        if (c->inlen - pos < qlen) break;
         dispatch(c, q, qlen);
         pos += qlen;
+        if (pending_focus) {
+            window_t *w = lookup_window(pending_focus);
+            pending_focus = 0;
+            if (w && window_viewable(w) && !kiosk) set_focus(w, 2);
+            else if (w && window_viewable(w) && !focus_window()) set_focus(w, 2);
+        }
     }
     if (pos) {
         memmove(c->inbuf, c->inbuf + pos, (size_t)(c->inlen - pos));
         c->inlen -= pos;
     }
-}
-
-/* Drain whatever input is waiting: the desktop's window-manager events and the
- * test channel, and put anything it changed on screen.  Called from the main
- * loop, and from inside the frame dump — see b64_write().  Repainting matters
- * as much as reading: accepting a keystroke during a dump but leaving the
- * screen untouched until the dump ends would show the user a window frozen
- * minutes behind what they typed. */
-static void render(void);   /* fwd */
-static int render_due(void);
-static int poll_desktop(void);
-static void pump_input(void) {
-    if (!headless) {
-        poll_desktop();
-        if (render_due()) render();
-    }
-    keyfifo_poll();
-}
-
-/* Base64-encode `len` bytes to fd, wrapping at 76 chars/line.
- *
- * Input is drained between lines.  That looks out of place in an encoder, but
- * this is the only caller and it writes ~1 MB to a 115200-baud serial line —
- * upwards of a minute during which maeroX is otherwise inside one write().  The
- * desktop's event channel is a small FIFO opened non-blocking, so once it fills
- * every further keystroke is thrown away with no error anywhere; a keystroke
- * dropped between a press and its release then leaves the client believing the
- * key is still held.  Draining as we go keeps the session alive while the
- * diagnostic streams. */
-static void b64_write(int fd, const uint8_t *in, int len) {
-    static const char *T =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    char line[80]; int col = 0;
-    for (int i = 0; i < len; i += 3) {
-        uint32_t v = (uint32_t)in[i] << 16;
-        if (i + 1 < len) v |= (uint32_t)in[i + 1] << 8;
-        if (i + 2 < len) v |= in[i + 2];
-        line[col++] = T[(v >> 18) & 63];
-        line[col++] = T[(v >> 12) & 63];
-        line[col++] = (i + 1 < len) ? T[(v >> 6) & 63] : '=';
-        line[col++] = (i + 2 < len) ? T[v & 63] : '=';
-        if (col >= 76) {
-            line[col++] = '\n'; write(fd, line, col); col = 0;
-            pump_input();
-        }
-    }
-    if (col) { line[col++] = '\n'; write(fd, line, col); }
-}
-
-/* Composite every mapped window into an off-screen RGB surface and stream it,
- * half-resolution, as base64 to /dev/tty (→ COM1 → host serial), bracketed by
- * FFDUMP/FFDUMPEND markers a host script decodes into a PNG.  This makes the
- * proven-but-invisible headless paint (putimg>0, no framebuffer) actually
- * viewable.  Half-res keeps the serial transfer to ~0.5MB. */
-static void composite_windows(draw_surface_t *s, int cx0, int cy0, int cx1, int cy1);
-static void frame_dump(void) {
-    if (trace_fd < 0) return;
-    int W = 1280, H = 800;
-    draw_surface_t s;
-    s.w = W; s.h = H;
-    s.px = (uint32_t *)malloc((size_t)W * H * 4);
-    if (!s.px) return;
-    for (int i = 0; i < W * H; i++) s.px[i] = 0x00202830;   /* desktop bg */
-    composite_windows(&s, 0, 0, s.w, s.h);
-    /* Downsample 2x into a packed RGB buffer. */
-    int dw = W / 2, dh = H / 2;
-    uint8_t *rgb = (uint8_t *)malloc((size_t)dw * dh * 3);
-    if (rgb) {
-        for (int y = 0; y < dh; y++)
-            for (int x = 0; x < dw; x++) {
-                uint32_t p = s.px[(size_t)(y * 2) * W + (x * 2)];
-                uint8_t *o = rgb + ((size_t)y * dw + x) * 3;
-                o[0] = (p >> 16) & 0xFF; o[1] = (p >> 8) & 0xFF; o[2] = p & 0xFF;
-            }
-        char hdr[48];
-        int n = snprintf(hdr, sizeof(hdr), "\nFFDUMP %d %d\n", dw, dh);
-        write(trace_fd, hdr, n);
-        b64_write(trace_fd, rgb, dw * dh * 3);
-        write(trace_fd, "FFDUMPEND\n", 10);
-        free(rgb);
-    }
-    free(s.px);
-}
-
-/* ── compositing ─────────────────────────────────────────────────────────── */
-/* Draw the mapped windows bottom-up in win_above() order — the one shared
- * definition of the stacking order — so the window the compositor paints last
- * is the same one the click hit-test and the key-target fallback call topmost.
- * Iterating the resource array instead drew them in slot order, and because
- * res_new() reuses freed pixmap/GC slots the MozContainer Firefox renders into
- * could land below the blank toplevel: the browser painted normally
- * (putimg=24) while the screen showed the toplevel's empty background.  That
- * was a coin flip - 10 of 20 runs. */
-static void composite_windows(draw_surface_t *s, int cx0, int cy0, int cx1, int cy1) {
-    xres_t *order[MAX_XCLIENTS * MAX_RES];
-    int n = 0;
-    for (int ci = 0; ci < MAX_XCLIENTS; ci++) {
-        if (!clients[ci].used) continue;
-        xclient_t *c = &clients[ci];
-        for (int i = 0; i < c->nres && n < (int)(sizeof(order) / sizeof(order[0])); i++) {
-            xres_t *w = &c->res[i];
-            if (w->kind != R_WINDOW || !w->mapped || !w->px || !w->painted) continue;
-            order[n++] = w;
-        }
-    }
-    for (int i = 1; i < n; i++) {            /* insertion sort: n is tiny */
-        xres_t *t = order[i];
-        int j = i - 1;
-        while (j >= 0 && win_above(order[j], t)) { order[j + 1] = order[j]; j--; }
-        order[j + 1] = t;
-    }
-    for (int k = 0; k < n; k++) {
-        xres_t *w = order[k];
-        /* Clip to the surface and to the clip rectangle [cx0,cx1)x[cy0,cy1):
-         * the part of each window outside it is already on screen. */
-        int tx = w->x - cx0, ty = w->y - cy0, sx = 0, sy = 0, cw = w->w, ch = w->h;
-        if (!clip_span(&tx, &sx, &cw, cx1 - cx0, w->w, NULL) ||
-            !clip_span(&ty, &sy, &ch, cy1 - cy0, w->h, NULL)) continue;
-        tx += cx0;
-        ty += cy0;
-        /* Skip a window wholly covered by an opaque one above it (every
-         * composited window is opaque: its own pixels, no alpha). */
-        int hidden = 0;
-        for (int a = k + 1; a < n && !hidden; a++) {
-            xres_t *o = order[a];
-            hidden = o->x <= tx && o->y <= ty &&
-                     o->x + o->w >= tx + cw && o->y + o->h >= ty + ch;
-        }
-        if (hidden) continue;
-        for (int yy = 0; yy < ch; yy++)
-            memcpy(s->px + (size_t)(ty + yy) * s->w + tx,
-                   w->px + (size_t)(sy + yy) * w->w + sx, (size_t)cw * 4);
-    }
-}
-
-static int count_clients(void) {
-    int n = 0;
-    for (int i = 0; i < MAX_XCLIENTS; i++) if (clients[i].used) n++;
-    return n;
-}
-
-/* Forward a libgui click (surface coords) to the topmost X window under it as a
- * ButtonPress + ButtonRelease pair.  "Topmost" is topmost_window()'s answer —
- * the same one the compositor draws by — so the window that gets the button is
- * the one the user actually clicked on rather than whichever happened to sit in
- * the higher resource slot.  The button goes to that window; the keyboard moves
- * only if focus_offer() says the policy allows it. */
-static void on_x_click(gui_window_t *g, int x, int y) {
-    (void)g;
-    xclient_t *hit_c = NULL;
-    xres_t *hit_w = topmost_window(1, x, y, &hit_c);
-    if (hit_c && hit_w) {
-        int ex = x - hit_w->x, ey = y - hit_w->y;
-        focus_offer(hit_c, hit_w);
-        send_pointer(hit_c, hit_w, 4, 1, ex, ey);   /* ButtonPress, button 1 */
-        send_pointer(hit_c, hit_w, 5, 1, ex, ey);   /* ButtonRelease */
-    }
-}
-
-static unsigned render_n_full, render_n_part;   /* "renders" in -T traces */
-
-/* The backdrop's top band (status line on the background colour), rendered
- * once per text or width change, so a partial render that reaches it copies
- * just its part instead of redrawing the text whole. */
-static uint32_t *strip_px;
-static int strip_w;
-static char strip_text[sizeof(status)];
-
-static void backdrop_rows(draw_surface_t *s, int x0, int y0, int x1, int y1) {
-    snprintf(status, sizeof(status), "maeroX :0 - %d client%s, DISPLAY=:0",
-             count_clients(), count_clients() == 1 ? "" : "s");
-    if (y0 < STATUS_BAND_H && (strip_w != s->w || strcmp(strip_text, status))) {
-        uint32_t *np = (uint32_t *)realloc(strip_px, (size_t)s->w * STATUS_BAND_H * 4);
-        if (np) {
-            draw_surface_t t = { np, s->w, STATUS_BAND_H };
-            strip_px = np;
-            strip_w = s->w;
-            strcpy(strip_text, status);
-            draw_fill(&t, draw_rgb(24, 28, 36));
-            draw_text_aa(&t, 12, 14, status, draw_rgb(150, 200, 255), &draw_font_ui);
-        }
-    }
-    for (int y = y0; y < y1; y++) {
-        uint32_t *d = s->px + (size_t)y * s->w + x0;
-        if (y < STATUS_BAND_H && strip_px && strip_w == s->w)
-            memcpy(d, strip_px + (size_t)y * strip_w + x0, (size_t)(x1 - x0) * 4);
-        else
-            fill32(d, draw_rgb(24, 28, 36), x1 - x0);
-    }
-}
-
-/* Put what changed on the desktop surface and tell the compositor which part.
- * A full render repaints the backdrop and every window; a damaged one only the
- * damage rectangle, and reports just that to the compositor. */
-static void render(void) {
-    draw_surface_t *s = &gui.surf;
-    if (!s->px) return;
-    int x0 = 0, y0 = 0, x1 = s->w, y1 = s->h;
-    if (!dirty) {
-        if (pd_x0 >= pd_x1) return;                  /* nothing changed */
-        x0 = pd_x0 < 0 ? 0 : pd_x0;
-        y0 = pd_y0 < 0 ? 0 : pd_y0;
-        x1 = pd_x1 > s->w ? s->w : pd_x1;
-        y1 = pd_y1 > s->h ? s->h : pd_y1;
-    }
-    pd_x0 = pd_x1 = 0;
-    if (x0 < x1 && y0 < y1) {
-        backdrop_rows(s, x0, y0, x1, y1);
-        composite_windows(s, x0, y0, x1, y1);
-        if (dirty) { wm_commit(&gui.wm, gui.slot); render_n_full++; }
-        else { wm_commit_rect(&gui.wm, gui.slot, x0, y0, x1 - x0, y1 - y0); render_n_part++; }
-    }
-    dirty = 0;
-    last_render_ms = now_ms();
-}
-
-/* Take the desktop's events for our window.  Input is forwarded to X clients
- * by the handlers (they repaint and that damages); only a resize gives us a
- * new, blank surface that must be repainted whole. */
-static int poll_desktop(void) {
-    uint32_t *px = gui.surf.px;
-    int w = gui.surf.w, h = gui.surf.h;
-    int n = gui_poll(&gui);
-    if (gui.surf.px != px || gui.surf.w != w || gui.surf.h != h) dirty = 1;
-    return n;
-}
-
-/* Frame pacing: drawing requests are taken as fast as clients send them, but
- * the result is put on screen at most once per FRAME_MS (~60 Hz) - one render
- * and one compositor commit per frame instead of one per request batch. */
-static int render_due(void) {
-    if (!dirty && pd_x0 >= pd_x1) return 0;
-    return now_ms() - last_render_ms >= FRAME_MS;
-}
-
-/* ── connection setup ────────────────────────────────────────────────────── */
-static int start_listener(void) {
-    int fd = socket(AF_UNIX, SOCK_STREAM | 0x800 /* NONBLOCK */, 0);
-    if (fd < 0) return -1;
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strcpy(addr.sun_path, X_SOCKET_PATH);
-    socklen_t alen = (socklen_t)(sizeof(addr.sun_family) + strlen(X_SOCKET_PATH));
-    /* bind() makes a real socket inode, as on Linux: the directory must exist
-     * (world-writable and sticky, as X servers create it), and a socket file
-     * left by an earlier server holds the name until it is removed — unless
-     * a server still answers on it. */
-    if (mkdir(X_SOCKET_DIR, 01777) == 0)
-        chmod(X_SOCKET_DIR, 01777);        /* past the umask */
-    int probe = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (probe >= 0) {
-        if (connect(probe, (struct sockaddr *)&addr, alen) != 0) unlink(X_SOCKET_PATH);
-        close(probe);
-    }
-    if (bind(fd, (struct sockaddr *)&addr, alen) != 0) { close(fd); return -2; }
-    if (listen(fd, 8) != 0) { close(fd); return -3; }
-    return fd;
 }
 
 static void accept_clients(void) {
@@ -2310,100 +801,128 @@ static void accept_clients(void) {
     fcntl(cfd, F_SETFL, O_RDWR | O_NONBLOCK);
     for (int i = 0; i < MAX_XCLIENTS; i++)
         if (!clients[i].used) {
-            memset(&clients[i], 0, sizeof(clients[i]));   /* out == NULL */
+            memset(&clients[i], 0, sizeof(clients[i]));
+            clients[i].inbuf = malloc(INBUF_SIZE);
+            if (!clients[i].inbuf) break;
             clients[i].used = 1;
             clients[i].fd = cfd;
-            dirty = 1;
+            clients[i].index = i;
             return;
         }
-    close(cfd);   /* table full */
+    close(cfd);
+}
+
+static int start_listener(void) {
+    int fd = socket(AF_UNIX, SOCK_STREAM | 0x800 /* NONBLOCK */, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, X_SOCKET_PATH);
+    socklen_t alen = (socklen_t)(sizeof(addr.sun_family) + strlen(X_SOCKET_PATH));
+    if (mkdir(X_SOCKET_DIR, 01777) == 0) chmod(X_SOCKET_DIR, 01777);
+    int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (probe >= 0) {
+        if (connect(probe, (struct sockaddr *)&addr, alen) != 0) unlink(X_SOCKET_PATH);
+        close(probe);
+    }
+    if (bind(fd, (struct sockaddr *)&addr, alen) != 0) { close(fd); return -2; }
+    chmod(X_SOCKET_PATH, 0777);
+    if (listen(fd, 16) != 0) { close(fd); return -3; }
+    return fd;
+}
+
+static void wait_for_clients(int ms) {
+    struct pollfd pfd[1 + MAX_XCLIENTS];
+    int n = 0;
+    if (listen_fd >= 0) { pfd[n].fd = listen_fd; pfd[n].events = POLLIN; pfd[n].revents = 0; n++; }
+    for (int i = 0; i < MAX_XCLIENTS; i++) {
+        client_t *c = &clients[i];
+        if (!c->used || c->dead) continue;
+        short ev = 0;
+        if (c->inlen < INBUF_SIZE) ev |= POLLIN;
+        if (c->outlen > 0) ev |= POLLOUT;
+        if (!ev) continue;
+        pfd[n].fd = c->fd; pfd[n].events = ev; pfd[n].revents = 0; n++;
+    }
+    poll(pfd, (unsigned long)n, ms);
+}
+
+/* The desktop resized our window: the root follows the body. */
+static void poll_desktop(void) {
+    uint32_t *px = gui.surf.px;
+    int w = gui.surf.w, h = gui.surf.h;
+    gui_poll(&gui);
+    if (gui.surf.px != px || gui.surf.w != w || gui.surf.h != h) {
+        if (gui.surf.w > 0 && gui.surf.h > 0 && (gui.surf.w != scr_w || gui.surf.h != scr_h)) {
+            scr_w = gui.surf.w;
+            scr_h = gui.surf.h;
+            core_resize_root(scr_w, scr_h);
+            status_clients = -1;
+            for (window_t *t = root->bottom; t; t = t->above)
+                if (t->wm_max && kiosk) configure_window(t, 0, 0, scr_w, scr_h, t->bw, 1);
+        }
+        dirty = 1;
+    }
 }
 
 int main(int argc, char *argv[]) {
-    int slot = 1;
-    int daemon = 0;
+    int slot = 1, daemon = 0, gw = 1000, gh = 700;
+    const char *logpath = "/tmp/maerox.log";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-H") || !strcmp(argv[i], "--headless")) headless = 1;
-        else if (!strcmp(argv[i], "-v")) xdbg = 1;
-        else if (!strcmp(argv[i], "-T")) trace_fd = -2;   /* request /dev/tty trace */
+        else if (!strcmp(argv[i], "-k")) kiosk = 1;
+        else if (!strcmp(argv[i], "-T")) trace_fd = -2;
         else if (!strcmp(argv[i], "-D")) { dumpmode = 1; trace_fd = -2; }
-        else if (!strcmp(argv[i], "-K") || !strcmp(argv[i], "--test-keys"))
-            test_keys = 1;             /* honoured only when headless */
+        else if (!strcmp(argv[i], "-K") || !strcmp(argv[i], "--test-keys")) test_keys = 1;
         else if (!strcmp(argv[i], "-d") || !strcmp(argv[i], "--daemon")) daemon = 1;
+        else if (!strcmp(argv[i], "-g") && i + 1 < argc) sscanf(argv[++i], "%dx%d", &gw, &gh);
+        else if (!strcmp(argv[i], "-L") && i + 1 < argc) logpath = argv[++i];
         else if (argv[i][0] >= '0' && argv[i][0] <= '9') slot = atoi(argv[i]);
     }
-    if (trace_fd == -2) {
-        trace_fd = open("/dev/tty", O_WRONLY);   /* → COM1 → host serial log */
-        xt("XT maeroX trace armed\n");
-    }
+    if (headless) kiosk = 1;
+    if (trace_fd == -2) trace_fd = open("/dev/tty", O_WRONLY);
+    log_fd = open(logpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (slot < 1 || slot > WM_MAX_SLOTS) slot = 1;
-    /* A client that exits with a reply pending must not take the server with
-     * it: writes to it get EPIPE (sends also pass MSG_NOSIGNAL). */
     signal(SIGPIPE, SIG_IGN);
 
     listen_fd = start_listener();
     if (listen_fd < 0) { printf("maerox: listen failed (%d)\n", listen_fd); return 1; }
-
     if (daemon) {
         printf("maerox: listening on " X_SOCKET_PATH " (daemonized)\n");
-        if (fork() > 0) return 0;          /* parent returns to the shell */
+        if (fork() > 0) return 0;
     }
-
-    if (!headless &&
-        gui_open(&gui, slot, "maeroX :0", 100 + slot * 12, 70 + slot * 10,
-                 820, 560) < 0)
+    if (!headless && gui_open(&gui, slot, "maeroX :0", 60 + slot * 12, 40 + slot * 10, gw, gh) < 0)
         headless = 1;
-    if (headless) printf("maerox: running headless\n");
-    if (!daemon)  printf("maerox: listening on " X_SOCKET_PATH "\n");
+    if (!headless && gui.surf.w > 0) { scr_w = gui.surf.w; scr_h = gui.surf.h; }
+    if (headless) { printf("maerox: running headless\n"); kiosk = 1; }
+    printf("maerox: listening on " X_SOCKET_PATH " (%dx%d)\n", scr_w, scr_h);
+    core_init();
     if (!headless) {
-        gui_set_click_handler(&gui, on_x_click);   /* forward clicks to X clients */
-        gui_set_rawkey_handler(&gui, on_x_key);    /* forward keys as KeyPress */
+        gui_set_ptr_handler(&gui, on_ptr);
+        gui_set_rawkey_handler(&gui, on_rawkey);
+        gui_set_scroll_handler(&gui, on_scroll);
         render();
     }
-    keyfifo_open();   /* after `headless` is final: -K is refused in a window */
-    /* Say once, on the trace, whether this server has an injection channel —
-     * and look at the filesystem rather than only at our own flag, so a node
-     * left behind by anything else is reported too.  smoke_firefox.py's
-     * --keycheck asserts this line reads "absent ... no node" on the desktop
-     * path, which is how a real session is shown not to have one. */
-    xt("XT keychannel: %s (%s)\n", keyfifo_fd >= 0 ? "OPEN" : "absent",
-       access(KEYFIFO_PATH, F_OK) == 0 ? "node present" : "no node");
+    keyfifo_open();
+    xlog("keychannel: %s (%s)\n", keyfifo_fd >= 0 ? "OPEN" : "absent",
+         access(KEYFIFO_PATH, F_OK) == 0 ? "node present" : "no node");
 
-    unsigned last_hist = now_ms();
-    unsigned last_dump = last_hist;
+    unsigned last_dump = now_ms();
     while (headless || !gui.closed) {
         if (!headless) poll_desktop();
         keyfifo_poll();
         accept_clients();
         for (int i = 0; i < MAX_XCLIENTS; i++)
             if (clients[i].used) { out_flush(&clients[i]); process_client(&clients[i]); }
-        /* Close clients whose writes failed or that broke the protocol — only
-         * here, never from inside a handler that may still reference them. */
         for (int i = 0; i < MAX_XCLIENTS; i++)
             if (clients[i].used && clients[i].dead) client_close(&clients[i]);
         if (!headless && render_due()) render();
         unsigned now = now_ms();
-        if (trace_fd >= 0 && now - last_hist >= 2000) {   /* every 2 s */
-            xt_dump_hist();
-            last_hist = now;
+        if (dumpmode && dumps_done < 4 && now - last_dump >= 2000) {
+            for (window_t *t = root->bottom; t; t = t->above)
+                if (t->mapped && t->d.w >= 400) { frame_dump(); dumps_done++; last_dump = now; break; }
         }
-        /* Frame-dump mode: once Firefox has painted (putimage_n>0) and a full-
-         * size toplevel is mapped, stream the composited frame every ~2s, a few
-         * times (first paint is often partial; later ones are settled). */
-        if (dumpmode && dumps_done < 4 && putimage_n > 0 &&
-            now - last_dump >= 2000) {
-            int have_top = 0;
-            for (int ci = 0; ci < MAX_XCLIENTS && !have_top; ci++) {
-                if (!clients[ci].used) continue;
-                for (int i = 0; i < clients[ci].nres; i++) {
-                    xres_t *w = &clients[ci].res[i];
-                    if (w->kind == R_WINDOW && w->mapped && w->px && w->w >= 400)
-                        { have_top = 1; break; }
-                }
-            }
-            if (have_top) { frame_dump(); dumps_done++; last_dump = now; }
-        }
-        /* Owed a frame: wake no later than its slot. */
         int wait = 12;
         if (!headless && (dirty || pd_x0 < pd_x1)) {
             unsigned since = now_ms() - last_render_ms;
@@ -2412,8 +931,8 @@ int main(int argc, char *argv[]) {
         }
         wait_for_clients(wait);
     }
-
     close(listen_fd);
+    unlink(X_SOCKET_PATH);
     if (keyfifo_fd >= 0) { close(keyfifo_fd); unlink(KEYFIFO_PATH); }
     if (!headless) gui_close(&gui);
     return 0;

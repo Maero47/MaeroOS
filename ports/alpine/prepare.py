@@ -67,7 +67,19 @@ PACKAGES = ["bash", "coreutils", "python3", "vim", "less", "nano",
 # openssh-keygen and the libraries openssh-client already installed.
 REPO_PACKAGES = ["tree", "openssh-server", "openssh-server-common"]
 
-IMG = os.environ.get("ALPINE_IMG", os.path.join(ROOT, "disk-alpine.img"))
+# ALPINE_X=1: the X11 desktop-apps image (docs/alpinex.md).  The same base
+# root, plus an offline repo holding X_PACKAGES and everything they depend on
+# (`apk fetch -R`), split over /repo/main and /repo/community like the
+# mirror.  Its pins live in their own lock (alpine-x.lock) and it is a
+# separate image, so disk-alpine.img and smoke-alpine stay small.
+X = bool(os.environ.get("ALPINE_X"))
+X_PACKAGES = ["xterm", "xeyes", "xclock", "xev", "xdpyinfo", "xwininfo",
+              "mousepad", "galculator", "feh", "ristretto", "mpv", "gimp",
+              "font-dejavu", "adwaita-icon-theme", "hicolor-icon-theme"]
+X_LOCK = os.path.join(HERE, "alpine-x.lock")
+
+IMG = os.environ.get("ALPINE_IMG", os.path.join(
+    ROOT, "disk-alpinex.img" if X else "disk-alpine.img"))
 
 
 def log(msg):
@@ -224,16 +236,15 @@ def main():
                 sys.exit(f"[alpine] repo package {name} is not in alpine.lock")
     # apk names a cached index after a hash of its URL; pick the one that
     # lists the repo packages (they all come from main).
-    idx = [n for n in os.listdir(APK_CACHE)
-           if n.startswith("APKINDEX.") and n.endswith(".tar.gz")
-           and index_has(os.path.join(APK_CACHE, n), REPO_PACKAGES)]
-    if len(idx) != 1:
-        sys.exit(f"[alpine] cannot tell the main APKINDEX in {APK_CACHE}: {idx}")
-    shutil.copy(os.path.join(APK_CACHE, idx[0]),
-                os.path.join(repo, "APKINDEX.tar.gz"))
+    main_idx = find_index(REPO_PACKAGES, "main")
+    shutil.copy(main_idx, os.path.join(repo, "APKINDEX.tar.gz"))
+    repos = "/repo/main\n"
+    if X:
+        add_x_repo(apk_static, root, main_idx, relock)
+        repos += "/repo/community\n"
     with open(os.path.join(root, "etc", "apk", "repositories"), "w") as f:
         f.write("# Offline repo on the MaeroOS disk (ports/alpine/prepare.py).\n"
-                "# Online: " + f"{MIRROR}/{BRANCH}/main\n/repo/main\n")
+                "# Online: " + f"{MIRROR}/{BRANCH}/main\n" + repos)
     # Linux mounts these; MaeroOS passes /dev and /proc through the chroot.
     os.chmod(os.path.join(root, "tmp"), 0o1777)
 
@@ -247,6 +258,10 @@ def main():
                          text=True).stdout
     kib = int(out.split()[0])
     size_mb = max(256, (kib * 3 // 2) // 1024 + 64)
+    if X:
+        # Room to install the whole repo in the guest: packages unpack to
+        # about three times their .apk size.  The image file is sparse.
+        size_mb += 3 * kib // 1024 + 512
     log(f"mke2fs {os.path.basename(IMG)} ({size_mb} MiB, tree {kib // 1024} MiB)")
     if os.path.exists(IMG):
         os.unlink(IMG)
@@ -254,6 +269,77 @@ def main():
                     "-b", "1024", "-d", stage, "-F", IMG, f"{size_mb}M"],
                    check=True)
     log("done: " + IMG)
+
+
+def find_index(names, what):
+    idx = [os.path.join(APK_CACHE, n) for n in os.listdir(APK_CACHE)
+           if n.startswith("APKINDEX.") and n.endswith(".tar.gz")
+           and index_has(os.path.join(APK_CACHE, n), names)]
+    if len(idx) != 1:
+        sys.exit(f"[alpine] cannot tell the {what} APKINDEX in {APK_CACHE}: {idx}")
+    return idx[0]
+
+
+def index_versions(path):
+    """{name-version} of every package an APKINDEX lists."""
+    with tarfile.open(path, "r:gz") as t:
+        text = t.extractfile("APKINDEX").read().decode()
+    out, name = set(), None
+    for line in text.split("\n"):
+        if line.startswith("P:"):
+            name = line[2:]
+        elif line.startswith("V:") and name:
+            out.add(name + "-" + line[2:])
+    return out
+
+
+def add_x_repo(apk_static, root, main_idx, relock):
+    """X_PACKAGES and their whole dependency closure into /repo/main and
+    /repo/community (each .apk next to the index that lists it), pinned in
+    alpine-x.lock the way alpine.lock pins the base."""
+    files, pkgs = {}, set()
+    if os.path.exists(X_LOCK):
+        for line in open(X_LOCK):
+            f = line.split()
+            if f and f[0] == "file":
+                files[f[1]] = f[2]
+            elif f and f[0] == "pkg":
+                pkgs.add(f[1])
+    fetched = os.path.join(CACHE, "fetch-x-" + BRANCH)
+    os.makedirs(fetched, exist_ok=True)
+    if not os.environ.get("ALPINE_OFFLINE"):
+        log("apk fetch -R " + " ".join(X_PACKAGES))
+        apk(apk_static, root, "fetch", "-R", "-o", fetched, *X_PACKAGES)
+    comm_idx = find_index(["xterm"], "community")
+    lists = {"main": index_versions(main_idx), "community": index_versions(comm_idx)}
+    dirs = {r: os.path.join(root, "repo", r, ARCH) for r in lists}
+    os.makedirs(dirs["community"], exist_ok=True)
+    shutil.copy(comm_idx, os.path.join(dirs["community"], "APKINDEX.tar.gz"))
+    have = set()
+    for name in sorted(os.listdir(fetched)):
+        if not name.endswith(".apk"):
+            continue
+        nv = name[:-4]
+        where = [r for r in lists if nv in lists[r]]
+        if not where:
+            sys.exit(f"[alpine] {name} is in no cached APKINDEX (stale fetch cache?)")
+        src = os.path.join(fetched, name)
+        check_file(src, files, relock)
+        have.add(nv)
+        shutil.copy(src, dirs[where[0]])
+    if relock or not pkgs:
+        pkgs = have
+    elif have != pkgs:
+        sys.exit("[alpine] X repo differs from alpine-x.lock\n"
+                 f"  not in the lock: {sorted(have - pkgs)}\n"
+                 f"  locked, missing: {sorted(pkgs - have)}")
+    with open(X_LOCK, "w") as out:
+        out.write("# Pins for the X11 apps repo of ports/alpine/prepare.py (ALPINE_X=1).\n")
+        for name in sorted(files):
+            out.write(f"file {name} {files[name]}\n")
+        for p in sorted(pkgs):
+            out.write(f"pkg {p}\n")
+    log(f"X repo: {len(have)} packages")
 
 
 def find_tool(name):

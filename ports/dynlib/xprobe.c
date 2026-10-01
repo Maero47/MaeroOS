@@ -79,7 +79,7 @@ int main(void) {
         printf("XHANDSHAKE_FAIL mask=0x%x screens=%u\n", id_mask, nscreens);
         kill(srv, 9); return 1;
     }
-    unsigned off = 32 + ((vlen + 3) & ~3u) + 2 * 8;
+    unsigned off = 32 + ((vlen + 3) & ~3u) + body[21] * 8;   /* pixmap formats: 8 bytes each */
     unsigned root = u32(body + off);
 
     printf("XHANDSHAKE_OK root=0x%x base=0x%x mask=0x%x screens=%u\n",

@@ -700,10 +700,13 @@ view/view.o: view/view.c include/gui.h include/draw.h
 $(TESTFILES)/view: view/view.o $(GUIAPP_DEPS)
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) view/view.o libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o libwm/wm.o libc/libc.a
 
-maerox/maerox.o: maerox/maerox.c include/gui.h include/draw.h
-	$(CC) $(CFLAGS) -c $< -o $@
-$(TESTFILES)/maerox: maerox/maerox.o $(GUIAPP_DEPS)
-	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) maerox/maerox.o libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o libwm/wm.o libc/libc.a
+MAEROX_OBJS := maerox/maerox.o maerox/xcore.o maerox/xdraw.o maerox/xfont.o maerox/xrender.o
+$(MAEROX_OBJS): maerox/xs.h include/gui.h include/draw.h
+maerox/xcore.o: maerox/rgbnames.h
+maerox/xfont.o: include/font8x16.h
+
+$(TESTFILES)/maerox: $(MAEROX_OBJS) $(GUIAPP_DEPS)
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) $(MAEROX_OBJS) libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o libwm/wm.o libc/libc.a
 
 gfxbench/gfxbench.o: gfxbench/gfxbench.c include/gui.h include/wm.h include/draw.h
 	$(CC) $(CFLAGS) -c $< -o $@

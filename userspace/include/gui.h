@@ -32,6 +32,11 @@ typedef void (*gui_click_cb)(gui_window_t *gui, int x, int y);
 /* Every mouse event in body coordinates: press, drag motion (buttons held)
  * and release (buttons = 0).  Takes precedence over the click hook. */
 typedef void (*gui_mouse_cb)(gui_window_t *gui, int x, int y, int buttons);
+/* The raw pointer stream (gui_set_ptr_handler): every motion and button change
+ * over the body, in body coordinates, `buttons` the held mask (1 left, 2 right,
+ * 4 middle), `inside` 0 once when the pointer leaves the body.  A press holds
+ * the stream until all buttons are up, even outside the window. */
+typedef void (*gui_ptr_cb)(gui_window_t *gui, int x, int y, int buttons, int inside);
 
 enum {
     GUI_WIDGET_PANEL = 1,
@@ -89,6 +94,7 @@ struct gui_window {
     gui_scroll_cb on_scroll;  /* raw wheel hook (when no widget is hit) */
     gui_click_cb on_click;    /* raw click hook (bypasses widget routing) */
     gui_mouse_cb on_mouse;    /* raw mouse hook (press/drag/release) */
+    gui_ptr_cb on_ptr;        /* raw pointer stream (motion, all buttons) */
     char bg[12];
     gui_widget_t widgets[GUI_MAX_WIDGETS];
     int widget_count;
@@ -164,6 +170,7 @@ void gui_set_rawkey_handler(gui_window_t *gui, gui_rawkey_cb callback);
 void gui_set_scroll_handler(gui_window_t *gui, gui_scroll_cb callback);
 void gui_set_click_handler(gui_window_t *gui, gui_click_cb callback);
 void gui_set_mouse_handler(gui_window_t *gui, gui_mouse_cb callback);
+void gui_set_ptr_handler(gui_window_t *gui, gui_ptr_cb callback);
 /* on: deliver Escape to this window instead of letting it close the
  * window; off: Escape closes it again (the default). */
 void gui_grab_escape(gui_window_t *gui, int on);
