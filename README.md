@@ -209,7 +209,8 @@ without userspace polling.
 ### Drivers
 
 ATA with bus-master DMA reads and PIO writes (`ata.c`), PCI enumeration (`pci.c`), RTL8139 (`rtl8139.c`), Intel 82801AA AC'97
-audio (`ac97.c`), Multiboot VBE framebuffer (`framebuffer.c`), VGA text (`vga.c`), PS/2
+audio (`ac97.c`), Intel High Definition Audio (`hda.c`: CORB/RIRB, codec widget walk, cyclic BDL
+playback; `/dev/dsp` uses whichever of the two is present), Multiboot VBE framebuffer (`framebuffer.c`), VGA text (`vga.c`), PS/2
 keyboard and mouse (`keyboard.c`, `mouse.c`), CMOS RTC (`rtc.c`) and 16550 serial
 (`serial.c`).
 

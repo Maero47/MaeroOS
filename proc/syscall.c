@@ -2915,6 +2915,8 @@ static int ioctl_arg_shape(uint32_t req, uint32_t *len) {
                               *len = 36;            return IOA_IN;    /* TCSETS/W/F */
     case 0x5413:              *len = 8;             return IOA_OUT;   /* TIOCGWINSZ */
     case 0x540F:              *len = sizeof(int);   return IOA_OUT;   /* TIOCGPGRP */
+    case 0x80044D00U:         *len = sizeof(int);   return IOA_OUT;   /* SOUND_MIXER_READ_VOLUME */
+    case 0xC0044D00U:         *len = sizeof(int);   return IOA_INOUT; /* SOUND_MIXER_WRITE_VOLUME */
     case 0x5410:              *len = sizeof(int);   return IOA_IN;    /* TIOCSPGRP */
     case 0x5601:              *len = 8;             return IOA_OUT;   /* VT_GETMODE: struct vt_mode */
     case 0x5602:              *len = 8;             return IOA_IN;    /* VT_SETMODE */

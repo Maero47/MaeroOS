@@ -129,7 +129,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui check abiprobes smoke-abi smoke-firefox smoke-firefox-web repo repo-serve start resolutions icons
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-hda check abiprobes smoke-abi smoke-firefox smoke-firefox-web repo repo-serve start resolutions icons
 
 all: $(TARGET)
 
@@ -346,6 +346,11 @@ smoke-x: $(TARGET) initrd
 smoke-gtk: $(TARGET) initrd
 	python3 tools/smoke_gtk.py
 
+# Intel HDA playback via /dev/dsp, checked from QEMU's wav audiodev capture
+# (build/smoke-hda/out.wav); see tools/smoke_hda.py.
+smoke-hda: $(TARGET) initrd
+	python3 tools/smoke_hda.py
+
 # The desktop and its apps, driven through QMP mouse/keyboard input on the
 # ISO + a copy of disk.img (~30 s).  Screendumps and the serial log land in
 # build/smoke-gui/; see tools/smoke_gui.py.
@@ -360,7 +365,7 @@ smoke-gui: $(TARGET) iso disk
 # with -display none (tools/smokelib.py), so no display is needed.
 # Pick a subset with CHECK_SUITES="smoke smoke-x".
 CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-fw \
-                 smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui
+                 smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui smoke-hda
 CHECK_LOG_DIR ?= build/check
 
 # repo: smoke-pkg serves packages from repo/ (see the smoke-pkg target).
