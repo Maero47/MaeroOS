@@ -288,9 +288,12 @@ only); other code points show `?`. The display resolution is the framebuffer mod
 boot loader sets (`gfxpayload` in GRUB's config, `make start RES=WxH`), so Settings does
 not offer it.
 
-The clipboard is shared by all apps: `gui_clipboard_set()` writes `/tmp/clipboard`
-(through a rename) and tells the desktop (`clip N bytes`), `gui_clipboard_get()` reads
-it. The editor copies text there, the terminal its selection, and Files the absolute
+The clipboard is shared by all of a user's apps: `gui_clipboard_set()` writes `clip`
+in a directory only that user can enter (`$HOME/.clipboard`, else
+`/tmp/.clipboard-<uid>`, checked to be a 0700 directory of theirs) through an
+`O_EXCL` temp file and a rename, and tells the desktop (`clip N bytes`);
+`gui_clipboard_get()` reads it only if the user owns it. The terminal pastes text
+only: escape sequences and other control characters are dropped. The editor copies text there, the terminal its selection, and Files the absolute
 path of a file, which it pastes as a copy (or a move after Cut).
 
 Two windows belong to the desktop itself: `Console`,

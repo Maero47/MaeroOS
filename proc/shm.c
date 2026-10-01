@@ -73,6 +73,14 @@ int shm_sys_create(uint32_t npages) {
     if (npages < 1 || npages > SHM_MAX_PAGES)
         return -22;  /* -EINVAL */
     if (!current_proc) return -22;
+    if (current_proc->euid != 0) {
+        uint32_t held = 0;
+        for (int i = 0; i < SHM_MAX_OBJECTS; i++)
+            if (objects[i].used && objects[i].uid == current_proc->euid)
+                held += objects[i].npages;
+        if (held + npages > SHM_UID_MAX_PAGES)
+            return -28;  /* -ENOSPC, as shmget past SHMALL */
+    }
     for (int i = 0; i < SHM_MAX_OBJECTS; i++) {
         if (!objects[i].used) {
             obj = &objects[i];

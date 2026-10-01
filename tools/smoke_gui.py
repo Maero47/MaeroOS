@@ -166,9 +166,11 @@ KEYMAP = {" ": ("spc", False), "\n": ("ret", False), "-": ("minus", False),
           "_": ("minus", True), ".": ("dot", False), "/": ("slash", False),
           ">": ("dot", True), "=": ("equal", False), ",": ("comma", False),
           "$": ("4", True), ";": ("semicolon", False),
-          ":": ("semicolon", True), "*": ("8", True), "'": ("apostrophe", False)}
+          ":": ("semicolon", True), "*": ("8", True), "'": ("apostrophe", False),
+          "[": ("bracket_left", False), "\\": ("backslash", False)}
 for _c in "abcdefghijklmnopqrstuvwxyz":
     KEYMAP[_c] = (_c, False)
+    KEYMAP[_c.upper()] = (_c, True)
 for _c in "0123456789":
     KEYMAP[_c] = (_c, False)
 
@@ -523,6 +525,33 @@ class GuiSmoke:
         self.settle()
         self.shot("term-maximized")
         self.check_pty_size(win, cols, rows)
+        # Erasing the scrollback (CSI 3J) while scrolled back into it must
+        # not leave the view pointing before the history: the terminal has
+        # to keep running and drawing.  (The capital J also checks that
+        # Shift+letter types a capital.)
+        self.con.run("busybox rm -f /tmp/guismoke.3j")
+        self.inp.type("busybox seq 1 300; busybox sleep 2; "
+                      "busybox printf '\\033[3J'; "
+                      "echo $$ > /tmp/guismoke.3j\n")
+        self.settle(1.0)
+        self.inp.move_to(win["x"] + 200, win["y"] + 200)
+        for _ in range(10):
+            self.qmp.events([btn(True, "wheel-up")])
+            self.qmp.events([btn(False, "wheel-up")])
+            time.sleep(0.03)
+        deadline = time.time() + 15
+        while str(win["shell_pid"]) not in self.con.run("cat /tmp/guismoke.3j"):
+            if time.time() >= deadline:
+                raise AssertionError("the CSI 3J command never finished")
+            self.settle(0.5)
+        m = self.con.wait_re(r"\[term\] scrollback erased view=(\d+)",
+                             start=start)
+        if int(m.group(1)) == 0:
+            raise AssertionError("the terminal was not scrolled back when "
+                                 "its scrollback was erased")
+        self.settle(0.5)
+        self.type_in_terminal(win, "echo still-alive", "/tmp/guismoke.term")
+        self.shot("term-after-3j")
 
     def term_vi(self, win):
         """A full-screen program: vi edits and writes a file, which needs
@@ -601,6 +630,16 @@ class GuiSmoke:
         self.inp.combo(["ctrl"], "c")
         self.con.wait_re(r"\[edit\] copied 12 bytes")
         self.con.wait_re(r"\[desktop\] clipboard 12 bytes")
+        # The clipboard is in a 0700 directory of the desktop user's, not a
+        # fixed name in the shared /tmp.
+        out = self.con.run("busybox sh -c 'busybox ls -ld /tmp/.clipboard-* "
+                           "/disk/home/*/.clipboard /home/*/.clipboard "
+                           "2>/dev/null'")
+        dirs = re.findall(r"^(d\S+)\s+\d+\s+(\S+).*?(\S*clipboard\S*)\r?$",
+                          out, re.M)
+        if (not dirs or any(d[0][:10] != "drwx------" or d[1] == "root"
+                            for d in dirs) or "/tmp/clipboard\n" in out):
+            raise AssertionError(f"clipboard storage is not private: {out!r}")
         self.inp.press("down")
         self.inp.combo(["ctrl"], "v")
         self.con.wait_re(r"\[edit\] pasted 12 bytes")

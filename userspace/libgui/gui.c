@@ -3,7 +3,9 @@
 #include <linux/input.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <syscall.h>
 #include <unistd.h>
 
@@ -582,19 +584,45 @@ static void handle_scroll(gui_window_t *gui, const wm_event_t *event) {
     }
 }
 
-#define CLIPBOARD_PATH "/tmp/clipboard"
+/* The clipboard lives in a directory only its user can enter:
+ * $HOME/.clipboard, else /tmp/.clipboard-<uid>.  A fixed name in the shared
+ * /tmp would let another user plant a symlink at the temp file (and have a
+ * copy overwrite a file of ours) or own the clipboard file itself (and feed
+ * us text that a terminal paste runs as commands). */
+static int clipboard_dir(char *out, int size) {
+    const char *home = getenv("HOME");
+    struct stat st;
+    int uid = getuid();
+
+    if (home && home[0] == '/' && stat(home, &st) == 0 &&
+        S_ISDIR(st.st_mode) && (int)st.st_uid == uid)
+        snprintf(out, (size_t)size, "%s/.clipboard", home);
+    else
+        snprintf(out, (size_t)size, "/tmp/.clipboard-%d", uid);
+    mkdir(out, 0700);                 /* EEXIST is fine: checked below */
+    /* Not a symlink, ours, and closed to everyone else. */
+    if (lstat(out, &st) < 0 || !S_ISDIR(st.st_mode) ||
+        (int)st.st_uid != uid || (st.st_mode & 077))
+        return -1;
+    return 0;
+}
 
 int gui_clipboard_set(gui_window_t *gui, const char *text, int len) {
+    char dir[200], tmp[240], path[240];
+    static int seq;
     int fd, n;
 
-    if (!text || len < 0) return -1;
-    /* Write a sibling file and rename it in, so a reader never sees half. */
-    fd = open(CLIPBOARD_PATH ".new", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (!text || len < 0 || clipboard_dir(dir, sizeof(dir)) < 0) return -1;
+    snprintf(path, sizeof(path), "%s/clip", dir);
+    snprintf(tmp, sizeof(tmp), "%s/.new-%d-%d", dir, getpid(), seq++);
+    /* Write a fresh file and rename it in, so a reader never sees half. */
+    unlink(tmp);
+    fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd < 0) return -1;
     n = len ? (int)write(fd, text, (size_t)len) : 0;
     close(fd);
-    if (n != len || rename(CLIPBOARD_PATH ".new", CLIPBOARD_PATH) < 0) {
-        unlink(CLIPBOARD_PATH ".new");
+    if (n != len || rename(tmp, path) < 0) {
+        unlink(tmp);
         return -1;
     }
     if (gui) wm_command(&gui->wm, "clip %d bytes", len);
@@ -602,12 +630,21 @@ int gui_clipboard_set(gui_window_t *gui, const char *text, int len) {
 }
 
 int gui_clipboard_get(char *buf, int max) {
+    char dir[200], path[240];
+    struct stat st;
     int fd, total = 0, n;
 
     if (!buf || max <= 0) return 0;
     buf[0] = 0;
-    fd = open(CLIPBOARD_PATH, O_RDONLY);
+    if (clipboard_dir(dir, sizeof(dir)) < 0) return 0;
+    snprintf(path, sizeof(path), "%s/clip", dir);
+    fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) ||
+        (int)st.st_uid != getuid()) {
+        close(fd);
+        return 0;
+    }
     while (total < max - 1 &&
            (n = (int)read(fd, buf + total, (size_t)(max - 1 - total))) > 0)
         total += n;

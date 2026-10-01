@@ -151,7 +151,8 @@ int gui_icondef_mic(gui_window_t *gui, int index, const char *path,
  * the shown icon later via gui_find(gui,id)->value. */
 int gui_image(gui_window_t *gui, int id, int x, int y, int index);
 
-/* Shared clipboard (desktop-wide): the text lives in /tmp/clipboard and the
+/* Shared clipboard (all of a user's apps): the text lives in a private
+ * per-user directory ($HOME/.clipboard or /tmp/.clipboard-<uid>) and the
  * desktop is told about each change.  get returns the length copied (the
  * buffer is NUL-terminated), 0 when the clipboard is empty. */
 int gui_clipboard_set(gui_window_t *gui, const char *text, int len);

@@ -2161,7 +2161,7 @@ static void handle_wmctl_line(char *line) {
         }
         return;
     }
-    /* An app put something on the shared clipboard (/tmp/clipboard, see
+    /* An app put something on the shared clipboard (see
      * gui_clipboard_set); the desktop only records it. */
     arg = command_arg(line, "grabesc");      /* grabesc <slot> [0|1] */
     if (arg) {
@@ -3592,8 +3592,8 @@ static unsigned key_to_cp(uint16_t key) {
     }
     {
         char c = us_char(key, shift_down);
-        if (c >= 'a' && c <= 'z' && caps_on) c -= 32;
-        else if (c >= 'A' && c <= 'Z' && caps_on) c += 32;
+        /* Letters: Shift and Caps Lock each flip the case. */
+        if (c >= 'a' && c <= 'z' && (shift_down ^ caps_on)) c -= 32;
         return (unsigned char)c;
     }
 }

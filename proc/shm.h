@@ -29,7 +29,7 @@ struct proc;
  * caller's class; root bypasses.  The owner may widen the mode.
  *
  * Syscalls (custom numbers 500-502 and 506, outside the Linux i386 table):
- *   shm_create(npages)   → id
+ *   shm_create(npages)   → id  (-ENOSPC past SHM_UID_MAX_PAGES, non-root)
  *   shm_map(id)          → vaddr (mapped PAGE_SHARED|WRITABLE|USER)
  *   shm_unmap(id)        → 0   (also drops an unused creator reservation)
  *   shm_chmod(id, mode)  → 0   (506; owner or root; mode & 0666)
@@ -38,6 +38,10 @@ struct proc;
 #define SHM_MAX_OBJECTS 32
 #define SHM_MAX_PAGES   2048  /* 8 MiB — one 1920x1080x32 surface (a maximized window) */
 #define SHM_MAX_ATTACH  256   /* attachments system-wide */
+/* Pages one non-root user may hold in shm objects at once: a desktop
+ * session's window surfaces (four maximized 1920x1080 windows, or a dozen
+ * ordinary ones), so no user can pin SHM_MAX_OBJECTS x 8 MiB. */
+#define SHM_UID_MAX_PAGES 8192   /* 32 MiB */
 
 int shm_sys_create(uint32_t npages);
 int shm_sys_map(int id);

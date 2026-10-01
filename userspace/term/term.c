@@ -146,6 +146,13 @@ static void clear_rows(int r0, int r1) {
     for (int r = r0; r < r1; r++) clear_cells(r, 0, cols);
 }
 
+/* Keep the scrollback offset inside the history we have: visible_line()
+ * indexes history[] with hist_count - view, which must not go negative. */
+static void clamp_view(void) {
+    if (view > hist_count) view = hist_count;
+    if (view < 0) view = 0;
+}
+
 static void push_history(const cell_t *line) {
     int slot;
     if (hist_count < SCROLLBACK) {
@@ -157,6 +164,7 @@ static void push_history(const cell_t *line) {
     }
     memcpy(history[slot], line, sizeof(cell_t) * MAX_COLS);
     if (view) view++;            /* keep the scrolled-back view still */
+    clamp_view();                /* ...unless the ring was already full */
 }
 
 static void scroll_up(int top, int bot, int n) {
@@ -382,7 +390,13 @@ static void csi_dispatch(char f) {
             clear_cells(scr->cy, 0, scr->cx + 1);
         } else if (m == 2 || m == 3) {
             clear_rows(0, rows);
-            if (m == 3) hist_count = 0;
+            if (m == 3) {            /* erase the scrollback too */
+                gui_trace("term", "scrollback erased view=%d", view);
+                hist_count = 0;
+                hist_head = 0;
+                view = 0;
+                sel_active = sel_dragging = 0;
+            }
         }
         break;
     }
@@ -618,7 +632,10 @@ static uint32_t palette_color(int idx) {
 
 /* The line shown at visible row r: history while scrolled back. */
 static const cell_t *visible_line(int r, int *abs_line) {
-    int first = hist_count - view;          /* absolute index of row 0 */
+    int first;
+
+    clamp_view();
+    first = hist_count - view;              /* absolute index of row 0 */
     int a = first + r;
     *abs_line = a;
     if (a < hist_count)
@@ -764,6 +781,8 @@ static void copy_selection(void) {
     for (int l = l0; l <= l1 && n < (int)sizeof(buf) - MAX_COLS * 4; l++) {
         const cell_t *line;
         int from = l == l0 ? c0 : 0, to = l == l1 ? c1 : cols - 1, end;
+        if (to >= cols) to = cols - 1;
+        if (l < 0) continue;                 /* scrolled out of history */
         if (l < hist_count) line = history[(hist_head + l) % SCROLLBACK];
         else if (l - hist_count < rows) line = scr->cells[l - hist_count];
         else break;
@@ -782,8 +801,27 @@ static void paste_clipboard(void) {
     int n = gui_clipboard_get(buf, sizeof(buf));
 
     if (n <= 0) return;
-    for (int i = 0; i < n; i++)
-        if (buf[i] == '\n') buf[i] = '\r';     /* what Enter sends */
+    /* Text only: no ESC (so no "ESC[201~" ending a bracketed paste early,
+     * no smuggled sequences) and no other C0/C1 controls; newline becomes
+     * what Enter sends. */
+    {
+        int o = 0;
+        for (int i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)buf[i];
+            if (c == '\n') { buf[o++] = '\r'; continue; }
+            if (c == '\t') { buf[o++] = '\t'; continue; }
+            if (c < 32 || c == 127) continue;
+            if (c == 0xC2 && i + 1 < n &&
+                (unsigned char)buf[i + 1] >= 0x80 &&
+                (unsigned char)buf[i + 1] <= 0x9F) {   /* U+0080..U+009F */
+                i++;
+                continue;
+            }
+            buf[o++] = (char)c;
+        }
+        n = o;
+    }
+    if (n <= 0) return;
     if (bracketed_paste) pty_puts("\033[200~");
     pty_write(buf, n);
     if (bracketed_paste) pty_puts("\033[201~");
@@ -807,8 +845,7 @@ static void on_key(gui_window_t *g, int code, int value, int ascii) {
     if (ctrl && shift && code == KEY_V) { paste_clipboard(); return; }
     if (shift && (code == KEY_PAGEUP || code == KEY_PAGEDOWN)) {
         view += (code == KEY_PAGEUP ? 1 : -1) * (rows - 1);
-        if (view > hist_count) view = hist_count;
-        if (view < 0) view = 0;
+        clamp_view();
         dirty = 1;
         return;
     }
@@ -865,8 +902,7 @@ static void on_scroll(gui_window_t *g, int delta) {
         return;
     }
     view += delta * 3;
-    if (view > hist_count) view = hist_count;
-    if (view < 0) view = 0;
+    clamp_view();
     dirty = 1;
 }
 
@@ -876,6 +912,7 @@ static void cell_at(int x, int y, int *line, int *col) {
     if (r >= rows) r = rows - 1;
     if (c < 0) c = 0;
     if (c > cols) c = cols;
+    clamp_view();
     *line = hist_count - view + r;
     *col = c;
 }
