@@ -120,7 +120,8 @@ Firefox 115 ESR reaches the sound card. Once this work was merged with the
 rest of the tree (PAE paging, the compositor's damage tracking and frame pacing,
 the `rep movs`/`stos` libc string functions, among others), three runs of
 `smoke_firefox.py --audio` passed: the 3 s, 440 Hz clip was captured for
-2.99-3.00 s with 5 silent 10 ms blocks inside. On the audio branch alone the
+2.99-3.00 s with 5 silent 10 ms blocks inside (2 after the vruntime
+scheduler, one run). On the audio branch alone the
 same test showed the choppy playback described below. Which later change made
 the difference has not been isolated, so the analysis is kept as it was
 measured.
@@ -165,9 +166,11 @@ kernel are zero. Raising `media.audio.audiosink.threshold_ms` (200, 500)
 and running with `-smp 2` did not change this. The rate is the same for a
 plain WAV, so the decode work itself is not the limit. Each packet makes a
 round trip from MediaDecoderStateMachine to the decoder task queue and back
-to the AudioSink, and that round trip is slow on this kernel's scheduler (a
-20 ms quantum; wakeups from interrupts do not preempt). Fixing it belongs
-to the Firefox/scheduler latency work.
+to the AudioSink, and that round trip was slow on the scheduler of the time
+(a 20 ms quantum; wakeups from interrupts did not preempt). The vruntime
+scheduler that replaced it (4 ms slices, wakeup preemption, a resched IPI)
+leaves 2 silent 10 ms blocks inside the same 3 s clip, against 5 just before
+it on the integrated tree.
 
 Two earlier failures were also fixed on the way. The `/dev/snd` nodes were
 0660 root and Firefox runs as `user`; they are now 0666 like `/dev/dsp`.

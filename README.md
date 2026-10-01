@@ -83,7 +83,7 @@ What is proven by the automated QEMU tests in `tools/`:
   card through cubeb's PulseAudio backend, apulse and the kernel's ALSA ABI
   (`docs/audio.md`). On the current tree `smoke_firefox.py --audio` passes: in three
   runs the 3 s, 440 Hz clip was captured for 2.99-3.00 s with 5 silent 10 ms blocks
-  inside. It is not part of `make check`, and only that one clip has been tried.
+  inside, and in one run on the vruntime scheduler with 2. It is not part of `make check`, and only that one clip has been tried.
 - **Execute protection needs PAE and NX in the CPU.** With both (`-cpu qemu32,+nx`,
   which every smoke suite uses, or any x86-64 CPU), user stacks, heaps, anonymous and
   shm mappings are non-executable and `mprotect(PROT_EXEC)` toggles it. QEMU's default
