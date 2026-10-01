@@ -151,6 +151,7 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
 
     /* ── M7: Heap ────────────────────────────────────────────────────────── */
     heap_init();
+    pmm_refcount_init();
 #if KHEAP_TEST
     heap_selftest();
 #endif

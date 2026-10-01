@@ -70,6 +70,14 @@ SECTIONS {
     ASSERT(_kernel_phys_end <= boot_mapped_bytes,
            "kernel image (_kernel_end) exceeds boot.asm's initial mapping (boot_mapped_bytes, 12 MiB): shrink .bss or raise BOOT_PAGE_TABLES")
 
+    /* Limine's Multiboot 2 loader must find [1 MiB, bss_end_addr) free, and
+     * bss_end_addr is _kernel_phys_end + 64 KiB (boot.asm's address tag).
+     * OVMF x64 keeps memory reserved from 8 MiB up (its MEMFD area: SEC page
+     * tables, lock box, work area), so a longer image does not boot on most
+     * UEFI PCs ("could not find viable load address", make smoke-uefi). */
+    ASSERT(_kernel_phys_end + 0x10000 <= 0x800000,
+           "kernel image ends past 8 MiB - 64 KiB, where OVMF x64 reserves memory: Limine cannot load it on UEFI; move big static tables to the heap")
+
     /DISCARD/ : {
         *(.comment)
         *(.note.*)

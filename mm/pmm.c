@@ -1,5 +1,7 @@
 #include "pmm.h"
 #include "../kernel/printk.h"
+#include "heap.h"
+#include "../lib/string.h"
 #include <kernel/config.h>
 #include <stdint.h>
 
@@ -48,8 +50,14 @@ static uint32_t  pmm_last_alloc;  /* Last successfully allocated frame index */
 static uint32_t pmm_bitmap_phys;
 static uint32_t pmm_bitmap_size;  /* Bytes */
 
-/* Per-frame reference counts (used by COW fork/free and shared memory) */
-static uint16_t frame_refcount[PMM_MAX_FRAMES];
+/* Per-frame reference counts (used by COW fork/free and shared memory), one
+ * per frame of RAM, from the kernel heap (pmm_refcount_init).  It used to be a
+ * 2 MiB .bss array sized for 4 GiB, which pushed the image's end past 8 MiB,
+ * where OVMF x64 keeps memory reserved, so Limine could not load the kernel.
+ * Only user mappings take references, and the first comes long after the
+ * heap; until then every count reads as 0. */
+static uint16_t *frame_refcount;
+static uint32_t  refcount_frames;
 
 /* Allocator bitmap storage: 1 bit per frame, statically sized to the 4 GiB
  * maximum (PMM_MAX_FRAMES/32 words = 128 KiB).  Kept in .bss so it is always
@@ -94,7 +102,7 @@ void pmm_init(multiboot_info_t *mbi) {
         total_mem_kb += mbi->mem_upper;
 
     pmm_total = total_mem_kb / 4;   /* Frames = KiB / 4 (each frame = 4 KiB) */
-    /* Clamp to the statically-sized structures (bitmap + refcount = 4 GiB).
+    /* Clamp to the statically-sized bitmap (4 GiB).
      * On non-PAE i686, usable RAM never exceeds this, but stay defensive. */
     if (pmm_total > PMM_MAX_FRAMES) pmm_total = PMM_MAX_FRAMES;
 
@@ -164,7 +172,7 @@ void pmm_init(multiboot_info_t *mbi) {
  * use-after-free that lets two owners alias the same physical page (the GTK
  * heap-corruption bug).  Log it loudly with the stale count. */
 static void pmm_alloc_uaf_check(uint32_t idx) {
-    if (idx < PMM_MAX_FRAMES && frame_refcount[idx] != 0) {
+    if (idx < refcount_frames && frame_refcount[idx] != 0) {
         printk("[pmm-UAF] alloc frame idx=%u phys=%08x with stale refcount=%u!\n",
                (unsigned)idx, (unsigned)(idx * PAGE_SIZE),
                (unsigned)frame_refcount[idx]);
@@ -250,10 +258,22 @@ void pmm_reserve_region(uint32_t phys, uint32_t size) {
     pmm_used_region(phys, size);
 }
 
+void pmm_refcount_init(void) {
+    frame_refcount = kmalloc(pmm_total * sizeof(uint16_t));
+    if (!frame_refcount) {
+        printk("[PMM] no memory for %u frame refcounts\n", (unsigned)pmm_total);
+        return;
+    }
+    memset(frame_refcount, 0, pmm_total * sizeof(uint16_t));
+    refcount_frames = pmm_total;
+}
+
+/* Frames outside RAM (a framebuffer mapped into a process, say) are not
+ * counted: they read as 0 and are never freed, as before. */
 void pmm_frame_incref(uint32_t phys) {
     uint32_t idx = phys / PAGE_SIZE;
     uint32_t irq = pmm_irq_save();
-    if (idx < PMM_MAX_FRAMES && frame_refcount[idx] < 65535)
+    if (idx < refcount_frames && frame_refcount[idx] < 65535)
         frame_refcount[idx]++;
     pmm_irq_restore(irq);
 }
@@ -263,13 +283,13 @@ void pmm_frame_incref(uint32_t phys) {
  * the entry can be reclaimed once no process maps it anymore. */
 uint16_t pmm_frame_refcount(uint32_t phys) {
     uint32_t idx = phys / PAGE_SIZE;
-    if (idx >= PMM_MAX_FRAMES) return 0;
+    if (idx >= refcount_frames) return 0;
     return frame_refcount[idx];
 }
 
 void pmm_frame_decref(uint32_t phys) {
     uint32_t idx = phys / PAGE_SIZE;
-    if (idx >= PMM_MAX_FRAMES) return;
+    if (idx >= refcount_frames) return;
     uint32_t irq = pmm_irq_save();
     int do_free = 0;
     if (frame_refcount[idx] > 0) {
