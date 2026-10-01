@@ -127,19 +127,22 @@ static void sched_wakeup(struct proc *p) {
     uint32_t ncpu = smp_cpu_count();
     if (ncpu > MAX_CPUS) ncpu = MAX_CPUS;
     uint32_t self = this_cpu_id();
-    /* A syscall waking another thread (a pipe write, a condvar signal): the
-     * waker yields to it at the syscall's exit if no CPU has taken it by
-     * then, as Linux's sync wakeups do in practice — glibc-2.36's Riegel
-     * condvar relies on the signalled waiter running before the signaller
-     * can come back and steal the signal. */
-    if (!cpus[self].in_irq && current_proc && current_proc != p)
-        cpus[self].wake_last = p;
     /* An idle CPU takes it at once.  Prefer this one if idle (a wake from an
      * IRQ that interrupted the idle wait). */
     if (cpus[self].idle) { cpus[self].need_resched = 1; return; }
     for (uint32_t c = 0; c < ncpu; c++)
         if (cpus[c].online || c == 0)
-            if (cpus[c].idle) { resched_cpu(c); return; }
+            if (cpus[c].idle && !cpus[c].need_resched) { resched_cpu(c); return; }
+    /* A syscall waking another thread (a pipe write, a condvar signal, an X
+     * request): the waker steps behind it at the syscall's exit, so the woken
+     * thread runs before the waker can act again — what the old round-robin
+     * yield guaranteed.  glibc-2.36's Riegel condvar relies on the signalled
+     * waiter running before the signaller comes back to steal the signal, and
+     * a client writing to two channels (X socket, then key FIFO) relies on the
+     * server handling the first before the second. */
+    if (!cpus[self].in_irq && current_proc && current_proc != p &&
+        p->vruntime + 1 > cpus[self].wake_vr)
+        cpus[self].wake_vr = p->vruntime + 1;
     /* Otherwise the CPU running the thread furthest ahead of p. */
     uint64_t now = clock_mono_ns();
     int best = -1;
@@ -536,19 +539,24 @@ int wake_up_n_tgid(void *chan, int n, int tgid) {
  * made a thread runnable that should displace this one (sched_wakeup: the
  * wakee is SCHED_WAKEUP_GRAN ahead in vruntime — the usual case for a thread
  * that was blocked), or when the tick ended the slice; and a syscall that
- * woke a thread no CPU has picked up yet yields to it (sync wake, see
- * sched_wakeup).  Guarded by no_preempt so lwIP and other non-reentrant sections
+ * woke threads no idle CPU took queues the waker behind them and yields (sync
+ * wake, see sched_wakeup).  Guarded by no_preempt so lwIP and other non-reentrant sections
  * are never interrupted. */
 void resched_on_return(void) {
     struct cpu *me = &cpus[this_cpu_id()];
-    struct proc *w = me->wake_last;
-    me->wake_last = NULL;
+    uint64_t wvr = me->wake_vr;
+    me->wake_vr = 0;
     if (!current_proc || current_proc->no_preempt) return;
-    if (me->need_resched) { sched_irq_exit(1); return; }
-    if (w && w->state == PROC_RUNNABLE) {
+    if (wvr) {
+        /* Sync wake: queue behind the woken threads, then let them run. */
+        uint64_t cv = cpu_curr_vr(this_cpu_id(), clock_mono_ns());
+        if (wvr > cv) current_proc->vruntime += wvr - cv;
+        me->need_resched = 0;
         kprof_count(KPE_RESCHED);
         yield();
+        return;
     }
+    if (me->need_resched) sched_irq_exit(1);
 }
 
 int io_activity;

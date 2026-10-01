@@ -450,6 +450,12 @@ int main(int argc,char**argv){
         inject(LK_A,1,0);                      /* press while w has the focus */
         ok = next_key_event(e)==0 && e[0]==2 && u32(e+12)==w;
         set_input_focus(w2);                   /* focus moves mid-keystroke */
+        /* The FIFO and the X connection are separate channels with no order
+         * between them (XTEST users XSync for the same reason): a round trip
+         * makes sure the server has acted on SetInputFocus before the next
+         * injection.  Without it the server can drain the FIFO — key after
+         * key, each answered at once — before it reads the request. */
+        get_input_focus();
         inject(LK_A,0,0);
         ok = ok && next_key_event(e)==0 && e[0]==3 && u32(e+12)==w;
         check("release follows its press window", ok);
@@ -460,6 +466,7 @@ int main(int argc,char**argv){
         ok = ok && next_key_event(e)==0 && e[0]==3 && u32(e+12)==w2;
         check("next press follows the new focus", ok);
         set_input_focus(w);
+        get_input_focus();                     /* in effect before the next key */
     }
 
     /* A release whose press was never delivered must produce nothing at all.

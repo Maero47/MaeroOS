@@ -32,10 +32,11 @@ struct cpu {
     volatile int need_resched;
     volatile int idle;
     uint64_t run_t0;
-    /* A syscall on this CPU woke wake_last (sync wake): the syscall exit
-     * yields to it if it is still waiting for a CPU.  in_irq: nesting of
-     * hardware interrupt handlers, whose wakes are not the thread's own. */
-    struct proc *wake_last;
+    /* A syscall on this CPU woke threads that no idle CPU took (sync wake):
+     * wake_vr is the largest vruntime among them (0: none), and the syscall
+     * exit queues the waker behind them.  in_irq: nesting of hardware
+     * interrupt handlers, whose wakes are not the running thread's own. */
+    uint64_t wake_vr;
     int in_irq;
 };
 
