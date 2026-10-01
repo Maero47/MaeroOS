@@ -62,8 +62,22 @@ def make_host_symlinks():
             raise AssertionError(f"debugfs could not create {name}")
 
 
+def clear_respawn_marks():
+    """respawnprobe exits (and is respawned) only on a boot that finds no
+    /home/root/respawn-alive.  This suite removes the marks at its end, but
+    any other boot of disk.img without snapshot=on (smoke-ext4's first boot,
+    a `make run`) leaves them behind, and the respawn this suite waits for
+    then never happens.  Start from the state the check expects."""
+    tool = shutil.which("debugfs") or "/sbin/debugfs"
+    img = os.path.join(ROOT, "disk.img")
+    for name in ("respawn-first", "respawn-alive"):
+        subprocess.run([tool, "-w", "-R", f"rm /home/root/{name}", img],
+                       capture_output=True, timeout=30)
+
+
 def main():
     make_host_symlinks()
+    clear_respawn_marks()
     proc = subprocess.Popen(
         [
             "qemu-system-i386",

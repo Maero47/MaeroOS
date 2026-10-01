@@ -6,6 +6,7 @@
 cat /proc/partitions                   # hda, hdb, hdb1, hdb2, hdc5, ...
 mkdir -p /mnt
 mount -t ext4 /dev/hdb2 /mnt           # busybox: "is write-protected, mounting read-only"
+mount -t ext2 /dev/sdb1 /data          # read-write (fs/ext2.c), see "Read-write" below
 mount -o ro -t ext4 /dev/hdc5 /mnt2    # the same, without the retry
 cat /proc/mounts
 umount /mnt
@@ -28,6 +29,7 @@ partitions are `sdb2`, `nvme0n1p5`.
 | `drivers/blkpart.c` | one `blkpart_t` per disk and partition, a view over `blkdev.c`'s table: MBR primaries 1-4, logical partitions from 5 (walking the EBR chain), GPT entries (header and entry-array CRC32 checked, backup header as fallback); `/dev/<name>` nodes (raw access for root; writes to the disk mounted at `/disk` are `EBUSY`; `docs/install.md`) and `/proc/partitions` |
 | `fs/vfs.c` | the mount table: `vfs_mount_add/find/remove`, crossing in the path walk, the mount each lookup ends on (for `MS_RDONLY`), `/proc/mounts` |
 | `fs/mount.c` | `mount_do()`/`umount_do()`: types `ext4`/`ext3`/`ext2` (block device source), `tmpfs`, `proc`, `devtmpfs`; `MS_REMOUNT`, `MS_BIND`, propagation flags (accepted, no-op) |
+| `fs/ext2.c` | the read-write ext2 driver: `/disk` and every read-write mount |
 | `fs/ext4.c` | the read-only ext2/3/4 driver |
 | `proc/syscall.c` | `mount` (21), `umount` (22), `umount2` (52); `EROFS` on read-only mounts for open-for-write, create, mkdir, mknod, unlink, rmdir, rename, symlink, link, truncate, chmod, chown, the utime family, and through descriptors for fchmod, fchown, ftruncate, fallocate, futimens |
 | `userspace/mntprobe` | bind pinning, umount-by-name after slot reuse, `EROFS`/`EBUSY` through descriptors (run by `smoke-ext4`) |
@@ -51,7 +53,9 @@ this inside the Alpine chroot).
   it; `umount` of the lower one is `EBUSY` while the upper one exists.
 * `umount` is `EBUSY` while a file of the filesystem is open (descriptor or
   mapping) or a process's cwd is inside it; `MNT_DETACH` removes the mount
-  anyway and leaves a still-busy instance allocated.
+  anyway; a still-busy instance stays allocated and keeps its device taken (a
+  second mount of it, and raw writes through `/dev`, are `EBUSY`) until it is
+  idle, when the next such check releases it.
 * The boot mounts (`/disk`, `/tmp`, `/dev`, `/proc`, made by `vfs_mount()`)
   are listed in `/proc/mounts` but cannot be unmounted.
 * `rmdir`/`unlink` of a mountpoint is `EBUSY`.
@@ -98,12 +102,46 @@ Refused at mount: `needs_recovery` (the journal must be replayed first,
 errors, mounts with a warning. Unknown read-only-compatible features do not
 matter to a reader.
 
-### Why read-only
+### Read-write: the ext2 driver
+
+A read-write mount request of type `ext2`, `ext3` or `ext4` goes to
+`fs/ext2.c`, the driver behind `/disk`, which keeps one instance per mounted
+filesystem (geometry, block cache, node cache, open-inode table). It takes the
+filesystem when:
+
+* the only incompatible feature is `filetype` (no `extent`, `64bit`,
+  `flex_bg`, `meta_bg`, `inline_data`, ...), and `needs_recovery` is not set;
+* every read-only-compatible feature is one it keeps intact: `sparse_super`,
+  `large_file`, `btree_dir`, `dir_nlink`. Others (`metadata_csum`,
+  `gdt_csum`/`uninit_bg`, `huge_file`, `extra_isize`, ...) would be left
+  inconsistent by its writes.
+
+So plain ext2 and ext3 (an empty journal is written around, as Linux's ext2
+driver does) mount read-write; a modern ext4 gets `EROFS` and busybox retries
+read-only, which is this driver's. `mount -t ext2 -o ro` stays with the ext2
+driver when it can read the filesystem, so `remount,rw` works there.
+
+While mounted read-write the superblock is marked not clean (mount count and
+time updated) and marked clean again at `umount` or `remount,ro`; writes are
+synchronous (the disk drivers flush every write), so that is all `umount` has
+to sync. A directory with an htree index loses its index flag when the driver
+changes it (it stays a valid linear directory; Linux's ext2 does the same),
+deleting an inode releases its extended-attribute block, and `mkdir`/`rmdir`
+keep the group's directory count. `umount` is `EBUSY` while a file or
+directory of the instance is open. Raw writes through `/dev/<name>` to a
+mounted device, or to a disk or partition overlapping one, are `EBUSY`, as
+they are for `/disk`'s disk.
+
+`make smoke-ext2rw` (`tools/smoke_ext2rw.py`, images in `build/ext2rw/`)
+mounts an ext2 on AHCI and an ext3 on NVMe read-write together and checks the
+result on the host with `e2fsck -fn` and `debugfs`.
+
+### Why the ext4 driver is read-only
 
 Every Linux ext4 filesystem made by a distribution has a journal
 (`has_journal`). Writing to it correctly needs either jbd2 transactions or
 the guarantee that the journal is empty and stays consistent with metadata
-written around it. Writing directly and clearing `has_journal` would change
+written around it (which is what the ext2 driver relies on for ext3, above). Writing directly and clearing `has_journal` would change
 the filesystem behind the owner's back; writing without updating the
 metadata checksums (`metadata_csum` is the default) would corrupt it. Neither
 is acceptable, so the driver never issues a write: a read-write mount request

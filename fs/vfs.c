@@ -610,6 +610,36 @@ int vfs_mnt_rdonly(const vfs_mnt_t *m, uint32_t seq) {
            (m->flags & VFS_MS_RDONLY);
 }
 
+/* Instances detached by a lazy umount while still busy.  Their descriptors
+ * keep reading and writing the device, so the device stays taken: it cannot
+ * be mounted again, or written through /dev, until the last one closes.  The
+ * instance is released when a later check finds it idle. */
+typedef struct {
+    int    used;
+    char   source[64];
+    void  *fs;
+    int  (*busy)(void *fs);
+    void (*release)(void *fs);
+} vfs_detached_t;
+static vfs_detached_t g_detached[VFS_MNT_MAX];
+
+/* Release every detached instance that has gone idle. */
+static void detached_reap(void) {
+    for (int i = 0; i < VFS_MNT_MAX; i++) {
+        void (*release)(void *) = NULL;
+        void *fs = NULL;
+        preempt_disable();
+        vfs_detached_t *d = &g_detached[i];
+        if (d->used && !(d->busy && d->busy(d->fs))) {
+            release = d->release;
+            fs = d->fs;
+            d->used = 0;
+        }
+        preempt_enable();
+        if (release) release(fs);
+    }
+}
+
 int vfs_mount_remove(vfs_mnt_t *m, uint32_t flags) {
     if (!m || !m->used || m->boot) return -22;
     /* Busy while a mount sits inside it, or a bind mount shows one of its
@@ -628,8 +658,24 @@ int vfs_mount_remove(vfs_mnt_t *m, uint32_t flags) {
     g_mnt_active--;
     preempt_enable();
     /* A lazily detached instance that still has open files is left alive:
-     * its descriptors keep working, and it is never freed. */
-    if (release && !busy) release(fs);
+     * its descriptors keep working, and it keeps its device until it is
+     * idle (see g_detached). */
+    if (busy) {
+        preempt_disable();
+        for (int i = 0; i < VFS_MNT_MAX; i++) {
+            vfs_detached_t *d = &g_detached[i];
+            if (d->used) continue;
+            d->used = 1;
+            mnt_copy_str(d->source, m->source, sizeof(d->source));
+            d->fs = fs;
+            d->busy = m->busy;
+            d->release = release;
+            break;
+        }
+        preempt_enable();
+    } else if (release) {
+        release(fs);
+    }
     return 0;
 }
 
@@ -663,14 +709,11 @@ void vfs_mount_note(const char *source, const char *target, const char *fstype,
 }
 
 int vfs_mount_has_fs_source(const char *source) {
-    for (int i = 0; i < VFS_MNT_MAX; i++)
+    detached_reap();
+    for (int i = 0; i < VFS_MNT_MAX; i++) {
         if (g_mnt[i].used && strcmp(g_mnt[i].source, source) == 0) return 1;
-    return 0;
-}
-
-int vfs_mount_any_source(int (*fn)(const char *source, void *arg), void *arg) {
-    for (int i = 0; i < VFS_MNT_MAX; i++)
-        if (g_mnt[i].used && fn(g_mnt[i].source, arg)) return 1;
+        if (g_detached[i].used && strcmp(g_detached[i].source, source) == 0) return 1;
+    }
     return 0;
 }
 

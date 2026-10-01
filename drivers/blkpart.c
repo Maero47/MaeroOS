@@ -5,6 +5,7 @@
 #include "../lib/printf.h"
 #include "../kernel/printk.h"
 #include "../proc/scheduler.h"
+#include "../fs/vfs.h"
 #include <stddef.h>
 
 /*
@@ -18,6 +19,23 @@ static blkpart_t *g_parts[BLKPART_MAX];
 static uint32_t   g_nparts;
 
 /* ── Raw sector I/O ─────────────────────────────────────────────────────── */
+
+/* A mount(2) filesystem sits on sectors [start, start + nsect) of disk `dev`,
+ * on a partition or whole disk overlapping them, or did until a lazy umount
+ * and still has files open (vfs_mount_has_fs_source): its driver caches what
+ * it read and is not told about raw writes.  vfat and ext2/ext4 mounts, USB
+ * sticks included. */
+static int range_mounted(int dev, uint32_t start, uint32_t nsect) {
+    for (uint32_t i = 0; i < g_nparts; i++) {
+        const blkpart_t *o = g_parts[i];
+        if (o->dev != dev || o->start >= start + nsect || start >= o->start + o->nsect)
+            continue;
+        char src[24];
+        snprintf(src, sizeof(src), "/dev/%s", o->name);
+        if (vfs_mount_has_fs_source(src)) return 1;
+    }
+    return 0;
+}
 
 int blkpart_read(blkpart_t *bp, uint32_t sector, uint32_t count, void *buf) {
     if (!bp || bp->gone || !count || count > 128) return -1;
@@ -33,16 +51,8 @@ int blkpart_write(blkpart_t *bp, uint32_t sector, uint32_t count, const void *bu
 
 /* ── Byte-granular access, used by the /dev node and by pread64/pwrite64 ──── */
 
-/* vfs_mount_any_source callback: `source` is /dev/<a partition or disk> on
- * disk *(int *)arg. */
-static int source_on_disk(const char *source, void *arg) {
-    if (strncmp(source, "/dev/", 5) != 0) return 0;
-    blkpart_t *p = blkpart_find(source + 5);
-    return p && p->dev == *(const int *)arg;
-}
-
 int blkpart_disk_in_use(int dev) {
-    return blk_disk_busy(dev) || vfs_mount_any_source(source_on_disk, &dev);
+    return blk_disk_busy(dev) || range_mounted(dev, 0, 0xFFFFFFFFu);
 }
 
 int blkpart_rw(blkpart_t *bp, uint64_t off, uint8_t *buf, uint32_t len, int write) {
@@ -51,10 +61,11 @@ int blkpart_rw(blkpart_t *bp, uint64_t off, uint8_t *buf, uint32_t len, int writ
     if (len == 0) return 0;
     if (off >= size) return write ? -28 : 0;               /* -ENOSPC / EOF */
     if ((uint64_t)len > size - off) len = (uint32_t)(size - off);
-    /* The disk ext2 has mounted at /disk, and any disk with a mounted
-     * partition (vfat, ext4; a USB stick too), is never written behind the
-     * filesystem's back. */
-    if (write && blkpart_disk_in_use(bp->dev)) return -16; /* -EBUSY */
+    /* The disk ext2 has mounted at /disk, and any range a mounted filesystem
+     * sits on, is never written behind the filesystem's back. */
+    if (write && (blk_disk_busy(bp->dev) ||
+                  range_mounted(bp->dev, bp->start, bp->nsect)))
+        return -16;                                        /* -EBUSY */
     uint8_t *sec = NULL;
     uint32_t done = 0;
     int err = 0;

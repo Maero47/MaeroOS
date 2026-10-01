@@ -330,10 +330,7 @@ uint32_t vfs_mounts_format(char *buf, uint32_t size);
  * set, the directory that would hold it) is on a read-only mount. */
 int vfs_path_rdonly(const char *path, int parent);
 
-/* 1 when some mount's instance is `fs` (used to refuse a second mount of a
- * device). */
+/* 1 when `source` is mounted, or was lazily unmounted (MNT_DETACH) and its
+ * instance still has open files (used to refuse a second mount of a device,
+ * and raw writes to it).  Releases detached instances that have gone idle. */
 int vfs_mount_has_fs_source(const char *source);
-
-/* 1 when `fn` returns nonzero for the source of some mount (mount(2) or a
- * boot note): blkpart_rw asks whether a disk holds a mounted filesystem. */
-int vfs_mount_any_source(int (*fn)(const char *source, void *arg), void *arg);
