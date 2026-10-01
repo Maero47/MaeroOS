@@ -130,6 +130,14 @@ def check_fsck():
 def main():
     os.makedirs(WORK, exist_ok=True)
     subprocess.run(["cp", "--reflink=auto", os.path.join(ROOT, "disk.img"), IMG], check=True)
+    # disk.img may already have been through smoke-disk (make check runs it
+    # first), and diskprobe cannot remove the /dpdir that run left behind.
+    listing = debugfs("-R", "ls /dpdir").stdout.decode("utf-8", "replace")
+    if "File not found" not in listing:
+        for ino, name in re.findall(r"(\d+)\s+\(\d+\)\s+(\S+)", listing):
+            if ino != "0" and name not in (".", ".."):
+                debugfs("-R", f"rm /dpdir/{name}", write=True)
+        debugfs("-R", "rmdir /dpdir", write=True)
     data = os.urandom(BIG_BYTES)
     with open(BIG, "wb") as f:
         f.write(data)
@@ -147,7 +155,7 @@ def main():
     try:
         smokelib.login(proc, sel, log)
         check_boot_log(log, "pc+ahci")
-        run(proc, sel, log, "cat /disk/hello.txt\n", "Hello from MaeroOS")
+        run(proc, sel, log, "cat /disk/hello.txt\n", "o from MaeroOS initrd!")  # smoke-disk overwrites the start
         run(proc, sel, log, "diskprobe\n", "diskprobe ok")
         run(proc, sel, log, "fsprobe\n", "fsprobe ok", "fsprobe FAIL")
         run(proc, sel, log, "symprobe\n", "symprobe ok", "symprobe FAIL")
