@@ -111,6 +111,19 @@ int elf_load_bias(vfs_node_t *node, uint32_t pgdir_phys, uint32_t want_bias,
     info->phnum      = ehdr->e_phnum;
     info->has_interp = 0;
     info->interp[0]  = '\0';
+    info->stack_flags = -1;
+
+    /* PT_GNU_STACK first: without one this is a legacy i386 object whose
+     * readable segments must all stay executable (Linux READ_IMPLIES_EXEC,
+     * elf_read_implies_exec), and it can come after the PT_LOADs. */
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        if (ehdr->e_phoff + (uint32_t)(i + 1) * ehdr->e_phentsize > node->size)
+            break;
+        const Elf32_Phdr *ph =
+            (const Elf32_Phdr *)(img + ehdr->e_phoff + (uint32_t)i * ehdr->e_phentsize);
+        if (ph->p_type == PT_GNU_STACK) info->stack_flags = (int)ph->p_flags;
+    }
+    int read_implies_exec = info->stack_flags < 0;
 
     /* Walk program headers */
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
@@ -175,12 +188,15 @@ int elf_load_bias(vfs_node_t *node, uint32_t pgdir_phys, uint32_t want_bias,
          * elf_map with make_prot(p_flags)).  Read-only pages also carry
          * PAGE_WRPROT, the "write refused" marker the COW fault handler checks:
          * fork makes every private page COW, and without it a write to .text
-         * in the child would break COW instead of raising SIGSEGV.  Execute
-         * permission cannot be expressed: i686 without PAE has no NX bit, so
-         * every present user page is executable. */
-        uint32_t pflags = (phdr->p_flags & PF_W)
-                          ? PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE
-                          : PAGE_PRESENT | PAGE_USER | PAGE_WRPROT;
+         * in the child would break COW instead of raising SIGSEGV.  Only a
+         * PF_X segment is executable (NX on the rest; a no-op without PAE+NX),
+         * unless the object predates PT_GNU_STACK. */
+        int seg_exec = (phdr->p_flags & PF_X) ||
+                       (read_implies_exec && (phdr->p_flags & PF_R));
+        pte_t pflags = ((phdr->p_flags & PF_W)
+                        ? PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE
+                        : PAGE_PRESENT | PAGE_USER | PAGE_WRPROT) |
+                       page_nx_unless(seg_exec);
 
         /* Map and populate each page.  A biased segment may share its first
          * or last page with an adjacent segment (PIE text/data are often only
@@ -189,10 +205,19 @@ int elf_load_bias(vfs_node_t *node, uint32_t pgdir_phys, uint32_t want_bias,
          * stay writable for the data half. */
         for (uint32_t va = vstart; va < vend; va += PAGE_SIZE) {
             uint8_t *dst;
-            uint32_t existing = pgdir_virt_to_phys(pgdir_phys, va);
+            pte_t old = pgdir_virt_to_pte(pgdir_phys, va);
+            phys_t existing = (old & PAGE_PRESENT) ? pte_frame(old) : 0;
             if (existing) {
-                if ((phdr->p_flags & PF_W) &&
-                    pgdir_map(pgdir_phys, va, existing, pflags) != 0) {
+                /* The union: writable if either half is, executable if
+                 * either half is. */
+                pte_t keep = old & (0xFFFU | PAGE_NX) &
+                             ~(pte_t)(PAGE_ACCESSED | PAGE_DIRTY);
+                pte_t uflags = keep;
+                if (phdr->p_flags & PF_W)
+                    uflags = (uflags & ~(pte_t)PAGE_WRPROT) | PAGE_WRITABLE;
+                if (seg_exec) uflags &= ~PAGE_NX;
+                if (uflags != keep &&
+                    pgdir_map(pgdir_phys, va, existing, uflags) != 0) {
                     printk("[ELF] OOM remapping segment page\n");
                     if (owned_hdr) { kfree(owned_hdr); }
                     if (bounce)    { kfree(bounce); }
@@ -200,7 +225,7 @@ int elf_load_bias(vfs_node_t *node, uint32_t pgdir_phys, uint32_t want_bias,
                 }
                 dst = (uint8_t *)paging_temp_map(existing);
             } else {
-                uint32_t phys = pmm_alloc_frame();
+                phys_t phys = pmm_alloc_user_frame();
                 if (!phys) {
                     printk("[ELF] OOM loading segment\n");
                     if (owned_hdr) { kfree(owned_hdr); }

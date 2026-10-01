@@ -45,7 +45,8 @@
  * before the first process is created.
  *
  *   0xC0000000-0xD0000000  direct map of the first 256 MiB of RAM (paging.c);
- *                          PTEs 1-2 are the temp-map slots (TEMP_MAP_VIRT*)
+ *                          PTEs 1-2 are the temp-map slots (TEMP_MAP_VIRT*).
+ *                          No-execute (PAE + NX) outside kernel .text
  *   0xD0000000-0xE0000000  kernel heap (HEAP_START..HEAP_MAX)
  *   0xE0000000-0xF0000000  framebuffer (drivers/framebuffer.c)
  *   0xF0000000-0xF2000000  kernel stacks (KSTACK_REGION_*)
@@ -60,8 +61,11 @@
  *                          time too, so its page tables are reserved up front
  *   0xFEC00000             I/O APIC (not mapped; MADT only)
  *   0xFEE00000             local APIC, identity-mapped (LAPIC_PHYS_BASE)
- *   0xFEE01000-0xFFC00000  free
- *   0xFFC00000-0xFFFFFFFF  recursive page tables and page directory
+ *   0xFEE01000-0xFF800000  free
+ *   0xFF800000-0xFFFFFFFF  recursive page tables and directories: PAE uses
+ *                          all 8 MiB (tables from 0xFF800000, the four
+ *                          directories at 0xFFFFC000), legacy paging the top
+ *                          4 MiB (0xFFC00000, directory at 0xFFFFF000)
  *
  * The _Static_asserts below keep the windows from growing into each other.
  */

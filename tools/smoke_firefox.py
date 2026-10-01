@@ -1226,8 +1226,9 @@ def main():
     ap.add_argument("--out", default=os.path.join("build", "ff-smoke"), help="artifact root")
     ap.add_argument("--tag", default=None, help="suffix for the artifact directory (default: accel-smpN)")
     ap.add_argument("--qemu", default="qemu-system-i386")
-    ap.add_argument("--cpu", default=None,
-                    help="QEMU -cpu model (default: QEMU's own). "
+    ap.add_argument("--cpu", default=os.environ.get("SMOKE_CPU", "qemu32,+nx") or None,
+                    help="QEMU -cpu model (default: $SMOKE_CPU, else qemu32,+nx: QEMU's "
+                         "own model plus NX, so the JIT runs under W^X; \"\" = QEMU's own). "
                          "Use to test what the guest does with a wider feature set, e.g. --cpu host")
     ap.add_argument("--hold", type=float, default=25.0,
                     help="seconds to keep sampling frames after the paint verdict "

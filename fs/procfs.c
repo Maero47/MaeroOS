@@ -11,6 +11,7 @@
 #include "../mm/pmm.h"
 #include "../kernel/klog.h"
 #include "../arch/i686/cpu/pit.h"
+#include "../arch/i686/mm/paging.h"
 #include <kernel/config.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -726,7 +727,7 @@ static uint32_t procfs_meminfo_read(vfs_node_t *n, uint32_t off, uint32_t len,
     (void)n;
     char content[256];
     uint32_t pos = 0;
-    uint32_t total_kb = pmm_total_frames() * 4;
+    uint32_t total_kb = pmm_ram_frames() * 4;
     uint32_t free_kb  = pmm_free_frames()  * 4;
 
     pappend(content, &pos, sizeof(content), "MemTotal:     ");
@@ -734,6 +735,13 @@ static uint32_t procfs_meminfo_read(vfs_node_t *n, uint32_t off, uint32_t len,
     pappend(content, &pos, sizeof(content), " kB\n");
     pappend(content, &pos, sizeof(content), "MemFree:      ");
     pappend_int(content, &pos, sizeof(content), free_kb);
+    pappend(content, &pos, sizeof(content), " kB\n");
+    /* RAM above 4 GiB (PAE): only user pages go there. */
+    pappend(content, &pos, sizeof(content), "HighTotal:    ");
+    pappend_int(content, &pos, sizeof(content), (int)(pmm_high_frames() * 4));
+    pappend(content, &pos, sizeof(content), " kB\n");
+    pappend(content, &pos, sizeof(content), "HighFree:     ");
+    pappend_int(content, &pos, sizeof(content), (int)(pmm_high_free_frames() * 4));
     pappend(content, &pos, sizeof(content), " kB\n");
     content[pos] = '\0';
 
@@ -780,13 +788,20 @@ static uint32_t procfs_uptime_read(vfs_node_t *n, uint32_t off, uint32_t len,
 static uint32_t procfs_cpuinfo_read(vfs_node_t *n, uint32_t off, uint32_t len,
                                      uint8_t *buf) {
     (void)n;
-    static const char content[] =
-        "processor\t: 0\n"
-        "vendor_id\t: MaeroOS\n"
-        "model name\t: i686\n"
-        "cpu MHz\t\t: 1000\n"
-        "bogomips\t: 2000.00\n";
-    uint32_t total = (uint32_t)(sizeof(content) - 1);
+    /* The flags line names only what the kernel turned on that a program
+     * may want to know about: PAE paging and NX (wxprobe checks for "nx"). */
+    char content[160];
+    uint32_t total = 0;
+    pappend(content, &total, sizeof(content),
+            "processor\t: 0\n"
+            "vendor_id\t: MaeroOS\n"
+            "model name\t: i686\n"
+            "cpu MHz\t\t: 1000\n"
+            "bogomips\t: 2000.00\n"
+            "flags\t\t: fpu");
+    if (paging_pae) pappend(content, &total, sizeof(content), " pae");
+    if (paging_nx)  pappend(content, &total, sizeof(content), " nx");
+    pappend(content, &total, sizeof(content), "\n");
     if (off >= total) return 0;
     uint32_t avail = total - off;
     if (avail > len) avail = len;

@@ -105,7 +105,7 @@ void *kstack_alloc(void) {
         uint32_t base = slot_base((unsigned)pick);
         for (unsigned k = 0; k < KSTACKSIZE / PAGE_SIZE; k++) {
             if (vmm_alloc_page(base + k * PAGE_SIZE,
-                               PAGE_PRESENT | PAGE_WRITABLE) != 0) {
+                               PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX) != 0) {
                 kmem_oom_report("physical memory for a kernel stack", base);
                 unmap_stack(base, k);
                 f = irq_save();

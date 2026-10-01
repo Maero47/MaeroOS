@@ -18,6 +18,8 @@ global ap_trampoline_end
 global ap_tramp_cr3
 global ap_tramp_stack
 global ap_tramp_entry
+global ap_tramp_cr4
+global ap_tramp_nx
 
 bits 16
 ap_trampoline_start:
@@ -43,6 +45,19 @@ ap_pm32:
     mov ss, ax
     mov fs, ax
     mov gs, ax
+    ; PAE and NX as the BSP runs them (patched): CR4.PAE before CR3 is
+    ; loaded, EFER.NXE before paging walks the kernel's NX entries.
+    mov eax, [TRAMP_BASE + (ap_tramp_cr4 - ap_trampoline_start)]
+    mov ecx, cr4
+    or  ecx, eax
+    mov cr4, ecx
+    cmp dword [TRAMP_BASE + (ap_tramp_nx - ap_trampoline_start)], 0
+    je  .no_nx
+    mov ecx, 0xC0000080    ; IA32_EFER
+    rdmsr
+    or  eax, 0x800         ; NXE
+    wrmsr
+.no_nx:
     ; CR3 = kernel page directory (patched by the BSP)
     mov eax, [TRAMP_BASE + (ap_tramp_cr3 - ap_trampoline_start)]
     mov cr3, eax
@@ -74,4 +89,6 @@ align 4
 ap_tramp_cr3:   dd 0       ; patched: kernel pgdir physical address
 ap_tramp_stack: dd 0       ; patched: per-CPU kernel stack top (virtual)
 ap_tramp_entry: dd 0       ; patched: ap_entry() virtual address
+ap_tramp_cr4:   dd 0       ; patched: CR4 bits to set (PAE)
+ap_tramp_nx:    dd 0       ; patched: 1 = set EFER.NXE
 ap_trampoline_end:

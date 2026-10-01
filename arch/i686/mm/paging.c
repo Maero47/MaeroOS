@@ -21,15 +21,33 @@ extern int vma_handle_fault(uint32_t addr);   /* demand-paged anonymous VMAs */
 extern int vma_prot_lookup(uint32_t addr);    /* mmap prot of the VMA at addr, -1 if none */
 
 /*
- * paging.c — x86 two-level page table management.
+ * paging.c — x86 page table management, legacy two-level (4-byte entries) or
+ * PAE three-level (8-byte entries, NX), chosen by boot.asm from CPUID.
  *
- * Recursive mapping (PDE[1023] = page directory itself):
- *   0xFFC00000 + i*4096  → page table i (all 1024 page tables accessible)
- *   0xFFFFF000           → the page directory itself
+ * Recursive mapping (paging.h has the details):
+ *   legacy: PDE[1023] = the page directory itself; tables at 0xFFC00000,
+ *           the directory at 0xFFFFF000.
+ *   PAE:    PD3[508..511] = page directories 0..3; tables at 0xFF800000,
+ *           the four directories at 0xFFFFC000 (one 2048-entry array).
+ *
+ * An address space is named by what CR3 holds: the page directory (legacy) or
+ * the PDPT (PAE) — "pgdir_phys" everywhere.  A PAE address space owns five
+ * frames: the PDPT and its four directories, allocated together, so PDPT
+ * entries never change after creation (the CPU caches them at each CR3 load).
+ * Directory 3's entries 0..507 map the kernel and are copied from the kernel
+ * address space, sharing its page tables, exactly like legacy PDEs 768..1022.
  */
 
 /* Provided by boot.asm — the boot page directory (virtual address) */
 extern uint32_t boot_page_directory[];
+extern uint64_t boot_pae_pd[];           /* PAE: PD0..PD3, 512 entries each */
+
+uint32_t paging_nx;
+
+/* Kernel-half entries of directory 3 (PAE) / of the directory (legacy) that
+ * every address space shares: below the recursive slot(s). */
+#define PAE_KERNEL_PDES   508U           /* PD3[0..507]; 508..511 recursive */
+#define PAE_REC_INDEX     (3U * 512U + PAE_KERNEL_PDES)   /* global PDE 2044 */
 
 /* Linker symbols for kernel section boundaries */
 extern char _kernel_phys_start[], _kernel_phys_end[];
@@ -53,12 +71,10 @@ static int fixup_exception(registers_t *regs) {
 /* Physical address of the kernel page directory (exported for scheduler CR3 switching) */
 uint32_t kernel_pgdir_phys;
 
-#define KPGDIR ((uint32_t *)PAGE_DIR_VIRT)
-
 static void page_fault_handler(registers_t *regs);
 static void map_higher_half_physical_memory(void);
 
-void *paging_temp_map(uint32_t phys);
+void *paging_temp_map(phys_t phys);
 void  paging_temp_unmap(void);
 
 /*
@@ -68,9 +84,8 @@ void  paging_temp_unmap(void);
  * the page tables are then shared and growth is globally visible.
  */
 static void reserve_kernel_pagetables(uint32_t start, uint32_t end) {
-    for (uint32_t va = start & ~0x3FFFFFU; va < end; va += 0x400000U) {
-        uint32_t *pde = paging_get_pde(va);
-        if (*pde & PAGE_PRESENT) continue;
+    for (uint32_t va = start & ~(PT_SPAN - 1); va < end; va += PT_SPAN) {
+        if (pde_present(va)) continue;
         uint32_t pt_phys = pmm_alloc_frame();
         /* FATAL by design (audit category (c)): called from paging_init before
          * the heap exists, to put the kernel's PDEs in place so every later
@@ -80,14 +95,91 @@ static void reserve_kernel_pagetables(uint32_t start, uint32_t end) {
         if (!pt_phys)
             panic("paging_init: no memory for a kernel page table", 0);
         pmm_frame_incref(pt_phys);          /* permanent — never freed */
-        *pde = pt_phys | PAGE_PRESENT | PAGE_WRITABLE;   /* kernel-only PDE */
-        uint32_t *pt = paging_get_pte(va);  /* recursive window to the new PT */
-        for (int i = 0; i < 1024; i++) pt[i] = 0;
+        pde_set(va, pt_phys | PAGE_PRESENT | PAGE_WRITABLE);   /* kernel-only PDE */
+        /* recursive window to the new PT */
+        __builtin_memset((void *)pt_window(pt_index(va)), 0, PAGE_SIZE);
     }
 }
 
+/* Turn on EFER.NXE when the CPU has NX (CPUID 0x80000001:EDX bit 20).  Only
+ * meaningful with PAE: legacy entries have no bit 63.  "nonx" on the kernel
+ * command line keeps it off (paging_nx_disable). */
+static int nx_refused;
+void paging_nx_disable(void) { nx_refused = 1; }
+
+static void enable_nx(void) {
+    if (!paging_pae || nx_refused) return;
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000000U));
+    if (a < 0x80000001U) return;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000001U));
+    if (!(d & (1U << 20))) return;
+    uint32_t lo, hi;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000080U));
+    lo |= 0x800U;                                       /* EFER.NXE */
+    __asm__ volatile("wrmsr" :: "a"(lo), "d"(hi), "c"(0xC0000080U));
+    paging_nx = 1;
+}
+
+/*
+ * A new PAE address space: PDPT + four zeroed directories, directory 3's
+ * kernel half copied from `kpd3` (a kernel address of 508 8-byte PDEs) and
+ * its last four entries pointing back at the directories.  Returns the PDPT
+ * frame, 0 on OOM.  Uses the temp maps, with interrupts off.
+ */
+static uint32_t pae_pgdir_fill(const volatile void *kpd3);
+static uint32_t pae_pgdir_new(const volatile void *kpd3) {
+    uint32_t fl;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+    uint32_t pdpt = pae_pgdir_fill(kpd3);
+    if (fl & 0x200) __asm__ volatile("sti");
+    return pdpt;
+}
+
+static uint32_t pae_pgdir_fill(const volatile void *kpd3) {
+    uint32_t pdpt = pmm_alloc_frame();
+    if (!pdpt) return 0;
+    uint32_t pd[4];
+    for (int k = 0; k < 4; k++) {
+        pd[k] = pmm_alloc_frame();
+        if (!pd[k]) {
+            while (--k >= 0) pmm_free_frame(pd[k]);
+            pmm_free_frame(pdpt);
+            return 0;
+        }
+    }
+    for (int k = 0; k < 4; k++) {
+        volatile void *t = paging_temp_map(pd[k]);
+        __builtin_memset((void *)t, 0, PAGE_SIZE);
+        if (k == 3) {
+            for (uint32_t i = 0; i < PAE_KERNEL_PDES; i++)
+                tbl_set(t, i, tbl_get(kpd3, i));
+            for (uint32_t j = 0; j < 4; j++)
+                tbl_set(t, PAE_KERNEL_PDES + j, pd[j] | PAGE_PRESENT | PAGE_WRITABLE);
+        }
+        paging_temp_unmap();
+    }
+    volatile void *t = paging_temp_map(pdpt);
+    __builtin_memset((void *)t, 0, PAGE_SIZE);
+    for (uint32_t k = 0; k < 4; k++)
+        tbl_set(t, k, pd[k] | PAGE_PRESENT);   /* a PDPTE takes P/PWT/PCD only */
+    paging_temp_unmap();
+    return pdpt;
+}
+
 void paging_init(void) {
-    uint32_t pd_phys = pmm_alloc_frame();
+    enable_nx();
+
+    uint32_t pd_phys;
+    if (paging_pae) {
+        pd_phys = pae_pgdir_new(&boot_pae_pd[3 * 512]);
+        /* FATAL by design (audit category (c)): the kernel page directory,
+         * the very first allocation the kernel makes. */
+        if (!pd_phys)
+            panic("paging_init: no memory for the kernel page directory", 0);
+        goto loaded;
+    }
+    pd_phys = pmm_alloc_frame();
     /* FATAL by design (audit category (c)): the kernel page directory, the
      * very first allocation the kernel makes. */
     if (!pd_phys)
@@ -111,6 +203,7 @@ void paging_init(void) {
 
     paging_temp_unmap();
 
+loaded:
     /* Switch to the new page directory */
     __asm__ volatile("mov %0, %%cr3" :: "r"(pd_phys) : "memory");
 
@@ -141,6 +234,9 @@ void paging_init(void) {
 
     printk("[VMM]  New PD at phys 0x%08x. Recursive mapping active.\n",
            (unsigned)pd_phys);
+    printk("[VMM]  Paging: %s, NX %s.\n",
+           paging_pae ? "PAE (3-level, 64-bit entries)" : "legacy 2-level (no PAE)",
+           paging_nx ? "on" : "off");
 }
 
 /*
@@ -181,8 +277,7 @@ void kmem_oom_report(const char *what, unsigned detail) {
  * individual page), which is what paging_map has always done.
  */
 int paging_reserve_table(uint32_t virt, int user) {
-    uint32_t *pde = paging_get_pde(virt);
-    if (*pde & PAGE_PRESENT) return 0;
+    if (pde_present(virt)) return 0;
 
     /*
      * Allocating a page table for a not-present PDE must be atomic w.r.t.
@@ -196,17 +291,15 @@ int paging_reserve_table(uint32_t virt, int user) {
     uint32_t eflags;
     __asm__ volatile("pushf; pop %0; cli" : "=r"(eflags) :: "memory");
     int rc = 0;
-    if (!(*pde & PAGE_PRESENT)) {        /* re-check inside the critical section */
+    if (!pde_present(virt)) {            /* re-check inside the critical section */
         uint32_t pt_phys = pmm_alloc_frame();
         if (!pt_phys) {
             rc = -1;
         } else {
-            *pde = pt_phys | PAGE_PRESENT | PAGE_WRITABLE |
-                   (user ? PAGE_USER : 0U);
+            pde_set(virt, pt_phys | PAGE_PRESENT | PAGE_WRITABLE |
+                          (user ? PAGE_USER : 0U));
             /* Zero the new page table via the recursive window */
-            uint32_t *pt = paging_get_pte(virt & ~0x3FFFFFU);
-            for (int i = 0; i < 1024; i++)
-                pt[i] = 0;
+            __builtin_memset((void *)pt_window(pt_index(virt)), 0, PAGE_SIZE);
         }
     }
     if (eflags & 0x200) __asm__ volatile("sti");
@@ -223,9 +316,9 @@ int paging_reserve_table(uint32_t virt, int user) {
  * For a caller whose mapping loop must not fail halfway.
  */
 int paging_reserve_range(uint32_t start, uint32_t end, int user) {
-    for (uint32_t v = start & ~0x3FFFFFU; v < end; v += 0x400000U) {
+    for (uint32_t v = start & ~(PT_SPAN - 1); v < end; v += PT_SPAN) {
         if (paging_reserve_table(v, user) != 0) return -1;
-        if (v + 0x400000U < v) break;              /* 4 GiB wrap */
+        if (v + PT_SPAN < v) break;                /* 4 GiB wrap */
     }
     return 0;
 }
@@ -236,14 +329,14 @@ int paging_reserve_range(uint32_t start, uint32_t end, int user) {
  * mapping (mmap, brk, stack growth, COW) a machine halt.  On failure NOTHING
  * has been changed, so a caller can propagate -ENOMEM without unwinding.
  */
-int paging_map(uint32_t virt, uint32_t phys, uint32_t flags) {
+int paging_map(uint32_t virt, phys_t phys, pte_t flags) {
     virt &= ~0xFFFU;
-    phys &= ~0xFFFU;
+    phys &= ~(phys_t)0xFFFU;
 
     if (paging_reserve_table(virt, (flags & PAGE_USER) != 0) != 0)
         return -1;
 
-    *paging_get_pte(virt) = phys | flags;
+    pte_set(virt, phys | flags);
     tlb_flush_single(virt);
     return 0;
 }
@@ -291,43 +384,65 @@ static void map_higher_half_physical_memory(void) {
 
     printk("[VMM]  RAM: %u MiB total; higher-half direct map covers %u MiB "
            "(rest is high memory via temp maps).\n",
-           (unsigned)(total_phys >> 20),
+           (unsigned)(pmm_ram_frames() / 256),
            (unsigned)(map_limit / (1024U * 1024U)));
 }
 
 void paging_unmap(uint32_t virt) {
     virt &= ~0xFFFU;
-    if (*paging_get_pde(virt) & PAGE_PRESENT) {
-        *paging_get_pte(virt) = 0;
+    if (pde_present(virt)) {
+        pte_set(virt, 0);
         tlb_flush_single(virt);
     }
 }
 
+/* Kernel addresses only: every kernel page is below 4 GiB. */
 uint32_t paging_get_physical(uint32_t virt) {
-    if (!(*paging_get_pde(virt) & PAGE_PRESENT)) return 0;
-    uint32_t pte = *paging_get_pte(virt);
+    pte_t pte = pte_read(virt);
     if (!(pte & PAGE_PRESENT)) return 0;
-    return (pte & ~0xFFFU) | (virt & 0xFFFU);
+    return (uint32_t)pte_frame(pte) | (virt & 0xFFFU);
 }
 
 void paging_set_kernel_permissions(void) {
     uint32_t addr = (uint32_t)(uintptr_t)_text_start;
     while (addr < (uint32_t)(uintptr_t)_text_end) {
-        uint32_t *pte = paging_get_pte(addr);
-        if (*pte & PAGE_PRESENT)
-            *pte &= ~PAGE_WRITABLE;
+        pte_t pte = pte_get(addr);
+        if (pte & PAGE_PRESENT)
+            pte_set(addr, pte & ~(pte_t)PAGE_WRITABLE);
         tlb_flush_single(addr);
         addr += 4096;
     }
     addr = (uint32_t)(uintptr_t)_rodata_start;
     while (addr < (uint32_t)(uintptr_t)_rodata_end) {
-        uint32_t *pte = paging_get_pte(addr);
-        if (*pte & PAGE_PRESENT)
-            *pte &= ~PAGE_WRITABLE;
+        pte_t pte = pte_get(addr);
+        if (pte & PAGE_PRESENT)
+            pte_set(addr, pte & ~(pte_t)PAGE_WRITABLE);
         tlb_flush_single(addr);
         addr += 4096;
     }
-    printk("[VMM]  Kernel .text/.rodata marked read-only (W^X).\n");
+    /* NX on the whole direct map except kernel .text: .rodata, .data, .bss,
+     * the boot code that is done with, and every other RAM page reached
+     * through phys + KERNEL_VMA.  The page tables are shared by every address
+     * space, so this is done once. */
+    uint32_t nx_pages = 0;
+    if (paging_nx) {
+        uint32_t ts = (uint32_t)(uintptr_t)_text_start & ~0xFFFU;
+        uint32_t te = ((uint32_t)(uintptr_t)_text_end + 0xFFFU) & ~0xFFFU;
+        for (addr = KERNEL_VMA; addr < HEAP_START; addr = pt_next(addr)) {
+            if (!pde_present(addr)) continue;
+            for (uint32_t va = addr; va < pt_next(addr); va += PAGE_SIZE) {
+                if (va >= ts && va < te) continue;
+                pte_t pte = pte_get(va);
+                if (!(pte & PAGE_PRESENT) || (pte & PAGE_NX)) continue;
+                pte_set(va, pte | PAGE_NX);
+                nx_pages++;
+            }
+        }
+        tlb_flush_all();
+    }
+    printk("[VMM]  Kernel .text/.rodata marked read-only (W^X)%s.\n",
+           paging_nx ? "; direct map outside .text no-execute" : "");
+    (void)nx_pages;
 }
 
 /* ─── Temporary page mapping ─────────────────────────────────────────────── */
@@ -338,31 +453,37 @@ void paging_set_kernel_permissions(void) {
  * across all page directories.  Must only be used with IF=0.
  */
 
-void *paging_temp_map(uint32_t phys) {
-    *paging_get_pte(TEMP_MAP_VIRT) = (phys & ~0xFFFU) | PAGE_PRESENT | PAGE_WRITABLE;
+void *paging_temp_map(phys_t phys) {
+    pte_set(TEMP_MAP_VIRT, (phys & ~(phys_t)0xFFFU) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX);
     tlb_flush_single(TEMP_MAP_VIRT);
     return (void *)TEMP_MAP_VIRT;
 }
 
 void paging_temp_unmap(void) {
-    *paging_get_pte(TEMP_MAP_VIRT) = 0;
+    pte_set(TEMP_MAP_VIRT, 0);
     tlb_flush_single(TEMP_MAP_VIRT);
 }
 
-void *paging_temp_map2(uint32_t phys) {
-    *paging_get_pte(TEMP_MAP_VIRT2) = (phys & ~0xFFFU) | PAGE_PRESENT | PAGE_WRITABLE;
+void *paging_temp_map2(phys_t phys) {
+    pte_set(TEMP_MAP_VIRT2, (phys & ~(phys_t)0xFFFU) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX);
     tlb_flush_single(TEMP_MAP_VIRT2);
     return (void *)TEMP_MAP_VIRT2;
 }
 
 void paging_temp_unmap2(void) {
-    *paging_get_pte(TEMP_MAP_VIRT2) = 0;
+    pte_set(TEMP_MAP_VIRT2, 0);
     tlb_flush_single(TEMP_MAP_VIRT2);
 }
 
 /* ─── Page directory management ──────────────────────────────────────────── */
 
 uint32_t pgdir_create(void) {
+    /* Directory 3 of the current address space, whose kernel half is the one
+     * every address space shares. */
+    if (paging_pae)
+        return pae_pgdir_new((const volatile void *)(uintptr_t)(PAGE_DIR_VIRT +
+                                                                3U * 4096U));
+
     uint32_t pd_phys = pmm_alloc_frame();
     if (!pd_phys) return 0;
 
@@ -374,7 +495,7 @@ uint32_t pgdir_create(void) {
         pd[i] = 0;
 
     /* Copy kernel higher-half mappings from the current kernel pgdir */
-    uint32_t *cur_pd = KPGDIR;
+    uint32_t *cur_pd = (uint32_t *)PAGE_DIR_VIRT;
     for (int i = 768; i < 1023; i++)
         pd[i] = cur_pd[i];
 
@@ -391,7 +512,7 @@ uint32_t pgdir_create(void) {
  * Temporarily switches CR3 to pgdir_phys so that the recursive mapping
  * works relative to the target pgdir.  IF must be 0 at call time.
  */
-int pgdir_map(uint32_t pgdir_phys, uint32_t virt, uint32_t phys, uint32_t flags) {
+int pgdir_map(uint32_t pgdir_phys, uint32_t virt, phys_t phys, pte_t flags) {
     uint32_t prev_cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(prev_cr3));
     __asm__ volatile("mov %0, %%cr3" :: "r"(pgdir_phys) : "memory");
@@ -400,17 +521,82 @@ int pgdir_map(uint32_t pgdir_phys, uint32_t virt, uint32_t phys, uint32_t flags)
     return rc;
 }
 
-/* Return the physical frame backing `virt` in pgdir_phys, or 0 if unmapped. */
-uint32_t pgdir_virt_to_phys(uint32_t pgdir_phys, uint32_t virt) {
-    uint32_t prev_cr3, phys = 0;
+void pgdir_install_pt(uint32_t pgdir_phys, uint32_t idx, pte_t pde) {
+    uint32_t fl;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+    uint32_t dir = pgdir_phys;
+    if (paging_pae) {                     /* the PDPT names directory idx/512 */
+        dir = (uint32_t)pte_frame(tbl_get(paging_temp_map2(pgdir_phys), idx / 512U));
+        paging_temp_unmap2();
+        idx %= 512U;
+    }
+    tbl_set(paging_temp_map2(dir), idx, pde);
+    paging_temp_unmap2();
+    if (fl & 0x200) __asm__ volatile("sti");
+}
+
+/* Return the whole PTE of `virt` in pgdir_phys, 0 if there is none. */
+pte_t pgdir_virt_to_pte(uint32_t pgdir_phys, uint32_t virt) {
+    uint32_t prev_cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(prev_cr3));
     __asm__ volatile("mov %0, %%cr3" :: "r"(pgdir_phys) : "memory");
-    if (*paging_get_pde(virt) & PAGE_PRESENT) {
-        uint32_t pte = *paging_get_pte(virt);
-        if (pte & PAGE_PRESENT) phys = pte & ~0xFFFU;
-    }
+    pte_t pte = pte_read(virt);
     __asm__ volatile("mov %0, %%cr3" :: "r"(prev_cr3) : "memory");
-    return phys;
+    return pte;
+}
+
+/* Return the physical frame backing `virt` in pgdir_phys, or 0 if unmapped. */
+phys_t pgdir_virt_to_phys(uint32_t pgdir_phys, uint32_t virt) {
+    pte_t pte = pgdir_virt_to_pte(pgdir_phys, virt);
+    return (pte & PAGE_PRESENT) ? pte_frame(pte) : 0;
+}
+
+/* ─── Signal-return page ─────────────────────────────────────────────────── */
+/*
+ * The sigreturn trampoline, at SIGPAGE_VA in every address space.  A handler
+ * returns here with esp just above the frame's argument block; the frame
+ * builder (proc/signal.c) put the restore-frame address and its type marker
+ * right after the four argument slots, at [esp+12] and [esp+16]:
+ *     mov  eax, 0x77          ; sigreturn
+ *     mov  ecx, [esp+12]      ; restore-frame address
+ *     mov  edx, [esp+16]      ; marker
+ *     int  0x80
+ * One frame, shared read-only by everyone; its permanent reference keeps it.
+ */
+static uint32_t sigpage_phys;
+
+int paging_map_sigpage(uint32_t pgdir_phys) {
+    static const uint8_t code[] = {
+        0xB8, 0x77, 0x00, 0x00, 0x00,
+        0x8B, 0x4C, 0x24, 0x0C,
+        0x8B, 0x54, 0x24, 0x10,
+        0xCD, 0x80,
+        0x0F, 0x0B,                     /* ud2: sigreturn does not return */
+    };
+    if (!sigpage_phys) {
+        uint32_t f = pmm_alloc_frame();
+        if (!f) return -1;
+        pmm_frame_incref(f);                   /* the permanent reference */
+        uint32_t fl;
+        __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+        uint8_t *k = (uint8_t *)paging_temp_map(f);
+        __builtin_memset(k, 0xCC, PAGE_SIZE);
+        __builtin_memcpy(k, code, sizeof(code));
+        paging_temp_unmap();
+        if (fl & 0x200) __asm__ volatile("sti");
+        sigpage_phys = f;
+    }
+    /* Read-only and executable.  COW like any private page, so a process
+     * that mprotect()s it writable gets its own copy on the first store and
+     * never writes the one every process runs. */
+    pmm_frame_incref(sigpage_phys);
+    uint32_t fl;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+    int rc = pgdir_map(pgdir_phys, SIGPAGE_VA, sigpage_phys,
+                       PAGE_PRESENT | PAGE_USER | PAGE_COW | PAGE_WRPROT);
+    if (fl & 0x200) __asm__ volatile("sti");
+    if (rc != 0) pmm_frame_decref(sigpage_phys);
+    return rc;
 }
 
 /*
@@ -430,30 +616,41 @@ void pgdir_free_user(uint32_t pgdir_phys) {
     __asm__ volatile("mov %%cr3, %0" : "=r"(prev_cr3));
     __asm__ volatile("mov %0, %%cr3" :: "r"(pgdir_phys) : "memory");
 
-    uint32_t *pd = KPGDIR;  /* now addresses pgdir_phys via recursive mapping */
+    /* now addresses pgdir_phys via recursive mapping */
+    volatile void *pd = (volatile void *)(uintptr_t)PAGE_DIR_VIRT;
 
-    for (int i = 0; i < 768; i++) {
-        if (!(pd[i] & PAGE_PRESENT)) continue;
-        uint32_t pt_phys = pd[i] & ~0xFFFU;
+    for (uint32_t i = 0; i < USER_PT_COUNT; i++) {
+        pte_t pde = tbl_get(pd, i);
+        if (!(pde & PAGE_PRESENT)) continue;
+        uint32_t pt_phys = (uint32_t)pte_frame(pde);   /* tables are low */
 
         /* Access page table entries via recursive mapping */
-        uint32_t *pt = (uint32_t *)(PAGE_TABLES_BASE + (uint32_t)i * PAGE_SIZE);
-        for (int j = 0; j < 1024; j++) {
+        volatile void *pt = pt_window(i);
+        for (uint32_t j = 0; j < PT_ENTRIES; j++) {
+            pte_t e = tbl_get(pt, j);
             /* PAGE_PROTNONE entries are not present but still own a frame. */
-            if (!(pt[j] & (PAGE_PRESENT | PAGE_PROTNONE))) continue;
-            uint32_t frame_phys = pt[j] & ~0xFFFU;
-            pmm_frame_decref(frame_phys);
+            if (!(e & (PAGE_PRESENT | PAGE_PROTNONE))) continue;
+            pmm_frame_decref(pte_frame(e));
         }
 
-        pd[i] = 0;
+        tbl_set(pd, i, 0);
         pmm_free_frame(pt_phys);  /* PT frame itself is not ref-counted */
     }
+
+    /* PAE: the four directories, read from the recursive slots before the
+     * address space is left. */
+    uint32_t dirs[4] = { 0, 0, 0, 0 };
+    if (paging_pae)
+        for (uint32_t k = 0; k < 4; k++)
+            dirs[k] = (uint32_t)pte_frame(tbl_get(pd, PAE_REC_INDEX + k));
 
     /* Restore previous pgdir (also flushes TLB) */
     __asm__ volatile("mov %0, %%cr3" :: "r"(prev_cr3) : "memory");
 
     /* Free the pgdir frame (not ref-counted) */
     pmm_free_frame(pgdir_phys);
+    for (uint32_t k = 0; k < 4; k++)
+        if (dirs[k]) pmm_free_frame(dirs[k]);
 }
 
 /* ─── Page fault handler ─────────────────────────────────────────────────── */
@@ -477,12 +674,11 @@ static void page_fault_handler(registers_t *regs) {
      * COW fault: protection violation (bit 0) + write (bit 1) + PAGE_COW set.
      * Allocate a new frame, copy the old one, update PTE.
      */
-    if ((err & 0x3U) == 0x3U &&
-        (*paging_get_pde(cr2) & PAGE_PRESENT)) {
-        uint32_t *pte = paging_get_pte(cr2);
+    if ((err & 0x3U) == 0x3U && pde_present(cr2)) {
+        pte_t pte = pte_get(cr2);
         int vprot = vma_prot_lookup(cr2);
-        if ((*pte & PAGE_PRESENT) && (*pte & PAGE_COW) &&
-            !(*pte & PAGE_WRPROT) &&
+        if ((pte & PAGE_PRESENT) && (pte & PAGE_COW) &&
+            !(pte & PAGE_WRPROT) &&
             (vprot < 0 || (vprot & 0x2))) {
             /* A COW page in a mapping WITHOUT PROT_WRITE (mprotect(PROT_READ)
              * after fork) is a real protection fault, not a COW break: the
@@ -494,7 +690,7 @@ static void page_fault_handler(registers_t *regs) {
              * copy path and the wp_page_reuse one below equally: a last
              * reference is no reason to re-grant a write the process asked us
              * to refuse. */
-            uint32_t old_phys = *pte & ~0xFFFU;
+            phys_t old_phys = pte_frame(pte);
 
             /* Last reference (the sharer exited, unmapped or DONTNEED'ed its
              * side): no copy needed, just make the page writable again (Linux
@@ -505,14 +701,14 @@ static void page_fault_handler(registers_t *regs) {
                  * only correct because the test above has already excluded
                  * PAGE_WRPROT pages; do not relax that guard without changing
                  * this line too. */
-                *pte = (*pte & ~(uint32_t)PAGE_COW) | PAGE_WRITABLE;
+                pte_set(cr2, (pte & ~(pte_t)PAGE_COW) | PAGE_WRITABLE);
                 tlb_flush_single(cr2 & ~0xFFFU);
                 tlb_shootdown();
                 return;
             }
 
             kprof_count(KPE_PF_COW);
-            uint32_t new_phys = pmm_alloc_frame();
+            phys_t new_phys = pmm_alloc_user_frame();
             if (!new_phys) {
                 /* Linux: do_wp_page returns VM_FAULT_OOM and
                  * pagefault_out_of_memory() picks a victim.  We have no OOM
@@ -547,8 +743,9 @@ static void page_fault_handler(registers_t *regs) {
             /* New frame has refcount=1 (not COW); set it with incref */
             pmm_frame_incref(new_phys);
 
-            /* Update PTE: writable, no COW */
-            *pte = new_phys | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+            /* Update PTE: writable, no COW, executable or not as before */
+            pte_set(cr2, new_phys | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER |
+                         (pte & PAGE_NX));
             tlb_flush_single(cr2 & ~0xFFFU);
 
             /* SMP: a sibling thread (shared pgdir) may have the old read-only
@@ -574,9 +771,22 @@ static void page_fault_handler(registers_t *regs) {
          * stale entry — retrying it would fault forever.  Let it fall through
          * to SIGSEGV (SEGV_ACCERR). */
         int user_ok = !(err & 0x4U) ||
-                      ((*pte & PAGE_USER) && (*paging_get_pde(cr2) & PAGE_USER));
-        if (user_ok && (*pte & PAGE_PRESENT) && (*pte & PAGE_WRITABLE) &&
-            !(*pte & PAGE_COW)) {
+                      ((pte & PAGE_USER) && (pde_get(cr2) & PAGE_USER));
+        if (user_ok && (pte & PAGE_PRESENT) && (pte & PAGE_WRITABLE) &&
+            !(pte & PAGE_COW)) {
+            tlb_flush_single(cr2 & ~0xFFFU);
+            return;
+        }
+    }
+
+    /* The same for an instruction fetch (error bit 4, NX only): a sibling
+     * thread's mprotect(PROT_EXEC) — a JIT flipping a code page from RW to
+     * RX — cleared NX on a page this CPU still caches as no-execute. */
+    if ((err & 0x11U) == 0x11U && pde_present(cr2)) {
+        pte_t pte = pte_get(cr2);
+        int user_ok = !(err & 0x4U) ||
+                      ((pte & PAGE_USER) && (pde_get(cr2) & PAGE_USER));
+        if (user_ok && (pte & PAGE_PRESENT) && !(pte & PAGE_NX)) {
             tlb_flush_single(cr2 & ~0xFFFU);
             return;
         }
@@ -587,8 +797,7 @@ static void page_fault_handler(registers_t *regs) {
      * frame and must NOT be demand-populated or treated as stack growth — the
      * access is a genuine SIGSEGV (Linux: pte_protnone → access_error). */
     int protnone = !(err & 0x1U) && cr2 < 0xC0000000U &&
-                   (*paging_get_pde(cr2) & PAGE_PRESENT) &&
-                   (*paging_get_pte(cr2) & PAGE_PROTNONE);
+                   (pte_read(cr2) & PAGE_PROTNONE);
 
     /* Demand-paged VMA: a not-present fault may be the first touch of a
      * lazily-allocated mmap region (e.g. a thread stack).  This fires for BOTH
@@ -611,12 +820,13 @@ static void page_fault_handler(registers_t *regs) {
         if (!(err & 0x1U) && !protnone && current_proc &&
             cr2 >= stack_grow_floor && cr2 < (uint32_t)USER_STACK_BASE) {
             uint32_t page = cr2 & ~0xFFFU;
-            uint32_t phys = pmm_alloc_frame();
+            phys_t phys = pmm_alloc_user_frame();
             if (phys) {
                 kprof_count(KPE_PF_STACK);
                 pmm_frame_incref(phys);
                 if (paging_map(page, phys,
-                               PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
+                               PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER |
+                               page_nx_unless(proc_stack_exec(current_proc))) != 0) {
                     /* No page table for the new stack page.  Give the frame
                      * back and fall through: the process gets SIGSEGV, which
                      * is what a stack that cannot grow means. */
@@ -640,15 +850,14 @@ static void page_fault_handler(registers_t *regs) {
 
     /* Not a handled fault */
     const char *present = (err & 0x1U) ? "protection" : "not-present";
-    const char *access  = (err & 0x2U) ? "write"      : "read";
+    const char *access  = (err & 0x10U) ? "exec" : (err & 0x2U) ? "write" : "read";
     const char *ring    = (err & 0x4U) ? "user"        : "kernel";
 
-    uint32_t pte_val = 0;
-    if (*paging_get_pde(cr2) & PAGE_PRESENT) pte_val = *paging_get_pte(cr2);
-    printk("[PAGE FAULT] pid=%d addr=0x%08x  eip=0x%08x  (%s %s in %s mode) pte=%08x\n",
+    pte_t pte_val = pte_read(cr2);
+    printk("[PAGE FAULT] pid=%d addr=0x%08x  eip=0x%08x  (%s %s in %s mode) pte=%08x%s\n",
            current_proc ? current_proc->pid : -1,
            (unsigned)cr2, (unsigned)regs->eip, access, present, ring,
-           (unsigned)pte_val);
+           (unsigned)pte_val, (pte_val & PAGE_NX) ? " NX" : "");
     printk("  eax=%08x ebx=%08x ecx=%08x edx=%08x esi=%08x edi=%08x ebp=%08x esp=%08x\n",
            (unsigned)regs->eax, (unsigned)regs->ebx, (unsigned)regs->ecx,
            (unsigned)regs->edx, (unsigned)regs->esi, (unsigned)regs->edi,
@@ -689,8 +898,7 @@ static void page_fault_handler(registers_t *regs) {
                  * thread may have a wild esp, and faulting here is in ring 0. */
                 uint32_t sp = regs->useresp, retaddr = 0;
                 if (sp >= 0x08000000U && sp < 0xC0000000U &&
-                    (*paging_get_pde(sp) & PAGE_PRESENT) &&
-                    (*paging_get_pte(sp) & PAGE_PRESENT)) {
+                    (pte_read(sp) & PAGE_PRESENT)) {
                     retaddr = *(uint32_t *)sp;
                 }
                 printk("[SIG] pid=%d SIGSEGV loop eip=%08x addr=%08x ret=%08x — killed\n",

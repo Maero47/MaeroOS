@@ -45,6 +45,14 @@ static uint32_t *pmm_bitmap;
 static uint32_t  pmm_total;       /* Total frames */
 static uint32_t  pmm_used;        /* Currently used frames */
 static uint32_t  pmm_last_alloc;  /* Last successfully allocated frame index */
+static uint32_t  pmm_last_high;   /* the same for pmm_alloc_user_frame */
+static uint32_t  pmm_low_total;   /* frames below 4 GiB: min(pmm_total, PMM_LOW_FRAMES) */
+static uint32_t  pmm_high_used;   /* used frames at or above PMM_LOW_FRAMES */
+static uint32_t  pmm_ram;         /* frames the memory map calls RAM (holes are
+                                   * inside pmm_total but never free) */
+static uint32_t  pmm_high_ram;    /* the part of pmm_ram above 4 GiB */
+
+extern uint32_t paging_pae;       /* boot.asm: frames above 4 GiB are mappable */
 
 /* Physical address of the bitmap storage area */
 static uint32_t pmm_bitmap_phys;
@@ -68,6 +76,7 @@ static void pmm_mark_used(uint32_t frame_idx) {
     if (!BIT_TEST(pmm_bitmap, frame_idx)) {
         BIT_SET(pmm_bitmap, frame_idx);
         pmm_used++;
+        if (frame_idx >= PMM_LOW_FRAMES) pmm_high_used++;
     }
 }
 
@@ -75,6 +84,7 @@ static void pmm_mark_free(uint32_t frame_idx) {
     if (BIT_TEST(pmm_bitmap, frame_idx)) {
         BIT_CLEAR(pmm_bitmap, frame_idx);
         pmm_used--;
+        if (frame_idx >= PMM_LOW_FRAMES) pmm_high_used--;
     }
 }
 
@@ -82,8 +92,13 @@ static void pmm_mark_free(uint32_t frame_idx) {
 static void pmm_free_region(uint64_t addr, uint64_t len) {
     uint32_t start = (uint32_t)((addr + PAGE_SIZE - 1) / PAGE_SIZE); /* round up */
     uint32_t end   = (uint32_t)((addr + len) / PAGE_SIZE);           /* round down */
-    for (uint32_t i = start; i < end && i < pmm_total; i++)
+    for (uint32_t i = start; i < end && i < pmm_total; i++) {
+        if (BIT_TEST(pmm_bitmap, i)) {
+            pmm_ram++;
+            if (i >= PMM_LOW_FRAMES) pmm_high_ram++;
+        }
         pmm_mark_free(i);
+    }
 }
 
 /* Mark a physical range [addr, addr+len) as used */
@@ -102,9 +117,26 @@ void pmm_init(multiboot_info_t *mbi) {
         total_mem_kb += mbi->mem_upper;
 
     pmm_total = total_mem_kb / 4;   /* Frames = KiB / 4 (each frame = 4 KiB) */
-    /* Clamp to the statically-sized bitmap (4 GiB).
-     * On non-PAE i686, usable RAM never exceeds this, but stay defensive. */
+    /* mem_upper stops at the first hole, below 4 GiB; the memory map knows
+     * about RAM past it (QEMU puts everything beyond 3 GiB above 4 GiB). */
+    if (mbi->flags & MULTIBOOT_FLAG_MMAP) {
+        uintptr_t v = (uintptr_t)mbi->mmap_addr + KERNEL_VMA;
+        uintptr_t e = v + mbi->mmap_length;
+        while (v < e) {
+            multiboot_mmap_entry_t *m = (multiboot_mmap_entry_t *)v;
+            if (m->type == MULTIBOOT_MEMORY_AVAILABLE) {
+                uint64_t end = (m->addr + m->len) / PAGE_SIZE;
+                if (end > PMM_MAX_FRAMES) end = PMM_MAX_FRAMES;
+                if (end > pmm_total) pmm_total = (uint32_t)end;
+            }
+            v += m->size + sizeof(m->size);
+        }
+    }
+    /* Clamp to the statically-sized bitmap (16 GiB), and to 4 GiB unless
+     * PAE paging can map what lies above. */
     if (pmm_total > PMM_MAX_FRAMES) pmm_total = PMM_MAX_FRAMES;
+    if (!paging_pae && pmm_total > PMM_LOW_FRAMES) pmm_total = PMM_LOW_FRAMES;
+    pmm_low_total = pmm_total < PMM_LOW_FRAMES ? pmm_total : PMM_LOW_FRAMES;
 
     /* The bitmap is a static array in the kernel image (.bss).  It used to be
      * placed dynamically at _kernel_phys_end, but GRUB loads the initrd module
@@ -122,6 +154,8 @@ void pmm_init(multiboot_info_t *mbi) {
     for (uint32_t i = 0; i < (pmm_total + 31) / 32; i++)
         pmm_bitmap[i] = 0xFFFFFFFF;
     pmm_used = pmm_total;
+    pmm_high_used = pmm_total - pmm_low_total;
+    pmm_last_high = pmm_low_total;
 
     /* Walk the multiboot memory map: mark available regions free */
     if (mbi->flags & MULTIBOOT_FLAG_MMAP) {
@@ -160,10 +194,13 @@ void pmm_init(multiboot_info_t *mbi) {
         pmm_used_region((uint32_t)(mbi->mmap_addr), mbi->mmap_length);
 
     printk("[PMM] %u MiB total (%u frames), %u free (%u MiB)\n",
-           (unsigned)(pmm_total / 256),
-           (unsigned)pmm_total,
+           (unsigned)(pmm_ram / 256),
+           (unsigned)pmm_ram,
            (unsigned)(pmm_total - pmm_used),
            (unsigned)((pmm_total - pmm_used) / 256));
+    if (pmm_total > pmm_low_total)
+        printk("[PMM] above 4 GiB: %u MiB usable for user pages (PAE)\n",
+               (unsigned)((pmm_total - pmm_low_total - pmm_high_used) / 256));
 }
 
 /* UAF detector: a frame returned by the allocator must have refcount 0 (it was
@@ -180,41 +217,44 @@ static void pmm_alloc_uaf_check(uint32_t idx) {
     }
 }
 
+/* First free frame in [lo, hi), searching from *cursor and wrapping; marks it
+ * used.  Returns its index, or 0xFFFFFFFF.  Caller holds the IRQ guard. */
+static uint32_t pmm_scan(uint32_t lo, uint32_t hi, uint32_t *cursor) {
+    if (*cursor < lo || *cursor >= hi) *cursor = lo;
+    for (int pass = 0; pass < 2; pass++) {
+        uint32_t from = pass ? lo : *cursor, to = pass ? *cursor : hi;
+        for (uint32_t idx = from; idx < to; ) {
+            if ((idx & 31) == 0 && idx + 32 <= to && pmm_bitmap[idx / 32] == 0xFFFFFFFF) {
+                idx += 32;                  /* fast skip of fully-used words */
+                continue;
+            }
+            if (!BIT_TEST(pmm_bitmap, idx)) {
+                pmm_mark_used(idx);
+                *cursor = idx;
+                pmm_alloc_uaf_check(idx);
+                return idx;
+            }
+            idx++;
+        }
+    }
+    return 0xFFFFFFFFU;
+}
+
 uint32_t pmm_alloc_frame(void) {
     uint32_t irq = pmm_irq_save();
-    /* Fast scan: skip fully-used 32-frame words */
-    for (uint32_t i = pmm_last_alloc / 32; i < (pmm_total + 31) / 32; i++) {
-        if (pmm_bitmap[i] == 0xFFFFFFFF) continue;
-        for (uint32_t bit = 0; bit < 32; bit++) {
-            uint32_t idx = i * 32 + bit;
-            if (idx >= pmm_total) break;
-            if (!BIT_TEST(pmm_bitmap, idx)) {
-                BIT_SET(pmm_bitmap, idx);
-                pmm_used++;
-                pmm_last_alloc = idx;
-                pmm_alloc_uaf_check(idx);
-                pmm_irq_restore(irq);
-                return idx * PAGE_SIZE;
-            }
-        }
-    }
-    /* Wrap around from the beginning */
-    for (uint32_t i = 0; i < pmm_last_alloc / 32; i++) {
-        if (pmm_bitmap[i] == 0xFFFFFFFF) continue;
-        for (uint32_t bit = 0; bit < 32; bit++) {
-            uint32_t idx = i * 32 + bit;
-            if (!BIT_TEST(pmm_bitmap, idx)) {
-                BIT_SET(pmm_bitmap, idx);
-                pmm_used++;
-                pmm_last_alloc = idx;
-                pmm_alloc_uaf_check(idx);
-                pmm_irq_restore(irq);
-                return idx * PAGE_SIZE;
-            }
-        }
-    }
+    uint32_t idx = pmm_scan(0, pmm_low_total, &pmm_last_alloc);
     pmm_irq_restore(irq);
-    return 0;   /* Out of physical memory */
+    return idx == 0xFFFFFFFFU ? 0 : idx * PAGE_SIZE;   /* 0: out of memory */
+}
+
+phys_t pmm_alloc_user_frame(void) {
+    if (pmm_total > pmm_low_total) {
+        uint32_t irq = pmm_irq_save();
+        uint32_t idx = pmm_scan(pmm_low_total, pmm_total, &pmm_last_high);
+        pmm_irq_restore(irq);
+        if (idx != 0xFFFFFFFFU) return (phys_t)idx * PAGE_SIZE;
+    }
+    return pmm_alloc_frame();
 }
 
 /* SMP use-after-free guard — deferred frame reuse (quarantine).
@@ -236,8 +276,8 @@ static uint32_t pmm_quar[PMM_QUARANTINE];
 static int      pmm_quar_n;     /* fill level (0..PMM_QUARANTINE)          */
 static int      pmm_quar_pos;   /* oldest entry once full (FIFO eviction)  */
 
-void pmm_free_frame(uint32_t phys) {
-    uint32_t idx = phys / PAGE_SIZE;
+void pmm_free_frame(phys_t phys) {
+    uint32_t idx = (uint32_t)(phys / PAGE_SIZE);
     if (idx >= pmm_total) return;
     uint32_t irq = pmm_irq_save();
     if (pmm_quar_n < PMM_QUARANTINE) {
@@ -253,6 +293,11 @@ void pmm_free_frame(uint32_t phys) {
 
 uint32_t pmm_free_frames(void)  { return pmm_total - pmm_used; }
 uint32_t pmm_total_frames(void) { return pmm_total; }
+uint32_t pmm_ram_frames(void)   { return pmm_ram; }
+uint32_t pmm_high_frames(void)  { return pmm_high_ram; }
+uint32_t pmm_high_free_frames(void) {
+    return pmm_total - pmm_low_total - pmm_high_used;
+}
 
 void pmm_reserve_region(uint32_t phys, uint32_t size) {
     pmm_used_region(phys, size);
@@ -270,8 +315,8 @@ void pmm_refcount_init(void) {
 
 /* Frames outside RAM (a framebuffer mapped into a process, say) are not
  * counted: they read as 0 and are never freed, as before. */
-void pmm_frame_incref(uint32_t phys) {
-    uint32_t idx = phys / PAGE_SIZE;
+void pmm_frame_incref(phys_t phys) {
+    uint32_t idx = (uint32_t)(phys / PAGE_SIZE);
     uint32_t irq = pmm_irq_save();
     if (idx < refcount_frames && frame_refcount[idx] < 65535)
         frame_refcount[idx]++;
@@ -281,14 +326,14 @@ void pmm_frame_incref(uint32_t phys) {
 /* Current reference count of a frame (0 if out of range).  Used by the shared-
  * mmap registry to detect frames that only IT still references (count==1) so
  * the entry can be reclaimed once no process maps it anymore. */
-uint16_t pmm_frame_refcount(uint32_t phys) {
-    uint32_t idx = phys / PAGE_SIZE;
+uint16_t pmm_frame_refcount(phys_t phys) {
+    uint32_t idx = (uint32_t)(phys / PAGE_SIZE);
     if (idx >= refcount_frames) return 0;
     return frame_refcount[idx];
 }
 
-void pmm_frame_decref(uint32_t phys) {
-    uint32_t idx = phys / PAGE_SIZE;
+void pmm_frame_decref(phys_t phys) {
+    uint32_t idx = (uint32_t)(phys / PAGE_SIZE);
     if (idx >= refcount_frames) return;
     uint32_t irq = pmm_irq_save();
     int do_free = 0;

@@ -10,7 +10,7 @@
  * machine halt.  Callers must check; the frame is released again on the
  * page-table failure path so a partial failure leaks nothing.
  */
-int vmm_alloc_page(uint32_t virt, uint32_t flags) {
+int vmm_alloc_page(uint32_t virt, pte_t flags) {
     uint32_t phys = pmm_alloc_frame();
     if (!phys) return -1;
     if (vmm_map_page(virt, phys, flags | PAGE_PRESENT) != 0) {

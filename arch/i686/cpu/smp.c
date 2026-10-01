@@ -20,6 +20,8 @@ extern char     ap_trampoline_end[];
 extern uint32_t ap_tramp_cr3;
 extern uint32_t ap_tramp_stack;
 extern uint32_t ap_tramp_entry;
+extern uint32_t ap_tramp_cr4;
+extern uint32_t ap_tramp_nx;
 
 extern uint32_t kernel_pgdir_phys;
 
@@ -235,6 +237,11 @@ static int boot_one_ap(uint8_t apicid, uint32_t idx) {
     *(volatile uint32_t *)(TRAMP_VIRT + o_cr3)   = kernel_pgdir_phys;
     *(volatile uint32_t *)(TRAMP_VIRT + o_stack) = stack_top;
     *(volatile uint32_t *)(TRAMP_VIRT + o_entry) = (uint32_t)(uintptr_t)&ap_entry;
+    *(volatile uint32_t *)(TRAMP_VIRT + (uint32_t)((char *)&ap_tramp_cr4 -
+                                               ap_trampoline_start)) =
+        paging_pae ? 0x20U : 0U;                                  /* CR4.PAE */
+    *(volatile uint32_t *)(TRAMP_VIRT + (uint32_t)((char *)&ap_tramp_nx -
+                                               ap_trampoline_start)) = paging_nx;
 
     /* The AP turns paging on while still executing at linear 0x8000, so that
      * page must be valid in the kernel pgdir until it reaches higher-half C.
