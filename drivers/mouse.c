@@ -168,6 +168,10 @@ void mouse_init(void) {
     buttons = 0;
     present = 0;
 
+    if (!ps2_controller_present()) {
+        printk("[MOUSE] no PS/2 controller; USB pointers only\n");
+        return;
+    }
     while (inb(PS2_STATUS_PORT) & PS2_STATUS_OUT)
         (void)inb(PS2_DATA_PORT);
 

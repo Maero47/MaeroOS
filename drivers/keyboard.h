@@ -14,6 +14,9 @@ typedef struct {
 } input_event_t;
 
 void keyboard_init(void);
+/* Whether an 8042 PS/2 controller answers at 0x60/0x64.  Many current PCs
+ * have none (USB input only); its ports then read 0xFF. */
+int ps2_controller_present(void);
 uint32_t keyboard_read_events(uint32_t len, uint8_t *buf);
 int keyboard_has_events(void);
 /* Feed one key event (Linux evdev code) into /dev/input/event0. */

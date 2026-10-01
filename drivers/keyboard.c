@@ -256,10 +256,21 @@ out:
     if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
 }
 
+/* With no 8042 the status port floats to 0xFF: "output full" never clears, so
+ * every drain loop here would spin for good.  A real controller never reports
+ * all of parity error, timeout and both buffers full at once. */
+int ps2_controller_present(void) {
+    return inb(KBD_STATUS_PORT) != 0xFF;
+}
+
 void keyboard_init(void) {
     head = tail = 0;
     got_e0 = 0;
 
+    if (!ps2_controller_present()) {
+        printk("[KBD]  no PS/2 controller; USB keyboards only\n");
+        return;
+    }
     while (inb(KBD_STATUS_PORT) & KBD_STATUS_OUT)
         (void)inb(KBD_DATA_PORT);
 
