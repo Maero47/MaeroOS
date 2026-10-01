@@ -233,6 +233,23 @@ the recursive Big Kernel Lock (`bkl.c`). A CPU spinning for the lock keeps servi
 shootdown requests while it waits, because it holds interrupts off and would otherwise
 deadlock the sender.
 
+### Scheduler
+
+`proc/scheduler.c` shares the CPUs out by virtual runtime, as Linux CFS does: every
+thread accumulates the nanoseconds it spends on a CPU, weighted by its nice value
+(`setpriority`, `nice`; Linux's weight table), and each CPU runs the runnable thread
+with the least. A thread that blocked comes back at no less than the queue minimum minus
+3 ms, so a sleeper (input, audio, the compositor, a pipe reader) is ahead of a CPU hog
+without being able to bank its sleep. A wake compares the woken thread with what the
+CPUs are running: an idle CPU is kicked (a reschedule IPI to a halted BSP, a flag the
+idle APs poll), otherwise the CPU running the thread furthest behind gets its
+`need_resched` set, with an IPI when it is another CPU. The switch happens at the next
+return to user mode (syscall exit, IRQ exit), never inside kernel code. A syscall that
+woke a thread no idle CPU took queues the waker behind it and yields, so a condvar
+waiter or a server runs before the waker acts again. The tick ends a slice after 4 ms
+(rounded up to the 100 Hz tick) when another thread is waiting. `make bench-sched`
+measures wake latency under CPU hogs (`testfiles/schedlat`).
+
 ### Filesystems
 
 `fs/vfs.c` mount table with a root overlay and path lookup (symlinks are followed
@@ -653,6 +670,7 @@ make smoke-firefox-web  # ...and load a page served from the host over the netwo
 make smoke-alpine   # Alpine 3.22/3.24 userland in a chroot, apk from an offline repo (opt-in)
 make smoke-alpine-net  # ip/udhcpc/ping, flock and sshd in that chroot (opt-in, needs ssh on the host)
 make bench-gfx      # compositor/maeroX cost of an animating region (a benchmark, judges nothing)
+make bench-sched    # wake latency and a 10 ms audio-like hand-off under CPU hogs
 ```
 
 `SMOKE_SMP=N make smoke-cmds` boots the same guest with `-smp N`. `make smoke-gtk` needs

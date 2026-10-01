@@ -57,6 +57,8 @@ def main():
     ap.add_argument("--cases",
                     default="gui,x,gui-full,x-full,gui-60,x-60,x-full-60")
     ap.add_argument("--label", default="")
+    ap.add_argument("--iso", default=os.path.join(ROOT, "maeros.iso"),
+                    help="the ISO to boot (default maeros.iso), to compare kernels")
     args = ap.parse_args()
 
     os.makedirs(OUT, exist_ok=True)
@@ -66,7 +68,7 @@ def main():
     sockdir = tempfile.mkdtemp(prefix="bgfx")
     qmp_path = os.path.join(sockdir, "qmp")
     accel = pick_accel()
-    cmd = ["qemu-system-i386", "-cdrom", os.path.join(ROOT, "maeros.iso"),
+    cmd = ["qemu-system-i386", "-cdrom", os.path.abspath(args.iso),
            "-drive", f"file={disk},format=raw,if=ide",
            "-accel", accel, "-vga", "std", *smokelib.QEMU_DISPLAY,
            "-serial", "stdio", "-m", "512M", "-no-reboot", "-no-shutdown",

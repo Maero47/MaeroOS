@@ -253,6 +253,19 @@ struct proc {
     uint32_t         run_us_mark;   /* run_us at the last KTRACE cpu dump */
     uint32_t         sched_count;   /* times scheduled */
 
+    /* Fair scheduling (proc/scheduler.c): on-CPU time in ns, weighted by
+     * nice, and the flags that place it.  The runnable thread with the least
+     * vruntime runs next.  vr_placed: vruntime was set from the run queue's
+     * minimum (0 = fresh slot, placed on first pick); vr_slept: the thread
+     * blocked and gets sleeper placement when it is next made runnable;
+     * vr_skip: it called yield() and is passed over by the next pick. */
+    uint64_t         vruntime;
+    uint64_t         vr_sleep_t0;   /* clock_mono_ns() when it last blocked */
+    uint8_t          vr_placed;
+    uint8_t          vr_slept;
+    uint8_t          vr_skip;
+    int8_t           nice;          /* -20..19, setpriority(2) */
+
     /* Non-zero: the PIT tick must not preempt this process (it is inside a
      * non-reentrant critical section, e.g. the lwIP stack).  Nests. */
     int              no_preempt;
@@ -366,6 +379,7 @@ static inline uint32_t proc_prot_adjust(const struct proc *p, uint32_t prot) {
 
 /* Process table and current process */
 extern struct proc ptable[];
+extern int ptable_hwm;   /* one past the highest slot ever used */
 
 /* SMP: `current_proc` is PER-CPU — the process running on the calling CPU.  It
  * expands to that CPU's slot in cpus[] (indexed by logical CPU id), so reads and

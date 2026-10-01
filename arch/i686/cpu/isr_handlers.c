@@ -8,6 +8,7 @@ extern void panic(const char *msg, registers_t *regs) __attribute__((noreturn));
 
 /* Forward declaration — defined in proc/syscall.c */
 extern void syscall_dispatch(registers_t *regs);
+extern void sched_irq_exit(int from_user);   /* proc/scheduler.c */
 
 /* User-mode fault containment: a CPU exception (GP fault, invalid opcode, divide,
  * etc.) raised by ring-3 code must terminate the faulting PROCESS (POSIX signal),
@@ -72,6 +73,9 @@ void isr_handler(registers_t *regs) {
     /* Dispatch to a registered handler if present (e.g. #PF → page_fault_handler) */
     if (regs->int_no < 32 && exception_handlers[regs->int_no]) {
         exception_handlers[regs->int_no](regs);
+        /* A wake during the fault (or the tick, if the fault slept) may
+         * want this CPU: switch on the way back to user mode. */
+        sched_irq_exit((regs->cs & 3) == 3);
         kprof_switch(kp_old);
         return;
     }

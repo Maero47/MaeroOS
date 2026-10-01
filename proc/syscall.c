@@ -1012,6 +1012,7 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
     child->read_implies_exec = parent->read_implies_exec;
     child->exec_stack        = parent->exec_stack;
     child->umask     = parent->umask;
+    child->nice      = parent->nice;
     child->uid = parent->uid; child->gid = parent->gid;
     child->euid = parent->euid; child->egid = parent->egid;
     child->suid = parent->suid; child->sgid = parent->sgid;
@@ -7071,9 +7072,64 @@ static int sys_sched_getaffinity(registers_t *regs) {
     return 8;                             /* kernel cpumask size */
 }
 
+/* ── getpriority(which, who) / setpriority(which, who, nice) — EAX=96/97 ──
+ * The nice value weights the thread's share of CPU time (proc/scheduler.c).
+ * PRIO_PROCESS names one thread (0: the caller), PRIO_PGRP a process group,
+ * PRIO_USER a real uid, as in Linux.  getpriority returns the raw syscall
+ * value 20 - nice of the highest-priority match; lowering nice needs root. */
+static int prio_match(struct proc *q, int which, uint32_t who) {
+    if (q->state == PROC_UNUSED || q->state == PROC_ZOMBIE || q->state == PROC_EMBRYO)
+        return 0;
+    switch (which) {
+    case 0: return q->pid == (int)(who ? who : (uint32_t)current_proc->pid);
+    case 1: return q->pgrp == (int)(who ? who : (uint32_t)current_proc->pgrp);
+    case 2: return q->uid == (who ? who : current_proc->uid);
+    }
+    return 0;
+}
+
+static int sys_getpriority(registers_t *regs) {
+    int which = (int)regs->ebx;
+    if (which < 0 || which > 2) return -22;
+    int best = -100;
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (prio_match(&ptable[i], which, regs->ecx) && 20 - ptable[i].nice > best)
+            best = 20 - ptable[i].nice;
+    return best == -100 ? -3 : best;       /* -ESRCH */
+}
+
+static int sys_setpriority(registers_t *regs) {
+    int which = (int)regs->ebx;
+    int nice  = (int)regs->edx;
+    if (which < 0 || which > 2) return -22;
+    if (nice < -20) nice = -20;
+    if (nice > 19) nice = 19;
+    int found = 0, err = 0;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (!prio_match(q, which, regs->ecx)) continue;
+        found = 1;
+        if (current_proc->euid != 0 && q->uid != current_proc->euid &&
+            q->euid != current_proc->euid) { err = -1; continue; }   /* -EPERM */
+        if (current_proc->euid != 0 && nice < q->nice) { err = -13; continue; }  /* -EACCES */
+        q->nice = (int8_t)nice;
+    }
+    return found ? err : -3;
+}
+
+/* nice(inc) — EAX=34: the caller's own nice, clamped to -20..19. */
+static int sys_nice(registers_t *regs) {
+    int n = current_proc->nice + (int)regs->ebx;
+    if (n < -20) n = -20;
+    if (n > 19) n = 19;
+    if (n < current_proc->nice && current_proc->euid != 0) return -1;   /* -EPERM */
+    current_proc->nice = (int8_t)n;
+    return 0;
+}
+
 /* ── sys_sched_getattr(pid, attr*, size, flags) — EAX=352 ───────────────────
- * Linux struct sched_attr; report SCHED_NORMAL, nice 0, priority 0 (our only
- * scheduling class).  Firefox queries this during thread-pool/priority setup;
+ * Linux struct sched_attr; report SCHED_NORMAL, the caller's nice, priority 0
+ * (our only scheduling class).  Firefox queries this during thread-pool/priority setup;
  * returning ENOSYS makes it fall back, but reporting the real (default) policy
  * is the Linux-faithful answer.  Linux writes attr->size = the kernel struct
  * size and zeroes the policy-specific fields for a SCHED_NORMAL task. */
@@ -7096,7 +7152,7 @@ static int sys_sched_getattr(registers_t *regs) {
     __builtin_memset(&a, 0, sizeof(a));
     a.size = 48;                           /* SCHED_ATTR_SIZE_VER0 */
     a.policy = 0;                          /* SCHED_NORMAL */
-    a.nice = 0;
+    a.nice = current_proc->nice;
     a.priority = 0;
     uint32_t n = size < sizeof(a) ? size : sizeof(a);
     if (copy_to_user(uattr, &a, n) < 0) return -14;
@@ -7573,23 +7629,23 @@ static int futex_wake_n(uint32_t uaddr, int is_private, uint32_t phys,
             : ((p)->futex_shared && phys && (p)->futex_phys == phys)))
 
     int matches = 0;
-    for (int i = 0; i < MAX_PROCS; i++)
+    for (int i = 0; i < ptable_hwm; i++)
         if (FUTEX_MATCH(&ptable[i])) matches++;
 
     int woken = 0;
     if (n >= matches) {                 /* wake all matching (single pass) */
-        for (int i = 0; i < MAX_PROCS; i++) {
+        for (int i = 0; i < ptable_hwm; i++) {
             struct proc *p = &ptable[i];
             if (FUTEX_MATCH(p)) {
                 p->sleep_chan = (void *)0; p->wake_tick = 0;
                 p->futex_wait = 2;         /* woken by a FUTEX_WAKE */
-                p->state = PROC_RUNNABLE; woken++;
+                sched_make_runnable_sync(p); woken++;
             }
         }
     } else {                            /* wake the n OLDEST (min sleep_seq) */
         while (woken < n) {
             struct proc *best = (void *)0;
-            for (int i = 0; i < MAX_PROCS; i++) {
+            for (int i = 0; i < ptable_hwm; i++) {
                 struct proc *p = &ptable[i];
                 if (FUTEX_MATCH(p) && (!best || p->sleep_seq < best->sleep_seq))
                     best = p;
@@ -7597,11 +7653,10 @@ static int futex_wake_n(uint32_t uaddr, int is_private, uint32_t phys,
             if (!best) break;
             best->sleep_chan = (void *)0; best->wake_tick = 0;
             best->futex_wait = 2;          /* woken by a FUTEX_WAKE */
-            best->state = PROC_RUNNABLE; woken++;
+            sched_make_runnable_sync(best); woken++;
         }
     }
     #undef FUTEX_MATCH
-    if (woken > 0) { extern volatile int g_resched_pending; g_resched_pending = 1; }
     return woken;
 }
 
@@ -8387,6 +8442,7 @@ static int sys_clone(registers_t *regs) {
     if (child->root_node) vfs_retain(child->root_node);
     child->heap_end  = parent->heap_end;
     child->umask     = parent->umask;
+    child->nice      = parent->nice;
     child->uid = parent->uid; child->gid = parent->gid;
     child->euid = parent->euid; child->egid = parent->egid;
     child->suid = parent->suid; child->sgid = parent->sgid;
@@ -10018,8 +10074,9 @@ void syscall_dispatch(registers_t *regs) {
     case 406: ret = sys_clock_getres_time64(regs); break;
     case 268: ret = sys_statfs64(regs);        break;  /* statfs64 */
     case 269: ret = sys_fstatfs64(regs);       break;  /* fstatfs64 */
-    case 96:  ret = 20;                        break;  /* getpriority: nice 0 → 20-0 */
-    case 97:  ret = 0;                         break;  /* setpriority: accept, no-op */
+    case 96:  ret = sys_getpriority(regs);     break;
+    case 97:  ret = sys_setpriority(regs);     break;
+    case 34:  ret = sys_nice(regs);            break;
     case 158: yield(); ret = 0;                break;  /* sched_yield */
     case 351: ret = sys_sched_setattr(regs);   break;  /* sched_setattr */
     case 352: ret = sys_sched_getattr(regs);   break;  /* sched_getattr */

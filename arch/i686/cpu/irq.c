@@ -2,9 +2,13 @@
 #include "isr.h"
 #include "pic.h"
 #include "apic.h"
+#include "percpu.h"
 #include <io.h>
 #include <stddef.h>
 #include <kernel/kprof.h>
+
+#define RESCHED_IPI_VECTOR 0xFCU   /* proc/scheduler.c */
+extern void sched_irq_exit(int from_user);
 
 /* Signal delivery on return from an interrupt to ring 3 (Linux
  * exit_to_user_mode_loop -> arch_do_signal_or_restart on every IRQ return):
@@ -14,6 +18,13 @@
  * switches away for good in proc_exit, cannot leave the interrupt in service. */
 extern void signal_return_to_user(registers_t *regs, int syscall_nr);
 static void irq_return_signals(registers_t *regs) {
+    /* The handler's own work is over: wakes from here on (none, normally)
+     * are not interrupt context.  Cleared BEFORE delivery, because a fatal
+     * signal exits the thread in proc_exit and a stop signal parks it in
+     * proc_stop_self — both switch away and never come back through
+     * irq_handler on this CPU, which would leave the flag set and turn off
+     * the futex sync hand-off (sched_wakeup) here for good. */
+    cpus[this_cpu_id()].in_irq = 0;
     if ((regs->cs & 3) == 3)
         signal_return_to_user(regs, -1);
 }
@@ -61,8 +72,19 @@ static void irq_handler_body(registers_t *regs);
 
 void irq_handler(registers_t *regs) {
     int kp_old = kprof_switch(KPB_IRQ);
+    /* A flag, not a nesting count: IRQ gates run with interrupts off, and
+     * the paths that leave without irq_return_signals (spurious IRQ7/15)
+     * are covered by clearing it again below. */
+    cpus[this_cpu_id()].in_irq = 1;
     irq_handler_body(regs);
+    cpus[this_cpu_id()].in_irq = 0;
     kprof_switch(kp_old);
+    /* A wake from this IRQ (a device's reader, a tick-expired sleeper, a
+     * reschedule IPI from another CPU) or the tick's slice expiry asked for a
+     * switch: take it on the way back to user mode — Linux's IRQ-exit
+     * preemption, so the woken thread runs now, not when the slice ends.  The
+     * handler is done (EOI sent, signals delivered), so nothing is in flight. */
+    sched_irq_exit((regs->cs & 3) != 0);
 }
 
 static void irq_handler_body(registers_t *regs) {
@@ -75,6 +97,15 @@ static void irq_handler_body(registers_t *regs) {
         int user_mode = (regs->cs & 3) != 0;
         extern void scheduler_tick(int user_mode);
         scheduler_tick(user_mode);
+        irq_return_signals(regs);
+        return;
+    }
+
+    /* ── Reschedule IPI (vector 0xFC): another CPU woke a thread that should
+     * displace ours, or kicked us out of the idle halt.  It set our
+     * need_resched; the switch is irq_handler's return-to-user check. */
+    if (regs->int_no == RESCHED_IPI_VECTOR) {
+        apic_eoi();
         irq_return_signals(regs);
         return;
     }

@@ -1045,10 +1045,12 @@ static void pappend_uint(char *buf, uint32_t *pos, uint32_t cap, uint32_t val) {
  * Exact CPU time per thread, in microseconds, from the scheduler's dispatch
  * timestamps (not tick sampling), plus the time the CPUs sat idle:
  *   idle <us>
+ *   handoffs <n>     (futex sync hand-offs the scheduler took)
  *   <pid> <tgid> <us> <name>
  * tools/bench_gfx.py reads it to split CPU between the desktop, maeroX and a
  * client; the counters only grow, so readers take differences. */
 extern uint32_t sched_idle_us;
+extern uint32_t sched_handoffs;
 
 static uint32_t procfs_cputime_read(vfs_node_t *n, uint32_t off,
                                     uint32_t len, uint8_t *buf) {
@@ -1059,6 +1061,9 @@ static uint32_t procfs_cputime_read(vfs_node_t *n, uint32_t off,
     if (!content) return 0;
     pappend(content, &pos, CAP, "idle ");
     pappend_uint(content, &pos, CAP, sched_idle_us);
+    pappend(content, &pos, CAP, "\n");
+    pappend(content, &pos, CAP, "handoffs ");
+    pappend_uint(content, &pos, CAP, sched_handoffs);
     pappend(content, &pos, CAP, "\n");
     for (int i = 0; i < MAX_PROCS; i++) {
         struct proc *p = &ptable[i];

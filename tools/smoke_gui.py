@@ -631,9 +631,12 @@ class GuiSmoke:
         self.expect_focus(win)
         self.inp.type("hello world\n")
         self.inp.combo(["ctrl"], "a")
+        at = self.con.mark()
         self.inp.combo(["ctrl"], "c")
-        self.con.wait_re(r"\[edit\] copied 12 bytes")
-        self.con.wait_re(r"\[desktop\] clipboard 12 bytes")
+        # Two processes trace the copy (the app, then the desktop it tells),
+        # in no fixed order: whichever the scheduler runs first prints first.
+        self.con.wait_re(r"\[edit\] copied 12 bytes", start=at)
+        self.con.wait_re(r"\[desktop\] clipboard 12 bytes", start=at)
         # The clipboard is in a 0700 directory of the desktop user's, not a
         # fixed name in the shared /tmp.
         out = self.con.run("busybox sh -c 'busybox ls -ld /tmp/.clipboard-* "
@@ -707,9 +710,10 @@ class GuiSmoke:
         self.settle()
         self.click(*row("a.txt"))
         self.con.wait_re(r"\[files\] selected a\.txt")
+        at = self.con.mark()
         button("copy")
-        self.con.wait_re(r"\[files\] copied /tmp/fm/a\.txt")
-        self.con.wait_re(r"\[desktop\] clipboard \d+ bytes")
+        self.con.wait_re(r"\[files\] copied /tmp/fm/a\.txt", start=at)
+        self.con.wait_re(r"\[desktop\] clipboard \d+ bytes", start=at)
         self.click(*row("sub"), double=True)
         self.con.wait_re(r"\[files\] cwd /tmp/fm/sub entries=1")
         button("paste")

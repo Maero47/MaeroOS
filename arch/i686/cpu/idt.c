@@ -111,6 +111,10 @@ void idt_init(void) {
     extern void lapic_timer_isr(void);
     idt_set_gate(0xF0, (uint32_t)lapic_timer_isr, 0x08, 0x8E);
 
+    /* Reschedule IPI (vector 0xFC): wakeup preemption across CPUs. */
+    extern void resched_ipi_isr(void);
+    idt_set_gate(0xFC, (uint32_t)resched_ipi_isr, 0x08, 0x8E);
+
     /* TLB shootdown IPI (vector 0xFD): bare handler, flushes this CPU's TLB. */
     extern void tlb_ipi_isr(void);
     idt_set_gate(0xFD, (uint32_t)tlb_ipi_isr, 0x08, 0x8E);
