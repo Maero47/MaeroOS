@@ -102,13 +102,15 @@ class AlpineX:
 
     def launch(self, name, title_re):
         """Launch through the desktop; returns the toplevel's screen rect."""
-        maps = len(re.findall(r"map toplevel", self.maerox_log())) if self.maerox else 0
+        pattern = (r"map toplevel 0x([0-9a-f]+) client=(\d+) (\d+)x(\d+) "
+                   r"@(-?\d+),(-?\d+) title='%s" % title_re)
+        # Only earlier maps of this same title count (dialogs map too).
+        maps = len(re.findall(pattern, self.maerox_log())) if self.maerox else 0
         start = self.con.mark()
         self.sh(f"wmctl launch {name}")
         if self.maerox is None:
             self.maerox = self.g.wait_window("maeroX :0", timeout=60, start=start)
-        m = self.wait_log(r"map toplevel 0x([0-9a-f]+) client=(\d+) (\d+)x(\d+) "
-                          r"@(-?\d+),(-?\d+) title='%s" % title_re, timeout=120, skip=maps)
+        m = self.wait_log(pattern, timeout=120, skip=maps)
         w, h, x, y = (int(m.group(i)) for i in (3, 4, 5, 6))
         self.g.settle(3.0)
         mx = self.maerox["x"] + BODY_X
@@ -193,6 +195,11 @@ class AlpineX:
         self.inp.combo(["ctrl"], "s")
         self.g.settle(4.0)
         self.g.shot("mousepad-save-dialog")
+        # The desktop user's home in the root (the shell does not glob).
+        listing = re.sub(r"\x1b\[[0-9;]*m", "", self.sh("ls /disk/alpine/home"))
+        users = [l.strip().rstrip("/") for l in listing.splitlines()
+                 if l.strip() and not l.lstrip().startswith("[")]
+        home = "/disk/alpine/home/" + (users[0] if users else "user")
         self.inp.combo(["ctrl"], "a")
         self.inp.type("maerox-note.txt")
         # GTK's file chooser ignores Enter while it is still loading the
@@ -205,7 +212,7 @@ class AlpineX:
             deadline = time.time() + 10
             while time.time() < deadline:
                 self.g.settle(1.0)
-                saved = self.sh("cat /disk/alpine/home/*/maerox-note.txt")
+                saved = self.sh(f"cat {home}/maerox-note.txt")
                 if "hello from maeroX" in saved:
                     break
             if "hello from maeroX" in saved:
