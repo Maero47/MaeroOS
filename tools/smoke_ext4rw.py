@@ -253,6 +253,13 @@ def build_images():
     run(MKE2FS, "-q", "-F", "-t", "ext4", "-L", "ext4e", e_img, "64M")
     journal_csum_v3(e_img)
     info["e_img"] = e_img
+
+    # 128-byte group descriptors: readable, never written by fs/ext2.c.
+    f_img = os.path.join(OUT, "f.img")
+    run(MKE2FS, "-q", "-F", "-t", "ext4", "-E", "desc_size=128", "-L", "ext4f", f_img, "32M")
+    info["f_img"] = f_img
+    with open(f_img, "rb") as f:
+        info["f_md5"] = md5(f.read())
     return a_img, b_img, c_img, d_img, info
 
 
@@ -420,6 +427,12 @@ def guest_tests(g, info):
     check(rc == 0 and m is not None and int(m.group(1)) > 50,
           f"sdc: x4smalltxn workload committed in steps ({m.group(0) if m else out.strip()[-200:]!r})")
 
+    # 128-byte descriptors: the read-write request falls back to read-only.
+    rc, out = g.sh("busybox mkdir -p /mnt/f && busybox mount -t ext4 /dev/sdf /mnt/f; "
+                   "busybox grep /mnt/f /proc/mounts; echo x > /mnt/f/x; busybox umount /mnt/f")
+    check(" /mnt/f ext4 ro" in out and "Read-only" in out,
+          f"sdf (128-byte descriptors): read-only, writes refused ({out.strip()[-200:]!r})")
+
     # Power loss in the middle of freeing a 300-extent file.
     rc, out = g.sh("busybox mount -t ext4 -o x4smalltxn /dev/sde /mnt/e && cd /mnt/e && "
                    "for i in $(busybox seq 1 300); do busybox cat /tmp/4k >> A; busybox cat /tmp/4k >> B; done && "
@@ -489,6 +502,9 @@ def host_checks(a_img, b_img, c_img, d_img, info):
     sp = b" " * 4096
     check(debugfs_cat(c_img, "/H") == (big_bytes()[:1048576] * 4) and debugfs_cat(c_img, "/F") == sp * 50
           and "G" not in live_names(c_img, "/"), "debugfs: sdc x4smalltxn files")
+
+    with open(info["f_img"], "rb") as f:
+        check(md5(f.read()) == info["f_md5"], "sdf: byte-identical after the guest")
 
     # sde: power lost between two steps of an unlink.
     e_img = info["e_img"]
@@ -577,6 +593,7 @@ def main():
          "-drive", f"file={c_img},format=raw,index=2,media=disk",
          "-drive", f"file={d_img},format=raw,index=3,media=disk",
          "-drive", f"file={info['e_img']},format=raw,index=4,media=disk",
+         "-drive", f"file={info['f_img']},format=raw,index=5,media=disk",
          "-drive", f"file={b_img},format=raw,if=none,id=nv",
          "-device", "nvme,serial=ext4rw,drive=nv",
          "-serial", "stdio", "-m", "512M", "-no-reboot"],
