@@ -95,7 +95,15 @@ LWIP_SRCS := \
 
 LWIP_OBJS := $(LWIP_SRCS:.c=.o)
 LWIP_CFLAGS := $(filter-out -Werror,$(CFLAGS)) -Wno-unused-parameter
-ALL_OBJS := $(C_OBJS) $(LWIP_OBJS) $(ASM_OBJS)
+# uACPI (MIT, third_party/uacpi): the AML interpreter behind drivers/acpi.c.
+# Its printf-style format strings assume uint32_t is unsigned int, which it is
+# not on i686-elf (long), hence -Wno-format; the sizes are identical.
+UACPI_SRCS := $(wildcard third_party/uacpi/source/*.c)
+UACPI_OBJS := $(UACPI_SRCS:.c=.o)
+UACPI_CFLAGS := $(filter-out -std=gnu99 -Werror,$(CFLAGS)) -std=gnu11 \
+	-Wno-format -I./third_party/uacpi/include
+drivers/acpi.o: CFLAGS += -I./third_party/uacpi/include
+ALL_OBJS := $(C_OBJS) $(LWIP_OBJS) $(UACPI_OBJS) $(ASM_OBJS)
 
 $(LWIP_OBJS): CFLAGS := $(LWIP_CFLAGS)
 
@@ -129,12 +137,12 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui check abiprobes smoke-abi smoke-firefox smoke-firefox-web repo repo-serve start resolutions icons
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-acpi check abiprobes smoke-abi smoke-firefox smoke-firefox-web repo repo-serve start resolutions icons
 
 all: $(TARGET)
 
 $(TARGET): $(ALL_OBJS)
-	$(LD) $(LDFLAGS) -o $@ $^
+	$(LD) $(LDFLAGS) -o $@ $^ -lgcc
 
 $(C_OBJS): $(KTRACE_STAMP)
 
@@ -144,6 +152,9 @@ $(C_OBJS): $(KTRACE_STAMP)
 
 third_party/lwip/%.o: third_party/lwip/%.c
 	$(CC) $(LWIP_CFLAGS) $(DEPFLAGS) -c $< -o $@
+
+third_party/uacpi/%.o: third_party/uacpi/%.c
+	$(CC) $(UACPI_CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # NASM assembly
 %.o: %.asm
@@ -334,6 +345,10 @@ smoke-toybox: $(TARGET) initrd
 smoke-cmds: $(TARGET) initrd
 	python3 tools/smoke_cmds.py
 
+# ACPI: poweroff, reboot and the power button on the pc and q35 machines.
+smoke-acpi: $(TARGET) initrd
+	python3 tools/smoke_acpi.py
+
 smoke-dyn: $(TARGET) initrd
 	python3 tools/smoke_dyn.py
 
@@ -360,7 +375,7 @@ smoke-gui: $(TARGET) iso disk
 # with -display none (tools/smokelib.py), so no display is needed.
 # Pick a subset with CHECK_SUITES="smoke smoke-x".
 CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-fw \
-                 smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui
+                 smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui smoke-acpi
 CHECK_LOG_DIR ?= build/check
 
 # repo: smoke-pkg serves packages from repo/ (see the smoke-pkg target).
@@ -525,7 +540,7 @@ iso: $(TARGET) initrd
 	"$$g" $${d:+-d "$$d"} -o maeros.iso isodir
 
 clean:
-	find kernel arch/i686 mm fs drivers proc lib net third_party/lwip/src \
+	find kernel arch/i686 mm fs drivers proc lib net third_party/lwip/src third_party/uacpi \
 		\( -name "*.o" -o -name "*.d" \) -delete 2>/dev/null || true
 	rm -f $(TARGET) maeros.iso initrd.tar disk.img disk-ff.img $(QEMU_ISO_PID) $(KTRACE_STAMP)
 	rm -rf isodir repo
@@ -534,4 +549,4 @@ clean:
 	$(MAKE) -C userspace clean
 
 # Pull in auto-generated dependency files (silence errors if none exist yet)
--include $(C_OBJS:.o=.d) $(LWIP_OBJS:.o=.d)
+-include $(C_OBJS:.o=.d) $(LWIP_OBJS:.o=.d) $(UACPI_OBJS:.o=.d)

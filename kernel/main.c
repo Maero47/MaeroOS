@@ -31,6 +31,7 @@
 #include "../fs/procfs.h"
 #include "../drivers/ata.h"
 #include "../drivers/pci.h"
+#include "../drivers/acpi.h"
 #include "../drivers/rtl8139.h"
 #include "../drivers/framebuffer.h"
 #include "../drivers/keyboard.h"
@@ -196,6 +197,10 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
      * wall time (arch/i686/cpu/tsc.c). */
     tsc_init();
 
+    /* ACPI tables + AML namespace (uACPI).  Needs the heap, PCI and a clock;
+     * must precede init so init's page directory inherits the map window. */
+    acpi_init();
+
     /* Network bottom-half: keeps DHCP/TCP alive without userspace polling */
     if (net_find_interface("eth0"))
         proc_create_kthread(knetd, "knetd");
@@ -227,6 +232,7 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
             for (;;) __asm__ volatile("hlt");
         }
     }
+    acpi_start_thread();
 
     printk("[BOOT] Jumping to scheduler.\n");
     /* The process table is now fully built — release the APs so they can scan

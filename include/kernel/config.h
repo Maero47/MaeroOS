@@ -56,6 +56,13 @@
                                             * tables reserved at boot */
 #define KSTACK_REGION_END   (KSTACK_REGION_START + KSTACK_SLOTS * KSTACK_SLOT_SIZE)
 
+/* ACPI mapping window (drivers/acpi.c): uACPI's tables and SystemMemory
+ * operation regions, mapped uncached and never reused.  16 MiB just below the
+ * I/O APIC (0xFEC00000) and LAPIC (0xFEE00000) pages; its 4 page tables are
+ * reserved by acpi_init before init's page directory is built. */
+#define ACPI_MAP_START      0xFD000000UL
+#define ACPI_MAP_END        0xFE000000UL
+
 #define USER_STACK_TOP    0xC0000000UL
 #define USER_STACK_PAGES  64
 #define USER_STACK_BASE   (USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE))

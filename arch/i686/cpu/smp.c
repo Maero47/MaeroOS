@@ -11,6 +11,7 @@
 #include <kernel/config.h>
 #include "../../../proc/scheduler.h"
 #include "pit.h"
+#include "../../../drivers/acpi.h"
 #include <stddef.h>
 
 /* The trampoline blob + its patch words (defined in ap_trampoline.asm). */
@@ -158,6 +159,14 @@ static void send_ipi(uint8_t apicid, uint32_t icr_lo) {
     ipi_wait_delivery();
 }
 
+void smp_stop_others(void) {
+    if (!apic_available() || g_cpu_count < 2) return;
+    /* Destination shorthand "all excluding self", INIT, level assert. */
+    apic_write(LAPIC_REG_ICR_HI, 0);
+    apic_write(LAPIC_REG_ICR_LO, (3U << 18) | (1U << 14) | 0x500U);
+    ipi_wait_delivery();
+}
+
 /* ── AP C entry (higher half; kernel pgdir + trampoline GDT) ─────────────── */
 void ap_entry(void) {
     apic_init();                 /* per-CPU LAPIC enable (AP masks LINT0/1) */
@@ -266,9 +275,20 @@ uint32_t smp_boot_aps(void) {
     if (hint > MAX_CPUS) hint = MAX_CPUS;
     uint32_t bsp = apic_id();
 
-    /* APIC IDs for QEMU -smp N are 0..N-1; probe every id except the BSP's. */
+    /* The MADT names every enabled CPU's APIC id (acpi_init ran before us);
+     * real machines need not number them 0..N-1.  Without ACPI, fall back to
+     * the ids QEMU uses for -smp N: 0..N-1 for the CPUID count hint. */
+    uint8_t ids[32];
+    uint32_t nids = acpi_madt_lapic_ids(ids, sizeof(ids));
+    if (nids) {
+        printk("[SMP]  %u CPU(s) listed in the MADT\n", (unsigned)nids);
+    } else {
+        for (uint32_t id = 0; id < hint && id < sizeof(ids); id++) ids[nids++] = (uint8_t)id;
+    }
+
     uint32_t next_idx = 1;              /* logical slot 0 is the BSP */
-    for (uint32_t id = 0; id < hint && next_idx < MAX_CPUS; id++) {
+    for (uint32_t k = 0; k < nids && next_idx < MAX_CPUS; k++) {
+        uint32_t id = ids[k];
         if (id == bsp) continue;
         /* From here a second CPU may execute kernel code, so this_cpu_id() must
          * go back to asking the hardware.  Before the AP is started, not after:

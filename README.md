@@ -45,6 +45,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | X11 server | `XHANDSHAKE_OK`, `XDRAW_OK` (`w=320 h=200` from `GetGeometry`), `XEVENT_OK`, and `XREAL_PAINTED` from a client linked against the cross-built libX11 | `make smoke-x` |
 | Desktop and its apps | driven with QMP mouse and keyboard input on the ISO: the launcher opens the terminal, a command typed into it runs in the terminal's own shell (its pid is checked), the image viewer shows `/disk/wallpaper.ppm`, Files enters a directory by double-click, Settings applies an accent (the desktop reloads, `desktop.conf` changes), the Store shows its verified list or the "run pkg update" state, the Task Manager lists the desktop and the Store, windows close by button, Esc and Alt-Tab and the focus passes to the topmost window left; every window must also show up in a screendump | `make smoke-gui` |
 | GLib, Cairo, Pango, GTK3 | `GLIB_OK` (v2.78), `CAIRO_OK rect_px=0xe69919`, `PANGO_OK`, `GTK_OK init`, `GTK_WINDOW_SHOWN`, `GTK_DRAWN` (needs probe binaries a fresh clone lacks, see Testing) | `make smoke-gtk` |
+| ACPI (uACPI 6.1.0) | on QEMU's `pc` and `q35` machines the kernel finds the RSDP, loads the AML namespace (`[ACPI] ready`), `poweroff` ends QEMU through S5 (`\_PTS`, `\_S5`), `reboot` restarts it through the FADT reset register (q35) or 0xCF9 (pc, whose FADT has none), and the ACPI power button (`system_powerdown`) reaches init as SIGUSR2 and powers off | `make smoke-acpi` |
 | Firefox 115.15.0esr | `ff: Firefox painted` (the browser window, about 5 s after `firefox-bin` starts); with `--web`, a page served from the host (HTML, a CSS rule, a PNG) requested and its image on screen about 3 s after Enter (needs the Firefox tree, see `ports/firefox/`) | `make smoke-firefox`, `make smoke-firefox-web` |
 
 ### What does not work
@@ -605,7 +606,7 @@ A wedged boot prints nothing, so three things exist to make one visible.
 | Path | Contents |
 |---|---|
 | `arch/i686/` | boot and AP trampoline assembly, GDT/IDT/TSS/PIC/PIT, LAPIC, SMP, BKL, paging |
-| `drivers/` | ATA, PCI, RTL8139, AC'97, framebuffer, VGA, keyboard, mouse, RTC, serial |
+| `drivers/` | ATA, PCI, RTL8139, AC'97, framebuffer, VGA, keyboard, mouse, RTC, serial, ACPI (uACPI glue) |
 | `fs/` | VFS, ustar initrd, ext2, tmpfs, devfs, procfs |
 | `include/kernel/` | `config.h`, `types.h`, `multiboot.h`, `assert.h` |
 | `kernel/` | `main.c`, `printk`, ring-buffer `klog`, `panic`, RNG, stack protector |
@@ -616,7 +617,7 @@ A wedged boot prints nothing, so three things exist to make one visible.
 | `userspace/` | libc, init, shell, libdraw/libwm/libgui, desktop, maeroX, commands |
 | `ports/` | cross-build scripts, Dockerfiles and package recipes for imported software |
 | `testfiles/` | the root filesystem staged into `initrd.tar` and `disk.img` |
-| `third_party/` | vendored lwIP, toybox and TweetNaCl |
+| `third_party/` | vendored lwIP, toybox, TweetNaCl and uACPI |
 | `tools/` | smoke tests, QEMU launch script, icon/font/wallpaper/repo generators |
 | `docs/` | screenshots, the Firefox first-paint audit (`docs/audit/`) and startup profile (`docs/perf/`) |
 
@@ -654,6 +655,7 @@ For the longer story of how the browser stack was built up, phase by phase, see
 | lwIP | 2.2.1 | `third_party/lwip` | BSD 3-clause (`third_party/lwip/COPYING`) |
 | toybox | 0.8.13 | `third_party/toybox` | 0BSD (`third_party/toybox/LICENSE`) |
 | TweetNaCl | 20140427 | `third_party/tweetnacl` | public domain (`third_party/tweetnacl/LICENSE`) |
+| uACPI | 6.1.0 (`f5f6cc2`) | `third_party/uacpi` | MIT (`third_party/uacpi/LICENSE`, `NOTICE.maeros`) |
 | fbDOOM | id Software Doom source | `ports/fbDOOM` | GPL v2 |
 | BusyBox | 1.35.0 | `ports/busybox`, `ports/packages/busybox` | GPL v2 |
 | links | 2.30 | `ports/links-2.30.tar.gz`, `ports/packages/links` | GPL v2 |
