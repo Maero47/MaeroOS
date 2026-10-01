@@ -147,7 +147,7 @@ INTREE_PREREQS=0    # 1: gmp/mpfr/mpc/isl built inside the gcc tree
 # disk tooling, script runtimes.
 APT_REQUIRED="build-essential bison flex texinfo libgmp-dev libmpfr-dev libmpc-dev libisl-dev
 nasm qemu-system-x86 qemu-system-gui grub-pc-bin grub-common xorriso mtools e2fsprogs
-python3 wget xz-utils zstd librsvg2-bin ovmf"
+exfatprogs python3 wget xz-utils zstd librsvg2-bin ovmf"
 # Optional: docker.io only for rebuilding ports/, gcc-multilib for
 # ports/firefox/build-glstubs.sh without Docker, gdb-multiarch for `make gdb`.
 APT_OPTIONAL_PKGS="docker.io gcc-multilib gdb-multiarch"
@@ -159,11 +159,11 @@ APT_OPTIONAL_PKGS="docker.io gcc-multilib gdb-multiarch"
 # not relocatable, musl.cc's native toolchain is (see nosudo_native).
 # The shellcheck linter (for tools/*.sh) is included because it is tiny and static.
 NOSUDO_PKGS="make nasm bison flex m4 texinfo qemu-system-x86 qemu-system-gui grub-pc-bin
-mtools xorriso e2fsprogs xz-utils zstd shellcheck ovmf"
+mtools xorriso e2fsprogs exfatprogs xz-utils zstd shellcheck ovmf"
 # Tools that get a wrapper in $BIN_DIR when the relocated tree provides them.
 NOSUDO_WRAP="make nasm bison flex m4 makeinfo texi2any qemu-system-i386 qemu-system-x86_64
 grub-mkrescue grub-mkimage grub-file mformat mcopy mmd mdir mdel mtype mattrib minfo mlabel
-xorriso mke2fs mkfs.ext2 debugfs xz zstd shellcheck"
+xorriso mke2fs mkfs.ext2 debugfs mkfs.exfat fsck.exfat xz zstd shellcheck"
 
 usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -673,6 +673,7 @@ verify() {
     check_tool mformat           1 "apt: mtools, or --no-sudo"
     check_tool mke2fs            1 "apt: e2fsprogs, or --no-sudo"
     check_tool debugfs           1 "apt: e2fsprogs, or --no-sudo"
+    check_tool mkfs.exfat        0 "apt: exfatprogs, or --no-sudo (make smoke-exfat; also found in /usr/sbin)"
     check_tool python3           1 "apt: python3"
     check_tool tar               1 "apt: tar"
     check_tool sed               1 "apt: sed"

@@ -439,15 +439,24 @@ def fat16_session(g, man):
                    "busybox cp \"/mnt16/sub/data.bin\" /mnt16/sub/copy.bin && "
                    "busybox cp \"/mnt12/odd cluster chain.bin\" \"/mnt12/kopya ı.bin\" && "
                    "busybox rm /mnt12/fat12.txt && busybox mkdir /mnt12/dir && "
-                   "busybox seq 1 3000 > /mnt12/dir/seq.txt && "
-                   "busybox umount /mnt16 && busybox umount /mnt12")
-    check(rc == 0, f"FAT16 and FAT12 written and unmounted ({out.strip()[-200:]!r})")
+                   "busybox seq 1 3000 > /mnt12/dir/seq.txt")
+    check(rc == 0, f"FAT16 and FAT12 written ({out.strip()[-200:]!r})")
+    # Two FAT volumes share the driver's rename_fn: a rename between them is
+    # EXDEV (it used to run on the wrong volume), and mv copies instead.
+    rc, out = g.sh("fsprobe rename /mnt16/fat16.txt /mnt12/fat16.txt")
+    check("rename: -18" in out, f"rename(2) between two FAT mounts is EXDEV ({out.strip()!r})")
+    rc, out = g.sh("busybox mv /mnt16/fat16.txt /mnt12/ && busybox cat /mnt12/fat16.txt && "
+                   "busybox test ! -e /mnt16/fat16.txt && busybox umount /mnt16 && busybox umount /mnt12")
+    check(rc == 0 and "hello from FAT16" in out,
+          f"mv between two FAT mounts copies the file; both unmount ({out.strip()[-160:]!r})")
     w16 = dict(man["fat16"]["files"])
     w16["sub/copy.bin"] = w16["sub/data.bin"]
+    fat16_txt = w16.pop("fat16.txt")
     w12 = dict(man["fat12"]["files"])
     w12["kopya ı.bin"] = w12["odd cluster chain.bin"]
     del w12["fat12.txt"]
     w12["dir/seq.txt"] = md5("".join(f"{i}\n" for i in range(1, 3001)).encode())
+    w12["fat16.txt"] = fat16_txt
     return w16, w12
 
 

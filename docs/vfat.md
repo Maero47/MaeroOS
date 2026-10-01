@@ -63,7 +63,7 @@ slot and the name. One stick at a time (the MSC driver's limit).
 * FAT12, FAT16 and FAT32, the type decided as Linux does: no 16-bit FAT size
   in the BPB means FAT32, otherwise the cluster count (fewer than 4085: FAT12).
   Sector sizes 512 to 4096, clusters up to 64 KiB, FAT32 with mirrored FATs or
-  one active FAT (`BPB_ExtFlags`). exFAT is detected and refused with a message.
+  one active FAT (`BPB_ExtFlags`). exFAT is `fs/exfat.c`'s (`docs/exfat.md`).
 * Long names (VFAT): UTF-16 in the entries, UTF-8 in the VFS, surrogate pairs
   for characters outside the BMP; a long name whose checksum does not match its
   short entry is ignored (as Windows does). Names are case-insensitive and
@@ -89,7 +89,9 @@ slot and the name. One stick at a time (the MSC driver's limit).
   (".." follows), case-only changes, and over an existing entry: the existing
   short entry is pointed at the moved object in one sector write, so the
   target name never disappears, then the old entries are deleted. A directory
-  cannot move below itself (`EINVAL`).
+  cannot move below itself (`EINVAL`). Between two FAT mounts it is `EXDEV`
+  (`mv` copies): `rename(2)` compares the mount instances, not the shared
+  rename hook, and the driver checks again.
 * Timestamps: creation, modification and access date; `utimensat` sets them.
   FAT stores local time without a zone; it is read and written as UTC here.
 * Metadata (FAT, directories, boot sector, FSInfo) goes through a 256 KiB
@@ -110,7 +112,7 @@ slot and the name. One stick at a time (the MSC driver's limit).
   `fs/ext4.c` does), because some kernel callers of `vfs_read` take the result
   as a length; write errors return `EIO`.
 
-Not supported: exFAT, symlinks and hard links (`EPERM`), device nodes, FIFOs
+Not supported (exFAT is a separate driver, `docs/exfat.md`): symlinks and hard links (`EPERM`), device nodes, FIFOs
 and sockets on FAT, `chown`, time zones, updating the FAT32 backup boot sector.
 
 ## Sources

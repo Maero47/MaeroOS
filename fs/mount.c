@@ -2,6 +2,7 @@
 #include "ext2.h"
 #include "ext4.h"
 #include "vfat.h"
+#include "exfat.h"
 #include "tmpfs.h"
 #include "../drivers/blkpart.h"
 #include "../drivers/blkdev.h"
@@ -38,6 +39,10 @@ static int is_ext_type(const char *t) {
 static int is_fat_type(const char *t) {
     return strcmp(t, "vfat") == 0 || strcmp(t, "msdos") == 0 ||
            strcmp(t, "fat") == 0;
+}
+
+static int is_exfat_type(const char *t) {
+    return strcmp(t, "exfat") == 0;
 }
 
 /* statfs(2) of a mount(2) ext2 instance, in the vfs_mnt_t hook's form. */
@@ -93,6 +98,21 @@ static int mount_block(const char *source, const char *target, const char *fstyp
         t.statfs  = vfat_statfs;
         r = vfs_mount_add(target, root, &t);
         if (r < 0) vfat_release(vfs);
+        return r;
+    }
+    if (is_exfat_type(fstype)) {
+        vfat_opts_t o;
+        vfat_parse_opts(data, &o);
+        exfat_fs_t *xfs;
+        r = exfat_mount_dev(bp, (flags & VFS_MS_RDONLY) != 0, &o, &root, &xfs);
+        if (r < 0) return r;
+        t.fs      = xfs;
+        t.busy    = exfat_busy;
+        t.release = exfat_release;
+        t.set_ro  = exfat_set_ro;
+        t.statfs  = exfat_statfs;
+        r = vfs_mount_add(target, root, &t);
+        if (r < 0) exfat_release(xfs);
         return r;
     }
 
@@ -200,7 +220,7 @@ int mount_do(const char *source, const char *target, const char *fstype,
     }
     if (!fstype) return -22;
 
-    if (is_ext_type(fstype) || is_fat_type(fstype))
+    if (is_ext_type(fstype) || is_fat_type(fstype) || is_exfat_type(fstype))
         return mount_block(source, target, fstype, flags, data);
 
     vfs_node_t *root = NULL;

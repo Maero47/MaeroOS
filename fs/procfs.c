@@ -264,13 +264,13 @@ static uint32_t procfs_partitions_read(vfs_node_t *n, uint32_t off, uint32_t len
 }
 
 /* /proc/filesystems: what mount(2) takes.  busybox mount without -t tries
- * the types not marked nodev in this order, so vfat (which only needs its
- * boot sector to say no) comes before the ext family. */
+ * the types not marked nodev in this order, so vfat and exfat (which only
+ * need their boot sector to say no) come before the ext family. */
 static uint32_t procfs_filesystems_read(vfs_node_t *n, uint32_t off, uint32_t len,
                                         uint8_t *buf) {
     (void)n;
     static const char text[] =
-        "\tvfat\n\text4\n\text3\n\text2\n"
+        "\tvfat\n\texfat\n\text4\n\text3\n\text2\n"
         "nodev\tmsdos\nnodev\ttmpfs\nnodev\tproc\nnodev\tdevtmpfs\n";
     char tmp[sizeof(text)];
     memcpy(tmp, text, sizeof(text));

@@ -27,7 +27,7 @@ typedef struct {
 void vfat_parse_opts(const char *data, vfat_opts_t *o);
 
 /* Mount the filesystem on `bp`.  On success returns 0 and sets *root and *fs.
- * -EINVAL: not a FAT filesystem (or exFAT, which this driver does not read);
+ * -EINVAL: not a FAT filesystem (exFAT is fs/exfat.c's);
  * -ENOMEM; -EIO. */
 int vfat_mount_dev(blkpart_t *bp, int ro, const vfat_opts_t *o,
                    vfs_node_t **root, vfat_fs_t **fs);
