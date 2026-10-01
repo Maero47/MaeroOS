@@ -3,7 +3,11 @@
 
 1. live      qemu-system-i386 -M q35: maeros-limine.iso on the AHCI CD, a
              copy of disk.img as sda (the live /disk) and an empty 1 GiB sdb.
-             As root: `maeros-install -l` lists both and marks sda in use,
+             On the desktop (session user "user"): launcher, "install", Enter
+             opens a Terminal running `sudo maeros-install`; it takes the
+             password, the disk name sdb and "no", and cancels (screenshot
+             gui-cancelled.png; no maeros-install left running).  As root on
+             the serial console: `maeros-install -l` lists both and marks sda in use,
              `maeros-install -y /dev/sda` is refused, `maeros-install -y
              /dev/sdb` installs; then poweroff.
    host      the target's GPT verifies (sgdisk -v), its root partition is
@@ -29,7 +33,7 @@ import tempfile
 import time
 
 import smokelib
-from smoke_gui import Console, Image, Qmp, distinct_colors, pick_accel
+from smoke_gui import Console, Image, Input, Qmp, distinct_colors, pick_accel
 from smoke_uefi import X64_NAMES, FW_DIRS, find_firmware, prepare_disk
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -85,6 +89,35 @@ def poweroff(con):
         raise AssertionError("QEMU did not exit after poweroff")
 
 
+def gui_front_end(con, qmp, out):
+    """The desktop's "Install MaeroOS" launcher entry, up to the last
+    question, answered "no"."""
+    inp = Input(qmp)
+    m = con.wait_re(r"\[desktop\] ready fb=\d+x\d+ orb=(\d+),(\d+)", timeout=120, start=0)
+    time.sleep(1.5)
+    at = con.mark()
+    inp.click(int(m.group(1)), int(m.group(2)))
+    con.wait_re(r"\[desktop\] launcher open", timeout=20, start=at)
+    inp.type("install\n")
+    con.wait_re(r"\[desktop\] window opened: Terminal", timeout=30, start=at)
+    con.wait_re(r"exec '/disk/doas'", timeout=30, start=at)
+    time.sleep(1)
+    inp.type("user\n")                                      # doas password
+    con.wait_re(r"exec '/disk/maeros-install'", timeout=30, start=at)
+    time.sleep(1.5)
+    inp.type("sdb\n")
+    time.sleep(1.5)
+    inp.type("no\n")
+    time.sleep(1.5)
+    ppm = os.path.join(out, "screen.ppm")
+    qmp.cmd("screendump", filename=ppm)
+    Image.read_ppm(ppm).write_png(os.path.join(out, "gui-cancelled.png"))
+    os.remove(ppm)
+    ps = con.run("ps", timeout=20)
+    if "maeros-install" in ps or "doas" in ps:
+        raise AssertionError(f"the GUI installer did not cancel on \"no\":\n{ps}")
+
+
 def live_install(accel):
     live = os.path.join(OUT, "live.img")
     prepare_disk(live)
@@ -101,8 +134,9 @@ def live_install(accel):
     try:
         con.wait_re(r'\[BOOT\] multiboot2: loader "Limine', timeout=180)
         smokelib.login(con.proc, con.sel, con.log, timeout=180, start=0)
+        gui_front_end(con, qmp, out)
         listing = con.run("maeros-install -l", timeout=30)
-        if not re.search(r"/dev/sda .*in use", listing) or not re.search(r"/dev/sdb\s+1024 MiB", listing):
+        if not re.search(r"/dev/sda .*\(in use\)", listing) or not re.search(r"/dev/sdb\s+1024 MiB", listing):
             raise AssertionError(f"maeros-install -l: unexpected listing:\n{listing}")
         refused = con.run("maeros-install -y /dev/sda; echo rc=$?", timeout=30)
         if "mounted filesystem" not in refused or "rc=1" not in refused:

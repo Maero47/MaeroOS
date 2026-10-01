@@ -197,7 +197,7 @@ static void print_disks(disk_t *d, int n) {
     for (int i = 0; i < n; i++)
         printf("  /dev/%-10s %8llu MiB%s\n", d[i].name,
                (unsigned long long)(d[i].sectors / MiB),
-               d[i].in_use ? "   (in use: holds a mounted filesystem)" : "");
+               d[i].in_use ? "   (in use)" : "");
 }
 
 /* ── GPT ─────────────────────────────────────────────────────────────────── */

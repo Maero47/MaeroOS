@@ -1594,6 +1594,20 @@ static int start_term(void) {
     return start_multi(preferred_term_path(), "TERMINAL LAUNCHED");
 }
 
+/* The Install icon: maeros-install in a Terminal, through sudo (it writes
+ * raw disks).  Shown when the system carries what the installer copies,
+ * i.e. it was booted from the Limine live image (docs/install.md). */
+static int install_available(void) {
+    static int avail = -1;
+    if (avail < 0) avail = access("/boot/kernel.elf", R_OK) == 0;
+    return avail;
+}
+
+static int start_install(void) {
+    return start_multi_file(preferred_term_path(), "INSTALLER LAUNCHED",
+                            "sudo maeros-install; echo; echo Press Ctrl+D or close this window.; cat >/dev/null");
+}
+
 static int start_browse(void) {
     return start_multi(preferred_browse_path(), "BROWSER LAUNCHED");
 }
@@ -2484,6 +2498,7 @@ static void launcher_menu_action(int item) {
         start_multi(disk_or_initrd("/disk/store", "/store"),
                     "STORE LAUNCHED");
         break;
+    case 12: start_install(); break;
     }
 }
 
@@ -2634,8 +2649,14 @@ static const desk_icon_t desk_icons[] = {
     { "Browser",  desk_art_web,   start_browse,  "browser" },
     { "Files",    desk_art_files, start_files,   "files" },
     { "Widgets",  desk_art_demo,  start_uidemo,  "sysmon" },
+    { "Install",  desk_art_files, start_install, "disk" },   /* last: optional */
 };
-#define DESK_ICONS   ((int)(sizeof(desk_icons) / sizeof(desk_icons[0])))
+#define DESK_ICONS   desk_icon_count()
+
+static int desk_icon_count(void) {
+    int all = (int)(sizeof(desk_icons) / sizeof(desk_icons[0]));
+    return install_available() ? all : all - 1;
+}
 #define DESK_CELL_W  76
 #define DESK_CELL_H  84
 #define DESK_X       20
@@ -2920,6 +2941,7 @@ static const sm_item_t sm_items[] = {
     { "Store",        11 }, { "Terminal", 0 }, { "Browser",      1 },
     { "Files",        2 }, { "Editor",   3 }, { "Calculator",   4 },
     { "Task Manager", 5 }, { "Console",  8 }, { "System Monitor", 9 },
+    { "Install MaeroOS", 12 },          /* last: only when install_available() */
 };
 #define SM_ITEMS ((int)(sizeof(sm_items) / sizeof(sm_items[0])))
 
@@ -2949,7 +2971,8 @@ static int sm_match(const char *label) {
 static int sm_filtered(int *out, int max) {
     int n = 0;
     for (int i = 0; i < SM_ITEMS && n < max; i++)
-        if (sm_match(sm_items[i].label))
+        if (sm_match(sm_items[i].label) &&
+            (sm_items[i].action != 12 || install_available()))
             out[n++] = i;
     for (int i = 0; i < inst_app_count && n < max; i++)
         if (sm_match(inst_apps[i].name))
