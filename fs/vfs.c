@@ -668,6 +668,12 @@ int vfs_mount_has_fs_source(const char *source) {
     return 0;
 }
 
+int vfs_mount_any_source(int (*fn)(const char *source, void *arg), void *arg) {
+    for (int i = 0; i < VFS_MNT_MAX; i++)
+        if (g_mnt[i].used && fn(g_mnt[i].source, arg)) return 1;
+    return 0;
+}
+
 uint32_t vfs_mounts_format(char *buf, uint32_t size) {
     uint32_t pos = 0;
     if (!size) return 0;

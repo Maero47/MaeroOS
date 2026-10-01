@@ -409,12 +409,23 @@ def fat32_session(g, man, big):
     return want
 
 
+def raw_write_refused(g, dev, what):
+    """A raw write to `dev` while a filesystem on its disk is mounted must
+    fail with EBUSY (blkpart_rw).  It rewrites sector 1 with its own bytes,
+    so even a wrongly accepted write changes nothing."""
+    rc, out = g.sh(f"busybox dd if={dev} of=/tmp/sect bs=512 skip=1 count=1 2>/dev/null; "
+                   f"busybox dd if=/tmp/sect of={dev} bs=512 seek=1 count=1 conv=notrunc")
+    check(rc != 0 and "busy" in out.lower(),
+          f"raw write to {dev} refused with EBUSY: {what} ({out.strip()[-120:]!r})")
+
+
 def fat16_session(g, man):
     rc, out = g.sh("busybox mkdir -p /mnt16 /mnt12 && busybox mount -t vfat -o ro /dev/sdc1 /mnt16 && "
                    "busybox mount -t msdos -o ro /dev/sdc2 /mnt12")
     check(rc == 0, f"mount FAT16 sdc1 and FAT12 sdc2 read-only ({out.strip()!r})")
     compare_tree(g.md5_tree("/mnt16"), man["fat16"]["files"], "FAT16, read")
     compare_tree(g.md5_tree("/mnt12"), man["fat12"]["files"], "FAT12, read")
+    raw_write_refused(g, "/dev/sdc", "whole disk while sdc1/sdc2 are mounted")
     # Fill the FAT12 volume: ENOSPC, then everything given back.
     rc, out = g.sh("busybox mount -o remount,rw /mnt12 && busybox stat -f -c %f /mnt12 && "
                    "busybox dd if=/dev/zero of=/mnt12/fill bs=4096; "
@@ -452,6 +463,11 @@ def usb_session(g, man):
                    "busybox cp /usb/Belgeler/photo.jpg /usb/Yedek/fotoğraf.jpg && "
                    "busybox mv /usb/usb-hello.txt /usb/Yedek/ && busybox rm /usb/DOS.TXT")
     check(rc == 0, f"USB: create, copy, mkdir, rename, unlink ({out.strip()[-200:]!r})")
+    raw_write_refused(g, "/dev/sdd", "USB stick mounted read-write")
+    rc, out = g.sh("maeros-install -l")
+    check(re.search(r"sdd.*\(in use\)", out) is not None and
+          re.search(r"sdc.*\(in use\)", out) is None,
+          f"maeros-install -l: the mounted USB stick sdd is in use, sdc (unmounted by now) is not ({out.strip()!r})")
     want = dict(man["usb"]["files"])
     want["USB-yazıldı.txt"] = md5("".join(f"{i}\n" for i in range(1, 50001)).encode())
     want["Yedek/fotoğraf.jpg"] = want["Belgeler/photo.jpg"]

@@ -33,14 +33,26 @@ int blkpart_write(blkpart_t *bp, uint32_t sector, uint32_t count, const void *bu
 
 /* ── Byte-granular access, used by the /dev node and by pread64/pwrite64 ──── */
 
+/* vfs_mount_any_source callback: `source` is /dev/<a partition or disk> on
+ * disk *(int *)arg. */
+static int source_on_disk(const char *source, void *arg) {
+    if (strncmp(source, "/dev/", 5) != 0) return 0;
+    blkpart_t *p = blkpart_find(source + 5);
+    return p && p->dev == *(const int *)arg;
+}
+
 int blkpart_rw(blkpart_t *bp, uint64_t off, uint8_t *buf, uint32_t len, int write) {
     if (!bp) return -19;                                   /* -ENODEV */
     uint64_t size = (uint64_t)bp->nsect * 512u;
     if (len == 0) return 0;
     if (off >= size) return write ? -28 : 0;               /* -ENOSPC / EOF */
     if ((uint64_t)len > size - off) len = (uint32_t)(size - off);
-    /* The disk ext2 has mounted at /disk is never written behind its back. */
-    if (write && blk_disk_busy(bp->dev)) return -16;       /* -EBUSY */
+    /* The disk ext2 has mounted at /disk, and any disk with a mounted
+     * partition (vfat, ext4; a USB stick too), is never written behind the
+     * filesystem's back. */
+    if (write && (blk_disk_busy(bp->dev) ||
+                  vfs_mount_any_source(source_on_disk, &bp->dev)))
+        return -16;                                        /* -EBUSY */
     uint8_t *sec = NULL;
     uint32_t done = 0;
     int err = 0;
