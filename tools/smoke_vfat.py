@@ -377,8 +377,9 @@ def fat16_session(g, man):
 def usb_session(g, man):
     rc, out = g.sh("busybox cat /proc/partitions")
     check(re.search(r"\bsdd\b", out) is not None, "the USB stick is sdd in /proc/partitions")
-    rc, out = g.sh("busybox mkdir -p /usb && busybox mount -t vfat /dev/sdd /usb")
-    check(rc == 0, f"mount -t vfat /dev/sdd /usb (USB, no partition table) ({out.strip()!r})")
+    rc, out = g.sh("busybox mkdir -p /usb && busybox mount /dev/sdd /usb && busybox grep sdd /proc/mounts")
+    check(rc == 0 and "/dev/sdd /usb vfat rw" in out,
+          f"mount /dev/sdd /usb without -t: vfat found through /proc/filesystems ({out.strip()!r})")
     compare_tree(g.md5_tree("/usb"), man["usb"]["files"], "USB stick, read")
     rc, out = g.sh("busybox seq 1 50000 > \"/usb/USB-yazıldı.txt\" && "
                    "busybox mkdir /usb/Yedek && "
