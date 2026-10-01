@@ -5601,7 +5601,11 @@ static int sys_reboot(registers_t *regs) {
          magic2 != 369367448 && magic2 != 537993216))
         return -22;   /* -EINVAL */
 
-    /* NVMe asks for an orderly shutdown notification before power goes. */
+    /* Writable mounts (vfat) are flushed and marked clean, as umount would;
+     * NVMe asks for an orderly shutdown notification before power goes. */
+    if (cmd == LINUX_REBOOT_CMD_POWER_OFF || cmd == LINUX_REBOOT_CMD_RESTART ||
+        cmd == LINUX_REBOOT_CMD_HALT)
+        vfs_mounts_shutdown();
     if (cmd == LINUX_REBOOT_CMD_POWER_OFF || cmd == LINUX_REBOOT_CMD_RESTART)
         nvme_shutdown();
 
@@ -5612,7 +5616,8 @@ static int sys_reboot(registers_t *regs) {
         acpi_reboot();
     case LINUX_REBOOT_CMD_HALT:
         /* Linux kernel_halt(): stop the other CPUs, then this one.  Writes
-         * are already on disk (fsync/sync have nothing to flush here). */
+         * are already on disk (fsync/sync have nothing to flush here: vfat
+         * writes each call through, and its mounts were just marked clean). */
         __asm__ volatile("cli");
         smp_stop_others();
         printk("[REBOOT] System halted.\n");

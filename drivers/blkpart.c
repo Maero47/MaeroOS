@@ -4,6 +4,7 @@
 #include "../lib/string.h"
 #include "../lib/printf.h"
 #include "../kernel/printk.h"
+#include "../proc/scheduler.h"
 #include <stddef.h>
 
 /*
@@ -19,13 +20,13 @@ static uint32_t   g_nparts;
 /* ── Raw sector I/O ─────────────────────────────────────────────────────── */
 
 int blkpart_read(blkpart_t *bp, uint32_t sector, uint32_t count, void *buf) {
-    if (!bp || !count || count > 128) return -1;
+    if (!bp || bp->gone || !count || count > 128) return -1;
     if (sector >= bp->nsect || count > bp->nsect - sector) return -1;
     return blk_disk_read(bp->dev, bp->start + sector, count, buf);
 }
 
 int blkpart_write(blkpart_t *bp, uint32_t sector, uint32_t count, const void *buf) {
-    if (!bp || !count || count > 128) return -1;
+    if (!bp || bp->gone || !count || count > 128) return -1;
     if (sector >= bp->nsect || count > bp->nsect - sector) return -1;
     return blk_disk_write(bp->dev, bp->start + sector, count, buf);
 }
@@ -86,7 +87,9 @@ static blkpart_t *blkpart_add(int dev, int partno, uint32_t start, uint32_t nsec
     bp->node.rdev    = bp->rdev;
     bp->node.read_fn = blkpart_node_read;
     bp->node.private = bp;
+    preempt_disable();
     g_parts[g_nparts++] = bp;
+    preempt_enable();
     return bp;
 }
 
@@ -198,6 +201,18 @@ static void mbr_scan_logical(int dev, uint32_t ext_start, uint32_t ext_len,
     }
 }
 
+/* A FAT or exFAT boot sector: a disk formatted without a partition table
+ * (a "superfloppy", common on USB sticks).  Its boot code would otherwise be
+ * read as partition entries. */
+static int is_fat_vbr(const uint8_t *sec) {
+    if (memcmp(sec + 3, "EXFAT   ", 8) == 0) return 1;
+    if (sec[0] != 0xEB && sec[0] != 0xE9) return 0;
+    uint32_t bps = (uint32_t)sec[11] | ((uint32_t)sec[12] << 8);
+    if (bps != 512 && bps != 1024 && bps != 2048 && bps != 4096) return 0;
+    if (!sec[13] || (sec[13] & (sec[13] - 1)) || !sec[16]) return 0;
+    return memcmp(sec + 54, "FAT", 3) == 0 || memcmp(sec + 82, "FAT32", 5) == 0;
+}
+
 static void scan_disk(int dev) {
     uint32_t n = blk_disk_sectors(dev);
     if (!blkpart_add(dev, 0, 0, n)) return;
@@ -205,6 +220,11 @@ static void scan_disk(int dev) {
     if (!sec) return;
     if (blk_disk_read(dev, 0, 1, sec) < 0 || sec[510] != 0x55 || sec[511] != 0xAA)
         goto out;
+    if (is_fat_vbr(sec)) {
+        printk("[PART] %s: FAT filesystem on the whole disk, no partition table\n",
+               blk_disk_devname(dev));
+        goto out;
+    }
     /* A protective MBR (type 0xEE) means GPT. */
     for (int i = 0; i < 4; i++) {
         if (sec[446 + i * 16 + 4] == 0xEE) {
@@ -236,13 +256,34 @@ out:
     kfree(sec);
 }
 
-void blkpart_init(void) {
-    for (int dev = 0; dev < blk_disk_count(); dev++)
-        scan_disk(dev);
-    for (uint32_t i = 0; i < g_nparts; i++)
+static void print_parts(uint32_t from) {
+    for (uint32_t i = from; i < g_nparts; i++)
         if (g_parts[i]->partno)
             printk("[PART] %s: start %u, %u sectors\n", g_parts[i]->name,
                    (unsigned)g_parts[i]->start, (unsigned)g_parts[i]->nsect);
+}
+
+void blkpart_init(void) {
+    for (int dev = 0; dev < blk_disk_count(); dev++)
+        scan_disk(dev);
+    print_parts(0);
+}
+
+void blkpart_scan(int dev) {
+    uint32_t from = g_nparts;
+    scan_disk(dev);
+    print_parts(from);
+}
+
+void blkpart_drop(int dev) {
+    preempt_disable();
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < g_nparts; i++) {
+        if (g_parts[i]->dev == dev) g_parts[i]->gone = 1;
+        else g_parts[k++] = g_parts[i];
+    }
+    g_nparts = k;
+    preempt_enable();
 }
 
 blkpart_t *blkpart_find(const char *name) {

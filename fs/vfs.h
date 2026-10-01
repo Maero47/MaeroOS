@@ -302,6 +302,10 @@ vfs_mnt_t *vfs_mount_find(const char *path, int *err);
  * Calls the release hook unless the instance is still busy. */
 int vfs_mount_remove(vfs_mnt_t *m, uint32_t flags);
 
+/* Power-off and reboot: every writable mount whose filesystem has a set_ro
+ * hook goes read-only (flushed, its volume marked clean). */
+void vfs_mounts_shutdown(void);
+
 /* 1 when a mount sits on `n` (rmdir/unlink of it is -EBUSY). */
 int vfs_is_mountpoint(vfs_node_t *n);
 

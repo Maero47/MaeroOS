@@ -117,6 +117,14 @@ int  usb_msc_attach(struct usb_device *dev, const uint8_t *cfg, uint32_t len);
 void usb_msc_detach(struct usb_device *dev);
 /* devfs: the /dev/usbdisk0 node while a disk is attached, else NULL. */
 struct vfs_node *usb_msc_node(void);
+/* For drivers/blkdev.c: size in 512-byte sectors (saturated), and sector
+ * I/O (0 or -1); they take the USB lock, so never call them with it held. */
+uint32_t usb_msc_sectors(void);
+int usb_msc_read(uint32_t lba, uint32_t count, void *buf);
+int usb_msc_write(uint32_t lba, uint32_t count, const void *buf);
+/* kusbd, without the USB lock: put a newly attached disk into the disk
+ * table and scan its partitions. */
+void usb_msc_service(void);
 
 /* ── HID class driver (usb_hid.c) ─────────────────────────────────────────── */
 
