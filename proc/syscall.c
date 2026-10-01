@@ -7694,6 +7694,8 @@ static int sys_link_paths(int olddirfd, const char *uold, int newdirfd,
     if (target->flags == VFS_FLAG_DIR) return -1;              /* -EPERM */
     r = resolve_path_at_fd(newdirfd, newpath, newres, sizeof(newres));
     if (r < 0) return r;
+    /* The new name goes into the directory that would hold it. */
+    if (vfs_path_rdonly(newres, 1)) return -30;                /* -EROFS */
     char new_dir[256], new_base[256];
     if (path_split(newres, new_dir, new_base) < 0 || !new_base[0]) return -2;
     vfs_node_t *dir = vfs_open_parent_at(newres, new_dir);
@@ -7856,7 +7858,8 @@ static int do_utimens(vfs_node_t *n, int have, const int64_t sec[2],
 }
 
 /* The node utimensat()-style calls act on: `upath` under `dirfd`, or with a
- * NULL or (AT_EMPTY_PATH) empty path the descriptor itself. */
+ * NULL or (AT_EMPTY_PATH) empty path the descriptor itself.  -EROFS when it
+ * is on a read-only mount, like chmod and chown. */
 static int utimens_target(int dirfd, const char *upath, int flags,
                           vfs_node_t **out) {
     if (flags & ~(0x100 | 0x1000)) return -22;  /* AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH */
@@ -7869,6 +7872,7 @@ static int utimens_target(int dirfd, const char *upath, int flags,
         if (dirfd < 0 || dirfd >= MAX_FD ||
             current_proc->ofile[dirfd].type == FD_NONE || !current_proc->ofile[dirfd].node)
             return -9;                                         /* -EBADF */
+        if (fd_rofs(&current_proc->ofile[dirfd])) return -30;  /* -EROFS */
         *out = current_proc->ofile[dirfd].node;
         return 0;
     }
@@ -7877,7 +7881,9 @@ static int utimens_target(int dirfd, const char *upath, int flags,
     if (r < 0) return r;
     int err;
     *out = vfs_lookup(resolved, !(flags & 0x100), &err);
-    return *out ? 0 : err;
+    if (!*out) return err;
+    if (vfs_path_rdonly(resolved, (flags & 0x100) != 0)) return -30;  /* -EROFS */
+    return 0;
 }
 
 static int sys_utimensat_common(registers_t *regs, int time64) {
