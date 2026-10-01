@@ -320,7 +320,12 @@ void flock_fd_closed(proc_file_t *f) {
     }
     /* flock and OFD: once the open file description's last descriptor
      * closes. */
-    if (f->fid && !fid_in_use(f->fid, f)) {
+    int held = 0;
+    for (flk_t *l = locks; l && f->fid; l = l->next)
+        if (l->kind != LK_POSIX && l->owner == f->fid) { held = 1; break; }
+    /* (The scan of every descriptor table runs only for a description
+     * that holds such a lock.) */
+    if (held && !fid_in_use(f->fid, f)) {
         c.owner = f->fid;
         unlock_all(match_fid, &c);
     }

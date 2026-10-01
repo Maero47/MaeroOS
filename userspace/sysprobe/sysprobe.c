@@ -142,12 +142,22 @@ int main(void) {
         }
         struct flock fl;
         memset(&fl, 0, sizeof(fl));
-        fl.l_type = F_WRLCK;
+        /* Record locks are real (proc/flock.c): a read lock on this
+         * read-only descriptor works, a write lock is EBADF as on Linux. */
+        fl.l_type = F_RDLCK;
         r = fcntl(tmpfd, F_SETLK, &fl);
         if (r < 0) {
             printf("sysprobe: fcntl F_SETLK failed errno=%d\n", errno);
             failed = 1;
         }
+        fl.l_type = F_WRLCK;
+        if (fcntl(tmpfd, F_SETLK, &fl) == 0 || errno != EBADF) {
+            printf("sysprobe: F_WRLCK on a read-only fd: want EBADF, errno=%d\n",
+                   errno);
+            failed = 1;
+        }
+        fl.l_type = F_UNLCK;
+        fcntl(tmpfd, F_SETLK, &fl);
         failed |= expect_raw("fcntl bad lock ptr",
                              syscall3(55, tmpfd, F_SETLK, (int)bad), -14);
 
