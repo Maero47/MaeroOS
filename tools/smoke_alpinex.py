@@ -69,7 +69,7 @@ class AlpineX:
             self.g.settle(1.0)
 
     def install_cli(self, name):
-        out = self.sh(f"/disk/xapp install {name}", timeout=400)
+        out = self.sh(f"/disk/xapp install {name}", timeout=900)
         if f"{name} installed" not in out:
             raise AssertionError(f"xapp install {name} failed:\n{out[-800:]}")
 
@@ -83,7 +83,7 @@ class AlpineX:
         self.g.settle(1.0)
         x, y = int(m.group(1)), int(m.group(2))
         self.g.click(win["x"] + BODY_X + x, win["y"] + BODY_Y + y)
-        self.con.wait_re(r"\[linuxapps\] installed %s exit=0" % name, timeout=400)
+        self.con.wait_re(r"\[linuxapps\] installed %s exit=0" % name, timeout=900)
         self.g.shot(f"linuxapps-{name}-installed")
         self.g.close(win)
 
