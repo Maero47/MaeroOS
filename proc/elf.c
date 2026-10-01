@@ -206,7 +206,7 @@ int elf_load_bias(vfs_node_t *node, uint32_t pgdir_phys, uint32_t want_bias,
         for (uint32_t va = vstart; va < vend; va += PAGE_SIZE) {
             uint8_t *dst;
             pte_t old = pgdir_virt_to_pte(pgdir_phys, va);
-            uint32_t existing = (old & PAGE_PRESENT) ? pte_frame(old) : 0;
+            phys_t existing = (old & PAGE_PRESENT) ? pte_frame(old) : 0;
             if (existing) {
                 /* The union: writable if either half is, executable if
                  * either half is. */
@@ -225,7 +225,7 @@ int elf_load_bias(vfs_node_t *node, uint32_t pgdir_phys, uint32_t want_bias,
                 }
                 dst = (uint8_t *)paging_temp_map(existing);
             } else {
-                uint32_t phys = pmm_alloc_frame();
+                phys_t phys = pmm_alloc_user_frame();
                 if (!phys) {
                     printk("[ELF] OOM loading segment\n");
                     if (owned_hdr) { kfree(owned_hdr); }

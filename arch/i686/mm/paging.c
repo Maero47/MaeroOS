@@ -74,7 +74,7 @@ uint32_t kernel_pgdir_phys;
 static void page_fault_handler(registers_t *regs);
 static void map_higher_half_physical_memory(void);
 
-void *paging_temp_map(uint32_t phys);
+void *paging_temp_map(phys_t phys);
 void  paging_temp_unmap(void);
 
 /*
@@ -125,9 +125,18 @@ static void enable_nx(void) {
  * A new PAE address space: PDPT + four zeroed directories, directory 3's
  * kernel half copied from `kpd3` (a kernel address of 508 8-byte PDEs) and
  * its last four entries pointing back at the directories.  Returns the PDPT
- * frame, 0 on OOM.  Uses the temp maps: IF=0.
+ * frame, 0 on OOM.  Uses the temp maps, with interrupts off.
  */
+static uint32_t pae_pgdir_fill(const volatile void *kpd3);
 static uint32_t pae_pgdir_new(const volatile void *kpd3) {
+    uint32_t fl;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+    uint32_t pdpt = pae_pgdir_fill(kpd3);
+    if (fl & 0x200) __asm__ volatile("sti");
+    return pdpt;
+}
+
+static uint32_t pae_pgdir_fill(const volatile void *kpd3) {
     uint32_t pdpt = pmm_alloc_frame();
     if (!pdpt) return 0;
     uint32_t pd[4];
@@ -320,9 +329,9 @@ int paging_reserve_range(uint32_t start, uint32_t end, int user) {
  * mapping (mmap, brk, stack growth, COW) a machine halt.  On failure NOTHING
  * has been changed, so a caller can propagate -ENOMEM without unwinding.
  */
-int paging_map(uint32_t virt, uint32_t phys, pte_t flags) {
+int paging_map(uint32_t virt, phys_t phys, pte_t flags) {
     virt &= ~0xFFFU;
-    phys &= ~0xFFFU;
+    phys &= ~(phys_t)0xFFFU;
 
     if (paging_reserve_table(virt, (flags & PAGE_USER) != 0) != 0)
         return -1;
@@ -375,7 +384,7 @@ static void map_higher_half_physical_memory(void) {
 
     printk("[VMM]  RAM: %u MiB total; higher-half direct map covers %u MiB "
            "(rest is high memory via temp maps).\n",
-           (unsigned)(total_phys >> 20),
+           (unsigned)(pmm_ram_frames() / 256),
            (unsigned)(map_limit / (1024U * 1024U)));
 }
 
@@ -387,10 +396,11 @@ void paging_unmap(uint32_t virt) {
     }
 }
 
+/* Kernel addresses only: every kernel page is below 4 GiB. */
 uint32_t paging_get_physical(uint32_t virt) {
     pte_t pte = pte_read(virt);
     if (!(pte & PAGE_PRESENT)) return 0;
-    return pte_frame(pte) | (virt & 0xFFFU);
+    return (uint32_t)pte_frame(pte) | (virt & 0xFFFU);
 }
 
 void paging_set_kernel_permissions(void) {
@@ -443,8 +453,8 @@ void paging_set_kernel_permissions(void) {
  * across all page directories.  Must only be used with IF=0.
  */
 
-void *paging_temp_map(uint32_t phys) {
-    pte_set(TEMP_MAP_VIRT, (phys & ~0xFFFU) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX);
+void *paging_temp_map(phys_t phys) {
+    pte_set(TEMP_MAP_VIRT, (phys & ~(phys_t)0xFFFU) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX);
     tlb_flush_single(TEMP_MAP_VIRT);
     return (void *)TEMP_MAP_VIRT;
 }
@@ -454,8 +464,8 @@ void paging_temp_unmap(void) {
     tlb_flush_single(TEMP_MAP_VIRT);
 }
 
-void *paging_temp_map2(uint32_t phys) {
-    pte_set(TEMP_MAP_VIRT2, (phys & ~0xFFFU) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX);
+void *paging_temp_map2(phys_t phys) {
+    pte_set(TEMP_MAP_VIRT2, (phys & ~(phys_t)0xFFFU) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX);
     tlb_flush_single(TEMP_MAP_VIRT2);
     return (void *)TEMP_MAP_VIRT2;
 }
@@ -502,7 +512,7 @@ uint32_t pgdir_create(void) {
  * Temporarily switches CR3 to pgdir_phys so that the recursive mapping
  * works relative to the target pgdir.  IF must be 0 at call time.
  */
-int pgdir_map(uint32_t pgdir_phys, uint32_t virt, uint32_t phys, pte_t flags) {
+int pgdir_map(uint32_t pgdir_phys, uint32_t virt, phys_t phys, pte_t flags) {
     uint32_t prev_cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(prev_cr3));
     __asm__ volatile("mov %0, %%cr3" :: "r"(pgdir_phys) : "memory");
@@ -512,14 +522,17 @@ int pgdir_map(uint32_t pgdir_phys, uint32_t virt, uint32_t phys, pte_t flags) {
 }
 
 void pgdir_install_pt(uint32_t pgdir_phys, uint32_t idx, pte_t pde) {
+    uint32_t fl;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
     uint32_t dir = pgdir_phys;
     if (paging_pae) {                     /* the PDPT names directory idx/512 */
-        dir = pte_frame(tbl_get(paging_temp_map2(pgdir_phys), idx / 512U));
+        dir = (uint32_t)pte_frame(tbl_get(paging_temp_map2(pgdir_phys), idx / 512U));
         paging_temp_unmap2();
         idx %= 512U;
     }
     tbl_set(paging_temp_map2(dir), idx, pde);
     paging_temp_unmap2();
+    if (fl & 0x200) __asm__ volatile("sti");
 }
 
 /* Return the whole PTE of `virt` in pgdir_phys, 0 if there is none. */
@@ -533,7 +546,7 @@ pte_t pgdir_virt_to_pte(uint32_t pgdir_phys, uint32_t virt) {
 }
 
 /* Return the physical frame backing `virt` in pgdir_phys, or 0 if unmapped. */
-uint32_t pgdir_virt_to_phys(uint32_t pgdir_phys, uint32_t virt) {
+phys_t pgdir_virt_to_phys(uint32_t pgdir_phys, uint32_t virt) {
     pte_t pte = pgdir_virt_to_pte(pgdir_phys, virt);
     return (pte & PAGE_PRESENT) ? pte_frame(pte) : 0;
 }
@@ -609,7 +622,7 @@ void pgdir_free_user(uint32_t pgdir_phys) {
     for (uint32_t i = 0; i < USER_PT_COUNT; i++) {
         pte_t pde = tbl_get(pd, i);
         if (!(pde & PAGE_PRESENT)) continue;
-        uint32_t pt_phys = pte_frame(pde);
+        uint32_t pt_phys = (uint32_t)pte_frame(pde);   /* tables are low */
 
         /* Access page table entries via recursive mapping */
         volatile void *pt = pt_window(i);
@@ -629,7 +642,7 @@ void pgdir_free_user(uint32_t pgdir_phys) {
     uint32_t dirs[4] = { 0, 0, 0, 0 };
     if (paging_pae)
         for (uint32_t k = 0; k < 4; k++)
-            dirs[k] = pte_frame(tbl_get(pd, PAE_REC_INDEX + k));
+            dirs[k] = (uint32_t)pte_frame(tbl_get(pd, PAE_REC_INDEX + k));
 
     /* Restore previous pgdir (also flushes TLB) */
     __asm__ volatile("mov %0, %%cr3" :: "r"(prev_cr3) : "memory");
@@ -677,7 +690,7 @@ static void page_fault_handler(registers_t *regs) {
              * copy path and the wp_page_reuse one below equally: a last
              * reference is no reason to re-grant a write the process asked us
              * to refuse. */
-            uint32_t old_phys = pte_frame(pte);
+            phys_t old_phys = pte_frame(pte);
 
             /* Last reference (the sharer exited, unmapped or DONTNEED'ed its
              * side): no copy needed, just make the page writable again (Linux
@@ -695,7 +708,7 @@ static void page_fault_handler(registers_t *regs) {
             }
 
             kprof_count(KPE_PF_COW);
-            uint32_t new_phys = pmm_alloc_frame();
+            phys_t new_phys = pmm_alloc_user_frame();
             if (!new_phys) {
                 /* Linux: do_wp_page returns VM_FAULT_OOM and
                  * pagefault_out_of_memory() picks a victim.  We have no OOM
@@ -807,7 +820,7 @@ static void page_fault_handler(registers_t *regs) {
         if (!(err & 0x1U) && !protnone && current_proc &&
             cr2 >= stack_grow_floor && cr2 < (uint32_t)USER_STACK_BASE) {
             uint32_t page = cr2 & ~0xFFFU;
-            uint32_t phys = pmm_alloc_frame();
+            phys_t phys = pmm_alloc_user_frame();
             if (phys) {
                 kprof_count(KPE_PF_STACK);
                 pmm_frame_incref(phys);

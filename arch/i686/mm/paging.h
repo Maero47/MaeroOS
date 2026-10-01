@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "../../../mm/pmm.h"    /* phys_t */
 
 /* PTE/PDE flag bits */
 #define PAGE_PRESENT    0x001
@@ -42,8 +43,10 @@ typedef uint64_t pte_t;
 extern uint32_t paging_pae;   /* 1: PAE (3-level, 64-bit entries), set by boot.asm */
 extern uint32_t paging_nx;    /* 1: EFER.NXE is on, PAGE_NX is honoured */
 
-/* Frame address of an entry (physical memory below 4 GiB). */
-static inline uint32_t pte_frame(pte_t e) { return (uint32_t)e & ~0xFFFU; }
+/* Frame address of an entry: up to 52 bits under PAE (user pages may live
+ * above 4 GiB, pmm_alloc_user_frame), 32 in a legacy entry. */
+#define PTE_ADDR_MASK   0x000FFFFFFFFFF000ULL
+static inline phys_t pte_frame(pte_t e) { return e & PTE_ADDR_MASK; }
 
 /*
  * One page table covers PT_SPAN bytes: 4 MiB (1024 4-byte entries) legacy,
@@ -130,7 +133,7 @@ void paging_init(void);
 void paging_nx_disable(void);
 /* Map one page.  Returns 0, or -1 if the page table it needs could not be
  * allocated (physical memory exhausted).  On failure nothing was changed. */
-int  paging_map(uint32_t virt, uint32_t phys, pte_t flags)
+int  paging_map(uint32_t virt, phys_t phys, pte_t flags)
      __attribute__((warn_unused_result));
 
 /* Ensure the page table covering `virt` exists, so a later paging_map() of any
@@ -162,9 +165,9 @@ extern uint32_t kernel_pgdir_phys;
 #define TEMP_MAP_VIRT  0xC0001000U
 #define TEMP_MAP_VIRT2 0xC0002000U
 
-void *paging_temp_map(uint32_t phys);   /* maps phys at TEMP_MAP_VIRT */
+void *paging_temp_map(phys_t phys);     /* maps phys at TEMP_MAP_VIRT */
 void  paging_temp_unmap(void);
-void *paging_temp_map2(uint32_t phys);  /* maps phys at TEMP_MAP_VIRT2 */
+void *paging_temp_map2(phys_t phys);    /* maps phys at TEMP_MAP_VIRT2 */
 void  paging_temp_unmap2(void);
 
 /* Allocate a new page directory with kernel mappings copied from the current one */
@@ -173,12 +176,12 @@ uint32_t pgdir_create(void);
 /* Map a page in a specific page directory (not necessarily the current CR3).
  * Caller must ensure IF=0 around this call. */
 /* Map a page in another page directory.  0 on success, -1 on OOM. */
-int  pgdir_map(uint32_t pgdir_phys, uint32_t virt, uint32_t phys, pte_t flags)
+int  pgdir_map(uint32_t pgdir_phys, uint32_t virt, phys_t phys, pte_t flags)
      __attribute__((warn_unused_result));
 
 /* Return the physical frame backing `virt` in pgdir_phys, or 0 if unmapped.
  * Caller must ensure IF=0 (switches CR3 transiently). */
-uint32_t pgdir_virt_to_phys(uint32_t pgdir_phys, uint32_t virt);
+phys_t pgdir_virt_to_phys(uint32_t pgdir_phys, uint32_t virt);
 /* Set user PDE `idx` (0..USER_PT_COUNT-1) of another address space to `pde`
  * (fork).  Uses TEMP_MAP_VIRT2: IF=0. */
 void pgdir_install_pt(uint32_t pgdir_phys, uint32_t idx, pte_t pde);

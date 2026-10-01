@@ -727,7 +727,7 @@ static uint32_t procfs_meminfo_read(vfs_node_t *n, uint32_t off, uint32_t len,
     (void)n;
     char content[256];
     uint32_t pos = 0;
-    uint32_t total_kb = pmm_total_frames() * 4;
+    uint32_t total_kb = pmm_ram_frames() * 4;
     uint32_t free_kb  = pmm_free_frames()  * 4;
 
     pappend(content, &pos, sizeof(content), "MemTotal:     ");
@@ -735,6 +735,13 @@ static uint32_t procfs_meminfo_read(vfs_node_t *n, uint32_t off, uint32_t len,
     pappend(content, &pos, sizeof(content), " kB\n");
     pappend(content, &pos, sizeof(content), "MemFree:      ");
     pappend_int(content, &pos, sizeof(content), free_kb);
+    pappend(content, &pos, sizeof(content), " kB\n");
+    /* RAM above 4 GiB (PAE): only user pages go there. */
+    pappend(content, &pos, sizeof(content), "HighTotal:    ");
+    pappend_int(content, &pos, sizeof(content), (int)(pmm_high_frames() * 4));
+    pappend(content, &pos, sizeof(content), " kB\n");
+    pappend(content, &pos, sizeof(content), "HighFree:     ");
+    pappend_int(content, &pos, sizeof(content), (int)(pmm_high_free_frames() * 4));
     pappend(content, &pos, sizeof(content), " kB\n");
     content[pos] = '\0';
 

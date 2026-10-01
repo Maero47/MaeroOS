@@ -420,7 +420,7 @@ void *kmalloc_try(size_t size) {
          * discover it cannot have the big size. */
         size_t pages = expand_pages_for(asz);
         if (pages <= (size_t)((HEAP_MAX - (unsigned long)heap_end) / PAGE_SIZE) &&
-            pages <= (size_t)pmm_free_frames())
+            pages <= (size_t)(pmm_free_frames() - pmm_high_free_frames()))
             r = kmalloc_nolock(asz);
     }
     kprof_probe_end(KPP_KMALLOC, t0);

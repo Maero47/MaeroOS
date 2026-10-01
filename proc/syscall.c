@@ -1082,7 +1082,7 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
             if (!(pte & (PAGE_PRESENT | PAGE_PROTNONE)))
                 continue;
 
-            uint32_t frame_phys = pte_frame(pte);
+            phys_t frame_phys = pte_frame(pte);
 
             /* Every private page becomes COW, writable or not: a read-only
              * private page may be made writable later by mprotect(), and the
@@ -1647,7 +1647,7 @@ static int sys_brk(registers_t *regs) {
                 (pte_get(va) & PAGE_PRESENT))
                 continue;
 
-            uint32_t phys = pmm_alloc_frame();
+            phys_t phys = pmm_alloc_user_frame();
             if (!phys) return -12;  /* -ENOMEM */
             pmm_frame_incref(phys);
             if (paging_map(va, phys,
@@ -2252,7 +2252,7 @@ static int sys_exec(registers_t *regs) {
         uint32_t stack_base = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
         if (ustack_base < stack_base) stack_base = ustack_base;
         for (uint32_t va = stack_base; va < USER_STACK_TOP; va += PAGE_SIZE) {
-            uint32_t stack_phys = pmm_alloc_frame();
+            phys_t stack_phys = pmm_alloc_user_frame();
             if (!stack_phys) {
                 kfree(uargv_ptrs);
                 kfree(uenvp_ptrs);
@@ -4339,7 +4339,7 @@ static int vma_populate_page(struct vma *v, uint32_t addr) {
     addr &= ~0xFFFU;
     if (pde_present(addr) &&
         pte_mapped(pte_get(addr))) return 1;     /* already there */
-    uint32_t phys = pmm_alloc_frame();
+    phys_t phys = pmm_alloc_user_frame();        /* private: may be high */
     if (!phys) return 0;
     pmm_frame_incref(phys);
 
@@ -4414,7 +4414,7 @@ static int vma_populate_range(struct vma *v, uint32_t start, uint32_t end) {
  * frame after it has been reclaimed and handed to another allocation.  Batched
  * so an arbitrarily large range uses bounded stack. */
 static void unmap_pages(uint32_t start, uint32_t end) {
-    uint32_t batch[256];
+    phys_t batch[256];
     int nb = 0;
     for (uint32_t va = start; va < end; ) {
         if (!pde_present(va)) {
@@ -4858,7 +4858,7 @@ static int sys_madvise(registers_t *regs) {
      * mapped: shared frames (no per-VMA population path), and pages outside
      * any VMA (brk heap, stack) which are zeroed in place instead — for a COW
      * page in place means a private zero frame, so the sharer is untouched. */
-    uint32_t batch[256];
+    phys_t batch[256];
     int nb = 0;
     for (uint32_t va = addr; va < end; ) {
         if (!pde_present(va)) {
@@ -4869,7 +4869,7 @@ static int sys_madvise(registers_t *regs) {
         }
         pte_t old = pte_get(va);
         if (pte_mapped(old) && (old & PAGE_USER) && !(old & PAGE_SHARED)) {
-            uint32_t frame = pte_frame(old);
+            phys_t frame = pte_frame(old);
             if (vma_find(va)) {
                 batch[nb++] = frame;             /* free AFTER the shootdown */
                 pte_set(va, 0);
@@ -4882,7 +4882,7 @@ static int sys_madvise(registers_t *regs) {
             } else if (old & PAGE_PRESENT) {
                 if (pmm_frame_refcount(frame) > 1) {
                     /* COW-shared: give this side a private zero frame */
-                    uint32_t nf = pmm_alloc_frame();
+                    phys_t nf = pmm_alloc_user_frame();
                     if (nf) {
                         pmm_frame_incref(nf);
                         preempt_disable();
@@ -7361,12 +7361,14 @@ static int sys_sysinfo(registers_t *regs) {
     uint32_t ksi[16];
     __builtin_memset(ksi, 0, sizeof(ksi));
     ksi[0] = pit_ticks() / 100;     /* uptime seconds */
-    ksi[4] = pmm_total_frames();    /* totalram */
+    ksi[4] = pmm_ram_frames();      /* totalram */
     ksi[5] = pmm_free_frames();     /* freeram */
     uint32_t procs = 0;
     for (int i = 0; i < MAX_PROCS; i++)
         if (ptable[i].state != PROC_UNUSED) procs++;
     ksi[10] = procs & 0xFFFF;       /* u16 procs, then 2 bytes pad */
+    ksi[11] = pmm_high_frames();    /* totalhigh: above 4 GiB, user pages only */
+    ksi[12] = pmm_high_free_frames();   /* freehigh */
     ksi[13] = 4096;                 /* mem_unit (after totalhigh, freehigh) */
     return copy_to_user(si, ksi, sizeof(ksi));
 }
@@ -7381,7 +7383,11 @@ static uint32_t futex_resolve_phys(uint32_t uaddr) {
     if (!pde_present(page)) return 0;
     pte_t pte = pte_get(page);
     if (!(pte & PAGE_PRESENT)) return 0;
-    return (pte & ~0xFFFU) | (uaddr & 0xFFF);
+    /* The key is the physical address shifted right by 2: futex words are
+     * 4-byte aligned, so nothing is lost, and a frame above 4 GiB (PAE, up to
+     * 16 GiB) still gets a key of its own in 32 bits.  Never 0: frame 0 is
+     * not RAM a process can map. */
+    return (uint32_t)((pte_frame(pte) | (uaddr & 0xFFFU)) >> 2);
 }
 
 /* Address-space-scoped futex wake — replaces the bare wake_up_n(uaddr) for futex
