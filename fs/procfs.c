@@ -263,6 +263,20 @@ static uint32_t procfs_partitions_read(vfs_node_t *n, uint32_t off, uint32_t len
     return r;
 }
 
+/* /proc/filesystems: what mount(2) takes.  busybox mount without -t tries
+ * the types not marked nodev in this order, so vfat (which only needs its
+ * boot sector to say no) comes before the ext family. */
+static uint32_t procfs_filesystems_read(vfs_node_t *n, uint32_t off, uint32_t len,
+                                        uint8_t *buf) {
+    (void)n;
+    static const char text[] =
+        "\tvfat\n\text4\n\text3\n\text2\n"
+        "nodev\tmsdos\nnodev\ttmpfs\nnodev\tproc\nnodev\tdevtmpfs\n";
+    char tmp[sizeof(text)];
+    memcpy(tmp, text, sizeof(text));
+    return procfs_text_window(tmp, sizeof(text) - 1, off, len, buf);
+}
+
 /* ── /proc/kmsg ───────────────────────────────────────────────────────────── */
 
 static uint32_t procfs_kmsg_read(vfs_node_t *n, uint32_t off, uint32_t len,
@@ -720,6 +734,7 @@ static vfs_node_t proc_cputime_node;
 static vfs_node_t proc_kmsg_node;
 static vfs_node_t proc_mounts_node;
 static vfs_node_t proc_partitions_node;
+static vfs_node_t proc_filesystems_node;
 static vfs_node_t proc_root_node;
 
 /* ── /proc/meminfo ────────────────────────────────────────────────────────── */
@@ -1167,6 +1182,7 @@ static int procfs_root_readdir(vfs_node_t *node, uint32_t idx,
         { "partitions", VFS_FLAG_FILE, 12 },
         { "net",     VFS_FLAG_DIR,  83 },
         { "cputime", VFS_FLAG_FILE, 19 },
+        { "filesystems", VFS_FLAG_FILE, 82 },
     };
     static const uint32_t nentries =
         sizeof(entries) / sizeof(entries[0]);
@@ -1214,6 +1230,7 @@ static vfs_node_t *procfs_root_finddir(vfs_node_t *node, const char *name) {
     if (strcmp(name, "mounts")  == 0) return &proc_mounts_node;
     if (strcmp(name, "partitions") == 0) return &proc_partitions_node;
     if (strcmp(name, "net")     == 0) return &proc_net_node;
+    if (strcmp(name, "filesystems") == 0) return &proc_filesystems_node;
 
     int pid = procfs_parse_pid(name);
     if (pid > 0) {
@@ -1239,6 +1256,13 @@ vfs_node_t *procfs_mount(void) {
     proc_partitions_node.inode   = 12;
     proc_partitions_node.mask    = 0444;
     proc_partitions_node.read_fn = procfs_partitions_read;
+
+    memset(&proc_filesystems_node, 0, sizeof(proc_filesystems_node));
+    strncpy(proc_filesystems_node.name, "filesystems", 255);
+    proc_filesystems_node.flags   = VFS_FLAG_FILE;
+    proc_filesystems_node.inode   = 82;
+    proc_filesystems_node.mask    = 0444;
+    proc_filesystems_node.read_fn = procfs_filesystems_read;
 
     /* /proc/version */
     memset(&proc_version_node, 0, sizeof(proc_version_node));

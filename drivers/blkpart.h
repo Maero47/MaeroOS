@@ -27,11 +27,19 @@ typedef struct blkpart {
     int        partno;      /* 0 = whole disk */
     int        has_guid;    /* a GPT entry: `guid` is its unique partition GUID */
     uint8_t    guid[16];    /* as stored on disk */
+    int        gone;        /* its disk was unplugged: all I/O fails */
     vfs_node_t node;        /* the /dev node */
 } blkpart_t;
 
 /* Scan every disk for partitions.  Call after blk_init(). */
 void blkpart_init(void);
+
+/* Hot-plug: register disk `dev` and its partitions (it was just added to
+ * the disk table), or drop them all (unplugged).  Dropped entries are marked
+ * gone and leave the list, but their memory stays: a mounted filesystem or
+ * an open /dev node may still point at them. */
+void blkpart_scan(int dev);
+void blkpart_drop(int dev);
 
 blkpart_t *blkpart_find(const char *name);
 blkpart_t *blkpart_get(uint32_t idx);          /* idx-th device, NULL past the end */

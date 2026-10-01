@@ -40,6 +40,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | SATA AHCI disk (pc + `-device ahci`, then `-M q35`), no IDE disk | `/disk` mounted from `ahci0`, `diskprobe ok`, `fsprobe ok`, `symprobe ok`, a 3 MiB random file read and copied with matching md5 in the guest and on the host (`debugfs`), persistence across a reboot onto q35, `e2fsck -fn` showing no new damage, `reboot`/`poweroff` ending QEMU | `make smoke-ahci` |
 | NVMe disk (pc + `-device nvme`, then `-M q35` with MDTS=2 and two namespaces), no IDE/AHCI disk | `/disk` mounted from `nvme0`, both namespaces found, `diskprobe ok`, `fsprobe ok`, a 3 MiB random file read and copied with matching md5 in the guest and on the host, transfers using PRP lists and split at MDTS (driver counters at shutdown), persistence across a reboot, `e2fsck -fn` clean of new damage, `reboot`/`poweroff` ending QEMU | `make smoke-nvme` |
 | `mount`/`umount`, partitions, read-only ext4 | busybox `mount -t ext4 /dev/hdb2 /mnt` on a GPT disk (4 KiB blocks, `64bit`, `metadata_csum`, `huge_file`, `flex_bg`) and `/dev/hdc5` on an MBR logical partition (1 KiB blocks): md5 of every file equals the host's, including a 300 MiB sparse file and an unwritten extent; a 5020-entry and a 20000-entry (two-level) htree directory list and resolve completely; fast, slow, relative, absolute and directory symlinks; writes fail with `EROFS`; `umount` is refused while a cwd is inside; tmpfs `remount,ro`; non-root `mount` refused; afterwards both filesystems are byte-identical to their images and `e2fsck -fn` is clean; on q35 the same partitions are found and mounted from AHCI (`/dev/sdb2`) and NVMe (`/dev/nvme0n1p5`) | `make smoke-ext4` |
+| Read-write FAT12/16/32 (vfat), USB sticks | volumes made on the host with `mkfs.fat` and `mtools` (long and Turkish names, a 300-entry directory, a 5 MiB file): mounted read-write with busybox `mount -t vfat` from AHCI (`/dev/sdb1`, MBR), a QEMU `usb-storage` stick without a partition table (`/dev/sdd`, mounted without `-t`) and IDE (`/dev/hdb1`); every file's md5 matches; mkdir, create, a 5 MiB copy, a directory that grows to 150 long-name entries, append, write past the end, truncate, renames (across directories, a directory with contents, over an existing file, case-only), unlink, `rm -r`, rmdir; `df` accounting; a file unlinked while open; `ENOSPC` on a full FAT12 volume; `remount,ro`/`rw`; the stick unplugged while mounted and plugged back in; `poweroff` with the stick still mounted; afterwards `fsck.fat -n` is clean on every volume and `mtools` on the host sees exactly the guest's files and contents | `make smoke-vfat` |
 | Installing to a disk (`maeros-install`) | from the Limine live ISO on q35 with the live `disk.img` as `sda` and an empty 1 GiB `sdb`: `maeros-install -l` lists both and marks `sda` in use, installing over `sda` is refused, `maeros-install -y /dev/sdb` writes a GPT (BIOS boot, FAT32 ESP, ext2 root) and Limine; on the host `sgdisk -v`, `e2fsck -fn` and `fsck.fat -n` are clean; then the installed disk alone boots under SeaBIOS and OVMF x64: Limine passes `root=PARTUUID=...`, `/dev/sda3` is `/disk`, login and the desktop work, and a file written in the first boot is there in the second | `make smoke-install` |
 | `pkg` and the signed repo index | `tools/test_pkg_sign.py` runs the RFC 8032 vectors through the Python signer and the C verifier and rejects altered, unsigned and foreign-key indexes; in the guest, `pkg update` rejects unsigned, tampered and rolled-back indexes, installs and runs busybox, and `install` rejects a tarball whose SHA-256 does not match | `make smoke-pkg` |
 | TCP/IP over lwIP and RTL8139 | `MAEROS_HTTP_OK` fetched from a host HTTP server; `sockprobe` checks that `send` after `shutdown(SHUT_WR)` fails with `EPIPE`, a two-step shutdown ends in a FIN and no RST, closing TIME_WAIT sockets keeps TCP working, and a non-blocking client gets `EINPROGRESS`, `SO_ERROR`, `EAGAIN`, `ECONNREFUSED` and both socket names; `abi2probe net` checks `MSG_NOSIGNAL` and `EPIPE` after a reset | `make smoke-net` |
@@ -99,8 +100,9 @@ What is proven by the automated QEMU tests in `tools/`:
   (`arch/i686/cpu/bkl.c`).
 - **ext4 is read-only.** `mount -t ext4` works, but the driver never writes: it
   cannot replay or write the journal, so a read-write mount is refused with `EROFS`
-  and busybox `mount` falls back to read-only (`docs/ext4.md`). Only the boot disk
-  (`/disk`, ext2) is writable.
+  and busybox `mount` falls back to read-only (`docs/ext4.md`). Writable: the boot
+  disk (`/disk`, ext2) and FAT volumes (`mount -t vfat`, `docs/vfat.md`). There is no
+  exFAT driver: an exFAT stick is recognised and refused.
 - **Missing Linux interfaces.** There is no SysV IPC and no utmp.
   `/proc/<pid>/` has only `status` and `stat` (the full set is under `/proc/self`), and
   there is no `/proc/stat`, so toybox is built without `killall` (it matches names
@@ -209,6 +211,9 @@ iteratively with a 40-link budget, then `ELOOP`; `mount(2)`/`umount2(2)` attach
 filesystems at any directory, crossed during the walk, listed in `/proc/mounts`),
 `fs/ext4.c` (read-only ext2/3/4 for `mount -t ext4`: extents, `64bit`, `flex_bg`,
 `meta_bg`, htree lookups, `metadata_csum` verified; see `docs/ext4.md`),
+`fs/vfat.c` (read-write FAT12/16/32 with long names for `mount -t vfat`: UTF-8 names,
+8.3 aliases with `~N` tails, FSInfo, the dirty flag, `uid=`/`gid=`/`umask=`; see
+`docs/vfat.md`),
 `drivers/blkpart.c` (MBR, logical and GPT partitions of all four IDE disks as
 `/dev/hda`..`/dev/hdd5`, `/proc/partitions`), `fs/initrd.c` ustar archive read from
 the Multiboot module, `fs/ext2.c` (read and write, mounted at `/disk` and overlaid on
@@ -248,8 +253,9 @@ USB (`drivers/usb/`): an xHCI host controller driver (`xhci.c`) whose kernel thr
 event ring every tick; HID keyboards, mice and tablets (`usb_hid.c`: boot protocol, or a
 report-descriptor parser for absolute pointers) feed the same `/dev/input/event0` and
 `event1` as the PS/2 drivers; mass storage (`usb_msc.c`, bulk-only SCSI) appears as the
-raw block device `/dev/usbdisk0`. Not yet: USB 3 hubs, interrupts/MSI, and mounting a
-filesystem from the stick. Run it with `-device qemu-xhci -device usb-kbd -device
+raw block device `/dev/usbdisk0` and joins the disk table as the next `sdX` (partitions
+too, plugged in and out at run time), so a FAT stick mounts with `mount /dev/sdb1 /mnt`.
+Not yet: USB 3 hubs, interrupts/MSI, more than one stick at a time. Run it with `-device qemu-xhci -device usb-kbd -device
 usb-tablet` (and `-device usb-storage,drive=...`).
 
 ### Userland
@@ -576,6 +582,7 @@ make smoke-disk     # ext2, login/passwd, init sessions, service supervision, ov
 make smoke-ahci     # /disk on a SATA AHCI controller only (pc and q35)
 make smoke-nvme     # /disk on an NVMe namespace only (pc and q35)
 make smoke-ext4     # mount/umount, GPT+MBR partitions, read-only ext4 vs host md5s
+make smoke-vfat     # read-write FAT on AHCI, a USB stick and IDE; fsck.fat + mtools after
 make smoke-net      # DHCP, TCP, HTTP GET from the host
 make smoke-net-e1000  # the same on an e1000, plus resolv.conf from DHCP and DNS lookups
 make smoke-tcpsrv   # listen/accept and blocking UDP, from the host through hostfwd
@@ -668,7 +675,8 @@ there: QEMU, started without `-no-shutdown`, must exit through ACPI S5.
 `smoke-cmds`, `smoke-toybox`, `smoke-disk`, `smoke-net`, `smoke-net-e1000`, `smoke-tcpsrv`, `smoke-fw`,
 `smoke-dyn`, `smoke-dynlib`, `smoke-x`, `smoke-pkg` (which first builds `repo/` and, on a
 host without one, a repo signing key), `smoke-gui` (which needs the ISO, so `check`
-builds it), `smoke-ext4`, `smoke-uefi` (the Limine ISO under SeaBIOS, OVMF x64 and OVMF IA32; `check`
+builds it), `smoke-ext4`, `smoke-vfat` (needs `mkfs.fat`, `fsck.fat` and mtools on
+the host), `smoke-uefi` (the Limine ISO under SeaBIOS, OVMF x64 and OVMF IA32; `check`
 builds the ISO, which fetches the pinned Limine release once, and the test skips a
 firmware that is not installed), `smoke-install`, `smoke-hda`, `smoke-acpi`, `smoke-ahci`, `smoke-nvme`,
 `smoke-usb` and `smoke-pc`. It runs them one after another, writes each suite's

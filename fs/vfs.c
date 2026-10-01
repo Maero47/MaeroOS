@@ -633,6 +633,16 @@ int vfs_mount_remove(vfs_mnt_t *m, uint32_t flags) {
     return 0;
 }
 
+void vfs_mounts_shutdown(void) {
+    for (int i = 0; i < VFS_MNT_MAX; i++) {
+        vfs_mnt_t *m = &g_mnt[i];
+        if (m->used && !m->boot && m->set_ro && !(m->flags & VFS_MS_RDONLY)) {
+            m->set_ro(m->fs, 1);
+            m->flags |= VFS_MS_RDONLY;
+        }
+    }
+}
+
 int vfs_is_mountpoint(vfs_node_t *n) {
     return g_mnt_active && n && mnt_on(n) != NULL;
 }

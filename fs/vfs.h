@@ -247,6 +247,14 @@ vfs_node_t *vfs_open_nofollow(const char *path);
 
 #define VFS_MNT_MAX 16
 
+typedef struct vfs_statfs {
+    uint32_t type;              /* f_type magic */
+    uint32_t bsize;
+    uint64_t blocks, bfree;
+    uint64_t files, ffree;
+    uint32_t namelen;
+} vfs_statfs_t;
+
 typedef struct vfs_mnt {
     int          used;
     int          boot;          /* listed only; not crossed, never unmounted */
@@ -269,6 +277,8 @@ typedef struct vfs_mnt {
     /* Switch the instance between read-only and read-write (remount);
      * NULL = only read-only is possible for a read-write request. */
     int        (*set_ro)(void *fs, int ro);
+    /* statfs(2) numbers for the instance; NULL = the generic answer. */
+    int        (*statfs)(void *fs, struct vfs_statfs *out);
 } vfs_mnt_t;
 
 /* Like vfs_lookup, and also report the mount the result lives on (NULL for
@@ -301,6 +311,10 @@ vfs_mnt_t *vfs_mount_find(const char *path, int *err);
  * on top of it, or when its instance is busy and VFS_MNT_DETACH is not given.
  * Calls the release hook unless the instance is still busy. */
 int vfs_mount_remove(vfs_mnt_t *m, uint32_t flags);
+
+/* Power-off and reboot: every writable mount whose filesystem has a set_ro
+ * hook goes read-only (flushed, its volume marked clean). */
+void vfs_mounts_shutdown(void);
 
 /* 1 when a mount sits on `n` (rmdir/unlink of it is -EBUSY). */
 int vfs_is_mountpoint(vfs_node_t *n);

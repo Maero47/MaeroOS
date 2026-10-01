@@ -1,5 +1,6 @@
 #include "mount.h"
 #include "ext4.h"
+#include "vfat.h"
 #include "tmpfs.h"
 #include "../drivers/blkpart.h"
 #include "../drivers/blkdev.h"
@@ -33,8 +34,13 @@ static int is_ext_type(const char *t) {
            strcmp(t, "ext2") == 0;
 }
 
+static int is_fat_type(const char *t) {
+    return strcmp(t, "vfat") == 0 || strcmp(t, "msdos") == 0 ||
+           strcmp(t, "fat") == 0;
+}
+
 static int mount_block(const char *source, const char *target, const char *fstype,
-                       uint32_t flags) {
+                       uint32_t flags, const char *data) {
     if (!source) return -22;                                  /* -EINVAL */
     int err;
     vfs_node_t *dn = vfs_lookup(source, 1, &err);
@@ -50,20 +56,38 @@ static int mount_block(const char *source, const char *target, const char *fstyp
     strncpy(devname, "/dev/", sizeof(devname));
     strncat(devname, bp->name, sizeof(devname) - strlen(devname) - 1);
     if (vfs_mount_has_fs_source(devname)) return -16;         /* -EBUSY */
+
+    vfs_mnt_t t;
+    memset(&t, 0, sizeof(t));
+    strncpy(t.source, devname, sizeof(t.source) - 1);
+    strncpy(t.fstype, fstype, sizeof(t.fstype) - 1);
+    t.flags = flags & MS_KEEP;
+    vfs_node_t *root;
+    int r;
+    if (is_fat_type(fstype)) {
+        vfat_opts_t o;
+        vfat_parse_opts(data, &o);
+        vfat_fs_t *vfs;
+        r = vfat_mount_dev(bp, (flags & VFS_MS_RDONLY) != 0, &o, &root, &vfs);
+        if (r < 0) return r;
+        t.fs      = vfs;
+        t.busy    = vfat_busy;
+        t.release = vfat_release;
+        t.set_ro  = vfat_set_ro;
+        t.statfs  = vfat_statfs;
+        r = vfs_mount_add(target, root, &t);
+        if (r < 0) vfat_release(vfs);
+        return r;
+    }
+
     /* This driver cannot honour an ext4 journal and never writes, so a
      * read-write mount is refused rather than silently downgraded; mount(8)
      * then retries read-only ("is write-protected, mounting read-only"). */
     if (!(flags & VFS_MS_RDONLY)) return -30;                 /* -EROFS */
 
-    vfs_node_t *root;
     ext4_fs_t *fs;
-    int r = ext4_mount_dev(bp, &root, &fs);
+    r = ext4_mount_dev(bp, &root, &fs);
     if (r < 0) return r;
-    vfs_mnt_t t;
-    memset(&t, 0, sizeof(t));
-    strncpy(t.source, devname, sizeof(t.source) - 1);
-    strncpy(t.fstype, fstype, sizeof(t.fstype) - 1);
-    t.flags   = flags & MS_KEEP;
     t.fs      = fs;
     t.busy    = ext4_busy;
     t.release = ext4_release;
@@ -96,13 +120,18 @@ static int mount_remount(const char *target, uint32_t flags) {
             }
         }
     }
+    /* A filesystem that writes (vfat) is told, so it can flush and mark the
+     * volume clean, or dirty again. */
+    if (m->set_ro && want_ro != ((m->flags & VFS_MS_RDONLY) != 0)) {
+        int r = m->set_ro(m->fs, want_ro);
+        if (r < 0) return r;
+    }
     m->flags = flags & MS_KEEP;
     return 0;
 }
 
 int mount_do(const char *source, const char *target, const char *fstype,
              uint32_t flags, const char *data) {
-    (void)data;
     /* Pre-2.4 magic in the high half (MS_MGC_VAL). */
     if ((flags & 0xFFFF0000u) == 0xC0ED0000u) flags &= 0xFFFFu;
     if (!target || target[0] != '/') return -22;
@@ -134,8 +163,8 @@ int mount_do(const char *source, const char *target, const char *fstype,
     }
     if (!fstype) return -22;
 
-    if (is_ext_type(fstype))
-        return mount_block(source, target, fstype, flags);
+    if (is_ext_type(fstype) || is_fat_type(fstype))
+        return mount_block(source, target, fstype, flags, data);
 
     vfs_node_t *root = NULL;
     if (strcmp(fstype, "tmpfs") == 0) {

@@ -1460,6 +1460,7 @@ static void kusbd(void) {
             for (;;) sleep_ticks(1000000);
         }
         usb_unlock();
+        usb_msc_service();
         sleep_ticks(1);
     }
 }

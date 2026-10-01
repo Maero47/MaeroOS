@@ -9,13 +9,20 @@
  * One device at a time (the first one attached), LUN 0, block sizes up to
  * 4 KiB.  Transfers go through one 32 KiB bounce buffer in .bss; callers
  * hold the USB lock for the whole command, so the buffer needs no more.
- * There is no partition table or filesystem support here: the kernel's ext2
- * reads the ATA disk directly, and a block-device layer it could mount
- * through is the follow-up (see the report).
+ *
+ * Besides the raw node, an attached disk joins drivers/blkdev.c's table as
+ * the next SCSI disk name after the AHCI ones ("sdb" next to one AHCI
+ * disk), and its partitions are scanned, so it can be mounted
+ * (`mount -t vfat /dev/sdb1 /mnt`).  That registration does disk I/O, which
+ * needs the USB lock, so kusbd does it after attach returns
+ * (usb_msc_service()); unplugging removes the disk and its partitions from
+ * the table at once.
  */
 #include "usb.h"
 #include "../../fs/vfs.h"
 #include "../../kernel/printk.h"
+#include "../blkdev.h"
+#include "../blkpart.h"
 #include "../../lib/string.h"
 #include <stdint.h>
 
@@ -53,6 +60,8 @@ static uint8_t ifnum;
 static uint32_t tag_seq;
 static uint32_t block_size, block_count;
 static vfs_node_t disk_node;
+static volatile int blk_pending;     /* attached, not yet in the disk table */
+static int blk_index = -1;           /* index in blkdev's table, -1 = none */
 
 /* Find the first SCSI/BOT interface and its two bulk endpoints. */
 static int find_bot(const uint8_t *cfg, uint32_t len, uint8_t *ifn,
@@ -166,7 +175,7 @@ static int rw10(struct usb_device *d, int write, uint32_t lba, uint32_t count) {
 
 /* Read or write `len` bytes at byte offset `off`; partial blocks at either
  * end are read, patched and written back. */
-static uint32_t disk_io(uint32_t off, uint32_t len, uint8_t *buf,
+static uint32_t disk_io(uint64_t off, uint32_t len, uint8_t *buf,
                         const uint8_t *wbuf) {
     uint32_t done = 0;
     usb_lock();
@@ -179,12 +188,12 @@ static uint32_t disk_io(uint32_t off, uint32_t len, uint8_t *buf,
         usb_unlock();
         return 0;
     }
-    if ((uint64_t)off + len > total) len = (uint32_t)(total - off);
+    if (off + len > total) len = (uint32_t)(total - off);
     uint32_t per = BOUNCE_SIZE / block_size;
     while (done < len) {
-        uint32_t pos = off + done;
-        uint32_t lba = pos / block_size;
-        uint32_t skip = pos % block_size;
+        uint64_t pos = off + done;
+        uint32_t lba = (uint32_t)(pos / block_size);
+        uint32_t skip = (uint32_t)(pos % block_size);
         uint32_t want = len - done;
         uint32_t nblk = (skip + want + block_size - 1) / block_size;
         if (nblk > per) nblk = per;
@@ -225,6 +234,34 @@ static int disk_ready(vfs_node_t *n) {
 
 vfs_node_t *usb_msc_node(void) {
     return msc_dev ? &disk_node : 0;
+}
+
+/* ── the disk table (drivers/blkdev.c) ───────────────────────────────────── */
+
+uint32_t usb_msc_sectors(void) {
+    uint64_t n = (uint64_t)block_count * block_size / 512u;
+    return n > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (uint32_t)n;
+}
+
+int usb_msc_read(uint32_t lba, uint32_t count, void *buf) {
+    uint32_t len = count * 512u;
+    return disk_io((uint64_t)lba * 512u, len, (uint8_t *)buf, 0) == len ? 0 : -1;
+}
+
+int usb_msc_write(uint32_t lba, uint32_t count, const void *buf) {
+    uint32_t len = count * 512u;
+    return disk_io((uint64_t)lba * 512u, len, 0, (const uint8_t *)buf) == len ? 0 : -1;
+}
+
+void usb_msc_service(void) {
+    if (!blk_pending) return;
+    blk_pending = 0;
+    if (!msc_dev) return;
+    int disk = blk_usb_attach(0);
+    if (disk < 0) return;
+    blk_index = disk;
+    printk("[USB-MSC] /dev/usbdisk0 is /dev/%s\n", blk_disk_devname(disk));
+    blkpart_scan(disk);
 }
 
 /* ── attach / detach (kusbd, lock held) ──────────────────────────────────── */
@@ -302,6 +339,7 @@ int usb_msc_attach(struct usb_device *d, const uint8_t *cfg, uint32_t len) {
     disk_node.read_ready_fn = disk_ready;
     disk_node.write_ready_fn = disk_ready;
     msc_dev = d;
+    blk_pending = 1;
     printk("[USB-MSC] /dev/usbdisk0: %s %s, %u blocks of %u bytes (%u MiB)\n",
            vendor, product, (unsigned)block_count, (unsigned)block_size,
            (unsigned)(bytes >> 20));
@@ -312,5 +350,11 @@ void usb_msc_detach(struct usb_device *d) {
     if (d != msc_dev) return;
     msc_dev = 0;
     block_size = block_count = 0;
+    blk_pending = 0;
+    if (blk_index >= 0) {
+        blkpart_drop(blk_index);
+        blk_usb_detach(blk_index);
+        blk_index = -1;
+    }
     printk("[USB-MSC] /dev/usbdisk0 removed\n");
 }
