@@ -4,10 +4,12 @@
 *.a
 kernel.elf
 maeros.iso
+maeros-limine.iso
 initrd.tar
 disk.img
 disk-ff.img
 isodir/
+isodir-limine/
 repo/
 .qemu-iso.pid
 .ktrace-stamp
@@ -34,6 +36,7 @@ ports/firefox/prebuilt/
 ports/firefox/glibstack/
 ports/firefox/out/
 third_party/*.tar.gz
+third_party/limine/bin/
 third_party/toybox/generated/
 third_party/toybox/toybox
 

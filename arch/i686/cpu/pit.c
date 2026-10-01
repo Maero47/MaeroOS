@@ -1,6 +1,7 @@
 #include "pit.h"
 #include "tsc.h"
 #include "irq.h"
+#include "pic.h"
 #include "../include/io.h"
 #include "../include/registers.h"
 #include "../../../kernel/random.h"
@@ -34,6 +35,9 @@ void pit_init(uint32_t hz) {
     outb(PIT_CH0_DATA, (uint8_t)(divisor & 0xFF));
     outb(PIT_CH0_DATA, (uint8_t)((divisor >> 8) & 0xFF));
     irq_install_handler(0, (void *)pit_handler);
+    /* pic_remap keeps the firmware's masks: SeaBIOS leaves IRQ0 open, UEFI
+     * firmware does not. */
+    pic_unmask(0);
 }
 
 uint32_t pit_ticks(void) { return ticks; }

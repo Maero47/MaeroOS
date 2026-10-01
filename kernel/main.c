@@ -1,6 +1,7 @@
 #include <kernel/types.h>
 #include <kernel/config.h>
 #include <kernel/multiboot.h>
+#include <kernel/boot_info.h>
 #include "../drivers/serial.h"
 #include "../drivers/rtc.h"
 #include "../drivers/ac97.h"
@@ -89,7 +90,8 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     serial_puts("[BOOT] Serial up.\r\n");
     rtc_init();
 
-    if (mb_magic != 0x2BADB002) {
+    if (mb_magic != MULTIBOOT1_BOOTLOADER_MAGIC &&
+        mb_magic != MULTIBOOT2_BOOTLOADER_MAGIC) {
         serial_puts("[BOOT] ERROR: bad multiboot magic!\r\n");
         for (;;) __asm__ volatile("hlt");
     }
@@ -107,7 +109,9 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     printk("[BOOT] Magic: 0x%08x   MB_info_phys: 0x%08x\n", mb_magic, mb_phys);
 
     /* ── M5: PMM ─────────────────────────────────────────────────────────── */
-    multiboot_info_t *mbi = (multiboot_info_t *)(mb_phys + KERNEL_VMA);
+    /* Multiboot 2 (Limine, BIOS or UEFI) is translated into the Multiboot 1
+     * view everything below reads; see include/kernel/boot_info.h. */
+    multiboot_info_t *mbi = boot_info_init(mb_magic, mb_phys);
 
     /*
      * Save module addresses before pmm_init writes the bitmap over them.

@@ -137,13 +137,17 @@ NOSUDO=auto         # auto | 0 | 1
 NOSUDO_EXPLICIT=""  # the flag that pinned it, for the contradiction check
 NOSUDO_AUTO=0       # 1: no-sudo was chosen by auto-detection, not by a flag
 USE_NATIVE=0        # 1: host compiler is the musl.cc native toolchain (cc/c++ wrappers)
+# Debian's 32-bit UEFI firmware (edk2, BSD-2-Clause-Patent), pinned.
+OVMF_IA32_URL=${OVMF_IA32_URL:-https://deb.debian.org/debian/pool/main/e/edk2/ovmf-ia32_2025.02-8+deb13u1_all.deb}
+OVMF_IA32_SHA256=${OVMF_IA32_SHA256:-c3fb803bd8a066ef7065c4dfce2a2ecf29ee35d1de42ea5f8b320de9cf317b7c}
+
 INTREE_PREREQS=0    # 1: gmp/mpfr/mpc/isl built inside the gcc tree
 
 # Required apt packages: GCC cross build deps, assembler, emulator, ISO and
 # disk tooling, script runtimes.
 APT_REQUIRED="build-essential bison flex texinfo libgmp-dev libmpfr-dev libmpc-dev libisl-dev
 nasm qemu-system-x86 qemu-system-gui grub-pc-bin grub-common xorriso mtools e2fsprogs
-python3 wget xz-utils zstd librsvg2-bin"
+python3 wget xz-utils zstd librsvg2-bin ovmf"
 # Optional: docker.io only for rebuilding ports/, gcc-multilib for
 # ports/firefox/build-glstubs.sh without Docker, gdb-multiarch for `make gdb`.
 APT_OPTIONAL_PKGS="docker.io gcc-multilib gdb-multiarch"
@@ -155,7 +159,7 @@ APT_OPTIONAL_PKGS="docker.io gcc-multilib gdb-multiarch"
 # not relocatable, musl.cc's native toolchain is (see nosudo_native).
 # The shellcheck linter (for tools/*.sh) is included because it is tiny and static.
 NOSUDO_PKGS="make nasm bison flex m4 texinfo qemu-system-x86 qemu-system-gui grub-pc-bin
-mtools xorriso e2fsprogs xz-utils zstd shellcheck"
+mtools xorriso e2fsprogs xz-utils zstd shellcheck ovmf"
 # Tools that get a wrapper in $BIN_DIR when the relocated tree provides them.
 NOSUDO_WRAP="make nasm bison flex m4 makeinfo texi2any qemu-system-i386 qemu-system-x86_64
 grub-mkrescue grub-mkimage grub-file mformat mcopy mmd mdir mdel mtype mattrib minfo mlabel
@@ -701,6 +705,14 @@ verify() {
             printf '  [ -- ]   %-24s optional: %s\n' "qemu gui display" "apt: qemu-system-gui (make start needs a window)"
         fi
     fi
+    for fw in "x64:OVMF_CODE_4M.fd:apt: ovmf, or --no-sudo" "ia32:OVMF32_CODE_4M.fd:Debian ovmf-ia32, fetched by this script"; do
+        name=${fw%%:*}; rest=${fw#*:}; file=${rest%%:*}; hint=${rest#*:}
+        if [ -f "/usr/share/OVMF/$file" ] || [ -f "$HOSTPKGS_DIR/usr/share/OVMF/$file" ]; then
+            printf '  [ ok ]   %-24s %s\n' "OVMF $name firmware" "$file"
+        else
+            printf '  [ -- ]   %-24s optional: %s\n' "OVMF $name firmware" "$hint (make smoke-uefi)"
+        fi
+    done
     if PATH="$BUILD_PATH" command -v gcc >/dev/null 2>&1; then
         if printf 'int main(void){return 0;}' | PATH="$BUILD_PATH" gcc -m32 -x c - -o /dev/null 2>/dev/null; then
             printf '  [ ok ]   %-24s %s\n' "gcc -m32" "works"
@@ -981,6 +993,25 @@ if [ "$DO_MUSL" = 1 ]; then
         musl_ok || die "extracting $MUSL_TGZ did not produce $MUSL_DIR/bin/i686-linux-musl-gcc"
         say "   extracted to $MUSL_DIR"
     fi
+fi
+
+# IA32 UEFI firmware for `make smoke-uefi` (32-bit OVMF, BOOTIA32.EFI path).
+# Ubuntu ships only the x64 build (apt: ovmf); Debian's ovmf-ia32 is a plain
+# data package, so the pinned .deb is unpacked into $HOSTPKGS_DIR with no root
+# in either mode.  Optional: smoke-uefi skips the IA32 run without it.
+step "3b. IA32 OVMF firmware -> $HOSTPKGS_DIR/usr/share/OVMF"
+if [ -f /usr/share/OVMF/OVMF32_CODE_4M.fd ] || [ -f "$HOSTPKGS_DIR/usr/share/OVMF/OVMF32_CODE_4M.fd" ]; then
+    say "   present, skipping"
+elif have dpkg-deb; then
+    ia32_deb="$HOSTPKGS_DIR/debs/$(basename "$OVMF_IA32_URL")"
+    if ( fetch "$OVMF_IA32_URL" "$ia32_deb" && verify_hash "$ia32_deb" sha256 "$OVMF_IA32_SHA256" OVMF_IA32_SHA256 \
+         && dpkg-deb -x "$ia32_deb" "$HOSTPKGS_DIR" ); then
+        say "   unpacked $(basename "$ia32_deb")"
+    else
+        say "   WARNING: could not install the IA32 OVMF build (optional; smoke-uefi skips uefi-ia32)"
+    fi
+else
+    say "   dpkg-deb not found; skipping (optional)"
 fi
 
 # Environment file for convenience.
