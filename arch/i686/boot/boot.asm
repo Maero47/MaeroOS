@@ -213,17 +213,25 @@ _start:
     or  ecx, 0x80010000                 ; CR0.PG (bit 31) + CR0.WP (bit 16)
     mov cr0, ecx
 
-    ; Far jump to higher-half virtual address — transfers execution to 0xC0xxxxx.
-    lea ecx, [higher_half]
+    ; Jump to this code's higher-half alias.  .boot.text is linked at its
+    ; physical address, so `higher_half` alone would keep running through the
+    ; identity map that the next lines remove: that worked only while the TLB
+    ; still held the translation for this page, and under KVM it sometimes did
+    ; not (a page fault on the next fetch with no IDT yet = triple fault, about
+    ; one boot in ten on q35 -smp 2).
+    lea ecx, [higher_half + KERNEL_VMA]
     jmp ecx
 
-; ─── Now executing at virtual address ────────────────────────────────────────
-; From here, all virtual addresses work normally via PDE[768].
+; ─── Now executing at the higher-half alias (0xC01xxxxx via PDE[768]) ────────
+; Branches out of this section must be absolute: a relative one would be off by
+; KERNEL_VMA, because the linker computed it from the physical link address.
 higher_half:
-    ; Remove identity maps (PDE[0], PDE[1]).  Higher-half only from here.
+    ; Remove identity maps (PDE[0], PDE[1]).  Higher-half only from here;
+    ; reload CR3 so no stale identity translation survives in the TLB.
     mov dword [(boot_page_directory) + 0*4], 0
     mov dword [(boot_page_directory) + 1*4], 0
-    invlpg [0]
+    mov ecx, cr3
+    mov cr3, ecx
 
     ; Set up the kernel stack (stack_top is the virtual .bss symbol, now valid).
     mov esp, stack_top
@@ -231,7 +239,8 @@ higher_half:
     ; Call kernel_main(u32 mb_magic, u32 mb_phys)
     push ebx                            ; arg2: multiboot_info physical address
     push eax                            ; arg1: multiboot magic
-    call kernel_main
+    mov ecx, kernel_main
+    call ecx
 
     ; kernel_main must not return.
     cli
