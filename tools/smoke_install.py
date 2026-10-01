@@ -60,7 +60,7 @@ def start_qemu(name, cmd):
     os.makedirs(out, exist_ok=True)
     sockdir = tempfile.mkdtemp(prefix="sinst")
     qmp_path = os.path.join(sockdir, "qmp")
-    cmd = cmd + ["-vga", "std", *smokelib.QEMU_DISPLAY, "-serial", "stdio",
+    cmd = cmd + ["-vga", "std", *smokelib.qemu_args(cmd[0]), "-serial", "stdio",
                  "-no-reboot", "-qmp", f"unix:{qmp_path},server=on,wait=off"]
     with open(os.path.join(out, "qemu-cmdline.txt"), "w") as f:
         f.write(" ".join(cmd) + "\n")
