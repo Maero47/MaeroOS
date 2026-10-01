@@ -205,8 +205,15 @@ def main():
     # 4. The guest's offline repo: the signed main index and REPO_PACKAGES.
     repo = os.path.join(root, "repo", "main", ARCH)
     os.makedirs(repo)
-    log("apk fetch " + " ".join(REPO_PACKAGES))
-    apk(apk_static, root, "fetch", "-o", repo, *REPO_PACKAGES)
+    # apk fetch bypasses apk's package cache, so keep its downloads too.
+    fetched = os.path.join(CACHE, "fetch-" + BRANCH)
+    os.makedirs(fetched, exist_ok=True)
+    if not os.environ.get("ALPINE_OFFLINE"):
+        log("apk fetch " + " ".join(REPO_PACKAGES))
+        apk(apk_static, root, "fetch", "-o", fetched, *REPO_PACKAGES)
+    for name in os.listdir(fetched):
+        if name.endswith(".apk"):
+            shutil.copy(os.path.join(fetched, name), repo)
     for name in sorted(os.listdir(repo)):
         if name.endswith(".apk"):
             check_file(os.path.join(repo, name), lock_files, relock)
