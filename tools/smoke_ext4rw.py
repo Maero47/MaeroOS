@@ -29,7 +29,8 @@ mount replays the journal (hello.txt has the logged contents).  Then
 On the host: e2fsck -fn clean (no checksum errors) on all, debugfs and md5
 see the data, the superblocks are clean without needs_recovery; sdd's
 journal holds the guest's transaction and e2fsck replays it (e2fsprogs
-accepts the descriptor, tag and commit checksums written here).
+accepts the descriptor, tag and commit checksums written here); a copy of it
+is booted again and this driver replays its own log at mount.
 """
 import hashlib
 import os
@@ -403,6 +404,51 @@ def host_checks(a_img, b_img, c_img, d_img, info):
     check(r.returncode == 0, f"sdd: e2fsck -fn clean after the replay (rc={r.returncode})\n{r.stdout[-1500:]}")
 
 
+def second_boot(d2_img):
+    """Mount the power-lost sdd read-write: this driver replays its own log."""
+    accel = ["-accel", "kvm"] if os.access("/dev/kvm", os.R_OK | os.W_OK) else ["-accel", "tcg"]
+    proc = subprocess.Popen(
+        ["qemu-system-i386", *smokelib.QEMU_DISPLAY, *accel, "-M", "q35",
+         "-kernel", "kernel.elf", "-initrd", "initrd.tar",
+         "-drive", "file=disk.img,format=raw,index=0,media=disk,snapshot=on",
+         "-drive", f"file={d2_img},format=raw,index=1,media=disk",
+         "-serial", "stdio", "-m", "256M", "-no-reboot"],
+        cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, bufsize=0)
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+    log = []
+    g = Guest(proc, sel, log)
+    try:
+        smokelib.login(proc, sel, log, timeout=120.0)
+        g.sh("busybox mkdir -p /mnt/d")
+        rc, out = g.sh("busybox mount -t ext4 /dev/sdb /mnt/d && busybox cat /mnt/d/crash.txt /mnt/d/keep.txt")
+        check(rc == 0 and "crash-test" in out and "kept" in out,
+              f"second boot: sdd mounts read-write, crash.txt is there ({out.strip()!r})")
+        m = re.search(r"sdb: journal replayed: transactions (\d+)\.\.(\d+), (\d+) blocks", "".join(log))
+        check(m is not None and int(m.group(3)) > 0,
+              f"second boot: the driver replayed its own log ({m.group(0) if m else None})")
+        rc, out = g.sh("echo after-crash >> /mnt/d/crash.txt && busybox umount /mnt/d")
+        check(rc == 0, "second boot: written and unmounted")
+        smokelib.send(proc, "poweroff\n")
+        deadline = time.time() + 60
+        while proc.poll() is None and time.time() < deadline:
+            for k, _ in sel.select(0.2):
+                os.read(k.fd, 4096)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+    r = subprocess.run([E2FSCK, "-fn", d2_img], capture_output=True, text=True)
+    check(r.returncode == 0, f"second boot: e2fsck -fn sdd clean (rc={r.returncode})\n{r.stdout[-1500:]}")
+    check(debugfs_cat(d2_img, "/crash.txt") == b"crash-test\nafter-crash\n",
+          "second boot: debugfs sees crash.txt with the line added after the replay")
+
+
 def main():
     a_img, b_img, c_img, d_img, info = build_images()
     check(info["a_htree"], "host: sdb /big is an htree directory (e2fsck -D)")
@@ -452,7 +498,12 @@ def main():
                 proc.kill()
                 proc.wait()
 
+    # The journal the guest left on sdd, twice: e2fsck replays one copy
+    # (host_checks), this driver the other (a second boot).
+    d2_img = os.path.join(OUT, "d-guest.img")
+    shutil.copyfile(d_img, d2_img)
     host_checks(a_img, b_img, c_img, d_img, info)
+    second_boot(d2_img)
 
     if failures:
         print(f"\n[SMOKE-EXT4RW] {len(failures)} check(s) failed:")
