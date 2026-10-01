@@ -669,6 +669,7 @@ int rawip_create(int protocol, const xsock_ops_t **ops, void **x) {
  */
 
 #include "lwip/inet_chksum.h"
+#include "../kernel/random.h"
 #include "lwip/ip6_addr.h"
 
 #define AF_INET6_K        10
@@ -684,7 +685,7 @@ typedef struct {
     uint8_t data[FRAME_MAX];
 } ipkt_t;
 
-typedef struct {
+typedef struct isock {
     struct raw_pcb *pcb;
     int domain;            /* AF_INET (ping only) or AF_INET6 */
     int proto;
@@ -694,6 +695,7 @@ typedef struct {
     ip_addr_t peer;
     ipkt_t *ring;
     int head, count;
+    struct isock *next;    /* ping: the list of live ping sockets */
 } isock_t;
 
 typedef struct {
@@ -703,7 +705,29 @@ typedef struct {
     uint32_t scope_id;
 } sockaddr_in6_k;
 
-static uint16_t ping_next_ident = 0x4d31;
+/* Live ping sockets.  An echo identifier belongs to one socket of a family
+ * at a time (Linux ping_get_port: bind to a taken one is EADDRINUSE), so a
+ * reply reaches only the socket that sent the request.  Free identifiers
+ * are picked from a random start, not a guessable sequence. */
+static isock_t *ping_socks;
+
+static int ident_in_use(int domain, uint16_t id, const isock_t *except) {
+    for (isock_t *p = ping_socks; p; p = p->next)
+        if (p != except && p->domain == domain && p->ident == id)
+            return 1;
+    return 0;
+}
+
+/* An unused nonzero identifier, 0 when all 65535 are taken. */
+static uint16_t ident_alloc(int domain) {
+    uint16_t id;
+    random_get_bytes(&id, sizeof(id));
+    for (uint32_t n = 0; n < 65536; n++, id++) {
+        if (id && !ident_in_use(domain, id, NULL))
+            return id;
+    }
+    return 0;
+}
 
 static int is_v4mapped6(const uint8_t *a) {
     static const uint8_t pfx[12] = { 0,0,0,0, 0,0,0,0, 0,0,0xff,0xff };
@@ -807,8 +831,13 @@ static int is_bind(void *x, const void *addr, uint32_t alen) {
     if (IP_IS_V4(&a) ? !net_lwip_addr_is_local(ip4_addr_get_u32(ip_2_ip4(&a)))
                         : !net_lwip_addr6_is_local((const uint8_t *)ip_2_ip6(&a)->addr))
         return -99;
+    if (s->ping && port && port != s->ident) {
+        if (ident_in_use(s->domain, port, s))
+            return -98;                                /* -EADDRINUSE */
+    }
+    if (raw_bind(s->pcb, &a) != ERR_OK) return -22;
     if (s->ping && port) s->ident = port;
-    return raw_bind(s->pcb, &a) == ERR_OK ? 0 : -22;
+    return 0;
 }
 
 static int is_connect(void *x, const void *addr, uint32_t alen) {
@@ -911,6 +940,11 @@ static int is_getopt(void *x, int level, int name, void *val, uint32_t *len) {
 
 static void is_release(void *x) {
     isock_t *s = (isock_t *)x;
+    for (isock_t **pp = &ping_socks; *pp; pp = &(*pp)->next)
+        if (*pp == s) {
+            *pp = s->next;
+            break;
+        }
     raw_remove(s->pcb);
     kfree(s->ring);
     kfree(s);
@@ -939,9 +973,15 @@ static int isock_create(int domain, int protocol, int ping,
         s->pcb->chksum_offset = 2;
     }
     if (ping) {
-        s->ident = ping_next_ident;
-        ping_next_ident = (uint16_t)(ping_next_ident * 75u + 74u);
-        if (!ping_next_ident) ping_next_ident = 1;
+        s->ident = ident_alloc(domain);
+        if (!s->ident) {
+            raw_remove(s->pcb);
+            kfree(s->ring);
+            kfree(s);
+            return -98;                                /* -EADDRINUSE */
+        }
+        s->next = ping_socks;
+        ping_socks = s;
     }
     raw_recv(s->pcb, isock_recv_cb, s);
     *ops = &is_ops;

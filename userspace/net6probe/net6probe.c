@@ -6,7 +6,8 @@
  *                         an AF_INET6 dual-stack listener reached by an
  *                         AF_INET client (peer ::ffff:127.0.0.1); an
  *                         IPV6_V6ONLY listener refusing it; UDP over ::1;
- *                         ICMP echo over ping sockets to 127.0.0.1 and ::1;
+ *                         ICMP echo over ping sockets to 127.0.0.1 and ::1,
+ *                         each owning its identifier (EADDRINUSE on reuse);
  *                         SO_LINGER and IPV6_V6ONLY read back.
  *   net6probe gai <name>  getaddrinfo(AF_UNSPEC, SOCK_STREAM): one
  *                         "gai: <family> <address>" line per result, in order.
@@ -267,6 +268,31 @@ static void ping_check(int fam) {
     if (!fails) printf("net6probe: ping %s ok\n", fam == AF_INET ? "127.0.0.1" : "::1");
 }
 
+/* A ping socket's identifier is its own: a second socket binding the
+ * first's (from getsockname) gets EADDRINUSE, both before and after the
+ * first sends; once the first is closed the identifier is free again. */
+static void ping_ident_check(int fam) {
+    int a = socket(fam, SOCK_DGRAM, fam == AF_INET ? IPPROTO_ICMP : IPPROTO_ICMPV6);
+    int b = socket(fam, SOCK_DGRAM, fam == AF_INET ? IPPROTO_ICMP : IPPROTO_ICMPV6);
+    check("ping ident sockets", a >= 0 && b >= 0);
+    if (a < 0 || b < 0) return;
+    anyaddr me, ba;
+    socklen_t ml = sizeof(me);
+    check("ping getsockname", getsockname(a, &me.sa, &ml) == 0 && port_of(&me) != 0);
+    int id = port_of(&me);
+    socklen_t bl = loopback(fam, &ba, id);
+    int r = bind(b, &ba.sa, bl);
+    check("ping bind to a taken identifier is EADDRINUSE", r < 0 && errno == EADDRINUSE);
+    anyaddr bm;
+    socklen_t bml = sizeof(bm);
+    getsockname(b, &bm.sa, &bml);
+    check("ping identifiers differ", port_of(&bm) != id);
+    close(a);
+    check("ping bind to a released identifier", bind(b, &ba.sa, bl) == 0);
+    close(b);
+    if (!fails) printf("net6probe: ping ident %s ok\n", fam == AF_INET ? "v4" : "v6");
+}
+
 static void linger_check(void) {
     int s = socket(AF_INET6, SOCK_STREAM, 0);
     struct { int on, secs; } l = { 1, 0 }, g = { -1, -1 };
@@ -286,6 +312,8 @@ static int do_lo(void) {
     udp6_check();
     ping_check(AF_INET);
     ping_check(AF_INET6);
+    ping_ident_check(AF_INET);
+    ping_ident_check(AF_INET6);
     linger_check();
     printf(fails ? "net6probe lo FAILED (%d)\n" : "net6probe lo ok\n", fails);
     return fails ? 1 : 0;

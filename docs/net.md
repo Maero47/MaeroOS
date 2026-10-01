@@ -65,7 +65,10 @@ Where you can see it:
   `socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6)` work without privilege
   (Linux semantics with `ping_group_range` open). Sends must be echo requests.
   The kernel sets the identifier and the checksum. Receives are the matching
-  echo replies (ICMP header plus data).
+  echo replies (ICMP header plus data). The identifier is the socket's "port":
+  a free one is picked from a random start, it belongs to one live socket of
+  the family at a time (`bind` to a taken one is `EADDRINUSE`, as in Linux's
+  `ping_get_port`), and only its owner receives the replies.
 - `AF_INET6` `SOCK_RAW` (root only, like Linux): the payload after the IPv6
   header. `IPPROTO_ICMPV6` checksums are filled in by the kernel, and
   `ICMP6_FILTER` is accepted and ignored.
