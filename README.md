@@ -112,7 +112,9 @@ What is proven by the automated QEMU tests in `tools/`:
 - **No SMP scaling.** One Big Kernel Lock serialises all kernel execution
   (`arch/i686/cpu/bkl.c`).
 - **Hardware coverage is what QEMU emulates.** Every driver is tested against QEMU's
-  device models only. There is no Wi-Fi, no Realtek r8169 or virtio device, no GPU
+  device models only (the Realtek r8169 driver, which QEMU cannot emulate, is
+  tested on the host against a simulated chip: `docs/r8169.md`). There is no
+  Wi-Fi, no virtio device, no GPU
   acceleration (the desktop draws into the boot framebuffer), no ACPI sleep states
   (only S5 power-off), and USB 3 hubs are untested (QEMU has none).
 - **ext4 writes cover what `mkfs.ext4` makes, not every feature.** The ext2 driver

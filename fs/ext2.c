@@ -5176,9 +5176,10 @@ int ext2_set_ro(void *p, int ro) {
 static int ext2_set_ro_locked(ext2_fs_t *fs, int ro) {
     if (ro == fs->ro) return 0;
     if (ro) {
-        /* Every write is synchronous (ext2_write_block goes to the disk, and
-         * the disk drivers flush), so going read-only only has to close the
-         * superblock's record of the mount. */
+        /* Writes are synchronous (ext2_write_block goes to the disk, and the
+         * disk drivers flush); a journaled instance's open transaction is
+         * committed and checkpointed by ext2_sb_mark() before it closes the
+         * superblock's record of the mount, so the journal is left empty. */
         ext2_sb_mark(fs, 0);
         fs->ro = 1;
         printk("[EXT2]  %s: now read-only\n", fs->name);
