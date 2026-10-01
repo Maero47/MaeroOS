@@ -98,6 +98,15 @@ static volatile uint32_t irq_count;
 #define START_BYTES  (32 * 1024)
 static uint8_t *const cyc = &dma_buf[0][0];
 static uint32_t done_bufs, play_abs, write_abs, underruns;
+/* Positions are byte counts that wrap at 2^32 (6.2 h of 48 kHz stereo), so
+ * they are only ever compared through their signed difference.  A stream's
+ * positions start at AUDIO_POS_START; `make AUDIO_POS_START=0xFFFE0000U`
+ * starts them 128 KiB before the wrap, so every sound crosses it (test). */
+#ifndef AUDIO_POS_START
+#define AUDIO_POS_START 0U
+#endif
+#define POS_LT(a, b) ((int32_t)((uint32_t)(a) - (uint32_t)(b)) < 0)
+_Static_assert(AUDIO_POS_START % CYC_BYTES == 0, "positions start at a cyclic-buffer boundary");
 static uint8_t last_civ;
 
 static uint32_t virt_to_phys(const void *p) {
@@ -112,7 +121,7 @@ static uint32_t ring_used(void) {
 static void copy_in(uint32_t limit) {
     uint32_t n = ring_used();
 
-    if (write_abs >= limit) return;
+    if (!POS_LT(write_abs, limit)) return;
     if (n > limit - write_abs) n = limit - write_abs;
     for (uint32_t i = 0; i < n; i++)
         cyc[(write_abs + i) % CYC_BYTES] = ring[(ring_tail + i) % RING_BYTES];
@@ -124,7 +133,7 @@ static void copy_in(uint32_t limit) {
 
 /* Zero [from, to) (absolute) in the cyclic buffer. */
 static void zero_range(uint32_t from, uint32_t to) {
-    while (from < to) {
+    while (POS_LT(from, to)) {
         uint32_t o = from % CYC_BYTES;
         uint32_t n = CYC_BYTES - o;
         if (n > to - from) n = to - from;
@@ -149,7 +158,7 @@ static void update_play(void) {
     pos = (uint32_t)picb * 2;
     if (pos > BUF_BYTES) pos = BUF_BYTES;
     pos = done_bufs * BUF_BYTES + (BUF_BYTES - pos);
-    if (pos > play_abs) play_abs = pos;
+    if (POS_LT(play_abs, pos)) play_abs = pos;
     zero_range(old, play_abs);
 }
 
@@ -163,7 +172,7 @@ static void pump(void) {
         /* Everything queued goes: the ring, and the PCM ahead of the engine
          * (bar the guard bytes it may have fetched already). */
         ring_tail = ring_head;
-        if (playing && write_abs > play_abs + WRITE_GUARD) {
+        if (playing && POS_LT(play_abs + WRITE_GUARD, write_abs)) {
             zero_range(play_abs + WRITE_GUARD, write_abs);
             write_abs = play_abs + WRITE_GUARD;
         }
@@ -190,9 +199,10 @@ static void pump(void) {
             bdl[i].samples = BUF_BYTES / 2;       /* 16-bit samples */
             bdl[i].flags = 0x8000;                /* IOC */
         }
-        done_bufs = play_abs = 0;
+        done_bufs = AUDIO_POS_START / BUF_BYTES;  /* CIV 0 */
+        play_abs = AUDIO_POS_START;
         last_civ = 0;
-        write_abs = ring_tail & 3;                /* frame alignment */
+        write_abs = AUDIO_POS_START + (ring_tail & 3);   /* frame alignment */
         copy_in(CYC_BYTES - BUF_BYTES);
         outl((uint16_t)(nabm_base + PO_BDBAR), virt_to_phys(bdl));
         outb((uint16_t)(nabm_base + PO_LVI), NUM_BUFS - 1);
@@ -203,18 +213,18 @@ static void pump(void) {
     }
 
     update_play();
-    if (write_abs < play_abs && ring_used()) {
+    if (POS_LT(write_abs, play_abs) && ring_used()) {
         underruns++;
         write_abs = play_abs + RESYNC_LEAD;
         write_abs += (ring_tail - write_abs) & 3;   /* keep frames aligned */
     }
-    if (write_abs < play_abs + WRITE_GUARD && ring_used())
+    if (POS_LT(write_abs, play_abs + WRITE_GUARD) && ring_used())
         write_abs += (play_abs + WRITE_GUARD - write_abs + 3) & ~3U;
     /* up to the end of the buffer before the current one */
     copy_in((done_bufs + NUM_BUFS - 1) * BUF_BYTES);
     outb((uint16_t)(nabm_base + PO_LVI), (uint8_t)((last_civ + NUM_BUFS - 1) % NUM_BUFS));
 
-    if (ring_used() == 0 && play_abs >= write_abs) {
+    if (ring_used() == 0 && !POS_LT(play_abs, write_abs)) {
         outb((uint16_t)(nabm_base + PO_CR), 0);
         outw((uint16_t)(nabm_base + PO_SR), SR_LVBCI | SR_BCIS | SR_FIFOE);
         playing = 0;
@@ -267,7 +277,7 @@ uint32_t ac97_queued(void) {
 
     if (!present) return 0;
     q = ring_used();
-    if (playing && write_abs > play_abs)
+    if (playing && POS_LT(play_abs, write_abs))
         q += write_abs - play_abs;
     return q;
 }

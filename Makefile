@@ -43,8 +43,12 @@ KHEAP_TEST ?= 0
 ifneq ($(KHEAP_TEST),0)
 CFLAGS  += -DKHEAP_TEST=$(KHEAP_TEST)
 endif
+# Sound drivers' stream positions start here; `make AUDIO_POS_START=0xFFFE0000U`
+# makes every sound cross their 32-bit wrap (drivers/hda.c, drivers/ac97.c).
+AUDIO_POS_START ?= 0U
+CFLAGS  += -DAUDIO_POS_START=$(AUDIO_POS_START)
 KTRACE_STAMP := .ktrace-stamp
-$(shell [ "$$(cat $(KTRACE_STAMP) 2>/dev/null)" = "$(KTRACE) $(KSTACK_TEST) $(KHEAP_TEST)" ] || echo "$(KTRACE) $(KSTACK_TEST) $(KHEAP_TEST)" > $(KTRACE_STAMP))
+$(shell [ "$$(cat $(KTRACE_STAMP) 2>/dev/null)" = "$(KTRACE) $(KSTACK_TEST) $(KHEAP_TEST) $(AUDIO_POS_START)" ] || echo "$(KTRACE) $(KSTACK_TEST) $(KHEAP_TEST) $(AUDIO_POS_START)" > $(KTRACE_STAMP))
 
 ASFLAGS := -f elf32 -g
 

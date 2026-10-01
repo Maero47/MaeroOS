@@ -160,6 +160,15 @@ static spinlock_t verb_lock;
 static volatile int playing;
 static uint32_t play_abs, write_abs, last_lpib, underruns;
 static volatile int drop_req;    /* hda_drop() -> pump(): discard queued PCM */
+/* Positions are byte counts that wrap at 2^32 (6.2 h of 48 kHz stereo), so
+ * they are only ever compared through their signed difference.  A stream's
+ * positions start at AUDIO_POS_START; `make AUDIO_POS_START=0xFFFE0000U`
+ * starts them 128 KiB before the wrap, so every sound crosses it (test). */
+#ifndef AUDIO_POS_START
+#define AUDIO_POS_START 0U
+#endif
+#define POS_LT(a, b) ((int32_t)((uint32_t)(a) - (uint32_t)(b)) < 0)
+_Static_assert(AUDIO_POS_START % CYC_BYTES == 0, "positions start at a cyclic-buffer boundary");
 static int drop_chan;                             /* its sleep channel */
 
 /* output paths: the node to put the volume on, and that node's step count */
@@ -532,7 +541,7 @@ static uint32_t ring_used(void) {
 static void copy_in(uint32_t limit) {
     uint32_t n = ring_used();
 
-    if (write_abs >= limit) return;
+    if (!POS_LT(write_abs, limit)) return;
     if (n > limit - write_abs) n = limit - write_abs;
     __asm__ volatile("" ::: "memory");        /* ring data after ring_head */
     for (uint32_t i = 0; i < n; i++)
@@ -545,7 +554,7 @@ static void copy_in(uint32_t limit) {
 
 /* Zero [from, to) (absolute) in the cyclic buffer. */
 static void zero_range(uint32_t from, uint32_t to) {
-    while (from < to) {
+    while (POS_LT(from, to)) {
         uint32_t o = from % CYC_BYTES;
         uint32_t n = CYC_BYTES - o;
         if (n > to - from) n = to - from;
@@ -577,7 +586,7 @@ static void pump(void) {
          * engine in the cyclic buffer (the guard bytes it may have fetched
          * already stay).  The end-of-data test below then stops the stream. */
         ring_tail = ring_head;
-        if (playing && write_abs > play_abs + WRITE_GUARD) {
+        if (playing && POS_LT(play_abs + WRITE_GUARD, write_abs)) {
             zero_range(play_abs + WRITE_GUARD, write_abs);
             write_abs = play_abs + WRITE_GUARD;
         }
@@ -593,8 +602,9 @@ static void pump(void) {
         idle_head = ring_head;
         if (used == 0 || (used < START_BYTES && !quiet)) return;
         stream_setup();
-        play_abs = last_lpib = 0;
-        write_abs = ring_tail & 3;               /* frame alignment */
+        play_abs = AUDIO_POS_START;
+        last_lpib = 0;
+        write_abs = AUDIO_POS_START + (ring_tail & 3);   /* frame alignment */
         memset(cyc, 0, CYC_BYTES);
         copy_in(CYC_BYTES - WRITE_GUARD);
         w32(sd + SD_CTL, ((uint32_t)STREAM_TAG << 20) | SD_CTL_RUN | SD_CTL_IOCE);
@@ -611,14 +621,14 @@ static void pump(void) {
         /* played space comes round again as the future: silence it */
         zero_range(old, play_abs);
     }
-    if (write_abs < play_abs && ring_used()) {
+    if (POS_LT(write_abs, play_abs) && ring_used()) {
         underruns++;
         write_abs = play_abs + RESYNC_LEAD;
         write_abs += (ring_tail - write_abs) & 3;   /* keep frames aligned */
     }
     copy_in(play_abs + CYC_BYTES - WRITE_GUARD);
 
-    if (ring_used() == 0 && play_abs >= write_abs) {
+    if (ring_used() == 0 && !POS_LT(play_abs, write_abs)) {
         stream_stop();
         playing = 0;
         printk("[HDA] playback done (%u irqs, %u underruns)\n",
@@ -680,7 +690,7 @@ uint32_t hda_queued(void) {
 
     if (!present) return 0;
     q = ring_used();
-    if (playing && write_abs > play_abs)
+    if (playing && POS_LT(play_abs, write_abs))
         q += write_abs - play_abs;
     return q;
 }

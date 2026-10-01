@@ -96,6 +96,20 @@ about its length and without dropouts:
 | 2000 Hz, 0.5 s | `tone 2000 500` | `/dev/dsp` |
 
 `python3 tools/smoke_audio.py --ac97` runs the same on an AC'97 card.
+`make AUDIO_POS_START=0xFFFE0000U` builds a kernel whose sound streams start
+128 KiB before the drivers' 32-bit position wrap. With it, the three `aplay`
+tones each cross the wrap during smoke-audio. The drivers compare positions
+only through signed differences (`POS_LT`); with plain comparisons the same run
+underruns at the wrap and hangs.
+
+`tools/test_alsa_resample.c` runs the resampler (`drivers/alsa_resample.h`)
+on the host:
+
+    cc -O2 -o build/test_alsa_resample tools/test_alsa_resample.c -lm && build/test_alsa_resample
+
+It feeds a full-scale 44.1 kHz square wave and a sine. Every output frame must
+be within 1 LSB of the exact interpolation, and 48000/44100 as many frames must
+come out.
 `make smoke-hda` (in `make check`) still covers `/dev/dsp` on HDA.
 
 Firefox: `python3 tools/smoke_firefox.py --audio` (see below).

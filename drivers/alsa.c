@@ -1,5 +1,6 @@
 #include "alsa.h"
 #include "ac97.h"
+#include "alsa_resample.h"
 #include "hda.h"
 #include "../arch/i686/cpu/pit.h"
 #include "../arch/i686/cpu/spinlock.h"
@@ -161,10 +162,7 @@ static struct {
     int pushing;                  /* PCM on its way to the driver: hw frozen */
     uint8_t *stage;               /* converted PCM before the start */
     uint32_t stage_len, stage_cap;
-    /* resampler: 16.16 position between the previous and next input frame */
-    uint32_t step, pos;
-    int32_t pl, pr;
-    int have_prev;
+    struct alsa_rs rs;            /* to 48 kHz (drivers/alsa_resample.h) */
 } pcm;
 
 /* ── output device ─────────────────────────────────────────────────────── */
@@ -640,18 +638,7 @@ static uint32_t convert(const uint8_t *in, uint32_t frames) {
             n++;
             continue;
         }
-        if (!pcm.have_prev) {
-            pcm.pl = l; pcm.pr = r; pcm.pos = 0; pcm.have_prev = 1;
-            continue;
-        }
-        while (pcm.pos < 65536 && n < OUT_FRAMES) {
-            out_buf[2 * n]     = (int16_t)(pcm.pl + (((l - pcm.pl) * (int32_t)pcm.pos) >> 16));
-            out_buf[2 * n + 1] = (int16_t)(pcm.pr + (((r - pcm.pr) * (int32_t)pcm.pos) >> 16));
-            n++;
-            pcm.pos += pcm.step;
-        }
-        pcm.pos -= 65536;
-        pcm.pl = l; pcm.pr = r;
+        n += alsa_rs_frame(&pcm.rs, l, r, out_buf + 2 * n, OUT_FRAMES - n);
     }
     return n;
 }
@@ -665,9 +652,9 @@ static uint32_t chunk_frames(void) {
 }
 
 static void resampler_reset(void) {
-    pcm.have_prev = 0;
-    pcm.pos = 0;
-    pcm.step = (uint32_t)(((uint64_t)pcm.rate << 16) / OUT_RATE);
+    pcm.rs.have_prev = 0;
+    pcm.rs.pos = 0;
+    pcm.rs.step = (uint32_t)(((uint64_t)pcm.rate << 16) / OUT_RATE);
 }
 
 /* ── pointers ──────────────────────────────────────────────────────────── */
