@@ -121,6 +121,8 @@ static int mount_block(const char *source, const char *target, const char *fstyp
         r = ext2_mount_dev(bp, !want_rw, &root, &e2);
         if (r == 0) {
             if (data && want_rw && mount_has_opt(data, "x4crash")) ext2_test_crash(e2);
+            if (data && want_rw && mount_has_opt(data, "x4smalltxn")) ext2_test_opt(e2, "x4smalltxn");
+            if (data && want_rw && mount_has_opt(data, "x4crashunlink")) ext2_test_opt(e2, "x4crashunlink");
             t.fs      = e2;
             t.busy    = ext2_busy;
             t.release = ext2_release;

@@ -286,7 +286,10 @@ struct ext2_fs {
     uint8_t             xc_root[60];
     struct ext2_jnl    *j;           /* the journal, when one is written */
     int                 crash_test;  /* mount -o x4crash, see ext2_test_crash */
+    int                 crash_unlink; /* mount -o x4crashunlink */
     volatile int        lock;        /* ext2_lock: one changing operation at a time */
+    int                 want_reclaim; /* ENOSPC with freed blocks awaiting commit */
+    int                 no_step;     /* undoing: no step commits (ext2_jnl_due) */
     int                 nozero;      /* the block being allocated is about to be
                                       * written whole: no need to clear it */
 };
@@ -340,6 +343,10 @@ static const uint8_t *ext2_jt_find(ext2_fs_t *fs, uint32_t blk);
 static void ext2_op_end(ext2_fs_t *fs);
 static int ext2_jnl_reclaim(ext2_fs_t *fs);
 static int ext2_jnl_commit(ext2_fs_t *fs);
+static int ext2_jnl_due(ext2_fs_t *fs);
+static void ext2_free_blocks_from(ext2_fs_t *fs, uint32_t ino, ext2_inode_t *inode,
+                                  uint32_t from);
+static void ext2_jnl_step(ext2_fs_t *fs);
 
 /* Operations that change an ext3/ext4 instance run one at a time, and the
  * journal flusher runs between them: the running transaction is shared
@@ -1153,11 +1160,12 @@ static uint32_t ext2_alloc_inode(ext2_fs_t *fs) {
 static uint32_t ext2_alloc_block_goal_once(ext2_fs_t *fs, uint32_t goal, int zero);
 static uint32_t ext2_alloc_block_goal(ext2_fs_t *fs, uint32_t goal, int zero) {
     uint32_t b = ext2_alloc_block_goal_once(fs, goal, zero);
-    /* Full, apart from blocks the running transaction freed: commit it, and
-     * they can be had. */
-    if (!b && fs->j && ext2_jnl_reclaim(fs)) {
-        b = ext2_alloc_block_goal_once(fs, goal, zero);
-    }
+    /* Full, apart from blocks the running transaction freed: they become
+     * free once it commits, which can only happen between operations (a
+     * commit here would make half of this one durable).  write(2) commits
+     * and retries (ext2_write_node); anything else gets ENOSPC, like an
+     * ext4 that runs out of retries. */
+    if (!b && fs->j && ext2_jnl_reclaim(fs)) fs->want_reclaim = 1;
     return b;
 }
 
@@ -1726,35 +1734,55 @@ fail:
 
 /* Release every block from file block `from` onward (unwritten ones too) and
  * the tree blocks that are no longer needed.  Returns the data blocks freed,
- * or -1 if the tree could not be read (then nothing was changed). */
+ * or -1 if the tree could not be read (then nothing was changed).
+ *
+ * Freed from the end backwards.  With a journal, once the transaction is big
+ * enough, the tree is cut back to what is still kept, the inode written and
+ * the step committed before going on (Linux's truncate restart): every
+ * commit then holds a tree that references no block the same commit marks
+ * free, so a crash in the middle leaves a shorter file, never a block that is
+ * both free and in use. */
 static int x4_ext_free_from(ext2_fs_t *fs, uint32_t ino, ext2_inode_t *inode, uint32_t from) {
-    x4_list_t l;
-    memset(&l, 0, sizeof(l));
-    if (x4_collect(fs, (const uint8_t *)inode->i_block, 60, 0, &l) < 0) {
+    uint32_t freed = 0;
+    for (int round = 0; ; round++) {
+        x4_list_t l;
+        memset(&l, 0, sizeof(l));
+        if (x4_collect(fs, (const uint8_t *)inode->i_block, 60, 0, &l) < 0) {
+            x4_list_free(&l);
+            return round ? (int)freed : -1;
+        }
+        uint32_t i = l.n, now = 0;
+        int stepped = 0;
+        while (i > 0) {
+            x4_ext_t *x = &l.v[i - 1];
+            if (x->lblk + x->len <= from) break;
+            if (x->lblk >= from) {
+                ext2_free_range(fs, x->pblk, x->len);
+                now += x->len;
+                i--;
+            } else {
+                uint32_t keep = from - x->lblk;
+                ext2_free_range(fs, x->pblk + keep, x->len - keep);
+                now += x->len - keep;
+                x->len = keep;
+                break;
+            }
+            if (i > 0 && l.v[i - 1].lblk + l.v[i - 1].len > from && ext2_jnl_due(fs)) {
+                stepped = 1;
+                break;
+            }
+        }
+        l.n = i;
+        freed += now;
+        uint32_t sectors = now * fs->st.sectors_per_block;
+        inode->i_blocks = inode->i_blocks > sectors ? inode->i_blocks - sectors : 0;
+        x4_rebuild(fs, ino, inode, &l, 0);
         x4_list_free(&l);
-        return -1;
+        if (!stepped) break;
+        if (ext2_write_inode(fs, ino, inode) < 0) break;
+        ext2_jnl_step(fs);
+        if (fs->ro) break;
     }
-    uint32_t freed = 0, o = 0;
-    for (uint32_t i = 0; i < l.n; i++) {
-        x4_ext_t x = l.v[i];
-        if (x.lblk >= from) {
-            ext2_free_range(fs, x.pblk, x.len);
-            freed += x.len;
-            continue;
-        }
-        if (x.lblk + x.len > from) {
-            uint32_t keep = from - x.lblk;
-            ext2_free_range(fs, x.pblk + keep, x.len - keep);
-            freed += x.len - keep;
-            x.len = keep;
-        }
-        l.v[o++] = x;
-    }
-    l.n = o;
-    uint32_t sectors = freed * fs->st.sectors_per_block;
-    inode->i_blocks = inode->i_blocks > sectors ? inode->i_blocks - sectors : 0;
-    x4_rebuild(fs, ino, inode, &l, 0);
-    x4_list_free(&l);
     return (int)freed;
 }
 
@@ -2160,6 +2188,16 @@ static uint32_t ext2_write_node_do(vfs_node_t *node, uint32_t offset,
         memcpy(blk_buf + blk_off, buf + done, to_copy);
         if (ext2_write_data(fs, blk_num, blk_buf) < 0) break;
         done += to_copy;
+        /* A large write commits in steps, each a complete shorter write:
+         * the inode says what has been written so far, then the commit. */
+        if (done < size && ext2_jnl_due(fs)) {
+            if (offset + done > inode.i_size) {
+                inode.i_size = offset + done;
+                node->size = inode.i_size;
+            }
+            if (ext2_write_inode(fs, priv->ino, &inode) < 0) break;
+            ext2_jnl_step(fs);
+        }
     }
 
     kfree(blk_buf);
@@ -2479,6 +2517,7 @@ static int x4_dx_add(ext2_fs_t *fs, uint32_t dir_ino, ext2_inode_t *d, uint32_t 
     uint8_t *root = (uint8_t *)kmalloc(bs), *node = (uint8_t *)kmalloc(bs);
     uint8_t *leaf = (uint8_t *)kmalloc(bs), *nleaf = (uint8_t *)kmalloc(bs);
     x4_dxent_t *ents = (x4_dxent_t *)kmalloc((bs / 12 + 1) * sizeof(x4_dxent_t));
+    uint8_t *fresh = (uint8_t *)0, *xbuf = (uint8_t *)0;
     int rc = -1;
     uint32_t rblk = 0, nodeblk = 0, nodel = 0, levels, version, hash;
     if (!root || !node || !leaf || !nleaf || !ents) goto out;
@@ -2516,65 +2555,15 @@ static int x4_dx_add(ext2_fs_t *fs, uint32_t dir_ino, ext2_inode_t *d, uint32_t 
         goto out;
     }
 
-    /* The leaf is full: room for one more index entry above it first. */
-    uint8_t *parent = levels ? node : root;
-    uint32_t poff = levels ? 8u : 0x20u, pat = levels ? nat : rat;
-    uint32_t pblk_w = levels ? nodeblk : rblk;
-    if (x4_rd16(parent + poff + 2) >= x4_rd16(parent + poff)) {
-        if (!levels) {
-            /* Root full: its entries move down into a new interior block. */
-            uint32_t pb, l = x4_dir_grow(fs, dir_ino, d, &pb);
-            if (!l) { rc = -1; goto out; }
-            memset(node, 0, bs);
-            ext2_dirent_t *fake = (ext2_dirent_t *)node;
-            fake->rec_len = (uint16_t)bs;
-            uint32_t cnt = x4_rd16(root + 0x22);
-            memcpy(node + 8, root + 0x20, 8 * cnt);
-            x4_wr16(node + 8, (uint16_t)dx_node_limit(fs));
-            x4_wr16(node + 10, (uint16_t)cnt);
-            x4_wr16(root + 0x22, 1);
-            x4_wr32(root + 0x24, l);
-            root[0x1E] = 1;
-            levels = 1;
-            nodel = l;
-            nodeblk = pb;
-            nat = rat;
-            rat = 0;
-            parent = node;
-            poff = 8;
-            pat = nat;
-            pblk_w = nodeblk;
-            if (ext2_write_dirblk(fs, dir_ino, d, rblk, root) < 0) { rc = -1; goto out; }
-        } else {
-            /* Interior block full: split it, if the root has room. */
-            if (x4_rd16(root + 0x22) >= x4_rd16(root + 0x20)) goto out;
-            uint32_t pb, l = x4_dir_grow(fs, dir_ino, d, &pb);
-            if (!l) { rc = -1; goto out; }
-            uint32_t cnt = x4_rd16(node + 10), half = cnt / 2;
-            memset(nleaf, 0, bs);              /* the new interior block */
-            ((ext2_dirent_t *)nleaf)->rec_len = (uint16_t)bs;
-            memcpy(nleaf + 8, node + 8 + 8 * half, 8 * (cnt - half));
-            x4_wr16(nleaf + 8, (uint16_t)dx_node_limit(fs));
-            x4_wr16(nleaf + 10, (uint16_t)(cnt - half));
-            uint32_t split_hash = x4_rd32(node + 8 + 8 * half);
-            x4_wr16(node + 10, (uint16_t)half);
-            x4_dx_insert(root, 0x20, rat, split_hash, l);
-            if (ext2_write_dirblk(fs, dir_ino, d, pb, nleaf) < 0 ||
-                ext2_write_dirblk(fs, dir_ino, d, rblk, root) < 0) { rc = -1; goto out; }
-            if (nat >= half) {                 /* our entry moved to the new block */
-                if (ext2_write_dirblk(fs, dir_ino, d, nodeblk, node) < 0) { rc = -1; goto out; }
-                memcpy(node, nleaf, bs);
-                nodeblk = pb;
-                nodel = l;
-                nat -= half;
-            }
-            parent = node;
-            pat = nat;
-            pblk_w = nodeblk;
-        }
-    }
+    /* The leaf is full.  Plan the split first and allocate every block it
+     * needs before any index block changes: running out of space then
+     * leaves the tree exactly as it was.  The writes go new blocks first,
+     * the root last; with a journal they all land in one transaction. */
+    int root_full = !levels && x4_rd16(root + 0x22) >= x4_rd16(root + 0x20);
+    int node_full = levels && x4_rd16(node + 10) >= x4_rd16(node + 8);
+    if (node_full && x4_rd16(root + 0x22) >= x4_rd16(root + 0x20))
+        goto out;                                  /* would need a third level */
 
-    /* Split the leaf at the median hash. */
     uint32_t n = 0, end = ext2_dir_end(fs);
     for (uint32_t off = 0; off < end && n < bs / 12; ) {
         if (!ext2_de_ok(leaf, off, end)) goto out;
@@ -2595,22 +2584,63 @@ static int x4_dx_add(ext2_fs_t *fs, uint32_t dir_ino, ext2_inode_t *d, uint32_t 
     uint32_t m = n / 2;
     uint32_t hash2 = ents[m].hash;
     uint32_t cont = (ents[m - 1].hash == hash2) ? 1u : 0u;
-    uint32_t newpb, newl = x4_dir_grow(fs, dir_ino, d, &newpb);
-    if (!newl) { rc = -1; goto out; }
-    /* Repack: [0, m) stays, [m, n) moves; both built from a copy. */
-    memcpy(nleaf, leaf, bs);                         /* nleaf: the old contents */
-    uint8_t *outb[2] = { leaf, (uint8_t *)0 };
-    uint8_t *fresh = (uint8_t *)kmalloc(bs);
-    if (!fresh) { rc = -1; goto out; }
-    outb[1] = fresh;
+
+    rc = -1;
+    uint32_t old_size = d->i_size, xl = 0, xpb = 0, newpb = 0, newl;
+    fresh = (uint8_t *)kmalloc(bs);
+    if ((root_full || node_full) && !(xbuf = (uint8_t *)kmalloc(bs))) goto nospace;
+    if (!fresh) goto nospace;
+    if ((root_full || node_full) && !(xl = x4_dir_grow(fs, dir_ino, d, &xpb))) goto nospace;
+    if (!(newl = x4_dir_grow(fs, dir_ino, d, &newpb))) goto nospace;
+
+    /* Everything is allocated: the index changes, in memory. */
+    uint8_t *parent;
+    uint32_t poff, pat, pblk_w;
+    if (root_full) {
+        /* The root's entries move down into the new interior block. */
+        memset(xbuf, 0, bs);
+        ((ext2_dirent_t *)xbuf)->rec_len = (uint16_t)bs;
+        uint32_t cnt = x4_rd16(root + 0x22);
+        memcpy(xbuf + 8, root + 0x20, 8 * cnt);
+        x4_wr16(xbuf + 8, (uint16_t)dx_node_limit(fs));
+        x4_wr16(xbuf + 10, (uint16_t)cnt);
+        x4_wr16(root + 0x22, 1);
+        x4_wr32(root + 0x24, xl);
+        root[0x1E] = 1;
+        parent = xbuf; poff = 8; pat = rat; pblk_w = xpb;
+    } else if (node_full) {
+        /* The interior block splits; the root gains the new half. */
+        uint32_t cnt = x4_rd16(node + 10), half = cnt / 2;
+        memset(xbuf, 0, bs);
+        ((ext2_dirent_t *)xbuf)->rec_len = (uint16_t)bs;
+        memcpy(xbuf + 8, node + 8 + 8 * half, 8 * (cnt - half));
+        x4_wr16(xbuf + 8, (uint16_t)dx_node_limit(fs));
+        x4_wr16(xbuf + 10, (uint16_t)(cnt - half));
+        uint32_t split_hash = x4_rd32(node + 8 + 8 * half);
+        x4_wr16(node + 10, (uint16_t)half);
+        x4_dx_insert(root, 0x20, rat, split_hash, xl);
+        poff = 8;
+        if (nat >= half) { parent = xbuf; pat = nat - half; pblk_w = xpb; }
+        else { parent = node; pat = nat; pblk_w = nodeblk; }
+    } else {
+        parent = levels ? node : root;
+        poff = levels ? 8u : 0x20u;
+        pat = levels ? nat : rat;
+        pblk_w = levels ? nodeblk : rblk;
+    }
+    (void)pblk_w;
+
+    /* The leaf, split at the median hash: [0, m) stays, [m, n) moves. */
+    memcpy(nleaf, leaf, bs);                         /* the old contents */
+    uint8_t *outb[2] = { leaf, fresh };
     for (int side = 0; side < 2; side++) {
-        uint8_t *b = outb[side];
-        memset(b, 0, bs);
+        uint8_t *bb = outb[side];
+        memset(bb, 0, bs);
         uint32_t off = 0, last = 0;
         int any = 0;
         for (uint32_t i = side ? m : 0; i < (side ? n : m); i++) {
             const ext2_dirent_t *src = (const ext2_dirent_t *)(nleaf + ents[i].off);
-            ext2_dirent_t *dst = (ext2_dirent_t *)(b + off);
+            ext2_dirent_t *dst = (ext2_dirent_t *)(bb + off);
             uint32_t len = ext2_dir_rec_len(src->name_len);
             dst->inode = src->inode;
             dst->name_len = src->name_len;
@@ -2621,23 +2651,37 @@ static int x4_dx_add(ext2_fs_t *fs, uint32_t dir_ino, ext2_inode_t *d, uint32_t 
             off += len;
             any = 1;
         }
-        if (any) ((ext2_dirent_t *)(b + last))->rec_len = (uint16_t)(end - last);
-        else ((ext2_dirent_t *)b)->rec_len = (uint16_t)end;
+        if (any) ((ext2_dirent_t *)(bb + last))->rec_len = (uint16_t)(end - last);
+        else ((ext2_dirent_t *)bb)->rec_len = (uint16_t)end;
     }
-    uint8_t *target = (hash >= hash2) ? fresh : leaf;
-    int ok = x4_leaf_insert(fs, target, child, name, nlen, ftype);
+    if (!x4_leaf_insert(fs, (hash >= hash2) ? fresh : leaf, child, name, nlen, ftype))
+        goto nospace;                              /* cannot happen: half empty */
     x4_dx_insert(parent, poff, pat, hash2 | cont, newl);
-    if (!ok ||
-        ext2_write_dirblk(fs, dir_ino, d, newpb, fresh) < 0 ||
-        ext2_write_dirblk(fs, dir_ino, d, leafblk, leaf) < 0 ||
-        ext2_write_dirblk(fs, dir_ino, d, pblk_w, parent) < 0) {
-        kfree(fresh);
-        rc = -1;
-        goto out;
-    }
-    kfree(fresh);
+
+    /* New blocks, then the changed old ones, the root last. */
+    if (ext2_write_dirblk(fs, dir_ino, d, newpb, fresh) < 0) goto out;
+    if (xbuf && ext2_write_dirblk(fs, dir_ino, d, xpb, xbuf) < 0) goto out;
+    if (levels && (node_full || parent == node) &&
+        ext2_write_dirblk(fs, dir_ino, d, nodeblk, node) < 0) goto out;
+    if (ext2_write_dirblk(fs, dir_ino, d, leafblk, leaf) < 0) goto out;
+    if ((root_full || node_full || !levels) &&
+        ext2_write_dirblk(fs, dir_ino, d, rblk, root) < 0) goto out;
     rc = 1;
+    goto out;
+
+nospace:
+    /* Give back what was allocated; nothing in the tree points at it. */
+    if (d->i_size > old_size) {
+        uint32_t keep = old_size / bs;
+        d->i_size = old_size;
+        fs->no_step = 1;
+        ext2_free_blocks_from(fs, dir_ino, d, keep);
+        fs->no_step = 0;
+    }
+    rc = -1;
 out:
+    if (fresh) kfree(fresh);
+    if (xbuf) kfree(xbuf);
     if (root) kfree(root);
     if (node) kfree(node);
     if (leaf) kfree(leaf);
@@ -3889,9 +3933,9 @@ static int ext2_readdir(vfs_node_t *dir, uint32_t req_idx,
 #define JBD2_INCOMPAT_FC     0x20u
 #define JBD2_INCOMPAT_KNOWN  (JBD2_INCOMPAT_REVOKE | JBD2_INCOMPAT_64BIT | JBD2_INCOMPAT_ASYNC | \
                               JBD2_INCOMPAT_CSUM2 | JBD2_INCOMPAT_CSUM3 | JBD2_INCOMPAT_FC)
-#define EXT2_JT_HASH        4096u           /* > 2 * the largest transaction */
-#define EXT2_JT_MAX         1024u
-#define EXT2_JT_FREED_MAX   256u
+#define EXT2_JT_HASH        8192u           /* > 2 * the largest transaction */
+#define EXT2_JT_MAX         4096u
+#define EXT2_JT_SOFT        1024u
 
 typedef struct ext2_jnl {
     uint32_t  len, first, seq;     /* s_maxlen, s_first, next transaction id */
@@ -3901,13 +3945,14 @@ typedef struct ext2_jnl {
     uint8_t   uuid[16];
     uint32_t  tag_bytes;
     int       csum;                /* v2 or v3 checksums */
-    uint32_t  cap;                 /* most blocks one transaction holds */
+    uint32_t  cap;                 /* commit at the next safe point past this */
+    uint32_t  hard;                /* most blocks one transaction can hold */
     uint32_t  n;
     uint32_t  tblk[EXT2_JT_MAX];
     uint8_t  *tdata[EXT2_JT_MAX];
     uint16_t  hash[EXT2_JT_HASH];  /* entry + 1, 0 = empty */
-    uint32_t  nfreed;
-    uint32_t  fstart[EXT2_JT_FREED_MAX], flen[EXT2_JT_FREED_MAX];
+    uint32_t  nfreed, fcap;
+    uint32_t *fstart, *flen;       /* grown as needed, emptied by each commit */
     int       busy;
     uint32_t  commits;
     uint32_t  last;                /* pit_ticks() of the last commit */
@@ -3947,9 +3992,18 @@ static void ext2_jt_drop(ext2_fs_t *fs, uint32_t blk) {
 /* Commit so the blocks this transaction freed can be allocated: 1 if
  * there were any. */
 static int ext2_jnl_reclaim(ext2_fs_t *fs) {
-    if (!fs->j->nfreed || fs->j->busy) return 0;
-    ext2_jnl_commit(fs);
-    return 1;
+    return fs->j->nfreed != 0;
+}
+
+/* The journal cannot take what the running operation needs (or a commit
+ * failed): like jbd2's abort, the instance stops writing.  What the journal
+ * already holds is consistent; the running transaction is lost. */
+static void ext2_jnl_abort(ext2_fs_t *fs, const char *why) {
+    if (!fs->ro)
+        printk("[EXT2]  %s: journal aborted (%s); read-only until remounted after "
+               "e2fsck\n", fs->name, why);
+    fs->ro = 1;
+    fs->rw_ok = 0;
 }
 
 static int ext2_jt_freed(ext2_fs_t *fs, uint32_t blk) {
@@ -3968,9 +4022,26 @@ static void ext2_jt_freed_add(ext2_fs_t *fs, uint32_t blk, uint32_t n) {
         j->flen[j->nfreed - 1] += n;
         return;
     }
-    if (j->nfreed == EXT2_JT_FREED_MAX) {
-        /* Commit what is logged so far; the list starts again. */
-        ext2_jnl_commit(fs);
+    if (j->nfreed == j->fcap) {
+        /* Never a commit here: the operation freeing these is half done. */
+        uint32_t nc = j->fcap ? j->fcap * 2 : 64;
+        uint32_t *ns = (uint32_t *)kmalloc(nc * sizeof(uint32_t));
+        uint32_t *nl = (uint32_t *)kmalloc(nc * sizeof(uint32_t));
+        if (!ns || !nl) {
+            if (ns) kfree(ns);
+            if (nl) kfree(nl);
+            ext2_jnl_abort(fs, "out of memory for freed blocks");
+            return;
+        }
+        if (j->nfreed) {
+            memcpy(ns, j->fstart, j->nfreed * sizeof(uint32_t));
+            memcpy(nl, j->flen, j->nfreed * sizeof(uint32_t));
+        }
+        if (j->fstart) kfree(j->fstart);
+        if (j->flen) kfree(j->flen);
+        j->fstart = ns;
+        j->flen = nl;
+        j->fcap = nc;
     }
     j->fstart[j->nfreed] = blk;
     j->flen[j->nfreed] = n;
@@ -3984,9 +4055,17 @@ static int ext2_jt_put(ext2_fs_t *fs, uint32_t blk, const void *buf) {
         memcpy(d, buf, fs->st.block_size);
         return 0;
     }
-    if (j->n >= j->cap && ext2_jnl_commit(fs) < 0) return -1;
+    /* Never a commit here, in the middle of an operation: operations that
+     * can grow large commit at their own safe points (ext2_jnl_step). */
+    if (j->n >= j->hard) {
+        ext2_jnl_abort(fs, "operation larger than the journal");
+        return -1;
+    }
     d = (uint8_t *)kmalloc(fs->st.block_size);
-    if (!d) return -1;
+    if (!d) {
+        ext2_jnl_abort(fs, "out of memory");
+        return -1;
+    }
     memcpy(d, buf, fs->st.block_size);
     uint32_t e = j->n++;
     j->tblk[e] = blk;
@@ -4127,8 +4206,10 @@ static int ext2_jnl_commit(ext2_fs_t *fs) {
     rc = 0;
 out:
     j->last = pit_ticks();
-    if (rc < 0)
+    if (rc < 0) {
         printk("[EXT2]  %s: journal commit %u failed\n", fs->name, (unsigned)seq);
+        ext2_jnl_abort(fs, "commit failed");
+    }
     for (uint32_t k = 0; k < j->n; k++) kfree(j->tdata[k]);
     j->n = 0;
     j->nfreed = 0;
@@ -4165,7 +4246,8 @@ static void x4_sb_sync(ext2_fs_t *fs) {
 static void ext2_op_end(ext2_fs_t *fs) {
     if (!fs->x4 || fs->ro) return;
     x4_sb_sync(fs);
-    if (fs->j && (fs->crash_test == 2 || pit_ticks() - fs->j->last >= EXT2_COMMIT_TICKS))
+    if (fs->j && (fs->crash_test == 2 || fs->j->n >= fs->j->cap ||
+                  pit_ticks() - fs->j->last >= EXT2_COMMIT_TICKS))
         ext2_jnl_commit(fs);
 }
 
@@ -4174,6 +4256,18 @@ static void ext2_sync_fs(ext2_fs_t *fs) {
     if (!fs->x4 || fs->ro) return;
     x4_sb_sync(fs);
     if (fs->j) ext2_jnl_commit(fs);
+}
+
+/* A safe point inside a large operation (one that commits in complete
+ * steps): is the transaction big enough to commit here? */
+static int ext2_jnl_due(ext2_fs_t *fs) {
+    return fs->j && !fs->ro && !fs->no_step && !fs->j->busy && fs->j->n >= fs->j->cap;
+}
+
+static void ext2_jnl_step(ext2_fs_t *fs) {
+    if (!ext2_jnl_due(fs)) return;
+    x4_sb_sync(fs);
+    ext2_jnl_commit(fs);
 }
 
 /* Journaled instances, for the flusher and sync(2). */
@@ -4271,6 +4365,8 @@ static void ext2_jnl_free(ext2_fs_t *fs) {
     if (!fs->j) return;
     for (uint32_t k = 0; k < fs->j->n; k++) kfree(fs->j->tdata[k]);
     if (fs->j->map) kfree(fs->j->map);
+    if (fs->j->fstart) kfree(fs->j->fstart);
+    if (fs->j->flen) kfree(fs->j->flen);
     kfree(fs->j);
     fs->j = (ext2_jnl_t *)0;
 }
@@ -4331,7 +4427,11 @@ static int ext2_jnl_open(ext2_fs_t *fs, uint32_t jino) {
             goto bad;
         }
     }
-    if (j->len < 64 || j->first == 0 || j->first >= j->len) goto bad;
+    if (j->len < 64 || j->first == 0 || j->first >= j->len || j->len - j->first < 32) {
+        printk("[EXT2]  %s: journal geometry impossible (len %u, first %u)\n", fs->name,
+               (unsigned)j->len, (unsigned)j->first);
+        goto bad;
+    }
     if (ext2_jnl_map(fs, jino, j->len) < 0) {
         printk("[EXT2]  %s: journal inode unreadable\n", fs->name);
         goto bad;
@@ -4340,9 +4440,12 @@ static int ext2_jnl_open(ext2_fs_t *fs, uint32_t jino) {
     {
         uint32_t room = j->len - j->first;
         uint32_t per = (fs->st.block_size - 12 - 4 - 16) / j->tag_bytes;
-        uint32_t cap = room - 2 - room / per - 2;
-        if (cap > EXT2_JT_MAX) cap = EXT2_JT_MAX;
-        j->cap = cap / 2;                       /* margin */
+        uint32_t desc = (room + per - 1) / per;
+        if (room < desc + 4 + 16) goto bad;
+        uint32_t hard = room - desc - 4;        /* jsb slack, commit block */
+        if (hard > EXT2_JT_MAX) hard = EXT2_JT_MAX;
+        j->hard = hard;
+        j->cap = hard / 2 < EXT2_JT_SOFT ? hard / 2 : EXT2_JT_SOFT;
     }
     kfree(b);
     return 0;
@@ -4365,7 +4468,12 @@ static int jnl_revoked(const jnl_revoke_t *r, uint32_t n, uint32_t blk, uint32_t
  * Returns the transaction id after the last complete one, or 0 on error. */
 static uint32_t ext2_jnl_scan(ext2_fs_t *fs, uint32_t start, uint32_t seq, int pass,
                               uint32_t end_seq, jnl_revoke_t *rv, uint32_t *nrv,
-                              uint32_t rvcap, uint32_t *replayed) {
+                              uint32_t rvcap, uint32_t *replayed, int *rv_over,
+                              uint32_t *rv_over_seq) {
+    /* Revoke records count only once their transaction's commit block has
+     * been read and checked: those of a torn last transaction are dropped
+     * (back to `committed`) at the end of pass 0. */
+    uint32_t committed = *nrv;
     ext2_jnl_t *j = fs->j;
     uint32_t bs = fs->st.block_size;
     uint8_t *b = (uint8_t *)kmalloc(bs), *d = (uint8_t *)kmalloc(bs);
@@ -4433,6 +4541,7 @@ static uint32_t ext2_jnl_scan(ext2_fs_t *fs, uint32_t start, uint32_t seq, int p
                 wbe32(b + 16, 0);
                 if (crc32c(j->seed, b, bs) != want) break;   /* torn: ends here */
             }
+            if (pass == 0) committed = *nrv;
             seq++;
             pos = JNEXT(pos);
             continue;
@@ -4445,13 +4554,13 @@ static uint32_t ext2_jnl_scan(ext2_fs_t *fs, uint32_t start, uint32_t seq, int p
                 for (uint32_t o = 16; o + rsz <= cnt; o += rsz) {
                     uint32_t blk = rsz == 8 ? be32(b + o + 4) : be32(b + o);
                     if (rsz == 8 && be32(b + o)) continue;
-                    uint32_t i;
-                    for (i = 0; i < *nrv; i++) if (rv[i].blk == blk) break;
-                    if (i == *nrv) {
-                        if (*nrv == rvcap) continue;
-                        rv[(*nrv)++].blk = blk;
+                    if (*nrv == rvcap) {           /* never dropped: see recover */
+                        if (!*rv_over) { *rv_over = 1; *rv_over_seq = seq; }
+                        continue;
                     }
-                    rv[i].seq = seq;
+                    rv[*nrv].blk = blk;
+                    rv[*nrv].seq = seq;
+                    (*nrv)++;
                 }
             }
             pos = JNEXT(pos);
@@ -4460,6 +4569,7 @@ static uint32_t ext2_jnl_scan(ext2_fs_t *fs, uint32_t start, uint32_t seq, int p
         break;
     }
 #undef JNEXT
+    if (pass == 0) *nrv = committed;
     kfree(b);
     kfree(d);
     return seq;
@@ -4474,11 +4584,22 @@ static int ext2_jnl_recover(ext2_fs_t *fs) {
     uint32_t start = be32(b + 0x1C), seq = be32(b + 0x18);
     kfree(b);
     if (!start) return 0;
-    uint32_t rvcap = 4096, nrv = 0, replayed = 0;
+    uint32_t rvcap = 16384, nrv = 0, replayed = 0, over_seq = 0;
+    int over = 0;
     jnl_revoke_t *rv = (jnl_revoke_t *)kmalloc(rvcap * sizeof(*rv));
     if (!rv) return -12;
-    uint32_t end = ext2_jnl_scan(fs, start, seq, 0, 0, rv, &nrv, rvcap, &replayed);
-    if (end != seq) ext2_jnl_scan(fs, start, seq, 1, end, rv, &nrv, rvcap, &replayed);
+    uint32_t end = ext2_jnl_scan(fs, start, seq, 0, 0, rv, &nrv, rvcap, &replayed,
+                                 &over, &over_seq);
+    if (over && (int32_t)(over_seq - end) < 0) {
+        /* A committed revoke that did not fit: replaying without it could
+         * write a stale block over a reused one.  Refuse instead. */
+        kfree(rv);
+        printk("[EXT2]  %s: journal has more than %u revoke records; not replaying "
+               "(run e2fsck)\n", fs->name, (unsigned)rvcap);
+        return -117;
+    }
+    if (end != seq) ext2_jnl_scan(fs, start, seq, 1, end, rv, &nrv, rvcap, &replayed,
+                                  &over, &over_seq);
     kfree(rv);
     printk("[EXT2]  %s: journal replayed: transactions %u..%u, %u blocks\n", fs->name,
            (unsigned)seq, (unsigned)(end - 1), (unsigned)replayed);
@@ -4515,6 +4636,10 @@ static int ext2_unlink(vfs_node_t *dir, const char *name) {
     ext2_fs_t *fs = (dir && dir->private) ? ((ext2_priv_t *)dir->private)->fs
                                         : (ext2_fs_t *)0;
     if (fs) ext2_lock(fs);
+    if (fs && fs->crash_unlink) {
+        fs->crash_unlink = 0;
+        fs->crash_test = 2;
+    }
     int r = ext2_unlink_do(dir, name);
     if (fs) {
         ext2_op_end(fs);
@@ -4589,8 +4714,19 @@ static uint32_t ext2_write_node(vfs_node_t *node, uint32_t offset,
                                 uint32_t size, const uint8_t *buf) {
     ext2_fs_t *fs = (node && node->private) ? ((ext2_priv_t *)node->private)->fs
                                              : (ext2_fs_t *)0;
-    if (fs) ext2_lock(fs);
+    if (fs) {
+        ext2_lock(fs);
+        fs->want_reclaim = 0;
+    }
     uint32_t r = ext2_write_node_do(node, offset, size, buf);
+    if (fs && fs->want_reclaim && r != VFS_WRITE_ENOMEM && r < size && !fs->ro) {
+        /* Out of space but for blocks freed by the open transaction: the
+         * write so far is a complete short write, so commit it and go on. */
+        fs->want_reclaim = 0;
+        ext2_sync_fs(fs);
+        uint32_t r2 = ext2_write_node_do(node, offset + r, size - r, buf + r);
+        if (r2 != VFS_WRITE_ENOMEM) r += r2;
+    }
     if (fs) {
         if (fs->crash_test == 1 && r) fs->crash_test = 2;
         ext2_op_end(fs);
@@ -4669,6 +4805,16 @@ static int x4_setup(ext2_fs_t *fs, uint8_t *sb_buf, int ro) {
         uint32_t ds = x4_rd16(sb_buf + SB_DESC_SIZE);
         if (ds < 32 || ds > 1024 || (ds & (ds - 1))) return -22;
         fs->desc_size = ds;
+        if (ds > sizeof(ext2_bgd_t)) {
+            /* Descriptors are read and checksummed through the 64-byte
+             * ext2_bgd_t: a bigger one could be read, not written. */
+            fs->rw_ok = 0;
+            if (!ro) {
+                printk("[EXT2]  %s: %u-byte group descriptors; read-only only\n",
+                       fs->name, (unsigned)ds);
+                return -30;
+            }
+        }
     }
     fs->csum = (fs->ro_compat & EXT2_RO_COMPAT_METADATA_CSUM) != 0;
     fs->extents = (inc & EXT2_INCOMPAT_EXTENTS) != 0;
@@ -4998,6 +5144,21 @@ void ext2_test_crash(ext2_fs_t *fs) {
     }
 }
 
+/* More test hooks (smoke-ext4rw): x4smalltxn makes every transaction past
+ * two blocks due at the next safe point, so writes and frees commit in many
+ * steps; x4crashunlink loses power at the first commit inside the next
+ * unlink(2), i.e. between two steps of freeing a file. */
+void ext2_test_opt(ext2_fs_t *fs, const char *opt) {
+    if (!fs->j) return;
+    if (strcmp(opt, "x4smalltxn") == 0) {
+        fs->j->cap = 2;
+        printk("[EXT2]  %s: x4smalltxn: commits at 2 blocks\n", fs->name);
+    } else if (strcmp(opt, "x4crashunlink") == 0) {
+        fs->crash_unlink = 1;
+        printk("[EXT2]  %s: x4crashunlink armed\n", fs->name);
+    }
+}
+
 static int ext2_set_ro_locked(ext2_fs_t *fs, int ro);
 
 int ext2_busy(void *p) {
@@ -5036,6 +5197,8 @@ void ext2_release(void *p) {
     ext2_lock(fs);
     if (!fs->ro) ext2_sb_mark(fs, 0);
     ext2_unlock(fs);
-    printk("[EXT2]  %s: unmounted\n", fs->name);
+    if (fs->j) printk("[EXT2]  %s: unmounted (%u journal commits)\n", fs->name,
+                      (unsigned)fs->j->commits);
+    else printk("[EXT2]  %s: unmounted\n", fs->name);
     ext2_free_fs(fs);
 }

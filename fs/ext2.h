@@ -35,6 +35,8 @@ void ext2_sync_all(void);
 
 /* Test hook: lose power after the commit that ends the next write(2). */
 void ext2_test_crash(ext2_fs_t *fs);
+/* Test hooks x4smalltxn, x4crashunlink (see fs/ext2.c). */
+void ext2_test_opt(ext2_fs_t *fs, const char *opt);
 
 /* Hooks for the mount table (vfs_mnt_t busy/release/set_ro). */
 int  ext2_busy(void *fs);

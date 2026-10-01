@@ -159,6 +159,27 @@ def htree_levels(img, path):
     return int(m.group(1)) if m else None
 
 
+def torn_revoke(img, fsblk):
+    """After debugfs's transaction 1 (descriptor, data, commit at journal
+    blocks 1-3) append a revoke block of transaction 2 for the same block,
+    with no commit block after it: a torn transaction whose revoke must not
+    cancel the committed copy (jbd2 only honours committed revokes)."""
+    jblk0 = int(debugfs(img, "bmap <8> 0").split()[0])
+    jblk4 = int(debugfs(img, "bmap <8> 4").split()[0])
+    with open(img, "r+b") as f:
+        f.seek(jblk0 * 4096)
+        jsb = f.read(1024)
+        uuid = jsb[0x30:0x40]
+        r = bytearray(4096)
+        r[0:12] = struct.pack(">III", 0xC03B3998, 5, 2)
+        r[12:16] = struct.pack(">I", 16 + 8)            # 64bit journal: 8-byte records
+        r[16:24] = struct.pack(">Q", fsblk)
+        seed = crc32c(0xFFFFFFFF, uuid)
+        r[4092:4096] = struct.pack(">I", crc32c(seed, bytes(r)))
+        f.seek(jblk4 * 4096)
+        f.write(r)
+
+
 def build_images():
     shutil.rmtree(OUT, ignore_errors=True)
     os.makedirs(OUT)
@@ -216,6 +237,7 @@ def build_images():
     with open(cmds, "w") as f:
         f.write(f"jo\njw -b {blk} {newblk}\njc\n")
     run(DEBUGFS, "-w", "-f", cmds, c_img)
+    torn_revoke(c_img, blk)
     info["c_dirty"] = "needs_recovery" in subprocess.run(
         [DUMPE2FS, "-h", c_img], capture_output=True, text=True).stdout
 
@@ -226,6 +248,11 @@ def build_images():
         f.write(b"kept\n")
     run(MKE2FS, "-q", "-F", "-t", "ext4", "-L", "ext4d", "-d", src, d_img, "64M")
     journal_csum_v3(d_img)
+
+    e_img = os.path.join(OUT, "e.img")
+    run(MKE2FS, "-q", "-F", "-t", "ext4", "-L", "ext4e", e_img, "64M")
+    journal_csum_v3(e_img)
+    info["e_img"] = e_img
     return a_img, b_img, c_img, d_img, info
 
 
@@ -309,7 +336,7 @@ def common_ops(g, m, name):
 
 
 def guest_tests(g, info):
-    g.sh("busybox mkdir -p /mnt/a /mnt/b /mnt/c /mnt/d")
+    g.sh("busybox mkdir -p /mnt/a /mnt/b /mnt/c /mnt/d /mnt/e")
     rc, out = g.sh("busybox mount -t ext4 /dev/sdb /mnt/a")
     check(rc == 0, f"mount -t ext4 /dev/sdb /mnt/a ({out.strip()!r})")
     rc, out = g.sh("busybox mount -t ext4 /dev/nvme0n1 /mnt/b")
@@ -382,6 +409,28 @@ def guest_tests(g, info):
           "sdc: one transaction, one block replayed")
     rc, out = g.sh("echo after-replay > /mnt/c/after.txt && busybox umount /mnt/c")
     check(rc == 0, "sdc: written after the replay, unmounted")
+    # Commit in small steps everywhere (writes, frees), then a clean umount.
+    g.sh("busybox printf \"%4096s\" \"\" > /tmp/4k")
+    at = smokelib.mark(g.log)
+    rc, out = g.sh("busybox mount -t ext4 -o x4smalltxn /dev/sdc /mnt/c && cd /mnt/c && "
+                   "for i in $(busybox seq 1 100); do busybox cat /tmp/4k >> F; busybox cat /tmp/4k >> G; done && "
+                   "for i in 1 2 3 4; do busybox cat /tmp/pat1m >> H; done && "
+                   "busybox truncate -s 204800 F && busybox rm G && cd / && busybox umount /mnt/c", timeout=300.0)
+    m = re.search(r"sdc: unmounted \((\d+) journal commits\)", "".join(g.log)[at:])
+    check(rc == 0 and m is not None and int(m.group(1)) > 50,
+          f"sdc: x4smalltxn workload committed in steps ({m.group(0) if m else out.strip()[-200:]!r})")
+
+    # Power loss in the middle of freeing a 300-extent file.
+    rc, out = g.sh("busybox mount -t ext4 -o x4smalltxn /dev/sde /mnt/e && cd /mnt/e && "
+                   "for i in $(busybox seq 1 300); do busybox cat /tmp/4k >> A; busybox cat /tmp/4k >> B; done && "
+                   "for i in 1 2 3 4 5 6 7 8; do busybox cat /tmp/pat1m >> C; done && busybox sync && "
+                   "cd / && busybox umount /mnt/e", timeout=300.0)
+    check(rc == 0, f"sde: interleaved files written ({out.strip()[-200:]!r})")
+    at = smokelib.mark(g.log)
+    rc, out = g.sh("busybox mount -t ext4 -o x4smalltxn,x4crashunlink /dev/sde /mnt/e && "
+                   "busybox rm /mnt/e/A; busybox md5sum /mnt/e/B")
+    check(re.search(r"sde: x4crash: stopped after committing transaction", "".join(g.log)[at:]) is not None,
+          f"sde: power lost at the first commit inside unlink ({out.strip()[-200:]!r})")
 
     # simulated power loss after one commit
     rc, out = g.sh("busybox mount -t ext4 -o x4crash /dev/sdd /mnt/d && "
@@ -437,6 +486,23 @@ def host_checks(a_img, b_img, c_img, d_img, info):
           f"debugfs: nvme0n1 /big2 changes ({len(big2)} names)")
     check(debugfs_cat(c_img, "/hello.txt") == b"replayed content\n", "debugfs: sdc hello.txt replayed")
     check(debugfs_cat(c_img, "/after.txt") == b"after-replay\n", "debugfs: sdc after.txt")
+    sp = b" " * 4096
+    check(debugfs_cat(c_img, "/H") == (big_bytes()[:1048576] * 4) and debugfs_cat(c_img, "/F") == sp * 50
+          and "G" not in live_names(c_img, "/"), "debugfs: sdc x4smalltxn files")
+
+    # sde: power lost between two steps of an unlink.
+    e_img = info["e_img"]
+    st = subprocess.run([DUMPE2FS, "-h", e_img], capture_output=True, text=True).stdout
+    check("needs_recovery" in st, "sde: needs_recovery after the power loss inside unlink")
+    r = subprocess.run([E2FSCK, "-fy", e_img], capture_output=True, text=True)
+    bad = "Multiply-claimed" in r.stdout or re.search(r"Block bitmap differences:[^\n]*\+", r.stdout)
+    check("recovering journal" in r.stdout and not bad and r.returncode in (0, 1),
+          f"sde: e2fsck replays; no block both free and in use, none claimed twice (rc={r.returncode})\n"
+          f"{r.stdout[-1500:]}")
+    r = subprocess.run([E2FSCK, "-fn", e_img], capture_output=True, text=True)
+    check(r.returncode == 0, f"sde: e2fsck -fn clean afterwards (rc={r.returncode})")
+    check(debugfs_cat(e_img, "/B") == sp * 300 and debugfs_cat(e_img, "/C") == big_bytes()[:1048576] * 8,
+          "sde: the other files are intact")
 
     # sdd: the journal the guest left behind
     st = subprocess.run([DUMPE2FS, "-h", d_img], capture_output=True, text=True).stdout
@@ -510,6 +576,7 @@ def main():
          "-drive", f"file={a_img},format=raw,index=1,media=disk",
          "-drive", f"file={c_img},format=raw,index=2,media=disk",
          "-drive", f"file={d_img},format=raw,index=3,media=disk",
+         "-drive", f"file={info['e_img']},format=raw,index=4,media=disk",
          "-drive", f"file={b_img},format=raw,if=none,id=nv",
          "-device", "nvme,serial=ext4rw,drive=nv",
          "-serial", "stdio", "-m", "512M", "-no-reboot"],
@@ -538,7 +605,8 @@ def main():
               "poweroff took both read-write ext4 mounts read-only")
         check("has no checksum tail" not in text, "no directory block without a checksum tail")
         check("index dropped" not in text, "no htree index dropped")
-        check("journal commit" not in text, "no failed journal commits")
+        check(re.search(r"journal commit \d+ failed|journal aborted", text) is None,
+              "no failed journal commits, no journal abort")
     finally:
         if proc.poll() is None:
             proc.terminate()
