@@ -40,6 +40,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include "xs.h"
 
 #define X_SOCKET_DIR  "/tmp/.X11-unix"
@@ -54,6 +55,7 @@ int      render_major = 139;
 static gui_window_t gui;
 static int       headless;
 static int       listen_fd = -1;
+static int       abstract_fd = -1;   /* @/tmp/.X11-unix/X0: reaches chroots */
 static int       dirty = 1;
 static int       pd_x0, pd_y0, pd_x1, pd_y1;
 static unsigned  last_render_ms;
@@ -795,8 +797,14 @@ static void process_client(client_t *c) {
     }
 }
 
+static void accept_on(int lfd);
 static void accept_clients(void) {
-    int cfd = accept(listen_fd, 0, 0);
+    accept_on(listen_fd);
+    if (abstract_fd >= 0) accept_on(abstract_fd);
+}
+
+static void accept_on(int lfd) {
+    int cfd = accept(lfd, 0, 0);
     if (cfd < 0) return;
     fcntl(cfd, F_SETFL, O_RDWR | O_NONBLOCK);
     for (int i = 0; i < MAX_XCLIENTS; i++)
@@ -832,10 +840,29 @@ static int start_listener(void) {
     return fd;
 }
 
+/* The same display in the abstract namespace, which libxcb tries first: it
+ * is not part of the filesystem, so a client inside the Alpine chroot (whose
+ * /tmp is the chroot's own) reaches the server through it. */
+static int start_abstract_listener(void) {
+    int fd = socket(AF_UNIX, SOCK_STREAM | 0x800 /* NONBLOCK */, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path + 1, X_SOCKET_PATH);
+    socklen_t alen = (socklen_t)(sizeof(addr.sun_family) + 1 + strlen(X_SOCKET_PATH));
+    if (bind(fd, (struct sockaddr *)&addr, alen) != 0 || listen(fd, 16) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 static void wait_for_clients(int ms) {
-    struct pollfd pfd[1 + MAX_XCLIENTS];
+    struct pollfd pfd[2 + MAX_XCLIENTS];
     int n = 0;
     if (listen_fd >= 0) { pfd[n].fd = listen_fd; pfd[n].events = POLLIN; pfd[n].revents = 0; n++; }
+    if (abstract_fd >= 0) { pfd[n].fd = abstract_fd; pfd[n].events = POLLIN; pfd[n].revents = 0; n++; }
     for (int i = 0; i < MAX_XCLIENTS; i++) {
         client_t *c = &clients[i];
         if (!c->used || c->dead) continue;
@@ -888,6 +915,8 @@ int main(int argc, char *argv[]) {
 
     listen_fd = start_listener();
     if (listen_fd < 0) { printf("maerox: listen failed (%d)\n", listen_fd); return 1; }
+    abstract_fd = start_abstract_listener();
+
     if (daemon) {
         printf("maerox: listening on " X_SOCKET_PATH " (daemonized)\n");
         if (fork() > 0) return 0;
@@ -912,6 +941,8 @@ int main(int argc, char *argv[]) {
     while (headless || !gui.closed) {
         if (!headless) poll_desktop();
         keyfifo_poll();
+        /* The X apps xapp starts are our children: reap them as they exit. */
+        while (waitpid(-1, NULL, 1 /* WNOHANG */) > 0) ;
         accept_clients();
         for (int i = 0; i < MAX_XCLIENTS; i++)
             if (clients[i].used) { out_flush(&clients[i]); process_client(&clients[i]); }
@@ -932,6 +963,7 @@ int main(int argc, char *argv[]) {
         wait_for_clients(wait);
     }
     close(listen_fd);
+    if (abstract_fd >= 0) close(abstract_fd);
     unlink(X_SOCKET_PATH);
     if (keyfifo_fd >= 0) { close(keyfifo_fd); unlink(KEYFIFO_PATH); }
     if (!headless) gui_close(&gui);
