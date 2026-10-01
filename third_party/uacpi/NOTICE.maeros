@@ -1,0 +1,9 @@
+uACPI — a portable and easy-to-integrate ACPI implementation
+Source:  https://github.com/uACPI/uACPI
+Commit:  f5f6cc29f85dd5db0dd79c47700c8f3ebce18be4 (2026-09-04), version 6.1.0
+License: MIT (see LICENSE in this directory)
+
+Vendored unmodified: source/*.c, include/, LICENSE, README.md (files.cmake,
+meson and tests were left out).  The kernel-side host API it calls
+(uacpi_kernel_*) is implemented in drivers/acpi.c; the build rule is in the
+top-level Makefile (UACPI_SRCS).

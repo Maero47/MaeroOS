@@ -15,6 +15,7 @@
 #include "../drivers/serial.h"
 #include "../drivers/vga.h"
 #include "../drivers/framebuffer.h"
+#include "../drivers/acpi.h"
 #include "../drivers/keyboard.h"
 #include "../kernel/random.h"
 #include "../kernel/panic.h"
@@ -5489,46 +5490,39 @@ static int sys_mknodat(registers_t *regs) {
     return do_mknod(resolved, regs->edx);
 }
 
-/* ── sys_reboot(magic, magic2, cmd, arg) — EAX=88 ───────────────────────── */
-#define LINUX_REBOOT_CMD_POWER_OFF  0x4321FEDC
+/* ── sys_reboot(magic, magic2, cmd, arg) — EAX=88 ─────────────────────────
+ * Linux kernel/reboot.c: magic must be LINUX_REBOOT_MAGIC1 and magic2 one of
+ * the four MAGIC2 values (else -EINVAL); unknown commands are -EINVAL.  The
+ * power paths live in drivers/acpi.c (S5 via \_S5, FADT reset register).
+ * Note: Linux also requires CAP_SYS_BOOT; here any user may call it, because
+ * the desktop (running as the session user) powers off through it. */
+#define LINUX_REBOOT_MAGIC1         0xFEE1DEAD
 #define LINUX_REBOOT_CMD_RESTART    0x01234567
+#define LINUX_REBOOT_CMD_HALT       0xCDEF0123
+#define LINUX_REBOOT_CMD_CAD_ON     0x89ABCDEF
+#define LINUX_REBOOT_CMD_CAD_OFF    0x00000000
+#define LINUX_REBOOT_CMD_POWER_OFF  0x4321FEDC
 static int sys_reboot(registers_t *regs) {
-    /* magic1 = ebx, magic2 = ecx, cmd = edx */
-    uint32_t cmd = regs->edx;
+    uint32_t magic = regs->ebx, magic2 = regs->ecx, cmd = regs->edx;
+    if (magic != LINUX_REBOOT_MAGIC1 ||
+        (magic2 != 672274793 && magic2 != 85072278 &&
+         magic2 != 369367448 && magic2 != 537993216))
+        return -22;   /* -EINVAL */
 
-    if (cmd == LINUX_REBOOT_CMD_POWER_OFF) {
-        /* ACPI power off — try the well-known virtual-machine ports. */
-        __asm__ volatile("cli");
-        outw(0x604, 0x2000);     /* QEMU (>= 2.x) ACPI shutdown */
-        outw(0xB004, 0x2000);    /* Bochs / older QEMU */
-        outw(0x4004, 0x3400);    /* VirtualBox */
-        for (;;) __asm__ volatile("hlt");
+    switch (cmd) {
+    case LINUX_REBOOT_CMD_POWER_OFF:
+        acpi_poweroff();
+    case LINUX_REBOOT_CMD_RESTART:
+        acpi_reboot();
+    case LINUX_REBOOT_CMD_HALT:
+        printk("[REBOOT] System halted.\n");
+        for (;;) __asm__ volatile("cli; hlt");
+    case LINUX_REBOOT_CMD_CAD_ON:
+    case LINUX_REBOOT_CMD_CAD_OFF:
+        return 0;
+    default:
+        return -22;
     }
-
-    if (cmd == LINUX_REBOOT_CMD_RESTART) {
-        printk("[REBOOT] restart requested — resetting CPU\n");
-        __asm__ volatile("cli");
-
-        /* 1. 0xCF9 reset-control register (QEMU/modern chipsets). */
-        outb(0xCF9, 0x02);
-        outb(0xCF9, 0x0E);
-
-        /* 2. Pulse the 8042 keyboard-controller CPU reset line. */
-        for (int i = 0; i < 100000; i++)
-            if (!(inb(0x64) & 0x02)) break;   /* wait input buffer empty */
-        outb(0x64, 0xFE);
-
-        /* 3. Triple fault — install an empty IDT so the very next interrupt
-         *    cascades #GP → #DF → triple fault → CPU reset.  Foolproof on x86;
-         *    QEMU with -no-reboot exits, otherwise the machine restarts. */
-        static const struct { uint16_t limit; uint32_t base; }
-            __attribute__((packed)) null_idtr = { 0, 0 };
-        __asm__ volatile("lidt %0" :: "m"(null_idtr) : "memory");
-        __asm__ volatile("int $0x03");
-
-        for (;;) __asm__ volatile("hlt");
-    }
-    return 0;
 }
 
 /* ── sys_lstat(path, stat*) — EAX=107 ───────────────────────────────────── */

@@ -95,7 +95,15 @@ LWIP_SRCS := \
 
 LWIP_OBJS := $(LWIP_SRCS:.c=.o)
 LWIP_CFLAGS := $(filter-out -Werror,$(CFLAGS)) -Wno-unused-parameter
-ALL_OBJS := $(C_OBJS) $(LWIP_OBJS) $(ASM_OBJS)
+# uACPI (MIT, third_party/uacpi): the AML interpreter behind drivers/acpi.c.
+# Its printf-style format strings assume uint32_t is unsigned int, which it is
+# not on i686-elf (long), hence -Wno-format; the sizes are identical.
+UACPI_SRCS := $(wildcard third_party/uacpi/source/*.c)
+UACPI_OBJS := $(UACPI_SRCS:.c=.o)
+UACPI_CFLAGS := $(filter-out -std=gnu99 -Werror,$(CFLAGS)) -std=gnu11 \
+	-Wno-format -I./third_party/uacpi/include
+drivers/acpi.o: CFLAGS += -I./third_party/uacpi/include
+ALL_OBJS := $(C_OBJS) $(LWIP_OBJS) $(UACPI_OBJS) $(ASM_OBJS)
 
 $(LWIP_OBJS): CFLAGS := $(LWIP_CFLAGS)
 
@@ -134,7 +142,7 @@ TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 all: $(TARGET)
 
 $(TARGET): $(ALL_OBJS)
-	$(LD) $(LDFLAGS) -o $@ $^
+	$(LD) $(LDFLAGS) -o $@ $^ -lgcc
 
 $(C_OBJS): $(KTRACE_STAMP)
 
@@ -144,6 +152,9 @@ $(C_OBJS): $(KTRACE_STAMP)
 
 third_party/lwip/%.o: third_party/lwip/%.c
 	$(CC) $(LWIP_CFLAGS) $(DEPFLAGS) -c $< -o $@
+
+third_party/uacpi/%.o: third_party/uacpi/%.c
+	$(CC) $(UACPI_CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # NASM assembly
 %.o: %.asm
@@ -525,7 +536,7 @@ iso: $(TARGET) initrd
 	"$$g" $${d:+-d "$$d"} -o maeros.iso isodir
 
 clean:
-	find kernel arch/i686 mm fs drivers proc lib net third_party/lwip/src \
+	find kernel arch/i686 mm fs drivers proc lib net third_party/lwip/src third_party/uacpi \
 		\( -name "*.o" -o -name "*.d" \) -delete 2>/dev/null || true
 	rm -f $(TARGET) maeros.iso initrd.tar disk.img disk-ff.img $(QEMU_ISO_PID) $(KTRACE_STAMP)
 	rm -rf isodir repo
@@ -534,4 +545,4 @@ clean:
 	$(MAKE) -C userspace clean
 
 # Pull in auto-generated dependency files (silence errors if none exist yet)
--include $(C_OBJS:.o=.d) $(LWIP_OBJS:.o=.d)
+-include $(C_OBJS:.o=.d) $(LWIP_OBJS:.o=.d) $(UACPI_OBJS:.o=.d)

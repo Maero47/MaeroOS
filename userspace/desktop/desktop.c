@@ -5110,6 +5110,7 @@ int main(void) {
     /* The display stays in framebuffer mode after we exit (no text-mode
      * switch exists), so "returning to shell" would just freeze the screen.
      * QUIT means leave the machine: power off cleanly. */
-    syscall3(88, 0, 0, (int)0x4321FEDCu);   /* reboot(LINUX_REBOOT_CMD_POWER_OFF) */
+    /* reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, CMD_POWER_OFF) */
+    syscall3(88, (int)0xFEE1DEADu, 672274793, (int)0x4321FEDCu);
     return 0;
 }

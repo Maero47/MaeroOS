@@ -5,6 +5,9 @@
 #include "../include/unistd.h"
 #include "../include/syscall.h"
 
+/* Linux include/uapi/linux/reboot.h */
+#define REBOOT_MAGIC1 0xFEE1DEAD
+#define REBOOT_MAGIC2 672274793
 #define CMD_POWER_OFF 0x4321FEDC
 #define CMD_RESTART   0x01234567
 
@@ -13,6 +16,8 @@ int main(int argc, char *argv[]) {
     const char *base = me;
     for (const char *p = me; *p; p++) if (*p == '/') base = p + 1;
 
+    /* halt powers off too, as on most Linux systems (systemd, busybox -p):
+     * a halted-but-running machine is rarely what anyone wants. */
     int power_off = !strcmp(base, "poweroff") || !strcmp(base, "shutdown") ||
                     !strcmp(base, "halt");
     /* `shutdown -r` restarts. */
@@ -25,6 +30,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     printf("%s: %s now...\n", base, power_off ? "powering off" : "restarting");
-    syscall3(88, 0, 0, power_off ? CMD_POWER_OFF : CMD_RESTART);
+    sync();
+    syscall3(88, (int)REBOOT_MAGIC1, REBOOT_MAGIC2,
+             (int)(power_off ? CMD_POWER_OFF : CMD_RESTART));
     return 1;   /* only reached if the syscall returned */
 }

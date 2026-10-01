@@ -31,6 +31,7 @@
 #include "../fs/procfs.h"
 #include "../drivers/ata.h"
 #include "../drivers/pci.h"
+#include "../drivers/acpi.h"
 #include "../drivers/rtl8139.h"
 #include "../drivers/framebuffer.h"
 #include "../drivers/keyboard.h"
@@ -195,6 +196,10 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
      * the tick interrupt can be coalesced, so counting ticks does not measure
      * wall time (arch/i686/cpu/tsc.c). */
     tsc_init();
+
+    /* ACPI tables + AML namespace (uACPI).  Needs the heap, PCI and a clock;
+     * must precede init so init's page directory inherits the map window. */
+    acpi_init();
 
     /* Network bottom-half: keeps DHCP/TCP alive without userspace polling */
     if (net_find_interface("eth0"))
