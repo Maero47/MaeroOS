@@ -695,10 +695,14 @@ static int dir_iter(vfat_fs_t *fs, vfat_vnode_t *d, uint32_t *idx, dent_t *o) {
                 if (ord == 0 || ord > 20) { have = 0; continue; }
                 have = 1; left = (int)ord; sum = e[13]; start = i; nparts = ord;
                 for (int k = 0; k < 260; k++) lfn[k] = 0xFFFF;
-            } else if (!have || (int)ord != left || e[13] != sum) {
+            } else if (!have || left <= 0 || (int)ord != left || e[13] != sum) {
+                /* Out of sequence, including an ordinal 0 after a set that
+                 * is already complete (left == 0): drop the set. */
                 have = 0;
                 continue;
             }
+            /* ord is 1..nparts <= 20 here, so the copy stays inside lfn[]. */
+            if (ord == 0 || ord > nparts) { have = 0; continue; }
             static const uint8_t at[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
             for (int k = 0; k < 13; k++) lfn[(ord - 1) * 13 + k] = rd16(e + at[k]);
             left--;
@@ -744,12 +748,21 @@ static int is_dot(const dent_t *de) {
 /* Find `name` (long or short form, case-insensitive) in `d`.  0, -ENOENT or
  * -EIO.  Dot entries are never matched. */
 static int dir_find(vfat_fs_t *fs, vfat_vnode_t *d, const char *name, dent_t *o) {
+    /* Trailing dots are not part of a FAT name (name_parse drops them when
+     * storing), so "b." finds "b" everywhere: lookup, create, unlink and
+     * both sides of rename. */
+    char key[256];
+    strncpy(key, name, 255);
+    key[255] = '\0';
+    size_t l = strlen(key);
+    while (l && key[l - 1] == '.') key[--l] = '\0';
+    if (!l) return E_NOENT;
     uint32_t idx = 0;
     for (;;) {
         int r = dir_iter(fs, d, &idx, o);
         if (r) return r < 0 ? E_IO : E_NOENT;
         if (is_dot(o)) continue;
-        if (name_eq(o->name, name) || name_eq(o->sname, name)) return 0;
+        if (name_eq(o->name, key) || name_eq(o->sname, key)) return 0;
     }
 }
 

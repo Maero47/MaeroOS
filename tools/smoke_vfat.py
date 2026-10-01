@@ -179,6 +179,48 @@ def mtools_tree(path):
 
 # ── The guest session ────────────────────────────────────────────────────
 
+def crafted(man, accel):
+    """Malformed long-name sequences and randomly corrupted volumes: the
+    driver must read what it can, and never crash."""
+    work = []
+    for i, src in enumerate([man["crafted"]["image"]] + man["fuzz"]):
+        dst = os.path.join(OUT, f"run-crafted-{i}.img")
+        shutil.copyfile(src, dst)
+        work.append(dst)
+    args = ["-M", "q35", "-drive", "file=disk.img,format=raw,index=0,media=disk,snapshot=on"]
+    for i, w in enumerate(work):
+        args += ["-drive", f"file={w},format=raw,index={i + 1},media=disk"]
+    proc, sel, log, g = boot(args, accel)
+    try:
+        smokelib.login(proc, sel, log, timeout=120.0)
+        at = smokelib.mark(log)
+        rc, out = g.sh("busybox mkdir -p /c && busybox mount -t vfat -o ro /dev/sdb /c && "
+                       "cd /c && busybox find . -type f | busybox sort | "
+                       "while read -r f; do busybox md5sum \"$f\"; done")
+        got = sorted(re.findall(r"^([0-9a-f]{32})  ", out, re.M))
+        check(rc == 0 and got == man["crafted"]["md5s"],
+              f"crafted LFN sequences (ordinal 0 after a complete set, ordinals past 20, "
+              f"bad checksum, orphan set): all {len(got)} files still read")
+        rc, out = g.sh("busybox ls /c | busybox wc -l; busybox umount /c")
+        check(rc == 0, "crafted volume lists and unmounts")
+        names = "abcdefghij"
+        for i in range(1, len(work)):
+            dev = f"/dev/sd{names[i + 1]}"
+            g.sh(f"busybox mkdir -p /f; busybox mount -t vfat -o ro {dev} /f && "
+                 "busybox find /f -maxdepth 6 | busybox wc -l; "
+                 "busybox find /f -maxdepth 6 -type f -exec busybox cat {} + >/dev/null 2>&1; "
+                 "busybox umount /f", timeout=180.0)
+            g.sh(f"busybox mount -t vfat {dev} /f && "
+                 "busybox rm -rf /f/* 2>/dev/null; echo new > /f/new.txt; "
+                 "busybox mkdir /f/d; busybox mv /f/new.txt /f/d/; busybox umount /f", timeout=180.0)
+        rc, out = g.sh("echo still-alive")
+        text = "".join(log)[at:].lower()
+        check(rc == 0 and "still-alive" in out and "panic" not in text and "page fault" not in text,
+              f"{len(work) - 1} fuzzed volumes read, written and unmounted without a crash")
+    finally:
+        stop(proc)
+
+
 def hotplug(man, usb_img, accel):
     """Unplug the stick while it is mounted, then plug it back in."""
     sockdir = tempfile.mkdtemp(prefix="svfat")
@@ -263,6 +305,10 @@ def fat32_session(g, man, big):
         ("write past the end", "echo -n X | busybox dd of=/mnt/hole.bin bs=1 seek=100000 2>/dev/null"),
         ("truncate", "busybox cp /mnt/big.bin /mnt/trunc.bin && busybox truncate -s 12345 /mnt/trunc.bin"),
         ("mkdir + rmdir", "busybox mkdir /mnt/gone && busybox rmdir /mnt/gone"),
+        ("rename onto \"name.\" (trailing dot) replaces \"name\"",
+         "echo first > /mnt/dotA && echo second > /mnt/dotB && busybox mv /mnt/dotA /mnt/dotB. && "
+         "busybox test ! -e /mnt/dotA && busybox test \"$(busybox cat /mnt/dotB)\" = first && "
+         "busybox test $(cd /mnt && busybox find . -maxdepth 1 -iname dotb | busybox wc -l) = 1"),
     ]
     for what, cmd in cmds:
         rc, out = g.sh(cmd, timeout=300.0)
@@ -321,6 +367,7 @@ def fat32_session(g, man, big):
         want[f"Yeni Klasör/çok/dosya numarası {i}.txt"] = md5(f"{i}\n".encode())
     want["hole.bin"] = md5(b"\0" * 100000 + b"X")
     want["trunc.bin"] = md5(big[:12345])
+    want["dotB"] = md5(b"first\n")
     compare_tree(g.md5_tree("/mnt"), want, "FAT32 after the writes, read in the guest")
 
     rc, out = g.sh("cd /mnt && busybox umount /mnt")
@@ -478,6 +525,7 @@ def main():
         stop(proc)
 
     hotplug(man, work["usb"], accel)
+    crafted(man, accel)
 
     if failures:
         print(f"\n{TAG} {len(failures)} check(s) failed:")
