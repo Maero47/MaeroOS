@@ -137,7 +137,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-fw smoke-disk smoke-ahci smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-acpi smoke-usb check abiprobes smoke-abi smoke-firefox smoke-firefox-web repo repo-serve start resolutions icons
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-fw smoke-disk smoke-ahci smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web repo repo-serve start resolutions icons
 
 all: $(TARGET)
 
@@ -385,6 +385,13 @@ smoke-gui: $(TARGET) iso disk
 smoke-usb: $(TARGET) iso disk
 	python3 tools/smoke_usb.py
 
+# A PC without legacy devices: q35 with no 8042, the disk on its AHCI, USB
+# keyboard and tablet on xHCI, two CPUs from the MADT; the desktop is used
+# over USB and `doas poweroff` in its Terminal must make QEMU exit (ACPI S5).
+# Output in build/smoke-pc/; see tools/smoke_pc.py.
+smoke-pc: $(TARGET) iso disk
+	python3 tools/smoke_pc.py
+
 # The headless suites CI runs (.github/workflows/ci.yml), in one command.
 # Each suite's console goes to $(CHECK_LOG_DIR)/<suite>.log; a failure prints
 # the tail of its log and the rest still run, then check exits non-zero.
@@ -394,7 +401,7 @@ smoke-usb: $(TARGET) iso disk
 # Pick a subset with CHECK_SUITES="smoke smoke-x".
 CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-net-e1000 smoke-fw \
                  smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui smoke-acpi \
-                 smoke-ahci smoke-usb
+                 smoke-ahci smoke-usb smoke-pc
 CHECK_LOG_DIR ?= build/check
 
 # repo: smoke-pkg serves packages from repo/ (see the smoke-pkg target).

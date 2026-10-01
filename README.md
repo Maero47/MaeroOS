@@ -48,6 +48,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | Desktop and its apps | driven with QMP mouse and keyboard input on the ISO: the launcher opens the terminal, a command typed into it runs in the terminal's own shell (its pid is checked), the image viewer shows `/disk/wallpaper.ppm`, Files enters a directory by double-click, Settings applies an accent (the desktop reloads, `desktop.conf` changes), the Store shows its verified list or the "run pkg update" state, the Task Manager lists the desktop and the Store, windows close by button, Esc and Alt-Tab and the focus passes to the topmost window left; every window must also show up in a screendump | `make smoke-gui` |
 | GLib, Cairo, Pango, GTK3 | `GLIB_OK` (v2.78), `CAIRO_OK rect_px=0xe69919`, `PANGO_OK`, `GTK_OK init`, `GTK_WINDOW_SHOWN`, `GTK_DRAWN` (needs probe binaries a fresh clone lacks, see Testing) | `make smoke-gtk` |
 | ACPI (uACPI 6.1.0) | on QEMU's `pc` and `q35` machines the kernel finds the RSDP, loads the AML namespace (`[ACPI] ready`), `poweroff` ends QEMU through S5 (`\_PTS`, `\_S5`), `reboot` restarts it through the FADT reset register (q35) or 0xCF9 (pc, whose FADT has none), and the ACPI power button (`system_powerdown`) reaches init as SIGUSR2 and powers off | `make smoke-acpi` |
+| PC without legacy devices | `-M q35,i8042=off -smp 2`: no PS/2 controller (`[KBD]  no PS/2 controller`), `/disk` from `ahci0`, both CPUs from the MADT, the desktop's Terminal opened and typed into with a USB tablet and keyboard, and `doas poweroff` typed there makes QEMU exit through S5 | `make smoke-pc` |
 | Firefox 115.15.0esr | `ff: Firefox painted` (the browser window, about 5 s after `firefox-bin` starts); with `--web`, a page served from the host (HTML, a CSS rule, a PNG) requested and its image on screen about 3 s after Enter (needs the Firefox tree, see `ports/firefox/`) | `make smoke-firefox`, `make smoke-firefox-web` |
 
 ### What does not work
@@ -564,13 +565,20 @@ a `qemu-xhci` with a `usb-kbd` and `usb-tablet` bound to the VGA display (so QMP
 land where sent and that the boot mouse moves the pointer, reads and writes the stick
 through `/dev/usbdisk0` (checksummed against the image file) and unplugs and replugs it.
 
+`make smoke-pc` (`tools/smoke_pc.py`, about 15 s) boots a PC with no legacy devices:
+`-M q35,i8042=off -smp 2`, the disk on q35's AHCI controller, and a `usb-kbd` and
+`usb-tablet` on a `qemu-xhci` as the only input. It checks that the kernel skips the
+missing PS/2 controller, mounts `/disk` from `ahci0`, starts both CPUs from the MADT and
+enumerates the USB devices, opens the Terminal with them, and types `doas poweroff`
+there: QEMU, started without `-no-shutdown`, must exit through ACPI S5.
+
 ### Continuous integration
 
 `make check` runs the suites that need nothing beyond a fresh clone: `smoke`,
 `smoke-cmds`, `smoke-toybox`, `smoke-disk`, `smoke-net`, `smoke-net-e1000`, `smoke-fw`,
 `smoke-dyn`, `smoke-dynlib`, `smoke-x`, `smoke-pkg` (which first builds `repo/` and, on a
 host without one, a repo signing key), `smoke-gui` (which needs the ISO, so `check`
-builds it), `smoke-acpi`, `smoke-ahci` and `smoke-usb`. It runs them one after another, writes each suite's
+builds it), `smoke-acpi`, `smoke-ahci`, `smoke-usb` and `smoke-pc`. It runs them one after another, writes each suite's
 console to `build/check/<suite>.log`, prints the tail of the log for any suite that
 fails, carries on with the rest and exits non-zero at the end. `CHECK_SUITES="smoke
 smoke-x" make check` runs a subset.
