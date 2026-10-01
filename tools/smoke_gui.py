@@ -104,7 +104,11 @@ class Console:
         smokelib.send(self.proc, command + "\n")
         smokelib.wait_for(self.proc, self.sel, PROMPT, self.log, timeout, before)
         out = self.text()[before:]
-        out = out.split("\n", 1)[1] if "\n" in out else ""
+        # A desktop/app trace line can land before the echo, so drop
+        # everything up to the end of the echoed command, not the first line.
+        echo = out.find(command)
+        cut = out.find("\n", echo if echo >= 0 else 0)
+        out = out[cut + 1:] if cut >= 0 else ""
         return out[: out.rfind(PROMPT)] if PROMPT in out else out
 
 
