@@ -6,8 +6,8 @@
 # testfiles/lib, resolving each requested soname against the same search path
 # the MaeroOS launcher uses at runtime:
 #
-#     LD_LIBRARY_PATH=/lib:/disk/lib:/disk/firefox
-#     -> testfiles/lib : testfiles/lib : testfiles/firefox
+#     LD_LIBRARY_PATH=/lib:/disk/lib:/disk/firefox:/disk/firefox/apulse
+#     -> testfiles/lib : testfiles/lib : testfiles/firefox : .../apulse
 #
 # Exits 0 when every soname resolves inside the tree, 1 otherwise.  Prints a
 # short summary and the full list of unresolved sonames (with the objects that
@@ -20,7 +20,7 @@ set -eu
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 FF="$ROOT/testfiles/firefox"
 LIB="$ROOT/testfiles/lib"
-SEARCH="$LIB:$FF"
+SEARCH="$LIB:$FF:$FF/apulse"
 VERBOSE=0
 [ "${1:-}" = "-v" ] && VERBOSE=1
 

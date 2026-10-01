@@ -39,7 +39,9 @@ static char *const ff_envp[] = {
     "HOME=/tmp/ffhome",
     "USER=user",
     "TERM=linux",
-    "LD_LIBRARY_PATH=/lib:/disk/lib:/disk/firefox",
+    /* apulse/: libpulse on top of alsa-lib, for cubeb's PulseAudio backend
+     * (the only audio backend in Mozilla's builds); see docs/audio.md. */
+    "LD_LIBRARY_PATH=/lib:/disk/lib:/disk/firefox:/disk/firefox/apulse",
     "DISPLAY=:0",
     "GDK_PIXBUF_MODULE_FILE=/disk/firefox/pixbuf-loaders/loaders.cache",
     "XDG_CACHE_HOME=/tmp",      /* fontconfig cache (avoids "no writable cache") */
@@ -74,6 +76,10 @@ static char *const ff_envp[] = {
      * that this kernel doesn't provide; without disabling it the content/RDD/GMP
      * children bail immediately and the parent stalls waiting for them. */
     "MOZ_DISABLE_CONTENT_SANDBOX=1",
+    /* alsa-lib (under apulse) reads its configuration from here instead of
+     * its compiled-in /usr/share/alsa; ports/firefox/fetch-runtime.sh
+     * installs it from libasound2-data. */
+    "ALSA_CONFIG_DIR=/disk/firefox/alsa",
     /* Crash reporter (Breakpad) LEFT ENABLED: with the clone-child-stack bug
      * fixed its dumper works, so when a CHILD process (content/GPU) crashes
      * Breakpad contains it and the PARENT keeps running — that's how the early

@@ -96,3 +96,11 @@ libgpg-error0
 liblz4-1
 liblzma5
 libzstd1
+
+# --- Sound.  Mozilla's Linux builds carry only cubeb's PulseAudio backends
+#     (no cubeb ALSA backend; libxul's libasound is WebMIDI's).  apulse is
+#     libpulse implemented on alsa-lib (MIT), installed as
+#     testfiles/firefox/apulse, and libasound2-data is alsa-lib's
+#     configuration tree, installed as testfiles/firefox/alsa (docs/audio.md)
+apulse
+libasound2-data

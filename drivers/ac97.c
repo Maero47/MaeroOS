@@ -61,6 +61,8 @@ typedef struct {
 
 static bdl_entry_t bdl[NUM_BUFS] __attribute__((aligned(8)));
 static uint8_t dma_buf[NUM_BUFS][BUF_BYTES] __attribute__((aligned(4)));
+static volatile int drop_req;                     /* ac97_drop() -> pump() */
+static int drop_chan;                             /* its sleep channel */
 
 /* PCM byte ring fed by /dev/dsp writes, drained into DMA buffers. */
 #define RING_BYTES (256 * 1024)
@@ -76,9 +78,36 @@ static int writer_busy;
 static uint16_t nam_base, nabm_base;
 static int present;
 static volatile int playing;
-static uint8_t next_buf;                          /* next BDL slot to fill */
-static uint8_t last_filled;                       /* LVI target (has data) */
 static volatile uint32_t irq_count;
+
+/*
+ * The 32 DMA buffers form one cyclic buffer that the engine plays round and
+ * round (LVI is kept just behind CIV, so it never reaches the end of the
+ * list), exactly like the HDA driver's.  Positions are absolute byte counts
+ * since the engine started: done_bufs buffers have completed, the engine is
+ * PICB samples from the end of the current one (play_abs), and real PCM is
+ * written up to write_abs.  Played space is zeroed at once, so stale PCM
+ * never comes round again; PCM always continues where the last write ended,
+ * however little arrived in between (refilling whole just-played buffers
+ * instead left silent buffers between a slow writer's chunks).  After an
+ * underrun, writing resumes RESYNC_LEAD bytes ahead of the engine.
+ */
+#define CYC_BYTES    (NUM_BUFS * BUF_BYTES)
+#define WRITE_GUARD  1024
+#define RESYNC_LEAD  4096
+#define START_BYTES  (32 * 1024)
+static uint8_t *const cyc = &dma_buf[0][0];
+static uint32_t done_bufs, play_abs, write_abs, underruns;
+/* Positions are byte counts that wrap at 2^32 (6.2 h of 48 kHz stereo), so
+ * they are only ever compared through their signed difference.  A stream's
+ * positions start at AUDIO_POS_START; `make AUDIO_POS_START=0xFFFE0000U`
+ * starts them 128 KiB before the wrap, so every sound crosses it (test). */
+#ifndef AUDIO_POS_START
+#define AUDIO_POS_START 0U
+#endif
+#define POS_LT(a, b) ((int32_t)((uint32_t)(a) - (uint32_t)(b)) < 0)
+_Static_assert(AUDIO_POS_START % CYC_BYTES == 0, "positions start at a cyclic-buffer boundary");
+static uint8_t last_civ;
 
 static uint32_t virt_to_phys(const void *p) {
     return (uint32_t)((uintptr_t)p - KERNEL_VMA);
@@ -88,76 +117,119 @@ static uint32_t ring_used(void) {
     return ring_head - ring_tail;
 }
 
-/* Fill one DMA buffer from the ring (zero-pad a partial tail). */
-static void fill_buf(int idx) {
-    uint32_t avail = ring_used();
-    uint32_t n = avail > BUF_BYTES ? BUF_BYTES : avail;
+/* Copy ring bytes into the cyclic buffer at write_abs, up to `limit`. */
+static void copy_in(uint32_t limit) {
+    uint32_t n = ring_used();
 
+    if (!POS_LT(write_abs, limit)) return;
+    if (n > limit - write_abs) n = limit - write_abs;
     for (uint32_t i = 0; i < n; i++)
-        dma_buf[idx][i] = ring[(ring_tail + i) % RING_BYTES];
+        cyc[(write_abs + i) % CYC_BYTES] = ring[(ring_tail + i) % RING_BYTES];
     ring_tail += n;
-    if (n < BUF_BYTES)
-        memset(dma_buf[idx] + n, 0, BUF_BYTES - n);
-    bdl[idx].addr = virt_to_phys(dma_buf[idx]);
-    bdl[idx].samples = BUF_BYTES / 2;       /* 16-bit samples */
-    bdl[idx].flags = 0x8000;                /* IOC */
-    if (ring_waiters)
+    write_abs += n;
+    if (n && ring_waiters)
         wake_up(&ring_waiters);
 }
 
-/* Advance playback: refill completed buffers, start/stop the engine. */
+/* Zero [from, to) (absolute) in the cyclic buffer. */
+static void zero_range(uint32_t from, uint32_t to) {
+    while (POS_LT(from, to)) {
+        uint32_t o = from % CYC_BYTES;
+        uint32_t n = CYC_BYTES - o;
+        if (n > to - from) n = to - from;
+        memset(cyc + o, 0, n);
+        from += n;
+    }
+}
+
+/* Advance play_abs from CIV/PICB and silence what was played. */
+static void update_play(void) {
+    uint8_t civ;
+    uint16_t picb;
+    uint32_t old = play_abs, pos;
+
+    do {
+        civ = inb((uint16_t)(nabm_base + PO_CIV));
+        picb = inw((uint16_t)(nabm_base + PO_PICB));
+    } while (civ != inb((uint16_t)(nabm_base + PO_CIV)));
+    civ %= NUM_BUFS;
+    done_bufs += (uint32_t)(civ - last_civ + NUM_BUFS) % NUM_BUFS;
+    last_civ = civ;
+    pos = (uint32_t)picb * 2;
+    if (pos > BUF_BYTES) pos = BUF_BYTES;
+    pos = done_bufs * BUF_BYTES + (BUF_BYTES - pos);
+    if (POS_LT(play_abs, pos)) play_abs = pos;
+    zero_range(old, play_abs);
+}
+
+/* Advance playback: refill the cyclic buffer, start/stop the engine. */
 static void pump(void) {
+    static uint32_t idle_head;
+
     if (!present) return;
 
-    if (!playing) {
-        int primed = 0;
-
-        if (ring_used() == 0) return;
-        /* Prime only buffers that have data; LVI marks the last one. */
-        next_buf = 0;
-        while (primed < NUM_BUFS && ring_used() > 0) {
-            fill_buf(primed);
-            last_filled = (uint8_t)primed;
-            primed++;
+    if (drop_req) {
+        /* Everything queued goes: the ring, and the PCM ahead of the engine
+         * (bar the guard bytes it may have fetched already). */
+        ring_tail = ring_head;
+        if (playing && POS_LT(play_abs + WRITE_GUARD, write_abs)) {
+            zero_range(play_abs + WRITE_GUARD, write_abs);
+            write_abs = play_abs + WRITE_GUARD;
         }
-        next_buf = 0;
+        drop_req = 0;
+        wake_up(&drop_chan);
+    }
+
+    if (!playing) {
+        uint32_t used = ring_used();
+        /* start with a cushion, or with whatever there is once the writer
+         * has gone quiet for a pump interval (a short sound) */
+        int quiet = ring_head == idle_head;
+        idle_head = ring_head;
+        if (used == 0 || (used < START_BYTES && !quiet)) return;
+
+        outb((uint16_t)(nabm_base + PO_CR), CR_RR);   /* CIV back to 0 */
+        {
+            int spin = 100000;
+            while ((inb((uint16_t)(nabm_base + PO_CR)) & CR_RR) && --spin) {}
+        }
+        memset(cyc, 0, CYC_BYTES);
+        for (int i = 0; i < NUM_BUFS; i++) {
+            bdl[i].addr = virt_to_phys(dma_buf[i]);
+            bdl[i].samples = BUF_BYTES / 2;       /* 16-bit samples */
+            bdl[i].flags = 0x8000;                /* IOC */
+        }
+        done_bufs = AUDIO_POS_START / BUF_BYTES;  /* CIV 0 */
+        play_abs = AUDIO_POS_START;
+        last_civ = 0;
+        write_abs = AUDIO_POS_START + (ring_tail & 3);   /* frame alignment */
+        copy_in(play_abs + CYC_BYTES - BUF_BYTES);
         outl((uint16_t)(nabm_base + PO_BDBAR), virt_to_phys(bdl));
-        outb((uint16_t)(nabm_base + PO_LVI), last_filled);
+        outb((uint16_t)(nabm_base + PO_LVI), NUM_BUFS - 1);
         outb((uint16_t)(nabm_base + PO_CR), CR_RPBM | CR_IOCE);
         playing = 1;
-        printk("[AC97] engine start (lvi=%u)\n", (unsigned)last_filled);
+        printk("[AC97] engine start\n");
         return;
     }
 
-    /* Refill buffers the engine has finished, while there is data.
-     * Stale buffers (no fresh data) are zeroed so they can never replay. */
-    {
-        uint8_t civ = inb((uint16_t)(nabm_base + PO_CIV));
-        while (next_buf != civ) {
-            if (ring_used() > 0) {
-                fill_buf(next_buf);
-                last_filled = next_buf;
-            } else {
-                memset(dma_buf[next_buf], 0, BUF_BYTES);
-            }
-            next_buf = (uint8_t)((next_buf + 1) % NUM_BUFS);
-        }
-        outb((uint16_t)(nabm_base + PO_LVI), last_filled);
+    update_play();
+    if (POS_LT(write_abs, play_abs) && ring_used()) {
+        underruns++;
+        write_abs = play_abs + RESYNC_LEAD;
+        write_abs += (ring_tail - write_abs) & 3;   /* keep frames aligned */
+    }
+    if (POS_LT(write_abs, play_abs + WRITE_GUARD) && ring_used())
+        write_abs += (play_abs + WRITE_GUARD - write_abs + 3) & ~3U;
+    /* up to the end of the buffer before the current one */
+    copy_in((done_bufs + NUM_BUFS - 1) * BUF_BYTES);
+    outb((uint16_t)(nabm_base + PO_LVI), (uint8_t)((last_civ + NUM_BUFS - 1) % NUM_BUFS));
 
-        /* QEMU's engine does not reliably halt at LVI — stop ourselves
-         * once the last data buffer has completed (civ just past it). */
-        if (ring_used() == 0) {
-            uint8_t delta = (uint8_t)((civ - last_filled + NUM_BUFS)
-                                      % NUM_BUFS);
-            if (delta >= 1 && delta <= 8) {
-                outb((uint16_t)(nabm_base + PO_CR), 0);
-                outw((uint16_t)(nabm_base + PO_SR),
-                     SR_LVBCI | SR_BCIS | SR_FIFOE);
-                playing = 0;
-                printk("[AC97] playback done (%u irqs)\n",
-                       (unsigned)irq_count);
-            }
-        }
+    if (ring_used() == 0 && !POS_LT(play_abs, write_abs)) {
+        outb((uint16_t)(nabm_base + PO_CR), 0);
+        outw((uint16_t)(nabm_base + PO_SR), SR_LVBCI | SR_BCIS | SR_FIFOE);
+        playing = 0;
+        printk("[AC97] playback done (%u irqs, %u underruns)\n",
+               (unsigned)irq_count, (unsigned)underruns);
     }
 }
 
@@ -196,6 +268,29 @@ void ac97_start_thread(void) {
 
 uint32_t ac97_irq_count(void) {
     return irq_count;
+}
+
+/* PCM bytes written but not yet played: the ring plus the PCM ahead of the
+ * engine in the cyclic buffer (as of the last pump, <= 20 ms old). */
+uint32_t ac97_queued(void) {
+    uint32_t q;
+
+    if (!present) return 0;
+    q = ring_used();
+    if (playing && POS_LT(play_abs, write_abs))
+        q += write_abs - play_abs;
+    return q;
+}
+
+/* Throw away everything queued (ALSA drop); returns once ksoundd has. */
+void ac97_drop(void) {
+    if (!present) return;
+    drop_req = 1;
+    io_wake();
+    while (drop_req) {
+        current_proc->wake_tick = pit_ticks() + 1;
+        sleep_on(&drop_chan);
+    }
 }
 
 /* Blocking PCM write (48kHz S16LE stereo).  EINTR-aware like the pipes. */

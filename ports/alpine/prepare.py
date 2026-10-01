@@ -61,7 +61,7 @@ ARCH = "x86"
 
 # Installed on the host into the image.
 PACKAGES = ["bash", "coreutils", "python3", "vim", "less", "nano",
-            "git", "openssh-client"]
+            "git", "openssh-client", "alsa-utils"]
 # Fetched into the guest's offline repo /repo, not installed: the smoke test
 # adds and deletes them.  tree depends on musl only; openssh-server needs
 # openssh-keygen and the libraries openssh-client already installed.

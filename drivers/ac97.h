@@ -8,3 +8,5 @@ void ac97_start_thread(void);    /* call after proc_init (spawns ksoundd) */
 int  ac97_present(void);
 int  ac97_write(const uint8_t *data, uint32_t len);   /* blocking */
 uint32_t ac97_irq_count(void);   /* diagnostics */
+uint32_t ac97_queued(void);      /* PCM bytes written but not yet played */
+void ac97_drop(void);            /* discard them (blocks until done) */
