@@ -129,7 +129,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui check abiprobes smoke-abi smoke-firefox smoke-firefox-web repo repo-serve start resolutions icons
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui check abiprobes smoke-abi smoke-firefox smoke-firefox-web repo repo-serve start resolutions icons
 
 all: $(TARGET)
 
@@ -360,12 +360,13 @@ smoke-gui: $(TARGET) iso disk
 # with -display none (tools/smokelib.py), so no display is needed.
 # Pick a subset with CHECK_SUITES="smoke smoke-x".
 CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-fw \
-                 smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui
+                 smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui smoke-uefi
 CHECK_LOG_DIR ?= build/check
 
 # repo: smoke-pkg serves packages from repo/ (see the smoke-pkg target).
 # iso: smoke-gui boots the desktop, which needs the ISO's framebuffer.
-check: $(TARGET) initrd disk repo iso
+# limine-iso: smoke-uefi boots the Limine ISO under SeaBIOS and OVMF.
+check: $(TARGET) initrd disk repo iso limine-iso
 	@mkdir -p $(CHECK_LOG_DIR); rm -f $(CHECK_LOG_DIR)/*.log; failed=""; \
 	for s in $(CHECK_SUITES); do \
 	    log=$(CHECK_LOG_DIR)/$$s.log; t0=$$(date +%s); \
@@ -524,11 +525,37 @@ iso: $(TARGET) initrd
 	echo "$$g $${d:+-d $$d }-o maeros.iso isodir"; \
 	"$$g" $${d:+-d "$$d"} -o maeros.iso isodir
 
+# Hybrid BIOS + UEFI ISO booted by Limine through Multiboot 2 (the GRUB ISO
+# above is BIOS-only Multiboot 1).  Boots under SeaBIOS, x86_64 UEFI (OVMF;
+# most real PCs) and IA32 UEFI; the framebuffer comes from VBE or the GOP.
+# Limine's binaries are fetched, pinned by sha256, by tools/fetch-limine.sh.
+# `make smoke-uefi` boots it under each firmware (tools/smoke_uefi.py).
+LIMINE_DIR := third_party/limine/bin
+limine-iso: $(TARGET) initrd tools/limine.conf tools/fetch-limine.sh
+	sh tools/fetch-limine.sh
+	rm -rf isodir-limine
+	mkdir -p isodir-limine/boot/limine isodir-limine/EFI/BOOT
+	cp $(TARGET) initrd.tar isodir-limine/boot/
+	cp tools/limine.conf isodir-limine/boot/limine/limine.conf
+	cp third_party/limine/LICENSE isodir-limine/boot/limine/LICENSE
+	cp $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin \
+	   $(LIMINE_DIR)/limine-uefi-cd.bin isodir-limine/boot/limine/
+	cp $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTIA32.EFI isodir-limine/EFI/BOOT/
+	xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin \
+		-no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus \
+		-apm-block-size 2048 --efi-boot boot/limine/limine-uefi-cd.bin \
+		-efi-boot-part --efi-boot-image --protective-msdos-label \
+		isodir-limine -o maeros-limine.iso
+	$(LIMINE_DIR)/limine bios-install maeros-limine.iso
+
+smoke-uefi: limine-iso disk
+	python3 tools/smoke_uefi.py
+
 clean:
 	find kernel arch/i686 mm fs drivers proc lib net third_party/lwip/src \
 		\( -name "*.o" -o -name "*.d" \) -delete 2>/dev/null || true
-	rm -f $(TARGET) maeros.iso initrd.tar disk.img disk-ff.img $(QEMU_ISO_PID) $(KTRACE_STAMP)
-	rm -rf isodir repo
+	rm -f $(TARGET) maeros.iso maeros-limine.iso initrd.tar disk.img disk-ff.img $(QEMU_ISO_PID) $(KTRACE_STAMP)
+	rm -rf isodir isodir-limine repo
 	rm -rf $(TOYBOX_DIR)/generated
 	rm -f $(TOYBOX_DIR)/toybox $(TOYBOX_DIR)/.singlemake testfiles/toybox
 	$(MAKE) -C userspace clean

@@ -1,9 +1,10 @@
 ; boot.asm — Higher-half multiboot bootstrap for i686 kernel
 ;
-; GRUB / QEMU's built-in multiboot loader loads this kernel into physical
-; memory, switches to 32-bit protected mode, and jumps to _start with:
-;   EAX = 0x2BADB002  (multiboot magic)
-;   EBX = physical address of multiboot_info struct
+; GRUB / QEMU's built-in multiboot loader (Multiboot 1) or Limine
+; (Multiboot 2, BIOS or UEFI) loads this kernel into physical memory, switches
+; to 32-bit protected mode, and jumps to _start with:
+;   EAX = 0x2BADB002 (Multiboot 1) or 0x36D76289 (Multiboot 2)
+;   EBX = physical address of the multiboot info struct
 ;   Paging OFF, interrupts OFF, no defined stack.
 ;
 ; Strategy
@@ -50,6 +51,46 @@ multiboot_header:
     dd 0                                ; height: gfxpayload picks the mode,
     dd 32                               ; depth   so the user can choose it)
 
+; ─── Multiboot 2 header ─────────────────────────────────────────────────────
+; Must lie within the first 32 KiB of the image, 8-byte aligned; every tag is
+; 8-byte aligned too.  GRUB's `multiboot` and QEMU -kernel use the Multiboot 1
+; header above; Limine's `protocol: multiboot2` (BIOS and UEFI, see
+; tools/limine.conf) uses this one.  The tags mirror the MB1 fields: load at
+; 1 MiB with room for the PMM after .bss, enter at _start, and a linear 32-bpp
+; framebuffer (UEFI GOP or VBE) if one is available.
+MB2_MAGIC equ 0xE85250D6
+MB2_ARCH  equ 0                         ; i386 protected mode
+align 8
+multiboot2_header:
+    dd MB2_MAGIC
+    dd MB2_ARCH
+    dd multiboot2_header_end - multiboot2_header
+    dd -(MB2_MAGIC + MB2_ARCH + (multiboot2_header_end - multiboot2_header))
+    ; address tag
+    dw 2, 0
+    dd 24
+    dd multiboot2_header                ; header_addr
+    dd 0x00100000                       ; load_addr
+    dd 0                                ; load_end_addr: load whole file
+    dd _kernel_phys_end + 0x10000       ; bss_end_addr
+    ; entry address tag
+    dw 3, 0
+    dd 12
+    dd _start
+    dd 0                                ; pad to 8
+    ; framebuffer tag, optional (flags bit 0): 0x0 = no preference
+    dw 5, 1
+    dd 20
+    dd 0, 0, 32
+    dd 0                                ; pad to 8
+    ; module alignment tag: modules (the initrd) page aligned
+    dw 6, 0
+    dd 8
+    ; end tag
+    dw 0, 0
+    dd 8
+multiboot2_header_end:
+
 ; ─── Paging structures + initial stack (in main .bss, linked at 0xC01xxxxx) ─
 ; Declared here (in boot.asm) so they are the very first things in .bss and
 ; remain 4096-byte aligned.
@@ -64,6 +105,13 @@ boot_page_table3:    resb 4096          ; 1024 PTEs (8-12 MiB; headroom for big 
 align 16
 stack_bottom: resb 16384               ; 16 KiB kernel stack
 stack_top:
+; Multiboot 2 hands over its info block wherever the loader put it (under
+; UEFI often above the 12 MiB the boot tables map), so _start copies it here
+; while paging is still off; kernel/boot_info.c parses the copy.
+global mb2_info_copy
+MB2_INFO_COPY_MAX equ 32768
+align 8
+mb2_info_copy: resb MB2_INFO_COPY_MAX
 
 ; ─── Entry point — lives at a physical address so GRUB can jump to it ────────
 section .boot.text progbits alloc exec
@@ -88,6 +136,26 @@ _start:
     inc edi
     jmp .zero_bss
 .bss_done:
+
+    ; ── Multiboot 2: copy the info block into the kernel image ────────────────
+    ; (EBX may point anywhere in the low 4 GiB.)  Copy at most
+    ; MB2_INFO_COPY_MAX bytes and clamp the copy's total_size to match, then
+    ; hand kernel_main the copy's physical address instead.
+    cmp eax, 0x36D76289
+    jne .mb2_done
+    mov ecx, [ebx]                      ; total_size
+    cmp ecx, MB2_INFO_COPY_MAX
+    jbe .mb2_size_ok
+    mov ecx, MB2_INFO_COPY_MAX
+.mb2_size_ok:
+    mov esi, ebx
+    mov edi, (mb2_info_copy - KERNEL_VMA)
+    mov edx, ecx
+    cld
+    rep movsb
+    mov ebx, (mb2_info_copy - KERNEL_VMA)
+    mov [ebx], edx
+.mb2_done:
 
     ; ── Zero boot_page_directory (physical address before paging) ────────────
     ; (label - KERNEL_VMA) converts virtual link address → physical load address

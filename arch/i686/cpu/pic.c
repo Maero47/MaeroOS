@@ -62,6 +62,10 @@ void pic_unmask(uint8_t irq) {
     uint16_t port = (irq < 8) ? PIC1_DATA : PIC2_DATA;
     uint8_t  bit  = (irq < 8) ? irq : (irq - 8);
     outb(port, inb(port) & (uint8_t)~(1 << bit));
+    /* A slave line reaches the CPU only through the master's IRQ2.  SeaBIOS
+     * leaves the cascade unmasked, UEFI firmware (OVMF) masks every line. */
+    if (irq >= 8)
+        outb(PIC1_DATA, inb(PIC1_DATA) & (uint8_t)~(1 << 2));
 }
 
 void pic_send_eoi(uint8_t irq) {

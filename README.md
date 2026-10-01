@@ -440,6 +440,7 @@ make run            # QEMU -kernel boot, serial on stdio, 512 MiB
 make run-net        # -kernel boot with an RTL8139 on QEMU user networking
 make run-disk       # -kernel boot with the ext2 disk.img attached
 make iso            # GRUB ISO (maeros.iso)
+make limine-iso     # hybrid BIOS + UEFI ISO via Limine/Multiboot 2 (maeros-limine.iso)
 make run-iso        # boot the ISO
 make start          # build disk + ISO + package repo and open the graphical desktop
 make disk           # build a 384 MiB ext2 disk from testfiles/
@@ -454,6 +455,12 @@ make clean
 information, so that path is serial and VGA text only. The graphical desktop needs the
 GRUB path: `make run-iso`, or `make start`, which also picks a guest resolution that fits
 the host screen and serves the package repository on port 8000.
+
+For UEFI PCs, `make limine-iso` builds `maeros-limine.iso`. It is a hybrid image that
+Limine boots through Multiboot 2 on legacy BIOS, x86_64 UEFI and IA32 UEFI. Under UEFI
+the desktop runs on the GOP framebuffer, and the kernel receives the ACPI RSDP from the
+loader. `docs/boot.md` covers the boot paths, the `boot_info_*()` API, OVMF and
+`make smoke-uefi`.
 
 Everything goes to the serial console, so `make run` gives you the boot log and a
 `maeros login:` prompt in your terminal. Log in as `root` (password `root`) or `user`
@@ -485,6 +492,7 @@ make smoke-dynlib   # external .so files, zlib, pthreads, AF_UNIX
 make smoke-x        # maeroX handshake, drawing and input events
 make smoke-gtk      # GLib, Cairo, Pango and a real GTK3 window
 make smoke-gui      # the desktop, driven by mouse and keyboard (needs the ISO)
+make smoke-uefi     # the Limine ISO under SeaBIOS, OVMF x64 and OVMF IA32: login + desktop
 make smoke-abi      # Linux-ABI probes (ports/abiprobes/README.md), needs i686-linux-musl-gcc and disk.img
 make smoke-firefox  # does Firefox paint? (README-BROWSER.md)
 make smoke-firefox-web  # ...and load a page served from the host over the network
@@ -544,8 +552,10 @@ with click targets as window-relative points (surface point + `GUI_BODY_X`/`GUI_
 `make check` runs the suites that need nothing beyond a fresh clone: `smoke`,
 `smoke-cmds`, `smoke-toybox`, `smoke-disk`, `smoke-net`, `smoke-fw`, `smoke-dyn`,
 `smoke-dynlib`, `smoke-x`, `smoke-pkg` (which first builds `repo/` and, on a host
-without one, a repo signing key) and `smoke-gui` (which needs the ISO, so `check` builds
-it). It runs them one after another, writes each suite's
+without one, a repo signing key), `smoke-gui` (which needs the ISO, so `check` builds
+it) and `smoke-uefi` (the Limine ISO under SeaBIOS, OVMF x64 and OVMF IA32; `check`
+builds the ISO, which fetches the pinned Limine release once, and the test skips a
+firmware that is not installed). It runs them one after another, writes each suite's
 console to `build/check/<suite>.log`, prints the tail of the log for any suite that
 fails, carries on with the rest and exits non-zero at the end. `CHECK_SUITES="smoke
 smoke-x" make check` runs a subset.
