@@ -79,6 +79,7 @@ struct usb_device;
 #define USB_MAX_EPS  3       /* endpoints per device besides EP0 */
 #define USB_CLS_HID  1
 #define USB_CLS_MSC  2
+#define USB_CLS_HUB  3
 #define USB_STALL    (-2)
 
 /* Physical address of a buffer in the kernel image (.data/.bss), which is

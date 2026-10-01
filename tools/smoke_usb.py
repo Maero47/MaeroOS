@@ -23,11 +23,12 @@ Checks:
     keyboard, and the root shell it starts writes `id -u` to a file;
   - relative motion from the USB boot mouse reaches /dev/input/event1 and
     moves the desktop pointer by the amount sent;
+  - a usb-hub on a root port, with the usb-mouse and the stick behind it;
   - a usb-storage stick (an 8 MiB image with markers written here) shows up
     as /dev/usbdisk0: markers read back at their offsets, a write through
     the device lands in the image file, the whole device reads back with
     the image's checksum; then the stick is unplugged and plugged back in
-    (QMP device_del / device_add) and is found again.
+    (QMP device_del / device_add on the hub's port) and is found again.
 
 The serial console is only used to log in a root shell for those checks (the
 console reads the serial line, never a keyboard; see userspace/init/init.c).
@@ -127,9 +128,15 @@ class UsbSmoke(GuiSmoke):
         self.inp = UsbInput(self.qmp, self.fb)
         text = self.con.text()
         for kind in ("keyboard", "pointer", "mouse"):
-            if not re.search(r"\[USB\] port \d+: \S+ \S+ speed, slot \d+: "
+            if not re.search(r"\[USB\] port [\d.]+: \S+ \S+ speed, slot \d+: "
                              r"HID %s " % kind, text):
                 raise AssertionError(f"kernel did not bring up a USB {kind}")
+        if not re.search(r"\[USB\] port \d+: \S+ full speed, slot \d+: hub, "
+                         r"\d+ ports", text):
+            raise AssertionError("kernel did not bring up the USB hub")
+        if not re.search(r"\[USB\] port \d+\.1: \S+ \S+ speed, slot \d+: "
+                         r"HID mouse", text):
+            raise AssertionError("the mouse behind the hub is missing")
 
     def login(self, term):
         """`doas login root` in the Terminal, every key on the USB keyboard."""
@@ -221,7 +228,7 @@ class UsbSmoke(GuiSmoke):
         start = con.mark()
         self.qmp.cmd("device_del", id=STICK)
         con.wait_re(r"\[USB-MSC\] /dev/usbdisk0 removed", start=start)
-        con.wait_re(r"\[USB\] port \d+: device removed", start=start)
+        con.wait_re(r"\[USB\] port \d+\.2: device removed", start=start)
         if "usbdisk0" in con.run("ls /dev"):
             raise AssertionError("/dev/usbdisk0 still listed after unplug")
         start = con.mark()
@@ -229,7 +236,7 @@ class UsbSmoke(GuiSmoke):
         self.qmp.cmd("blockdev-add", driver="raw", **{"node-name": "stick2"},
                      file={"driver": "file", "filename": self.stick})
         self.qmp.cmd("device_add", driver="usb-storage", drive="stick2",
-                     id=STICK)
+                     id=STICK, bus="xhci.0", port="3.2")
         con.wait_re(r"\[USB-MSC\] /dev/usbdisk0: .* 16384 blocks", timeout=20,
                     start=start)
         got = con.run("toybox dd if=/dev/usbdisk0 bs=1 count=16 2>/dev/null")
@@ -274,14 +281,17 @@ def main():
            "-drive", f"file={disk},format=raw,if=ide",
            "-accel", accel, "-vga", "none", "-device", f"VGA,id={DISPLAY}", *smokelib.QEMU_DISPLAY,
            "-serial", "stdio", "-m", "512M", "-no-reboot", "-no-shutdown",
-           # 8+8 root ports: with the 4+4 default QEMU puts a hub in front of
-           # the fourth device, and hubs are not supported yet.
-           "-device", "qemu-xhci,id=xhci,p2=8,p3=8",
-           "-device", f"usb-kbd,id={KBD},display={DISPLAY}",
-           "-device", f"usb-tablet,id={TABLET},display={DISPLAY}",
-           "-device", f"usb-mouse,id={MOUSE}",
+           # Keyboard and tablet on root ports; the mouse and the stick
+           # behind a (full-speed) hub on root port 3.
+           "-device", "qemu-xhci,id=xhci",
+           "-device", f"usb-kbd,id={KBD},display={DISPLAY},bus=xhci.0,port=1",
+           "-device", f"usb-tablet,id={TABLET},display={DISPLAY},bus=xhci.0,"
+                      "port=2",
+           "-device", "usb-hub,id=hub,bus=xhci.0,port=3",
+           "-device", f"usb-mouse,id={MOUSE},bus=xhci.0,port=3.1",
            "-drive", f"if=none,id=stick,format=raw,file={stick}",
-           "-device", f"usb-storage,drive=stick,id={STICK}",
+           "-device", f"usb-storage,drive=stick,id={STICK},bus=xhci.0,"
+                      "port=3.2",
            "-qmp", f"unix:{qmp_path},server=on,wait=off"]
     with open(os.path.join(OUT, "qemu-cmdline.txt"), "w") as f:
         f.write(" ".join(cmd) + "\n")

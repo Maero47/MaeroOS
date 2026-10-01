@@ -40,8 +40,10 @@ typedef struct __attribute__((packed)) {
     uint8_t  status;
 } csw_t;
 
-/* Aligned so that no buffer crosses a 64 KiB boundary (xHCI 4.11.7.1). */
-static uint8_t bounce[BOUNCE_SIZE] __attribute__((aligned(BOUNCE_SIZE)));
+/* Page alignment only: an alignment above 4 KiB raises the kernel's data
+ * segment alignment, which QEMU's multiboot loader then gets wrong (.data
+ * arrives zeroed).  usb_bulk() splits the buffer at a 64 KiB boundary. */
+static uint8_t bounce[BOUNCE_SIZE] __attribute__((aligned(4096)));
 static cbw_t cbw_buf __attribute__((aligned(64)));
 static csw_t csw_buf __attribute__((aligned(64)));
 
