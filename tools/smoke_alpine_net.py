@@ -155,7 +155,7 @@ def main():
         alpine("route -n", "10.0.2.2", "UG")
         # IPv6 (QEMU user-net's default, fec0::/64 by SLAAC) and lo, before
         # udhcpc's script flushes eth0's addresses.
-        alpine("i=0; until ip -6 addr show dev eth0 | grep -q 'inet6 fec0'; do "
+        alpine("i=0; until ip -6 addr show dev eth0 | grep -q \"inet6 fec0\"; do "
                "i=$((i+1)); [ $i -lt 30 ] || exit 1; sleep 1; done")
         alpine("ip -6 addr show dev eth0", "inet6 fec0::5054:ff:fe12:3456/64",
                "inet6 fe80::5054:ff:fe12:3456/64 scope link")
