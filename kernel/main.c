@@ -179,14 +179,14 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     ahci_init();
     nvme_init();
     blk_init();
-    blkpart_init();       /* /dev/hda.., partitions for mount(2) */
+    blkpart_init();       /* /dev/hda, /dev/sda1, ...: partitions for mount(2) */
     vfs_mount_note("rootfs", "/", "rootfs", 0);
     if (blk_present()) {
         vfs_node_t *disk_root = ext2_mount(0);
         if (disk_root) {
             vfs_mount("/disk", disk_root);
             vfs_set_root_overlay(disk_root);
-            vfs_mount_note("/dev/hda", "/disk", "ext2", 0);
+            vfs_mount_note(blk_boot_devpath(), "/disk", "ext2", 0);
         }
     }
 

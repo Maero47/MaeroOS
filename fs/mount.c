@@ -2,6 +2,7 @@
 #include "ext4.h"
 #include "tmpfs.h"
 #include "../drivers/blkpart.h"
+#include "../drivers/blkdev.h"
 #include "../lib/string.h"
 #include "../kernel/printk.h"
 #include "../proc/process.h"
@@ -40,9 +41,11 @@ static int mount_block(const char *source, const char *target, const char *fstyp
     if (!dn) return err;
     blkpart_t *bp = blkpart_from_node(dn);
     if (!bp) return -15;                                      /* -ENOTBLK */
-    /* The boot disk is /disk already, through fs/ext2.c, read-write. */
-    if (bp->dev == 0 && vfs_get_root_overlay() && bp->partno == 0) return -16;
-    char devname[16];
+    /* The boot disk (IDE, AHCI or NVMe) is /disk already, through fs/ext2.c,
+     * read-write. */
+    if (blk_disk_is_boot(bp->dev) && vfs_get_root_overlay() && bp->partno == 0)
+        return -16;
+    char devname[24];
     devname[0] = '\0';
     strncpy(devname, "/dev/", sizeof(devname));
     strncat(devname, bp->name, sizeof(devname) - strlen(devname) - 1);
