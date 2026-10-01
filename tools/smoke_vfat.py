@@ -299,6 +299,8 @@ def fat32_session(g, man, big):
                    "cd .. && busybox find . -maxdepth 1 && cd .. && busybox pwd")
     check("deep" in out and "çok" in out and out.strip().endswith("/mnt"),
           "relative paths and .. through moved directories")
+    rc, out = g.sh("busybox ln -s hello.txt /mnt/link")
+    check(rc != 0 and "not permitted" in out, f"symlink refused with EPERM ({out.strip()!r})")
     rc, out = g.sh("echo x > \"/mnt/bad:name\"")
     check(rc != 0, "a name with ':' is refused")
 

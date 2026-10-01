@@ -1635,6 +1635,12 @@ static void vfat_close(vfs_node_t *n) {
     }
 }
 
+/* FAT has no symlinks (Linux vfat: -EPERM, not the VFS's -ENOSYS). */
+static int vfat_symlink(vfs_node_t *d, const char *n, const char *t) {
+    (void)d; (void)n; (void)t;
+    return E_PERM;
+}
+
 static void node_hooks(vfat_vnode_t *vn) {
     vfs_node_t *n = &vn->vnode;
     n->setattr_fn  = vfat_setattr;
@@ -1647,6 +1653,7 @@ static void node_hooks(vfat_vnode_t *vn) {
         n->create_fn  = vfat_create;
         n->unlink_fn  = vfat_unlink;
         n->rename_fn  = vfat_rename;
+        n->symlink_fn = vfat_symlink;
     } else {
         n->read_fn     = vfat_read;
         n->write_fn    = vfat_write;
