@@ -34,6 +34,7 @@
 #include "../fs/devfs.h"
 #include "../fs/ext2.h"
 #include "../net/socket.h"
+#include "flock.h"
 #include <registers.h>
 #include <kernel/config.h>
 #include <stdint.h>
@@ -806,7 +807,7 @@ static int proc_in_group(uint32_t g) {
  * epoll identity, so the source gets one BEFORE it is copied: an fid handed
  * out only at EPOLL_CTL_ADD time would reach the adder's entry alone, and a
  * copy made earlier (a forked sharer of the epoll, say) would never match. */
-static uint32_t fd_new_fid(void) {
+uint32_t fd_new_fid(void) {
     static uint32_t next_fid = 1;
     uint32_t id;
     do { id = next_fid++; } while (!id);
@@ -833,6 +834,7 @@ void fd_retain(proc_file_t *f) {
 }
 
 void fd_release(proc_file_t *f) {
+    flock_fd_closed(f);        /* before the node and fid are gone */
     if (f->type == FD_FILE)    vfs_close(f->node);
     if (f->type == FD_PIPE_R)  { pipe_close_read(f->pipe);  vfs_close(f->node); }
     if (f->type == FD_PIPE_W)  { pipe_close_write(f->pipe); vfs_close(f->node); }
@@ -879,6 +881,7 @@ void fdtable_put(struct proc *p) {
     p->ofile = (proc_file_t *)0;
     if (!t) return;
     if (--t->refcount > 0) return;       /* other threads still share it */
+    flock_owner_gone(t);                 /* its POSIX record locks */
     for (int i = 0; i < MAX_FD; i++)
         if (t->f[i].type != FD_NONE) fd_release(&t->f[i]);
     kfree(t);
@@ -3138,39 +3141,13 @@ static int sys_fcntl(registers_t *regs) {
     case 4:  /* F_SETFL */
         f->flags = (f->flags & O_ACCMODE) | (arg & (O_APPEND | O_NONBLOCK));
         return 0;
-    case 5:   /* F_GETLK   */
-    case 12:  /* F_GETLK64 — advisory locks are not enforced.  CRITICAL: the caller
-              * uses F_GETLK to probe whether locking works AND to learn if the
-              * region is already locked; it reads back l_type.  We must report
-              * the region as UNLOCKED by writing l_type = F_UNLCK (2), else the
-              * caller (e.g. Firefox's nsProfileLock::LockWithFcntl) concludes the
-              * profile is held by another process and fails with "Access was
-              * denied".  struct flock/flock64 on i386: short l_type is field 0.
-              * NB: glibc on 32-bit compiled with _FILE_OFFSET_BITS=64 (which
-              * Firefox is) issues the *64* variants (12/13/14), not 5/6/7 — so
-              * these MUST be handled or nsProfileLock fails and Firefox declares
-              * its profile "missing or inaccessible" (a modal that hangs). */
-        {
-            /* Written with copy_to_user: access_ok() says nothing about
-             * writability, and a plain store into a read-only page would be
-             * a ring-0 fault. */
-            short unlck = 2;               /* F_UNLCK */
-            if (!arg || copy_to_user((void *)(uintptr_t)arg, &unlck, sizeof(unlck)) < 0)
-                return -14;
-        }
-        return 0;
-    case 6:   /* F_SETLK    */
-    case 7:   /* F_SETLKW   */
-    case 13:  /* F_SETLK64  */
-    case 14:  /* F_SETLKW64 */
-        {
-            /* Nothing is enforced, but the lock description must be readable
-             * (Linux copies it in first and fails with -EFAULT). */
-            short type;
-            if (!arg || copy_from_user(&type, (void *)(uintptr_t)arg, sizeof(type)) < 0)
-                return -14;
-        }
-        return 0;
+    case 5:  case 6:  case 7:   /* F_GETLK / F_SETLK / F_SETLKW */
+    case 12: case 13: case 14:  /* their flock64 forms (musl, glibc LFS) */
+    case 36: case 37: case 38:  /* F_OFD_GETLK / F_OFD_SETLK / F_OFD_SETLKW */
+        /* Real advisory record locks (proc/flock.c).  F_GETLK answers
+         * F_UNLCK when nothing conflicts, which is what Firefox's
+         * nsProfileLock probes for. */
+        return flock_fcntl(f, cmd, (void *)(uintptr_t)arg);
     case 1033: /* F_ADD_SEALS — memfd sealing.  We don't enforce seals, but
                 * accept them so Firefox's freezeable shared memory "freezes"
                 * (an EINVAL here leaves the buffer in a broken, unfrozen state). */
@@ -7311,14 +7288,13 @@ static int sys_readv(registers_t *regs) {
     return total;
 }
 
-/* ── sys_flock(fd, operation) — EAX=143 (stub) ──────────────────────────── */
+/* ── sys_flock(fd, operation) — EAX=143 ─────────────────────────────────── */
 static int sys_flock(registers_t *regs) {
     int fd = (int)regs->ebx;
     int op = (int)regs->ecx;
     if (fd < 0 || fd >= MAX_FD) return -9;
     if (current_proc->ofile[fd].type == FD_NONE) return -9;
-    if (op & ~(1 | 2 | 4 | 8)) return -22;
-    return 0;
+    return flock_bsd(&current_proc->ofile[fd], op);
 }
 
 /* ── sys__llseek(fd, off_high, off_low, loff_t *result, whence) — EAX=140 ─ */

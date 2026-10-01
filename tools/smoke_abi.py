@@ -100,6 +100,8 @@ PROBES = {
     "p37_link":                (60, "/disk"),
     "p38_sync":                (60, ""),
     "p39_splice":              (60, ""),
+    # Advisory locks: flock(2) and fcntl record locks (ports/alpine, apk).
+    "p40_flock":               (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

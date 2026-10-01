@@ -33,6 +33,8 @@ static int timed_out(uint32_t ms, uint32_t start) {
 #define SOCK_STREAM_K  1
 #define SOCK_DGRAM_K   2
 #define IPPROTO_TCP_K  6
+#define IPPROTO_IP_K   0
+#define IP_OPTIONS_K   4
 #define IPPROTO_UDP_K 17
 
 /* The table itself is small (~100 bytes a slot): the per-socket buffers, a
@@ -1284,6 +1286,12 @@ int net_socket_getopt(net_socket_t *s, int level, int name,
         case TCP_KEEPCNT_K:   v = s->keep_cnt ? (int32_t)s->keep_cnt : 9; break;
         default: return 1;
         }
+    } else if (level == IPPROTO_IP_K && name == IP_OPTIONS_K) {
+        /* No IP options are ever kept: an empty value.  Four zero bytes
+         * read as options, and sshd-session drops a connection that carries
+         * any (it refuses source routing). */
+        *len = 0;
+        return 0;
     } else {
         return 1;
     }
