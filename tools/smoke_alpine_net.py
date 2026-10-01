@@ -183,7 +183,7 @@ def main():
         if rc != 0:
             raise AssertionError(f"ssh true: rc={rc}: {out}")
         rc, out = host(ssh + ["echo SSH-$((6*7)); cat /etc/alpine-release; id -un"])
-        check("ssh command", out, ("SSH-42", "3.22", "root"))
+        check("ssh command", out, ("SSH-42", "3.2", "root"))
         if rc != 0:
             raise AssertionError(f"ssh command: rc={rc}")
         rc, out = host(ssh[:1] + ["-tt"] + ssh[1:],

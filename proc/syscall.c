@@ -6873,6 +6873,26 @@ static int sys_renameat(registers_t *regs) {
     return sys_rename_kernel_path(oldres, newres);
 }
 
+/* ── sys_renameat2(olddirfd, old, newdirfd, new, flags) — EAX=353 ─────────
+ * RENAME_NOREPLACE fails with EEXIST when `new` exists (checked and done in
+ * one syscall under the BKL); RENAME_EXCHANGE and RENAME_WHITEOUT are
+ * EINVAL, what Linux answers for a filesystem that lacks them. */
+static int sys_renameat2(registers_t *regs) {
+    uint32_t flags = regs->edi;
+    if (flags & ~1u) return -22;
+    if (flags & 1u) {                                  /* RENAME_NOREPLACE */
+        char newpath[256], newres[256];
+        int r = copy_user_str((const char *)(uintptr_t)regs->esi, newpath,
+                              sizeof(newpath));
+        if (r < 0) return r;
+        r = resolve_path_at_fd((int)regs->edx, newpath, newres, sizeof(newres));
+        if (r < 0) return r;
+        int lerr;
+        if (vfs_lookup(newres, 0, &lerr)) return -17;  /* -EEXIST */
+    }
+    return sys_renameat(regs);
+}
+
 /* ── sys_clock_nanosleep(clkid, flags, rqtp, rmtp) — EAX=267 / 407 ────────
  * TIMER_ABSTIME sleeps until an absolute instant of the given clock (used by
  * std::this_thread::sleep_until, Rust thread::sleep_until, pthread timed
@@ -10027,6 +10047,7 @@ void syscall_dispatch(registers_t *regs) {
     case 301: ret = sys_unlinkat(regs);        break;
     case 302: ret = sys_renameat(regs);        break;
     case 305: ret = sys_readlinkat(regs);      break;
+    case 353: ret = sys_renameat2(regs);       break;
     case 306: ret = sys_fchmodat(regs);        break;
     case 30:  ret = sys_utime(regs);           break;
     case 226: case 227: case 228: case 229: case 230: case 231:
