@@ -23,9 +23,11 @@ def send(proc, text):
 
 
 def main():
-    # pkg's tar/name and index-signature checks and the libc regex engine are
-    # plain C: exercise them on the host first.
-    for test in ("test_pkg_tarx.py", "test_pkg_sign.py", "test_regex.py"):
+    # pkg's tar/name and index-signature checks, the libc regex engine and
+    # the e1000 TX ring bookkeeping are plain C: exercise them on the host
+    # first.
+    for test in ("test_pkg_tarx.py", "test_pkg_sign.py", "test_regex.py",
+                 "test_e1000_tx.py"):
         if subprocess.run([sys.executable,
                            os.path.join(ROOT, "tools", test)]).returncode:
             raise AssertionError(f"tools/{test} failed")

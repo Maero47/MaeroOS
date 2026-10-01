@@ -29,7 +29,7 @@ MUSL_BINS := $(if $(MUSL_CC),$(TESTFILES)/wxpie $(TESTFILES)/unixprobe)
 
 LIBC_SRCS := libc/syscalls.c libc/stdio.c libc/stdlib.c libc/pthread.c \
              libc/string.c libc/dirent.c libc/termios.c libc/socket.c \
-             libc/resolve.c libc/toybox_compat.c libc/signal.c \
+             libc/netdb.c libc/toybox_compat.c libc/signal.c \
              libc/posix.c libc/math.c libc/regex.c \
              libc/time.c
 LIBC_OBJS := $(LIBC_SRCS:.c=.o)
@@ -54,7 +54,7 @@ USER_BINS := $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
 	     $(TESTFILES)/mkfifo $(TESTFILES)/ln $(TESTFILES)/readlink \
 	     $(TESTFILES)/sysprobe $(TESTFILES)/fcprobe $(TESTFILES)/lspci $(TESTFILES)/ifconfig \
 	     $(TESTFILES)/diskprobe $(TESTFILES)/fsprobe $(TESTFILES)/respawnprobe $(TESTFILES)/heapprobe \
-	     $(TESTFILES)/sockprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget \
+	     $(TESTFILES)/sockprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget $(TESTFILES)/getent \
 	     $(TESTFILES)/randprobe $(TESTFILES)/sysmiscprobe $(TESTFILES)/abi2probe $(TESTFILES)/sigexecprobe $(TESTFILES)/timerprobe $(TESTFILES)/symprobe $(TESTFILES)/sigshareprobe \
 	     $(TESTFILES)/fbtest $(TESTFILES)/evtest $(TESTFILES)/mousetest \
 	     $(TESTFILES)/polltest $(TESTFILES)/ptytest $(TESTFILES)/cttytest \
@@ -494,6 +494,13 @@ httpget/httpget.o: httpget/httpget.c
 
 $(TESTFILES)/httpget: $(CRT0_OBJ) httpget/httpget.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) httpget/httpget.o libc/libc.a
+
+# getent (hosts/services lookups through the libc resolver)
+getent/getent.o: getent/getent.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TESTFILES)/getent: $(CRT0_OBJ) getent/getent.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) getent/getent.o libc/libc.a
 
 # kwprobe (user write to kernel memory -> SIGSEGV; int3 -> SIGTRAP)
 kwprobe/kwprobe.o: kwprobe/kwprobe.c

@@ -18,6 +18,10 @@ struct maero_netif {
     void *driver_data;
     netif_send_fn send;
     netif_poll_fn poll;
+    /* For /proc/netif: the driver's name and its own details ("io=... irq=...
+     * mac=..."); both optional, set by the driver after net_register(). */
+    const char *driver;
+    int (*describe)(netif_t *iface, char *buf, uint32_t cap);
     uint32_t tx_packets;
     uint32_t tx_bytes;
     uint32_t rx_packets;

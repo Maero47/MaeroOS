@@ -29,7 +29,22 @@ struct sockaddr {
 
 #define SOL_SOCKET 1
 #define SO_REUSEADDR 2
+#define SO_TYPE      3
 #define SO_ERROR     4
+#define SO_BROADCAST 6
+#define SO_SNDBUF    7
+#define SO_RCVBUF    8
+#define SO_KEEPALIVE 9
+#define SO_LINGER    13
+#define SO_RCVTIMEO  20     /* honoured by libc for recv/recvfrom (socket.c) */
+#define SO_SNDTIMEO  21
+
+/* Large enough for any address family the kernel speaks (AF_INET6's 28
+ * bytes, AF_UNIX's 110), as on Linux. */
+struct sockaddr_storage {
+    sa_family_t ss_family;
+    char __ss_data[126];
+} __attribute__((aligned(4)));
 
 #define MSG_PEEK      0x0002
 #define MSG_DONTWAIT  0x0040
@@ -52,6 +67,8 @@ int sendto(int fd, const void *buf, size_t len, int flags,
 int recvfrom(int fd, void *buf, size_t len, int flags,
              struct sockaddr *addr, socklen_t *addrlen);
 int shutdown(int fd, int how);
+int getsockname(int fd, struct sockaddr *addr, socklen_t *len);
+int getpeername(int fd, struct sockaddr *addr, socklen_t *len);
 int setsockopt(int fd, int level, int optname, const void *optval,
                socklen_t optlen);
 int getsockopt(int fd, int level, int optname, void *optval,

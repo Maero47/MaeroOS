@@ -1,0 +1,4 @@
+127.0.0.1	localhost
+::1		localhost ip6-localhost ip6-loopback
+# QEMU user networking: the host is reachable at 10.0.2.2.
+10.0.2.2	qemu-host

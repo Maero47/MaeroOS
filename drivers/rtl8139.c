@@ -5,6 +5,7 @@
 #include "../arch/i686/include/io.h"
 #include "../include/kernel/config.h"
 #include "../kernel/printk.h"
+#include "../lib/printf.h"
 #include "../lib/string.h"
 #include "../net/net.h"
 #include "../proc/scheduler.h"
@@ -92,6 +93,16 @@ static int rtl8139_net_send(netif_t *iface, const void *data, uint32_t len) {
 static int rtl8139_net_poll(netif_t *iface) {
     (void)iface;
     return rtl8139_poll();
+}
+
+static int rtl8139_describe(netif_t *iface, char *buf, uint32_t cap) {
+    (void)iface;
+    return snprintf(buf, cap,
+                    "io=0x%04x irq=%u mac=%02x:%02x:%02x:%02x:%02x:%02x rx=0x%08x tx=0x%08x",
+                    (unsigned)info.io_base, (unsigned)info.irq,
+                    info.mac[0], info.mac[1], info.mac[2],
+                    info.mac[3], info.mac[4], info.mac[5],
+                    (unsigned)info.rx_config, (unsigned)info.tx_config);
 }
 
 int rtl8139_send(const void *data, uint32_t len) {
@@ -270,6 +281,10 @@ void rtl8139_init(void) {
 
     rtl_netif = net_register("eth0", info.mac, NET_MTU_ETHERNET, &info,
                              rtl8139_net_send, rtl8139_net_poll);
+    if (rtl_netif) {
+        rtl_netif->driver = "rtl8139";
+        rtl_netif->describe = rtl8139_describe;
+    }
 
     if (info.irq >= 1 && info.irq <= 15) {
         irq_install_handler((int)info.irq, rtl8139_irq);

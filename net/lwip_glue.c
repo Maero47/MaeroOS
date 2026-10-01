@@ -3,9 +3,11 @@
 #include "../lib/string.h"
 #include "../lib/printf.h"
 #include "../kernel/printk.h"
+#include "../fs/vfs.h"
 
 #include "lwip/init.h"
 #include "lwip/dhcp.h"
+#include "lwip/dns.h"
 #include "lwip/ip4_addr.h"
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
@@ -96,6 +98,89 @@ void net_lwip_input(netif_t *iface, const void *data, uint32_t len) {
         pbuf_free(p);
 }
 
+/*
+ * /etc/resolv.conf from the DHCP lease.  lwIP's DHCP client hands the DNS
+ * option to dns_setserver(); net_lwip_poll() notices a change and stages the
+ * new file here, and knetd writes it out (net_lwip_write_resolv_conf) once it
+ * is out of the preempt-disabled lwIP section, since the write can sleep on
+ * the disk.
+ */
+static char resolv_text[256];
+static uint32_t resolv_servers[DNS_MAX_SERVERS];
+static volatile int resolv_pending;
+
+static void resolv_check(void) {
+    if (!dhcp_supplied_address(&lwip_eth0))
+        return;
+
+    uint32_t now[DNS_MAX_SERVERS];
+    int any = 0, changed = 0;
+    for (int i = 0; i < DNS_MAX_SERVERS; i++) {
+        const ip_addr_t *a = dns_getserver((u8_t)i);
+        now[i] = ip_addr_isany(a) ? 0 : ip4_addr_get_u32(ip_2_ip4(a));
+        if (now[i]) any = 1;
+        if (now[i] != resolv_servers[i]) changed = 1;
+    }
+    if (!any || !changed)
+        return;
+
+    int pos = snprintf(resolv_text, sizeof(resolv_text),
+                       "# Written by the MaeroOS kernel from the DHCP lease on eth0.\n");
+    for (int i = 0; i < DNS_MAX_SERVERS; i++) {
+        resolv_servers[i] = now[i];
+        if (!now[i])
+            continue;
+        ip4_addr_t a;
+        ip4_addr_set_u32(&a, now[i]);
+        pos += snprintf(resolv_text + pos, sizeof(resolv_text) - (uint32_t)pos,
+                        "nameserver %u.%u.%u.%u\n",
+                        ip4_addr1(&a), ip4_addr2(&a), ip4_addr3(&a), ip4_addr4(&a));
+    }
+    resolv_pending = 1;
+}
+
+void net_lwip_write_resolv_conf(void) {
+    if (!resolv_pending)
+        return;
+    resolv_pending = 0;
+
+    /* With a disk attached /etc is the disk's (writable); on an initrd-only
+     * boot it is the read-only initrd and the shipped file stays. */
+    vfs_node_t *node = vfs_open("/etc/resolv.conf");
+    if (!node) {
+        vfs_node_t *dir = vfs_open("/etc");
+        if (dir && dir->create_fn &&
+            dir->create_fn(dir, "resolv.conf", VFS_FLAG_FILE) == 0)
+            node = vfs_open("/etc/resolv.conf");
+        if (dir)
+            vfs_close(dir);
+    }
+    if (!node || !node->write_fn || !node->truncate_fn) {
+        printk_klog("[NET] /etc/resolv.conf is read-only; DHCP DNS not written\n");
+        if (node)
+            vfs_close(node);
+        return;
+    }
+
+    /* Same servers as the file already names (every boot on the same
+     * network): leave the disk alone. */
+    uint32_t len = (uint32_t)strlen(resolv_text);
+    char cur[sizeof(resolv_text)];
+    if (node->size == len &&
+        vfs_read(node, 0, len, (uint8_t *)cur) == len &&
+        memcmp(cur, resolv_text, len) == 0) {
+        printk_klog("[NET] /etc/resolv.conf from DHCP: unchanged\n");
+        vfs_close(node);
+        return;
+    }
+    if (vfs_truncate(node, 0) < 0 ||
+        vfs_write(node, 0, len, (const uint8_t *)resolv_text) != len)
+        printk_klog("[NET] writing /etc/resolv.conf failed\n");
+    else
+        printk_klog("[NET] /etc/resolv.conf from DHCP: written\n");
+    vfs_close(node);
+}
+
 void net_lwip_poll(void) {
     if (!lwip_inited)
         return;
@@ -107,8 +192,9 @@ void net_lwip_poll(void) {
         char b[80];
         bound = 1;
         net_lwip_ipv4(b, sizeof(b));
-        printk("[LWIP] eth0 bound%s\n", b);
+        printk_klog("[LWIP] eth0 bound%s\n", b);
     }
+    resolv_check();
 }
 
 int net_lwip_ipv4(char *buf, uint32_t cap) {

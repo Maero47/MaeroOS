@@ -137,7 +137,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-ahci smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-acpi smoke-usb check abiprobes smoke-abi smoke-firefox smoke-firefox-web repo repo-serve start resolutions icons
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-fw smoke-disk smoke-ahci smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-acpi smoke-usb check abiprobes smoke-abi smoke-firefox smoke-firefox-web repo repo-serve start resolutions icons
 
 all: $(TARGET)
 
@@ -283,6 +283,8 @@ run: $(TARGET) initrd
 		-no-reboot \
 		-no-shutdown
 
+# NIC=e1000 for the Intel e1000 instead (drivers/e1000.c).
+NIC ?= rtl8139
 run-net: $(TARGET) initrd
 	qemu-system-i386 $(QEMU_DISPLAY) \
 		-kernel $(TARGET) \
@@ -292,7 +294,7 @@ run-net: $(TARGET) initrd
 		-no-reboot \
 		-no-shutdown \
 		-netdev user,id=n0 \
-		-device rtl8139,netdev=n0
+		-device $(NIC),netdev=n0
 
 # Run with initrd + ATA disk image
 run-disk: $(TARGET) initrd disk
@@ -328,6 +330,11 @@ smoke: $(TARGET) initrd
 
 smoke-net: $(TARGET) initrd
 	python3 tools/smoke_net.py
+
+# The same on an Intel e1000, with the disk (snapshot) for a writable /etc:
+# DHCP's resolv.conf and DNS lookups against a responder in the harness.
+smoke-net-e1000: $(TARGET) initrd disk
+	python3 tools/smoke_net_e1000.py
 
 smoke-fw: $(TARGET) initrd
 	python3 tools/smoke_fw.py
@@ -385,7 +392,7 @@ smoke-usb: $(TARGET) iso disk
 # timeouts assume the guest has a host core to itself.  The suites start QEMU
 # with -display none (tools/smokelib.py), so no display is needed.
 # Pick a subset with CHECK_SUITES="smoke smoke-x".
-CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-fw \
+CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-net-e1000 smoke-fw \
                  smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui smoke-acpi \
                  smoke-ahci smoke-usb
 CHECK_LOG_DIR ?= build/check

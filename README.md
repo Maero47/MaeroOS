@@ -40,6 +40,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | SATA AHCI disk (pc + `-device ahci`, then `-M q35`), no IDE disk | `/disk` mounted from `ahci0`, `diskprobe ok`, `fsprobe ok`, `symprobe ok`, a 3 MiB random file read and copied with matching md5 in the guest and on the host (`debugfs`), persistence across a reboot onto q35, `e2fsck -fn` showing no new damage, `reboot`/`poweroff` ending QEMU | `make smoke-ahci` |
 | `pkg` and the signed repo index | `tools/test_pkg_sign.py` runs the RFC 8032 vectors through the Python signer and the C verifier and rejects altered, unsigned and foreign-key indexes; in the guest, `pkg update` rejects unsigned, tampered and rolled-back indexes, installs and runs busybox, and `install` rejects a tarball whose SHA-256 does not match | `make smoke-pkg` |
 | TCP/IP over lwIP and RTL8139 | `MAEROS_HTTP_OK` fetched from a host HTTP server; `sockprobe` checks that `send` after `shutdown(SHUT_WR)` fails with `EPIPE`, a two-step shutdown ends in a FIN and no RST, closing TIME_WAIT sockets keeps TCP working, and a non-blocking client gets `EINPROGRESS`, `SO_ERROR`, `EAGAIN`, `ECONNREFUSED` and both socket names; `abi2probe net` checks `MSG_NOSIGNAL` and `EPIPE` after a reset | `make smoke-net` |
+| Intel e1000, DHCP DNS, name resolution | the same suite on an e1000; the DHCP lease's DNS server is in `/etc/resolv.conf`; against a DNS responder in the harness, `getent` resolves A, AAAA, a CNAME, a PTR and an NXDOMAIN, `/etc/hosts` wins over DNS, and `httpget`, `toybox wget` and `toybox nc` connect by name | `make smoke-net-e1000` |
 | Kernel firewall | after `fwctl enable` plus a drop rule the same fetch fails, `fwctl list` reports the firewall `enabled` with the `drop out tcp` rule, malformed rules (`/33`, an overflowing prefix, port 70000, `tcpp`) are rejected under `policy out drop`, and `fwctl flush` restores the fetch | `make smoke-fw` |
 | Dynamic linker | `DYNPROBE_OK` from a PIE loaded through musl `ld.so`; `WXPIE_OK` (the PIE's text and RELRO, libc's text and a `PROT_READ\|PROT_EXEC` library mapping are read-only) | `make smoke-dyn` |
 | External shared libraries and pthreads | `GREET_OK sum=42`, `ZLIB_OK ver=1.3`, `THREADS_OK count=200000`, `UNIX_SOCK_OK` | `make smoke-dynlib` |
@@ -86,10 +87,8 @@ What is proven by the automated QEMU tests in `tools/`:
 - **Missing Linux interfaces.** There is no `mount` syscall, no SysV IPC and no utmp.
   `/proc/<pid>/` has only `status` and `stat` (the full set is under `/proc/self`), and
   there is no `/proc/stat`, so toybox is built without `killall` (it matches names
-  through other processes' `cmdline`), `vmstat` and `who`. The libc's `getaddrinfo` is a
-  stub that fails (`userspace/libc/toybox_compat.c`; the native programs resolve names
-  with the one-query A-record resolver in `resolve.c`), so toybox has no `netcat`, `wget`
-  or `host`.
+  through other processes' `cmdline`), `vmstat` and `who`. There is no IPv6 stack:
+  the resolver returns AAAA records, but only IPv4 sockets connect.
 - **Only Linux and macOS hosts are covered.** The Makefile looks up `mke2fs`, `debugfs`
   and GNU `sed` on `PATH` (with the Homebrew locations as a fallback) and
   `tools/run-maeros.sh` picks the QEMU display, audio and screen-size probes per host,
@@ -202,7 +201,9 @@ the kernel heap, capped at 1 GiB per file, `EFBIG` beyond), `fs/devfs.c` at
 ### Networking
 
 lwIP 2.2.1 is vendored at `third_party/lwip` and driven by `net/lwip_glue.c` over the
-RTL8139 driver in `drivers/rtl8139.c`. DHCP runs at boot; `net/socket.c` implements the
+RTL8139 (`drivers/rtl8139.c`) or Intel e1000 (`drivers/e1000.c`) driver, whichever is
+found first. DHCP runs at boot, and the lease's DNS servers are written to
+`/etc/resolv.conf` when `/etc` is writable (a disk is attached); `net/socket.c` implements the
 BSD socket calls both through `socketcall` (102) and the direct i386 numbers 359 to 373;
 `net/firewall.c` is a rule-based packet filter configured by `fwctl` and readable at
 `/proc/firewall`; a kernel thread `knetd` (`net/net.c`) keeps timers and TCP alive
@@ -212,7 +213,7 @@ without userspace polling.
 
 ATA with bus-master DMA reads and PIO writes (`ata.c`), SATA AHCI with DMA reads and writes on every
 controller and port (`ahci.c`; `/disk` mounts from the IDE master if there is one, else the first AHCI
-disk, via `blkdev.c`), PCI enumeration (`pci.c`), RTL8139 (`rtl8139.c`), Intel 82801AA AC'97
+disk, via `blkdev.c`), PCI enumeration (`pci.c`), RTL8139 (`rtl8139.c`), Intel 8254x e1000 (`e1000.c`), Intel 82801AA AC'97
 audio (`ac97.c`), Multiboot VBE framebuffer (`framebuffer.c`), VGA text (`vga.c`), PS/2
 keyboard and mouse (`keyboard.c`, `mouse.c`), CMOS RTC (`rtc.c`) and 16550 serial
 (`serial.c`).
@@ -231,7 +232,8 @@ usb-tablet` (and `-device usb-storage,drive=...`).
 `userspace/` is about 39,500 lines across 228 source files, built with the same
 `i686-elf-gcc` and
 linked against its own freestanding libc (`userspace/libc/`: syscall stubs, stdio, stdlib,
-string, dirent, termios, sockets, signals, time, regex, a small libm, a DNS resolver,
+string, dirent, termios, sockets, signals, time, regex, a small libm, a DNS resolver
+(`netdb.c`: `getaddrinfo`/`getnameinfo` over `/etc/hosts` and `/etc/resolv.conf`),
 pthreads and a toybox compatibility layer, entered from `crt0.asm`). `userspace/Makefile` installs the binaries into
 `testfiles/`.
 
@@ -450,7 +452,7 @@ the guest from the Finder desktop bounds and uses the `cocoa` display with `core
 make                # build kernel.elf
 make initrd         # build userspace + toybox, pack testfiles/ into initrd.tar
 make run            # QEMU -kernel boot, serial on stdio, 512 MiB
-make run-net        # -kernel boot with an RTL8139 on QEMU user networking
+make run-net        # -kernel boot with an RTL8139 on QEMU user networking (NIC=e1000 for an e1000)
 make run-disk       # -kernel boot with the ext2 disk.img attached
 make iso            # GRUB ISO (maeros.iso)
 make run-iso        # boot the ISO
@@ -492,6 +494,7 @@ make smoke-toybox   # toybox as a static guest binary
 make smoke-disk     # ext2, login/passwd, init sessions, service supervision, overlay
 make smoke-ahci     # /disk on a SATA AHCI controller only (pc and q35)
 make smoke-net      # DHCP, TCP, HTTP GET from the host
+make smoke-net-e1000  # the same on an e1000, plus resolv.conf from DHCP and DNS lookups
 make smoke-pkg      # pkg against a host repo: signed index, install, rollback
 make smoke-fw       # firewall rule blocks and unblocks that GET
 make smoke-dyn      # PIE through the musl dynamic linker
@@ -564,10 +567,10 @@ through `/dev/usbdisk0` (checksummed against the image file) and unplugs and rep
 ### Continuous integration
 
 `make check` runs the suites that need nothing beyond a fresh clone: `smoke`,
-`smoke-cmds`, `smoke-toybox`, `smoke-disk`, `smoke-net`, `smoke-fw`, `smoke-dyn`,
-`smoke-dynlib`, `smoke-x`, `smoke-pkg` (which first builds `repo/` and, on a host
-without one, a repo signing key) and `smoke-gui` (which needs the ISO, so `check` builds
-it), `smoke-acpi`, `smoke-ahci` and `smoke-usb`. It runs them one after another, writes each suite's
+`smoke-cmds`, `smoke-toybox`, `smoke-disk`, `smoke-net`, `smoke-net-e1000`, `smoke-fw`,
+`smoke-dyn`, `smoke-dynlib`, `smoke-x`, `smoke-pkg` (which first builds `repo/` and, on a
+host without one, a repo signing key), `smoke-gui` (which needs the ISO, so `check`
+builds it), `smoke-acpi`, `smoke-ahci` and `smoke-usb`. It runs them one after another, writes each suite's
 console to `build/check/<suite>.log`, prints the tail of the log for any suite that
 fails, carries on with the rest and exits non-zero at the end. `CHECK_SUITES="smoke
 smoke-x" make check` runs a subset.
@@ -627,7 +630,7 @@ A wedged boot prints nothing, so three things exist to make one visible.
 | Path | Contents |
 |---|---|
 | `arch/i686/` | boot and AP trampoline assembly, GDT/IDT/TSS/PIC/PIT, LAPIC, SMP, BKL, paging |
-| `drivers/` | ATA, AHCI, PCI, RTL8139, AC'97, framebuffer, VGA, keyboard, mouse, RTC, serial, ACPI (uACPI glue) |
+| `drivers/` | ATA, AHCI, PCI, RTL8139, e1000, AC'97, framebuffer, VGA, keyboard, mouse, RTC, serial, ACPI (uACPI glue) |
 | `fs/` | VFS, ustar initrd, ext2, tmpfs, devfs, procfs |
 | `include/kernel/` | `config.h`, `types.h`, `multiboot.h`, `assert.h` |
 | `kernel/` | `main.c`, `printk`, ring-buffer `klog`, `panic`, RNG, stack protector |
