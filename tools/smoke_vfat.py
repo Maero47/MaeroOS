@@ -247,8 +247,8 @@ def hotplug(man, usb_img, accel):
         rc, out = g.sh("busybox grep -c sdb /proc/partitions; busybox md5sum /usb/Belgeler/photo.jpg; "
                        "echo x > /usb/new.txt")
         want = man["usb"]["files"]["Belgeler/photo.jpg"]
-        check(rc != 0 and want not in out and out.strip().startswith("0"),
-              "unplugged: sdb leaves /proc/partitions, reads and writes fail")
+        check(rc != 0 and want not in out and re.search(r"^0$", out, re.M) is not None,
+              f"unplugged: sdb leaves /proc/partitions, reads and writes fail ({out.strip()[-160:]!r})")
         rc, out = g.sh("busybox umount /usb")
         check(rc == 0, "the dead mount unmounts")
         at = smokelib.mark(log)
