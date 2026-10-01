@@ -12,7 +12,9 @@ input.  Whatever the desktop does here came through drivers/usb/.  (The
 device; naming a USB device there aborts QEMU.)
 
 Checks:
-  - the kernel enumerated all three devices (keyboard, tablet, boot mouse);
+  - the kernel enumerated all three devices (keyboard, tablet, boot mouse),
+    and xhci.c's boot self-tests passed (Link TRB chaining; aborting a TD
+    pending on a Running endpoint, which is what a timeout does);
   - the tablet's absolute positions land exactly where they were sent: the
     desktop traces each click's position, which must match (launcher orb,
     window close button);
@@ -132,6 +134,14 @@ class UsbSmoke(GuiSmoke):
             if not re.search(r"\[USB\] port [\d.]+: \S+ \S+ speed, slot \d+: "
                              r"HID %s " % kind, text):
                 raise AssertionError(f"kernel did not bring up a USB {kind}")
+        # xhci.c's boot-time checks: a chained TD across the ring's Link
+        # TRB keeps the chain, and a pending TD on a Running endpoint (the
+        # timeout case) is stopped and skipped, after which the keyboard
+        # must still work (it types everything below).
+        for check in (r"ring wrap with chained TD ok",
+                      r"abort of a pending TD on a running endpoint ok"):
+            if not re.search(r"\[XHCI\] self-test: " + check, text):
+                raise AssertionError(f"xHCI self-test failed: {check}")
         if not re.search(r"\[USB\] port \d+: \S+ full speed, slot \d+: hub, "
                          r"\d+ ports", text):
             raise AssertionError("kernel did not bring up the USB hub")

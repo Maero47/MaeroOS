@@ -137,6 +137,7 @@ typedef struct {
 #define TRB_CONFIG_EP    12
 #define TRB_EVAL_CTX     13
 #define TRB_RESET_EP     14
+#define TRB_STOP_EP      15
 #define TRB_SET_TR_DEQ   16
 #define TRB_EV_TRANSFER  32
 #define TRB_EV_CMD       33
@@ -147,6 +148,14 @@ typedef struct {
 #define CC_STALL         6
 #define CC_SHORT_PACKET  13
 #define CC_CONTEXT_STATE 19
+#define CC_STOPPED       26
+#define CC_STOPPED_LEN   27
+#define CC_STOPPED_SHORT 28
+#define CC_IS_STOPPED(c) ((c) >= CC_STOPPED && (c) <= CC_STOPPED_SHORT)
+
+/* Endpoint Context EP State (xHCI 6.2.3) */
+#define EP_STATE_RUNNING 1
+#define EP_STATE_HALTED  2
 
 typedef struct {
     xhci_trb_t *trbs;
@@ -322,14 +331,39 @@ static uint32_t ring_push(ring_t *r, uint32_t p_lo, uint32_t p_hi,
     t->control = (control & ~TRB_CYCLE) | r->cycle;
     __sync_synchronize();
     if (++r->enq == r->n - 1) {
-        /* Hand the Link TRB over with the current cycle, then wrap. */
+        /* Hand the Link TRB over with the current cycle, then wrap.  A Link
+         * TRB inside a TD must have its Chain bit set, or the controller
+         * may end the TD there (xHCI 4.11.5.1, 6.4.4.1): it takes the
+         * Chain bit of the TRB just queued. */
         volatile xhci_trb_t *link = &r->trbs[r->n - 1];
-        link->control = (link->control & ~TRB_CYCLE) | r->cycle;
+        link->control = (link->control & ~(TRB_CYCLE | TRB_CHAIN)) |
+                        (control & TRB_CHAIN) | r->cycle;
         __sync_synchronize();
         r->enq = 0;
         r->cycle ^= 1;
     }
     return phys;
+}
+
+/* Boot-time check of the ring logic on a scratch ring nobody executes: a
+ * chained TRB queued just before the Link TRB must leave the Link chained
+ * and the cycle toggled; an unchained one must leave it unchained. */
+static int ring_selftest(void) {
+    static xhci_trb_t t[8];
+    ring_t r;
+    ring_init(&r, t, 8);
+    for (int i = 0; i < 6; i++)
+        ring_push(&r, 0, 0, 0, TRB_TYPE(TRB_NORMAL));
+    ring_push(&r, 0, 0, 0, TRB_TYPE(TRB_NORMAL) | TRB_CHAIN);
+    int ok = r.enq == 0 && r.cycle == 0 &&
+             (t[7].control & TRB_CHAIN) && (t[7].control & TRB_CYCLE) &&
+             (t[7].control & TRB_TC);
+    for (int i = 0; i < 6; i++)
+        ring_push(&r, 0, 0, 0, TRB_TYPE(TRB_NORMAL) | TRB_CHAIN);
+    ring_push(&r, 0, 0, 0, TRB_TYPE(TRB_NORMAL) | TRB_IOC);
+    ok = ok && r.enq == 0 && r.cycle == 1 && !(t[7].control & TRB_CHAIN) &&
+         !(t[7].control & TRB_CYCLE) && (t[6].control & TRB_CYCLE) == 0;
+    return ok ? 0 : -1;
 }
 
 static inline void ring_doorbell(uint32_t slot, uint32_t target) {
@@ -360,7 +394,10 @@ static void bulk_event(struct usb_device *d, int i, uint32_t trb, int code,
         }
         before += len;
     }
-    if (code != CC_SUCCESS && code != CC_SHORT_PACKET) {
+    /* An error on a TRB not in the transfer: the endpoint failed before
+     * reaching it.  A Stopped event for an abandoned TD (ep_abort) is not
+     * news for the transfer in flight. */
+    if (code != CC_SUCCESS && code != CC_SHORT_PACKET && !CC_IS_STOPPED(code)) {
         d->eps[i].actual = 0;
         d->eps[i].code = code;
         d->eps[i].done = 1;
@@ -386,7 +423,8 @@ static void handle_event(const xhci_trb_t *ev) {
             if (ev->param_lo == d->ctl_data_trb)
                 d->ctl_residual = ev->status & 0xFFFFFF;
             if (ev->param_lo == d->ctl_status_trb ||
-                (code != CC_SUCCESS && code != CC_SHORT_PACKET)) {
+                (code != CC_SUCCESS && code != CC_SHORT_PACKET &&
+                 !CC_IS_STOPPED(code))) {
                 d->ctl_code = code;
                 d->ctl_done = 1;
             }
@@ -470,6 +508,42 @@ static int run_command(uint32_t p_lo, uint32_t status, uint32_t control,
     return -1;
 }
 
+/* ── endpoint recovery (xHCI 4.6.8, 4.6.9, 4.6.10) ──────────────────────── */
+
+static inline uint32_t *out_ep_ctx(struct usb_device *d, int dci);
+
+/* Throw away whatever is queued on endpoint `dci` (ring `r`): a timed-out
+ * TD, or the rest of a TD after a STALL or error.  A Halted endpoint is
+ * reset, a Running one stopped (Reset Endpoint and Set TR Dequeue Pointer
+ * both fail with a Context State Error on a Running endpoint), then its
+ * dequeue pointer is moved to our enqueue pointer, so the controller never
+ * touches the abandoned TRBs or the buffers they point at again.  Returns
+ * 0 when the endpoint ended up Stopped at our enqueue pointer. */
+static int ep_abort(struct usb_device *d, int dci, ring_t *r) {
+    uint32_t ep = (uint32_t)dci << 16;
+    uint32_t state = out_ep_ctx(d, dci)[0] & 7;
+    int cc = CC_SUCCESS;
+    if (state == EP_STATE_HALTED)
+        cc = run_command(0, 0, TRB_TYPE(TRB_RESET_EP) | TRB_SLOT(d->slot) | ep,
+                         0);
+    else if (state == EP_STATE_RUNNING)
+        cc = run_command(0, 0, TRB_TYPE(TRB_STOP_EP) | TRB_SLOT(d->slot) | ep,
+                         0);
+    if (cc != CC_SUCCESS && cc != CC_CONTEXT_STATE)
+        printk("[USB] slot %d: %s endpoint %d failed, code %d\n", d->slot,
+               state == EP_STATE_HALTED ? "reset" : "stop", dci, cc);
+    uint32_t deq = r->phys + r->enq * (uint32_t)sizeof(xhci_trb_t);
+    cc = run_command(deq | r->cycle, 0,
+                     TRB_TYPE(TRB_SET_TR_DEQ) | TRB_SLOT(d->slot) | ep, 0);
+    if (cc != CC_SUCCESS) {
+        printk("[USB] slot %d: set dequeue pointer on endpoint %d failed, "
+               "code %d\n", d->slot, dci, cc);
+        return -1;
+    }
+    uint32_t *ec = out_ep_ctx(d, dci);
+    return ((ec[0] & 7) == 3 && (ec[2] & ~0xFU) == deq) ? 0 : -1;
+}
+
 /* ── control transfers (xHCI 4.11.2.2) ───────────────────────────────────── */
 
 int usb_control(struct usb_device *d, const usb_setup_t *setup, void *data) {
@@ -506,13 +580,19 @@ int usb_control(struct usb_device *d, const usb_setup_t *setup, void *data) {
         if ((int32_t)(pit_ticks() - end) >= 0) {
             printk("[USB] slot %d: control request %02x/%02x timed out\n",
                    d->slot, setup->bmRequestType, setup->bRequest);
+            ep_abort(d, 1, &d->ep0);
             return -1;
         }
         if (spin > 200) sleep_ticks(1);
     }
     if (d->ctl_code != CC_SUCCESS && d->ctl_code != CC_SHORT_PACKET) {
-        printk("[USB] slot %d: control request %02x/%02x failed, code %d\n",
-               d->slot, setup->bmRequestType, setup->bRequest, d->ctl_code);
+        if (d->ctl_code != CC_STALL)
+            printk("[USB] slot %d: control request %02x/%02x failed, "
+                   "code %d\n", d->slot, setup->bmRequestType,
+                   setup->bRequest, d->ctl_code);
+        /* A STALL (a request the device does not support) or an error
+         * halts EP0 in the controller; the next request needs it back. */
+        ep_abort(d, 1, &d->ep0);
         return -1;
     }
     uint32_t got = len - (d->ctl_residual <= len ? d->ctl_residual : len);
@@ -552,6 +632,11 @@ static inline uint32_t *in_entry(struct usb_device *d, int i) {
 
 static inline uint32_t *out_entry(struct usb_device *d, int i) {
     return (uint32_t *)(d->dma->out_ctx + (uint32_t)i * ctx_size);
+}
+
+/* Output (device) context of endpoint `dci` (entry 0 is the slot). */
+static inline uint32_t *out_ep_ctx(struct usb_device *d, int dci) {
+    return out_entry(d, dci);
 }
 
 static uint32_t default_mps0(int speed) {
@@ -788,6 +873,8 @@ int usb_bulk(struct usb_device *d, int i, uint32_t phys, uint32_t len,
         if ((int32_t)(pit_ticks() - end) >= 0) {
             printk("[USB] slot %d: bulk transfer on endpoint %02x timed out\n",
                    d->slot, d->eps[i].addr);
+            /* Take the TD back before the caller reuses its buffer. */
+            ep_abort(d, d->eps[i].dci, &d->eps[i].ring);
             return -1;
         }
         if (spin > 200) sleep_ticks(1);
@@ -797,6 +884,7 @@ int usb_bulk(struct usb_device *d, int i, uint32_t phys, uint32_t len,
     if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) {
         printk("[USB] slot %d: bulk transfer on endpoint %02x failed, "
                "code %d\n", d->slot, d->eps[i].addr, cc);
+        ep_abort(d, d->eps[i].dci, &d->eps[i].ring);
         return -1;
     }
     if (actual) *actual = d->eps[i].actual;
@@ -808,18 +896,7 @@ int usb_bulk(struct usb_device *d, int i, uint32_t phys, uint32_t len,
  * device's halt feature. */
 int usb_clear_halt(struct usb_device *d, int i) {
     if (i < 0 || i >= USB_MAX_EPS || !d->eps[i].dci) return -1;
-    uint32_t ep = (uint32_t)d->eps[i].dci << 16;
-    int cc = run_command(0, 0, TRB_TYPE(TRB_RESET_EP) | TRB_SLOT(d->slot) | ep,
-                         0);
-    if (cc != CC_SUCCESS && cc != CC_CONTEXT_STATE)
-        printk("[USB] slot %d: reset endpoint failed, code %d\n", d->slot, cc);
-    ring_t *r = &d->eps[i].ring;
-    cc = run_command((r->phys + r->enq * (uint32_t)sizeof(xhci_trb_t)) |
-                     r->cycle, 0,
-                     TRB_TYPE(TRB_SET_TR_DEQ) | TRB_SLOT(d->slot) | ep, 0);
-    if (cc != CC_SUCCESS)
-        printk("[USB] slot %d: set dequeue pointer failed, code %d\n",
-               d->slot, cc);
+    ep_abort(d, d->eps[i].dci, &d->eps[i].ring);
     usb_setup_t s = { 0x02, 1 /* CLEAR_FEATURE */, 0 /* ENDPOINT_HALT */,
                       (uint16_t)d->eps[i].addr, 0 };
     return usb_control(d, &s, 0) < 0 ? -1 : 0;
@@ -834,6 +911,7 @@ static void queue_report(struct usb_device *d) {
 static void hid_transfer_done(struct usb_device *d, int code,
                               uint32_t residual) {
     if (!d->intr_active) return;
+    if (CC_IS_STOPPED(code)) return;     /* a TD ep_abort() took back */
     if (code == CC_SUCCESS || code == CC_SHORT_PACKET) {
         uint32_t mps = (uint32_t)d->eps[0].mps;
         uint32_t got = mps - (residual <= mps ? residual : mps);
@@ -887,6 +965,19 @@ static int setup_hid(struct usb_device *d, const usb_interface_desc_t *intf,
     d->cls = USB_CLS_HID;
     d->intr_active = 1;
     queue_report(d);
+    static int abort_checked;
+    if (!abort_checked) {
+        /* Check the timeout path once per boot on a real endpoint: the
+         * first report TD sits on a Running endpoint (nothing to report
+         * yet); abort it as a timed-out transfer is and queue it again. */
+        abort_checked = 1;
+        int was = (int)(out_ep_ctx(d, d->eps[0].dci)[0] & 7);
+        int ok = ep_abort(d, d->eps[0].dci, &d->eps[0].ring) == 0;
+        printk("[XHCI] self-test: abort of a pending TD on a %s endpoint "
+               "%s\n", was == EP_STATE_RUNNING ? "running" : "non-running",
+               ok ? "ok" : "FAILED");
+        queue_report(d);
+    }
     return 0;
 }
 
@@ -1244,6 +1335,8 @@ static void bios_handoff(void) {
 }
 
 static int hc_start(void) {
+    printk("[XHCI] self-test: ring wrap with chained TD %s\n",
+           ring_selftest() == 0 ? "ok" : "FAILED");
     bios_handoff();
 
     /* Stop, then reset. */
