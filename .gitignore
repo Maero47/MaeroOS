@@ -196,3 +196,6 @@ ports/fbDOOM/.git-upstream/
 userspace/pkg/repo_pubkey.h
 __pycache__/
 /testfiles/symprobe
+ports/alpine/cache/
+build/
+disk-alpine.img

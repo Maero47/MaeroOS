@@ -96,6 +96,7 @@ PROBES = {
     "p33_isatty":              (60, ""),
     "p34_statfs":              (60, ""),
     "p35_xattr":               (60, ""),
+    "p36_lstat_statx":         (60, "/disk"),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

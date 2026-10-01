@@ -129,7 +129,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui check abiprobes smoke-abi smoke-firefox smoke-firefox-web repo repo-serve start resolutions icons
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine disk-alpine repo repo-serve start resolutions icons
 
 all: $(TARGET)
 
@@ -413,6 +413,16 @@ smoke-firefox: $(TARGET) iso disk-ff
 smoke-firefox-web: $(TARGET) iso disk-ff
 	python3 tools/smoke_firefox.py --web $(SMOKE_FF_ARGS)
 
+# Alpine Linux x86 in a chroot on its own ext2 image (ports/alpine/README.md).
+# disk-alpine fetches the pinned minirootfs and packages once (cached under
+# ports/alpine/cache, ALPINE_OFFLINE=1 to forbid the network); the smoke test
+# then runs offline: bash, coreutils, python3, vim, git, ssh, less, apk add/del.
+disk-alpine:
+	python3 ports/alpine/prepare.py
+
+smoke-alpine: $(TARGET) initrd disk-alpine
+	python3 tools/smoke_alpine.py
+
 # Run with full interrupt + CPU-reset logging
 debug: $(TARGET)
 	qemu-system-i386 \
@@ -527,7 +537,7 @@ iso: $(TARGET) initrd
 clean:
 	find kernel arch/i686 mm fs drivers proc lib net third_party/lwip/src \
 		\( -name "*.o" -o -name "*.d" \) -delete 2>/dev/null || true
-	rm -f $(TARGET) maeros.iso initrd.tar disk.img disk-ff.img $(QEMU_ISO_PID) $(KTRACE_STAMP)
+	rm -f $(TARGET) maeros.iso initrd.tar disk.img disk-ff.img disk-alpine.img $(QEMU_ISO_PID) $(KTRACE_STAMP)
 	rm -rf isodir repo
 	rm -rf $(TOYBOX_DIR)/generated
 	rm -f $(TOYBOX_DIR)/toybox $(TOYBOX_DIR)/.singlemake testfiles/toybox

@@ -5217,13 +5217,20 @@ static int sys_statx(registers_t *regs) {
 
     struct kstat64 kst;
     /* empty path + AT_EMPTY_PATH(0x1000) → stat dirfd itself, whatever kind of
-     * descriptor it is (musl 1.2 implements fstat() as exactly this call). */
-    if (path[0] == '\0' && dirfd >= 0) {
+     * descriptor it is (musl 1.2 implements fstat() as exactly this call);
+     * without the flag an empty path is -ENOENT (below). */
+    if (path[0] == '\0' && dirfd >= 0 && ((int)regs->edx & 0x1000)) {
         int r = fd_kstat64(dirfd, &kst);
         if (r < 0) return r;
     } else {
+        /* Relative to dirfd, and with AT_SYMLINK_NOFOLLOW (0x100) the link
+         * itself: musl's lstat() and fstatat() on i386 are this call. */
+        if (path[0] == '\0') return -2;                       /* -ENOENT */
+        char resolved[256];
+        int r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
+        if (r < 0) return r;
         int lerr;
-        vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
+        vfs_node_t *n = vfs_lookup(resolved, !((int)regs->edx & 0x100), &lerr);
         if (!n) return lerr;
         fill_kstat64(&kst, n);
     }
