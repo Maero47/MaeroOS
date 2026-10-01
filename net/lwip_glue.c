@@ -169,6 +169,7 @@ void net_lwip_write_resolv_conf(void) {
     if (node->size == len &&
         vfs_read(node, 0, len, (uint8_t *)cur) == len &&
         memcmp(cur, resolv_text, len) == 0) {
+        printk_klog("[NET] /etc/resolv.conf from DHCP: unchanged\n");
         vfs_close(node);
         return;
     }
@@ -176,7 +177,7 @@ void net_lwip_write_resolv_conf(void) {
         vfs_write(node, 0, len, (const uint8_t *)resolv_text) != len)
         printk_klog("[NET] writing /etc/resolv.conf failed\n");
     else
-        printk_klog("[NET] /etc/resolv.conf written from DHCP\n");
+        printk_klog("[NET] /etc/resolv.conf from DHCP: written\n");
     vfs_close(node);
 }
 

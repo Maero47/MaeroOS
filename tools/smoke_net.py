@@ -357,7 +357,9 @@ def main():
             time.sleep(0.5)
         want = ["[LWIP] eth0 bound ip=10.0.2.15"]
         if nic == "e1000":
-            want.append("[NET] /etc/resolv.conf written from DHCP")
+            # "written", or "unchanged" when an earlier boot of this disk
+            # image (smoke-disk has QEMU's default e1000) already wrote it.
+            want.append("[NET] /etc/resolv.conf from DHCP: ")
         deadline = time.time() + 10
         while True:
             out = run(proc, sel, log, "dmesg")
