@@ -34,6 +34,8 @@ file nghttp2-libs-1.69.0-r0.04027969.apk 70c16aa0bf0ace08427e546a8c5966a1059794f
 file openssh-client-common-10.0_p1-r10.e3a7ce10.apk 38ab974e46dc93b717148f69ded46f507c2f6712f30cde56463bb2c3d495b4b7
 file openssh-client-default-10.0_p1-r10.ead37060.apk 2d020eef1cb7458f2e4d246b72b365f9cdff0e30114ecdffdeb51f7c22634c8b
 file openssh-keygen-10.0_p1-r10.12e0efd9.apk fefa19c2a63edb2b9eee9d7a5d7b878355be761d86682ed9fde61eaaf089a5dd
+file openssh-server-10.0_p1-r10.apk 41b6c14ba5852123d2c465ed6a20fefe86cbe526f968411d6f173ff0fc878bb6
+file openssh-server-common-10.0_p1-r10.apk 2cdfaed423be753dc226a8ddc449c3536ae1e093949df68072f21a8c7f7827b1
 file pcre2-10.46-r0.18ec3011.apk eafeb653254c467dcdf2032a6a936db0c5f500733a49d16d6a1a8e5b0225f0b9
 file python3-3.12.14-r0.1920ab30.apk 70c6d810b653962908715c5151bdde06db5cddf6578a656e75534f2af338f8d5
 file python3-pycache-pyc0-3.12.14-r0.6c641485.apk e002cd4aac067d848d194c1bdf4aae516fc4f05a2687f1c28561a87eb7027ca7
@@ -98,6 +100,8 @@ pkg python3-3.12.14-r0
 pkg python3-pyc-3.12.14-r0
 pkg python3-pycache-pyc0-3.12.14-r0
 pkg readline-8.2.13-r1
+pkg repo:openssh-server-10.0_p1-r10
+pkg repo:openssh-server-common-10.0_p1-r10
 pkg repo:tree-2.2.1-r0
 pkg scanelf-1.3.8-r1
 pkg skalibs-libs-2.14.4.0-r0

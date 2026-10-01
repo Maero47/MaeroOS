@@ -63,8 +63,9 @@ ARCH = "x86"
 PACKAGES = ["bash", "coreutils", "python3", "vim", "less", "nano",
             "git", "openssh-client"]
 # Fetched into the guest's offline repo /repo, not installed: the smoke test
-# adds and deletes them.  tree depends on musl only.
-REPO_PACKAGES = ["tree"]
+# adds and deletes them.  tree depends on musl only; openssh-server needs
+# openssh-keygen and the libraries openssh-client already installed.
+REPO_PACKAGES = ["tree", "openssh-server", "openssh-server-common"]
 
 IMG = os.environ.get("ALPINE_IMG", os.path.join(ROOT, "disk-alpine.img"))
 

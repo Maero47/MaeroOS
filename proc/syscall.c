@@ -36,6 +36,7 @@
 #include "../net/socket.h"
 #include "../net/xsock.h"
 #include "flock.h"
+#include "../lib/printf.h"
 #include <registers.h>
 #include <kernel/config.h>
 #include <stdint.h>
@@ -5684,6 +5685,69 @@ static int sys_symlinkat(registers_t *regs) {
     return symlink_at(regs->ebx, (int)regs->ecx, regs->edx);
 }
 
+/* readlink of /proc/self/fd/N or /proc/<pid>/fd/N: what the descriptor
+ * stands for, as Linux's magic links answer it — the path it was opened by
+ * (relative to the caller's root, as every fd path here is), or
+ * "pipe:[id]", "socket:[id]", "anon_inode:[...]".  musl's ttyname() reads
+ * it (sshd checks the pty it allocated that way).  Returns the length, -2
+ * for a closed descriptor, or 1 when `abs` is not such a path. */
+static int path_has_prefix(const char *s, const char *pre) {
+    while (*pre)
+        if (*s++ != *pre++) return 0;
+    return 1;
+}
+
+static int proc_fd_readlink(const char *abs, char *out, uint32_t cap) {
+    if (!path_has_prefix(abs, "/proc/")) return 1;
+    const char *p = abs + 6;
+    struct proc *who = NULL;
+    if (path_has_prefix(p, "self/")) {
+        who = current_proc;
+        p += 5;
+    } else if (path_has_prefix(p, "thread-self/")) {
+        who = current_proc;
+        p += 12;
+    } else {
+        int pid = 0;
+        if (*p < '0' || *p > '9') return 1;
+        while (*p >= '0' && *p <= '9') pid = pid * 10 + (*p++ - '0');
+        if (*p++ != '/') return 1;
+        for (int i = 0; i < MAX_PROCS; i++)
+            if (ptable[i].state != PROC_UNUSED && ptable[i].pid == pid) {
+                who = &ptable[i];
+                break;
+            }
+        if (!who) return 1;
+    }
+    if (!path_has_prefix(p, "fd/")) return 1;
+    p += 3;
+    int fd = 0;
+    if (*p < '0' || *p > '9') return 1;
+    while (*p >= '0' && *p <= '9') {
+        fd = fd * 10 + (*p++ - '0');
+        if (fd >= MAX_FD) return -2;
+    }
+    if (*p) return 1;
+    if (!who->ofile) return -2;
+    proc_file_t *f = &who->ofile[fd];
+    uint32_t id = f->fid ? f->fid : (uint32_t)fd + 1;
+    int n;
+    switch (f->type) {
+    case FD_NONE:    return -2;                             /* -ENOENT */
+    case FD_FILE:    n = snprintf(out, cap, "%s", f->path[0] ? f->path : "/"); break;
+    case FD_PIPE_R: case FD_PIPE_W:
+                     n = f->path[0] ? snprintf(out, cap, "%s", f->path)
+                                    : snprintf(out, cap, "pipe:[%u]", id);
+                     break;
+    case FD_SOCKET: case FD_USOCKET:
+                     n = snprintf(out, cap, "socket:[%u]", id); break;
+    case FD_EPOLL:   n = snprintf(out, cap, "anon_inode:[eventpoll]"); break;
+    case FD_EVENTFD: n = snprintf(out, cap, "anon_inode:[eventfd]"); break;
+    default:         n = snprintf(out, cap, "anon_inode:[%u]", id); break;
+    }
+    return n < (int)cap ? n : (int)cap - 1;
+}
+
 /* ── sys_readlink(path, buf, bufsiz) — EAX=85 ───────────────────────────── */
 static int sys_readlink(registers_t *regs) {
     char path[512];
@@ -5692,6 +5756,17 @@ static int sys_readlink(registers_t *regs) {
     int bufsiz = (int)regs->edx;
     if (bufsiz <= 0 || !access_ok(ubuf, (uint32_t)bufsiz)) return -14;
 
+    {
+        char abs[256], link[256];
+        if (resolve_path_at_fd(AT_FDCWD, path, abs, sizeof(abs)) == 0) {
+            int l = proc_fd_readlink(abs, link, sizeof(link));
+            if (l != 1) {
+                if (l < 0) return l;
+                if (l > bufsiz) l = bufsiz;
+                return copy_to_user(ubuf, link, (uint32_t)l) < 0 ? -14 : l;
+            }
+        }
+    }
     /* Resolve without following final symlink */
     int err;
     vfs_node_t *n = vfs_lookup_at(path, 0, &err);
@@ -6758,6 +6833,15 @@ static int sys_readlinkat(registers_t *regs) {
     if (r < 0) return r;
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
+    {
+        char link[256];
+        int l = proc_fd_readlink(resolved, link, sizeof(link));
+        if (l != 1) {
+            if (l < 0) return l;
+            if (l > bufsiz) l = bufsiz;
+            return copy_to_user(ubuf, link, (uint32_t)l) < 0 ? -14 : l;
+        }
+    }
     int lerr;
     vfs_node_t *n = vfs_lookup(resolved, 0, &lerr);
     if (!n) return lerr;
