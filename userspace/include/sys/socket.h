@@ -36,8 +36,11 @@ struct sockaddr {
 #define SO_RCVBUF    8
 #define SO_KEEPALIVE 9
 #define SO_LINGER    13
-#define SO_RCVTIMEO  20     /* honoured by libc for recv/recvfrom (socket.c) */
+#define SO_RCVTIMEO  20     /* struct timeval with a 32-bit time_t */
 #define SO_SNDTIMEO  21
+#define SO_ACCEPTCONN 30
+
+#define SOMAXCONN 4096
 
 /* Large enough for any address family the kernel speaks (AF_INET6's 28
  * bytes, AF_UNIX's 110), as on Linux. */
@@ -60,6 +63,7 @@ int bind(int fd, const struct sockaddr *addr, socklen_t len);
 int connect(int fd, const struct sockaddr *addr, socklen_t len);
 int listen(int fd, int backlog);
 int accept(int fd, struct sockaddr *addr, socklen_t *len);
+int accept4(int fd, struct sockaddr *addr, socklen_t *len, int flags);
 int send(int fd, const void *buf, size_t len, int flags);
 int recv(int fd, void *buf, size_t len, int flags);
 int sendto(int fd, const void *buf, size_t len, int flags,

@@ -42,6 +42,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | `pkg` and the signed repo index | `tools/test_pkg_sign.py` runs the RFC 8032 vectors through the Python signer and the C verifier and rejects altered, unsigned and foreign-key indexes; in the guest, `pkg update` rejects unsigned, tampered and rolled-back indexes, installs and runs busybox, and `install` rejects a tarball whose SHA-256 does not match | `make smoke-pkg` |
 | TCP/IP over lwIP and RTL8139 | `MAEROS_HTTP_OK` fetched from a host HTTP server; `sockprobe` checks that `send` after `shutdown(SHUT_WR)` fails with `EPIPE`, a two-step shutdown ends in a FIN and no RST, closing TIME_WAIT sockets keeps TCP working, and a non-blocking client gets `EINPROGRESS`, `SO_ERROR`, `EAGAIN`, `ECONNREFUSED` and both socket names; `abi2probe net` checks `MSG_NOSIGNAL` and `EPIPE` after a reset | `make smoke-net` |
 | Intel e1000, DHCP DNS, name resolution | the same suite on an e1000; the DHCP lease's DNS server is in `/etc/resolv.conf`; against a DNS responder in the harness, `getent` resolves A, AAAA, a CNAME, a PTR and an NXDOMAIN, `/etc/hosts` wins over DNS, and `httpget`, `toybox wget` and `toybox nc` connect by name | `make smoke-net-e1000` |
+| AF_INET server sockets | through QEMU `hostfwd`: `toybox nc -l -p 8080` exchanges a line each way with a host client; `srvprobe tcp` checks non-blocking `accept` (`EAGAIN`), `SO_RCVTIMEO` on `accept`, `poll` and `epoll` on a listener, three host clients queued in the backlog at once and taken with `accept4(SOCK_NONBLOCK\|SOCK_CLOEXEC)`, both socket names of an accepted connection, `EADDRINUSE` and then a `SO_REUSEADDR` rebind over TIME_WAIT, and `shutdown` of a listener; `srvprobe udp` checks a blocking `recvfrom` that `SO_RCVTIMEO` ends with `EAGAIN` and one that waits for the host's datagram | `make smoke-tcpsrv` |
 | Kernel firewall | after `fwctl enable` plus a drop rule the same fetch fails, `fwctl list` reports the firewall `enabled` with the `drop out tcp` rule, malformed rules (`/33`, an overflowing prefix, port 70000, `tcpp`) are rejected under `policy out drop`, and `fwctl flush` restores the fetch | `make smoke-fw` |
 | Dynamic linker | `DYNPROBE_OK` from a PIE loaded through musl `ld.so`; `WXPIE_OK` (the PIE's text and RELRO, libc's text and a `PROT_READ\|PROT_EXEC` library mapping are read-only) | `make smoke-dyn` |
 | External shared libraries and pthreads | `GREET_OK sum=42`, `ZLIB_OK ver=1.3`, `THREADS_OK count=200000`, `UNIX_SOCK_OK` | `make smoke-dynlib` |
@@ -78,8 +79,8 @@ What is proven by the automated QEMU tests in `tools/`:
   cases in `proc/syscall.c`).
 - **Unfinished credential and socket semantics.** `setfsuid`/`setfsgid` just report
   the effective id; a path lookup does not check search permission on the directories
-  it walks through; AF_INET sockets have no `listen`/`accept` (`-EOPNOTSUPP`), and a
-  blocking UDP `recv` returns `EAGAIN` instead of waiting.
+  it walks through. AF_INET has no loopback interface (a socket can bind
+  `127.0.0.1` but nothing reaches it), and `SO_LINGER` is accepted and ignored.
 - **One repo signing key per build host.** `index.txt` is Ed25519-signed and `pkg`
   checks it, but the key is created per host (`~/.config/maeros/repo-signing.key`) and
   its public half is compiled into `pkg`: a repo and a `pkg` built on different hosts,
@@ -502,6 +503,7 @@ make smoke-ahci     # /disk on a SATA AHCI controller only (pc and q35)
 make smoke-nvme     # /disk on an NVMe namespace only (pc and q35)
 make smoke-net      # DHCP, TCP, HTTP GET from the host
 make smoke-net-e1000  # the same on an e1000, plus resolv.conf from DHCP and DNS lookups
+make smoke-tcpsrv   # listen/accept and blocking UDP, from the host through hostfwd
 make smoke-pkg      # pkg against a host repo: signed index, install, rollback
 make smoke-fw       # firewall rule blocks and unblocks that GET
 make smoke-dyn      # PIE through the musl dynamic linker

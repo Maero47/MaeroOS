@@ -211,3 +211,12 @@ int net_lwip_ipv4(char *buf, uint32_t cap) {
                     ip4_addr1(mask), ip4_addr2(mask), ip4_addr3(mask), ip4_addr4(mask),
                     ip4_addr1(gw), ip4_addr2(gw), ip4_addr3(gw), ip4_addr4(gw));
 }
+
+int net_lwip_addr_is_local(uint32_t addr) {
+    ip4_addr_t a;
+    ip4_addr_set_u32(&a, addr);
+    if (ip4_addr_isany_val(a) || ip4_addr1(&a) == 127 ||
+        ip4_addr_ismulticast(&a) || addr == 0xFFFFFFFFu)
+        return 1;
+    return lwip_ready && ip4_addr_eq(&a, netif_ip4_addr(&lwip_eth0));
+}
