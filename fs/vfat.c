@@ -1829,7 +1829,7 @@ int vfat_mount_dev(blkpart_t *bp, int ro, const vfat_opts_t *o,
     fs->root_secs = (fs->root_ents * 32 + bps - 1) / bps;
     fs->root_sec = fs->reserved + fs->nfats * fs->fatsz;
     fs->data_sec = fs->root_sec + fs->root_secs;
-    if (!fs->fatsz || fs->data_sec >= fs->total) {
+    if (!fs->fatsz || !fs->total || fs->data_sec >= fs->total) {
         printk("[VFAT] %s: inconsistent BPB\n", bp->name);
         goto fail;
     }
@@ -1846,6 +1846,19 @@ int vfat_mount_dev(blkpart_t *bp, int ro, const vfat_opts_t *o,
     if (cap < 2) goto fail;
     if (fs->nclus > cap - 2) fs->nclus = (uint32_t)(cap - 2);
     if (fs->nclus == 0) goto fail;
+    /* Cluster numbers run 2..nclus+1 and must stay below the type's bad and
+     * end-of-chain markers (and, on FAT12/16, fit the 16-bit entry field):
+     * a FAT16 BPB claiming more clusters would make the allocator hand out
+     * markers and truncated numbers, cross-linking files.  Refused, as on
+     * Linux. */
+    {
+        uint32_t max = fs->type == 12 ? 0xFF5u : fs->type == 16 ? 0xFFF5u : 0x0FFFFFF5u;
+        if (fs->nclus > max) {
+            printk("[VFAT] %s: %u clusters is too many for FAT%d\n", bp->name,
+                   (unsigned)fs->nclus, fs->type);
+            goto fail;
+        }
+    }
     if ((uint64_t)fs->total * fs->s512 > bp->nsect) {
         printk("[VFAT] %s: filesystem is larger than its partition\n", bp->name);
         goto fail;

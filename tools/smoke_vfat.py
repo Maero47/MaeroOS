@@ -190,6 +190,9 @@ def crafted(man, accel):
     args = ["-M", "q35", "-drive", "file=disk.img,format=raw,index=0,media=disk,snapshot=on"]
     for i, w in enumerate(work):
         args += ["-drive", f"file={w},format=raw,index={i + 1},media=disk"]
+    bad = os.path.join(OUT, "run-badbpb.img")
+    shutil.copyfile(man["badbpb"]["image"], bad)
+    args += ["-drive", f"file={bad},format=raw,index={len(work) + 1},media=disk"]
     proc, sel, log, g = boot(args, accel)
     try:
         smokelib.login(proc, sel, log, timeout=120.0)
@@ -213,6 +216,20 @@ def crafted(man, accel):
             g.sh(f"busybox mount -t vfat {dev} /f && "
                  "busybox rm -rf /f/* 2>/dev/null; echo new > /f/new.txt; "
                  "busybox mkdir /f/d; busybox mv /f/new.txt /f/d/; busybox umount /f", timeout=180.0)
+        # Invalid boot sectors (sdf after the boot disk, crafted and fuzz disks).
+        at_bad = smokelib.mark(log)
+        results = {}
+        for n, what in ((1, "a FAT16 BPB with more clusters than FAT16 can number"),
+                        (2, "0 sectors per cluster"), (3, "300 bytes per sector"),
+                        (5, "FAT size 0"), (6, "3 sectors per cluster")):
+            rc, out = g.sh(f"busybox mount -t vfat /dev/sdf{n} /f")
+            results[what] = rc != 0
+            if rc == 0:
+                g.sh("busybox umount /f")
+        bad_log = "".join(log)[at_bad:]
+        check(all(results.values()), f"invalid boot sectors refused at mount ({results})")
+        check("too many for FAT16" in bad_log,
+              "the oversized FAT16 cluster count is named in the refusal")
         rc, out = g.sh("echo still-alive")
         text = "".join(log)[at:].lower()
         check(rc == 0 and "still-alive" in out and "panic" not in text and "page fault" not in text,

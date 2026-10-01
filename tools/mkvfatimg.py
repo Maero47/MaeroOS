@@ -12,6 +12,10 @@
               complete set, a lone 0x40, ordinals past 20, a bad checksum,
               an orphan set at the end): the files must still read, under
               their short names.
+  badbpb.img  MBR with volumes whose boot sectors were edited to be invalid:
+              a FAT16 BPB claiming more clusters than FAT16 can number,
+              sectors per cluster 0 and 3, 300 bytes per sector, FAT size 0.
+              Each must be refused at mount.
   fuzz-N.img  copies of the FAT16 volume with random bytes written over the
               FAT, the root directory and the first data clusters.
 
@@ -23,6 +27,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -251,6 +256,35 @@ def main():
         fuzz(fz, dst, 4000 + n)
         man["fuzz"].append(dst)
     os.remove(fz)
+
+    # ── badbpb.img ─────────────────────────────────────────────────────
+    img = os.path.join(OUT, "badbpb.img")
+    big_n, small_n = 40 << 11, 2 << 11
+    ext = 2048 + big_n + 2 * small_n
+    # Primaries 1-3, an extended partition 4 holding logical 5 and 6.
+    mbr(img, 60, [(2048, big_n, "6"), (2048 + big_n, small_n, "1"),
+                  (2048 + big_n + small_n, small_n, "1"), (ext, 3 * small_n, "5"),
+                  (ext + 2048, small_n, "1"), (ext + 2048 + small_n + 2048, small_n - 2048, "1")])
+    out = subprocess.run([tool("sfdisk"), "-d", img], capture_output=True, text=True, check=True).stdout
+    parts = {int(m.group(1)): (int(m.group(2)), int(m.group(3)))
+             for m in re.finditer(r"img(\d+) : start=\s*(\d+), size=\s*(\d+)", out)}
+    mkfs(img, 16, parts[1][0], parts[1][1])
+    for n in (2, 3, 5, 6):
+        mkfs(img, 12, parts[n][0], parts[n][1])
+
+    def patch(n, edits):
+        with open(img, "r+b") as f:
+            for off, data in edits:
+                f.seek(parts[n][0] * 512 + off)
+                f.write(data)
+    le16 = lambda v: v.to_bytes(2, "little")
+    le32 = lambda v: v.to_bytes(4, "little")
+    patch(1, [(13, b"\x01"), (22, le16(300)), (19, le16(0)), (32, le32(parts[1][1]))])
+    patch(2, [(13, b"\x00")])
+    patch(3, [(11, le16(300))])
+    patch(5, [(22, le16(0)), (36, le32(0))])
+    patch(6, [(13, b"\x03")])
+    man["badbpb"] = {"image": img, "parts": sorted(parts)}
 
     shutil.rmtree(SRC, ignore_errors=True)
     with open(os.path.join(OUT, "manifest.json"), "w") as f:
