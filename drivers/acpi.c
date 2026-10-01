@@ -417,7 +417,7 @@ uacpi_status uacpi_kernel_install_interrupt_handler(
 uacpi_status uacpi_kernel_uninstall_interrupt_handler(
         uacpi_interrupt_handler handler, uacpi_handle h) {
     (void)handler; (void)h;
-    if (sci_irq < 16) irq_remove_handler((uint8_t)sci_irq);
+    if (sci_irq < 16) irq_remove_handler((uint8_t)sci_irq, sci_trampoline);
     sci_handler = NULL;
     sci_irq = 0xFFFFFFFFU;
     return UACPI_STATUS_OK;

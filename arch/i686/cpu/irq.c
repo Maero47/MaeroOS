@@ -38,10 +38,16 @@ void irq_install_handler(uint8_t irq, isr_handler_t handler) {
     }
 }
 
-void irq_remove_handler(uint8_t irq) {
+/* Unchains one handler and keeps the rest: the line may be shared (ACPI's SCI
+ * with a PCI NIC's INTx, say). */
+void irq_remove_handler(uint8_t irq, isr_handler_t handler) {
     if (irq >= 16) return;
+    int j = 0;
     for (int i = 0; i < IRQ_CHAIN; i++)
-        irq_handlers[irq][i] = (isr_handler_t)0;
+        if (irq_handlers[irq][i] != handler)
+            irq_handlers[irq][j++] = irq_handlers[irq][i];
+    while (j < IRQ_CHAIN)
+        irq_handlers[irq][j++] = (isr_handler_t)0;
 }
 
 /*
