@@ -61,6 +61,18 @@ void irq_remove_handler(uint8_t irq, isr_handler_t handler) {
         irq_handlers[irq][j++] = (isr_handler_t)0;
 }
 
+static isr_handler_t msi_handlers[MSI_VECTORS];
+
+int msi_install_handler(isr_handler_t handler) {
+    if (!apic_available()) return -1;
+    for (int i = 0; i < MSI_VECTORS; i++)
+        if (!msi_handlers[i]) {
+            msi_handlers[i] = handler;
+            return (int)MSI_VECTOR_BASE + i;
+        }
+    return -1;
+}
+
 /*
  * irq_handler — called from irq_common_stub in isr.asm.
  *
@@ -105,6 +117,16 @@ static void irq_handler_body(registers_t *regs) {
      * displace ours, or kicked us out of the idle halt.  It set our
      * need_resched; the switch is irq_handler's return-to-user check. */
     if (regs->int_no == RESCHED_IPI_VECTOR) {
+        apic_eoi();
+        irq_return_signals(regs);
+        return;
+    }
+
+    /* ── MSI (vectors 0xE0-0xE3): edge-triggered messages to the LAPIC. */
+    if (regs->int_no >= MSI_VECTOR_BASE &&
+        regs->int_no < MSI_VECTOR_BASE + MSI_VECTORS) {
+        isr_handler_t h = msi_handlers[regs->int_no - MSI_VECTOR_BASE];
+        if (h) h(regs);
         apic_eoi();
         irq_return_signals(regs);
         return;

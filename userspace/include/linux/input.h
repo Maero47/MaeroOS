@@ -71,6 +71,9 @@
 #define KEY_LEFTALT    56
 #define KEY_SPACE      57
 #define KEY_CAPSLOCK   58
+#define KEY_MUTE       113
+#define KEY_VOLUMEDOWN 114
+#define KEY_VOLUMEUP   115
 #define KEY_F1         59
 #define KEY_F2         60
 #define KEY_F3         61

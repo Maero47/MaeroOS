@@ -134,7 +134,7 @@ uint32_t blk_disk_sectors(int disk) {
     if (d->gone)             return 0;
     if (d->kind == BLK_ATA)  return ata_dev_sectors(d->unit);
     if (d->kind == BLK_AHCI) return ahci_disk_sectors(d->unit);
-    if (d->kind == BLK_USB)  return usb_msc_sectors();
+    if (d->kind == BLK_USB)  return usb_msc_sectors(d->unit);
     return nvme_disk_sectors(d->unit);
 }
 
@@ -163,7 +163,7 @@ int blk_disk_read(int disk, uint32_t lba, uint32_t count, void *buf) {
     if (d->kind == BLK_ATA)
         return ata_dev_read(d->unit, lba, (uint8_t)count, buf);   /* 256 -> 0 */
     if (d->kind == BLK_AHCI) return ahci_read(d->unit, lba, count, buf);
-    if (d->kind == BLK_USB)  return usb_msc_read(lba, count, buf);
+    if (d->kind == BLK_USB)  return usb_msc_read(d->unit, lba, count, buf);
     return nvme_read(d->unit, lba, count, buf);
 }
 
@@ -174,6 +174,6 @@ int blk_disk_write(int disk, uint32_t lba, uint32_t count, const void *buf) {
     if (d->kind == BLK_ATA)
         return ata_dev_write(d->unit, lba, (uint8_t)count, buf);
     if (d->kind == BLK_AHCI) return ahci_write(d->unit, lba, count, buf);
-    if (d->kind == BLK_USB)  return usb_msc_write(lba, count, buf);
+    if (d->kind == BLK_USB)  return usb_msc_write(d->unit, lba, count, buf);
     return nvme_write(d->unit, lba, count, buf);
 }

@@ -1,11 +1,15 @@
 /*
- * USB HID class driver: boot-protocol keyboards and mice, and report-protocol
+ * USB HID class driver: boot-protocol keyboards and mice, report-protocol
  * pointers (absolute tablets such as QEMU's usb-tablet, and mice without a
- * boot interface) through a small report-descriptor parser.
+ * boot interface) and consumer-control interfaces (a keyboard's media keys:
+ * volume, mute, play/pause ...) through a small report-descriptor parser.
+ * xhci.c gives each HID interface of a device its own state, so a keyboard
+ * with a boot interface and a media-key interface works as both.
  *
  * Written from the Device Class Definition for HID 1.11 (report descriptor
  * items, section 6.2.2; boot reports, appendix B) and the HID Usage Tables
- * (keyboard page 0x07, generic desktop page 0x01, button page 0x09).
+ * (keyboard page 0x07, generic desktop page 0x01, button page 0x09,
+ * consumer page 0x0C).
  *
  * Keys held down repeat after REPEAT_DELAY at REPEAT_PERIOD (in 10 ms
  * ticks), as a PS/2 keyboard's typematic repeat does: another press event
@@ -31,7 +35,7 @@
 /* HID keyboard usage (page 0x07) -> Linux evdev key code.  The table is the
  * usage list of the HID Usage Tables 1.12 section 10 matched to the key
  * names of <linux/input-event-codes.h> (numbers, which are ABI). */
-static const uint8_t usage_to_key[0x66] = {
+static const uint8_t usage_to_key[0x82] = {
     [0x04] = 30, [0x05] = 48, [0x06] = 46, [0x07] = 32,   /* a b c d */
     [0x08] = 18, [0x09] = 33, [0x0A] = 34, [0x0B] = 35,   /* e f g h */
     [0x0C] = 23, [0x0D] = 36, [0x0E] = 37, [0x0F] = 38,   /* i j k l */
@@ -72,7 +76,46 @@ static const uint8_t usage_to_key[0x66] = {
     [0x61] = 73, [0x62] = 82, [0x63] = 83,                /* KP 9 0 . */
     [0x64] = 86,                                          /* non-US \ (102nd) */
     [0x65] = 127,                                         /* Application */
+    [0x7F] = 113, [0x80] = 115, [0x81] = 114,             /* Mute Vol+ Vol- */
 };
+
+/* Consumer page (0x0C) usages -> evdev key codes (HID Usage Tables 1.12
+ * section 15; <linux/input-event-codes.h>). */
+static const struct { uint16_t usage, key; } consumer_keys[] = {
+    { 0x0E2, 113 },    /* Mute -> KEY_MUTE */
+    { 0x0EA, 114 },    /* Volume Decrement -> KEY_VOLUMEDOWN */
+    { 0x0E9, 115 },    /* Volume Increment -> KEY_VOLUMEUP */
+    { 0x0CD, 164 },    /* Play/Pause -> KEY_PLAYPAUSE */
+    { 0x0B5, 163 },    /* Scan Next Track -> KEY_NEXTSONG */
+    { 0x0B6, 165 },    /* Scan Previous Track -> KEY_PREVIOUSSONG */
+    { 0x0B7, 166 },    /* Stop -> KEY_STOPCD */
+    { 0x06F, 225 },    /* Display Brightness Increment -> KEY_BRIGHTNESSUP */
+    { 0x070, 224 },    /* Display Brightness Decrement -> KEY_BRIGHTNESSDOWN */
+    { 0x192, 140 },    /* AL Calculator -> KEY_CALC */
+    { 0x18A, 155 },    /* AL Email Reader -> KEY_MAIL */
+    { 0x221, 217 },    /* AC Search -> KEY_SEARCH */
+    { 0x223, 172 },    /* AC Home -> KEY_HOMEPAGE */
+    { 0x224, 158 },    /* AC Back -> KEY_BACK */
+    { 0x225, 159 },    /* AC Forward -> KEY_FORWARD */
+};
+
+static uint16_t consumer_key(uint32_t usage) {
+    for (unsigned i = 0; i < sizeof(consumer_keys) / sizeof(consumer_keys[0]); i++)
+        if (consumer_keys[i].usage == usage) return consumer_keys[i].key;
+    return 0;
+}
+
+/* Key events go to keyboard.c, or into the self-test's buffer. */
+static uint16_t *capture;
+static int capture_n;
+
+static void emit_key(uint16_t key, int pressed) {
+    if (capture) {
+        if (capture_n < 16) capture[capture_n++] = (uint16_t)(key | (pressed ? 0x8000 : 0));
+        return;
+    }
+    keyboard_input_key(key, pressed);
+}
 
 #define REPEAT_DELAY  50     /* 500 ms */
 #define REPEAT_PERIOD 3      /* ~33 per second */
@@ -85,6 +128,7 @@ const char *hid_kind_name(int kind) {
     case HID_KIND_KEYBOARD: return "keyboard";
     case HID_KIND_MOUSE:    return "mouse";
     case HID_KIND_POINTER:  return "pointer";
+    case HID_KIND_CONSUMER: return "consumer control";
     default:                return "none";
     }
 }
@@ -190,6 +234,99 @@ static int parse_pointer(hid_state_t *st, const uint8_t *d, uint32_t len) {
     return st->x.size && st->y.size ? 0 : -1;
 }
 
+/* Find the first Input item on the consumer page and record it: an array
+ * (each field holds an index into a usage range, 0 = nothing pressed) or
+ * one-bit variables with their usages. */
+static int parse_consumer(hid_state_t *st, const uint8_t *d, uint32_t len) {
+    uint32_t usage_page = 0, report_size = 0, report_count = 0;
+    int32_t lmin = 0;
+    uint32_t report_id = 0;
+    uint32_t usages[MAX_USAGES];
+    uint32_t nusages = 0, umin = 0, umax = 0;
+    int have_range = 0;
+    uint32_t bitpos[256];
+    memset(bitpos, 0, sizeof(bitpos));
+
+    for (uint32_t i = 0; i < len;) {
+        uint8_t prefix = d[i];
+        if (prefix == 0xFE) {                     /* long item: skip */
+            if (i + 2 >= len) break;
+            i += 3u + d[i + 1];
+            continue;
+        }
+        uint32_t size = prefix & 3;
+        if (size == 3) size = 4;
+        if (i + 1 + size > len) break;
+        uint32_t uval = 0;
+        for (uint32_t k = 0; k < size; k++)
+            uval |= (uint32_t)d[i + 1 + k] << (8 * k);
+        int32_t sval = (int32_t)uval;
+        if (size == 1) sval = (int8_t)uval;
+        else if (size == 2) sval = (int16_t)uval;
+        uint8_t tag = prefix & 0xFC;
+        i += 1 + size;
+
+        switch (tag) {
+        case 0x04: usage_page = uval; break;
+        case 0x14: lmin = sval; break;
+        case 0x74: report_size = uval; break;
+        case 0x94: report_count = uval; break;
+        case 0x84: report_id = uval & 0xFF; break;
+        case 0x08:
+            if (nusages < MAX_USAGES)
+                usages[nusages++] = size == 4 ? uval : (usage_page << 16) | uval;
+            break;
+        case 0x18: umin = size == 4 ? uval : (usage_page << 16) | uval;
+                   have_range = 1; break;
+        case 0x28: umax = size == 4 ? uval : (usage_page << 16) | uval;
+                   have_range = 1; break;
+        case 0x80: {                                          /* Input */
+            uint32_t start = bitpos[report_id];
+            bitpos[report_id] += report_size * report_count;
+            uint32_t first = have_range ? umin : nusages ? usages[0] : 0;
+            int consumer = (first >> 16) == 0x0C;
+            if (!(uval & 1) && consumer && report_size && report_size <= 16 &&
+                report_count && !st->cc.size) {
+                st->cc.offset = (uint16_t)start;
+                st->cc.size = (uint8_t)report_size;
+                st->cc.count = (uint8_t)(report_count > HID_CC_MAX ?
+                                         HID_CC_MAX : report_count);
+                st->cc.lmin = lmin;
+                st->report_id = (uint8_t)report_id;
+                if (!(uval & 2)) {                        /* array */
+                    st->cc_array = 1;
+                    if (have_range) {
+                        st->cc_umin = (uint16_t)umin;
+                        st->cc_umax = (uint16_t)umax;
+                    } else {
+                        /* an array over a usage list: index into it */
+                        st->cc_n = (uint8_t)(nusages > HID_CC_MAX ?
+                                             HID_CC_MAX : nusages);
+                        for (uint32_t k = 0; k < st->cc_n; k++)
+                            st->cc_usage[k] = (uint16_t)usages[k];
+                    }
+                } else {                                   /* variables */
+                    st->cc_n = st->cc.count;
+                    for (uint32_t k = 0; k < st->cc_n; k++) {
+                        uint32_t u = have_range ? umin + k :
+                                     usages[k < nusages ? k : nusages - 1];
+                        st->cc_usage[k] = (uint16_t)u;
+                    }
+                }
+            }
+            nusages = 0; have_range = 0;
+            break;
+        }
+        case 0x90: case 0xB0: case 0xA0: case 0xC0:
+            nusages = 0; have_range = 0;
+            break;
+        default:
+            break;
+        }
+    }
+    return st->cc.size ? 0 : -1;
+}
+
 static int32_t get_field(const hid_field_t *f, const uint8_t *data,
                          uint32_t len) {
     uint32_t v = 0;
@@ -214,8 +351,16 @@ void hid_setup(hid_state_t *st, const usb_interface_desc_t *intf,
         st->kind = HID_KIND_MOUSE;
         return;
     }
-    if (report_desc && parse_pointer(st, report_desc, len) == 0)
+    if (!report_desc) return;
+    if (parse_pointer(st, report_desc, len) == 0) {
         st->kind = HID_KIND_POINTER;
+        return;
+    }
+    uint8_t ifnum = st->ifnum;
+    memset(st, 0, sizeof(*st));
+    st->ifnum = ifnum;
+    if (parse_consumer(st, report_desc, len) == 0)
+        st->kind = HID_KIND_CONSUMER;
 }
 
 /* ── reports ─────────────────────────────────────────────────────────────── */
@@ -237,12 +382,12 @@ static void keyboard_report(hid_state_t *st, const uint8_t *r, uint32_t len) {
     uint8_t changed = cur[0] ^ st->prev[0];
     for (int b = 0; b < 8; b++)
         if (changed & (1U << b))
-            keyboard_input_key(modifier_keys[b], (cur[0] >> b) & 1);
+            emit_key(modifier_keys[b], (cur[0] >> b) & 1);
     for (int i = 2; i < 8; i++) {
         uint8_t u = st->prev[i];
         if (u > 3 && !key_in(cur, u) && u < sizeof(usage_to_key) &&
             usage_to_key[u]) {
-            keyboard_input_key(usage_to_key[u], 0);
+            emit_key(usage_to_key[u], 0);
             if (st->repeat_key == usage_to_key[u]) st->repeat_key = 0;
         }
     }
@@ -250,7 +395,7 @@ static void keyboard_report(hid_state_t *st, const uint8_t *r, uint32_t len) {
         uint8_t u = cur[i];
         if (u > 3 && !key_in(st->prev, u) && u < sizeof(usage_to_key) &&
             usage_to_key[u]) {
-            keyboard_input_key(usage_to_key[u], 1);
+            emit_key(usage_to_key[u], 1);
             /* The newest key is the one that repeats. */
             st->repeat_key = usage_to_key[u];
             st->repeat_tick = pit_ticks() + REPEAT_DELAY;
@@ -323,11 +468,51 @@ static void pointer_report(hid_state_t *st, const uint8_t *r, uint32_t len) {
     mouse_input(dx, dy, wheel, buttons);
 }
 
+/* Consumer report: the media keys held now against those held before. */
+static void consumer_report(hid_state_t *st, const uint8_t *r, uint32_t len) {
+    if (st->report_id) {
+        if (len < 1 || r[0] != st->report_id) return;    /* another report */
+        r++;
+        len--;
+    }
+    uint16_t cur[HID_CC_MAX];
+    int ncur = 0;
+    memset(cur, 0, sizeof(cur));
+    for (uint32_t k = 0; k < st->cc.count; k++) {
+        hid_field_t one = st->cc;
+        one.offset = (uint16_t)(st->cc.offset + k * st->cc.size);
+        one.is_signed = 0;
+        uint32_t v = (uint32_t)get_field(&one, r, len);
+        uint32_t usage = 0;
+        if (st->cc_array) {
+            uint32_t idx = v - (uint32_t)st->cc.lmin;
+            if (st->cc_n) usage = idx < st->cc_n ? st->cc_usage[idx] : 0;
+            else if (st->cc_umin + idx <= st->cc_umax) usage = st->cc_umin + idx;
+        } else if (v && k < st->cc_n) {
+            usage = st->cc_usage[k];
+        }
+        uint16_t key = usage ? consumer_key(usage & 0xFFFF) : 0;
+        if (key && ncur < HID_CC_MAX) cur[ncur++] = key;
+    }
+    for (int i = 0; i < HID_CC_MAX && st->cc_down[i]; i++) {
+        int still = 0;
+        for (int j = 0; j < ncur; j++) still |= cur[j] == st->cc_down[i];
+        if (!still) emit_key(st->cc_down[i], 0);
+    }
+    for (int j = 0; j < ncur; j++) {
+        int was = 0;
+        for (int i = 0; i < HID_CC_MAX && st->cc_down[i]; i++)
+            was |= cur[j] == st->cc_down[i];
+        if (!was) emit_key(cur[j], 1);
+    }
+    memcpy(st->cc_down, cur, sizeof(cur));
+}
+
 void hid_tick(hid_state_t *st) {
     if (st->kind != HID_KIND_KEYBOARD || !st->repeat_key) return;
     uint32_t now = pit_ticks();
     if ((int32_t)(now - st->repeat_tick) < 0) return;
-    keyboard_input_key(st->repeat_key, 1);
+    emit_key(st->repeat_key, 1);
     st->repeat_tick = now + REPEAT_PERIOD;
 }
 
@@ -347,7 +532,74 @@ void hid_report(hid_state_t *st, const uint8_t *data, uint32_t len) {
     case HID_KIND_POINTER:
         pointer_report(st, data, len);
         break;
+    case HID_KIND_CONSUMER:
+        consumer_report(st, data, len);
+        break;
     default:
         break;
     }
+}
+
+/* ── boot-time self-test ─────────────────────────────────────────────────── */
+
+/* Two consumer-control descriptors as keyboards ship them: a 16-bit array
+ * over the whole usage range behind report ID 3, after a system-control
+ * report (ID 2) that must be ignored; and three one-bit variables (volume
+ * up, volume down, mute) without report IDs. */
+static const uint8_t cc_array_desc[] = {
+    0x05, 0x01, 0x09, 0x80, 0xA1, 0x01, 0x85, 0x02, 0x19, 0x81, 0x29, 0x83,
+    0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x03, 0x81, 0x02, 0x95, 0x05,
+    0x81, 0x01, 0xC0,
+    0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x03, 0x15, 0x00, 0x26, 0xFF,
+    0x03, 0x19, 0x00, 0x2A, 0xFF, 0x03, 0x75, 0x10, 0x95, 0x02, 0x81, 0x00,
+    0xC0,
+};
+static const uint8_t cc_bits_desc[] = {
+    0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01,
+    0x95, 0x03, 0x09, 0xE9, 0x09, 0xEA, 0x09, 0xE2, 0x81, 0x02, 0x95, 0x05,
+    0x81, 0x01, 0xC0,
+};
+
+#define PRESS(k)   ((uint16_t)((k) | 0x8000))
+
+int hid_selftest(void) {
+    static hid_state_t st;
+    uint16_t got[16];
+    usb_interface_desc_t intf;
+    memset(&intf, 0, sizeof(intf));
+    intf.bInterfaceClass = 3;
+    int ok = 1;
+    capture = got;
+
+    /* array: Vol+ down, Vol+ and Mute down, all up; system report ignored */
+    memset(&st, 0, sizeof(st));
+    hid_setup(&st, &intf, cc_array_desc, sizeof(cc_array_desc));
+    ok = ok && st.kind == HID_KIND_CONSUMER && st.report_id == 3;
+    static const uint8_t a1[] = { 3, 0xE9, 0, 0, 0 };
+    static const uint8_t a2[] = { 3, 0xE9, 0, 0xE2, 0 };
+    static const uint8_t a3[] = { 2, 0x01 };
+    static const uint8_t a4[] = { 3, 0, 0, 0, 0 };
+    capture_n = 0;
+    hid_report(&st, a1, sizeof(a1));
+    hid_report(&st, a2, sizeof(a2));
+    hid_report(&st, a3, sizeof(a3));
+    hid_report(&st, a4, sizeof(a4));
+    static const uint16_t want_a[] = { PRESS(115), PRESS(113), 115, 113 };
+    ok = ok && capture_n == 4 && memcmp(got, want_a, sizeof(want_a)) == 0;
+
+    /* variables: Vol+, then Mute instead, then nothing */
+    memset(&st, 0, sizeof(st));
+    hid_setup(&st, &intf, cc_bits_desc, sizeof(cc_bits_desc));
+    ok = ok && st.kind == HID_KIND_CONSUMER && st.report_id == 0 &&
+         st.cc_n == 3;
+    static const uint8_t b1[] = { 0x01 }, b2[] = { 0x04 }, b3[] = { 0x00 };
+    capture_n = 0;
+    hid_report(&st, b1, 1);
+    hid_report(&st, b2, 1);
+    hid_report(&st, b3, 1);
+    static const uint16_t want_b[] = { PRESS(115), 115, PRESS(113), 113 };
+    ok = ok && capture_n == 4 && memcmp(got, want_b, sizeof(want_b)) == 0;
+
+    capture = 0;
+    return ok ? 0 : -1;
 }

@@ -48,9 +48,10 @@ What still stands between MaeroOS and daily use on real hardware:
   framebuffer, and the resolution is the one the boot loader set.
 - **Power.** ACPI sleep states (suspend to RAM); today only S5 power-off,
   reboot and the power button work.
-- **USB.** USB 3 hubs, xHCI interrupts (MSI or INTx) instead of polling, more
-  than one mass-storage device at a time, more than one HID interface per
-  device (keyboards' media keys), keyboard LEDs.
+- **USB.** USB 3 hubs on real hardware (the code is in, but QEMU has no
+  SuperSpeed hub to test it on), isochronous transfers (webcams, USB audio),
+  UAS, a HID keyboard driven in report protocol (today boot protocol, plus a
+  separate media-key interface), the volume keys wired to an ALSA mixer.
 - **Firefox.** Turn the content sandbox back on, cover CJK and Indic text
   with fonts, and shorten the roughly 5 s startup
   (`docs/perf/firefox-startup.md`); audio is only checked by an opt-in run.

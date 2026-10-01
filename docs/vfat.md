@@ -29,10 +29,12 @@ are ignored.
 
 ## USB mass storage in the disk table
 
-`drivers/usb/usb_msc.c` still exposes the raw `/dev/usbdisk0`, and now also
-puts the attached stick into `drivers/blkdev.c`'s disk table as the next SCSI
-disk name after the AHCI disks (`sdb` next to one AHCI disk; Linux numbers SATA
-and USB disks in one `sd` sequence too), with `dev_t` 8:16·n. Its partitions
+`drivers/usb/usb_msc.c` exposes every attached USB disk (each LUN of each
+stick, up to 8) as a raw `/dev/usbdisk<N>`, and also puts it into
+`drivers/blkdev.c`'s disk table as SCSI disk number N after the AHCI disks
+(`usbdisk0` is `sdb` next to one AHCI disk, `usbdisk1` `sdc`; Linux numbers SATA
+and USB disks in one `sd` sequence too), with `dev_t` 8:16·n. A disk takes the
+lowest free N, so a stick unplugged and plugged back in gets its names back. Its partitions
 are scanned like any other disk's and appear in `/dev` and `/proc/partitions`.
 
 Hot-plug: the scan needs disk I/O, which needs the USB lock that `kusbd` holds

@@ -21,5 +21,9 @@ uint32_t keyboard_read_events(uint32_t len, uint8_t *buf);
 int keyboard_has_events(void);
 /* Feed one key event (Linux evdev code) into /dev/input/event0. */
 void keyboard_input_key(uint16_t key, int pressed);
+/* Lock keys as the keyboard LEDs show them, toggled by every press of Num,
+ * Caps and Scroll Lock on any keyboard: bit 0 Num, 1 Caps, 2 Scroll (the HID
+ * boot LED report). */
+uint8_t keyboard_leds(void);
 /* Register a pid that Ctrl+Alt+Backspace will SIGKILL (fullscreen escape). */
 void keyboard_set_kill_target(int pid);

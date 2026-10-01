@@ -229,6 +229,10 @@ static int ctrl_down;
 static int caps_on;
 static int super_down;           /* either Super/Windows key held (Mod4) */
 static int num_on;               /* Num Lock latched (Mod2) */
+/* Volume as the media keys set it (USB consumer-control keys, or a
+ * keyboard's own Mute/Volume keys): traced for now, no mixer behind it. */
+static int media_volume = 50;
+static int media_muted;
 static int altgr_down;           /* right Alt: third level on the TR layout */
 /* Clients that asked for Escape ("grabesc"): terminals and editors need the
  * key itself, so Esc does not close their window. */
@@ -3836,6 +3840,17 @@ static void handle_key(uint16_t code, int value) {
         return;
     }
     if (!value) return;
+    if (code == KEY_MUTE || code == KEY_VOLUMEDOWN || code == KEY_VOLUMEUP) {
+        if (code == KEY_MUTE) media_muted = !media_muted;
+        else {
+            media_volume += code == KEY_VOLUMEUP ? 5 : -5;
+            if (media_volume < 0) media_volume = 0;
+            if (media_volume > 100) media_volume = 100;
+            media_muted = 0;
+        }
+        trace("volume %d%s", media_volume, media_muted ? " muted" : "");
+        return;
+    }
     if (code == KEY_NUMLOCK) {
         num_on = !num_on;
         return;

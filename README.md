@@ -60,7 +60,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | Sound for Linux programs (ALSA ABI) | Alpine's unmodified `aplay` (alsa-utils 1.2.14) in the chroot plays a 44.1 kHz mono S16 WAV through alsa-lib's `default` device and 22.05 kHz U8 and 48 kHz float WAVs through `hw:0`, then `tone` plays through `/dev/dsp`; QEMU's wav capture holds each tone at its frequency (DFT peak and zero crossings), for its length, without dropouts; the same on AC'97 with `--ac97` (docs/audio.md; needs `disk-alpine.img`) | `make smoke-audio` |
 | ACPI (uACPI 6.1.0) | on QEMU's `pc` and `q35` machines the kernel finds the RSDP, loads the AML namespace (`[ACPI] ready`), `poweroff` ends QEMU through S5 (`\_PTS`, `\_S5`), `reboot` restarts it through the FADT reset register (q35) or 0xCF9 (pc, whose FADT has none), and the ACPI power button (`system_powerdown`) reaches init as SIGUSR2 and powers off | `make smoke-acpi` |
 | PC without legacy devices | `-M q35,i8042=off -smp 2` with an ICH9 HDA: no PS/2 controller (`[KBD]  no PS/2 controller`), `/disk` from `ahci0`, both CPUs from the MADT, the desktop's Terminal opened and typed into with a USB tablet and keyboard, and `doas poweroff` typed there makes QEMU exit through S5 | `make smoke-pc` |
-| USB input and storage (xHCI) | the desktop driven with only a `usb-kbd` and `usb-tablet` on a `qemu-xhci`: the Terminal opens and a `doas login root` typed on the USB keyboard reaches a root shell, tablet clicks land where sent, a held key repeats, a `usb-mouse` behind a `usb-hub` moves the pointer, and a `usb-storage` stick behind the hub is read and written through `/dev/usbdisk0` (checksummed against the image), unplugged and plugged back in | `make smoke-usb` |
+| USB input and storage (xHCI) | the desktop driven with only a `usb-kbd` and `usb-tablet` on a `qemu-xhci`: the Terminal opens and a `doas login root` typed on the USB keyboard reaches a root shell, tablet clicks land where sent, a held key repeats, a `usb-mouse` behind a `usb-hub` moves the pointer, the xHCI on MSI-X interrupts; two FAT `usb-storage` sticks (one behind the hub at full speed, one on a root port at SuperSpeed) mounted at once with a file copied each way, the first also read and written raw through its `/dev/usbdiskN` (checksummed against the image); a two-LUN `usb-bot` as two disks; Caps Lock sets the keyboard's LED by SET_REPORT; Volume Up reaches the desktop; the SuperSpeed stick unplugged and plugged back in five times under a looping reader without errors or leaked devices; idle kusbd CPU reported (smoke-pc runs the xHCI on its INTx line) | `make smoke-usb` |
 | UEFI and BIOS boot (Limine, Multiboot 2) | `maeros-limine.iso` under SeaBIOS, OVMF x64 and OVMF IA32: the kernel sees Multiboot 2 from Limine on the expected firmware with an ACPI RSDP tag, the framebuffer (VBE or GOP) comes from the boot info, login works, the desktop starts and a screendump is that size and not blank, and `poweroff` exits through S5 (a firmware that is not installed is reported as SKIP) | `make smoke-uefi` |
 | Linux ABI conformance | 44 musl-built probes (`ports/abiprobes/`), each printing the same `PASS` on Linux, covering findings of the Firefox audit plus later additions: `splice`, `flock`/`fcntl` record locks, `renameat2`, rtnetlink and `/proc/<pid>/fd` link permissions among them; any `FAIL`, missing verdict or wedge fails the run | `make smoke-abi` |
 | Firefox 115.15.0esr | `ff: Firefox painted` (the browser window, about 5 s after `firefox-bin` starts); with `--web`, a page served from the host (HTML, a CSS rule, a PNG) requested and its image on screen about 3 s after Enter (needs the Firefox tree, see `ports/firefox/`) | `make smoke-firefox`, `make smoke-firefox-web` |
@@ -111,7 +111,7 @@ What is proven by the automated QEMU tests in `tools/`:
 - **Hardware coverage is what QEMU emulates.** Every driver is tested against QEMU's
   device models only. There is no Wi-Fi, no Realtek r8169 or virtio device, no GPU
   acceleration (the desktop draws into the boot framebuffer), no ACPI sleep states
-  (only S5 power-off), no USB 3 hubs, and xHCI is polled rather than interrupt-driven.
+  (only S5 power-off), and USB 3 hubs are untested (QEMU has none).
 - **ext4 with its usual features is read-only.** The ext2 driver mounts ext2
   read-write, and ext3/ext4 too when they use no incompatible feature and their
   journal is empty (it writes them like ext2 and never uses the journal). A typical
@@ -271,7 +271,8 @@ read-write, and so does an ext3/ext4 without incompatible features or a pending 
 the kernel heap, capped at 1 GiB per file, `EFBIG` beyond), `fs/devfs.c` at
 `/dev` (`null`, `zero`, `tty`,
 `ptmx`, `pts/`, `random`, `urandom`, `fb0`, `dsp`, `snd/controlC0`, `snd/pcmC0D0p`, `shm`, `input/event0`, `input/event1`,
-`initrd` (the boot module, for the installer), `usbdisk0`, the disk and partition
+`initrd` (the boot module, for the installer), `usbdisk0`, `usbdisk1`, ... (one per
+USB disk), the disk and partition
 nodes, `stdin`/`stdout`/`stderr`), and `fs/procfs.c` at `/proc` (per-pid `status`,
 `stat` and `fd/N` links;
 `self` adds `statm`, `maps`, `fd`, `cmdline`, `environ`, `auxv`, `exe`; plus `meminfo`, `version`,
@@ -306,14 +307,21 @@ keyboard and mouse (`keyboard.c`, `mouse.c`), CMOS RTC (`rtc.c`) and 16550 seria
 (`serial.c`).
 
 USB (`drivers/usb/`): an xHCI host controller driver (`xhci.c`) whose kernel thread
-`kusbd` enumerates root-hub ports and USB 2.0 hubs (hot-plug included) and polls the
-event ring every tick; HID keyboards, mice and tablets (`usb_hid.c`: boot protocol, or a
-report-descriptor parser for absolute pointers) feed the same `/dev/input/event0` and
-`event1` as the PS/2 drivers; mass storage (`usb_msc.c`, bulk-only SCSI) appears as the
-raw block device `/dev/usbdisk0` and joins the disk table as the next `sdX` (partitions
-too, plugged in and out at run time), so a FAT stick mounts with `mount /dev/sdb1 /mnt`.
-Not yet: USB 3 hubs, interrupts/MSI, more than one stick at a time. Run it with `-device qemu-xhci -device usb-kbd -device
-usb-tablet` (and `-device usb-storage,drive=...`).
+`kusbd` enumerates root-hub ports, USB 2.0 hubs and USB 3 hubs (hot-plug included,
+hub ports looked at when the hub's status-change endpoint reports) and sleeps until
+the controller interrupts: MSI-X or MSI to the BSP's Local APIC (vectors 0xE0-0xE3,
+`arch/i686/cpu/irq.c`), else the PCI INTx line through the PIC, shared, with
+interrupter moderation (at most one interrupt per 250 us) and a 500 ms fallback poll;
+`xhci=poll` / `xhci=intx` on the command line force the older modes. HID (`usb_hid.c`)
+drives every HID interface of a device: keyboards (boot protocol, with the Num/Caps/Scroll
+Lock LEDs set by SET_REPORT as the lock keys toggle), mice, tablets and consumer-control
+interfaces (volume, mute, media keys, as evdev `KEY_VOLUMEUP` and friends) through a
+report-descriptor parser, feeding the same `/dev/input/event0` and `event1` as the PS/2
+drivers; mass storage (`usb_msc.c`, bulk-only SCSI) gives every LUN of every stick a
+raw block device `/dev/usbdisk<N>` (up to 8) and a place in the disk table as the next
+`sdX` (partitions too, plugged in and out at run time; a replugged stick gets its old
+names back), so a FAT stick mounts with `mount /dev/sdb1 /mnt`. Run it with `-device
+qemu-xhci -device usb-kbd -device usb-tablet` (and `-device usb-storage,drive=...`).
 
 ### Userland
 
@@ -657,7 +665,7 @@ make smoke-dynlib   # external .so files, zlib, pthreads, AF_UNIX
 make smoke-x        # maeroX handshake, drawing and input events
 make smoke-gtk      # GLib, Cairo, Pango and a real GTK3 window
 make smoke-gui      # the desktop, driven by mouse and keyboard (needs the ISO)
-make smoke-usb      # the same desktop with USB input only, a hub and a USB stick
+make smoke-usb      # the same desktop with USB input only, a hub, two sticks, replugs
 make smoke-hda      # Intel HDA playback through /dev/dsp, checked from a wav capture
 make smoke-audio    # Alpine's aplay through the ALSA ABI (/dev/snd), checked the same way (opt-in)
 make smoke-acpi     # poweroff, reboot, power button and halt through ACPI (pc and q35)
@@ -722,13 +730,18 @@ about the same time.
 A new app becomes testable by calling `gui_trace("app", ...)` where its state changes,
 with click targets as window-relative points (surface point + `GUI_BODY_X`/`GUI_BODY_Y`).
 
-`make smoke-usb` (`tools/smoke_usb.py`, about 40 s) does the same with USB input only:
-a `qemu-xhci` with a `usb-kbd` and `usb-tablet` bound to the VGA display (so QMP
-`input-send-event` reaches them and never the PS/2 devices), and a `usb-hub` with a
-`usb-mouse` and a `usb-storage` stick behind it. It opens the Terminal and logs in
-(`doas login root`, both passwords typed on the USB keyboard), checks that tablet clicks
-land where sent and that the boot mouse moves the pointer, reads and writes the stick
-through `/dev/usbdisk0` (checksummed against the image file) and unplugs and replugs it.
+`make smoke-usb` (`tools/smoke_usb.py`, about 60 s) does the same with USB input only:
+a `qemu-xhci` (on MSI-X) with a `usb-kbd` and `usb-tablet` bound to the VGA display (so
+QMP `input-send-event` reaches them and never the PS/2 devices), a `usb-hub` with a
+`usb-mouse`, a FAT `usb-storage` stick and a two-LUN `usb-bot` behind it, and a second
+FAT stick on a root port (SuperSpeed). It opens the Terminal and logs in (`doas login
+root`, both passwords typed on the USB keyboard), checks that tablet clicks land where
+sent and that the boot mouse moves the pointer, that Caps Lock makes the kernel send
+the keyboard its LED report and Volume Up reaches the desktop, reads and writes the
+first stick through its `/dev/usbdiskN` (checksummed against the image file), mounts
+both sticks at once and copies a file each way (checked in the images afterwards),
+unplugs and replugs the second stick five times while a reader loops over it (no
+errors, no leaked devices) and reports kusbd's CPU time over 10 idle seconds.
 
 `make smoke-pc` (`tools/smoke_pc.py`, about 20 s) boots a PC with no legacy devices:
 `-M q35,i8042=off -smp 2` with an ICH9 HDA codec, the disk on q35's AHCI controller, and a `usb-kbd` and

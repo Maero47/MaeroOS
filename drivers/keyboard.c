@@ -1,5 +1,6 @@
 #include "keyboard.h"
 #include "mouse.h"
+#include "usb/usb.h"
 #include "../arch/i686/cpu/irq.h"
 #include "../arch/i686/cpu/pic.h"
 #include "../arch/i686/cpu/pit.h"
@@ -182,6 +183,11 @@ void keyboard_set_kill_target(int pid) {
 }
 
 static int kbd_ctrl_down, kbd_alt_down;
+static volatile uint8_t kbd_leds;
+
+uint8_t keyboard_leds(void) {
+    return kbd_leds;
+}
 
 static void push_event(uint16_t type, uint16_t code, int32_t value) {
     uint32_t next = (head + 1) % KBD_RING_SIZE;
@@ -254,6 +260,11 @@ void keyboard_input_key(uint16_t key, int pressed) {
         goto out;
     }
 
+    if (!release && (key == 69 /*KEY_NUMLOCK*/ || key == 58 /*KEY_CAPSLOCK*/ ||
+                     key == 70 /*KEY_SCROLLLOCK*/)) {
+        kbd_leds ^= key == 69 ? 1 : key == 58 ? 2 : 4;
+        usb_kick();                       /* USB keyboards' LEDs follow */
+    }
     push_event(EV_KEY, key, release ? 0 : 1);
     push_event(EV_SYN, SYN_REPORT, 0);
 out:
