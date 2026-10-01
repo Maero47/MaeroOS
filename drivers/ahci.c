@@ -168,16 +168,12 @@ static int         ndisks;
 static spinlock_t  ahci_lock;
 
 /*
- * The register windows are mapped at a fixed kernel virtual range: 8 KiB per
- * controller (ABAR is at most 0x1100 bytes), cache-disabled.  The range sits
- * between the kernel-stack window (ends 0xF2000000) and the LAPIC
- * (0xFEE00000).  It is mapped during boot, before the first process is
- * created, so the page table it needs is in every later address space
+ * The register windows are mapped at AHCI_MMIO_VIRT, AHCI_MMIO_STRIDE per
+ * controller (see the kernel virtual map in include/kernel/config.h),
+ * cache-disabled.  They are mapped during boot, before the first process is
+ * created, so the page table they need is in every later address space
  * (pgdir_create copies the kernel PDEs).
  */
-#define AHCI_MMIO_VIRT   0xF7000000u
-#define AHCI_MMIO_STRIDE 0x2000u
-#define AHCI_MAX_CTRL    4
 
 static uint32_t kphys(const void *p) {
     return (uint32_t)(uintptr_t)p - (uint32_t)KERNEL_VMA;

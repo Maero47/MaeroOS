@@ -43,10 +43,7 @@
 #include "../../proc/scheduler.h"
 #include <stdint.h>
 
-/* Kernel virtual window for the controller's register BAR (free range between
- * the kernel-stack window, which ends at 0xF2000000, and the LAPIC). */
-#define XHCI_MMIO_VIRT   0xF6000000U
-#define XHCI_MMIO_MAX    0x00100000U    /* map at most 1 MiB of the BAR */
+/* The register BAR is mapped at XHCI_MMIO_VIRT (include/kernel/config.h). */
 
 #define XHCI_MAX_DEVS    16
 #define HUB_MAX_PORTS    15
