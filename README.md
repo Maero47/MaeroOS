@@ -587,7 +587,7 @@ there: QEMU, started without `-no-shutdown`, must exit through ACPI S5.
 ### Continuous integration
 
 `make check` runs the suites that need nothing beyond a fresh clone: `smoke`,
-`smoke-cmds`, `smoke-toybox`, `smoke-disk`, `smoke-net`, `smoke-net-e1000`, `smoke-fw`,
+`smoke-cmds`, `smoke-toybox`, `smoke-disk`, `smoke-net`, `smoke-net-e1000`, `smoke-tcpsrv`, `smoke-fw`,
 `smoke-dyn`, `smoke-dynlib`, `smoke-x`, `smoke-pkg` (which first builds `repo/` and, on a
 host without one, a repo signing key), `smoke-gui` (which needs the ISO, so `check`
 builds it), `smoke-hda`, `smoke-acpi`, `smoke-ahci`, `smoke-nvme`, `smoke-usb` and `smoke-pc`. It runs them one after another, writes each suite's
