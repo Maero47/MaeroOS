@@ -30,6 +30,8 @@
 #include "../fs/devfs.h"
 #include "../fs/procfs.h"
 #include "../drivers/ata.h"
+#include "../drivers/ahci.h"
+#include "../drivers/blkdev.h"
 #include "../drivers/pci.h"
 #include "../drivers/acpi.h"
 #include "../drivers/rtl8139.h"
@@ -160,7 +162,9 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     ac97_init();
     net_lwip_init();
     ata_init();
-    if (ata_present()) {
+    ahci_init();
+    blk_init();
+    if (blk_present()) {
         vfs_node_t *disk_root = ext2_mount(0);
         if (disk_root) {
             vfs_mount("/disk", disk_root);
