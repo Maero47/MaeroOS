@@ -318,17 +318,18 @@ static int do_tcp(const char *host, const char *port, const char *line) {
         printf("net6probe tcp: cannot resolve %s\n", host);
         return 1;
     }
-    int fd = -1;
+    int fd = -1, err = 0;
     for (ai = res; ai && fd < 0; ai = ai->ai_next) {
         fd = socket(ai->ai_family, SOCK_STREAM, 0);
         if (fd >= 0 && connect(fd, ai->ai_addr, ai->ai_addrlen) < 0) {
+            err = errno;
             close(fd);
             fd = -1;
         }
     }
     freeaddrinfo(res);
     if (fd < 0) {
-        printf("net6probe tcp: connect failed errno=%d\n", errno);
+        printf("net6probe tcp: connect failed errno=%d\n", err);
         return 1;
     }
     set_timeout(fd, 5);

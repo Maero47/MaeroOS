@@ -16,6 +16,8 @@
 #include "lwip/ip4_addr.h"
 #include "lwip/ip6_addr.h"
 #include "lwip/ip_addr.h"
+#include "lwip/ip.h"
+#include "lwip/netif.h"
 #include "lwip/pbuf.h"
 #include "lwip/priv/tcp_priv.h"   /* TF_ACK_NOW for the window-update nudge */
 
@@ -184,7 +186,7 @@ static int sa_to_ip(net_socket_t *s, const net_sockaddr_t *sa, ip_addr_t *ip,
     ip_addr_set_zero_ip6(ip);
     memcpy(ip_2_ip6(ip)->addr, sa->addr6, 16);
     ip6_addr_clear_zone(ip_2_ip6(ip));
-    if (ip6_addr_islinklocal(ip_2_ip6(ip)) || ip6_addr_ismulticast_linklocal(ip_2_ip6(ip))) {
+    if (ip6_addr_has_scope(ip_2_ip6(ip), IP6_UNKNOWN)) {
         uint32_t zone = sa->scope_id ? sa->scope_id : (uint32_t)net_lwip_eth_zone();
         ip6_addr_set_zone(ip_2_ip6(ip), (u8_t)zone);
     }
@@ -781,11 +783,13 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
     if (cr < 0)
         return cr;
     /* Egress firewall: block outbound by remote ip/port if a rule matches
-     * (its rules are IPv4). */
-    if (IP_IS_V4_VAL(dst)) {
+     * (an IPv6 peer only meets the rules for any address). */
+    {
         int proto = (s->type == SOCK_DGRAM_K) ? FW_UDP : FW_TCP;
-        int fr = firewall_check(FW_OUT, proto, ip4_addr_get_u32(ip_2_ip4(&dst)),
-                                bswap16(addr->port));
+        int fr = IP_IS_V4_VAL(dst)
+            ? firewall_check(FW_OUT, proto, ip4_addr_get_u32(ip_2_ip4(&dst)),
+                             bswap16(addr->port))
+            : firewall_check6(FW_OUT, proto, bswap16(addr->port));
         if (fr < 0) return fr;
     }
     if ((cr = route_check(&dst)) < 0)
@@ -928,9 +932,10 @@ static int socket_sendto_locked(net_socket_t *s, const void *buf, uint32_t len,
             pbuf_free(p);
             return cr;
         }
-        if (IP_IS_V4_VAL(ip) &&
-            firewall_check(FW_OUT, FW_UDP, ip4_addr_get_u32(ip_2_ip4(&ip)),
-                           bswap16(addr->port)) < 0) {
+        if (IP_IS_V4_VAL(ip)
+            ? firewall_check(FW_OUT, FW_UDP, ip4_addr_get_u32(ip_2_ip4(&ip)),
+                             bswap16(addr->port)) < 0
+            : firewall_check6(FW_OUT, FW_UDP, bswap16(addr->port)) < 0) {
             pbuf_free(p);
             return -13;   /* -EACCES */
         }
@@ -1075,7 +1080,19 @@ int net_socket_getname(net_socket_t *s, int peer, net_sockaddr_in_t *out) {
         struct tcp_pcb *pcb = s->tcp ? s->tcp : s->lpcb;
         ip_to_sa(s, &pcb->local_ip, pcb->local_port, out);
     } else if (s->udp) {
-        ip_to_sa(s, &s->udp->local_ip, s->udp->local_port, out);
+        /* A connected UDP socket with no bound address names the source a
+         * datagram to its peer would carry, as Linux's ip4/ip6_datagram_
+         * connect binds it: musl's and glibc's RFC 6724 sort read it. */
+        const ip_addr_t *src = &s->udp->local_ip;
+        if (s->connected && ip_addr_isany(src)) {
+            struct netif *n = ip_route(IP_IS_V6(&s->remote_addr) ? IP6_ADDR_ANY
+                                                                  : IP4_ADDR_ANY,
+                                       &s->remote_addr);
+            const ip_addr_t *l = n ? ip_netif_get_local_ip(n, &s->remote_addr) : NULL;
+            if (l)
+                src = l;
+        }
+        ip_to_sa(s, src, s->udp->local_port, out);
     }
     preempt_enable();
     return r;

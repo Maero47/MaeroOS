@@ -734,7 +734,7 @@ static int isock_addr_in(isock_t *s, const void *addr, uint32_t alen,
     ip_addr_set_zero_ip6(ip);
     memcpy(ip_2_ip6(ip)->addr, sa.addr, 16);
     ip6_addr_clear_zone(ip_2_ip6(ip));
-    if (ip6_addr_islinklocal(ip_2_ip6(ip)) || ip6_addr_ismulticast_linklocal(ip_2_ip6(ip)))
+    if (ip6_addr_has_scope(ip_2_ip6(ip), IP6_UNKNOWN))
         ip6_addr_set_zone(ip_2_ip6(ip),
                           (u8_t)(sa.scope_id ? sa.scope_id : (uint32_t)net_lwip_eth_zone()));
     if (port) *port = bswap16(sa.port);

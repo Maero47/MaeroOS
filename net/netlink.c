@@ -108,6 +108,7 @@
 #define ARPHRD_ETHER   1
 #define ARPHRD_LOOPBACK 772
 #define RT_SCOPE_HOST  254
+#define RT_SCOPE_SITE  200
 #define RTPROT_RA      9
 #define IFA_F_TENTATIVE 0x40
 #define LO_ADDR        0x0100007Fu      /* 127.0.0.1, network order */
@@ -411,7 +412,8 @@ static void put_addr6(nlbuf_t *b, netif_t *iface, uint16_t flags,
             ifa->prefixlen = a[i].plen;
             ifa->flags = (uint8_t)f;
             ifa->scope = a[i].scope == 0x10 ? RT_SCOPE_HOST
-                       : a[i].scope == 0x20 ? RT_SCOPE_LINK : RT_SCOPE_UNIVERSE;
+                       : a[i].scope == 0x20 ? RT_SCOPE_LINK
+                       : a[i].scope == 0x40 ? RT_SCOPE_SITE : RT_SCOPE_UNIVERSE;
             ifa->index = (uint32_t)netdev_index(iface);
         }
         nb_attr(b, IFA_ADDRESS, a[i].addr, 16);
@@ -605,7 +607,18 @@ static int do_setlink(const ifinfomsg_k *ifi, const attrs_t *a) {
 
 static int do_newaddr(const nlmsghdr_k *h, const ifaddrmsg_k *ifa,
                       const attrs_t *a, int del) {
-    if (ifa->family == AF_INET6_K) return -95;         /* SLAAC's only */
+    if (ifa->family == AF_INET6_K) {
+        /* Removing one works (busybox `ip addr flush`); adding is SLAAC's. */
+        if (!del) return -95;
+        if (!is_root()) return -1;
+        netif_t *i6 = netdev_by_index((int)ifa->index);
+        if (!i6) return -19;
+        const void *p6 = a->p[IFA_LOCAL] ? a->p[IFA_LOCAL] : a->p[IFA_ADDRESS];
+        uint32_t l6 = a->p[IFA_LOCAL] ? a->len[IFA_LOCAL] : a->len[IFA_ADDRESS];
+        if (!p6 || l6 != 16) return -22;
+        if (i6->loopback) return -95;
+        return net_lwip_ip6_del(i6, (const uint8_t *)p6);
+    }
     if (ifa->family != AF_INET_K) return -97;          /* -EAFNOSUPPORT */
     if (!is_root()) return -1;
     netif_t *iface = netdev_by_index((int)ifa->index);

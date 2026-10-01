@@ -20,8 +20,8 @@ int net_lwip_addr6_is_local(const uint8_t a[16]);
 void net_lwip_kick(void);
 
 /* IPv6 addresses of an interface (lo: ::1/128) for netlink and
- * /proc/net/if_inet6.  scope is the Linux RT_SCOPE value (0 global, 0x20
- * link, 0x10 host).  Returns how many were written. */
+ * /proc/net/if_inet6.  scope holds Linux's IPV6_ADDR_* scope bits as
+ * /proc/net/if_inet6 prints them (0 global, 0x10 host, 0x20 link, 0x40 site).  Returns how many were written. */
 typedef struct {
     uint8_t addr[16];
     uint8_t plen;
@@ -36,6 +36,9 @@ int net_lwip_ip6_addrs(netif_t *iface, net_ip6_info_t *out, int max);
 int net_lwip_ip6_router(uint8_t out[16]);
 /* `a` is in the /64 of one of eth0's valid IPv6 addresses. */
 int net_lwip_ip6_onlink(const uint8_t a[16]);
+/* `ip addr del` / flush of one of eth0's IPv6 addresses (a later RA may
+ * configure a SLAAC one again, as on Linux). */
+int net_lwip_ip6_del(netif_t *iface, const uint8_t a[16]);
 struct netif;
 struct netif *net_lwip_netif_of(netif_t *iface);
 /* eth0's lwIP netif index (the zone of its link-local addresses). */

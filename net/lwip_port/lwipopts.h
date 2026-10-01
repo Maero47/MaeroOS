@@ -86,9 +86,12 @@
 #define TCP_WND                         (16 * TCP_MSS)
 
 
-/* ── MaeroOS firewall: filter inbound IPv4 after ethernet/ARP demux ────── */
+/* ── MaeroOS firewall: filter inbound IPv4/IPv6 after the ethernet demux ── */
 struct pbuf;
 struct netif;
 int firewall_ip4_input_hook(struct pbuf *p, struct netif *inp);
 #define LWIP_HOOK_IP4_INPUT(pbuf, input_netif) \
     firewall_ip4_input_hook((pbuf), (input_netif))
+int firewall_ip6_input_hook(struct pbuf *p, struct netif *inp);
+#define LWIP_HOOK_IP6_INPUT(pbuf, input_netif) \
+    firewall_ip6_input_hook((pbuf), (input_netif))

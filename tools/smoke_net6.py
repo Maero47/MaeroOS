@@ -14,7 +14,9 @@ Checks, in the guest (e1000, disk.img as a snapshot for a writable /etc):
   - getaddrinfo(AF_UNSPEC) of a dual-stack name from a DNS responder here:
     both AAAA and A, the IPv4 one first (fec0::/10 is below IPv4 in RFC
     6724's policy table), and localhost as ::1 then 127.0.0.1;
-  - net6probe tcp to the dual-stack name connects (first address wins).
+  - toybox wget of the dual-stack name connects (first address wins);
+  - the firewall: an any-address rule blocks an IPv6 connect, and lo stays
+    open under "policy in drop".
 """
 import os
 import selectors
@@ -146,6 +148,21 @@ def main():
                   " && cat /tmp/wd.html", timeout=40)
         if "MAEROS_HTTP6_OK" not in out:
             raise AssertionError("wget of the dual-stack name failed")
+        # The firewall covers IPv6: a rule for any address blocks an IPv6
+        # connect (EACCES), and lo stays open under "policy in drop".
+        run(proc, sel, log, "fwctl enable")
+        run(proc, sel, log, f"fwctl drop out tcp 0.0.0.0/0 {port}")
+        out = run(proc, sel, log, f"net6probe tcp fec0::2 {port} GET", timeout=30)
+        if "connect failed errno=13" not in out:
+            raise AssertionError("the firewall did not block an IPv6 connect")
+        run(proc, sel, log, "fwctl flush")
+        run(proc, sel, log, "fwctl policy in drop")
+        out = run(proc, sel, log, "net6probe lo", timeout=60)
+        if "net6probe lo ok" not in out:
+            raise AssertionError("loopback broke under policy in drop")
+        run(proc, sel, log, "fwctl policy in allow")
+        run(proc, sel, log, "fwctl disable")
+        print("firewall over IPv6 ok")
         print("smoke-net6 ok")
         return 0
     finally:

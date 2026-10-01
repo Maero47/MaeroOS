@@ -43,7 +43,9 @@ What still stands between MaeroOS and daily use on real hardware:
 - **SMP scaling.** Replace the single Big Kernel Lock with finer locking.
 - **Networking hardware.** Wi-Fi (an 802.11 stack and a driver), Realtek
   r8169 and virtio-net; today only RTL8139 and e1000 are supported.
-- **Networking stack.** A loopback interface for AF_INET, IPv6, `SO_LINGER`.
+- **Networking stack.** DHCPv6 and static IPv6 addresses, IPv6 nameservers
+  in the native resolver, and a blocking `SO_LINGER` timeout. Loopback, dual-stack
+  IPv6 with SLAAC and ping sockets are in place (`docs/net.md`).
 - **Graphics.** No GPU acceleration: the desktop draws into the boot
   framebuffer, and the resolution is the one the boot loader set.
 - **Power.** ACPI sleep states (suspend to RAM); today only S5 power-off,

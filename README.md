@@ -48,6 +48,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | Installing to a disk (`maeros-install`) | from the Limine live ISO on q35 with the live `disk.img` as `sda` and an empty 1 GiB `sdb`: `maeros-install -l` lists both and marks `sda` in use, installing over `sda` is refused, `maeros-install -y /dev/sdb` writes a GPT (BIOS boot, FAT32 ESP, ext2 root) and Limine; on the host `sgdisk -v`, `e2fsck -fn` and `fsck.fat -n` are clean; then the installed disk alone boots under SeaBIOS and OVMF x64: Limine passes `root=PARTUUID=...`, `/dev/sda3` is `/disk`, login and the desktop work, the ESP (`/dev/sda2`) mounts with the vfat driver and its `limine.conf` names the booted root, and a file written in the first boot is there in the second | `make smoke-install` |
 | `pkg` and the signed repo index | `tools/test_pkg_sign.py` runs the RFC 8032 vectors through the Python signer and the C verifier and rejects altered, unsigned and foreign-key indexes; in the guest, `pkg update` rejects unsigned, tampered and rolled-back indexes, installs and runs busybox, and `install` rejects a tarball whose SHA-256 does not match | `make smoke-pkg` |
 | TCP/IP over lwIP and RTL8139 | `MAEROS_HTTP_OK` fetched from a host HTTP server; `sockprobe` checks that `send` after `shutdown(SHUT_WR)` fails with `EPIPE`, a two-step shutdown ends in a FIN and no RST, closing TIME_WAIT sockets keeps TCP working, and a non-blocking client gets `EINPROGRESS`, `SO_ERROR`, `EAGAIN`, `ECONNREFUSED` and both socket names; `abi2probe net` checks `MSG_NOSIGNAL` and `EPIPE` after a reset | `make smoke-net` |
+| Loopback and IPv6 | SLAAC on eth0 (QEMU user-net `fec0::/64`) in `/proc/net/if_inet6`. A guest TCP server on `127.0.0.1` and `[::1]` is reached by a guest client, an `AF_INET6` listener on `[::]` accepts an IPv4 client as `::ffff:127.0.0.1`, an `IPV6_V6ONLY` one refuses it, UDP runs over `::1`, and ICMP echo to `127.0.0.1` and `::1` works over ping sockets. `toybox wget` fetches from a host server at `http://[fec0::2]:port/`, `getaddrinfo` of a dual-stack name returns A and AAAA in RFC 6724 order, and an any-address firewall rule blocks an IPv6 connect | `make smoke-net6` |
 | Intel e1000, DHCP DNS, name resolution | the same suite on an e1000; the DHCP lease's DNS server is in `/etc/resolv.conf`; against a DNS responder in the harness, `getent` resolves A, AAAA, a CNAME, a PTR and an NXDOMAIN, `/etc/hosts` wins over DNS, and `httpget`, `toybox wget` and `toybox nc` connect by name | `make smoke-net-e1000` |
 | AF_INET server sockets | through QEMU `hostfwd`: `toybox nc -l -p 8080` exchanges a line each way with a host client; `srvprobe tcp` checks non-blocking `accept` (`EAGAIN`), `SO_RCVTIMEO` on `accept`, `poll` and `epoll` on a listener, three host clients queued in the backlog at once and taken with `accept4(SOCK_NONBLOCK\|SOCK_CLOEXEC)`, both socket names of an accepted connection, `EADDRINUSE` and then a `SO_REUSEADDR` rebind over TIME_WAIT, and `shutdown` of a listener; `srvprobe udp` checks a blocking `recvfrom` that `SO_RCVTIMEO` ends with `EAGAIN` and one that waits for the host's datagram | `make smoke-tcpsrv` |
 | Kernel firewall | after `fwctl enable` plus a drop rule the same fetch fails, `fwctl list` reports the firewall `enabled` with the `drop out tcp` rule, malformed rules (`/33`, an overflowing prefix, port 70000, `tcpp`) are rejected under `policy out drop`, and `fwctl flush` restores the fetch | `make smoke-fw` |
@@ -98,8 +99,8 @@ What is proven by the automated QEMU tests in `tools/`:
   cases in `proc/syscall.c`).
 - **Unfinished credential and socket semantics.** `setfsuid`/`setfsgid` just report
   the effective id; a path lookup does not check search permission on the directories
-  it walks through. AF_INET has no loopback interface (a socket can bind
-  `127.0.0.1` but nothing reaches it), and `SO_LINGER` is accepted and ignored.
+  it walks through. `SO_LINGER` only acts with a zero timeout (`close()` sends a
+  reset). A non-zero linger does not make `close()` wait.
 - **One repo signing key per build host.** `index.txt` is Ed25519-signed and `pkg`
   checks it, but the key is created per host (`~/.config/maeros/repo-signing.key`) and
   its public half is compiled into `pkg`: a repo and a `pkg` built on different hosts,
@@ -124,8 +125,9 @@ What is proven by the automated QEMU tests in `tools/`:
   `/proc/<pid>/` lists only `status` and `stat` and resolves `fd/N` links (the full
   set is under `/proc/self`), and
   there is no `/proc/stat`, so toybox is built without `killall` (it matches names
-  through other processes' `cmdline`), `vmstat` and `who`. There is no IPv6 stack:
-  the resolver returns AAAA records, but only IPv4 sockets connect.
+  through other processes' `cmdline`), `vmstat` and `who`. IPv6 is SLAAC only
+  (no DHCPv6, no static IPv6 addresses), and the native resolver reads only IPv4
+  `nameserver` lines (`docs/net.md`).
 - **Only Linux and macOS hosts are covered.** The Makefile looks up `mke2fs`, `debugfs`
   and GNU `sed` on `PATH` (with the Homebrew locations as a fallback) and
   `tools/run-maeros.sh` picks the QEMU display, audio and screen-size probes per host,
@@ -292,6 +294,13 @@ without userspace polling. For Linux network tools, `net/netlink.c` answers
 default route and `IFF_UP`) and the `SIOC*` interface and route ioctls, and
 `net/rawsock.c` provides `AF_PACKET` (with classic BPF filters) and raw `AF_INET`
 sockets, which is what busybox `ip`, `udhcpc` and `ping` in the Alpine chroot use.
+
+The stack is dual-stack. `lo` (`127.0.0.1/8`, `::1`) is interface 1 and the
+NIC is 2. eth0 configures IPv6 with SLAAC from router advertisements.
+`AF_INET6` sockets are dual-stack (v4-mapped peers) unless `IPV6_V6ONLY` is
+set, and ICMP ping sockets need no privilege. `/proc/net/if_inet6`, rtnetlink
+and the firewall cover IPv6, and `getaddrinfo` orders its results by RFC 6724
+(`docs/net.md`).
 
 ### Drivers
 
@@ -650,6 +659,7 @@ make smoke-ext2rw   # two more ext2/ext3 mounted read-write at once, then host e
 make smoke-net      # DHCP, TCP, HTTP GET from the host
 make smoke-net-e1000  # the same on an e1000, plus resolv.conf from DHCP and DNS lookups
 make smoke-tcpsrv   # listen/accept and blocking UDP, from the host through hostfwd
+make smoke-net6     # lo and IPv6: SLAAC, TCP/UDP over 127.0.0.1 and [::1], ping, wget over v6
 make smoke-pkg      # pkg against a host repo: signed index, install, rollback
 make smoke-fw       # firewall rule blocks and unblocks that GET
 make smoke-dyn      # PIE through the musl dynamic linker

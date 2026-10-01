@@ -64,6 +64,42 @@ static err_t maero_lwip_init_if(struct netif *lwif) {
     return ERR_OK;
 }
 
+/* lo's counters (/proc/net/dev, netlink): every packet lwIP's loop netif
+ * sends is also the one it receives. */
+static netif_t *host_lo;
+static netif_output_fn lo_output4;
+static netif_output_ip6_fn lo_output6;
+
+static void lo_count(struct pbuf *p) {
+    if (!host_lo || !p)
+        return;
+    host_lo->tx_packets++;
+    host_lo->rx_packets++;
+    host_lo->tx_bytes += p->tot_len;
+    host_lo->rx_bytes += p->tot_len;
+}
+
+static err_t lo_out4(struct netif *n, struct pbuf *p, const ip4_addr_t *a) {
+    lo_count(p);
+    return lo_output4(n, p, a);
+}
+
+static err_t lo_out6(struct netif *n, struct pbuf *p, const ip6_addr_t *a) {
+    lo_count(p);
+    return lo_output6(n, p, a);
+}
+
+static void lo_attach(void) {
+    struct netif *lo = netif_find("lo0");
+    host_lo = net_find_interface("lo");
+    if (!lo || !host_lo)
+        return;
+    lo_output4 = lo->output;
+    lo_output6 = lo->output_ip6;
+    if (lo_output4) lo->output = lo_out4;
+    if (lo_output6) lo->output_ip6 = lo_out6;
+}
+
 void net_lwip_init(void) {
     /* The stack comes up even with no NIC: socket() only needs the memp
      * pools, and connect()/sendto() then fail with ENETUNREACH (no route),
@@ -72,6 +108,7 @@ void net_lwip_init(void) {
      * UDP pcb" (72 of them in one no-network Firefox boot). */
     lwip_init();
     lwip_inited = 1;
+    lo_attach();
 
     host_eth0 = net_find_interface("eth0");
     if (!host_eth0) {
@@ -290,7 +327,9 @@ int net_lwip_ip6_addrs(netif_t *iface, net_ip6_info_t *out, int max) {
         const ip6_addr_t *a = netif_ip6_addr(&lwip_eth0, i);
         memcpy(out[n].addr, a->addr, 16);
         out[n].plen = 64;
-        out[n].scope = ip6_addr_islinklocal(a) ? 0x20 : 0;   /* link / global */
+        /* Linux's IPV6_ADDR_* scope bits: link 0x20, site 0x40 (fec0::/10,
+         * slirp's prefix), global 0. */
+        out[n].scope = ip6_addr_islinklocal(a) ? 0x20 : ip6_addr_issitelocal(a) ? 0x40 : 0;
         out[n].tentative = ip6_addr_istentative(st) != 0;
         /* SLAAC addresses have a lifetime; the link-local one is permanent. */
         out[n].dynamic = !ip6_addr_islinklocal(a);
@@ -301,6 +340,18 @@ int net_lwip_ip6_addrs(netif_t *iface, net_ip6_info_t *out, int max) {
         n++;
     }
     return n;
+}
+
+int net_lwip_ip6_del(netif_t *iface, const uint8_t a[16]) {
+    if (!lwip_ready || iface != host_eth0)
+        return -99;
+    for (int i = 0; i < LWIP_IPV6_NUM_ADDRESSES; i++)
+        if (!ip6_addr_isinvalid(netif_ip6_addr_state(&lwip_eth0, i)) &&
+            !memcmp(netif_ip6_addr(&lwip_eth0, i)->addr, a, 16)) {
+            netif_ip6_addr_set_state(&lwip_eth0, i, IP6_ADDR_INVALID);
+            return 0;
+        }
+    return -99;                                        /* -EADDRNOTAVAIL */
 }
 
 int net_lwip_ip6_onlink(const uint8_t a[16]) {
