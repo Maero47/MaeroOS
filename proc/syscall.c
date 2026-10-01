@@ -1191,6 +1191,13 @@ static int sys_read(registers_t *regs) {
     /* VFS file read */
     if (f->type == FD_FILE) {
         if (!fd_readable(f)) return -9;    /* opened write-only */
+        /* O_NONBLOCK on a device that can say whether data is there (pty,
+         * terminal, FIFO): -EAGAIN instead of sleeping in its read.  xterm
+         * sets it on its pty master and reads it after every select(); a read
+         * that slept there stopped it serving its X connection. */
+        if ((f->flags & O_NONBLOCK) && f->node && f->node->read_ready_fn &&
+            !f->node->read_ready_fn(f->node))
+            return -11;                    /* -EAGAIN */
         int n = vfs_read_user(f->node, f->offset, buf, (uint32_t)len);
         if (n > 0) f->offset += (uint32_t)n;
         return n;
@@ -1264,6 +1271,9 @@ static int sys_write(registers_t *regs) {
         /* O_APPEND: every write goes to the current end of file (Linux
          * generic_write_checks), whether it was set at open or by F_SETFL. */
         if (f->flags & O_APPEND) f->offset = f->node->size;
+        if ((f->flags & O_NONBLOCK) && f->node->write_ready_fn &&
+            !f->node->write_ready_fn(f->node))
+            return -11;                        /* -EAGAIN */
         int written = vfs_write_user(f->node, f->offset, buf, (uint32_t)len);
         if (written > 0) f->offset += (uint32_t)written;
         return written;
@@ -1556,6 +1566,7 @@ static int sys_open_kernel_path(const char *path, int flags, uint32_t mode) {
              * under the descriptor and the next close jumped through a recycled
              * function pointer. */
             vfs_retain(node);
+            if (!(flags & 0400 /* O_NOCTTY */)) devfs_tty_opened(node);
             current_proc->ofile[i].type    = FD_FILE;
             current_proc->ofile[i].node    = node;
             current_proc->ofile[i].offset  = (flags & O_APPEND) ? node->size : 0;
@@ -3025,6 +3036,15 @@ static int sys_ioctl(registers_t *regs) {
 
     if (fd < 0 || fd >= MAX_FD) return -9;
     proc_file_t *f = &current_proc->ofile[fd];
+    /* FIONBIO (Linux ioctl_fionbio): the descriptor's O_NONBLOCK, on any open
+     * file — xterm sets its pty master non-blocking this way. */
+    if (req == 0x5421) {
+        int on;
+        if (f->type == FD_NONE) return -9;
+        if (copy_from_user(&on, (const void *)(uintptr_t)regs->edx, sizeof(on)) < 0) return -14;
+        if (on) f->flags |= O_NONBLOCK; else f->flags &= ~O_NONBLOCK;
+        return 0;
+    }
     /* Interface and routing ioctls (SIOCGIFCONF, SIOCGIFADDR, SIOCADDRT...)
      * work on any socket, as on Linux (net/netlink.c). */
     if ((f->type == FD_SOCKET || f->type == FD_USOCKET) &&
@@ -9918,6 +9938,29 @@ static int sys_socket_direct(registers_t *regs, int which) {
     }
 }
 
+/* ── sys_membarrier(cmd, flags) — EAX=375 ──────────────────────────────────
+ * musl's dlopen() of a library with TLS issues MEMBARRIER_CMD_PRIVATE_EXPEDITED
+ * so every thread sees the new DTV.  Without the syscall musl falls back to
+ * signalling each thread and waiting for all of them on a semaphore while it
+ * holds the thread-list lock; a thread that is itself waiting for that lock
+ * (pthread_create) then never answers and GTK applications hang at start-up
+ * (Mousepad on maeroX).  x86 orders loads after loads and stores after
+ * stores, so a full fence here, plus the serialising return to user mode on
+ * every other CPU's next kernel entry, gives the ordering the callers need. */
+static int sys_membarrier(registers_t *regs) {
+    enum { CMD_QUERY = 0, CMD_GLOBAL = 1, CMD_GLOBAL_EXPEDITED = 2,
+           CMD_REGISTER_GLOBAL_EXPEDITED = 4, CMD_PRIVATE_EXPEDITED = 8,
+           CMD_REGISTER_PRIVATE_EXPEDITED = 16 };
+    const int supported = CMD_GLOBAL | CMD_GLOBAL_EXPEDITED | CMD_REGISTER_GLOBAL_EXPEDITED |
+                          CMD_PRIVATE_EXPEDITED | CMD_REGISTER_PRIVATE_EXPEDITED;
+    int cmd = (int)regs->ebx;
+    if (regs->ecx != 0) return -22;
+    if (cmd == CMD_QUERY) return supported;
+    if (!(cmd & supported) || (cmd & (cmd - 1))) return -22;
+    __asm__ volatile("mfence" ::: "memory");
+    return 0;
+}
+
 /* ── Dispatch table ───────────────────────────────────────────────────────── */
 
 void syscall_dispatch(registers_t *regs) {
@@ -10094,6 +10137,7 @@ void syscall_dispatch(registers_t *regs) {
         ret = 0; break;
     case 312: ret = 0;                         break;  /* get_robust_list */
     case 386: ret = -38;                       break;  /* rseq: ENOSYS (glibc falls back) */
+    case 375: ret = sys_membarrier(regs);      break;  /* membarrier (musl dlopen) */
     case 265: ret = sys_clock_gettime(regs);   break;
     case 295: ret = sys_openat(regs);          break;
     case 330: ret = sys_dup3(regs);            break;

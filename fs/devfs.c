@@ -601,9 +601,13 @@ static void pty_send_pgrp_signal(pty_pair_t *p, int sig) {
     signal_send_pgrp(pg, sig);
 }
 
+/* Linux tty_check_change(): job control applies only to a process whose
+ * controlling terminal this is.  xterm's parent keeps the slave open while its
+ * child (another session) owns it; neither that nor any other process without
+ * this terminal as its ctty is ever stopped for touching it. */
 static int pty_background_current(pty_pair_t *p) {
     int fg = p->fg_pgrp;
-    if (!fg || !current_proc) return 0;
+    if (!fg || !current_proc || current_proc->ctty != &p->slave) return 0;
     return current_proc->pgrp != fg;
 }
 
@@ -871,11 +875,26 @@ static int pty_ioctl(vfs_node_t *n, uint32_t req, void *arg) {
             vfs_retain(current_proc->ctty);
         }
         p->sid = current_proc->sid;
-        if (!p->fg_pgrp)
-            p->fg_pgrp = current_proc->pgrp;
+        p->fg_pgrp = current_proc->pgrp;     /* Linux __proc_set_tty */
         return 0;
     }
     return -25;
+}
+
+/* open() of a terminal without O_NOCTTY (Linux tty_open_proc_set_tty): a
+ * session leader that has no controlling terminal yet acquires it, if no
+ * other session holds it.  xterm, script and sshd's child rely on this after
+ * setsid() rather than on TIOCSCTTY. */
+void devfs_tty_opened(vfs_node_t *n) {
+    if (!n || n->ioctl_fn != pty_ioctl || !current_proc) return;
+    pty_pair_t *p = (pty_pair_t *)n->private;
+    if (!p || !p->used || n != &p->slave) return;
+    if (current_proc->sid != current_proc->pid || current_proc->ctty) return;
+    if (p->sid && p->sid != current_proc->sid) return;
+    current_proc->ctty = &p->slave;
+    vfs_retain(current_proc->ctty);
+    p->sid = current_proc->sid;
+    p->fg_pgrp = current_proc->pgrp;
 }
 
 static void pty_maybe_free(pty_pair_t *p) {

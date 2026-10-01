@@ -21,6 +21,9 @@
  *   -g WxH   initial window body size
  *   -K       headless only: the test injection FIFO /tmp/.maerox-keys
  *   -T       trace to /dev/tty;  -D also dumps frames there (base64)
+ *   -x       request trace in the log: every request, reply, event and error
+ *            per client (also on when /tmp/.maerox-xtrace exists as a client
+ *            connects)
  *   -L file  log (QueryExtension answers, unimplemented requests...);
  *            default /tmp/maerox.log
  *   -d       daemonize after binding the socket
@@ -42,6 +45,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include "xs.h"
+#include "opnames.h"
 
 #define X_SOCKET_DIR  "/tmp/.X11-unix"
 #define X_SOCKET_PATH "/tmp/.X11-unix/X0"
@@ -60,6 +64,7 @@ static int       dirty = 1;
 static int       pd_x0, pd_y0, pd_x1, pd_y1;
 static unsigned  last_render_ms;
 static int       trace_fd = -1;
+int              xtrace;             /* request trace into the log (-x, or /tmp/.maerox-xtrace) */
 static int       log_fd = -1;
 static int       dumpmode, dumps_done;
 static uint32_t  pending_focus;      /* toplevel to focus after its map */
@@ -154,8 +159,8 @@ void x_error(client_t *c, int code, uint32_t bad) {
     put16(e + 8, c->cur_minor);
     e[10] = c->cur_major;
     out_write(c, e, 32);
-    if (trace_fd >= 0) xlog("error %d op=%d.%d seq=%d bad=0x%x\n", code, c->cur_major,
-                            c->cur_minor, c->seq, (unsigned)bad);
+    if (trace_fd >= 0 || xtrace) xlog("c%d #%u error %d op=%d.%d bad=0x%x\n", c->index, c->seq, code, c->cur_major,
+                            c->cur_minor, (unsigned)bad);
 }
 
 void send_reply(client_t *c, uint8_t b1, const uint8_t data24[24]) {
@@ -165,6 +170,7 @@ void send_reply(client_t *c, uint8_t b1, const uint8_t data24[24]) {
     put16(r + 2, c->seq);
     if (data24) memcpy(r + 8, data24, 24);
     out_write(c, r, 32);
+    if (xtrace) xlog("c%d #%u reply\n", c->index, c->seq);
 }
 
 void send_reply_var(client_t *c, uint8_t b1, const uint8_t data24[24],
@@ -177,6 +183,7 @@ void send_reply_var(client_t *c, uint8_t b1, const uint8_t data24[24],
     put32(r + 4, (uint32_t)words);
     if (data24) memcpy(r + 8, data24, 24);
     out_write(c, r, 32);
+    if (xtrace) xlog("c%d #%u reply +%d bytes\n", c->index, c->seq, extra_len);
     if (extra_len > 0) {
         out_write(c, extra, (size_t)extra_len);
         int pad = words * 4 - extra_len;
@@ -188,6 +195,8 @@ void send_event(client_t *c, uint8_t ev[32]) {
     if (!c->used || c->dead || !c->setup_done) return;
     if ((ev[0] & 0x7F) != KeymapNotify) put16(ev + 2, c->seq);
     out_write(c, ev, 32);
+    if (xtrace) xlog("c%d event %d%s win=0x%x\n", c->index, ev[0] & 0x7F, ev[0] & 0x80 ? " (sent)" : "",
+                     (unsigned)(ev[4] | ev[5] << 8 | ev[6] << 16 | (uint32_t)ev[7] << 24));
 }
 
 /* ── damage ──────────────────────────────────────────────────────────────── */
@@ -745,6 +754,11 @@ static void dispatch(client_t *c, const uint8_t *q, int qlen) {
     c->seq++;
     c->cur_major = q[0];
     c->cur_minor = 0;
+    if (xtrace) {
+        if (q[0] >= 1 && q[0] <= 119) xlog("c%d #%u %s len=%d\n", c->index, c->seq, core_names[q[0]], qlen);
+        else if (q[0] == render_major) xlog("c%d #%u RENDER.%d len=%d\n", c->index, c->seq, q[1], qlen);
+        else xlog("c%d #%u op=%d.%d len=%d\n", c->index, c->seq, q[0], q[1], qlen);
+    }
     core_dispatch(c, q, qlen);
 }
 
@@ -772,6 +786,7 @@ static void process_client(client_t *c) {
         c->setup_done = 1;
         memmove(c->inbuf, c->inbuf + need, (size_t)(c->inlen - need));
         c->inlen -= need;
+        if (access("/tmp/.maerox-xtrace", F_OK) == 0) xtrace = 1;
         xlog("client %d connected (screen %dx%d)\n", c->index, scr_w, scr_h);
     }
     int pos = 0;
@@ -906,6 +921,7 @@ int main(int argc, char *argv[]) {
         if (!strcmp(argv[i], "-H") || !strcmp(argv[i], "--headless")) headless = 1;
         else if (!strcmp(argv[i], "-k")) kiosk = 1;
         else if (!strcmp(argv[i], "-T")) trace_fd = -2;
+        else if (!strcmp(argv[i], "-x")) xtrace = 1;
         else if (!strcmp(argv[i], "-D")) { dumpmode = 1; trace_fd = -2; }
         else if (!strcmp(argv[i], "-K") || !strcmp(argv[i], "--test-keys")) test_keys = 1;
         else if (!strcmp(argv[i], "-d") || !strcmp(argv[i], "--daemon")) daemon = 1;
@@ -915,7 +931,7 @@ int main(int argc, char *argv[]) {
     }
     if (headless) kiosk = 1;
     if (trace_fd == -2) trace_fd = open("/dev/tty", O_WRONLY);
-    log_fd = open(logpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    log_fd = open(logpath, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
     if (slot < 1 || slot > WM_MAX_SLOTS) slot = 1;
     signal(SIGPIPE, SIG_IGN);
 

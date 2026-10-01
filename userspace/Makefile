@@ -712,6 +712,7 @@ $(TESTFILES)/linuxapps: xapp/linuxapps.o $(GUIAPP_DEPS)
 MAEROX_OBJS := maerox/maerox.o maerox/xcore.o maerox/xdraw.o maerox/xfont.o maerox/xrender.o
 $(MAEROX_OBJS): maerox/xs.h include/gui.h include/draw.h
 maerox/xcore.o: maerox/rgbnames.h
+maerox/maerox.o: maerox/opnames.h
 maerox/xfont.o: include/font8x16.h
 
 $(TESTFILES)/maerox: $(MAEROX_OBJS) $(GUIAPP_DEPS)

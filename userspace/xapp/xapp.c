@@ -166,6 +166,32 @@ static int do_remove(const xapp_t *a) {
     return 0;
 }
 
+/* The caller's uid needs a name inside the Alpine root too: GLib, xterm and
+ * the shell look the user up with getpwuid() and fall back badly without one
+ * (no home directory, "I have no name!").  Appends "<user>:x:<uid>:<gid>"
+ * to the root's /etc/passwd and /etc/group when the id is not there yet. */
+static void ensure_account(const char *file, const char *line, unsigned id) {
+    char buf[8192];
+    int fd = open(file, O_RDONLY);
+    int n = fd >= 0 ? (int)read(fd, buf, sizeof(buf) - 1) : -1;
+    if (fd >= 0) close(fd);
+    if (n < 0) return;
+    buf[n] = 0;
+    char key[24];
+    snprintf(key, sizeof(key), ":x:%u:", id);
+    for (char *l = buf; l && *l; ) {
+        char *nl = strchr(l, '\n');
+        char *k = strstr(l, key);
+        if (k && (!nl || k < nl) && memchr(l, ':', (size_t)(k - l + 1)) == k) return;
+        l = nl ? nl + 1 : NULL;
+    }
+    fd = open(file, O_WRONLY | O_APPEND);
+    if (fd < 0) return;
+    if (n > 0 && buf[n - 1] != '\n') write(fd, "\n", 1);
+    write(fd, line, strlen(line));
+    close(fd);
+}
+
 /* Enter the Alpine root, become the caller and exec the app.  Only returns
  * on failure. */
 static void exec_app(const xapp_t *a, uid_t uid, gid_t gid, int wait_server) {
@@ -179,6 +205,14 @@ static void exec_app(const xapp_t *a, uid_t uid, gid_t gid, int wait_server) {
         snprintf(home, sizeof(home), "/home/%s", user);
     }
     char path[128];
+    if (uid != 0) {
+        char line[160];
+        snprintf(line, sizeof(line), "%s:x:%u:%u:%s:%s:/bin/sh\n", user, (unsigned)uid,
+                 (unsigned)gid, user, home);
+        ensure_account(ALPINE_ROOT "/etc/passwd", line, (unsigned)uid);
+        snprintf(line, sizeof(line), "%s:x:%u:\n", user, (unsigned)gid);
+        ensure_account(ALPINE_ROOT "/etc/group", line, (unsigned)gid);
+    }
     snprintf(path, sizeof(path), ALPINE_ROOT "%s", home);
     mkdir(ALPINE_ROOT "/home", 0755);
     if (mkdir(path, 0700) == 0 || errno == EEXIST) chown(path, uid, gid);
