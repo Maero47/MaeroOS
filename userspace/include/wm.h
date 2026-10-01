@@ -22,6 +22,7 @@ enum {
     WM_EVENT_CLOSE = 5,
     WM_EVENT_SCROLL = 6,   /* mouse wheel at (x,y); value = notches (+ = up) */
     WM_EVENT_RAWKEY = 7,   /* uncooked key: code + press/release + modifier mask */
+    WM_EVENT_PTR = 8,      /* raw pointer: x, y, button = mask, value = inside */
 };
 
 /*

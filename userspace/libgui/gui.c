@@ -328,6 +328,14 @@ void gui_set_mouse_handler(gui_window_t *gui, gui_mouse_cb callback) {
     if (gui) gui->on_mouse = callback;
 }
 
+/* Asks the desktop for the raw pointer stream ("rawptr"); with it set the
+ * cooked "mouse" events still arrive and are ignored. */
+void gui_set_ptr_handler(gui_window_t *gui, gui_ptr_cb callback) {
+    if (!gui) return;
+    gui->on_ptr = callback;
+    wm_command(&gui->wm, "rawptr %d %d", gui->slot, callback ? 1 : 0);
+}
+
 void gui_grab_escape(gui_window_t *gui, int on) {
     if (gui) wm_command(&gui->wm, "grabesc %d %d", gui->slot, on ? 1 : 0);
 }
@@ -716,8 +724,12 @@ int gui_poll(gui_window_t *gui) {
     while ((got = wm_next_event(&gui->events, &event)) > 0) {
         if (event.slot != gui->slot) continue;
         count++;
-        if (event.type == WM_EVENT_MOUSE) {
-            handle_mouse(gui, &event);
+        if (event.type == WM_EVENT_PTR) {
+            if (gui->on_ptr)
+                gui->on_ptr(gui, event.x - GUI_BODY_X, event.y - GUI_BODY_Y,
+                            event.button, event.value);
+        } else if (event.type == WM_EVENT_MOUSE) {
+            if (!gui->on_ptr) handle_mouse(gui, &event);
         } else if (event.type == WM_EVENT_SCROLL) {
             handle_scroll(gui, &event);
         } else if (event.type == WM_EVENT_KEY) {

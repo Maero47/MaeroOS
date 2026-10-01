@@ -1,0 +1,561 @@
+# Pins for the X11 apps repo of ports/alpine/prepare.py (ALPINE_X=1).
+file abseil-cpp-int128-20240722.1-r1.apk 1d8ef3c1af3fa70499a98ccf5e402434af93039f70feb36da2ae392bbf53b337
+file abseil-cpp-raw-logging-internal-20240722.1-r1.apk 9a3119f6c8a806a3d6e75d0c70eb6722dbf2c2114b4272d4b57532f1ddea9f1c
+file abseil-cpp-strings-20240722.1-r1.apk e073ebb6c8df776f5b2d17016598ea6b62f382023d6bf9618b289b2b47e9a1b7
+file abseil-cpp-strings-internal-20240722.1-r1.apk f9c27945eacd71e7f7585b12437a3acd476fc8a1c5398fa3b382ed60edfa544f
+file acl-libs-2.3.2-r1.apk 377073374b782268065b776a0bffeac053b76ea474155786374918f69a8c0446
+file adwaita-icon-theme-48.1-r0.apk 602b32a597a0888bd49dfea2e37680996b0c70f367bbcc995eed0dc409e4e46a
+file alsa-lib-1.2.14-r0.apk 5dd1bf1a99d68eb40cb9254e8eda7135f2b0af9be8453c69b904409675679fac
+file aom-libs-3.12.1-r0.apk 23a9d8c7baf585205f97ccf2f3fbe3de64566c569d0fef9fb533f24e9ecf8523
+file appstream-glib-0.8.3-r0.apk ef594c9a32a73293c6c14905601b8e0349fc1d76ab6c589ed4b7429e079e39a1
+file at-spi2-core-2.56.5-r0.apk 63494f51b890fa0782b00e8f10b8f3aad618aa410193c6bfd2de48064d24cd3a
+file at-spi2-core-libs-2.56.5-r0.apk 36630dc6a72f77fa58bc45db8635da781b07f10fe3aa955af24abe590a0bef21
+file avahi-libs-0.8-r21.apk 0a3637a8c658880e8d2fe8c9145f6fdcbfba9bf2082b61c2f9e31b734e1833cc
+file babl-0.1.114-r0.apk 38af98fdab7d6779b1f2d80eca4f2fbcc97350cce59b72529f7288fd48cfc77a
+file brotli-libs-1.1.0-r2.apk 44182528fb903e97b14dc5848732752873e1a21ecc21d17c4538e2c0b1f1101e
+file busybox-1.37.0-r20.apk 6e166329b22c6113f0057085cb7d84ffde887e7af00e6a08f86a9a130da6f523
+file busybox-binsh-1.37.0-r20.apk 41d05528c044c0d405742406eb34c56682e390c02023ac6d52a2b1010e36a0b1
+file c-ares-1.34.8-r0.apk 23adbfe5527f89aeddd3f364adc36848b7bde8b246efce7e2905f8f25a247423
+file ca-certificates-bundle-20260909-r0.apk 240311b7ebb8da05466a800371b86a7e0052a5a4537dd60426cc7b03c62d5df3
+file cairo-1.18.4-r0.apk 546348c5f3ff20e3a735358a24c9bc900f505c05b5656bdc62e5981d3dc27e75
+file cairo-gobject-1.18.4-r0.apk c2332a4ad724bfbe12c155ca313ed0b8cf8c01bceda85472d19c62fb3cd920ed
+file cjson-1.7.19-r0.apk 5b726b757044d6ff225d4168258ce47f651f4b6c88344c461163b89612da2b52
+file cups-libs-2.4.18-r0.apk 2a00747fd95c449b9ff251aacb161b0f90db1f2cf7f8f19cf0234505872045b9
+file dbus-libs-1.16.2-r1.apk 4d803caa3ab180bbf5062c66a9bc6422de72820e4b996ab870d134653dc16116
+file desktop-file-utils-0.28-r0.apk e839baa294c1e8c7f97f524c9fa9bd72a9c02de7e3307bd466c1b4dd6c609218
+file enchant2-libs-2.8.10-r0.apk 901630d9b625da18472b6fff07a58c9ae4bbc3220f7df5a27634924c29c3887b
+file encodings-1.0.7-r1.apk 4761b1cc97b6965b5d4ed4541da3847339e922a6990efb1bbb7809139b9c8802
+file eudev-libs-3.2.14-r5.apk 96bdbfcca7df31c1ccb95f8cb1f8cc323015f02e86139cdc0bf5c3e327903bcc
+file exiv2-libs-0.28.7-r0.apk 946cffd1cd2f7224617cb5a3bd783e1202e1fdf255b35a863fc6ecf491401c20
+file feh-3.10.3-r0.apk 265537b24889fd0b4beec6fff9164a4e9a1bd347b3b06b3f4477183f07c07f0d
+file ffmpeg-libavcodec-6.1.2-r2.apk 2bfe4dc4b016ab5ed23d7fdeb3f7a4e446d2d6beb057e3e88a58a84a5aee97cc
+file ffmpeg-libavdevice-6.1.2-r2.apk a5d3e0a57d2ac1d0fdfa9cb005622693ac6a08f0d2188a62d73dd3bae8942ad2
+file ffmpeg-libavfilter-6.1.2-r2.apk 81c95ca856de2f0e2059b10322d09fae560849cef4ea3fc8f0f108d1825487a6
+file ffmpeg-libavformat-6.1.2-r2.apk d19668aa23df88ce0fdc81e5a118613fb2a84aec4bf401ae130a48847d6e18f8
+file ffmpeg-libavutil-6.1.2-r2.apk 5fbc94c0dd66f1a4edf81645a1f2b613b38cd8d91ecd70d5b44b8bdd66c579d3
+file ffmpeg-libpostproc-6.1.2-r2.apk e78343733d0093e9f13512ef818e44fd4e13b1af2bbdb8644220789de50c0c68
+file ffmpeg-libswresample-6.1.2-r2.apk d636674bcd20d5f366413a5fc8cca3750cdb679a90a1513e8a63ac665fdd9b2e
+file ffmpeg-libswscale-6.1.2-r2.apk 37a2a2dd95f5cdb36756b424bc56fb710e335a474f7b5e81c17aed9935784929
+file fftw-double-libs-3.3.10-r6.apk 9f7a83e2fd87a0dbd5fba0828bf03117be346c1def0087af159400feb3972086
+file font-dejavu-2.37-r6.apk da12cdc27a972e94de45c6943f6a026d68cf1cc8f003c5d25a3008b491cd5773
+file fontconfig-2.15.0-r3.apk e75dd1f6419b3fa672c83f4b16bbaebd015757d2f410ac5d04a53c72ba3c7281
+file freetype-2.13.3-r0.apk 5b483760e87dd3ec30b84513effe6374f266d18725f38443ca7e580512667b2a
+file fribidi-1.0.16-r1.apk b8328a996fd5102a9458120b17a8f1ab5e3e048e2f78dd8f515fd9b38ee573d9
+file galculator-2.1.4-r4.apk dd65cfc4a9fcb16231c041c8a8fc821de564c7e11a89e96b4b40b63befaec250
+file gdbm-1.24-r0.apk 5776e9586fc0520f2029cd77e8acbdd21ee586867eb518f71e90fe45d2454960
+file gdk-pixbuf-2.42.12-r1.apk 89eae92bf1a18802d1484e196e37dd0d6704d54365c836708464f355812c8196
+file gegl-0.4.62-r0.apk 3c06a76f35186f57917abd42c05e966bdeec7e9512dba0283f75c62656145d6a
+file gexiv2-0.14.6-r0.apk 7e4d3f14109a6b2015c8feab52a5a00f9bedb8bcdaf6c089603260669f012f90
+file giflib-5.2.2-r2.apk 190a253d8f313e4e221328ade72970ec3fd585906296d3b5e64ea343fc817acc
+file gimp-3.0.4-r0.apk 5653c2b2aa1dab5debd1afa8127da2cd26030dd42a56c05fcab597c5ad6dc699
+file glib-2.84.4-r0.apk 3968ecacf16189e4ebf1f9695dfb1aee386c681424642f6f8e10f1fe907c6f85
+file glslang-libs-1.4.309.0-r0.apk cf3e7a759ce23c9fb02d3877e8f1a2224183017054264437e1f36c2d4765efc2
+file gmp-6.3.0-r3.apk 68a7c7c9ef11706495b73e903c035573d12e48e6ad199a52251dae9c047d27a8
+file gnutls-3.8.13-r0.apk 09eff5471f142fd642f44f3df9eadccacb47cd3ddce921087bb17ec20c1f1e27
+file gobject-introspection-1.84.0-r0.apk fb9bec01e54141b56cbca0e87b767b6de863fdd2dd49058dcbc35c3466e4095a
+file graphite2-1.3.14-r6.apk 3bb0632dfb733541190195c71e4a25f901e03f17196284d1ebd8a7405c0d7a69
+file gsettings-desktop-schemas-48.0-r0.apk 939ffa797d9b8b3c95fd771c61222f3ac4a57bf5c2099fb68cee500b1546a763
+file gspell-1.14.0-r1.apk a146ac7ea420723f8871dc017c9e000df7c2ce33c699a9140ccc385eff3499e8
+file gtk+3.0-3.24.50-r0.apk 789bd16ba7b4efaed62705769f3941e6c5276ece70cb95ccd46532f218a101f4
+file gtk-update-icon-cache-3.24.50-r0.apk 3667424da2e422f8dca94b706212383fbc4ed1e81dab90400704a30399d67bf8
+file gtksourceview-3.24.11-r3.apk 3ce6c09a6bcb316546218c37f292ad65d2318851c780aee7d5804c882b29ca45
+file harfbuzz-11.2.1-r0.apk cf2a4d05171b230fad75abe511ff6333be505e13cbe51e24c974668e6cbf4f7d
+file hicolor-icon-theme-0.18-r0.apk 287b27b3e281ddbbe73f83a27e710eafa3048375d1f5458d9f78da9565f0550e
+file hwdata-pci-0.395-r0.apk 8d798150cdc59feab90ff4144297eb29a290cb22abfff8ab3b163297a5aae300
+file icu-data-en-76.1-r1.apk 75ff8210622b992668338c3430826a8a3cd94a43c54c8bae5cefa609198d08d2
+file icu-libs-76.1-r1.apk 62fd66a367b1e9abad6dffa90604b638354018389068d62fe601ee2436a9dcbc
+file imath-3.1.12-r0.apk c997f3bf27f0f7bd189ec01a21df73e555786a669ca8936d958e07545784b7d5
+file imlib2-1.12.4-r0.apk 4732fe5324066c094cd65a175101042d465865078d94fd5554d958886cad7d8d
+file inih-60-r0.apk 6d671c712b3c4ed87813185d49d68be51e437a8a9817b65aaf7912581f610b1a
+file inih-inireader-60-r0.apk 4ff20a10da475a26dc88ee0a050ff5de53f8ce9b9d5e6b6b0e6313649282791e
+file iso-codes-4.17.0-r0.apk fb496542748a8b1a21efd3e7063c843167654a841f619115336747b30b2bee2d
+file jack-1.9.22-r4.apk 2824619e669771b8a8604f0edf0d78398bdd869fd8e3bacff1409cdeee26f7d0
+file json-c-0.18-r1.apk f50b047578dd96ad0f4a62e87e8d2212b8d0bb173d50c10ba9f060f7fed079a8
+file json-glib-1.10.8-r0.apk cec28335992aca6bf85fb219a12103dc4e8c2c5b110e74d2cd4bc67bdf58d021
+file lame-libs-3.100-r5.apk 871059e1b499a215171dc52488e442aabbc7dc4682d4994b2ec6c2a67c004aea
+file lcms2-2.19-r0.apk d2ddf4698ad3c58a8004d09b4a563df276fc1efd4d8bf3bd7d44920503ad8332
+file libarchive-3.8.3-r0.apk 7f36c36dfa9086615d7b7a8f9c38a50bce78a4e647faa3295be085a786a765d9
+file libass-0.17.3-r0.apk de9b9ce0c3865611960b62aff6897567184157956e50b25e5a94e6e8dbf2a931
+file libasyncns-0.8-r4.apk 8ed6ed4856912d2680b2187a6e28e94c717f8e68ae30880095777f3b607ff373
+file libatk-1.0-2.56.5-r0.apk bd5b6b67e3ac9a510724d3a3d556d0a346da2d8f37764f5fa5ee7ae1a73595cd
+file libatk-bridge-2.0-2.56.5-r0.apk da3f6826ab2e540993eea9cc541770f6ac7b307d95dedd0f455bfe62cc41428d
+file libblkid-2.41.6-r1.apk b536871f26d239656f839e067868aa2582e9393e5bc5107765d301b7b0707f7c
+file libbluray-1.3.4-r1.apk 1f7c9f68d9112852cb7885af5acc68a99dd2fa106d5c5f246912e3753b27f52e
+file libbsd-0.12.2-r0.apk 2752ef602ac5d2dcfffdef61ca0abcbe16270369f129e5e0ef2216056593b2a9
+file libbz2-1.0.8-r6.apk bdd77af63b97e79714d1ff0baa8ca08c18098b7987f24f11b52d9f11ba1bcadd
+file libcaca-0.99_beta20-r4.apk 92bb0f88d615233bd62f58340a66e1bfecd45414176a91ac52d9c7ca044d69e0
+file libcamera-0.5.1-r0.apk 66eb8351e93bd135c9c8811cb6914fb6b8ea88d2eefd64c1b1a23e5e4379be62
+file libcamera-ipa-0.5.1-r0.apk 4dec0d011cce876fe3bfe841cb1a81e0af4b079fdb160324eda9f49be2aa8f42
+file libcdio-2.2.0-r0.apk a63c0bf1b29460d9741df02a7240ed6c83d24f6d0f64d44b3d2a00923b1d00d9
+file libcdio-paranoia-10.2.2.0.2-r2.apk e0fddf3eea1391a4ffe0b09f45a16b7053d798597a00c58ff3a4fde72620bfd9
+file libcrypto3-3.5.9-r0.apk 5e89b3fcf9ed3aa5ef64f8bf84088fd924ca2c18c591c9a5b67292574003a22e
+file libcurl-8.14.1-r3.apk 736f4987c7c46cb0c1531896cbd8629acb97c1348dbb8b0c1b317e7134facd44
+file libdav1d-1.5.1-r0.apk 59ab62355ee6d28a900f7280c97ccbb65c54f28b3bc49af080bb4ca759dfae25
+file libde265-1.0.15-r1.apk 8f0863ba85f6db783baba41367fefc5202e75ee7b5e11ca9b0d72ca1a064c2b6
+file libdeflate-1.23-r0.apk 84143100d5deb4d4ab3710c79916d7511e06d93e7c3ac42c7b1a9e7e2bcc6339
+file libdisplay-info-0.2.0-r0.apk a58745de92b59aa928623715ac5ca23c185102b1e312478998b6bca3c2643681
+file libdovi-3.3.1-r1.apk a6f8abd72e8af2525e67aef13a61529149e644bd6de8ad98554fa2b2b4115d3a
+file libdrm-2.4.124-r0.apk d9e6add4f5acd946369b6e2e08a2e038dfc4434e6ec6a9242f9eb991c3f822f0
+file libdvdcss-1.4.3-r0.apk 0c02d9feb424d40a273fe7e57fd15684be5a5c08929cc92e2120da7bfe68ee67
+file libdvdnav-6.1.1-r1.apk 02d3e1d3dfdd5d623c91aa44a3134d446aa36be91895190def307a13119a69e2
+file libdvdread-6.1.3-r2.apk 29f119e8babdcb8698f97ecd12de464f6c7c5bad24c3f167ad9e4d942769a571
+file libeconf-0.6.3-r0.apk a7a6cd5efb005dc5e693cdeb31ed857929a01573c993b38eceaa3c5c29dfce3f
+file libelf-0.193-r0.apk e1dc3c02d560a19b6d7df95d3eeb620de7595a9a604c1e27202c9e72a11843ac
+file libepoxy-1.5.10-r1.apk 7f3ff179350e8b988b620bc2971d6db01c539f843da3ea4b6b11f4e368b0580c
+file libexif-0.6.25-r0.apk f862b7d9a13d15ca54311e2d5bc28379c1050962997a8cb2bfa1fb12bc7faa0d
+file libexpat-2.8.5-r0.apk fa28ea230b7c1f68a67e1fcfbf8ab6c09ec41266608bb4dab2fe0ebbd0cf991a
+file libffi-3.4.8-r0.apk ad588b91a38f0c2828347080c96a39062af51a1f06ea3d5e170a988781ef18b6
+file libflac-1.4.3-r1.apk 67b9baf004a52cf123f8cabf405028ebc30927c00fdad4543b72cc1ecb6272ac
+file libfontenc-1.1.8-r0.apk 374a239c1e755a2cfd9c46b04539f81555ec7f309250352171a2f869a29e58ab
+file libgcc-14.2.0-r6.apk a34b11774b5129374540676551071c60486a40ff507812d001a144ae44ffd7ea
+file libgomp-14.2.0-r6.apk 4629f1e618e63aa58ebc030684bb538d20f3998d1933ed74b2712112374d2aa3
+file libgtop-2.41.3-r1.apk 7c1953b2fc7e9339ccad58cc0886b73966351a310dad4c5e700e6694ce6d5618
+file libheif-1.19.8-r1.apk 4f6bede679d895fd1f878e50ab22e5b70ee76e1c547a9eb32483a000de036352
+file libhwy-1.0.7-r1.apk f4ab87eef1b49ef4f662aa5bbde808a80cd0119e04980378627f30af9ebc94d3
+file libice-1.1.2-r0.apk 9f14b0a32ca177e3d01f851e079c9706c0c223f842ed3c10c9b304a36cf21f19
+file libid3tag-0.16.3-r0.apk 480fc31276813ffa7c3cc544c1ef5de283afc8a973014a3e3138f1ec3c869437
+file libidn2-2.3.7-r0.apk b11a65039a6f2b92038502890252d23736325faf656ae9a24cfe67c81c7080d7
+file libintl-0.24.1-r0.apk fb7e92fb73abbcbae080aba6241d7dd1d552b841023cef072f2f12dfa9caf008
+file libjpeg-turbo-3.1.0-r0.apk b12343409a02a9037adfb7e85abba721a8eb3de8f2e15ba139cdddb1dfdf2c2a
+file libjxl-0.10.3-r2.apk abfe4d57e625e107e42fd54d727953a38b44f2bdf21e54436c9c7f79e8f193fe
+file libltdl-2.5.4-r1.apk 14a719c18a865e236249f63596759e99f73632e67b016a1ca67f920eeeddee31
+file libmagic-5.46-r2.apk e6bfd8c415c3bad75f5a646eaad8cc7e67786db46047950ae5bc15f4ec18295e
+file libmd-1.1.0-r0.apk 30b039e986379f41d2cd7fc3940e2ce97a2d42b8ac56d0bbc0164c85809250f8
+file libmount-2.41.6-r1.apk 0e693b246131572ec34289918698fe0f44babe3ef528163787b92775c4bfbfc7
+file libmypaint-1.6.1-r0.apk 0a0dd5482532966ef258858db4e4f586dacbcef90cf46912d547276628a72a52
+file libncursesw-6.5_p20250503-r0.apk b1262e30c3eb0c9a9b74dba4f33c36ca37e33c4a060429af22f371236bfd4d61
+file libogg-1.3.5-r5.apk c4c223317f85cf10237986cc20d59494ffd47fa56e17099ad8c5e216eac4b80e
+file libopenmpt-0.7.15-r0.apk 38b24ff907bf2468b6da143086a2616ed5c82f9cea9df6900fe52d9c82790e5b
+file libpanelw-6.5_p20250503-r0.apk 99d7af1e225dc199179f892b577f8ac74d7b7a3da08cd7bc7450fd838c8f8361
+file libpciaccess-0.18.1-r0.apk 3756d56137e590bfca7d9bb9945ae1be81e4a9c9daa3494f9d080eac3368189b
+file libplacebo-6.338.2-r3.apk 80df8b2326bd47c868358cf919d4fa6cfe99afbdd6a800bf5b811d6306b0c720
+file libpng-1.6.59-r0.apk 835ca8b00a0cf0cd9e133940b4ad3223c710b9cf95657d4f50c6f8b300cafb97
+file libpsl-0.21.5-r3.apk 1fb1abe0eb7329d261364e15547f4d3fc4e394dfc1519cbaaca293b5add5ee76
+file libpulse-17.0-r5.apk b823520e54ec29d6729f68bec73892237a9475b003864a3f1f0f6d9223523140
+file libraw-0.21.4-r0.apk 1e984d75c726e4ef329fc0ef2315e9eaabc79ef37cd9655fa3c1ea838b9fc60c
+file librist-0.2.10-r1.apk 6d792f1ef5cdb1e3231083e9607e6ed5122748c876c222b12bf429cc9cb511a3
+file librsvg-2.60.0-r0.apk f59c5949ee589f9cf7e0a1fbcfd14957565886ac06563ed87ea680402a17152c
+file libsamplerate-0.2.2-r3.apk b39180a7d1ab2a2f3363c9e21f3543c3f6c0e5bbf6d5dd293dbd57c8cc86d37e
+file libsharpyuv-1.5.0-r0.apk a11c2409344b9601e17c2a2bfb3d318ad0fb7c4d0b1b7aeec110b1953298e543
+file libsixel-1.10.5-r0.apk a050ec6fec21c127f24cac0f45549210245def69230c9e15bbc6754560a2cadf
+file libsm-1.2.5-r0.apk 989cd01817c7d485ee78206cd2a43b6259ff4c6051ec1b284470c19d2e689241
+file libsndfile-1.2.2-r2.apk 7cf7a3f9f95c1e4d8f22f6b9fa9126020e1aa36c6a96ccdca985299528f7de6c
+file libsodium-1.0.20-r1.apk 177339e165129dce71b4e45cf3b48926f7187a0253b98e2ab397178fc998da78
+file libsrt-1.5.3-r1.apk 94fdbe01ccc21bc7e76bce2076880bdf6c581b4642ee9d31f5eacc0af1027a7c
+file libssh-0.11.2-r0.apk f7fcafc894e17afc7cce2e63584cbc1e0b0e8f4965307d50c95d99662dc132e9
+file libssl3-3.5.9-r0.apk 4453763aa62fab2370ade9799c0026136a2c0371e5b51a882088ac55476a7bb3
+file libstdc++-14.2.0-r6.apk 009297e8c8a9a9ed12518cce15fe07d0274de7146bf20e363b2f132e083c6ec6
+file libtasn1-4.21.0-r0.apk f23e8a2710e8ee09c9cd10886fe68548cddb6992dd57ca160ddc7c86a38f1b82
+file libtheora-1.1.1-r18.apk 5550bf08be46c27efede1d43e5dc70e8812a13b4798882c85af367c08c8be949
+file libucontext-1.3.2-r0.apk c615179227dde5d3da546033251e006713c01cbe511cf94a71ea41628d3d2cef
+file libunibreak-6.1-r0.apk 80ade630bc4a289d7f1328ef1da7cfd9c26a9d172aafc8355433cdc9177ccac3
+file libunistring-1.3-r0.apk 198633a94e9e9a859e5081b1216fd60a6eb4c9e5032ba6eb611bff8972950afb
+file libunwind-1.8.1-r0.apk f7660ac0ec0900074053c39eb9771d5b1b3109ce17b6d163fe2e28e0bab6c723
+file libuuid-2.41.6-r1.apk f67d5e39973cbd6ed1b4d225b5ad0038f881e22c9c2e87260b485d0acac3977e
+file libuv-1.51.0-r0.apk f54ff7ce7559a6bbd1ea5d03385c7b91611d735e01c147b417521bd89e268f00
+file libva-2.22.0-r1.apk f65049abe9de0ba097441a76ad657c44a685476db1bf44a67dc84deb1fc2a3d4
+file libvdpau-1.5-r4.apk 690b284e4bd0b476caad96a1963b2901659c821d89aab02cc55edc7e3a20fd3d
+file libvorbis-1.3.7-r2.apk 03a2fd93d6d52c5622bd161ce9d6c513cfdc428dadddf2d555edf7de7f36d219
+file libvpx-1.15.0-r0.apk 52a628605a06125e90b731117039c4e1eddbafc8565642705656fcba301d49d8
+file libwebp-1.5.0-r0.apk 9d1fc6413abe7cc1f8310387159e0ff9bd96b30e6e311e11ae20553d7a9424c5
+file libwebpdemux-1.5.0-r0.apk 9b4a05f0cd033857b8a4f9cde9ac14f7507af36ec49267445bb1b69d610b68a1
+file libwebpmux-1.5.0-r0.apk 41bfb51840e3353865146b429f07073ddb0e29d5872c835fa6f716e63b9256cd
+file libx11-1.8.11-r0.apk d410786a3a7b2fe3dc26b523421de26ff6f525d219a3ce50adefc87d1cd90a42
+file libxau-1.0.12-r0.apk 56c39847ccfd23025d513b127de40e94aac13bdbd610da77b5bb445aa912895f
+file libxaw-1.0.16-r1.apk 5835ab2000e1febc908753373ec993065c0baa94145530869e36de52935c1b4e
+file libxcb-1.17.0-r0.apk a0648127d862a00827ae6ae8545bb2a169541e5e5dabdf5b061d7cf5472c1acc
+file libxcomposite-0.4.6-r5.apk fbcee93c040110dc64367d8b13c4c1dcff0a901ccdfc6430f2790da01b8e53d7
+file libxcursor-1.2.3-r0.apk 729adc77853676fe07409eb6d114b0bc06bf49116b6734209c25e31d6bbfa39b
+file libxdamage-1.1.6-r5.apk 92cb1f1d4bc1016ebd0ea504a504dfa6df8ae88dd753bace224c66e9ae8c40ec
+file libxdmcp-1.1.5-r1.apk 83d5075907cbb9eaff0f7697e86bc7cb1df3ac815c9b2590110a7b7296a8c71c
+file libxext-1.3.6-r2.apk 147bbdfc141b82694affd7c6f14684a06c794820c9a9e52a759e453fd78ed67c
+file libxfce4ui-4.20.1-r0.apk ffad783e9548e490a53fde92c69fb85fc400867e6d9cdccc24de3a16855b96f1
+file libxfce4util-4.20.0-r0.apk 9e8afee0d8330a4e354d9950d0f8f02e2abcc55cd7773d582d30b3fd806d8614
+file libxfixes-6.0.1-r4.apk 5af446dec5337025a8af6e50dd042124a696ceeb6650ed64b94e087c85bd01b3
+file libxft-2.3.8-r3.apk 16cf92120282d4986ab205d22e75fa6184c07b25d573f2ebf9b58c3dd768b0dc
+file libxi-1.8.2-r0.apk 09be97ec95d43de9737341c7078dd89206830482c1c63be796724a5fb3b92a50
+file libxinerama-1.1.5-r4.apk ad938a5f414c0f74c382603593cbf8d33e8ff9c22c46977088167308ef465426
+file libxkbcommon-1.8.1-r2.apk 3d958ba4b30a023c05c22cd02a9580ac775790a1a22cf641ac11542b0a265ded
+file libxkbfile-1.1.3-r0.apk 1464685d4d45dcc17c31922b471c1d640d56ccca133dc9226aa6f2805f0faf4b
+file libxml2-2.13.9-r1.apk 3dcfaeb4e1ff73aaf666774d7fd226faca7cdfc7545349759bb417c2be26764e
+file libxmu-1.2.1-r0.apk efa86502d66fc92a4d9453c92f42dc0d43a3f25dc04e5cade4e0451f57535edb
+file libxpm-3.5.19-r0.apk 86b37223d948e1e023070886871aac55632f9056fc4d814af75daa524e2bc7be
+file libxpresent-1.0.1-r3.apk 1c440022c4c1dee5f405fde0cece9d506af0e4c859e37f5c86920024effa313f
+file libxrandr-1.5.4-r1.apk fabbc718d3d5eed87228a522b6ed59f802e8345c1de1a4cf8e26b2cca20b552d
+file libxrender-0.9.12-r0.apk 7ccb61ab49a3703ab41ea737134404c792b317ccc7a51f9e24073a21d096cae3
+file libxscrnsaver-1.2.4-r3.apk 47a5167ce4db1a3ebb4233335094d1828ca8a0cc5be4d6533b63421602ca65ea
+file libxshmfence-1.3.3-r0.apk 41b4be80eebf0a5757caf70bec00e64c233c5307bacb13a40684233acc8f7f66
+file libxt-1.3.1-r0.apk 868e4184fb6790678c3068c05e3123dcc46d9a9e14fff149465fb9cfeafc5eff
+file libxtst-1.2.5-r0.apk 2c002c8f83469bfaabd4a20c7a4fa90f80a56f04b36765431f4140ac871c3e9a
+file libxv-1.0.13-r0.apk a59571df6a38f00b9081a317064223a33daa8d383f5cf264543473a90720c701
+file libzmq-4.3.5-r2.apk 9cb1a4e6ed2c8534109a58229a6115ea977e2c6ac62b10b5e3d7ee9eb9166b78
+file lilv-libs-0.24.26-r0.apk c52f30a0230f694f0030f81762c5ca2a2f332891dcc2ed0435d98597bb1b1010
+file llvm20-libs-20.1.8-r0.apk 4848a04c061ebb5f0bcac367978b894c9ab25dac1e6bc466d0d8604bb9d2812b
+file luajit-2.1_p20240815-r1.apk 47b162273c03f52e0d86f66f8afab5fde257fdb50c1a90cc8d60cfb09283276f
+file lz4-libs-1.10.0-r0.apk 5abb9cac78d4cf58e5af7372a03f735aa977a6d3ac3f09b6cb0f3e3df42f31af
+file mbedtls-3.6.7-r0.apk adcb2be59db44171d33f9e450672b8cb0d7bc048fc0e5e00ef65eebb07981391
+file mesa-25.1.9-r0.apk 299526b7bd1b382029dcaafe73c0f8403bda76cfc73c79a9d632ce9d4c00827b
+file mesa-egl-25.1.9-r0.apk a9a0d0f46a31c41b0d637598cefbc423de09ceda8ccc40b5c2b5f762c96f94c9
+file mesa-gbm-25.1.9-r0.apk d793017ef50f20b2ef066e1e46af81a9b4ddcf442fe0b642a8b6589d45effbf7
+file mkfontscale-1.2.3-r1.apk db3d33d68da2f8722d2865a0c6ab4214aa6457c583821a0cc4149885cc1ffb6c
+file mousepad-0.6.3-r1.apk 116ee3a74d6d92a95d30e1dca98a0686cdbc2e702cc011a79c86f9e5a9375aa5
+file mpdecimal-4.0.1-r0.apk 487e6264a7c2371f991e5924c4c12e9329e94e0f648ba0598a718694489a8ece
+file mpg123-libs-1.32.10-r0.apk 92a7a5648e561dcd4f7b5067456e7c9350123b4b3eae7f77f0b99174673f59f2
+file mpv-0.40.0-r1.apk 04ddc8551e1c0333dd5cea15dfd77972ea7e2ad9846f6203096e8c4d20e963e2
+file musl-1.2.5-r12.apk d047373c9afb6eaac68df1d03128ac75803350b0368327af85cc95a5b042a1da
+file ncurses-terminfo-base-6.5_p20250503-r0.apk 3264426877964e0ac55488ede6313e907d3663f831008b45fa27c95d60ac34b8
+file nettle-3.10.2-r0.apk f01d8194a66ef76dbab03dacca285bda6ad879ec8e165ead68655f7981160569
+file nghttp2-libs-1.69.0-r0.apk 70c16aa0bf0ace08427e546a8c5966a1059794f629fad8fe9bf945af187ee810
+file nspr-4.36-r0.apk 6ac5ef58b722539c8ecfcdeb7accb7b8a848d189fedccff46ccd044b00204181
+file nss-3.114-r0.apk 615add754b538b78bf4f25cd4c5bb33dbd6273df6fd2b73f7ff89db90ac130ab
+file numactl-2.0.18-r0.apk 93cd48c121327cd8f68aef3452a6b4e80e6db5d860c59adc73cfd432c5dfb83e
+file openexr-libiex-3.3.11-r0.apk ff282f95375e257a268b6221986451f83e4e3c91dfdd09baa581e22ec7be04c8
+file openexr-libilmthread-3.3.11-r0.apk 4cebf6ff6d14d51a51c7db962f6fe79b08724b70b6fc292613da90d4ed6425f2
+file openexr-libopenexr-3.3.11-r0.apk 3326d2da759a520cb26b6e3f16bda09f6abc2823fa82a4d3fee0f9907d0a59f6
+file openexr-libopenexrcore-3.3.11-r0.apk c551004ec676e350e28d55192197872d9ef408b3ef8bce4e2893e0a011d31150
+file openjpeg-2.5.4-r0.apk cf01c977bec4b74782dfba1a07234fc13afdbe6b8958f385948c8c563f1d3b2d
+file opus-1.5.2-r1.apk b51eedecf40ec538a4d4227618b21c488ad3b7df937017cec05f5a9581010c58
+file orc-0.4.40-r1.apk 2057df825c9372cc482580a35a332011d0c765a0c7d80b790c35158cf8047681
+file p11-kit-0.26.2-r0.apk f36b486f01348e2a0ae375fe8b447a21d33d1cda4b040eee4b7d9d5a44ab3735
+file pango-1.56.3-r0.apk 16ed82a4d392a1585bb5fee0320b10f6376119f246c052acd332541659f7c8c2
+file pcre2-10.46-r0.apk eafeb653254c467dcdf2032a6a936db0c5f500733a49d16d6a1a8e5b0225f0b9
+file pipewire-libs-1.4.7-r0.apk 1b6dd5fe9c8ed60a2922f92f753eff7fe67811ca61a2532d4ed08131c049603f
+file pixman-0.46.4-r0.apk cd5b4c6ea1213b0f58f6ab2d6e6bc232313e6b6ff42a9235557a3d7d2e9f03e3
+file pkgconf-2.4.3-r0.apk a74da07722f6bbb3f97ebc9088574342e2de9c11e72865cf73be501e648475f6
+file poppler-25.04.0-r0.apk ee254a226ca0c58ffbd9208f223643cbb1dd8ef1a56990d2a6752181f2fc13bf
+file poppler-glib-25.04.0-r0.apk a7c13795d770449b5b7b20691404d499aba63cada5ec5423c4cdd19e92c40842
+file py3-gobject3-3.52.3-r1.apk 714ec2de0b4999fae4bb347190c58041e6ef66062ac74b804ee40b8439de5eff
+file py3-gobject3-pyc-3.52.3-r1.apk 4afabfcebf5cb9c153587986cb2a8b39668d84e2ba5d6d6f1c9bb9c520239b9f
+file pyc-3.12.14-r0.apk 664e6fe4ed64cc0a9c061db80309a277461a4701131e3ecd6ea75e94cb60703c
+file python3-3.12.14-r0.apk 70c6d810b653962908715c5151bdde06db5cddf6578a656e75534f2af338f8d5
+file python3-pyc-3.12.14-r0.apk 23f93d08eb46d9c7c9e6b53a747ba4574279e1833dd4ae15454e75f624db1dd8
+file python3-pycache-pyc0-3.12.14-r0.apk e002cd4aac067d848d194c1bdf4aae516fc4f05a2687f1c28561a87eb7027ca7
+file rav1e-libs-0.7.1-r2.apk 128a9be76efacdd88b5d006c4aef0c5f10b544c05b2eda270b73bc1db89a6227
+file readline-8.2.13-r1.apk 29e35b5876481d0d1d4f60fdfdbd59a0c974d86e6355f7c38ea85518645ada6b
+file ristretto-0.13.3-r0.apk 2d8346f00cf0d4a8fcdcf44543178e72637453be8cc02f748d772499824b43bb
+file roc-toolkit-libs-0.4.0-r1.apk e129b1eb8a31da6696b751bbd0522776cafb4522b3a70e20175b37b5794d366c
+file rubberband-libs-4.0.0-r0.apk 519d0997df5411d571889bbf40a042ca401c13d6e0ed7c333a41df4762efb3ad
+file sdl2-compat-2.32.56-r0.apk 5ae0e09830c6053d41e697814c5fe709d7cc5991a2924b29c5712dc44d4174f3
+file sdl3-3.2.16-r0.apk 6921a07f7769e6bb2d34daff805ad70e9a770da599a5ead6dbae48dcd9642375
+file serd-libs-0.32.4-r0.apk 0a9a8e0600800e969f87e21dc1e03d04c180fcb70cbe2782887e60f16fbb98d8
+file shaderc-2024.4-r0.apk ae5f3428a5095a8dacb709d7f538e9f1f99ae34473e050008e02fdfe94d9225a
+file shared-mime-info-2.4-r6.apk c63939660a6944ee1e556d2b1de24f53d5a110ebf8f4c78028f7ba50239781b3
+file sndio-libs-1.10.0-r1.apk 5eb2ab13a4b3c45917cd278c0b514233517c68fa3fc109c8bed0568ec30ce6df
+file sord-libs-0.16.18-r0.apk 2644ebbfc6b9edaba3a54ecd076595d01d94a690ab3f05e44b14239a48998577
+file soxr-0.1.3-r7.apk cf24fc7c0e0ae0d8a78f423b4bd05fd9ca88f1caaba1524c29f118e7d42bc0be
+file speexdsp-1.2.1-r2.apk 303c81ec9263ffd2e97479ed00a405ae02645e1c8790fbd71ffe9078a56bfb40
+file spirv-tools-1.4.313.0-r0.apk 5cf343c07eec49f6e9d9ee2bd7899157c2d00743c142dffce7c6573004ad7e8a
+file sqlite-libs-3.49.2-r1.apk 8f02658fa7fb60a4d25b8a167fbd140bd58ea26d2d56f8ef15d8c16b3d1e6447
+file sratom-0.6.18-r0.apk 375cb994527bc290a0a80b75d8c1d96bb1568d181ed66bd1d9a9bff591c0edf5
+file ssl_client-1.37.0-r20.apk 4e484cc15aabdc26493dd9b98bf5bd793caeb81386c2199a4309958c497f9e4e
+file startup-notification-0.12-r8.apk 04765f412e378d381835b6be43eaada1f5a26277782a274ccd1b5a5f63046a27
+file tdb-libs-1.4.12-r0.apk 695b095ff22d7a273d87722475b1692e4580a9180d1cf8bb4c50479bf3402b2a
+file tiff-4.7.1-r0.apk 1456b2f81719ab1fa70465501f7935bac98c4f2747bdecd85d69de473f599e22
+file uchardet-libs-0.0.8-r2.apk 4953f78021bd60a10e08fbebc0c6d75bcafddd55c898e23740f98f8764e0c6b2
+file umpv-0.40.0-r1.apk 8bba67c2b32c2ebf276588d1b22662062a248063bdf04a4a8055a19f2028539f
+file v4l-utils-libs-1.28.1-r1.apk 857b64593fc16d89915caa1a5205993caab302be2d13da3d6aedf6a6b1c756e9
+file vidstab-1.1.1-r0.apk d33cc58147adbd987aa0e0db66183cccc17693373e7b9db1b116ce241bb98b64
+file vulkan-loader-1.4.313.0-r0.apk b5bd963505be1b33a8ead5bbec3a71af10af27e540b3f3de3f23cc39a217a347
+file wayland-libs-client-1.23.1-r3.apk bea691382c4e6712952fed6248c56083056dd840431231e17f4f78a2f668be9f
+file wayland-libs-cursor-1.23.1-r3.apk 166e602a891cb65e1afbe6b88f7aca943adaa40a46c76744fd2bbd63922d5083
+file wayland-libs-egl-1.23.1-r3.apk 9b63e5a4d94d1319631e8c861c4f77623bc52b6dba36f2153f332d97a3f25b91
+file wayland-libs-server-1.23.1-r3.apk ad17e97d45a82371d3f5590b14fd7357de68c3f3fcad7ab7719cfc2185c84c8a
+file webrtc-audio-processing-2-2.1-r0.apk 2d610b55f519eb023f51be917de9b70cd422ea6da1f05189bb0c1a6a9c815cac
+file x264-libs-0.164.3108-r0.apk 71d886e2ba32bfc0a6710b0db20c431cc98d85dd2acd928ffe535f4b3b57631b
+file x265-libs-3.6-r0.apk 1e45945bd028392b131a8622e025d61ca2d18c46a2fe42c6804c949e74cb2608
+file xcb-util-0.4.1-r3.apk 8cdec9bab62bddcdafa33187767da571943975a3c5abc452346d5628ee71f22a
+file xclock-1.1.1-r0.apk 0bcc8f122ec7973d29f99e92f4409e00d21d9b775f6c64ca992ecccbf315829a
+file xdpyinfo-1.3.4-r1.apk f5808b4b21f3bb1d6ad3b334c979ba66d92d9d2a7f58d532d5a5effaf6170ff4
+file xev-1.2.6-r0.apk c3a085aac8281c8adc5e5a425ab74c83143dfd53bc2dc2872ef6a6a7cb28f2af
+file xeyes-1.3.0-r0.apk 31de6d30b350f198f83e5cf3bd02a5740da0adbab3ca8cc8c60f36ee85e28f70
+file xfconf-4.20.0-r1.apk 810a3cdef3ac8bdfbd88645d7113e3888ff568f22c76f513ca09cb09fb5c4958
+file xkeyboard-config-2.43-r0.apk fd9846bae5258c35bac892c6f4dfc93f16352f6ccced8e09e7616641187e5b9c
+file xterm-399-r0.apk e591ef8198f8648347b95afcdfa601b75c1775ab2a355434152895793eb4cef9
+file xvidcore-1.3.7-r2.apk 47577d4115b4b0fe3f473ae269d0baeea4e40e115c210abfc21d6a2a8dbe28fa
+file xwininfo-1.1.6-r0.apk 8c98cc3b5e523520c23fa9a21ad0a5bea259ce9fa42c76397a6c383e555892d7
+file xz-libs-5.8.4-r0.apk 8cfdd002358b780c35087176edf8f03ad302a20efc7139c91bd710fe0ebec6ff
+file yaml-0.2.5-r2.apk b7b753b737fab6a7a62b69a37a7b1f292aa141c52613f937f0e78eecf49f1195
+file zimg-3.0.5-r3.apk 4eddf00bb34fa2b7b777b244ae132963cd5df1074aedfe7ae4218c49236a187a
+file zix-libs-0.6.2-r0.apk 98667b64c3e7ffd4bc64f2fdd0a9aa95ddc8a4ca18e6fc1b16d5c287d6941705
+file zlib-1.3.2-r0.apk 486231ba02da32d11a86d29ff838a6991a435b8d8c433926278efdbbcaea74dd
+file zstd-libs-1.5.7-r0.apk af64af859e619af891546e18f1c5bb22f1d9c05fa7b74aef6579b253c3be62a1
+pkg abseil-cpp-int128-20240722.1-r1
+pkg abseil-cpp-raw-logging-internal-20240722.1-r1
+pkg abseil-cpp-strings-20240722.1-r1
+pkg abseil-cpp-strings-internal-20240722.1-r1
+pkg acl-libs-2.3.2-r1
+pkg adwaita-icon-theme-48.1-r0
+pkg alsa-lib-1.2.14-r0
+pkg aom-libs-3.12.1-r0
+pkg appstream-glib-0.8.3-r0
+pkg at-spi2-core-2.56.5-r0
+pkg at-spi2-core-libs-2.56.5-r0
+pkg avahi-libs-0.8-r21
+pkg babl-0.1.114-r0
+pkg brotli-libs-1.1.0-r2
+pkg busybox-1.37.0-r20
+pkg busybox-binsh-1.37.0-r20
+pkg c-ares-1.34.8-r0
+pkg ca-certificates-bundle-20260909-r0
+pkg cairo-1.18.4-r0
+pkg cairo-gobject-1.18.4-r0
+pkg cjson-1.7.19-r0
+pkg cups-libs-2.4.18-r0
+pkg dbus-libs-1.16.2-r1
+pkg desktop-file-utils-0.28-r0
+pkg enchant2-libs-2.8.10-r0
+pkg encodings-1.0.7-r1
+pkg eudev-libs-3.2.14-r5
+pkg exiv2-libs-0.28.7-r0
+pkg feh-3.10.3-r0
+pkg ffmpeg-libavcodec-6.1.2-r2
+pkg ffmpeg-libavdevice-6.1.2-r2
+pkg ffmpeg-libavfilter-6.1.2-r2
+pkg ffmpeg-libavformat-6.1.2-r2
+pkg ffmpeg-libavutil-6.1.2-r2
+pkg ffmpeg-libpostproc-6.1.2-r2
+pkg ffmpeg-libswresample-6.1.2-r2
+pkg ffmpeg-libswscale-6.1.2-r2
+pkg fftw-double-libs-3.3.10-r6
+pkg font-dejavu-2.37-r6
+pkg fontconfig-2.15.0-r3
+pkg freetype-2.13.3-r0
+pkg fribidi-1.0.16-r1
+pkg galculator-2.1.4-r4
+pkg gdbm-1.24-r0
+pkg gdk-pixbuf-2.42.12-r1
+pkg gegl-0.4.62-r0
+pkg gexiv2-0.14.6-r0
+pkg giflib-5.2.2-r2
+pkg gimp-3.0.4-r0
+pkg glib-2.84.4-r0
+pkg glslang-libs-1.4.309.0-r0
+pkg gmp-6.3.0-r3
+pkg gnutls-3.8.13-r0
+pkg gobject-introspection-1.84.0-r0
+pkg graphite2-1.3.14-r6
+pkg gsettings-desktop-schemas-48.0-r0
+pkg gspell-1.14.0-r1
+pkg gtk+3.0-3.24.50-r0
+pkg gtk-update-icon-cache-3.24.50-r0
+pkg gtksourceview-3.24.11-r3
+pkg harfbuzz-11.2.1-r0
+pkg hicolor-icon-theme-0.18-r0
+pkg hwdata-pci-0.395-r0
+pkg icu-data-en-76.1-r1
+pkg icu-libs-76.1-r1
+pkg imath-3.1.12-r0
+pkg imlib2-1.12.4-r0
+pkg inih-60-r0
+pkg inih-inireader-60-r0
+pkg iso-codes-4.17.0-r0
+pkg jack-1.9.22-r4
+pkg json-c-0.18-r1
+pkg json-glib-1.10.8-r0
+pkg lame-libs-3.100-r5
+pkg lcms2-2.19-r0
+pkg libarchive-3.8.3-r0
+pkg libass-0.17.3-r0
+pkg libasyncns-0.8-r4
+pkg libatk-1.0-2.56.5-r0
+pkg libatk-bridge-2.0-2.56.5-r0
+pkg libblkid-2.41.6-r1
+pkg libbluray-1.3.4-r1
+pkg libbsd-0.12.2-r0
+pkg libbz2-1.0.8-r6
+pkg libcaca-0.99_beta20-r4
+pkg libcamera-0.5.1-r0
+pkg libcamera-ipa-0.5.1-r0
+pkg libcdio-2.2.0-r0
+pkg libcdio-paranoia-10.2.2.0.2-r2
+pkg libcrypto3-3.5.9-r0
+pkg libcurl-8.14.1-r3
+pkg libdav1d-1.5.1-r0
+pkg libde265-1.0.15-r1
+pkg libdeflate-1.23-r0
+pkg libdisplay-info-0.2.0-r0
+pkg libdovi-3.3.1-r1
+pkg libdrm-2.4.124-r0
+pkg libdvdcss-1.4.3-r0
+pkg libdvdnav-6.1.1-r1
+pkg libdvdread-6.1.3-r2
+pkg libeconf-0.6.3-r0
+pkg libelf-0.193-r0
+pkg libepoxy-1.5.10-r1
+pkg libexif-0.6.25-r0
+pkg libexpat-2.8.5-r0
+pkg libffi-3.4.8-r0
+pkg libflac-1.4.3-r1
+pkg libfontenc-1.1.8-r0
+pkg libgcc-14.2.0-r6
+pkg libgomp-14.2.0-r6
+pkg libgtop-2.41.3-r1
+pkg libheif-1.19.8-r1
+pkg libhwy-1.0.7-r1
+pkg libice-1.1.2-r0
+pkg libid3tag-0.16.3-r0
+pkg libidn2-2.3.7-r0
+pkg libintl-0.24.1-r0
+pkg libjpeg-turbo-3.1.0-r0
+pkg libjxl-0.10.3-r2
+pkg libltdl-2.5.4-r1
+pkg libmagic-5.46-r2
+pkg libmd-1.1.0-r0
+pkg libmount-2.41.6-r1
+pkg libmypaint-1.6.1-r0
+pkg libncursesw-6.5_p20250503-r0
+pkg libogg-1.3.5-r5
+pkg libopenmpt-0.7.15-r0
+pkg libpanelw-6.5_p20250503-r0
+pkg libpciaccess-0.18.1-r0
+pkg libplacebo-6.338.2-r3
+pkg libpng-1.6.59-r0
+pkg libpsl-0.21.5-r3
+pkg libpulse-17.0-r5
+pkg libraw-0.21.4-r0
+pkg librist-0.2.10-r1
+pkg librsvg-2.60.0-r0
+pkg libsamplerate-0.2.2-r3
+pkg libsharpyuv-1.5.0-r0
+pkg libsixel-1.10.5-r0
+pkg libsm-1.2.5-r0
+pkg libsndfile-1.2.2-r2
+pkg libsodium-1.0.20-r1
+pkg libsrt-1.5.3-r1
+pkg libssh-0.11.2-r0
+pkg libssl3-3.5.9-r0
+pkg libstdc++-14.2.0-r6
+pkg libtasn1-4.21.0-r0
+pkg libtheora-1.1.1-r18
+pkg libucontext-1.3.2-r0
+pkg libunibreak-6.1-r0
+pkg libunistring-1.3-r0
+pkg libunwind-1.8.1-r0
+pkg libuuid-2.41.6-r1
+pkg libuv-1.51.0-r0
+pkg libva-2.22.0-r1
+pkg libvdpau-1.5-r4
+pkg libvorbis-1.3.7-r2
+pkg libvpx-1.15.0-r0
+pkg libwebp-1.5.0-r0
+pkg libwebpdemux-1.5.0-r0
+pkg libwebpmux-1.5.0-r0
+pkg libx11-1.8.11-r0
+pkg libxau-1.0.12-r0
+pkg libxaw-1.0.16-r1
+pkg libxcb-1.17.0-r0
+pkg libxcomposite-0.4.6-r5
+pkg libxcursor-1.2.3-r0
+pkg libxdamage-1.1.6-r5
+pkg libxdmcp-1.1.5-r1
+pkg libxext-1.3.6-r2
+pkg libxfce4ui-4.20.1-r0
+pkg libxfce4util-4.20.0-r0
+pkg libxfixes-6.0.1-r4
+pkg libxft-2.3.8-r3
+pkg libxi-1.8.2-r0
+pkg libxinerama-1.1.5-r4
+pkg libxkbcommon-1.8.1-r2
+pkg libxkbfile-1.1.3-r0
+pkg libxml2-2.13.9-r1
+pkg libxmu-1.2.1-r0
+pkg libxpm-3.5.19-r0
+pkg libxpresent-1.0.1-r3
+pkg libxrandr-1.5.4-r1
+pkg libxrender-0.9.12-r0
+pkg libxscrnsaver-1.2.4-r3
+pkg libxshmfence-1.3.3-r0
+pkg libxt-1.3.1-r0
+pkg libxtst-1.2.5-r0
+pkg libxv-1.0.13-r0
+pkg libzmq-4.3.5-r2
+pkg lilv-libs-0.24.26-r0
+pkg llvm20-libs-20.1.8-r0
+pkg luajit-2.1_p20240815-r1
+pkg lz4-libs-1.10.0-r0
+pkg mbedtls-3.6.7-r0
+pkg mesa-25.1.9-r0
+pkg mesa-egl-25.1.9-r0
+pkg mesa-gbm-25.1.9-r0
+pkg mkfontscale-1.2.3-r1
+pkg mousepad-0.6.3-r1
+pkg mpdecimal-4.0.1-r0
+pkg mpg123-libs-1.32.10-r0
+pkg mpv-0.40.0-r1
+pkg musl-1.2.5-r12
+pkg ncurses-terminfo-base-6.5_p20250503-r0
+pkg nettle-3.10.2-r0
+pkg nghttp2-libs-1.69.0-r0
+pkg nspr-4.36-r0
+pkg nss-3.114-r0
+pkg numactl-2.0.18-r0
+pkg openexr-libiex-3.3.11-r0
+pkg openexr-libilmthread-3.3.11-r0
+pkg openexr-libopenexr-3.3.11-r0
+pkg openexr-libopenexrcore-3.3.11-r0
+pkg openjpeg-2.5.4-r0
+pkg opus-1.5.2-r1
+pkg orc-0.4.40-r1
+pkg p11-kit-0.26.2-r0
+pkg pango-1.56.3-r0
+pkg pcre2-10.46-r0
+pkg pipewire-libs-1.4.7-r0
+pkg pixman-0.46.4-r0
+pkg pkgconf-2.4.3-r0
+pkg poppler-25.04.0-r0
+pkg poppler-glib-25.04.0-r0
+pkg py3-gobject3-3.52.3-r1
+pkg py3-gobject3-pyc-3.52.3-r1
+pkg pyc-3.12.14-r0
+pkg python3-3.12.14-r0
+pkg python3-pyc-3.12.14-r0
+pkg python3-pycache-pyc0-3.12.14-r0
+pkg rav1e-libs-0.7.1-r2
+pkg readline-8.2.13-r1
+pkg ristretto-0.13.3-r0
+pkg roc-toolkit-libs-0.4.0-r1
+pkg rubberband-libs-4.0.0-r0
+pkg sdl2-compat-2.32.56-r0
+pkg sdl3-3.2.16-r0
+pkg serd-libs-0.32.4-r0
+pkg shaderc-2024.4-r0
+pkg shared-mime-info-2.4-r6
+pkg sndio-libs-1.10.0-r1
+pkg sord-libs-0.16.18-r0
+pkg soxr-0.1.3-r7
+pkg speexdsp-1.2.1-r2
+pkg spirv-tools-1.4.313.0-r0
+pkg sqlite-libs-3.49.2-r1
+pkg sratom-0.6.18-r0
+pkg ssl_client-1.37.0-r20
+pkg startup-notification-0.12-r8
+pkg tdb-libs-1.4.12-r0
+pkg tiff-4.7.1-r0
+pkg uchardet-libs-0.0.8-r2
+pkg umpv-0.40.0-r1
+pkg v4l-utils-libs-1.28.1-r1
+pkg vidstab-1.1.1-r0
+pkg vulkan-loader-1.4.313.0-r0
+pkg wayland-libs-client-1.23.1-r3
+pkg wayland-libs-cursor-1.23.1-r3
+pkg wayland-libs-egl-1.23.1-r3
+pkg wayland-libs-server-1.23.1-r3
+pkg webrtc-audio-processing-2-2.1-r0
+pkg x264-libs-0.164.3108-r0
+pkg x265-libs-3.6-r0
+pkg xcb-util-0.4.1-r3
+pkg xclock-1.1.1-r0
+pkg xdpyinfo-1.3.4-r1
+pkg xev-1.2.6-r0
+pkg xeyes-1.3.0-r0
+pkg xfconf-4.20.0-r1
+pkg xkeyboard-config-2.43-r0
+pkg xterm-399-r0
+pkg xvidcore-1.3.7-r2
+pkg xwininfo-1.1.6-r0
+pkg xz-libs-5.8.4-r0
+pkg yaml-0.2.5-r2
+pkg zimg-3.0.5-r3
+pkg zix-libs-0.6.2-r0
+pkg zlib-1.3.2-r0
+pkg zstd-libs-1.5.7-r0
