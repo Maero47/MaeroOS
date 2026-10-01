@@ -235,6 +235,21 @@ def guest_tests(g, files):
     check(rc != 0 and "busy" in out.lower(), f"raw write to its disk /dev/sdb: EBUSY ({out.strip()!r})")
     rc, out = g.sh("exec 3</mnt/a/seq.txt; busybox umount /mnt/a")
     check(rc != 0 and "busy" in out.lower(), f"umount with an open file: EBUSY ({out.strip()!r})")
+    # Lazy umount with a file open for writing: the instance lives on behind
+    # the descriptor, so the device stays taken until it closes.
+    rc, out = g.sh("exec 3>>/mnt/a/lazy.txt; echo before >&3; "
+                   "busybox umount -l /mnt/a && echo DETACHED; "
+                   "busybox mount -t ext2 /dev/sdb1 /mnt/a; echo second=$?; "
+                   "busybox dd if=/dev/zero of=/dev/sdb1 bs=512 count=1 seek=32700 conv=notrunc; echo raw=$?; "
+                   "echo after-detach >&3; exec 3>&-; "
+                   "busybox mount -t ext2 /dev/sdb1 /mnt/a && echo REMOUNTED; "
+                   "busybox cat /mnt/a/lazy.txt")
+    check("DETACHED" in out, f"umount -l with a file open for writing ({out.strip()[-300:]!r})")
+    check("second=0" not in out and "busy" in out.lower(),
+          "after umount -l, a second mount of the still-open device is EBUSY")
+    check("raw=0" not in out, "after umount -l, raw /dev writes are still EBUSY")
+    check("REMOUNTED" in out and "before\nafter-detach" in out,
+          "once the last descriptor closes the device mounts again, with the data written through it")
     rc, out = g.sh("busybox mount -o remount,ro /mnt/b && echo x > /mnt/b/ro-test")
     check(rc != 0 and "Read-only" in out, f"remount,ro refuses writes ({out.strip()!r})")
     rc, out = g.sh("busybox grep nvme0n1 /proc/mounts")
@@ -302,6 +317,9 @@ def host_checks(a_img, a_fs, b_img, c_img, files):
     big = debugfs(b_img, "ls /big")
     check("zz-new" in big and "renamed" in big and "entry-00007-" not in big,
           "debugfs: nvme0n1 htree dir changes")
+    check(subprocess.run([DEBUGFS, "-R", "cat /lazy.txt", part], capture_output=True,
+                         text=True).stdout == "before\nafter-detach\n",
+          "debugfs: sdb1 lazy.txt, written after umount -l")
     check(md5(subprocess.run([DEBUGFS, "-R", "cat /seq-copy.txt", b_img],
                              capture_output=True).stdout) == seq_md5,
           "debugfs: nvme0n1 seq-copy.txt content")

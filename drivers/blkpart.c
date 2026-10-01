@@ -22,7 +22,6 @@ static uint32_t   g_nparts;
 /* A mount(2) filesystem sits on `bp`, or on a partition or disk overlapping
  * it: its driver caches what it read and is not told about raw writes. */
 static int blkpart_mounted(const blkpart_t *bp) {
-    if (!vfs_mounts_active()) return 0;
     for (uint32_t i = 0; i < g_nparts; i++) {
         const blkpart_t *o = g_parts[i];
         if (o->dev != bp->dev || o->start >= bp->start + bp->nsect ||

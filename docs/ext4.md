@@ -53,7 +53,9 @@ this inside the Alpine chroot).
   it; `umount` of the lower one is `EBUSY` while the upper one exists.
 * `umount` is `EBUSY` while a file of the filesystem is open (descriptor or
   mapping) or a process's cwd is inside it; `MNT_DETACH` removes the mount
-  anyway and leaves a still-busy instance allocated.
+  anyway; a still-busy instance stays allocated and keeps its device taken (a
+  second mount of it, and raw writes through `/dev`, are `EBUSY`) until it is
+  idle, when the next such check releases it.
 * The boot mounts (`/disk`, `/tmp`, `/dev`, `/proc`, made by `vfs_mount()`)
   are listed in `/proc/mounts` but cannot be unmounted.
 * `rmdir`/`unlink` of a mountpoint is `EBUSY`.
