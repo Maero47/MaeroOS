@@ -55,8 +55,12 @@ static void fn(int ok, const char *what) {
     if (!ok) { printf("FAIL fnmatch %s\n", what); fails++; }
 }
 
+#define SLOW_MS 500
+
 /* A pattern that backtracks exponentially without memoisation: must give
- * `want` (0 or REG_NOMATCH / REG_ESPACE) in under 50 ms. */
+ * `want` (0 or REG_NOMATCH / REG_ESPACE) in under SLOW_MS.  The bound only
+ * has to catch exponential blow-up, not measure speed: a tighter one
+ * flaked on loaded hosts (57 ms seen against 50). */
 static void slow(const char *re, int fl, char c, int n, const char *tail, int want) {
     char s[4096];
     regex_t r;
@@ -70,7 +74,7 @@ static void slow(const char *re, int fl, char c, int n, const char *tail, int wa
     clock_gettime(CLOCK_MONOTONIC, &b);
     double ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
     printf("time /%s/ on %d x '%c'%s: %.2f ms, result %d\n", re, n, c, tail, ms, x);
-    if (x != want || ms >= 50) {
+    if (x != want || ms >= SLOW_MS) {
         printf("FAIL slow /%s/ n=%d: result %d want %d, %.2f ms\n", re, n, x, want, ms);
         fails++;
     }
@@ -177,7 +181,7 @@ static void differential(void) {
 }
 
 /* regexec with nmatch = 10: rc `want`, and on a match the first `ngrp`
- * (so, eo) pairs equal `grp`; under 50 ms. */
+ * (so, eo) pairs equal `grp`; under SLOW_MS. */
 static void lines(const char *re, int fl, const char *s, int want, const long *grp, int ngrp) {
     regex_t r;
     regmatch_t m[10];
@@ -188,7 +192,7 @@ static void lines(const char *re, int fl, const char *s, int want, const long *g
     int x = regexec(&r, s, 10, m, 0);
     clock_gettime(CLOCK_MONOTONIC, &b);
     double ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
-    int ok = x == want && ms < 50;
+    int ok = x == want && ms < SLOW_MS;
     for (int i = 0; ok && !x && i < ngrp; i++)
         ok = m[i].rm_so == grp[2 * i] && m[i].rm_eo == grp[2 * i + 1];
     printf("time /%s/ on %zu bytes, nmatch 10: %.2f ms, result %d\n", re, strlen(s), ms, x);

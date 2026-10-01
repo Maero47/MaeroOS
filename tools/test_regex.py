@@ -5,7 +5,7 @@ Copies regex.c next to its public headers with the includes pointed at the
 host libc, builds userspace/libc/test_regex.c against it with the host
 compiler and runs it: the matching/submatch/fnmatch cases must agree,
 patterns that backtrack exponentially without memoisation ((a|aa)*b,
-(a*)*b, ...) must finish in under 50 ms each, and the memoised matcher must
+(a*)*b, ...) must finish in under 500 ms each, and the memoised matcher must
 report the same whole match and submatches as an unpruned build of the same
 source on a fixed repro and a few thousand random patterns.
 """
