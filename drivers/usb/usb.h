@@ -139,8 +139,11 @@ typedef struct {
     int kind;
     uint8_t  report_id;     /* 0 = reports carry no ID byte */
     hid_field_t buttons, x, y, wheel;
-    /* keyboard state */
+    /* keyboard state; repeat_key is the key held down for typematic repeat
+     * (USB keyboards, unlike PS/2 ones, do not repeat by themselves) */
     uint8_t  prev[8];
+    uint16_t repeat_key;
+    uint32_t repeat_tick;
     /* absolute pointer state */
     int      have_abs;
     int32_t  last_x, last_y;
@@ -153,4 +156,6 @@ void hid_setup(hid_state_t *st, const usb_interface_desc_t *intf,
                const uint8_t *report_desc, uint32_t len);
 /* One interrupt-IN report arrived. */
 void hid_report(hid_state_t *st, const uint8_t *data, uint32_t len);
+/* Called by kusbd every tick: key repeat for keyboards. */
+void hid_tick(hid_state_t *st);
 const char *hid_kind_name(int kind);

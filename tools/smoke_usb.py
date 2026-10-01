@@ -21,6 +21,7 @@ Checks:
   - a login over the USB keyboard: in that Terminal, `doas login root`
     asks for the user's password and then root's, both typed on the USB
     keyboard, and the root shell it starts writes `id -u` to a file;
+  - a key held down on the USB keyboard repeats (kernel typematic);
   - relative motion from the USB boot mouse reaches /dev/input/event1 and
     moves the desktop pointer by the amount sent;
   - a usb-hub on a root port, with the usb-mouse and the stick behind it;
@@ -172,6 +173,32 @@ class UsbSmoke(GuiSmoke):
         self.inp.type("exit\n")
         self.settle(1.0)
 
+    def key_repeat(self, term):
+        """USB keyboards do not repeat keys themselves; the kernel does
+        (usb_hid.c).  Hold x for 1.2 s in the Terminal: 500 ms delay, then
+        ~33 a second, so well over 10 x's must arrive."""
+        self.expect_focus(term)
+        proof = "/tmp/usbsmoke.rep"
+        self.con.run(f"rm -f {proof}")
+        self.inp.type("echo ")
+        self.inp.send(KBD, [key(True, "x")])
+        self.settle(1.2)
+        self.inp.send(KBD, [key(False, "x")])
+        self.inp.type(f" > {proof}\n")
+        deadline = time.time() + 10
+        while True:
+            got = self.con.run(f"cat {proof}")
+            m = re.search(r"^(x+)\r?$", got, re.M)
+            if m:
+                n = len(m.group(1))
+                if not 10 <= n <= 60:
+                    raise AssertionError(f"holding x for 1.2 s gave {n} x's")
+                print(f"\n[SMOKE-USB] held key repeated: {n} x's")
+                return
+            if time.time() >= deadline:
+                raise AssertionError(f"no repeat output; {proof}: {got!r}")
+            self.settle(0.5)
+
     def boot_mouse(self):
         """Relative motion from the usb-mouse: put the pointer somewhere
         known with the tablet, move it by (+40, +30) with the mouse, click,
@@ -256,6 +283,7 @@ class UsbSmoke(GuiSmoke):
         step("boot", self.boot)
         term = step("terminal (USB keyboard + tablet)", self.terminal)
         step("login over the USB keyboard", self.login, term)
+        step("key repeat", self.key_repeat, term)
         step("close terminal (tablet click)", self.close, term)
         step("boot mouse", self.boot_mouse)
         step("mass storage", self.storage)

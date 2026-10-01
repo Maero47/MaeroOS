@@ -1352,6 +1352,10 @@ static void kusbd(void) {
                 if (p >= 1 && p <= max_ports) port_check((int)p);
             }
         }
+        for (int i = 0; i < XHCI_MAX_DEVS; i++)
+            if (devs[i].used && devs[i].cls == USB_CLS_HID &&
+                devs[i].intr_active)
+                hid_tick(&devs[i].hid);
         if ((int32_t)(pit_ticks() - next_hub_poll) >= 0) {
             next_hub_poll = pit_ticks() + 25;
             for (int i = 0; i < XHCI_MAX_DEVS; i++)

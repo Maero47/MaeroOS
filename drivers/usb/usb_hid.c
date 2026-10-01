@@ -7,6 +7,10 @@
  * items, section 6.2.2; boot reports, appendix B) and the HID Usage Tables
  * (keyboard page 0x07, generic desktop page 0x01, button page 0x09).
  *
+ * Keys held down repeat after REPEAT_DELAY at REPEAT_PERIOD (in 10 ms
+ * ticks), as a PS/2 keyboard's typematic repeat does: another press event
+ * for the key, which is what userspace already gets from PS/2.
+ *
  * Output goes into the same rings as the PS/2 drivers: keys into
  * /dev/input/event0 (keyboard_input_key), pointer reports into
  * /dev/input/event1 (mouse_input).  That pointer interface is relative, so an
@@ -20,6 +24,7 @@
 #include "../framebuffer.h"
 #include "../keyboard.h"
 #include "../mouse.h"
+#include "../../arch/i686/cpu/pit.h"
 #include "../../lib/string.h"
 #include <stdint.h>
 
@@ -68,6 +73,9 @@ static const uint8_t usage_to_key[0x66] = {
     [0x64] = 86,                                          /* non-US \ (102nd) */
     [0x65] = 127,                                         /* Application */
 };
+
+#define REPEAT_DELAY  50     /* 500 ms */
+#define REPEAT_PERIOD 3      /* ~33 per second */
 
 /* Modifier byte bits 0-7: LCtrl LShift LAlt LGUI RCtrl RShift RAlt RGUI. */
 static const uint8_t modifier_keys[8] = { 29, 42, 56, 125, 97, 54, 100, 126 };
@@ -233,14 +241,20 @@ static void keyboard_report(hid_state_t *st, const uint8_t *r, uint32_t len) {
     for (int i = 2; i < 8; i++) {
         uint8_t u = st->prev[i];
         if (u > 3 && !key_in(cur, u) && u < sizeof(usage_to_key) &&
-            usage_to_key[u])
+            usage_to_key[u]) {
             keyboard_input_key(usage_to_key[u], 0);
+            if (st->repeat_key == usage_to_key[u]) st->repeat_key = 0;
+        }
     }
     for (int i = 2; i < 8; i++) {
         uint8_t u = cur[i];
         if (u > 3 && !key_in(st->prev, u) && u < sizeof(usage_to_key) &&
-            usage_to_key[u])
+            usage_to_key[u]) {
             keyboard_input_key(usage_to_key[u], 1);
+            /* The newest key is the one that repeats. */
+            st->repeat_key = usage_to_key[u];
+            st->repeat_tick = pit_ticks() + REPEAT_DELAY;
+        }
     }
     memcpy(st->prev, cur, 8);
 }
@@ -307,6 +321,14 @@ static void pointer_report(hid_state_t *st, const uint8_t *r, uint32_t len) {
         st->last_y = sy;
     }
     mouse_input(dx, dy, wheel, buttons);
+}
+
+void hid_tick(hid_state_t *st) {
+    if (st->kind != HID_KIND_KEYBOARD || !st->repeat_key) return;
+    uint32_t now = pit_ticks();
+    if ((int32_t)(now - st->repeat_tick) < 0) return;
+    keyboard_input_key(st->repeat_key, 1);
+    st->repeat_tick = now + REPEAT_PERIOD;
 }
 
 void hid_report(hid_state_t *st, const uint8_t *data, uint32_t len) {

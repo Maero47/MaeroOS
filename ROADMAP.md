@@ -33,7 +33,6 @@ the test that proves it, is in the status table of [README.md](README.md).
 - **USB.** Mount filesystems from `/dev/usbdisk0` (needs a block-device
   layer under ext2 instead of its direct `ata_read` calls), USB 3 hubs,
   xHCI interrupts (MSI or INTx) instead of polling, more than one HID
-  interface per device (keyboards' media keys), keyboard LEDs and
-  auto-repeat for USB keyboards.
+  interface per device (keyboards' media keys), keyboard LEDs.
 - **Distribution.** A deterministic release artifact: kernel ELF, initrd,
   disk image and a documented QEMU command.
