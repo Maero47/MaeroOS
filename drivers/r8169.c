@@ -148,21 +148,6 @@ static const pci_device_t *find_device(void) {
     return 0;
 }
 
-/* Config-space offset of capability `id`, 0 if absent. */
-static uint8_t pci_cap(const pci_device_t *d, uint8_t id) {
-    uint32_t sts = pci_read_config32(d->bus, d->slot, d->func, 0x04) >> 16;
-    if (!(sts & 0x10))
-        return 0;
-    uint8_t p = (uint8_t)(pci_read_config32(d->bus, d->slot, d->func, 0x34) & 0xFC);
-    for (int n = 0; p && n < 48; n++) {
-        uint32_t v = pci_read_config32(d->bus, d->slot, d->func, p);
-        if ((v & 0xFF) == id)
-            return p;
-        p = (uint8_t)((v >> 8) & 0xFC);
-    }
-    return 0;
-}
-
 /* PCI state at probe, put back if the device turns out not to be ours to
  * drive (unknown revision, no usable BAR): COMMAND as firmware left it and
  * the power state.  pm_off is 0 when there is no PM capability. */
@@ -172,7 +157,7 @@ static uint8_t pm_off;
 
 /* Firmware may leave the NIC in D3hot; registers read all-ones there. */
 static void pci_to_d0(const pci_device_t *d) {
-    pm_off = pci_cap(d, 0x01);
+    pm_off = pci_find_cap(d, 0x01);
     if (!pm_off)
         return;
     orig_pmcsr = pci_read_config32(d->bus, d->slot, d->func, (uint8_t)(pm_off + 4));
@@ -205,7 +190,7 @@ static void bus_master_on(void *ctx) {
 /* ASPM L0s/L1 and clock PM off (as re(4) does by default): implicated in TX
  * stalls on many 8168 revisions.  Link Status above is RW1C; write 0s. */
 static int pcie_aspm_off(const pci_device_t *d) {
-    uint8_t pe = pci_cap(d, 0x10);
+    uint8_t pe = pci_find_cap(d, 0x10);
     if (!pe)
         return 0;
     uint8_t off = (uint8_t)(pe + 0x10);
