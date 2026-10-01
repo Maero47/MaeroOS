@@ -22,6 +22,7 @@
 #include "../arch/i686/cpu/pic.h"
 #include "../arch/i686/include/io.h"
 #include "../arch/i686/mm/paging.h"
+#include "../mm/mmio.h"
 #include "../include/kernel/config.h"
 #include "../kernel/printk.h"
 #include "../lib/printf.h"
@@ -126,9 +127,9 @@ struct e1000_tx_desc {
 #define TX_DESCS   32
 #define BUF_SIZE   2048
 
-/* The register file is 128 KiB (BAR0).  It is mapped uncached at
- * E1000_MMIO_VIRT, inside the PDEs 768-1022 every page directory snapshots
- * at creation (see the kernel virtual map in include/kernel/config.h). */
+/* The register file is 128 KiB (BAR0), mapped uncached through mmio_map()
+ * during boot (see the kernel virtual map in include/kernel/config.h). */
+#define E1000_MMIO_SIZE 0x20000U
 
 static const uint16_t e1000_ids[] = {
     0x1000, 0x1001, 0x1004, 0x1008, 0x1009, 0x100C, 0x100D, 0x100E, 0x100F,
@@ -432,15 +433,11 @@ void e1000_init(void) {
     cmd &= ~(1U << 10);
     pci_write_config32(dev->bus, dev->slot, dev->func, 0x04, cmd);
 
-    for (uint32_t off = 0; off < E1000_MMIO_SIZE; off += PAGE_SIZE) {
-        if (paging_map(E1000_MMIO_VIRT + off, phys + off,
-                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_NOCACHE |
-                       PAGE_WRITETHRU) != 0) {
-            printk("[E1000] cannot map the register window\n");
-            return;
-        }
+    mmio = mmio_map(phys, E1000_MMIO_SIZE);
+    if (!mmio) {
+        printk("[E1000] cannot map the register window\n");
+        return;
     }
-    mmio = (volatile uint8_t *)E1000_MMIO_VIRT;
 
     info.device_id = dev->device_id;
     info.mmio_phys = phys;

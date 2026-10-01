@@ -4,6 +4,7 @@
 #include "../kernel/printk.h"
 #include "../lib/string.h"
 #include "../arch/i686/mm/paging.h"
+#include "../mm/mmio.h"
 #include "../arch/i686/cpu/spinlock.h"
 #include "../arch/i686/cpu/tsc.h"
 #include <kernel/config.h>
@@ -168,12 +169,12 @@ static int         ndisks;
 static spinlock_t  ahci_lock;
 
 /*
- * The register windows are mapped at AHCI_MMIO_VIRT, AHCI_MMIO_STRIDE per
- * controller (see the kernel virtual map in include/kernel/config.h),
- * cache-disabled.  They are mapped during boot, before the first process is
- * created, so the page table they need is in every later address space
- * (pgdir_create copies the kernel PDEs).
+ * Each controller's ABAR (at most 0x1100 bytes: the HBA registers and 32
+ * ports) is mapped uncached through mmio_map() during boot (see the kernel
+ * virtual map in include/kernel/config.h).
  */
+#define AHCI_ABAR_SIZE   0x1100u
+#define AHCI_MAX_CTRL    4
 
 static uint32_t kphys(const void *p) {
     return (uint32_t)(uintptr_t)p - (uint32_t)KERNEL_VMA;
@@ -575,16 +576,11 @@ static void ahci_init_ctrl(const pci_device_t *pd, int ctrl) {
     pci_write_config32(pd->bus, pd->slot, pd->func, 0x04,
                        (cmd & 0xFFFFu) | 0x0006u | 0x0400u);
 
-    uint32_t virt = AHCI_MMIO_VIRT + (uint32_t)ctrl * AHCI_MMIO_STRIDE;
-    uint32_t page = phys & ~0xFFFu;
-    for (uint32_t off = 0; off < AHCI_MMIO_STRIDE; off += 0x1000u) {
-        if (paging_map(virt + off, page + off,
-                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_NOCACHE | PAGE_WRITETHRU) != 0) {
-            printk("[AHCI] cannot map the register window\n");
-            return;
-        }
+    volatile uint8_t *abar = mmio_map(phys, AHCI_ABAR_SIZE);
+    if (!abar) {
+        printk("[AHCI] cannot map the register window\n");
+        return;
     }
-    volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)(virt + (phys & 0xFFFu));
 
     uint32_t vs = rd(abar, HBA_VS);
     if (hba_reset(abar) < 0) {

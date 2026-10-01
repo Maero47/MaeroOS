@@ -35,6 +35,7 @@
 #include "../pci.h"
 #include "../../arch/i686/cpu/pit.h"
 #include "../../arch/i686/mm/paging.h"
+#include "../../mm/mmio.h"
 #include "../../include/kernel/config.h"
 #include "../../kernel/printk.h"
 #include "../../lib/string.h"
@@ -43,7 +44,9 @@
 #include "../../proc/scheduler.h"
 #include <stdint.h>
 
-/* The register BAR is mapped at XHCI_MMIO_VIRT (include/kernel/config.h). */
+/* The register BAR is mapped uncached through mmio_map(), at most this much
+ * of it (see the kernel virtual map in include/kernel/config.h). */
+#define XHCI_MMIO_MAX    0x00100000U
 
 #define XHCI_MAX_DEVS    16
 #define HUB_MAX_PORTS    15
@@ -1513,17 +1516,12 @@ void xhci_init(void) {
     pci_write_config32(b, s, f, 0x04, (cmd & 0xFFFFU) | 0x6U);
     if (size == 0 || size > XHCI_MMIO_MAX) size = XHCI_MMIO_MAX;
 
-    for (uint32_t off = 0; off < size; off += PAGE_SIZE) {
-        if (paging_map(XHCI_MMIO_VIRT + off, base + off,
-                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_NOCACHE |
-                       PAGE_WRITETHRU) != 0) {
-            printk("[XHCI] cannot map registers\n");
-            hc_pci = 0;
-            return;
-        }
+    cap_regs = mmio_map(base, size);
+    if (!cap_regs) {
+        printk("[XHCI] cannot map registers\n");
+        hc_pci = 0;
+        return;
     }
-
-    cap_regs = (volatile uint8_t *)XHCI_MMIO_VIRT;
     op_regs = cap_regs + (rd32(cap_regs, CAP_CAPLENGTH) & 0xFF);
     rt_regs = cap_regs + (rd32(cap_regs, CAP_RTSOFF) & ~0x1FU);
     db_regs = (volatile uint32_t *)(cap_regs +

@@ -3,6 +3,7 @@
 #include "../kernel/printk.h"
 #include "../lib/string.h"
 #include "../arch/i686/mm/paging.h"
+#include "../mm/mmio.h"
 #include "../arch/i686/cpu/spinlock.h"
 #include "../arch/i686/cpu/tsc.h"
 #include <kernel/config.h>
@@ -157,14 +158,11 @@ typedef struct {
 } nvme_disk_t;
 
 /*
- * The register windows are mapped at a fixed kernel virtual range, 16 KiB
- * per controller (registers plus the first doorbells), cache-disabled:
- * 0xF8000000-0xF8010000.  Other drivers' windows: AHCI 0xF7000000, xHCI
- * 0xF6000000, ACPI 0xFD000000, e1000 0xFF400000.  Mapped during boot,
- * before the first process, so every later address space has the table.
+ * Each controller's registers plus the first doorbells, 16 KiB, are mapped
+ * uncached through mmio_map() during boot (see the kernel virtual map in
+ * include/kernel/config.h).
  */
-#define NVME_MMIO_VIRT   0xF8000000u
-#define NVME_MMIO_STRIDE 0x4000u
+#define NVME_MMIO_SIZE   0x4000u
 #define NVME_MAX_CTRL    4
 
 static nvme_ctrl_mem_t ctrl_mem[NVME_MAX_CTRL];
@@ -463,26 +461,24 @@ static void nvme_init_ctrl(const pci_device_t *pd, int ctrl) {
     pci_write_config32(pd->bus, pd->slot, pd->func, 0x04,
                        (pcmd & 0xFFFFu) | 0x0006u | 0x0400u);
 
-    uint32_t virt = NVME_MMIO_VIRT + (uint32_t)ctrl * NVME_MMIO_STRIDE;
-    uint32_t page = phys & ~0xFFFu;
-    for (uint32_t off = 0; off < NVME_MMIO_STRIDE; off += 0x1000u) {
-        if (paging_map(virt + off, page + off,
-                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_NOCACHE | PAGE_WRITETHRU) != 0) {
-            printk("[NVMe] cannot map the register window\n");
-            return;
-        }
+    /* The window starts at the page holding the BAR, so the doorbell
+     * check below keeps measuring from that page. */
+    volatile uint8_t *regs = mmio_map(phys & ~0xFFFu, NVME_MMIO_SIZE);
+    if (!regs) {
+        printk("[NVMe] cannot map the register window\n");
+        return;
     }
 
     nvme_ctrl_t *c = &ctrls[ctrl];
     memset(c, 0, sizeof(*c));
-    c->regs = (volatile uint8_t *)(uintptr_t)(virt + (phys & 0xFFFu));
+    c->regs = regs + (phys & 0xFFFu);
     c->mem = &ctrl_mem[ctrl];
 
     uint32_t cap_lo = rd(c, NVME_CAP), cap_hi = rd(c, NVME_CAP + 4);
     uint32_t vs = rd(c, NVME_VS);
     /* Our doorbells (QID 0 and 1) must fall inside the mapped window. */
     if (!CAP_CSS_NVM(cap_hi) || CAP_MPSMIN(cap_hi) != 0 ||
-        NVME_DBS + 4u * (4u << CAP_DSTRD(cap_hi)) > NVME_MMIO_STRIDE - (phys & 0xFFFu)) {
+        NVME_DBS + 4u * (4u << CAP_DSTRD(cap_hi)) > NVME_MMIO_SIZE - (phys & 0xFFFu)) {
         printk("[NVMe] %02x:%02x.%u: unsupported controller (CAP=0x%08x%08x)\n",
                (unsigned)pd->bus, (unsigned)pd->slot, (unsigned)pd->func,
                (unsigned)cap_hi, (unsigned)cap_lo);

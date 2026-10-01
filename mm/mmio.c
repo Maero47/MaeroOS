@@ -3,6 +3,8 @@
 #include "../kernel/printk.h"
 #include <kernel/config.h>
 
+/* PCD and PWT both set: strong uncached whatever the PAT and MTRRs say,
+ * as the drivers' fixed windows had it. */
 static uint32_t mmio_next = MMIO_WINDOW_START;
 
 void *mmio_map(uint32_t phys, uint32_t size) {
@@ -19,7 +21,8 @@ void *mmio_map(uint32_t phys, uint32_t size) {
     for (uint32_t p = 0; p < len; p += PAGE_SIZE) {
         /* cannot fail: the tables were reserved above */
         if (paging_map(base + p, (phys & ~0xFFFU) + p,
-                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_NOCACHE) != 0)
+                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_NOCACHE |
+                       PAGE_WRITETHRU) != 0)
             return 0;
     }
     /* one unmapped guard page between consecutive mappings */
