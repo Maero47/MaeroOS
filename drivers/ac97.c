@@ -203,7 +203,7 @@ static void pump(void) {
         play_abs = AUDIO_POS_START;
         last_civ = 0;
         write_abs = AUDIO_POS_START + (ring_tail & 3);   /* frame alignment */
-        copy_in(CYC_BYTES - BUF_BYTES);
+        copy_in(play_abs + CYC_BYTES - BUF_BYTES);
         outl((uint16_t)(nabm_base + PO_BDBAR), virt_to_phys(bdl));
         outb((uint16_t)(nabm_base + PO_LVI), NUM_BUFS - 1);
         outb((uint16_t)(nabm_base + PO_CR), CR_RPBM | CR_IOCE);

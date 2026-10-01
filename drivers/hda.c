@@ -606,7 +606,7 @@ static void pump(void) {
         last_lpib = 0;
         write_abs = AUDIO_POS_START + (ring_tail & 3);   /* frame alignment */
         memset(cyc, 0, CYC_BYTES);
-        copy_in(CYC_BYTES - WRITE_GUARD);
+        copy_in(play_abs + CYC_BYTES - WRITE_GUARD);
         w32(sd + SD_CTL, ((uint32_t)STREAM_TAG << 20) | SD_CTL_RUN | SD_CTL_IOCE);
         playing = 1;
         printk("[HDA] stream start\n");
