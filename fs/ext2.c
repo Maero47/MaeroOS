@@ -1,6 +1,6 @@
 #include "ext2.h"
 #include "vfs.h"
-#include "../drivers/ata.h"
+#include "../drivers/blkdev.h"
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
 #include <kernel/config.h>
@@ -302,14 +302,14 @@ static int ext2_raw_read_block(uint32_t blk, void *buf) {
     uint32_t lba = g_state.lba_offset + blk * g_state.sectors_per_block;
     /* Read sectors_per_block sectors; handle block sizes > 255*512 by looping */
     if (g_state.sectors_per_block <= 255) {
-        return ata_read(lba, (uint8_t)g_state.sectors_per_block, buf);
+        return blk_read(lba, (uint8_t)g_state.sectors_per_block, buf);
     }
     /* Large blocks: read in 128-sector (64 KiB) chunks */
     uint8_t *p = (uint8_t *)buf;
     uint32_t rem = g_state.sectors_per_block;
     while (rem > 0) {
         uint8_t n = (rem > 128) ? 128 : (uint8_t)rem;
-        if (ata_read(lba, n, p) < 0) return -1;
+        if (blk_read(lba, n, p) < 0) return -1;
         lba += n; p += n * 512; rem -= n;
     }
     return 0;
@@ -328,7 +328,7 @@ static int ext2_raw_read_blocks(uint32_t blk, uint32_t n, void *buf) {
     uint8_t *p    = (uint8_t *)buf;
     while (rem > 0) {
         uint8_t k = (rem > 128) ? 128 : (uint8_t)rem;
-        if (ata_read(lba, k, p) < 0) return -1;
+        if (blk_read(lba, k, p) < 0) return -1;
         lba += k; p += (uint32_t)k * 512; rem -= k;
     }
     return 0;
@@ -338,14 +338,14 @@ static int ext2_raw_write_block(uint32_t blk, const void *buf) {
     if (blk >= g_state.blocks_count) return -1;   /* see ext2_raw_read_block */
     uint32_t lba = g_state.lba_offset + blk * g_state.sectors_per_block;
     if (g_state.sectors_per_block <= 255) {
-        return ata_write(lba, (uint8_t)g_state.sectors_per_block, buf);
+        return blk_write(lba, (uint8_t)g_state.sectors_per_block, buf);
     }
 
     const uint8_t *p = (const uint8_t *)buf;
     uint32_t rem = g_state.sectors_per_block;
     while (rem > 0) {
         uint8_t n = (rem > 128) ? 128 : (uint8_t)rem;
-        if (ata_write(lba, n, p) < 0) return -1;
+        if (blk_write(lba, n, p) < 0) return -1;
         lba += n;
         p += n * 512;
         rem -= n;
@@ -577,7 +577,7 @@ static int ext2_write_block(uint32_t blk, const void *buf) {
 
 static int ext2_update_super_free_counts(int block_delta, int inode_delta) {
     uint8_t sb_buf[2048];
-    if (ata_read(g_state.lba_offset + 2, 4, sb_buf) < 0)
+    if (blk_read(g_state.lba_offset + 2, 4, sb_buf) < 0)
         return -1;
     ext2_sb_t *sb = (ext2_sb_t *)sb_buf;
     if (sb->s_magic != 0xEF53)
@@ -590,7 +590,7 @@ static int ext2_update_super_free_counts(int block_delta, int inode_delta) {
         sb->s_free_inodes_count -= (uint32_t)(-inode_delta);
     else
         sb->s_free_inodes_count += (uint32_t)inode_delta;
-    return ata_write(g_state.lba_offset + 2, 4, sb_buf);
+    return blk_write(g_state.lba_offset + 2, 4, sb_buf);
 }
 
 /* ── Inode reading ────────────────────────────────────────────────────────── */
@@ -828,7 +828,7 @@ int ext2_statfs(uint32_t *block_size, uint32_t *blocks, uint32_t *bfree,
                 uint32_t *inodes, uint32_t *ifree) {
     if (!g_mounted) return -1;
     uint8_t sb_buf[2048];
-    if (ata_read(g_state.lba_offset + 2, 4, sb_buf) < 0) return -1;
+    if (blk_read(g_state.lba_offset + 2, 4, sb_buf) < 0) return -1;
     ext2_sb_t *sb = (ext2_sb_t *)sb_buf;
     if (sb->s_magic != 0xEF53) return -1;
     if (block_size) *block_size = g_state.block_size;
@@ -2305,14 +2305,14 @@ static int ext2_readdir(vfs_node_t *dir, uint32_t req_idx,
 /* ── Mount ────────────────────────────────────────────────────────────────── */
 
 vfs_node_t *ext2_mount(uint32_t lba_offset) {
-    if (!ata_present()) {
-        printk("[EXT2]  No ATA drive, skipping mount.\n");
+    if (!blk_present()) {
+        printk("[EXT2]  No disk, skipping mount.\n");
         return NULL;
     }
 
     /* Read superblock: always at byte 1024 = sector 2 offset 0 */
     uint8_t sb_buf[2048];  /* 4 sectors, safely covers ext2_sb_t */
-    if (ata_read(lba_offset + 2, 4, sb_buf) < 0) {
+    if (blk_read(lba_offset + 2, 4, sb_buf) < 0) {
         printk("[EXT2]  Cannot read superblock.\n");
         return NULL;
     }
