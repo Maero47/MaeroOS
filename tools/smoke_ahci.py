@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """AHCI smoke test: boot with the disk on a SATA (AHCI) controller only.
 
-Two boots share one scratch copy of disk.img (build/smoke-ahci/disk.img), so
+First the BIOS/OS handoff logic runs as a host unit test
+(tools/test_ahci_handoff.c).  Then two boots share one scratch copy of disk.img (build/smoke-ahci/disk.img), so
 the suite never changes the image the other suites use:
 
 1. pc machine with an explicit `-device ahci` and the disk as an ide-hd on its
@@ -127,8 +128,23 @@ def check_fsck():
         raise AssertionError("e2fsck -fn reported:\n" + "\n".join(bad))
 
 
+def handoff_unit_test():
+    """drivers/ahci_handoff.h against a simulated firmware (QEMU's AHCI has no
+    CAP2.BOH, so the boots below never take the BIOS/OS handoff path)."""
+    exe = os.path.join(WORK, "test_ahci_handoff")
+    cc = shutil.which("cc") or shutil.which("gcc")
+    subprocess.run([cc, "-Wall", "-Wextra", "-Werror", "-I", os.path.join(ROOT, "drivers"),
+                    "-o", exe, os.path.join(ROOT, "tools", "test_ahci_handoff.c")], check=True)
+    out = subprocess.run([exe], capture_output=True, text=True, timeout=30)
+    print(out.stdout, end="")
+    if out.returncode != 0:
+        raise AssertionError("tools/test_ahci_handoff.c failed")
+    os.unlink(exe)
+
+
 def main():
     os.makedirs(WORK, exist_ok=True)
+    handoff_unit_test()
     subprocess.run(["cp", "--reflink=auto", os.path.join(ROOT, "disk.img"), IMG], check=True)
     # disk.img may already have been through smoke-disk (make check runs it
     # first), and diskprobe cannot remove the /dpdir that run left behind.

@@ -1,4 +1,5 @@
 #include "ahci.h"
+#include "ahci_handoff.h"
 #include "pci.h"
 #include "../kernel/printk.h"
 #include "../lib/string.h"
@@ -58,9 +59,6 @@
 #define GHC_AE        (1u << 31)
 
 #define CAP2_BOH      (1u << 0)     /* BIOS/OS handoff supported */
-#define BOHC_BOS      (1u << 0)     /* BIOS owned semaphore */
-#define BOHC_OOS      (1u << 1)     /* OS owned semaphore */
-#define BOHC_BB       (1u << 4)     /* BIOS busy */
 
 /* ── Port registers, offsets from ABAR + 0x100 + port * 0x80 ───────────── */
 #define PX_CLB      0x00
@@ -521,19 +519,48 @@ static void port_probe(volatile uint8_t *abar, uint32_t cap, int ctrl, int portn
     ndisks++;
 }
 
-/* Take the controller from the firmware (spec 10.6), reset it and enable
- * AHCI mode.  0 on success. */
+/* BOHC through the register window, for ahci_bios_handoff(). */
+typedef struct {
+    ahci_bohc_io_t    io;
+    volatile uint8_t *abar;
+} ahci_bohc_hw_t;
+
+static uint32_t bohc_read(ahci_bohc_io_t *io) {
+    return rd(((ahci_bohc_hw_t *)io)->abar, HBA_BOHC);
+}
+
+static void bohc_write(ahci_bohc_io_t *io, uint32_t v) {
+    wr(((ahci_bohc_hw_t *)io)->abar, HBA_BOHC, v);
+}
+
+static void bohc_sleep(ahci_bohc_io_t *io, uint32_t ms) {
+    (void)io;
+    delay_ms(ms);
+}
+
+/* Take the controller from the firmware (spec 10.6.3, drivers/ahci_handoff.h),
+ * reset it and enable AHCI mode.  0 on success; on failure the reason is
+ * logged and the controller is left alone.  A controller whose BIOS never
+ * releases BOS is not reset: resetting it under a firmware that is still
+ * driving it is what the handoff exists to prevent. */
 static int hba_reset(volatile uint8_t *abar) {
     if (rd(abar, HBA_CAP2) & CAP2_BOH) {
-        wr(abar, HBA_BOHC, rd(abar, HBA_BOHC) | BOHC_OOS);
-        if (wait_reg(abar, HBA_BOHC, BOHC_BOS, 0, 25) == 0 &&
-            (rd(abar, HBA_BOHC) & BOHC_BB))
-            delay_ms(2000);
+        ahci_bohc_hw_t hw = { { bohc_read, bohc_write, bohc_sleep }, abar };
+        int busy = 0;
+        if (ahci_bios_handoff(&hw.io, &busy) < 0) {
+            printk("[AHCI] BIOS did not release the HBA (BOHC=0x%08x%s); "
+                   "leaving it alone\n", (unsigned)rd(abar, HBA_BOHC),
+                   busy ? ", BIOS busy" : "");
+            return -1;
+        }
+        printk("[AHCI] BIOS/OS handoff done%s\n", busy ? " (waited for busy BIOS)" : "");
     }
     wr(abar, HBA_GHC, rd(abar, HBA_GHC) | GHC_AE);
     wr(abar, HBA_GHC, rd(abar, HBA_GHC) | GHC_HR);
-    if (wait_reg(abar, HBA_GHC, GHC_HR, 0, 1000) < 0)
+    if (wait_reg(abar, HBA_GHC, GHC_HR, 0, 1000) < 0) {
+        printk("[AHCI] HBA reset timed out\n");
         return -1;
+    }
     wr(abar, HBA_GHC, (rd(abar, HBA_GHC) | GHC_AE) & ~GHC_IE);
     return 0;
 }
@@ -565,7 +592,7 @@ static void ahci_init_ctrl(const pci_device_t *pd, int ctrl) {
 
     uint32_t vs = rd(abar, HBA_VS);
     if (hba_reset(abar) < 0) {
-        printk("[AHCI] %02x:%02x.%u: HBA reset timed out\n",
+        printk("[AHCI] %02x:%02x.%u: controller skipped\n",
                (unsigned)pd->bus, (unsigned)pd->slot, (unsigned)pd->func);
         return;
     }
