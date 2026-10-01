@@ -37,6 +37,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | toybox 0.8.13, syscall edge cases, signals, timers, libc, job control, `pkg` archive checks | `TOYBOX_OK` plus about 90 applet checks, `sysmiscprobe ok`, `abi2probe ok` (open modes, `O_APPEND`, groups, `access`), `sigexecprobe ok`, `sigshareprobe ok` (process-wide pending signals, group stop), `timerprobe ok` (`alarm`, `setitimer`, `timer_*`), `LIBCTEST PASS`, `^Z`/`jobs`/`fg` on a pipeline, `pkg` refusing `../etc`, and the host-side `tools/test_pkg_tarx.py`, `tools/test_pkg_sign.py` and `tools/test_regex.py` | `make smoke-toybox` |
 | Native coreutils-style commands, user faults | `kwprobe ok` (a user write to kernel memory dies of SIGSEGV, a user `int3` of SIGTRAP), then `uname`, `whoami`, `hostname`, `free`, `df`, `uptime`, `which` | `make smoke-cmds` |
 | ext2 disk, symlinks, login/passwd/doas, permissions, init services, sessions | 169 checks including `passwd` keeping `/etc/shadow` root-only 0600, `login` dropping to `uid=1000`, `doas` ignoring a planted `./ls`, `credprobe ok`, `fsprobe ok`, `symprobe ok` (ext2 symlinks, checked on the image with `debugfs` too) and `svc` state transitions | `make smoke-disk` |
+| `mount`/`umount`, partitions, read-only ext4 | busybox `mount -t ext4 /dev/hdb2 /mnt` on a GPT disk (4 KiB blocks, `64bit`, `metadata_csum`, `huge_file`, `flex_bg`) and `/dev/hdc5` on an MBR logical partition (1 KiB blocks): md5 of every file equals the host's, including a 300 MiB sparse file and an unwritten extent; a 5020-entry and a 20000-entry (two-level) htree directory list and resolve completely; fast, slow, relative, absolute and directory symlinks; writes fail with `EROFS`; `umount` is refused while a cwd is inside; tmpfs `remount,ro`; non-root `mount` refused; afterwards both filesystems are byte-identical to their images and `e2fsck -fn` is clean | `make smoke-ext4` |
 | `pkg` and the signed repo index | `tools/test_pkg_sign.py` runs the RFC 8032 vectors through the Python signer and the C verifier and rejects altered, unsigned and foreign-key indexes; in the guest, `pkg update` rejects unsigned, tampered and rolled-back indexes, installs and runs busybox, and `install` rejects a tarball whose SHA-256 does not match | `make smoke-pkg` |
 | TCP/IP over lwIP and RTL8139 | `MAEROS_HTTP_OK` fetched from a host HTTP server; `sockprobe` checks that `send` after `shutdown(SHUT_WR)` fails with `EPIPE`, a two-step shutdown ends in a FIN and no RST, closing TIME_WAIT sockets keeps TCP working, and a non-blocking client gets `EINPROGRESS`, `SO_ERROR`, `EAGAIN`, `ECONNREFUSED` and both socket names; `abi2probe net` checks `MSG_NOSIGNAL` and `EPIPE` after a reset | `make smoke-net` |
 | Kernel firewall | after `fwctl enable` plus a drop rule the same fetch fails, `fwctl list` reports the firewall `enabled` with the `drop out tcp` rule, malformed rules (`/33`, an overflowing prefix, port 70000, `tcpp`) are rejected under `policy out drop`, and `fwctl flush` restores the fetch | `make smoke-fw` |
@@ -81,7 +82,11 @@ What is proven by the automated QEMU tests in `tools/`:
   owns.
 - **No SMP scaling.** One Big Kernel Lock serialises all kernel execution
   (`arch/i686/cpu/bkl.c`).
-- **Missing Linux interfaces.** There is no `mount` syscall, no SysV IPC and no utmp.
+- **ext4 is read-only.** `mount -t ext4` works, but the driver never writes: it
+  cannot replay or write the journal, so a read-write mount is refused with `EROFS`
+  and busybox `mount` falls back to read-only (`docs/ext4.md`). Only the boot disk
+  (`/disk`, ext2) is writable.
+- **Missing Linux interfaces.** There is no SysV IPC and no utmp.
   `/proc/<pid>/` has only `status` and `stat` (the full set is under `/proc/self`), and
   there is no `/proc/stat`, so toybox is built without `killall` (it matches names
   through other processes' `cmdline`), `vmstat` and `who`. The libc's `getaddrinfo` is a
@@ -187,7 +192,12 @@ deadlock the sender.
 ### Filesystems
 
 `fs/vfs.c` mount table with a root overlay and path lookup (symlinks are followed
-iteratively with a 40-link budget, then `ELOOP`), `fs/initrd.c` ustar archive read from
+iteratively with a 40-link budget, then `ELOOP`; `mount(2)`/`umount2(2)` attach
+filesystems at any directory, crossed during the walk, listed in `/proc/mounts`),
+`fs/ext4.c` (read-only ext2/3/4 for `mount -t ext4`: extents, `64bit`, `flex_bg`,
+`meta_bg`, htree lookups, `metadata_csum` verified; see `docs/ext4.md`),
+`drivers/blkpart.c` (MBR, logical and GPT partitions of all four IDE disks as
+`/dev/hda`..`/dev/hdd5`, `/proc/partitions`), `fs/initrd.c` ustar archive read from
 the Multiboot module, `fs/ext2.c` (read and write, mounted at `/disk` and overlaid on
 `/`, symlinks included), `fs/tmpfs.c` at `/tmp` (file bodies in page frames rather than
 the kernel heap, capped at 1 GiB per file, `EFBIG` beyond), `fs/devfs.c` at
@@ -477,6 +487,7 @@ make smoke          # boot, shell, procfs, PTYs, threads, shm, getrandom, ps
 make smoke-cmds     # native uname/whoami/hostname/free/df/uptime/which
 make smoke-toybox   # toybox as a static guest binary
 make smoke-disk     # ext2, login/passwd, init sessions, service supervision, overlay
+make smoke-ext4     # mount/umount, GPT+MBR partitions, read-only ext4 vs host md5s
 make smoke-net      # DHCP, TCP, HTTP GET from the host
 make smoke-pkg      # pkg against a host repo: signed index, install, rollback
 make smoke-fw       # firewall rule blocks and unblocks that GET
