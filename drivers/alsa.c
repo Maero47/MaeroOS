@@ -459,6 +459,15 @@ static int hw_refine(struct hw_params *p) {
     uint32_t cmask = 0;
     int r;
 
+    /* The answers below are recomputed on every refine (alsa-lib's "any"
+     * leaves info at ~0, which would claim pause, resume and mmap). */
+    p->info = 0;
+    p->fifo_size = 0;
+    if (p->rmask & (1U << P_SAMPLE_BITS))
+        p->msbits = 0;
+    if (p->rmask & (1U << P_RATE))
+        p->rate_num = p->rate_den = 0;
+
     memset(&allow, 0, sizeof(allow));
     allow.bits[0] = 1U << ACCESS_RW_INTERLEAVED;
     r = mask_refine(&p->masks[P_ACCESS], &allow);
@@ -526,8 +535,7 @@ static int hw_refine(struct hw_params *p) {
 
     p->cmask = cmask;
     p->rmask = 0;
-    if (!p->info)
-        p->info = INFO_INTERLEAVED | INFO_BLOCK_TRANSFER | INFO_BATCH;
+    p->info = INFO_INTERLEAVED | INFO_BLOCK_TRANSFER | INFO_BATCH;
     {
         int f = mask_first(&p->masks[P_FORMAT]);
         uint32_t only = 1;
@@ -1284,8 +1292,7 @@ static void chardev(vfs_node_t *n, const char *name, uint32_t ino, uint32_t mino
     strncpy(n->name, name, 255);
     n->flags = VFS_FLAG_CHARDEV;
     n->inode = ino;
-    n->mask = 0660;
-    n->gid = 0;
+    n->mask = 0666;                          /* like /dev/dsp: no audio group */
     n->rdev = (116U << 8) | minor;          /* ALSA's major */
     n->read_fn = nodata_read;
     n->write_fn = nodata_write;

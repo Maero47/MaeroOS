@@ -1,8 +1,9 @@
 # Alpine Linux x86 userland
 
 MaeroOS runs unmodified Alpine Linux x86 (32-bit, musl) packages: bash, GNU
-coreutils, python3, vim, less, nano, git, OpenSSH's client and apk itself, which
-installs and removes packages in the guest.
+coreutils, python3, vim, less, nano, git, OpenSSH's client, alsa-utils
+(`aplay`, through the kernel's ALSA ABI: `make smoke-audio`, docs/audio.md) and
+apk itself, which installs and removes packages in the guest.
 
     make smoke-alpine             # build disk-alpine.img if needed, boot, check
     python3 ports/alpine/prepare.py   # just build disk-alpine.img
@@ -75,7 +76,7 @@ inside one, and `/proc/self/fd/N` of a directory opened before the chroot.
    `alpine.lock`. The minirootfs carries the Alpine signing keys
    (`/etc/apk/keys`).
 2. Run `apk.static --root <tree> add bash coreutils python3 vim less nano
-   git openssh-client` on the host, inside `unshare -r` (an i386 static
+   git openssh-client alsa-utils` on the host, inside `unshare -r` (an i386 static
    binary that x86-64 Linux runs). apk itself verifies the signed APKINDEX
    and every package signature against those keys.
 3. Compare the installed `name-version` set and every downloaded `.apk`

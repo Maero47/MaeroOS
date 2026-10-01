@@ -482,7 +482,7 @@ fi
 : > "$MANIFEST"
 # The font directory is this script's alone (the tarball has no share/), so
 # drop it whole: a face removed from FONT_FILES must not linger in the image.
-rm -rf "${FFDIR:?}/share"
+rm -rf "${FFDIR:?}/share" "${FFDIR:?}/alsa" "${FFDIR:?}/apulse"
 mkdir -p "$FFDIR/pixbuf-loaders"
 nstale=0
 find "$FFDIR" -maxdepth 2 -type f \( -name '*.so' -o -name '*.so.*' \) | sort | while IFS= read -r f; do
@@ -582,6 +582,28 @@ if [ -s "$missing" ]; then
     die "sonames not provided by any listed package: $(tr '\n' ' ' < "$missing")(add the package to debian-packages.txt)"
 fi
 log "$ncopied Debian shared objects copied into ${FFDIR#"$ROOT"/} ($(wc -l < "$seen") sonames reachable, rest pruned)"
+
+# alsa-lib's configuration (alsa.conf, pcm/*.conf, cards/*.conf) from
+# libasound2-data.  The library looks for it at its compiled-in
+# /usr/share/alsa unless ALSA_CONFIG_DIR says otherwise; the ff launcher
+# sets ALSA_CONFIG_DIR=/disk/firefox/alsa.
+alsadata=$(find "$UNPACK" -type d -path "*/usr/share/alsa" 2>/dev/null | head -n 1)
+[ -n "$alsadata" ] && [ -f "$alsadata/alsa.conf" ] || die "alsa.conf not found in the unpacked packages (libasound2-data)"
+(cd "$alsadata" && find . -type f) | sed 's|^\./||' | sort | while IFS= read -r rel; do
+    mkdir -p "$FFDIR/alsa/$(dirname "$rel")"
+    install_ff "$alsadata/$rel" "alsa/$rel"
+done
+log "alsa-lib configuration ($(find "$FFDIR/alsa" -type f | wc -l) files) installed in ${FFDIR#"$ROOT"/}/alsa"
+
+# apulse: libpulse.so.0 (+ -simple, -mainloop-glib) implemented on alsa-lib,
+# for cubeb's PulseAudio backend.  Kept in their own directory, which the ff
+# launcher puts on LD_LIBRARY_PATH; their DT_NEEDED (libasound, GLib, libc)
+# are all in the tree already.
+apdir=$(find "$UNPACK/apulse" -type d -name apulse -path "*/lib/*" 2>/dev/null | head -n 1)
+[ -n "$apdir" ] && [ -f "$apdir/libpulse.so.0" ] || die "libpulse.so.0 not found in the apulse package"
+mkdir -p "$FFDIR/apulse"
+for f in "$apdir"/*.so.0; do install_ff "$f" "apulse/$(basename "$f")"; done
+log "apulse ($(ls "$FFDIR/apulse" | tr '\n' ' ')) installed in ${FFDIR#"$ROOT"/}/apulse"
 
 # ---------------------------------------------------------------------------
 # 9. loaders.cache with the on-disk paths

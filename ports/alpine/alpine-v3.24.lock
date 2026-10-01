@@ -2,6 +2,9 @@
 # file: sha256 of a downloaded file; pkg: an installed name-version.
 file acl-libs-2.3.2-r1.af260bc0.apk 9dd329380b583bbabe5f685bf7d2623a0886aa45236ff9d88ba9046fecd2a065
 file alpine-minirootfs-3.24.2-x86.tar.gz 757f07c5a3476ba3947cfbea2323b7f02fb6fb2fba8a3a3c2b9d17f0a54c9226
+file alsa-lib-1.2.15.3-r0.09cbae24.apk 61bc1eabaffd1cd2e653037b444fca9e1f4373f67b65f0937071808b4482042a
+file alsa-ucm-conf-1.2.16.1-r0.430d8bdb.apk c1da8713702e1418b87e3c288112e9376aa15554c386cd47301441a985d1a5fa
+file alsa-utils-1.2.15.2-r1.85f88f5c.apk 57588e047abfe6897df6799e0eb5d23e467b8991585641a4e15634802cea3db3
 file apk-tools-static-3.0.8-r0.apk f97a89e9af2d481434f7fd4917888a509290810e2a8132ae102de1beecaff64d
 file bash-5.3.9-r1.e8a6b00a.apk f5f0956b8464729577b1021bb6301f23d9e7b010bf11aac3678409827484ee52
 file brotli-libs-1.2.0-r1.224add79.apk ecb54296acafc3bb9a21dea29514c0d2214a005ada676677f8ef68e05a54d282
@@ -10,6 +13,8 @@ file coreutils-9.11-r0.58094241.apk b8043313c5649665e2b09676fc0c3804010bde5bfcd5
 file coreutils-env-9.11-r0.7cb75b68.apk c3b899dea89a67fb86a9d81fbf5b3427832b118a5b43761639459448ebe63aa7
 file coreutils-fmt-9.11-r0.a3776696.apk 672ae780a6acf8eecd00eaf9d8de318e806f2b92432264ed5a8b3d700feaea7e
 file coreutils-sha512sum-9.11-r0.a50e57e2.apk 70424777d41b8b652a3432ebdeca42c8f0decded674fe31f93e5f1391a1ad566
+file dialog-1.3.20260107-r1.415e2b75.apk e2eadcd315933c333130c5a7eccc9b8e2a2d1ad7bd6db6ceb6677b3c6e6a0b63
+file fftw-single-libs-3.3.11-r0.ab450224.apk de6c804e09a31433ddf4b87480888e84d05186bcb3ae9d9fa56c000ef431a96e
 file gdbm-1.26-r0.d185e299.apk 7744f4fe12bd6e81744e79bf8fd09ead3e8edd54c86872f8d7ee8375329e1a65
 file git-2.54.0-r0.e1f31fa5.apk ea4728fd0c3598905aee5bb654e81122830f17a5e0c80a8b5abc18738b4ce062
 file git-init-template-2.54.0-r0.02d0c461.apk ca41f4fd1ece7df2331a913b39d361bbe5fa96cc44f75bb50649b64e1178fafa
@@ -20,8 +25,10 @@ file libcurl-8.22.0-r0.0feef69d.apk 3900dc04661880c2882376f89264ea7eb9840dd15ba9
 file libedit-20260508.3.1-r1.754ec8ae.apk 3fc0fcfe011bcea8ed32f97c8088740e8d02d085b05c401834d97f40a06524fc
 file libexpat-2.8.5-r0.d04ae3df.apk 49fe8fcd2a8eba8fbebf005612950440bd0287c6ccf7c0b4128ff136ca001b34
 file libffi-3.5.2-r1.98ec9e75.apk b1c7cbf073a96066a84eb28fb15071e20838320f860df83d6609fa50af21cf97
+file libformw-6.6_p20260516-r0.0b6d4950.apk b7675a463c250f19ab4205387bcfeba51bc8a2b7c033d1ad68dfb63582ad9464
 file libgcc-15.2.0-r5.e4a64372.apk 8c7854c5671b7bec32768d47cb4086b3e78b9ff347a24cad5cf42e8c6e9b9551
 file libidn2-2.3.8-r0.4984bb8f.apk cae318b487162b91342504a6e85c3d6381b83988f5904a1099d212184d1a8afd
+file libmenuw-6.6_p20260516-r0.0a083325.apk d37d10c98227fcced56d6062a57c00b767af525aa1d30ea64ffb65daa5a3d9e6
 file libncursesw-6.6_p20260516-r0.aa6466d6.apk 49a048c29a93046b3fc5e72a21bb55ef537558d026f1064a42d25f42f19a90e9
 file libpanelw-6.6_p20260516-r0.7c0d7157.apk 8f591e6c968ef4a6e388b02503a895c15716c5b92fc4b39f2beaae10b77939c6
 file libpsl-0.21.5-r3.156cf905.apk b1877322d6a3e54c156e7f838e03dfaf723dae86859508b63fc8193961b9022d
@@ -52,6 +59,9 @@ pkg alpine-baselayout-3.7.2-r1
 pkg alpine-baselayout-data-3.7.2-r1
 pkg alpine-keys-2.6-r0
 pkg alpine-release-3.24.2-r0
+pkg alsa-lib-1.2.15.3-r0
+pkg alsa-ucm-conf-1.2.16.1-r0
+pkg alsa-utils-1.2.15.2-r1
 pkg apk-tools-3.0.8-r0
 pkg bash-5.3.9-r1
 pkg brotli-libs-1.2.0-r1
@@ -63,6 +73,8 @@ pkg coreutils-9.11-r0
 pkg coreutils-env-9.11-r0
 pkg coreutils-fmt-9.11-r0
 pkg coreutils-sha512sum-9.11-r0
+pkg dialog-1.3.20260107-r1
+pkg fftw-single-libs-3.3.11-r0
 pkg gdbm-1.26-r0
 pkg git-2.54.0-r0
 pkg git-init-template-2.54.0-r0
@@ -75,8 +87,10 @@ pkg libcurl-8.22.0-r0
 pkg libedit-20260508.3.1-r1
 pkg libexpat-2.8.5-r0
 pkg libffi-3.5.2-r1
+pkg libformw-6.6_p20260516-r0
 pkg libgcc-15.2.0-r5
 pkg libidn2-2.3.8-r0
+pkg libmenuw-6.6_p20260516-r0
 pkg libncursesw-6.6_p20260516-r0
 pkg libpanelw-6.6_p20260516-r0
 pkg libpsl-0.21.5-r3

@@ -51,6 +51,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | Desktop and its apps | driven with QMP mouse and keyboard input on the ISO: the launcher opens the terminal, a command typed into it runs in the terminal's own shell (its pid is checked), the image viewer shows `/disk/wallpaper.ppm`, Files enters a directory by double-click, Settings applies an accent (the desktop reloads, `desktop.conf` changes), the Store shows its verified list or the "run pkg update" state, the Task Manager lists the desktop and the Store, windows close by button, Esc and Alt-Tab and the focus passes to the topmost window left; every window must also show up in a screendump | `make smoke-gui` |
 | GLib, Cairo, Pango, GTK3 | `GLIB_OK` (v2.78), `CAIRO_OK rect_px=0xe69919`, `PANGO_OK`, `GTK_OK init`, `GTK_WINDOW_SHOWN`, `GTK_DRAWN` (needs probe binaries a fresh clone lacks, see Testing) | `make smoke-gtk` |
 | Intel HDA audio | on 2 CPUs, `tone` plays 1 kHz for 1.5 s and 2.5 kHz at 25 % mixer volume through `/dev/dsp`; QEMU's wav capture must hold each tone at its frequency, for about its length without dropouts, and the second one quieter | `make smoke-hda` |
+| Sound for Linux programs (ALSA ABI) | Alpine's unmodified `aplay` (alsa-utils 1.2.14) in the chroot plays a 44.1 kHz mono S16 WAV through alsa-lib's `default` device and 22.05 kHz U8 and 48 kHz float WAVs through `hw:0`, then `tone` plays through `/dev/dsp`; QEMU's wav capture holds each tone at its frequency (DFT peak and zero crossings), for its length, without dropouts; the same on AC'97 with `--ac97` (docs/audio.md; needs `disk-alpine.img`) | `make smoke-audio` |
 | ACPI (uACPI 6.1.0) | on QEMU's `pc` and `q35` machines the kernel finds the RSDP, loads the AML namespace (`[ACPI] ready`), `poweroff` ends QEMU through S5 (`\_PTS`, `\_S5`), `reboot` restarts it through the FADT reset register (q35) or 0xCF9 (pc, whose FADT has none), and the ACPI power button (`system_powerdown`) reaches init as SIGUSR2 and powers off | `make smoke-acpi` |
 | PC without legacy devices | `-M q35,i8042=off -smp 2` with an ICH9 HDA: no PS/2 controller (`[KBD]  no PS/2 controller`), `/disk` from `ahci0`, both CPUs from the MADT, the desktop's Terminal opened and typed into with a USB tablet and keyboard, and `doas poweroff` typed there makes QEMU exit through S5 | `make smoke-pc` |
 | Firefox 115.15.0esr | `ff: Firefox painted` (the browser window, about 5 s after `firefox-bin` starts); with `--web`, a page served from the host (HTML, a CSS rule, a PNG) requested and its image on screen about 3 s after Enter (needs the Firefox tree, see `ports/firefox/`) | `make smoke-firefox`, `make smoke-firefox-web` |
@@ -208,7 +209,7 @@ the Multiboot module, `fs/ext2.c` (read and write, mounted at `/disk` and overla
 `/`, symlinks included), `fs/tmpfs.c` at `/tmp` (file bodies in page frames rather than
 the kernel heap, capped at 1 GiB per file, `EFBIG` beyond), `fs/devfs.c` at
 `/dev` (`null`, `zero`, `tty`,
-`ptmx`, `pts/`, `random`, `urandom`, `fb0`, `dsp`, `shm`, `input/event0`, `input/event1`,
+`ptmx`, `pts/`, `random`, `urandom`, `fb0`, `dsp`, `snd/controlC0`, `snd/pcmC0D0p`, `shm`, `input/event0`, `input/event1`,
 `stdin`/`stdout`/`stderr`), and `fs/procfs.c` at `/proc` (per-pid `status` and `stat`;
 `self` adds `statm`, `maps`, `fd`, `cmdline`, `environ`, `auxv`, `exe`; plus `meminfo`, `version`,
 `uptime`, `cpuinfo`, `kmsg`, `processes`, `pci`, `netif`, `firewall`, `sys/vm/`).
@@ -231,7 +232,8 @@ controller and port (`ahci.c`), NVMe with one polled I/O queue pair per controll
 namespace as a disk (`nvme.c`; `/disk` mounts from the IDE master if there is one, else the first AHCI
 disk, else the first NVMe namespace, via `blkdev.c`), PCI enumeration (`pci.c`), RTL8139 (`rtl8139.c`), Intel 8254x e1000 (`e1000.c`), Intel 82801AA AC'97
 audio (`ac97.c`), Intel High Definition Audio (`hda.c`: CORB/RIRB, codec widget walk, cyclic BDL
-playback; `/dev/dsp` uses whichever of the two is present), Multiboot VBE framebuffer (`framebuffer.c`), VGA text (`vga.c`), PS/2
+playback; `/dev/dsp` uses whichever of the two is present, and so does the ALSA
+playback ABI in `alsa.c`, see [docs/audio.md](docs/audio.md)), Multiboot VBE framebuffer (`framebuffer.c`), VGA text (`vga.c`), PS/2
 keyboard and mouse (`keyboard.c`, `mouse.c`), CMOS RTC (`rtc.c`) and 16550 serial
 (`serial.c`).
 
@@ -532,6 +534,7 @@ make smoke-gtk      # GLib, Cairo, Pango and a real GTK3 window
 make smoke-gui      # the desktop, driven by mouse and keyboard (needs the ISO)
 make smoke-usb      # the same desktop with USB input only, a hub and a USB stick
 make smoke-hda      # Intel HDA playback through /dev/dsp, checked from a wav capture
+make smoke-audio    # Alpine's aplay through the ALSA ABI (/dev/snd), checked the same way (opt-in)
 make smoke-acpi     # poweroff, reboot, power button and halt through ACPI (pc and q35)
 make smoke-pc       # q35 with no PS/2: AHCI disk, USB input, desktop, poweroff
 make smoke-uefi     # the Limine ISO under SeaBIOS, OVMF x64 and OVMF IA32: login, desktop, ACPI poweroff

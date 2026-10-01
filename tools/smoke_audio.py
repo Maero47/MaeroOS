@@ -33,7 +33,7 @@ from smoke_hda import classify, peak_freq, read_wav, rms
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IMG = os.path.abspath(os.environ.get("ALPINE_IMG", os.path.join(ROOT, "disk-alpine.img")))
-OUT_DIR = os.path.join(ROOT, "build", "smoke-audio")
+OUT_DIR = os.path.join(ROOT, "build", os.environ.get("SMOKE_AUDIO_DIR", "smoke-audio"))
 WORK = os.path.join(OUT_DIR, "disk.img")
 WAV = os.path.join(OUT_DIR, "out.wav")
 PROMPT = smokelib.PROMPT

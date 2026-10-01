@@ -137,7 +137,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-ext4 smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine disk-alpine repo repo-serve start resolutions icons
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-ext4 smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-audio disk-alpine repo repo-serve start resolutions icons
 
 all: $(TARGET)
 
@@ -484,6 +484,14 @@ disk-alpine:
 
 smoke-alpine: $(TARGET) initrd disk-alpine
 	python3 tools/smoke_alpine.py
+
+# Sound for Linux programs (docs/audio.md): Alpine's alsa-utils `aplay` in the
+# chroot plays three WAVs through the kernel's ALSA ABI (/dev/snd) on an Intel
+# HDA, and `tone` a fourth through /dev/dsp; QEMU's wav capture must hold each
+# tone.  Opt-in like smoke-alpine.  `python3 tools/smoke_audio.py --ac97` for
+# the AC'97 card.
+smoke-audio: $(TARGET) initrd disk-alpine
+	python3 tools/smoke_audio.py
 
 # Run with full interrupt + CPU-reset logging
 debug: $(TARGET)

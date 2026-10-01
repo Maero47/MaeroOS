@@ -182,6 +182,137 @@ FONT_JS = r"""
 """
 
 
+# --audio: the page also carries an <audio autoplay> of a 440 Hz WAV served
+# from the host, and reports the element's events back.  The run's profile
+# gets media.cubeb.backend=alsa and autoplay allowed (AUDIO_PREFS, written into
+# a copy of the disk), the guest gets an Intel HDA whose output QEMU records,
+# and the capture must hold the tone.
+AUDIO_HZ = 440
+AUDIO_SECS = 3.0
+AUDIO_HTML = ("<audio id=snd src=\"tone.wav\" autoplay></audio><script>(function(){"
+              "var a=document.getElementById('snd');function r(e){try{var x=new XMLHttpRequest();"
+              "x.open('POST',REPORT_URL);x.send(JSON.stringify({ev:e,t:a.currentTime,"
+              "err:a.error?a.error.code+' '+a.error.message:null,paused:a.paused}));}catch(_){}}"
+              "['play','playing','ended','error','stalled','pause'].forEach(function(e){"
+              "a.addEventListener(e,function(){r(e);});});"
+              "var p=a.play();if(p&&p.catch)p.catch(function(e){r('play() rejected: '+e);});"
+              "setTimeout(function(){r('t+2s');},2000);})();</script>")
+# The --audio page itself, written onto the disk with tone.wav and opened as
+# file:///disk/audio.html: no network between Firefox and the media.  Its
+# event reports still go to the host's WebServer when the network is there.
+AUDIO_PAGE = ("<!doctype html><html><head><meta charset=\"utf-8\"><title>MaeroOS audio</title>"
+              "</head><body style=\"background:#e8eefc\"><h1>audio test</h1>"
+              "<img src=\"mark.png\" width=\"%d\" height=\"%d\">%s</body></html>")
+AUDIO_PREFS = ('user_pref("media.autoplay.default", 0);\n'
+               'user_pref("media.autoplay.blocking_policy", 0);\n')
+AUDIO_MOZLOG = "sync,timestamp,Widget:5,AudioStream:2"
+
+
+def tone_wav(hz, secs, rate):
+    """A stereo S16LE WAV of a sine at hz."""
+    import math
+    n = int(rate * secs)
+    pcm = b"".join(struct.pack("<hh", v, v) for v in
+                   (int(0.6 * 32767 * math.sin(2 * math.pi * hz * i / rate)) for i in range(n)))
+    fmt = struct.pack("<HHIIHH", 1, 2, rate, rate * 4, 4, 16)
+    body = b"WAVE" + b"fmt " + struct.pack("<I", 16) + fmt + b"data" + struct.pack("<I", len(pcm)) + pcm
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
+def audio_disk(args, port):
+    """A copy of the disk with AUDIO_PREFS appended to /ffprofile/user.js,
+    cubeb logging in /ffcfg/ffmozlog (moz.log on the disk at /mozaudio.log),
+    and /audio.html + /tone.wav + /mark.png (reports to the host's `port`).
+    In build/ (the image is ~1 GiB; not /tmp)."""
+    work = os.path.join(ROOT, "build", "ff-audio-disk.img")
+    subprocess.run(["cp", "--sparse=always", args.disk, work], check=True)
+    tmpd = tempfile.mkdtemp(prefix="ffaudio-", dir=os.path.join(ROOT, "build"))
+    try:
+        uj = os.path.join(tmpd, "user.js")
+        subprocess.run(["debugfs", "-R", "dump /ffprofile/user.js " + uj, work],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(uj, "a") as f:
+            f.write(AUDIO_PREFS)
+        with open(os.path.join(tmpd, "ffmozlog"), "w") as f:
+            f.write(AUDIO_MOZLOG + "\n")
+        with open(os.path.join(tmpd, "ffmozlogfile"), "w") as f:
+            f.write("/disk/mozaudio.log\n")
+        html = AUDIO_PAGE % (WEB_MARK_W, WEB_MARK_H, AUDIO_HTML.replace(
+            "REPORT_URL", "'http://10.0.2.2:%d/audioreport'" % port))
+        for name, data in (("audio.html", html.encode()), ("tone.wav", tone_wav(AUDIO_HZ, AUDIO_SECS, 44100)),
+                           ("mark.png", png_bytes(WEB_MARK_W, WEB_MARK_H, (255, 0, 0)))):
+            with open(os.path.join(tmpd, name), "wb") as f:
+                f.write(data)
+        cmds = ["write %s /%s" % (os.path.join(tmpd, n), n) for n in ("audio.html", "tone.wav", "mark.png")] + ["rm /ffprofile/user.js", "write %s /ffprofile/user.js" % uj,
+                "cd /ffcfg", "rm ffmozlog", "write %s ffmozlog" % os.path.join(tmpd, "ffmozlog"),
+                "rm ffmozlogfile", "write %s ffmozlogfile" % os.path.join(tmpd, "ffmozlogfile")]
+        cf = os.path.join(tmpd, "cmds")
+        with open(cf, "w") as f:
+            f.write("\n".join(cmds) + "\n")
+        subprocess.run(["debugfs", "-w", "-f", cf, work], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+    return work
+
+
+def audio_load(qmp, args, run, pump, web):
+    """Open file:///disk/audio.html, wait for its red block on screen and
+    then for 'ended' (or AUDIO_SECS + 60 s); note what the page reported.
+    The capture itself is judged once QEMU has exited."""
+    send_text(qmp, args, pump, "file:///disk/audio.htm")
+    t_enter = time.time()
+    qmp.hmp("sendkey l")
+    pump(0.5)
+    qmp.hmp("sendkey ret")
+    need = WEB_MARK_W * WEB_MARK_H * 9 // 10
+    t_red = None
+    tmpdir = tempfile.mkdtemp(prefix="ffaudio-")
+    try:
+        end = t_enter + args.web_timeout
+        while time.time() < end and t_red is None:
+            if not pump(2.0):
+                break
+            cand = qmp.screendump_ppm(os.path.join(tmpdir, "a.ppm"))
+            if red_pixels(read_ppm(cand) if cand else None) >= need:
+                t_red = time.time()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    run.web_notes.append("audio page on screen %s after Enter" %
+                         ("%.1fs" % (t_red - t_enter) if t_red else "never"))
+    end = time.time() + AUDIO_SECS + 60
+    while time.time() < end and not any(
+            ev.get("ev") in ("ended", "error") for _, ev in web.audio_events):
+        if not pump(1.0):
+            break
+    pump(3.0)
+    for t, ev in web.audio_events:
+        run.web_notes.append("audio event +%.1fs %s" % (t - t_enter, json.dumps(ev)))
+
+
+def audio_capture_check(args, run):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from smoke_hda import classify, peak_freq, read_wav, rms
+    path = os.path.join(args.outdir, "audio.wav")
+    try:
+        rate, _, s = read_wav(path)
+    except Exception as e:  # noqa: BLE001
+        return "no usable capture (%s)" % e, False
+    labels = classify(s, rate, [AUDIO_HZ])
+    n = sum(1 for x in labels if x == 0)
+    if n == 0:
+        return "capture of %.2f s holds no tone (all silent)" % (len(s) / rate), False
+    idx = [i for i, x in enumerate(labels) if x == 0]
+    blk = rate // 100
+    part = s[idx[0] * blk:(idx[-1] + 1) * blk]
+    f = peak_freq(part, rate)
+    zc = sum(1 for a, b in zip(part, part[1:]) if (a < 0) != (b < 0)) / 2 / (len(part) / rate)
+    msg = ("capture: %.2f s of sound in %.2f s, peak %d Hz, zero crossings %.0f Hz, rms %.0f"
+           % (n / 100, len(s) / rate, f, zc, rms(part)))
+    ok = abs(f - AUDIO_HZ) <= AUDIO_HZ * 0.02 and n / 100 >= AUDIO_SECS * 0.8
+    return msg, ok
+
+
 def png_bytes(w, h, rgb):
     """A w x h PNG of one solid colour (no colour-space chunk, so Firefox
     shows the exact value; a tagged image would be colour-managed)."""
@@ -223,11 +354,19 @@ class WebServer:
                    FONT_JS % (json.dumps([list(f) for f in FONT_FAMILIES]), json.dumps(FONT_TEXT))))
         return WebServer.PAGE_HEAD + body.encode("utf-8")
 
-    def __init__(self):
+    def __init__(self, audio=False):
         self.requests = []          # (host time, path, status)
         self.font_report = None     # (host time, parsed JSON) from the page
-        files = {"/": self.page(), "/mark.png": png_bytes(WEB_MARK_W, WEB_MARK_H, (255, 0, 0))}
+        self.audio_events = []      # (host time, parsed JSON) from AUDIO_JS
+        page = self.page()
+        if audio:
+            page = page.replace(b"</body>", AUDIO_HTML.replace(
+                "REPORT_URL", "'/audioreport'").encode() + b"</body>")
+        files = {"/": page, "/mark.png": png_bytes(WEB_MARK_W, WEB_MARK_H, (255, 0, 0))}
         types = {"/": "text/html; charset=utf-8", "/mark.png": "image/png"}
+        if audio:
+            files["/tone.wav"] = tone_wav(AUDIO_HZ, AUDIO_SECS, 44100)
+            types["/tone.wav"] = "audio/wav"
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -246,9 +385,14 @@ class WebServer:
             def do_POST(self):
                 n = int(self.headers.get("Content-Length") or 0)
                 data = self.rfile.read(n) if n > 0 else b""
-                ok = self.path == "/fontreport"
+                ok = self.path in ("/fontreport", "/audioreport")
                 outer.requests.append((time.time(), "POST " + self.path, 204 if ok else 404))
-                if ok:
+                if self.path == "/audioreport":
+                    try:
+                        outer.audio_events.append((time.time(), json.loads(data.decode("utf-8"))))
+                    except ValueError:
+                        pass
+                elif ok:
                     try:
                         outer.font_report = (time.time(), json.loads(data.decode("utf-8")))
                     except ValueError:
@@ -1258,6 +1402,11 @@ def main():
     ap.add_argument("--web", action="store_true",
                     help="after the paint verdict, load a page served from the host "
                          "(implies --net) and require its image on screen; see above")
+    ap.add_argument("--audio", action="store_true",
+                    help="after the paint verdict open file:///disk/audio.html, a page that "
+                         "plays a 440 Hz WAV through <audio autoplay> (both written into a "
+                         "copy of the disk); the guest gets an Intel HDA recorded by QEMU and "
+                         "Firefox the ALSA cubeb backend; the capture must hold the tone")
     ap.add_argument("--web-timeout", type=float, default=240.0,
                     help="seconds from Enter to the page's image on screen (default 240)")
     ap.add_argument("--font-timeout", type=float, default=60.0,
@@ -1272,6 +1421,8 @@ def main():
     args = ap.parse_args()
 
     os.chdir(ROOT)
+    if args.audio:
+        args.net = True
     if args.web or args.sites:
         args.net = True
     accel = args.accel or ("kvm" if kvm_usable() else "tcg")
@@ -1328,6 +1479,14 @@ def main():
         # QEMU's pc machine adds an e1000 unless told not to, and the kernel
         # drives it (drivers/e1000.c): keep the no-network run NIC-less.
         cmd += ["-nic", "none"]
+    if args.audio:
+        cmd += ["-audiodev", "wav,id=snd0,path=%s,out.frequency=48000,out.channels=2,out.format=s16"
+                % os.path.join(args.outdir, "audio.wav"),
+                "-device", "intel-hda", "-device", "hda-duplex,audiodev=snd0"]
+        audio_web = WebServer(audio=True)
+        disk = audio_disk(args, audio_web.port)
+        cmd = [("file=%s,format=raw,if=ide" % disk) if c == "file=%s,format=raw,if=ide" % args.disk
+               else c for c in cmd]
     with open(os.path.join(args.outdir, "qemu-cmdline.txt"), "w") as f:
         f.write(" ".join(cmd) + "\n")
 
@@ -1427,6 +1586,11 @@ def main():
                     web_load(qmp, args, run, pump, web)
                 finally:
                     web.close()
+            if args.audio:
+                try:
+                    audio_load(qmp, args, run, pump, audio_web)
+                finally:
+                    audio_web.close()
         elif run.panic_lines:
             pump(2.0)         # collect the register dump / stack trace
         else:
@@ -1468,6 +1632,12 @@ def main():
         run.raw.close()
         shutil.rmtree(tmp, ignore_errors=True)
 
+    if args.audio:
+        msg, ok = audio_capture_check(args, run)
+        run.web_notes.append("audio " + msg)
+        print("smoke-firefox: audio " + msg)
+        if run.result == "PASS" and not ok:
+            run.result, run.reason = "FAIL", "--audio: " + msg
     text = run.write_summary(cmd, accel, time.time() - run.t0)
     print()
     print(text)
