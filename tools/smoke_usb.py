@@ -26,12 +26,26 @@ Checks:
   - a key held down on the USB keyboard repeats (kernel typematic);
   - relative motion from the USB boot mouse reaches /dev/input/event1 and
     moves the desktop pointer by the amount sent;
-  - a usb-hub on a root port, with the usb-mouse and the stick behind it;
-  - a usb-storage stick (an 8 MiB image with markers written here) shows up
-    as /dev/usbdisk0: markers read back at their offsets, a write through
-    the device lands in the image file, the whole device reads back with
-    the image's checksum; then the stick is unplugged and plugged back in
-    (QMP device_del / device_add on the hub's port) and is found again.
+  - a usb-hub on a root port, with the usb-mouse and stick A behind it;
+  - the xHCI runs on interrupts (MSI-X under QEMU's default qemu-xhci);
+  - two usb-storage sticks at once, both FAT volumes made here: stick A
+    (8 MiB, full speed behind the hub) and stick B (16 MiB, on a root port,
+    so at the fastest speed QEMU's usb-storage offers).  Each is a
+    /dev/usbdiskN and an sdX disk; stick A reads back whole with its
+    image's checksum through /dev/usbdiskN, and a write through the device
+    lands in the image file;
+  - both sticks mounted (vfat) at the same time, a file copied from each to
+    the other, checked in the guest and, after umount, in the image files;
+  - a usb-bot device with two SCSI LUNs behind the hub: one disk each;
+  - Caps Lock pressed on the USB keyboard: the kernel sends the keyboard
+    its LED report (SET_REPORT, traced), on and off again;
+  - the keyboard's Volume Up key reaches the desktop (its volume trace);
+  - stick B unplugged and plugged back in five times (QMP device_del /
+    device_add) while a reader loops over it, each time found again under
+    the same names with the same data; stick A once on the hub's port; no
+    transfer timeouts or errors in the log, and as many devices in use
+    afterwards as before;
+  - kusbd's CPU time over 10 idle seconds (/proc/cputime), reported.
 
 The serial console is only used to log in a root shell for those checks (the
 console reads the serial line, never a keyboard; see userspace/init/init.c).
@@ -57,19 +71,40 @@ OUT = os.path.join(ROOT, "build", "smoke-usb")
 smoke_gui.OUT = OUT          # GuiSmoke.shot() writes there
 
 KBD, TABLET, MOUSE = "ukbd", "utab", "umouse"
-STICK = "ustick"
-STICK_SIZE = 8 << 20
-MARKS = {0: b"USBSTICK-START!\n", (1 << 20) + 100: b"MIDDLE-MARKER\n",
-         STICK_SIZE - 16: b"USBSTICK-END!!!\n"}
-WRITE_AT, WRITE_TEXT = 2000000, "written-over-usb"
+STICK, STICK_B = "ustick", "ustickb"
+STICK_SIZE, STICK_B_SIZE = 8 << 20, 16 << 20
+# A raw write through /dev/usbdiskN, near the end of stick A (a free
+# cluster of the nearly empty volume).
+WRITE_AT, WRITE_TEXT = STICK_SIZE - 3000, "written-over-usb"
+REPLUGS = 5
+LUN_SIZES = (2 << 20, 3 << 20)
+ENV = dict(os.environ, MTOOLS_SKIP_CHECK="1")
 
 
-def make_stick(path):
-    data = bytearray(STICK_SIZE)
-    for off, text in MARKS.items():
-        data[off:off + len(text)] = text
+def make_stick(path, size, label, files):
+    """A FAT volume (FAT12 or FAT16 by size) on the whole device, as sticks
+    come, holding `files`."""
     with open(path, "wb") as f:
-        f.write(data)
+        f.truncate(size)
+    subprocess.run(["mkfs.fat", "-n", label, path], check=True,
+                   stdout=subprocess.DEVNULL, env=ENV)
+    for name, data in files.items():
+        src = path + "." + name
+        with open(src, "wb") as f:
+            f.write(data)
+        subprocess.run(["mcopy", "-i", path, src, "::" + name], check=True,
+                       env=ENV)
+        os.remove(src)
+
+
+def stick_file(path, name):
+    """A file's bytes, read from the image with mtools."""
+    return subprocess.run(["mcopy", "-n", "-i", path, "::" + name, "-"],
+                          check=True, stdout=subprocess.PIPE, env=ENV).stdout
+
+
+def md5(data):
+    return hashlib.md5(data).hexdigest()
 DISPLAY = "vga0"
 ABS_MAX = 0x8000             # QEMU's tablet axis: 0 .. 0x7fff
 
@@ -148,6 +183,44 @@ class UsbSmoke(GuiSmoke):
         if not re.search(r"\[USB\] port \d+\.1: \S+ \S+ speed, slot \d+: "
                          r"HID mouse", text):
             raise AssertionError("the mouse behind the hub is missing")
+        m = re.search(r"\[XHCI\] interrupts: (MSI-X|MSI|INTx)", text)
+        if not m:
+            raise AssertionError("the xHCI is not on interrupts")
+        if not re.search(r"\[USB-HID\] self-test: consumer control "
+                         r"\(array, variables\) ok", text):
+            raise AssertionError("HID consumer-control self-test failed")
+        print(f"\n[SMOKE-USB] xHCI interrupts: {m.group(1)}")
+        # Both sticks: their usbdiskN by size, and their sdX.
+        self.disk = {}
+        at = self.con.at                 # these waits look back; keep the order
+        for blocks, which in ((STICK_SIZE // 512, "A"),
+                              (STICK_B_SIZE // 512, "B")):
+            m = self.con.wait_re(r"\[USB-MSC\] /dev/(usbdisk\d): .* %d "
+                                 r"blocks of 512 bytes" % blocks, start=0)
+            node = m.group(1)
+            m = self.con.wait_re(r"\[USB-MSC\] /dev/%s is /dev/(sd[a-z])"
+                                 % node, start=0)
+            self.disk[which] = (node, m.group(1))
+        self.con.at = max(at, self.con.at)
+        print(f"\n[SMOKE-USB] stick A {self.disk['A']}, stick B "
+              f"{self.disk['B']}")
+        # The two-LUN device: two disks on one slot.
+        luns = {}
+        for lun, blocks in ((0, LUN_SIZES[0] // 512), (1, LUN_SIZES[1] // 512)):
+            m = self.con.wait_re(r"\[USB-MSC\] /dev/(usbdisk\d): .* %d blocks "
+                                 r"of 512 bytes .*, slot (\d+) LUN %d"
+                                 % (blocks, lun), start=0)
+            luns[lun] = (m.group(1), m.group(2))
+        self.con.at = max(at, self.con.at)
+        if luns[0][1] != luns[1][1] or luns[0][0] == luns[1][0]:
+            raise AssertionError(f"LUNs not two disks of one device: {luns}")
+        for lun, (node, _) in luns.items():
+            out = self.con.run(f"toybox dd if=/dev/{node} bs=512 count=1 "
+                               f"2>/dev/null")
+            if f"LUN{lun}-MARK" not in out:
+                raise AssertionError(f"LUN {lun} ({node}) reads {out!r}")
+        print(f"\n[SMOKE-USB] usb-bot LUN 0 is {luns[0][0]}, LUN 1 is "
+              f"{luns[1][0]} (slot {luns[0][1]})")
 
     def login(self, term):
         """`doas login root` in the Terminal, every key on the USB keyboard."""
@@ -230,21 +303,32 @@ class UsbSmoke(GuiSmoke):
             raise AssertionError(f"usb-mouse click landed at {got}, not "
                                  f"{(x0 + 40, y0 + 30)}")
 
+    def bsh(self, cmd, timeout=60):
+        """`cmd` under busybox sh; (status, output)."""
+        assert "'" not in cmd
+        out = self.con.run(f"busybox sh -c '{cmd}; echo @@RC=$?'",
+                           timeout=timeout)
+        m = re.search(r"@@RC=(\d+)", out)
+        if not m:
+            raise AssertionError(f"no status from {cmd!r}: {out!r}")
+        return int(m.group(1)), out[:m.start()]
+
     def storage(self):
+        """Stick A through its raw node: whole-device checksum, a write."""
         con = self.con
-        if not re.search(r"\[USB-MSC\] /dev/usbdisk0: .* 16384 blocks of 512 "
-                         r"bytes", con.text()):
-            raise AssertionError("the USB stick did not become /dev/usbdisk0")
-        for off, text in MARKS.items():
-            want = text.decode().strip()
-            got = con.run(f"toybox dd if=/dev/usbdisk0 bs=1 skip={off} "
-                          f"count={len(text)} 2>/dev/null")
-            if want not in got:
-                raise AssertionError(f"usbdisk0 at {off}: {got!r}, not {want!r}")
+        node = self.disk["A"][0]
+        with open(self.stick, "rb") as f:
+            image = f.read()
+        out = con.run(f"toybox dd if=/dev/{node} of=/tmp/usb.img bs=32768 "
+                      "2>/dev/null; md5sum /tmp/usb.img; rm /tmp/usb.img",
+                      timeout=60)
+        if md5(image) not in out:
+            raise AssertionError(f"{node} checksum {out!r}, image {md5(image)}")
+        print(f"\n[SMOKE-USB] {node} reads back with md5 {md5(image)}")
         con.run(f"echo {WRITE_TEXT} > /tmp/usbw.txt")
-        con.run(f"toybox dd if=/tmp/usbw.txt of=/dev/usbdisk0 bs=1 "
+        con.run(f"toybox dd if=/tmp/usbw.txt of=/dev/{node} bs=1 "
                 f"seek={WRITE_AT} conv=notrunc 2>/dev/null")
-        got = con.run(f"toybox dd if=/dev/usbdisk0 bs=1 skip={WRITE_AT} "
+        got = con.run(f"toybox dd if=/dev/{node} bs=1 skip={WRITE_AT} "
                       f"count={len(WRITE_TEXT)} 2>/dev/null")
         if WRITE_TEXT not in got:
             raise AssertionError(f"write did not read back: {got!r}")
@@ -252,33 +336,155 @@ class UsbSmoke(GuiSmoke):
             image = f.read()
         if image[WRITE_AT:WRITE_AT + len(WRITE_TEXT)] != WRITE_TEXT.encode():
             raise AssertionError("the write did not reach the stick's image")
-        out = con.run("toybox dd if=/dev/usbdisk0 of=/tmp/usb.img bs=32768 "
-                      "2>/dev/null; md5sum /tmp/usb.img; rm /tmp/usb.img",
-                      timeout=60)
-        want = hashlib.md5(image).hexdigest()
-        if want not in out:
-            raise AssertionError(f"usbdisk0 checksum {out!r}, image {want}")
-        print(f"\n[SMOKE-USB] usbdisk0 reads back with md5 {want}")
+
+    def two_sticks(self):
+        """Both sticks mounted at once; a file copied each way."""
+        a, b = self.disk["A"][1], self.disk["B"][1]
+        rc, out = self.bsh(
+            f"busybox mkdir -p /mnt/ua /mnt/ub && "
+            f"busybox mount -t vfat /dev/{a} /mnt/ua && "
+            f"busybox mount -t vfat /dev/{b} /mnt/ub && "
+            f"busybox grep -E \"^/dev/({a}|{b}) \" /proc/mounts && "
+            f"busybox cp /mnt/ua/abig.bin /mnt/ub/ && "
+            f"busybox cp /mnt/ub/bbig.bin /mnt/ua/ && "
+            f"busybox md5sum /mnt/ua/abig.bin /mnt/ub/abig.bin "
+            f"/mnt/ua/bbig.bin /mnt/ub/bbig.bin", timeout=120)
+        if rc != 0:
+            raise AssertionError(f"mount/copy failed ({rc}): {out!r}")
+        mounted = re.findall(r"^/dev/(sd[a-z]) /mnt/u[ab] vfat", out, re.M)
+        if sorted(mounted) != sorted([a, b]):
+            raise AssertionError(f"not both mounted: {out!r}")
+        for name, want in (("abig.bin", self.files["abig.bin"]),
+                           ("bbig.bin", self.files["bbig.bin"])):
+            n = out.count(md5(want))
+            if n != 2:
+                raise AssertionError(f"{name}: md5 {md5(want)} seen {n} "
+                                     f"times, not 2: {out!r}")
+        rc, out = self.bsh("busybox sync && busybox umount /mnt/ua && "
+                           "busybox umount /mnt/ub")
+        if rc != 0:
+            raise AssertionError(f"umount failed: {out!r}")
+        # The copies are in the image files themselves.
+        if md5(stick_file(self.stick_b, "abig.bin")) != \
+                md5(self.files["abig.bin"]):
+            raise AssertionError("abig.bin did not reach stick B's image")
+        if md5(stick_file(self.stick, "bbig.bin")) != \
+                md5(self.files["bbig.bin"]):
+            raise AssertionError("bbig.bin did not reach stick A's image")
+        print(f"\n[SMOKE-USB] {a} and {b} mounted together; abig.bin "
+              f"{md5(self.files['abig.bin'])} and bbig.bin "
+              f"{md5(self.files['bbig.bin'])} copied across, found in both "
+              f"images")
+
+    def leds(self):
+        """Caps Lock on the USB keyboard: the kernel sends the LED report."""
+        con = self.con
+        for state in ("on", "off"):
+            start = con.mark()
+            self.inp.press("caps_lock")
+            m = con.wait_re(r"\[USB\] slot \d+: keyboard LEDs num off caps "
+                            r"%s scroll off \(SET_REPORT (\w+)\)" % state,
+                            timeout=10, start=start)
+            if m.group(1) != "ok":
+                raise AssertionError(f"SET_REPORT {m.group(0)!r}")
+            print(f"\n[SMOKE-USB] Caps Lock {state}: {m.group(0)}")
+
+    def media_key(self):
+        """Volume Up on the USB keyboard reaches the desktop."""
+        start = self.con.mark()
+        self.inp.press("volumeup")
+        m = self.con.wait_re(r"\[desktop\] volume (\d+)", timeout=10,
+                             start=start)
+        print(f"\n[SMOKE-USB] Volume Up: {m.group(0)}")
+
+    def in_use(self):
+        found = re.findall(r"\[USB\] (\d+) device\(s\) in use",
+                           self.con.text())
+        return int(found[-1]) if found else -1
+
+    def replug(self, which, port, node_name, size_blocks, load):
+        con = self.con
+        node, sd = self.disk[which]
+        dev_id = STICK if which == "A" else STICK_B
+        image = self.stick if which == "A" else self.stick_b
+        start = con.mark()
+        if load:
+            # A reader looping over the stick while it is pulled.
+            con.run(f"busybox sh -c \"while toybox dd if=/dev/{node} "
+                    f"of=/dev/null bs=65536 2>/dev/null; do :; done &\"")
+            time.sleep(0.3)
+        self.qmp.cmd("device_del", id=dev_id)
+        con.wait_re(r"\[USB-MSC\] /dev/%s removed" % node, start=start)
+        con.wait_re(r"\[USB\] port [\d.]+: device removed", start=start)
+        if node in con.run("ls /dev"):
+            raise AssertionError(f"/dev/{node} still listed after unplug")
+        if getattr(self, "node_" + which, None):
+            # The node from the last plug-in holds the image; free it.
+            for _ in range(20):
+                try:
+                    self.qmp.cmd("blockdev-del",
+                                 **{"node-name": getattr(self, "node_" + which)})
+                    break
+                except RuntimeError:
+                    time.sleep(0.2)
+        start = con.mark()
+        self.qmp.cmd("blockdev-add", driver="raw", **{"node-name": node_name},
+                     file={"driver": "file", "filename": image})
+        setattr(self, "node_" + which, node_name)
+        self.qmp.cmd("device_add", driver="usb-storage", drive=node_name,
+                     id=dev_id, bus="xhci.0", port=port)
+        con.wait_re(r"\[USB-MSC\] /dev/%s: .* %d blocks" % (node, size_blocks),
+                    timeout=20, start=start)
+        con.wait_re(r"\[USB-MSC\] /dev/%s is /dev/%s" % (node, sd),
+                    timeout=20, start=start)
+        with open(image, "rb") as f:
+            head = f.read(1 << 18)
+        out = con.run(f"toybox dd if=/dev/{node} bs=65536 count=4 2>/dev/null "
+                      f"| md5sum")
+        if md5(head) not in out:
+            raise AssertionError(f"replugged {node} reads {out!r}")
 
     def hotplug(self):
         con = self.con
+        before = self.in_use()
         start = con.mark()
-        self.qmp.cmd("device_del", id=STICK)
-        con.wait_re(r"\[USB-MSC\] /dev/usbdisk0 removed", start=start)
-        con.wait_re(r"\[USB\] port \d+\.2: device removed", start=start)
-        if "usbdisk0" in con.run("ls /dev"):
-            raise AssertionError("/dev/usbdisk0 still listed after unplug")
-        start = con.mark()
-        # device_del took the drive with it; plug a new one onto the image.
-        self.qmp.cmd("blockdev-add", driver="raw", **{"node-name": "stick2"},
-                     file={"driver": "file", "filename": self.stick})
-        self.qmp.cmd("device_add", driver="usb-storage", drive="stick2",
-                     id=STICK, bus="xhci.0", port="3.2")
-        con.wait_re(r"\[USB-MSC\] /dev/usbdisk0: .* 16384 blocks", timeout=20,
-                    start=start)
-        got = con.run("toybox dd if=/dev/usbdisk0 bs=1 count=16 2>/dev/null")
-        if "USBSTICK-START!" not in got:
-            raise AssertionError(f"replugged stick reads {got!r}")
+        t0 = time.time()
+        for n in range(REPLUGS):
+            self.replug("B", "4", f"sb{n}", STICK_B_SIZE // 512, load=True)
+            print(f"\n[SMOKE-USB] stick B replug {n + 1}/{REPLUGS}: ok")
+        self.replug("A", "3.2", "sa0", STICK_SIZE // 512, load=False)
+        self.settle(1.0)
+        log = con.text()[start:]
+        bad = re.findall(r"^.*(?:timed out|failed, code|too many|PANIC|"
+                         r"[Pp]age fault|panic).*$", log, re.M)
+        if bad:
+            raise AssertionError(f"errors during the replugs: {bad[:5]}")
+        after = self.in_use()
+        if after != before:
+            raise AssertionError(f"{before} devices in use before the "
+                                 f"replugs, {after} after")
+        print(f"\n[SMOKE-USB] {REPLUGS} replugs of stick B under load and one "
+              f"of stick A in {time.time() - t0:.1f}s, no errors; "
+              f"{after} devices in use before and after")
+
+    def cputime(self):
+        """kusbd's CPU time over 10 idle seconds."""
+        def sample():
+            out = self.con.run("cat /proc/cputime")
+            idle = int(re.search(r"^idle (\d+)", out, re.M).group(1))
+            m = re.search(r"^\d+ \d+ (\d+) kusbd\r?$", out, re.M)
+            return time.time(), idle, int(m.group(1))
+        t0, idle0, k0 = sample()
+        time.sleep(10)
+        t1, idle1, k1 = sample()
+        wall = (t1 - t0) * 1e6
+        irqs = re.findall(r"device\(s\) in use, (\d+) interrupts",
+                          self.con.text())
+        print(f"\n[SMOKE-USB] idle {t1 - t0:.1f}s: kusbd {k1 - k0} us "
+              f"({100.0 * (k1 - k0) / wall:.3f}%), CPU idle "
+              f"{100.0 * (idle1 - idle0) / wall:.1f}%")
+        if (k1 - k0) > wall * 0.01:
+            raise AssertionError(f"kusbd used {k1 - k0} us of {wall:.0f}")
 
     def run(self):
         steps = []
@@ -296,8 +502,12 @@ class UsbSmoke(GuiSmoke):
         step("key repeat", self.key_repeat, term)
         step("close terminal (tablet click)", self.close, term)
         step("boot mouse", self.boot_mouse)
+        step("keyboard LEDs", self.leds)
+        step("media key", self.media_key)
         step("mass storage", self.storage)
-        step("unplug and replug the stick", self.hotplug)
+        step("two sticks mounted together", self.two_sticks)
+        step("replug the sticks", self.hotplug)
+        step("idle CPU", self.cputime)
         self.settle()
         self.shot("final")
         return steps
@@ -311,7 +521,20 @@ def main():
             raise RuntimeError(f"{f} is missing (make iso disk)")
     disk = smoke_gui.prepare_disk()
     stick = os.path.join(OUT, "stick.img")
-    make_stick(stick)
+    stick_b = os.path.join(OUT, "stickb.img")
+    files = {"abig.bin": os.urandom(300 * 1024),
+             "bbig.bin": os.urandom(200 * 1024)}
+    make_stick(stick, STICK_SIZE, "STICKA",
+               {"abig.bin": files["abig.bin"], "a-hello.txt": b"hello A\n"})
+    luns = []
+    for n, size in enumerate(LUN_SIZES):
+        path = os.path.join(OUT, f"lun{n}.img")
+        with open(path, "wb") as f:
+            f.write(f"LUN{n}-MARK\n".encode())
+            f.truncate(size)
+        luns.append(path)
+    make_stick(stick_b, STICK_B_SIZE, "STICKB",
+               {"bbig.bin": files["bbig.bin"], "b-hello.txt": b"hello B\n"})
     sockdir = tempfile.mkdtemp(prefix="susb")
     qmp_path = os.path.join(sockdir, "qmp")
     accel = smoke_gui.pick_accel()
@@ -319,8 +542,8 @@ def main():
            "-drive", f"file={disk},format=raw,if=ide",
            "-accel", accel, "-vga", "none", "-device", f"VGA,id={DISPLAY}", *smokelib.QEMU_DISPLAY,
            "-serial", "stdio", "-m", "512M", "-no-reboot", "-no-shutdown",
-           # Keyboard and tablet on root ports; the mouse and the stick
-           # behind a (full-speed) hub on root port 3.
+           # Keyboard and tablet on root ports; the mouse and stick A
+           # behind a (full-speed) hub on root port 3; stick B on port 4.
            "-device", "qemu-xhci,id=xhci",
            "-device", f"usb-kbd,id={KBD},display={DISPLAY},bus=xhci.0,port=1",
            "-device", f"usb-tablet,id={TABLET},display={DISPLAY},bus=xhci.0,"
@@ -330,6 +553,14 @@ def main():
            "-drive", f"if=none,id=stick,format=raw,file={stick}",
            "-device", f"usb-storage,drive=stick,id={STICK},bus=xhci.0,"
                       "port=3.2",
+           "-device", "usb-bot,id=bot,bus=xhci.0,port=3.3",
+           "-drive", f"if=none,id=lun0,format=raw,file={luns[0]}",
+           "-device", "scsi-hd,bus=bot.0,scsi-id=0,lun=0,drive=lun0",
+           "-drive", f"if=none,id=lun1,format=raw,file={luns[1]}",
+           "-device", "scsi-hd,bus=bot.0,scsi-id=0,lun=1,drive=lun1",
+           "-drive", f"if=none,id=stickb,format=raw,file={stick_b}",
+           "-device", f"usb-storage,drive=stickb,id={STICK_B},bus=xhci.0,"
+                      "port=4",
            "-qmp", f"unix:{qmp_path},server=on,wait=off"]
     with open(os.path.join(OUT, "qemu-cmdline.txt"), "w") as f:
         f.write(" ".join(cmd) + "\n")
@@ -344,6 +575,8 @@ def main():
         qmp = Qmp(qmp_path)
         smoke = UsbSmoke(con, qmp)
         smoke.stick = stick
+        smoke.stick_b = stick_b
+        smoke.files = files
         steps = smoke.run()
         print("\n[SMOKE-USB] timings: " +
               ", ".join(f"{n} {s:.1f}s" for n, s in steps))

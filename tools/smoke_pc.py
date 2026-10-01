@@ -15,6 +15,9 @@ here on one boot, with an ICH9 HDA codec as on a desktop board:
     register BARs all get their windows from mm/mmio.c;
   - the USB keyboard and tablet are enumerated, the desktop starts, and the
     Terminal is opened and used with them (tablet clicks land where sent);
+    the qemu-xhci has MSI and MSI-X turned off, so its interrupts come on
+    its INTx line through the PIC (smoke-usb covers MSI-X), with the second
+    CPU running: interrupts must arrive while the devices are enumerated;
   - in that Terminal, `doas poweroff` (the password typed on the USB
     keyboard) enters ACPI S5 and QEMU, started without -no-shutdown, exits.
 
@@ -111,7 +114,16 @@ class PcSmoke(GuiSmoke):
             return result
 
         step("boot", self.boot)
+        if not re.search(r"\[XHCI\] interrupts: INTx on IRQ \d+",
+                         self.con.text()):
+            raise AssertionError("the xHCI is not on its INTx line")
         term = step("terminal (USB keyboard + tablet)", self.terminal)
+        irqs = [int(n) for n in re.findall(r"device\(s\) in use, (\d+) "
+                                           r"interrupts", self.con.text())]
+        if not irqs or irqs[-1] == 0:
+            raise AssertionError("no xHCI interrupts arrived on INTx")
+        print(f"\n[SMOKE-PC] xHCI on INTx: {irqs[-1]} interrupts while "
+              f"enumerating")
         step("poweroff from the Terminal", self.poweroff, term)
         return steps
 
@@ -133,7 +145,7 @@ def main():
            "-accel", accel, "-vga", "none", "-device", f"VGA,id={DISPLAY}",
            *smokelib.QEMU_DISPLAY,
            "-serial", "stdio", "-m", "512M", "-no-reboot",
-           "-device", "qemu-xhci,id=xhci",
+           "-device", "qemu-xhci,id=xhci,msi=off,msix=off",
            "-audiodev", "none,id=snd", "-device", "ich9-intel-hda",
            "-device", "hda-duplex,audiodev=snd",
            "-device", f"usb-kbd,id={KBD},display={DISPLAY},bus=xhci.0,port=1",

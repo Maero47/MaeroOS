@@ -586,6 +586,14 @@ static int process_events(void) {
              (phys_of(&evt_trbs[evt_deq]) & ~0xFU) | ERDP_EHB);
         wr32(rt_regs, RT_ERDP + 4, 0);
         wr32(op_regs, OP_USBSTS, USBSTS_EINT);
+        /* INTx: drop the line here too.  On an edge-triggered PIC input a
+         * line that stays high (IP set again before the handler's clear,
+         * the handler run late on a shared line) gives no further edges;
+         * the next event raises it afresh. */
+        if (irq_mode == IRQ_INTX) {
+            uint32_t iman = rd32(rt_regs, RT_IMAN);
+            if (iman & IMAN_IP) wr32(rt_regs, RT_IMAN, iman | IMAN_IP);
+        }
     }
     return n;
 }
