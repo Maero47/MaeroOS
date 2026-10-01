@@ -314,7 +314,7 @@ closes the focused window.
   foreground job gets `SIGWINCH` on a resize), cursor addressing, scroll regions,
   insert/delete, 16/256 colours and SGR attributes, the alternate screen, application
   cursor keys, function keys, DEC line drawing and bracketed paste, with
-  `TERM=xterm-256color`. `vi`, `less` and `top` work full-screen. The main screen keeps
+  `TERM=xterm-256color`. `vi` and `less` work full-screen (checked: vi by `make smoke-gui`, less by hand). The main screen keeps
   500 lines of scrollback (wheel, Shift+PgUp/PgDn); a mouse drag selects,
   Ctrl+Shift+C copies and Ctrl+Shift+V pastes. Several instances run side by side.
 - `edit` edits UTF-8 text: mouse and Shift+arrow selection, Ctrl+A/C/X/V, Ctrl+F find
