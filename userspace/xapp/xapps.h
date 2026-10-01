@@ -27,7 +27,7 @@ static const xapp_t xapps[] = {
     { "galculator", "Galculator", "galculator font-dejavu hicolor-icon-theme", "/usr/bin/galculator",
       "galculator", "Scientific calculator (GTK 3)" },
     { "ristretto", "Ristretto", "ristretto font-dejavu adwaita-icon-theme", "/usr/bin/ristretto",
-      "ristretto /usr/share/icons/hicolor", "Image viewer (GTK 3)" },
+      "ristretto /usr/share/icons/hicolor/128x128/apps/org.xfce.ristretto.png", "Image viewer (GTK 3)" },
     { "feh", "feh", "feh", "/usr/bin/feh",
       "feh -g 640x480 -. /usr/share/feh/images", "Lightweight image viewer" },
     { "mpv", "mpv", "mpv font-dejavu alsa-utils", "/usr/bin/mpv",

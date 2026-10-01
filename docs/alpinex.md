@@ -5,7 +5,8 @@ GTK 3 apps such as Mousepad and Galculator) as windows of maeroX, its X
 server, and installs them from the desktop.
 
     make disk-alpinex      # disk-alpinex.img: Alpine root + offline X repo + /disk/xapp
-    make smoke-alpinex     # opt-in: install, run, type into and close xterm, xeyes, mousepad
+    make smoke-alpinex     # opt-in: install, run, type into and close xterm, xeyes,
+                           # mousepad (type + save) and galculator (7*6=)
 
 Boot the ISO with `disk-alpinex.img` as the disk.  The Start menu then has
 **Linux Apps**, which lists the curated applications with Install/Remove and
@@ -88,6 +89,18 @@ Input: the desktop sends maeroX the raw pointer stream it asks for with
 4/5).  Unknown requests get BadRequest and are logged once to
 `/tmp/maerox.log`, as are the extensions clients query.
 
+Request trace: `maerox -x`, or `touch /tmp/.maerox-xtrace` before an app
+connects, logs every request (`c2 #173 MapWindow len=8`), reply, event and
+error per client to `/tmp/maerox.log` — the last request of a client that
+stalls is the first thing to read.  `ps` plus an NMI (`inject-nmi` in the
+QEMU monitor) shows which syscall each of its threads sleeps in.
+
+`tools/maerox-host/run.sh` builds maeroX for the Linux build host (a stub
+libgui with a control FIFO and PPM screen dumps) and runs it with an app from
+an Alpine root in private namespaces: a protocol problem shows up there in
+seconds; one that does not is the guest's (Mousepad mapped on the host at
+once while it hung in the guest, which led to membarrier).
+
 Not implemented (clients fall back): XKEYBOARD, XInputExtension, RANDR,
 SHAPE, MIT-SHM, BIG-REQUESTS, XFIXES, DAMAGE, Composite, SYNC, GLX.  Window
 gravity on parent resize, dashed lines and cursor images are ignored (the
@@ -95,5 +108,43 @@ desktop draws its own pointer).
 
 ## Applications
 
-See `.yonet/report.md` of the alpinex branch for the per-application
-status measured with `make smoke-alpinex`.
+![GIMP on maeroX](screenshots/alpinex/gimp.png)
+
+Measured on KVM with `make smoke-alpinex` (xterm, xeyes, Mousepad,
+Galculator) and by hand on a development image with every app preinstalled
+(`ALPINE_X=1 ALPINE_X_EXTRA="feh ristretto mpv gimp adwaita-icon-theme"
+ALPINE_IMG=build/disk-alpinex-full.img python3 ports/alpine/prepare.py`).
+
+| App | Status | Evidence |
+|---|---|---|
+| xterm | **works** | prompt, typed `echo typed-in-xterm > /tmp/xt.txt` runs in its shell (smoke) |
+| xeyes | **works** | pupils follow the pointer, 4.6% of the window changes (smoke) |
+| Mousepad (GTK 3) | **works** | maps in ~5 s, typed text, Ctrl+S, name typed into the GTK save dialog, Enter: file saved with the text (smoke) |
+| Galculator (GTK 3) | **works** | installed in the guest by `xapp install` (~37 s); 7 * 6 Enter shows 42 (smoke) |
+| feh | **works** | shows its sample images in a 640x480 window |
+| Ristretto (GTK 3) | **works** | window, toolbar, image; it opens its own 128x128 icon (it was given the hicolor directory, which holds no image at its top level) |
+| mpv | **works, with sound** | plays `/usr/share/sounds/alsa/Front_Center.wav` through ALSA (`AO: [alsa] 48000Hz mono`, the HDA output captured by QEMU peaks at 15487); X11 output via plain Xlib (no MIT-SHM) |
+| GIMP 3.0.4 | **works** | main window, toolbox, brushes and the "Welcome to GIMP" dialog in ~45 s; plug-ins start; GIMP had crashed maeroX before the frame-blit fix |
+
+What it took, besides maeroX itself:
+
+- `membarrier(2)` in the kernel.  musl's dlopen() of a library with TLS
+  issues MEMBARRIER_CMD_PRIVATE_EXPEDITED; without the syscall musl signals
+  every thread and waits for each on a semaphore while holding the thread-list
+  lock, and a thread blocked on that lock (with its signals blocked) never
+  answers: Mousepad hung before mapping its window.
+- O_NONBLOCK honoured on device reads and writes (-EAGAIN), and FIONBIO:
+  xterm slept in a read of its pty master and stopped serving X events.
+- Linux controlling-terminal rules for ptys: opening the slave without
+  O_NOCTTY makes it a session leader's controlling tty, TIOCSCTTY takes the
+  foreground group, job-control stops apply only to one's own ctty.  xterm's
+  shell was stopped with no tty.
+- xapp names the desktop user in the root's passwd/group (GLib's getpwuid)
+  and creates ~/.config, ~/.cache, ~/.local/share.
+
+The extensions maeroX lacks (see above) cost none of these apps more than a
+fallback (mpv: no MIT-SHM, plain XPutImage).  No D-Bus session bus (`DBUS_SESSION_BUS_ADDRESS=disabled:`): Ristretto's thumbnails
+and Xfconf settings, GIMP's single-instance check are off.  GLib has no file
+monitor (no inotify).  apk in the guest is slow for big packages (~35 s for
+Galculator alone, minutes for the GTK/ICU stack), which is why Mousepad's GTK
+stack is preinstalled on the image.
