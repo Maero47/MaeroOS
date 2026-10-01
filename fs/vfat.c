@@ -1743,6 +1743,36 @@ int vfat_set_ro(void *p, int ro) {
     return r < 0 ? E_IO : 0;
 }
 
+/* Free clusters by scanning the FAT, when FSInfo has no valid count (FAT12
+ * and FAT16 have no FSInfo at all).  Done once; allocation keeps it. */
+static int count_free(vfat_fs_t *fs) {
+    uint32_t n = 0;
+    for (uint32_t c = 2; c < fs->nclus + 2; c++) {
+        uint32_t v;
+        if (fat_rd(fs, c, &v) < 0) return -1;
+        if (v == 0) n++;
+    }
+    fs->free_count = n;
+    if (fs->fsinfo_sec && !fs->ro) fs->fsinfo_dirty = 1;
+    return 0;
+}
+
+int vfat_statfs(void *p, vfs_statfs_t *out) {
+    vfat_fs_t *fs = (vfat_fs_t *)p;
+    fs_lock(fs);
+    int r = 0;
+    if (fs->free_count == 0xFFFFFFFFu && count_free(fs) < 0) r = E_IO;
+    out->type    = 0x4d44;                         /* MSDOS_SUPER_MAGIC */
+    out->bsize   = fs->cb;
+    out->blocks  = fs->nclus;
+    out->bfree   = fs->free_count == 0xFFFFFFFFu ? 0 : fs->free_count;
+    out->files   = 0;
+    out->ffree   = 0;
+    out->namelen = 255;
+    fs_unlock(fs);
+    return r;
+}
+
 int vfat_mount_dev(blkpart_t *bp, int ro, const vfat_opts_t *o,
                    vfs_node_t **root_out, vfat_fs_t **fs_out) {
     uint8_t *bs = (uint8_t *)kmalloc(512);

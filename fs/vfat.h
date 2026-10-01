@@ -36,3 +36,4 @@ int vfat_mount_dev(blkpart_t *bp, int ro, const vfat_opts_t *o,
 int  vfat_busy(void *fs);
 void vfat_release(void *fs);
 int  vfat_set_ro(void *fs, int ro);
+int  vfat_statfs(void *fs, vfs_statfs_t *out);

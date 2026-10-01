@@ -32,6 +32,9 @@ import selectors
 import shutil
 import subprocess
 import sys
+import tempfile
+
+import smoke_gui
 
 import smokelib
 
@@ -176,6 +179,51 @@ def mtools_tree(path):
 
 # ── The guest session ────────────────────────────────────────────────────
 
+def hotplug(man, usb_img, accel):
+    """Unplug the stick while it is mounted, then plug it back in."""
+    sockdir = tempfile.mkdtemp(prefix="svfat")
+    qmp_path = os.path.join(sockdir, "qmp")
+    proc, sel, log, g = boot([
+        "-M", "q35",
+        "-drive", "file=disk.img,format=raw,index=0,media=disk,snapshot=on",
+        "-device", "qemu-xhci,id=xhci",
+        "-drive", f"file={usb_img},format=raw,if=none,id=stick,snapshot=on",
+        "-device", "usb-storage,drive=stick,bus=xhci.0,id=ustick",
+        "-qmp", f"unix:{qmp_path},server=on,wait=off"], accel)
+    qmp = None
+    try:
+        smokelib.login(proc, sel, log, timeout=120.0)
+        qmp = smoke_gui.Qmp(qmp_path)
+        rc, out = g.sh("i=0; while [ $i -lt 50 ] && ! busybox grep -q sdb /proc/partitions; "
+                       "do busybox sleep 0.2; i=$((i+1)); done; busybox mkdir -p /usb && "
+                       "busybox mount -t vfat /dev/sdb /usb && busybox cat /usb/Yedek/usb-hello.txt")
+        check(rc == 0 and "hello from the USB stick" in out,
+              "hot-plug boot: the stick is sdb next to one AHCI disk, mounted")
+        at = smokelib.mark(log)
+        qmp.cmd("device_del", id="ustick")
+        smokelib.wait_for(proc, sel, "/dev/usbdisk0 removed", log, 20.0, at)
+        rc, out = g.sh("busybox grep -c sdb /proc/partitions; busybox md5sum /usb/Belgeler/photo.jpg; "
+                       "echo x > /usb/new.txt")
+        want = man["usb"]["files"]["Belgeler/photo.jpg"]
+        check(rc != 0 and want not in out and out.strip().startswith("0"),
+              "unplugged: sdb leaves /proc/partitions, reads and writes fail")
+        rc, out = g.sh("busybox umount /usb")
+        check(rc == 0, "the dead mount unmounts")
+        at = smokelib.mark(log)
+        qmp.cmd("blockdev-add", driver="raw", **{"node-name": "stick2"},
+                file={"driver": "file", "filename": usb_img}, **{"read-only": True})
+        qmp.cmd("device_add", driver="usb-storage", drive="stick2", id="ustick", bus="xhci.0")
+        smokelib.wait_for(proc, sel, "/dev/usbdisk0 is /dev/sdb", log, 30.0, at)
+        rc, out = g.sh("busybox mount -t vfat -o ro /dev/sdb /usb && busybox md5sum /usb/Belgeler/photo.jpg "
+                       "&& busybox umount /usb")
+        check(rc == 0 and want in out, "plugged back in: sdb again, mounts and reads")
+    finally:
+        if qmp:
+            qmp.close()
+        stop(proc)
+        shutil.rmtree(sockdir, ignore_errors=True)
+
+
 def fat32_session(g, man, big):
     f32 = man["fat32"]
     rc, out = g.sh("busybox mkdir -p /mnt && busybox mount -t vfat /dev/sdb1 /mnt")
@@ -221,6 +269,29 @@ def fat32_session(g, man, big):
         check(rc == 0, f"{what} ({out.strip()[-200:]!r})")
     rc, out = g.sh("busybox rmdir \"/mnt/Yeni Klasör\"")
     check(rc != 0, "rmdir of a non-empty directory refused")
+    rc, out = g.sh("busybox mv \"/mnt/Yeni Klasör\" \"/mnt/Yeni Klasör/çok/içine\"")
+    check(rc != 0, f"a directory cannot move below itself ({out.strip()!r})")
+    # statfs: free clusters drop by exactly the clusters a 5 MiB file takes.
+    def free():
+        rc, out = g.sh("busybox stat -f -c \"%T %S %b %f\" /mnt")
+        m = re.search(r"(\S+) (\d+) (\d+) (\d+)", out)
+        return (m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))) if m else None
+    f0 = free()
+    g.sh("busybox cp /mnt/big.bin /mnt/statfs-probe.bin")
+    f1 = free()
+    g.sh("busybox rm /mnt/statfs-probe.bin")
+    f2 = free()
+    check(f0 and f1 and f2 and f0[0] == "msdos" and f0[1] == 512 and f0[3] - f1[3] == 10240
+          and f2[3] == f0[3], f"statfs: type msdos, 512-byte blocks, 10240 used by 5 MiB and "
+                              f"given back ({f0}, {f1}, {f2})")
+    # A file unlinked while open stays readable; its clusters go at close.
+    rc, out = g.sh("busybox cp /mnt/big.bin /mnt/open.bin && exec 3< /mnt/open.bin && "
+                   "busybox rm /mnt/open.bin && busybox test ! -e /mnt/open.bin && "
+                   "busybox md5sum <&3 && exec 3<&-")
+    check(rc == 0 and f32["files"]["big.bin"] in out,
+          "a file unlinked while open still reads back whole")
+    f3 = free()
+    check(f3 and f3[3] == f0[3], "its clusters are free once it is closed")
     rc, out = g.sh("cd /mnt && busybox find . -maxdepth 1 | busybox sed s,^./,,")
     check("SHORT.txt" in out.split("\n") and "short.txt" not in out.split("\n"),
           "the case-only rename shows the new spelling")
@@ -278,8 +349,16 @@ def fat16_session(g, man):
     check(rc == 0, f"mount FAT16 sdc1 and FAT12 sdc2 read-only ({out.strip()!r})")
     compare_tree(g.md5_tree("/mnt16"), man["fat16"]["files"], "FAT16, read")
     compare_tree(g.md5_tree("/mnt12"), man["fat12"]["files"], "FAT12, read")
+    # Fill the FAT12 volume: ENOSPC, then everything given back.
+    rc, out = g.sh("busybox mount -o remount,rw /mnt12 && busybox stat -f -c %f /mnt12 && "
+                   "busybox dd if=/dev/zero of=/mnt12/fill bs=4096; "
+                   "busybox stat -f -c %f /mnt12; busybox rm /mnt12/fill && busybox stat -f -c %f /mnt12",
+                   timeout=300.0)
+    nums = [int(x) for x in re.findall(r"^(\d+)$", out, re.M)]
+    check("No space" in out and len(nums) == 3 and nums[1] == 0 and nums[2] == nums[0],
+          f"FAT12 filled up: ENOSPC, 0 free, all free again after rm ({nums})")
     # Writes on both: FAT16 entries, and FAT12's 12-bit entries that share bytes.
-    rc, out = g.sh("busybox mount -o remount,rw /mnt16 && busybox mount -o remount,rw /mnt12 && "
+    rc, out = g.sh("busybox mount -o remount,rw /mnt16 && "
                    "busybox cp \"/mnt16/sub/data.bin\" /mnt16/sub/copy.bin && "
                    "busybox cp \"/mnt12/odd cluster chain.bin\" \"/mnt12/kopya ı.bin\" && "
                    "busybox rm /mnt12/fat12.txt && busybox mkdir /mnt12/dir && "
@@ -394,6 +473,8 @@ def main():
         compare_tree(g.md5_tree("/mnt"), want32, "IDE: FAT32 as written by the q35 guest")
     finally:
         stop(proc)
+
+    hotplug(man, work["usb"], accel)
 
     if failures:
         print(f"\n{TAG} {len(failures)} check(s) failed:")

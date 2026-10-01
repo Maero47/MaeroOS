@@ -74,6 +74,7 @@ static int mount_block(const char *source, const char *target, const char *fstyp
         t.busy    = vfat_busy;
         t.release = vfat_release;
         t.set_ro  = vfat_set_ro;
+        t.statfs  = vfat_statfs;
         r = vfs_mount_add(target, root, &t);
         if (r < 0) vfat_release(vfs);
         return r;
