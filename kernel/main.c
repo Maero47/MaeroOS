@@ -31,6 +31,7 @@
 #include "../fs/procfs.h"
 #include "../drivers/ata.h"
 #include "../drivers/ahci.h"
+#include "../drivers/nvme.h"
 #include "../drivers/blkdev.h"
 #include "../drivers/pci.h"
 #include "../drivers/rtl8139.h"
@@ -162,6 +163,7 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     net_lwip_init();
     ata_init();
     ahci_init();
+    nvme_init();
     blk_init();
     if (blk_present()) {
         vfs_node_t *disk_root = ext2_mount(0);

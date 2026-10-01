@@ -16,6 +16,7 @@
 #include "../drivers/vga.h"
 #include "../drivers/framebuffer.h"
 #include "../drivers/keyboard.h"
+#include "../drivers/nvme.h"
 #include "../kernel/random.h"
 #include "../kernel/panic.h"
 #include "../arch/i686/cpu/pit.h"
@@ -5495,6 +5496,10 @@ static int sys_mknodat(registers_t *regs) {
 static int sys_reboot(registers_t *regs) {
     /* magic1 = ebx, magic2 = ecx, cmd = edx */
     uint32_t cmd = regs->edx;
+
+    /* NVMe asks for an orderly shutdown notification before power goes. */
+    if (cmd == LINUX_REBOOT_CMD_POWER_OFF || cmd == LINUX_REBOOT_CMD_RESTART)
+        nvme_shutdown();
 
     if (cmd == LINUX_REBOOT_CMD_POWER_OFF) {
         /* ACPI power off — try the well-known virtual-machine ports. */
