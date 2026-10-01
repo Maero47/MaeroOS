@@ -1,5 +1,6 @@
 #include "devfs.h"
 #include "../drivers/ac97.h"
+#include "../drivers/hda.h"
 #include "vfs.h"
 #include "tmpfs.h"
 #include "../drivers/framebuffer.h"
@@ -422,14 +423,33 @@ static int tty_ioctl(vfs_node_t *n, uint32_t req, void *arg) {
     return -25;
 }
 
-/* ── /dev/dsp — AC97 PCM out (48kHz S16LE stereo), blocking writes ───────── */
+/* ── /dev/dsp — AC97 or HDA PCM out (48kHz S16LE stereo), blocking writes ── */
 
 static uint32_t dsp_write(vfs_node_t *n, uint32_t off, uint32_t len,
                           const uint8_t *buf) {
     (void)n;
     (void)off;
-    int r = ac97_write(buf, len);
+    int r = ac97_present() ? ac97_write(buf, len) : hda_write(buf, len);
     return r < 0 ? 0 : (uint32_t)r;
+}
+
+/* OSS SOUND_MIXER_{READ,WRITE}_VOLUME: left | right << 8, 0..100 (HDA only;
+ * the larger of the two channels is applied to both). */
+static int dsp_ioctl(vfs_node_t *n, uint32_t req, void *arg) {
+    (void)n;
+    if (req == 0x80044D00U || req == 0xC0044D00U) {
+        int *v = (int *)arg;
+        if (req == 0xC0044D00U) {
+            int l = *v & 0xFF, r = (*v >> 8) & 0xFF;
+            int rc = hda_set_volume(l > r ? l : r);
+            if (rc < 0) return rc;
+        }
+        int cur = hda_get_volume();
+        if (cur < 0) return cur;
+        *v = cur | (cur << 8);
+        return 0;
+    }
+    return -25;
 }
 
 static uint32_t dsp_read(vfs_node_t *n, uint32_t off, uint32_t len,
@@ -1153,6 +1173,7 @@ vfs_node_t *devfs_mount(void) {
     dev_dsp.inode    = 31;
     dev_dsp.read_fn  = dsp_read;
     dev_dsp.write_fn = dsp_write;
+    dev_dsp.ioctl_fn = dsp_ioctl;
     dev_dsp.read_ready_fn = always_ready;
     dev_dsp.write_ready_fn = always_ready;
 

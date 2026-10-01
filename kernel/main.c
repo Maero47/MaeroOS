@@ -4,6 +4,7 @@
 #include "../drivers/serial.h"
 #include "../drivers/rtc.h"
 #include "../drivers/ac97.h"
+#include "../drivers/hda.h"
 #include "../arch/i686/cpu/fpu.h"
 #include "../drivers/vga.h"
 #include "../kernel/printk.h"
@@ -165,6 +166,7 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     e1000_init();
     ac97_init();
     xhci_init();
+    hda_init();
     net_lwip_init();
     ata_init();
     ahci_init();
@@ -245,6 +247,7 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     if (net_find_interface("eth0"))
         proc_create_kthread(knetd, "knetd");
     ac97_start_thread();
+    hda_start_thread();
     xhci_start_thread();
 
     printk("[BOOT] Jumping to scheduler.\n");
