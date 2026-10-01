@@ -4,7 +4,17 @@
 #define SYS_LIGHTWEIGHT_PROT            0
 
 #define LWIP_IPV4                       1
-#define LWIP_IPV6                       0
+/* Dual stack: IPv6 with SLAAC from router advertisements (QEMU slirp
+ * -netdev user,ipv6=on announces fec0::/64), MLD for the solicited-node
+ * groups, and ICMPv6.  No DHCPv6; RDNSS stays off so the DHCPv4 lease keeps
+ * owning /etc/resolv.conf (lwIP would otherwise overwrite DNS server 0). */
+#define LWIP_IPV6                       1
+#define LWIP_IPV6_AUTOCONFIG            1
+#define LWIP_IPV6_MLD                   1
+#define LWIP_ND6_RDNSS_MAX_DNS_SERVERS  0
+#define LWIP_IPV6_DHCP6                 0
+#define LWIP_IPV6_NUM_ADDRESSES         4
+#define MEMP_NUM_MLD6_GROUP             8
 #define LWIP_ARP                        1
 #define LWIP_ETHERNET                   1
 #define LWIP_ICMP                       1
@@ -46,6 +56,13 @@
 #define PBUF_POOL_SIZE                  128
 #define PBUF_POOL_BUFSIZE               1536
 
+/* lo: lwIP's loop netif (127.0.0.1/8 and ::1), and packets an interface
+ * sends to one of its own addresses come back through its loop queue.
+ * Both queues are drained by netif_poll_all() in net_lwip_poll (NO_SYS). */
+#define LWIP_NETIF_LOOPBACK             1
+#define LWIP_HAVE_LOOPIF                1
+#define LWIP_LOOPIF_MULTICAST           1
+#define LWIP_NETIF_LOOPBACK_MULTITHREADING 0
 #define LWIP_NETIF_STATUS_CALLBACK      1
 #define LWIP_NETIF_LINK_CALLBACK        1
 #define LWIP_CHECKSUM_CTRL_PER_NETIF    0
@@ -69,9 +86,12 @@
 #define TCP_WND                         (16 * TCP_MSS)
 
 
-/* ── MaeroOS firewall: filter inbound IPv4 after ethernet/ARP demux ────── */
+/* ── MaeroOS firewall: filter inbound IPv4/IPv6 after the ethernet demux ── */
 struct pbuf;
 struct netif;
 int firewall_ip4_input_hook(struct pbuf *p, struct netif *inp);
 #define LWIP_HOOK_IP4_INPUT(pbuf, input_netif) \
     firewall_ip4_input_hook((pbuf), (input_netif))
+int firewall_ip6_input_hook(struct pbuf *p, struct netif *inp);
+#define LWIP_HOOK_IP6_INPUT(pbuf, input_netif) \
+    firewall_ip6_input_hook((pbuf), (input_netif))

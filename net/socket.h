@@ -4,12 +4,26 @@
 
 typedef struct net_socket net_socket_t;
 
-typedef struct net_sockaddr_in {
+/* sockaddr_in and sockaddr_in6 in one: an AF_INET name is the first 16
+ * bytes (addr, then sin_zero over addr6[0..7]); an AF_INET6 one is all 28
+ * (sin6_flowinfo in `addr`).  port and addr are in network byte order. */
+typedef struct net_sockaddr {
     uint16_t family;
     uint16_t port;
-    uint32_t addr;
-    uint8_t zero[8];
-} __attribute__((packed)) net_sockaddr_in_t;
+    uint32_t addr;          /* AF_INET: sin_addr; AF_INET6: sin6_flowinfo */
+    uint8_t addr6[16];
+    uint32_t scope_id;
+} __attribute__((packed)) net_sockaddr_t;
+typedef net_sockaddr_t net_sockaddr_in_t;
+
+#define NET_AF_INET   2
+#define NET_AF_INET6 10
+/* The size of a name of this family (16 or 28), 0 for another family. */
+static inline uint32_t net_sockaddr_len(int family) {
+    return family == NET_AF_INET ? 16 : family == NET_AF_INET6 ? 28 : 0;
+}
+/* The socket's family (NET_AF_INET or NET_AF_INET6). */
+int net_socket_domain(net_socket_t *s);
 
 void net_sockets_init(void);
 int net_socket_create(int domain, int type, int protocol, net_socket_t **out);

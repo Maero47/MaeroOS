@@ -14,6 +14,10 @@
 #include "lwip/udp.h"
 #include "lwip/tcp.h"
 #include "lwip/ip4_addr.h"
+#include "lwip/ip6_addr.h"
+#include "lwip/ip_addr.h"
+#include "lwip/ip.h"
+#include "lwip/netif.h"
 #include "lwip/pbuf.h"
 #include "lwip/priv/tcp_priv.h"   /* TF_ACK_NOW for the window-update nudge */
 
@@ -31,6 +35,7 @@ static int timed_out(uint32_t ms, uint32_t start) {
 }
 
 #define AF_INET_K      2
+#define AF_INET6_K    10
 #define SOCK_STREAM_K  1
 #define SOCK_DGRAM_K   2
 #define SOCK_RAW_K     3
@@ -40,6 +45,8 @@ static int timed_out(uint32_t ms, uint32_t start) {
 #define IPPROTO_IP_K   0
 #define IP_OPTIONS_K   4
 #define IPPROTO_UDP_K 17
+#define IPPROTO_ICMP_K 1
+#define IPPROTO_ICMPV6_K 58
 
 /* The table itself is small (~100 bytes a slot): the per-socket buffers, a
  * 64 KiB RX ring for a stream socket or a 6 KiB datagram queue for a UDP one,
@@ -68,7 +75,7 @@ enum {
 typedef struct udp_packet {
     uint8_t data[UDP_PACKET_MAX];
     uint32_t len;
-    uint32_t addr;
+    ip_addr_t addr;
     uint16_t port;
 } udp_packet_t;
 
@@ -113,6 +120,9 @@ struct net_socket {
     int opt_keepalive;
     int opt_nodelay;
     uint32_t keep_idle_ms, keep_intvl_ms, keep_cnt;   /* 0 = lwIP default */
+    int v6only;             /* IPV6_V6ONLY (AF_INET6): no v4-mapped peers */
+    int linger_on;          /* SO_LINGER: l_onoff, l_linger (seconds) */
+    int linger_s;
     uint32_t rcvtimeo_ms;   /* SO_RCVTIMEO: 0 = wait forever */
     uint32_t sndtimeo_ms;   /* SO_SNDTIMEO */
     /* AF_NETLINK, AF_PACKET and AF_INET SOCK_RAW (net/xsock.h): the
@@ -125,6 +135,111 @@ static net_socket_t sockets[MAX_NET_SOCKETS];
 
 static uint16_t bswap16(uint16_t v) {
     return (uint16_t)((v << 8) | (v >> 8));
+}
+
+/* ── Socket names <-> lwIP addresses ─────────────────────────────────────
+ * An AF_INET6 socket is dual-stack unless IPV6_V6ONLY: its pcb is of
+ * IPADDR_TYPE_ANY, an IPv4 peer is named ::ffff:a.b.c.d, and connecting or
+ * sending to such a name goes out over IPv4 (RFC 4291 2.5.5.2, RFC 3493 5.3).
+ * Link-local addresses carry their zone (sin6_scope_id, lwIP's netif index,
+ * which matches the interface index: lo 1, eth0 2); one without a scope id
+ * is eth0's. */
+
+static int is_v4mapped(const uint8_t *a) {
+    static const uint8_t pfx[12] = { 0,0,0,0, 0,0,0,0, 0,0,0xff,0xff };
+    return memcmp(a, pfx, 12) == 0;
+}
+
+static int is_zero16(const uint8_t *a) {
+    for (int i = 0; i < 16; i++)
+        if (a[i]) return 0;
+    return 1;
+}
+
+/* A name from the caller into an lwIP address.  `bind` turns :: into the
+ * wildcard of the socket's kind (IPADDR_TYPE_ANY when dual-stack). */
+static int sa_to_ip(net_socket_t *s, const net_sockaddr_t *sa, ip_addr_t *ip,
+                    int bind) {
+    if (s->domain == AF_INET_K) {
+        if (sa->family != AF_INET_K)
+            return -97;                                  /* -EAFNOSUPPORT */
+        ip_addr_set_ip4_u32(ip, sa->addr);
+        return 0;
+    }
+    if (sa->family != AF_INET6_K)
+        return -97;
+    if (is_v4mapped(sa->addr6)) {
+        if (s->v6only)
+            return bind ? -22 : -101;                    /* EINVAL / ENETUNREACH */
+        uint32_t a4;
+        memcpy(&a4, sa->addr6 + 12, 4);
+        ip_addr_set_ip4_u32(ip, a4);
+        return 0;
+    }
+    if (is_zero16(sa->addr6) && bind) {
+        if (s->v6only)
+            ip_addr_copy(*ip, *IP6_ADDR_ANY);
+        else
+            ip_addr_copy(*ip, *IP_ANY_TYPE);
+        return 0;
+    }
+    ip_addr_set_zero_ip6(ip);
+    memcpy(ip_2_ip6(ip)->addr, sa->addr6, 16);
+    ip6_addr_clear_zone(ip_2_ip6(ip));
+    if (ip6_addr_has_scope(ip_2_ip6(ip), IP6_UNKNOWN)) {
+        uint32_t zone = sa->scope_id ? sa->scope_id : (uint32_t)net_lwip_eth_zone();
+        ip6_addr_set_zone(ip_2_ip6(ip), (u8_t)zone);
+    }
+    return 0;
+}
+
+/* An lwIP address as the socket's kind of name. */
+static void ip_to_sa(net_socket_t *s, const ip_addr_t *ip, uint16_t port_host,
+                     net_sockaddr_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->port = bswap16(port_host);
+    if (s->domain == AF_INET_K) {
+        out->family = AF_INET_K;
+        if (ip && IP_IS_V4(ip))
+            out->addr = ip4_addr_get_u32(ip_2_ip4(ip));
+        return;
+    }
+    out->family = AF_INET6_K;
+    if (!ip || IP_IS_ANY_TYPE_VAL(*ip))
+        return;                                          /* :: */
+    if (IP_IS_V4(ip)) {
+        uint32_t a4 = ip4_addr_get_u32(ip_2_ip4(ip));
+        if (a4 == 0)
+            return;
+        out->addr6[10] = out->addr6[11] = 0xff;
+        memcpy(out->addr6 + 12, &a4, 4);
+        return;
+    }
+    memcpy(out->addr6, ip_2_ip6(ip)->addr, 16);
+    if (ip6_addr_has_zone(ip_2_ip6(ip)))
+        out->scope_id = ip6_addr_zone(ip_2_ip6(ip));
+}
+
+/* A destination is reachable: IPv4 always (lwIP decides), IPv6 only on lo,
+ * the link, eth0's prefixes, or via a router learnt from an RA.  lwIP would
+ * otherwise send a global destination out of eth0 from its link-local
+ * address and the connect would hang until it timed out, where Linux fails
+ * at once with ENETUNREACH (no route) and Happy Eyeballs moves on to IPv4. */
+static int ip_reachable(const ip_addr_t *ip) {
+    if (!IP_IS_V6(ip))
+        return 1;
+    const ip6_addr_t *a = ip_2_ip6(ip);
+    if (ip6_addr_isloopback(a) || ip6_addr_islinklocal(a) || ip6_addr_ismulticast(a))
+        return 1;
+    uint8_t r[16];
+    if (net_lwip_ip6_router(r))
+        return 1;
+    return net_lwip_ip6_onlink((const uint8_t *)a->addr);
+}
+
+/* Linux's ENETUNREACH when IPv6 has no route; ok otherwise. */
+static int route_check(const ip_addr_t *ip) {
+    return ip_reachable(ip) ? 0 : -101;
 }
 
 static uint32_t tcp_rx_space(net_socket_t *s) {
@@ -168,7 +283,7 @@ static void udp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
         len = UDP_PACKET_MAX;
     pbuf_copy_partial(p, pkt->data, (u16_t)len, 0);
     pkt->len = len;
-    pkt->addr = ip_2_ip4(addr)->addr;
+    ip_addr_copy(pkt->addr, *addr);
     pkt->port = port;
     s->qtail = (s->qtail + 1) % UDP_QUEUE_DEPTH;
     s->qcount++;
@@ -337,6 +452,8 @@ static int xsocket_create_locked(int domain, int type, int protocol,
     void *x = NULL;
     int r = domain == AF_NETLINK_K ? netlink_create(type, protocol, &ops, &x)
           : domain == AF_PACKET_K  ? packet_create(type, protocol, &ops, &x)
+          : type == SOCK_DGRAM_K   ? ping_create(domain, &ops, &x)
+          : domain == AF_INET6_K   ? rawip6_create(protocol, &ops, &x)
           : rawip_create(protocol, &ops, &x);
     if (r < 0)
         return r;
@@ -356,7 +473,13 @@ static int socket_create_locked(int domain, int type, int protocol, net_socket_t
     if (domain == AF_NETLINK_K || domain == AF_PACKET_K ||
         (domain == AF_INET_K && type == SOCK_RAW_K))
         return xsocket_create_locked(domain, type, protocol, out);
-    if (domain != AF_INET_K)
+    if (domain == AF_INET6_K && type == SOCK_RAW_K)
+        return xsocket_create_locked(domain, type, protocol, out);
+    /* ICMP "ping sockets" (SOCK_DGRAM, IPPROTO_ICMP / IPPROTO_ICMPV6). */
+    if ((domain == AF_INET_K || domain == AF_INET6_K) && type == SOCK_DGRAM_K &&
+        protocol == (domain == AF_INET_K ? IPPROTO_ICMP_K : IPPROTO_ICMPV6_K))
+        return xsocket_create_locked(domain, type, protocol, out);
+    if (domain != AF_INET_K && domain != AF_INET6_K)
         return -97;
     if (type != SOCK_DGRAM_K && type != SOCK_STREAM_K)
         return -94;
@@ -381,10 +504,11 @@ static int socket_create_locked(int domain, int type, int protocol, net_socket_t
 
     struct udp_pcb *upcb = NULL;
     struct tcp_pcb *tpcb = NULL;
+    u8_t iptype = domain == AF_INET6_K ? IPADDR_TYPE_ANY : IPADDR_TYPE_V4;
     if (type == SOCK_DGRAM_K)
-        upcb = udp_new_ip_type(IPADDR_TYPE_V4);
+        upcb = udp_new_ip_type(iptype);
     else
-        tpcb = tcp_new_ip_type(IPADDR_TYPE_V4);
+        tpcb = tcp_new_ip_type(iptype);
     if (!upcb && !tpcb) {
         printk("[NET] socket: lwIP has no free %s pcb\n",
                type == SOCK_DGRAM_K ? "UDP" : "TCP");
@@ -457,6 +581,17 @@ static void socket_release_locked(net_socket_t *s) {
     }
     if (s->udp)
         udp_remove(s->udp);
+    /* SO_LINGER on with a zero timeout: close() resets the connection
+     * (Linux tcp_close -> tcp_disconnect), dropping unsent data. */
+    if (s->tcp && s->linger_on && s->linger_s == 0) {
+        struct tcp_pcb *pcb = s->tcp;
+        tcp_arg(pcb, NULL);
+        tcp_recv(pcb, NULL);
+        tcp_err(pcb, NULL);
+        tcp_poll(pcb, NULL, 0);
+        s->tcp = NULL;
+        tcp_abort(pcb);
+    }
     socket_detach_pcb(s, 0);
     listen_stop(s);
     /* No lwIP callback can reach s any more (udp_remove, and the detach
@@ -470,8 +605,6 @@ static void socket_release_locked(net_socket_t *s) {
 static int socket_bind_locked(net_socket_t *s, const net_sockaddr_in_t *addr) {
     if (!s || !s->used || !addr)
         return -9;
-    if (addr->family != AF_INET_K)
-        return -97;
     /* Linux inet_bind: a socket binds once (EINVAL after that, also once
      * it listens or connected), and only to an address of this host. */
     if (s->type == SOCK_STREAM_K &&
@@ -479,10 +612,13 @@ static int socket_bind_locked(net_socket_t *s, const net_sockaddr_in_t *addr) {
         return -22;
     if (s->type == SOCK_DGRAM_K && s->udp->local_port != 0)
         return -22;
-    if (!net_lwip_addr_is_local(addr->addr))
-        return -99;                                      /* -EADDRNOTAVAIL */
     ip_addr_t ip;
-    ip_addr_set_ip4_u32(&ip, addr->addr);
+    int cr = sa_to_ip(s, addr, &ip, 1);
+    if (cr < 0)
+        return cr;
+    if (IP_IS_V4_VAL(ip) ? !net_lwip_addr_is_local(ip4_addr_get_u32(ip_2_ip4(&ip)))
+        : IP_IS_V6_VAL(ip) && !net_lwip_addr6_is_local((const uint8_t *)ip_2_ip6(&ip)->addr))
+        return -99;                                      /* -EADDRNOTAVAIL */
     err_t e = s->type == SOCK_DGRAM_K
         ? udp_bind(s->udp, &ip, bswap16(addr->port))
         : tcp_bind(s->tcp, &ip, bswap16(addr->port));
@@ -510,7 +646,10 @@ static err_t tcp_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err) {
     memset(c, 0, sizeof(*c));
     c->used = 1;
     c->refs = 1;
-    c->domain = AF_INET_K;
+    c->domain = ls->domain;
+    c->v6only = ls->v6only;
+    c->linger_on = ls->linger_on;
+    c->linger_s = ls->linger_s;
     c->type = SOCK_STREAM_K;
     c->protocol = IPPROTO_TCP_K;
     c->tcp = newpcb;
@@ -560,7 +699,9 @@ static int socket_listen_locked(net_socket_t *s, int backlog) {
     if (!q)
         return -12;
     /* An unbound socket gets an ephemeral port (Linux inet_autobind). */
-    if (s->tcp->local_port == 0 && tcp_bind(s->tcp, IP4_ADDR_ANY, 0) != ERR_OK) {
+    const ip_addr_t *any = s->domain == AF_INET_K ? IP4_ADDR_ANY
+                         : s->v6only ? IP6_ADDR_ANY : IP_ANY_TYPE;
+    if (s->tcp->local_port == 0 && tcp_bind(s->tcp, any, 0) != ERR_OK) {
         kfree(q);
         return -98;
     }
@@ -637,16 +778,24 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
                        int nonblock) {
     if (!s || !s->used || !addr)
         return -9;
-    if (addr->family != AF_INET_K)
-        return -97;
-    /* Egress firewall: block outbound by remote ip/port if a rule matches. */
+    ip_addr_t dst;
+    int cr = sa_to_ip(s, addr, &dst, 0);
+    if (cr < 0)
+        return cr;
+    /* Egress firewall: block outbound by remote ip/port if a rule matches
+     * (an IPv6 peer only meets the rules for any address). */
     {
         int proto = (s->type == SOCK_DGRAM_K) ? FW_UDP : FW_TCP;
-        int fr = firewall_check(FW_OUT, proto, addr->addr, bswap16(addr->port));
+        int fr = IP_IS_V4_VAL(dst)
+            ? firewall_check(FW_OUT, proto, ip4_addr_get_u32(ip_2_ip4(&dst)),
+                             bswap16(addr->port))
+            : firewall_check6(FW_OUT, proto, bswap16(addr->port));
         if (fr < 0) return fr;
     }
+    if ((cr = route_check(&dst)) < 0)
+        return cr;
     if (s->type == SOCK_DGRAM_K) {
-        ip_addr_set_ip4_u32(&s->remote_addr, addr->addr);
+        ip_addr_copy(s->remote_addr, dst);
         s->remote_port = bswap16(addr->port);
         preempt_disable();
         err_t e = udp_connect(s->udp, &s->remote_addr, s->remote_port);
@@ -677,7 +826,7 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
 
     /* Only a new attempt takes the address: one already under way (or
      * done) keeps its own peer, whatever a repeated connect() names. */
-    ip_addr_set_ip4_u32(&s->remote_addr, addr->addr);
+    ip_addr_copy(s->remote_addr, dst);
     s->remote_port = bswap16(addr->port);
     s->tcp_state = TCP_STATE_CONNECTING;
     s->tcp_error = 0;
@@ -694,6 +843,10 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
     if (nonblock)
         return -115;                                      /* -EINPROGRESS */
     return connect_wait(s);
+}
+
+int net_socket_domain(net_socket_t *s) {
+    return s && s->used ? s->domain : AF_INET_K;
 }
 
 int net_socket_is_stream(net_socket_t *s) {
@@ -771,17 +924,21 @@ static int socket_sendto_locked(net_socket_t *s, const void *buf, uint32_t len,
 
     err_t e;
     if (addr) {
-        if (addr->family != AF_INET_K) {
+        ip_addr_t ip;
+        int cr = sa_to_ip(s, addr, &ip, 0);
+        if (cr == 0)
+            cr = route_check(&ip);
+        if (cr < 0) {
             pbuf_free(p);
-            return -97;
+            return cr;
         }
-        if (firewall_check(FW_OUT, FW_UDP, addr->addr,
-                           bswap16(addr->port)) < 0) {
+        if (IP_IS_V4_VAL(ip)
+            ? firewall_check(FW_OUT, FW_UDP, ip4_addr_get_u32(ip_2_ip4(&ip)),
+                             bswap16(addr->port)) < 0
+            : firewall_check6(FW_OUT, FW_UDP, bswap16(addr->port)) < 0) {
             pbuf_free(p);
             return -13;   /* -EACCES */
         }
-        ip_addr_t ip;
-        ip_addr_set_ip4_u32(&ip, addr->addr);
         e = udp_sendto(s->udp, p, &ip, bswap16(addr->port));
     } else if (s->connected) {
         e = udp_send(s->udp, p);
@@ -792,6 +949,8 @@ static int socket_sendto_locked(net_socket_t *s, const void *buf, uint32_t len,
 
     pbuf_free(p);
     net_poll_all();
+    if (e == ERR_VAL)
+        return -22;       /* an IPv4 name on a v6-only socket or the like */
     return e == ERR_OK ? (int)len : -101;
 }
 
@@ -843,12 +1002,8 @@ static int socket_recvfrom_locked(net_socket_t *s, void *buf, uint32_t len,
     if (peek) {                     /* MSG_PEEK: leave the datagram queued */
         uint32_t n = pkt->len < len ? pkt->len : len;
         memcpy(buf, pkt->data, n);
-        if (addr) {
-            memset(addr, 0, sizeof(*addr));
-            addr->family = AF_INET_K;
-            addr->port = bswap16(pkt->port);
-            addr->addr = pkt->addr;
-        }
+        if (addr)
+            ip_to_sa(s, &pkt->addr, pkt->port, addr);
         return (int)n;
     }
     uint32_t n = pkt->len;
@@ -856,12 +1011,8 @@ static int socket_recvfrom_locked(net_socket_t *s, void *buf, uint32_t len,
         n = len;
     memcpy(buf, pkt->data, n);
 
-    if (addr) {
-        memset(addr, 0, sizeof(*addr));
-        addr->family = AF_INET_K;
-        addr->port = bswap16(pkt->port);
-        addr->addr = pkt->addr;
-    }
+    if (addr)
+        ip_to_sa(s, &pkt->addr, pkt->port, addr);
 
     s->qhead = (s->qhead + 1) % UDP_QUEUE_DEPTH;
     s->qcount--;
@@ -917,24 +1068,31 @@ int net_socket_poll_err(net_socket_t *s) {
 int net_socket_getname(net_socket_t *s, int peer, net_sockaddr_in_t *out) {
     if (!s || !s->used || !out)
         return -9;
-    memset(out, 0, sizeof(*out));
-    out->family = AF_INET_K;
+    ip_to_sa(s, NULL, 0, out);
     preempt_disable();
     int r = 0;
     if (peer) {
         if (!s->connected)
             r = -107;
-        else {
-            out->addr = ip4_addr_get_u32(ip_2_ip4(&s->remote_addr));
-            out->port = bswap16(s->remote_port);
-        }
+        else
+            ip_to_sa(s, &s->remote_addr, s->remote_port, out);
     } else if (s->tcp || s->lpcb) {
         struct tcp_pcb *pcb = s->tcp ? s->tcp : s->lpcb;
-        out->addr = ip4_addr_get_u32(ip_2_ip4(&pcb->local_ip));
-        out->port = bswap16(pcb->local_port);
+        ip_to_sa(s, &pcb->local_ip, pcb->local_port, out);
     } else if (s->udp) {
-        out->addr = ip4_addr_get_u32(ip_2_ip4(&s->udp->local_ip));
-        out->port = bswap16(s->udp->local_port);
+        /* A connected UDP socket with no bound address names the source a
+         * datagram to its peer would carry, as Linux's ip4/ip6_datagram_
+         * connect binds it: musl's and glibc's RFC 6724 sort read it. */
+        const ip_addr_t *src = &s->udp->local_ip;
+        if (s->connected && ip_addr_isany(src)) {
+            struct netif *n = ip_route(IP_IS_V6(&s->remote_addr) ? IP6_ADDR_ANY
+                                                                  : IP4_ADDR_ANY,
+                                       &s->remote_addr);
+            const ip_addr_t *l = n ? ip_netif_get_local_ip(n, &s->remote_addr) : NULL;
+            if (l)
+                src = l;
+        }
+        ip_to_sa(s, src, s->udp->local_port, out);
     }
     preempt_enable();
     return r;
@@ -1208,6 +1366,11 @@ int net_socket_accept(net_socket_t *s, net_socket_t **out, int nonblock) {
 #define SO_DOMAIN_K         39
 #define SO_RCVTIMEO_NEW_K   66
 #define SO_SNDTIMEO_NEW_K   67
+#define SO_LINGER_K         13
+#define IP_TTL_K            2
+#define IPPROTO_IPV6_K      41
+#define IPV6_UNICAST_HOPS_K 16
+#define IPV6_V6ONLY_K       26
 #define TCP_NODELAY_K       1
 #define TCP_KEEPIDLE_K      4
 #define TCP_KEEPINTVL_K     5
@@ -1285,7 +1448,37 @@ int net_socket_setopt(net_socket_t *s, int level, int name,
         iv = *(const uint8_t *)val;
     preempt_disable();
     int r = 0;
-    if (level == SOL_SOCKET_K && name == SO_REUSEADDR_K) {
+    if (level == SOL_SOCKET_K && name == SO_LINGER_K) {
+        /* struct linger { int l_onoff; int l_linger; } */
+        if (len < 8)
+            r = -22;
+        else {
+            s->linger_on = ((const int32_t *)val)[0] != 0;
+            s->linger_s = ((const int32_t *)val)[1] < 0 ? 0 : ((const int32_t *)val)[1];
+        }
+    } else if (level == IPPROTO_IPV6_K && name == IPV6_V6ONLY_K) {
+        /* Linux: only on an AF_INET6 socket, and only before it binds. */
+        int bound = (s->tcp && s->tcp->local_port) || s->lpcb ||
+                    (s->udp && s->udp->local_port) || s->was_connected;
+        if (s->domain != AF_INET6_K)
+            r = -92;                                     /* -ENOPROTOOPT */
+        else if (len < 4)
+            r = -22;
+        else if (bound)
+            r = -22;
+        else {
+            s->v6only = iv != 0;
+            u8_t t = s->v6only ? IPADDR_TYPE_V6 : IPADDR_TYPE_ANY;
+            if (s->tcp) {
+                IP_SET_TYPE_VAL(s->tcp->local_ip, t);
+                IP_SET_TYPE_VAL(s->tcp->remote_ip, t);
+            }
+            if (s->udp) {
+                IP_SET_TYPE_VAL(s->udp->local_ip, t);
+                IP_SET_TYPE_VAL(s->udp->remote_ip, t);
+            }
+        }
+    } else if (level == SOL_SOCKET_K && name == SO_REUSEADDR_K) {
         s->opt_reuseaddr = iv != 0;
     } else if (level == SOL_SOCKET_K && name == SO_KEEPALIVE_K) {
         s->opt_keepalive = iv != 0;
@@ -1338,6 +1531,12 @@ int net_socket_getopt(net_socket_t *s, int level, int name,
         case SO_SNDBUF_K:
         case SO_RCVBUF_K:     v = 65536; break;
         case SO_ACCEPTCONN_K: v = s->listening; break;
+        case SO_LINGER_K: {
+            int32_t l[2] = { s->linger_on, s->linger_s };
+            memcpy(buf, l, 8);
+            n = 8;
+            break;
+        }
         case SO_PROTOCOL_K:   v = s->protocol; break;
         case SO_DOMAIN_K:     v = s->domain; break;
         case SO_RCVTIMEO_OLD_K: case SO_RCVTIMEO_NEW_K:
@@ -1356,6 +1555,12 @@ int net_socket_getopt(net_socket_t *s, int level, int name,
         case TCP_KEEPCNT_K:   v = s->keep_cnt ? (int32_t)s->keep_cnt : 9; break;
         default: return 1;
         }
+    } else if (level == IPPROTO_IPV6_K && name == IPV6_V6ONLY_K &&
+               s->domain == AF_INET6_K) {
+        v = s->v6only;
+    } else if ((level == IPPROTO_IPV6_K && name == IPV6_UNICAST_HOPS_K) ||
+               (level == IPPROTO_IP_K && name == IP_TTL_K)) {
+        v = 64;                                          /* lwIP's default TTL */
     } else if (level == IPPROTO_IP_K && name == IP_OPTIONS_K) {
         /* No IP options are ever kept: an empty value.  Four zero bytes
          * read as options, and sshd-session drops a connection that carries

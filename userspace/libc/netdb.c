@@ -5,16 +5,19 @@
  * Lookups go to /etc/hosts first (and "localhost" is always the loopback
  * address), then to DNS over UDP using /etc/resolv.conf:
  *
- *   nameserver 10.0.2.3          up to 3 lines, IPv4 (no IPv6 stack yet)
+ *   nameserver 10.0.2.3          up to 3 lines, IPv4
  *   nameserver [10.0.2.2]:5353   OpenBSD's syntax for a non-default port
  *   search a.example b.example   (or "domain x") tried for short names
  *   options timeout:2 attempts:2 ndots:1
  *
  * With no usable nameserver line the server is 10.0.2.3, QEMU user-net's
- * DNS.  A and AAAA queries for one name go out together; for AF_UNSPEC the
- * IPv4 results come first because the kernel has no IPv6 sockets, so
- * connecting to the first address is the one that can work.  Replies with
- * TC set (truncated, needs TCP) are used as far as they go.
+ * DNS.  A and AAAA queries for one name go out together.  For several
+ * addresses the order is RFC 6724's destination selection in part: a
+ * destination this host has no route to goes last (rule 1, probed with a
+ * UDP connect, which sends nothing), then by the policy table's precedence
+ * (rule 6: ::1, then global IPv6, then IPv4; 6to4, ULAs and the deprecated
+ * site-local fec0::/10 after IPv4), as musl and glibc do.  Replies with TC
+ * set (truncated, needs TCP) are used as far as they go.
  *
  * Written for MaeroOS from RFC 1035 (messages, compression), RFC 3596
  * (AAAA, ip6.arpa), RFC 3493 (getaddrinfo/getnameinfo) and RFC 5952 (IPv6
@@ -53,6 +56,9 @@ struct addr {
     int family;
     unsigned char a[16];
 };
+
+const struct in6_addr in6addr_any = IN6ADDR_ANY_INIT;
+const struct in6_addr in6addr_loopback = IN6ADDR_LOOPBACK_INIT;
 
 /* ── small helpers ─────────────────────────────────────────────────────── */
 
@@ -891,6 +897,76 @@ static int lookup_name(const char *name, int family, struct addr *out, int max,
     return err;
 }
 
+/* ── destination order (RFC 6724 section 6, rules 1 and 6) ─────────────── */
+
+/* The policy table's precedence (RFC 6724 section 2.1). */
+static int precedence(const struct addr *a) {
+    const unsigned char *b = a->a;
+    if (a->family == AF_INET) return 35;                 /* ::ffff:0:0/96 */
+    static const unsigned char lo[16] = { [15] = 1 };
+    if (!memcmp(b, lo, 16)) return 50;                   /* ::1/128 */
+    if (IN6_IS_ADDR_V4MAPPED(b)) return 35;
+    if (b[0] == 0x20 && b[1] == 0x02) return 30;         /* 2002::/16 6to4 */
+    if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0 && b[3] == 0) return 5;  /* Teredo */
+    if ((b[0] & 0xfe) == 0xfc) return 3;                 /* fc00::/7 ULA */
+    if (b[0] == 0xfe && (b[1] & 0xc0) == 0xc0) return 1; /* fec0::/10 */
+    if (b[0] == 0x3f && b[1] == 0xfe) return 1;          /* 3ffe::/16 6bone */
+    int zero12 = 1;
+    for (int i = 0; i < 12; i++) if (b[i]) zero12 = 0;
+    if (zero12) return 1;                                /* ::/96 v4-compatible */
+    return 40;                                           /* ::/0 */
+}
+
+/* Rule 1: is there a route?  A connected UDP socket picks a source
+ * address without sending anything; ENETUNREACH means none. */
+static int reachable(const struct addr *a) {
+    int fd = socket(a->family, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+    if (fd < 0) return 0;
+    int ok;
+    if (a->family == AF_INET) {
+        struct sockaddr_in sin;
+        memset(&sin, 0, sizeof(sin));
+        sin.sin_family = AF_INET;
+        sin.sin_port = htons(65535);
+        memcpy(&sin.sin_addr, a->a, 4);
+        ok = connect(fd, (struct sockaddr *)&sin, sizeof(sin)) == 0;
+    } else {
+        struct sockaddr_in6 sin6;
+        memset(&sin6, 0, sizeof(sin6));
+        sin6.sin6_family = AF_INET6;
+        sin6.sin6_port = htons(65535);
+        memcpy(&sin6.sin6_addr, a->a, 16);
+        ok = connect(fd, (struct sockaddr *)&sin6, sizeof(sin6)) == 0;
+    }
+    close(fd);
+    return ok;
+}
+
+/* A stable sort on (reachable, precedence), both descending. */
+static int sort_dests(const struct addr *in, int n, struct addr *out) {
+    int key[MAXADDRS];
+    if (n <= 1) {
+        if (n == 1) out[0] = in[0];
+        return n;
+    }
+    for (int i = 0; i < n; i++) {
+        out[i] = in[i];
+        key[i] = (reachable(&in[i]) ? 100 : 0) + precedence(&in[i]);
+    }
+    for (int i = 1; i < n; i++) {
+        struct addr a = out[i];
+        int k = key[i], j = i - 1;
+        while (j >= 0 && key[j] < k) {
+            out[j + 1] = out[j];
+            key[j + 1] = key[j];
+            j--;
+        }
+        out[j + 1] = a;
+        key[j + 1] = k;
+    }
+    return n;
+}
+
 /* ── getaddrinfo ───────────────────────────────────────────────────────── */
 
 static int parse_service(const char *service, int socktype, int flags,
@@ -1035,11 +1111,13 @@ int getaddrinfo(const char *node, const char *service,
         if (!canon[0]) strncpy(canon, node, sizeof(canon) - 1);
     }
 
-    /* IPv4 first: the kernel has no IPv6 sockets. */
     struct addr sorted[MAXADDRS];
     int ns = 0;
-    for (int i = 0; i < n; i++) if (addrs[i].family == AF_INET) sorted[ns++] = addrs[i];
-    for (int i = 0; i < n; i++) if (addrs[i].family != AF_INET) sorted[ns++] = addrs[i];
+    if (!node) {
+        for (int i = 0; i < n; i++) sorted[ns++] = addrs[i];
+    } else {
+        ns = sort_dests(addrs, n, sorted);
+    }
 
     static const int types[] = { SOCK_STREAM, SOCK_DGRAM };
     struct addrinfo *head = 0, **tail = &head;

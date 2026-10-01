@@ -245,7 +245,9 @@ static void rx_setup(void) {
     wr32(REG_RDT, RX_DESCS - 1);
     wr32(REG_RDTR, 0);              /* no receive-interrupt delay */
     info.rx_next = 0;
-    wr32(REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2048);
+    /* MPE: every multicast frame, so IPv6 neighbour discovery (all-nodes
+     * and solicited-node groups) reaches lwIP without programming the MTA. */
+    wr32(REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_MPE | RCTL_SECRC | RCTL_BSIZE_2048);
 }
 
 static void tx_setup(void) {

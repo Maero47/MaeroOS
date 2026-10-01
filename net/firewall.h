@@ -20,6 +20,8 @@
  * Returns 0 to allow, -13 (-EACCES) to block.
  */
 int firewall_check(int dir, int proto, uint32_t remote_ip, uint16_t port);
+/* The same for an IPv6 peer: only rules for any address and the policy. */
+int firewall_check6(int dir, int proto, uint16_t port);
 
 /* Apply one control line (from /proc/firewall writes or fwctl).  Accepts:
  *   enable | disable | flush

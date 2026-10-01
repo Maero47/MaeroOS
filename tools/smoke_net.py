@@ -270,7 +270,8 @@ def dns_checks(proc, sel, log, webdir):
             # getnameinfo: PTR from the responder, /etc/hosts before DNS.
             ("getent hosts 192.0.2.7", "192.0.2.7       rev.maeros.test"),
             ("getent hosts 10.0.2.2", "10.0.2.2        qemu-host"),
-            ("getent hosts localhost", "127.0.0.1       localhost"),
+            # ::1 before 127.0.0.1 (RFC 6724 precedence, as musl orders it).
+            ("getent hosts localhost", "::1             localhost"),
             ("getent hosts nosuch.maeros.test; echo rc=$?",
              "Name does not resolve"),
         ]

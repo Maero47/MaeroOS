@@ -101,10 +101,18 @@
 /* if.h */
 #define IFF_UP         0x1
 #define IFF_BROADCAST  0x2
+#define IFF_LOOPBACK   0x8
 #define IFF_RUNNING    0x40
 #define IFF_MULTICAST  0x1000
 #define IFF_LOWER_UP   0x10000
 #define ARPHRD_ETHER   1
+#define ARPHRD_LOOPBACK 772
+#define RT_SCOPE_HOST  254
+#define RT_SCOPE_SITE  200
+#define RTPROT_RA      9
+#define IFA_F_TENTATIVE 0x40
+#define LO_ADDR        0x0100007Fu      /* 127.0.0.1, network order */
+#define LO_MASK        0x000000FFu      /* 255.0.0.0 */
 
 #define NL_QUEUE_MAX   (256 * 1024)   /* replies waiting to be read */
 
@@ -128,6 +136,8 @@ netif_t *netdev_by_index(int index) {
 }
 
 static uint32_t if_flags(netif_t *iface) {
+    if (iface->loopback)
+        return IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_LOWER_UP;
     uint32_t f = IFF_BROADCAST | IFF_MULTICAST;
     if (net_lwip_iface_is_ip(iface) && net_lwip_is_up())
         f |= IFF_UP | IFF_RUNNING | IFF_LOWER_UP;
@@ -327,7 +337,7 @@ static void put_link(nlbuf_t *b, netif_t *iface, uint16_t flags,
     nb_begin(b, RTM_NEWLINK, flags, seq, pid);
     ifinfomsg_k *ifi = (ifinfomsg_k *)nb_put(b, sizeof(*ifi));
     if (ifi) {
-        ifi->type = ARPHRD_ETHER;
+        ifi->type = iface->loopback ? ARPHRD_LOOPBACK : ARPHRD_ETHER;
         ifi->index = netdev_index(iface);
         ifi->flags = if_flags(iface);
         ifi->change = 0xFFFFFFFFu;
@@ -338,9 +348,9 @@ static void put_link(nlbuf_t *b, netif_t *iface, uint16_t flags,
     nb_u8(b, IFLA_OPERSTATE, (if_flags(iface) & IFF_UP) ? 6 : 2);  /* UP / DOWN */
     nb_u8(b, IFLA_LINKMODE, 0);
     nb_u32(b, IFLA_MTU, iface->mtu);
-    nb_str(b, IFLA_QDISC, "pfifo_fast");
+    nb_str(b, IFLA_QDISC, iface->loopback ? "noqueue" : "pfifo_fast");
     nb_attr(b, IFLA_ADDRESS, iface->mac, 6);
-    nb_attr(b, IFLA_BROADCAST, bcast, 6);
+    nb_attr(b, IFLA_BROADCAST, iface->loopback ? iface->mac : bcast, 6);
     /* struct rtnl_link_stats: 24 counters. */
     uint32_t st[24];
     memset(st, 0, sizeof(st));
@@ -357,28 +367,114 @@ static void put_addr(nlbuf_t *b, netif_t *iface, uint16_t flags,
                      uint32_t seq, uint32_t pid) {
     uint32_t ip, mask, gw;
     net_lwip_get_config(&ip, &mask, &gw);
-    if (!net_lwip_iface_is_ip(iface) || !ip)
-        return;
     int dyn = net_lwip_dhcp_owned();
+    if (iface->loopback) {
+        ip = LO_ADDR;
+        mask = LO_MASK;
+        dyn = 0;
+    } else if (!net_lwip_iface_is_ip(iface) || !ip)
+        return;
     nb_begin(b, RTM_NEWADDR, flags, seq, pid);
     ifaddrmsg_k *ifa = (ifaddrmsg_k *)nb_put(b, sizeof(*ifa));
     if (ifa) {
         ifa->family = AF_INET_K;
         ifa->prefixlen = (uint8_t)prefix_len(mask);
         ifa->flags = dyn ? 0 : IFA_F_PERMANENT;
-        ifa->scope = RT_SCOPE_UNIVERSE;
+        ifa->scope = iface->loopback ? RT_SCOPE_HOST : RT_SCOPE_UNIVERSE;
         ifa->index = (uint32_t)netdev_index(iface);
     }
     uint32_t bc = ip | ~mask;
     nb_u32(b, IFA_ADDRESS, ip);
     nb_u32(b, IFA_LOCAL, ip);
-    nb_u32(b, IFA_BROADCAST, bc);
+    if (!iface->loopback)
+        nb_u32(b, IFA_BROADCAST, bc);
     nb_str(b, IFA_LABEL, iface->name);
     nb_u32(b, IFA_FLAGS, dyn ? 0 : IFA_F_PERMANENT);
     /* struct ifa_cacheinfo: preferred/valid lifetimes "forever". */
     uint32_t ci[4] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0, 0 };
     nb_attr(b, IFA_CACHEINFO, ci, sizeof(ci));
     nb_end(b);
+}
+
+/* An interface's IPv6 addresses: lo's ::1/128, eth0's link-local and SLAAC
+ * ones (with their lifetimes, as iproute2 prints "valid_lft"). */
+static void put_addr6(nlbuf_t *b, netif_t *iface, uint16_t flags,
+                      uint32_t seq, uint32_t pid) {
+    net_ip6_info_t a[6];
+    int n = net_lwip_ip6_addrs(iface, a, 6);
+    for (int i = 0; i < n; i++) {
+        uint32_t f = (a[i].dynamic ? 0 : IFA_F_PERMANENT) |
+                     (a[i].tentative ? IFA_F_TENTATIVE : 0);
+        nb_begin(b, RTM_NEWADDR, flags, seq, pid);
+        ifaddrmsg_k *ifa = (ifaddrmsg_k *)nb_put(b, sizeof(*ifa));
+        if (ifa) {
+            ifa->family = AF_INET6_K;
+            ifa->prefixlen = a[i].plen;
+            ifa->flags = (uint8_t)f;
+            ifa->scope = a[i].scope == 0x10 ? RT_SCOPE_HOST
+                       : a[i].scope == 0x20 ? RT_SCOPE_LINK
+                       : a[i].scope == 0x40 ? RT_SCOPE_SITE : RT_SCOPE_UNIVERSE;
+            ifa->index = (uint32_t)netdev_index(iface);
+        }
+        nb_attr(b, IFA_ADDRESS, a[i].addr, 16);
+        nb_u32(b, IFA_FLAGS, f);
+        uint32_t ci[4] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0, 0 };
+        if (a[i].dynamic && a[i].valid_life) {
+            ci[0] = a[i].pref_life;
+            ci[1] = a[i].valid_life;
+        }
+        nb_attr(b, IFA_CACHEINFO, ci, sizeof(ci));
+        nb_end(b);
+    }
+}
+
+static void put_route6(nlbuf_t *b, uint32_t seq, uint32_t pid,
+                       const uint8_t *dst, int dst_len, const uint8_t *gw,
+                       int oif, uint8_t proto, uint32_t metric) {
+    nb_begin(b, RTM_NEWROUTE, NLM_F_MULTI, seq, pid);
+    rtmsg_k *rt = (rtmsg_k *)nb_put(b, sizeof(*rt));
+    if (rt) {
+        rt->family = AF_INET6_K;
+        rt->dst_len = (uint8_t)dst_len;
+        rt->table = RT_TABLE_MAIN;
+        rt->protocol = proto;
+        rt->scope = RT_SCOPE_UNIVERSE;
+        rt->type = RTN_UNICAST;
+    }
+    nb_u32(b, RTA_TABLE, RT_TABLE_MAIN);
+    if (dst_len) nb_attr(b, RTA_DST, dst, 16);
+    nb_u32(b, RTA_PRIORITY, metric);
+    if (gw) nb_attr(b, RTA_GATEWAY, gw, 16);
+    nb_u32(b, RTA_OIF, (uint32_t)oif);
+    nb_end(b);
+}
+
+/* IPv6 routes: ::1 on lo, each eth0 prefix (fe80::/64 and the SLAAC
+ * /64s), and the default route via the RA's router. */
+static void dump_routes6(nlbuf_t *b, uint32_t seq, uint32_t pid) {
+    for (int k = 0; k < net_interface_count(); k++) {
+        netif_t *iface = net_get_interface(k);
+        int idx = netdev_index(iface);
+        net_ip6_info_t a[6];
+        int n = net_lwip_ip6_addrs(iface, a, 6);
+        for (int i = 0; i < n; i++) {
+            uint8_t pfx[16];
+            memset(pfx, 0, 16);
+            int plen = a[i].plen;
+            memcpy(pfx, a[i].addr, (uint32_t)plen / 8);
+            int dup = 0;
+            for (int j = 0; j < i; j++)
+                if (a[j].plen == plen && !memcmp(a[j].addr, pfx, (uint32_t)plen / 8))
+                    dup = 1;
+            if (!dup)
+                put_route6(b, seq, pid, pfx, plen, NULL, idx,
+                           a[i].dynamic ? RTPROT_RA : RTPROT_KERNEL, 256);
+        }
+        uint8_t r[16];
+        if (!iface->loopback && n && net_lwip_iface_is_ip(iface) &&
+            net_lwip_ip6_router(r))
+            put_route6(b, seq, pid, NULL, 0, r, idx, RTPROT_RA, 1024);
+    }
 }
 
 static uint32_t gw_metric;   /* the metric the default route was added with */
@@ -433,6 +529,7 @@ static void do_dump(nlsock_t *s, const nlmsghdr_k *h, uint32_t plen) {
     nlbuf_t b = {0};
     uint8_t family = plen >= 1 ? ((const uint8_t *)(h + 1))[0] : 0;
     int v4 = family == 0 || family == AF_INET_K;
+    int v6 = family == 0 || family == AF_INET6_K;
     switch (h->type) {
     case RTM_GETLINK:
         for (int i = 0; i < net_interface_count(); i++)
@@ -442,9 +539,13 @@ static void do_dump(nlsock_t *s, const nlmsghdr_k *h, uint32_t plen) {
         if (v4)
             for (int i = 0; i < net_interface_count(); i++)
                 put_addr(&b, net_get_interface(i), NLM_F_MULTI, h->seq, s->portid);
+        if (v6)
+            for (int i = 0; i < net_interface_count(); i++)
+                put_addr6(&b, net_get_interface(i), NLM_F_MULTI, h->seq, s->portid);
         break;
     case RTM_GETROUTE:
         if (v4) dump_routes(&b, h->seq, s->portid);
+        if (v6) dump_routes6(&b, h->seq, s->portid);
         break;
     default:
         /* Neighbours, rules, qdiscs...: an empty table. */
@@ -496,6 +597,8 @@ static int do_setlink(const ifinfomsg_k *ifi, const attrs_t *a) {
         int up = (ifi->flags & IFF_UP) != 0;
         if (net_lwip_iface_is_ip(iface))
             net_lwip_set_up(up);
+        else if (iface->loopback)
+            return up ? 0 : -95; /* lo stays up */
         else if (up)
             return -95;          /* only the interface lwIP runs on comes up */
     }
@@ -504,10 +607,29 @@ static int do_setlink(const ifinfomsg_k *ifi, const attrs_t *a) {
 
 static int do_newaddr(const nlmsghdr_k *h, const ifaddrmsg_k *ifa,
                       const attrs_t *a, int del) {
+    if (ifa->family == AF_INET6_K) {
+        /* Removing one works (busybox `ip addr flush`); adding is SLAAC's. */
+        if (!del) return -95;
+        if (!is_root()) return -1;
+        netif_t *i6 = netdev_by_index((int)ifa->index);
+        if (!i6) return -19;
+        const void *p6 = a->p[IFA_LOCAL] ? a->p[IFA_LOCAL] : a->p[IFA_ADDRESS];
+        uint32_t l6 = a->p[IFA_LOCAL] ? a->len[IFA_LOCAL] : a->len[IFA_ADDRESS];
+        if (!p6 || l6 != 16) return -22;
+        if (i6->loopback) return -95;
+        return net_lwip_ip6_del(i6, (const uint8_t *)p6);
+    }
     if (ifa->family != AF_INET_K) return -97;          /* -EAFNOSUPPORT */
     if (!is_root()) return -1;
     netif_t *iface = netdev_by_index((int)ifa->index);
     if (!iface) return -19;
+    if (iface->loopback) {
+        uint32_t want = 0;
+        int have = attr_u32(a, IFA_LOCAL, &want) || attr_u32(a, IFA_ADDRESS, &want);
+        if (!del && have && want == LO_ADDR && ifa->prefixlen == 8)
+            return (h->flags & NLM_F_EXCL) ? -17 : 0;  /* already there */
+        return -95;
+    }
     uint32_t want = 0;
     int have = attr_u32(a, IFA_LOCAL, &want) || attr_u32(a, IFA_ADDRESS, &want);
     uint32_t ip, mask, gw;
@@ -871,14 +993,16 @@ static int ifconf_ioctl(void *uarg) {
     int32_t used = 0;
     for (int i = 0; i < net_interface_count(); i++) {
         netif_t *iface = net_get_interface(i);
-        if (!net_lwip_iface_is_ip(iface) || !ip) continue;   /* IPv4 only */
+        uint32_t a = iface->loopback ? LO_ADDR : ip;
+        if (!iface->loopback && (!net_lwip_iface_is_ip(iface) || !ip))
+            continue;                                         /* IPv4 only */
         if (ifc.buf) {
             if (used + (int32_t)sizeof(ifreq_k) > ifc.len) break;
             ifreq_k r;
             memset(&r, 0, sizeof(r));
             strncpy(r.name, iface->name, 15);
             r.u.in.family = AF_INET_K;
-            r.u.in.addr = ip;
+            r.u.in.addr = a;
             if (copy_to_user((void *)(uintptr_t)(ifc.buf + (uint32_t)used),
                              &r, sizeof(r)) < 0)
                 return -14;
@@ -919,6 +1043,10 @@ int netdev_ioctl(uint32_t req, void *uarg) {
     int isip = net_lwip_iface_is_ip(iface);
     uint32_t ip = 0, mask = 0, gw = 0;
     if (isip) net_lwip_get_config(&ip, &mask, &gw);
+    if (iface->loopback) {
+        ip = LO_ADDR;
+        mask = LO_MASK;
+    }
     int set = req == SIOCSIFFLAGS || req == SIOCSIFADDR || req == SIOCSIFDSTADDR ||
               req == SIOCSIFBRDADDR || req == SIOCSIFNETMASK ||
               req == SIOCSIFMETRIC || req == SIOCSIFMTU || req == SIOCSIFTXQLEN ||
@@ -931,6 +1059,7 @@ int netdev_ioctl(uint32_t req, void *uarg) {
     case SIOCSIFFLAGS: {
         int up = (r.u.flags & IFF_UP) != 0;
         if (isip) net_lwip_set_up(up);
+        else if (iface->loopback) return up ? 0 : -95;
         else if (up) return -95;
         return 0;
     }
@@ -972,7 +1101,7 @@ int netdev_ioctl(uint32_t req, void *uarg) {
         return (uint32_t)r.u.ivalue == iface->mtu ? 0 : -22;
     case SIOCGIFHWADDR:
         memset(&r.u, 0, sizeof(r.u));
-        r.u.sa.family = ARPHRD_ETHER;
+        r.u.sa.family = iface->loopback ? ARPHRD_LOOPBACK : ARPHRD_ETHER;
         memcpy(r.u.sa.data, iface->mac, 6);
         break;
     case SIOCGIFINDEX:
@@ -1002,6 +1131,26 @@ uint32_t netdev_proc_dev(char *buf, uint32_t cap) {
             "%8u %7u    0    0    0     0       0          0\n",
             f->name, f->rx_bytes, f->rx_packets, f->rx_dropped,
             f->tx_bytes, f->tx_packets);
+    }
+    return (uint32_t)pos < cap ? (uint32_t)pos : cap;
+}
+
+/* /proc/net/if_inet6: "address ifindex prefixlen scope flags name", the
+ * address as 32 hex digits (Linux if6_seq_show). */
+uint32_t netdev_proc_if_inet6(char *buf, uint32_t cap) {
+    int pos = 0;
+    for (int k = 0; k < net_interface_count() && (uint32_t)pos < cap; k++) {
+        netif_t *iface = net_get_interface(k);
+        net_ip6_info_t a[6];
+        int n = net_lwip_ip6_addrs(iface, a, 6);
+        for (int i = 0; i < n && (uint32_t)pos < cap; i++) {
+            for (int j = 0; j < 16; j++)
+                pos += snprintf(buf + pos, cap - (uint32_t)pos, "%02x", a[i].addr[j]);
+            uint32_t f = (a[i].dynamic ? 0 : IFA_F_PERMANENT) |
+                         (a[i].tentative ? IFA_F_TENTATIVE : 0);
+            pos += snprintf(buf + pos, cap - (uint32_t)pos, " %02x %02x %02x %02x %8s\n",
+                            netdev_index(iface), a[i].plen, a[i].scope, f, iface->name);
+        }
     }
     return (uint32_t)pos < cap ? (uint32_t)pos : cap;
 }

@@ -55,7 +55,7 @@ USER_BINS := $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
 	     $(TESTFILES)/mkfifo $(TESTFILES)/ln $(TESTFILES)/readlink \
 	     $(TESTFILES)/sysprobe $(TESTFILES)/fcprobe $(TESTFILES)/lspci $(TESTFILES)/ifconfig \
 	     $(TESTFILES)/diskprobe $(TESTFILES)/fsprobe $(TESTFILES)/mntprobe $(TESTFILES)/maeros-install $(TESTFILES)/respawnprobe $(TESTFILES)/heapprobe \
-	     $(TESTFILES)/sockprobe $(TESTFILES)/srvprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget $(TESTFILES)/getent \
+	     $(TESTFILES)/sockprobe $(TESTFILES)/srvprobe $(TESTFILES)/net6probe $(TESTFILES)/netprobe $(TESTFILES)/httpget $(TESTFILES)/getent \
 	     $(TESTFILES)/randprobe $(TESTFILES)/sysmiscprobe $(TESTFILES)/abi2probe $(TESTFILES)/sigexecprobe $(TESTFILES)/timerprobe $(TESTFILES)/symprobe $(TESTFILES)/sigshareprobe \
 	     $(TESTFILES)/fbtest $(TESTFILES)/evtest $(TESTFILES)/mousetest \
 	     $(TESTFILES)/polltest $(TESTFILES)/ptytest $(TESTFILES)/cttytest \
@@ -500,6 +500,13 @@ srvprobe/srvprobe.o: srvprobe/srvprobe.c
 
 $(TESTFILES)/srvprobe: $(CRT0_OBJ) srvprobe/srvprobe.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) srvprobe/srvprobe.o libc/libc.a
+
+# net6probe (loopback, IPv6, dual-stack and ping sockets; tools/smoke_net6.py)
+net6probe/net6probe.o: net6probe/net6probe.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TESTFILES)/net6probe: $(CRT0_OBJ) net6probe/net6probe.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) net6probe/net6probe.o libc/libc.a
 
 # netprobe
 netprobe/netprobe.o: netprobe/netprobe.c

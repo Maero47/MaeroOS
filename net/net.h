@@ -22,6 +22,7 @@ struct maero_netif {
      * mac=..."); both optional, set by the driver after net_register(). */
     const char *driver;
     int (*describe)(netif_t *iface, char *buf, uint32_t cap);
+    int loopback;          /* "lo": lwIP's loop netif, no driver */
     uint32_t tx_packets;
     uint32_t tx_bytes;
     uint32_t rx_packets;

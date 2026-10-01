@@ -20,6 +20,16 @@ static int read_netif(char *buf, int cap) {
     return n;
 }
 
+/* eth0's "txpkts=N", -1 when absent. */
+static long txpkts(const char *netif) {
+    const char *p = strstr(netif, "eth0: ");
+    p = p ? strstr(p, "txpkts=") : 0;
+    if (!p) return -1;
+    long v = 0;
+    for (p += 7; *p >= '0' && *p <= '9'; p++) v = v * 10 + (*p - '0');
+    return v;
+}
+
 int main(void) {
     char before[512];
     char after[512];
@@ -51,8 +61,9 @@ int main(void) {
 
     if (read_netif(after, sizeof(after)) < 0)
         return 1;
-    if (!strstr(after, "txpkts=1") && !strstr(after, "txpkts=2") &&
-        !strstr(after, "txpkts=3") && !strstr(after, "txpkts=4")) {
+    /* The diagnostic frame counts on eth0 (and so may IPv6 neighbour
+     * discovery meanwhile): the counter must have grown. */
+    if (txpkts(after) <= txpkts(before)) {
         printf("netprobe: tx counter did not advance\n%s", after);
         return 1;
     }

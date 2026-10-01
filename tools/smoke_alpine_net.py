@@ -13,6 +13,9 @@ ssh/ssh-keygen).  Inside `chroot /disk/alpine`:
     (addr flush/add, route add default ... metric) and writes resolv.conf;
     the kernel's own DHCP client steps aside;
   - `ping` over a raw ICMP socket;
+  - IPv6: `ip -6 addr` shows the SLAAC address, lo has 127.0.0.1 and ::1,
+    `ip -6 route` the RA's default route, ping to 127.0.0.1, ::1 and the
+    host's fec0::2 over raw ICMP/ICMPv6, and python3 TCP over [::1];
   - advisory locks: busybox `flock` contention (EWOULDBLOCK with -n, a
     blocking lock waits for the holder) and apk refusing to run while its
     database lock is held;
@@ -23,6 +26,7 @@ ssh/ssh-keygen).  Inside `chroot /disk/alpine`:
 
 No [SYSCALL] unimplemented line may appear.  The image is copied first.
 """
+import base64
 import os
 import selectors
 import shutil
@@ -149,6 +153,29 @@ def main():
         alpine("ifconfig eth0", "inet addr:10.0.2.15", "Mask:255.255.255.0",
                "HWaddr 52:54:00:12:34:56")
         alpine("route -n", "10.0.2.2", "UG")
+        # IPv6 (QEMU user-net's default, fec0::/64 by SLAAC) and lo, before
+        # udhcpc's script flushes eth0's addresses.
+        alpine("i=0; until ip -6 addr show dev eth0 | grep -q 'inet6 fec0'; do "
+               "i=$((i+1)); [ $i -lt 30 ] || exit 1; sleep 1; done")
+        alpine("ip -6 addr show dev eth0", "inet6 fec0::5054:ff:fe12:3456/64",
+               "inet6 fe80::5054:ff:fe12:3456/64 scope link")
+        alpine("ip addr show dev lo", "inet 127.0.0.1/8 scope host lo",
+               "inet6 ::1/128 scope host")
+        alpine("ip -6 route", "default via fe80::2 dev eth0")
+        alpine("ping -c 1 -W 5 127.0.0.1", "1 packets received")
+        alpine("ping -c 1 -W 5 ::1", "1 packets received")
+        alpine("ping -c 1 -W 5 fec0::2", "1 packets received")
+        # python3 sockets over [::1] and localhost (the script goes in as
+        # base64: alpine() quotes with '...').
+        py = ("import socket\n"
+              "s = socket.socket(socket.AF_INET6)\n"
+              "s.bind(('::1', 0)); s.listen(1)\n"
+              "c = socket.create_connection(('localhost', s.getsockname()[1]))\n"
+              "a = s.accept()[0]; c.sendall(b'v6')\n"
+              "print('PY6', a.recv(2), c.getpeername()[0])\n")
+        b64 = base64.b64encode(py.encode()).decode()
+        alpine(f"echo {b64} | base64 -d > /tmp/py6.py && python3 /tmp/py6.py",
+               "PY6 b'v6' ::1")
         # udhcpc over AF_PACKET; its script reconfigures eth0 through
         # rtnetlink and the kernel's DHCP client lets go.
         alpine("udhcpc -i eth0 -n -q -f", "lease of 10.0.2.15 obtained")

@@ -7,6 +7,12 @@
  * Outbound: firewall_check() is called from the socket layer on connect/
  *   sendto/bind, returning -EACCES to block (a clean, testable errno).
  *
+ * IPv6 (LWIP_HOOK_IP6_INPUT, firewall_check6): rules name IPv4 networks, so
+ * a rule with an address never matches an IPv6 packet, while rules for any
+ * address and the policies apply to both families.  ICMPv6 counts as
+ * "icmp"; neighbour discovery, router advertisements and MLD always pass,
+ * as DHCP does for IPv4, or SLAAC would stop working under "policy in drop".
+ *
  * Disabled by default — zero behaviour change until `fwctl enable`.
  */
 #include "firewall.h"
@@ -38,8 +44,9 @@ static int  policy_out    = FW_ALLOW;
 /* ── matching ───────────────────────────────────────────────────────────── */
 
 static int rule_matches(const fw_rule_t *r, int dir, int proto,
-                        uint32_t ip, uint16_t port) {
+                        uint32_t ip, uint16_t port, int v6) {
     if (!r->in_use) return 0;
+    if (v6 && r->mask) return 0;          /* an IPv4 network */
     if (r->dir != FW_ANYDIR && r->dir != dir) return 0;
     if (r->proto != FW_ANYPROTO && r->proto != proto) return 0;
     if (r->mask && (ip & r->mask) != (r->ip & r->mask)) return 0;
@@ -48,15 +55,19 @@ static int rule_matches(const fw_rule_t *r, int dir, int proto,
 }
 
 /* Returns FW_ALLOW or FW_DROP for a (dir,proto,ip,port) tuple. */
-static int fw_decide(int dir, int proto, uint32_t ip, uint16_t port) {
+static int fw_decide_af(int dir, int proto, uint32_t ip, uint16_t port, int v6) {
     if (!fw_enabled) return FW_ALLOW;
     for (int i = 0; i < FW_MAX_RULES; i++) {
-        if (rule_matches(&rules[i], dir, proto, ip, port)) {
+        if (rule_matches(&rules[i], dir, proto, ip, port, v6)) {
             rules[i].hits++;
             return rules[i].action;
         }
     }
     return (dir == FW_IN) ? policy_in : policy_out;
+}
+
+static int fw_decide(int dir, int proto, uint32_t ip, uint16_t port) {
+    return fw_decide_af(dir, proto, ip, port, 0);
 }
 
 /* ── outbound (socket layer) ────────────────────────────────────────────── */
@@ -65,12 +76,50 @@ int firewall_check(int dir, int proto, uint32_t remote_ip, uint16_t port) {
     return fw_decide(dir, proto, remote_ip, port) == FW_DROP ? -13 : 0;
 }
 
+int firewall_check6(int dir, int proto, uint16_t port) {
+    return fw_decide_af(dir, proto, 0, port, 1) == FW_DROP ? -13 : 0;
+}
+
+/* IPv6 inbound: the upper-layer protocol after the hop-by-hop, routing and
+ * destination-options headers (RFC 8200 4.1); a fragment or anything else
+ * is judged by the policy with port 0.  Returns 1 = consumed (dropped). */
+int firewall_ip6_input_hook(struct pbuf *p, struct netif *inp) {
+    if (!fw_enabled || !p || p->len < 40)
+        return 0;
+    if (inp && inp->name[0] == 'l' && inp->name[1] == 'o')
+        return 0;
+    const uint8_t *ip = (const uint8_t *)p->payload;
+    uint8_t nh = ip[6];
+    uint32_t off = 40;
+    for (int i = 0; i < 8 && (nh == 0 || nh == 43 || nh == 60); i++) {
+        if (p->len < off + 8) return 0;
+        nh = ip[off];
+        off += 8u + 8u * ip[off + 1];
+    }
+    int proto = nh == 58 ? FW_ICMP : nh;
+    uint16_t dport = 0;
+    if (nh == 58 && p->len >= off + 1) {
+        uint8_t t = ip[off];
+        /* MLD (130-132, 143), RS/RA/NS/NA/redirect (133-137). */
+        if ((t >= 130 && t <= 137) || t == 143) return 0;
+    } else if ((nh == FW_TCP || nh == FW_UDP) && p->len >= off + 4) {
+        dport = (uint16_t)((ip[off + 2] << 8) | ip[off + 3]);
+    }
+    if (fw_decide_af(FW_IN, proto, 0, dport, 1) == FW_DROP) {
+        pbuf_free(p);
+        return 1;
+    }
+    return 0;
+}
+
 /* ── inbound (lwIP hook) ────────────────────────────────────────────────── */
 /* Parse just enough of the IPv4 header to apply rules; on short/odd packets
  * fall back to the inbound policy.  Returns 1 = consumed (dropped). */
 int firewall_ip4_input_hook(struct pbuf *p, struct netif *inp) {
-    (void)inp;
     if (!fw_enabled || !p || p->len < 20)
+        return 0;
+    /* lo is always open (127.0.0.0/8 and our own addresses looped back). */
+    if (inp && inp->name[0] == 'l' && inp->name[1] == 'o')
         return 0;
 
     const uint8_t *ip = (const uint8_t *)p->payload;

@@ -253,6 +253,33 @@ static int vfs_write_user(vfs_node_t *n, uint32_t off, const char *ubuf, uint32_
 /* MSG_NOSIGNAL as seen by sock_send_user (net/socket.h has the other bits). */
 #define SOCK_MSG_NOSIGNAL 0x4000
 
+/* An AF_INET/AF_INET6 name from user memory: up to 28 bytes, the rest
+ * zero.  Linux wants at least sizeof(sockaddr_in) for AF_INET and
+ * SIN6_LEN_RFC2133 (24, no scope id) for AF_INET6, else EINVAL. */
+static int inet_name_in(const void *uaddr, uint32_t addrlen, net_sockaddr_t *k) {
+    __builtin_memset(k, 0, sizeof(*k));
+    if (!uaddr) return -14;
+    if ((int32_t)addrlen < 2) return -22;
+    uint32_t n = addrlen < sizeof(*k) ? addrlen : sizeof(*k);
+    if (!access_ok(uaddr, n) || copy_from_user(k, uaddr, n) < 0) return -14;
+    if (k->family == NET_AF_INET6 && addrlen < 24) return -22;
+    if (k->family != NET_AF_INET6 && addrlen < 16) return -22;
+    return 0;
+}
+
+/* A name out to user memory, Linux style: min(*ulen, size) bytes copied and
+ * the full size stored in *ulen. */
+static int inet_name_out(void *uaddr, uint32_t *ulen, const net_sockaddr_t *k) {
+    uint32_t klen, full = net_sockaddr_len(k->family);
+    if (!full) full = 16;
+    if (!ulen || copy_from_user(&klen, ulen, sizeof(klen)) < 0) return -14;
+    if ((int32_t)klen < 0) return -22;
+    if (klen > full) klen = full;
+    if (klen && copy_to_user(uaddr, k, klen) < 0) return -14;
+    if (copy_to_user(ulen, &full, sizeof(full)) < 0) return -14;
+    return 0;
+}
+
 /* One net_socket_recvfrom() into user `ubuf` (a datagram must arrive whole,
  * and a stream read may block, so exactly one call) — except that
  * MSG_WAITALL keeps reading bounce-buffer-sized pieces until `len` is filled
@@ -9291,12 +9318,10 @@ static int inet_msg(int call, uint32_t *kargs, proc_file_t *f) {
     uint32_t total = 0;
     for (int i = 0; i < niov; i++) total += iv[i].len;
 
-    net_sockaddr_in_t kaddr, *pa = NULL;
+    net_sockaddr_t kaddr, *pa = NULL;
     if (call == 16 && mh[0] && mh[1]) {
-        if (mh[1] < sizeof(kaddr)) { kfree(iv); return -22; }
-        if (copy_from_user(&kaddr, (void *)(uintptr_t)mh[0], sizeof(kaddr)) < 0) {
-            kfree(iv); return -14;
-        }
+        r = inet_name_in((void *)(uintptr_t)mh[0], mh[1], &kaddr);
+        if (r < 0) { kfree(iv); return r; }
         pa = &kaddr;
     }
 
@@ -9350,7 +9375,7 @@ static int inet_msg(int call, uint32_t *kargs, proc_file_t *f) {
          * tcp_recvmsg leaves msg_namelen 0). */
         uint32_t nl = 0, zero = 0;
         if (pa) {
-            nl = sizeof(kaddr);
+            nl = net_sockaddr_len(kaddr.family);
             uint32_t want = mh[1] < nl ? mh[1] : nl;
             if (want && copy_to_user((void *)(uintptr_t)mh[0], &kaddr, want) < 0) r = -14;
         }
@@ -9393,13 +9418,13 @@ static int inet_accept(proc_file_t *f, uint32_t *kargs, int flags) {
     if (r < 0)
         return r;
     if (kargs[1]) {
-        net_sockaddr_in_t pa;
+        net_sockaddr_t pa;
         if (net_socket_getname(ns, 1, &pa) < 0) {
             __builtin_memset(&pa, 0, sizeof(pa));
-            pa.family = 2;
+            pa.family = (uint16_t)net_socket_domain(ns);
         }
-        uint32_t c = klen < sizeof(pa) ? klen : sizeof(pa);
-        uint32_t full = sizeof(pa);
+        uint32_t full = net_sockaddr_len(pa.family);
+        uint32_t c = klen < full ? klen : full;
         if ((c && copy_to_user((void *)(uintptr_t)kargs[1], &pa, c) < 0) ||
             copy_to_user(ulen, &full, sizeof(full)) < 0) {
             net_socket_release(ns);
@@ -9699,14 +9724,10 @@ static int socketcall_core_inner(int call, uint32_t *kargs) {
     }
 
     if (call == 2 || call == 3) { /* bind/connect */
-        net_sockaddr_in_t *uaddr = (net_sockaddr_in_t *)(uintptr_t)kargs[1];
-        uint32_t addrlen = kargs[2];
-        if (addrlen < sizeof(net_sockaddr_in_t) ||
-            !access_ok(uaddr, sizeof(net_sockaddr_in_t)))
-            return -14;
-        net_sockaddr_in_t kaddr;
-        if (copy_from_user(&kaddr, uaddr, sizeof(kaddr)) < 0)
-            return -14;
+        net_sockaddr_t kaddr;
+        int ar = inet_name_in((void *)(uintptr_t)kargs[1], kargs[2], &kaddr);
+        if (ar < 0)
+            return ar;
         return (call == 2) ? net_socket_bind(f->socket, &kaddr)
                            : net_socket_connect(f->socket, &kaddr,
                                                 (f->flags & O_NONBLOCK) != 0);
@@ -9741,43 +9762,42 @@ static int socketcall_core_inner(int call, uint32_t *kargs) {
     if (call == 11) { /* sendto */
         const void *buf = (const void *)(uintptr_t)kargs[1];
         uint32_t len = kargs[2];
-        net_sockaddr_in_t *uaddr = (net_sockaddr_in_t *)(uintptr_t)kargs[4];
+        void *uaddr = (void *)(uintptr_t)kargs[4];
         uint32_t addrlen = kargs[5];
         if (!access_ok(buf, len))
             return -14;
         if (!uaddr)
             return sock_send_user(f->socket, buf, len, NULL, mflags);
-        if (addrlen < sizeof(net_sockaddr_in_t) ||
-            !access_ok(uaddr, sizeof(net_sockaddr_in_t)))
-            return -14;
-        net_sockaddr_in_t kaddr;
-        if (copy_from_user(&kaddr, uaddr, sizeof(kaddr)) < 0)
-            return -14;
+        net_sockaddr_t kaddr;
+        int ar = inet_name_in(uaddr, addrlen, &kaddr);
+        if (ar < 0)
+            return ar;
         return sock_send_user(f->socket, buf, len, &kaddr, mflags);
     }
 
     if (call == 12) { /* recvfrom */
         void *buf = (void *)(uintptr_t)kargs[1];
         uint32_t len = kargs[2];
-        net_sockaddr_in_t *uaddr = (net_sockaddr_in_t *)(uintptr_t)kargs[4];
+        void *uaddr = (void *)(uintptr_t)kargs[4];
         uint32_t *ulen = (uint32_t *)(uintptr_t)kargs[5];
-        net_sockaddr_in_t kaddr;
+        net_sockaddr_t kaddr;
         if (!access_ok(buf, len))
             return -14;
         if (uaddr) {
             uint32_t klen = 0;
-            if (!ulen || copy_from_user(&klen, ulen, sizeof(klen)) < 0 ||
-                klen < sizeof(net_sockaddr_in_t) ||
-                !access_ok(uaddr, sizeof(net_sockaddr_in_t)))
+            if (!ulen || copy_from_user(&klen, ulen, sizeof(klen)) < 0)
                 return -14;
+            if ((int32_t)klen < 0)
+                return -22;
         }
+        /* A stream read fills in no source: the name stays the family's
+         * wildcard. */
+        __builtin_memset(&kaddr, 0, sizeof(kaddr));
+        kaddr.family = (uint16_t)net_socket_domain(f->socket);
         int ret = sock_recv_user(f->socket, buf, len, uaddr ? &kaddr : NULL,
                                  mflags);
         if (ret >= 0 && uaddr) {
-            uint32_t klen = sizeof(net_sockaddr_in_t);
-            int cr = copy_to_user(uaddr, &kaddr, sizeof(kaddr));
-            if (cr < 0) return cr;
-            cr = copy_to_user(ulen, &klen, sizeof(klen));
+            int cr = inet_name_out(uaddr, ulen, &kaddr);
             if (cr < 0) return cr;
         }
         return ret;
@@ -9836,17 +9856,13 @@ static int socketcall_core_inner(int call, uint32_t *kargs) {
         void     *uaddr = (void *)(uintptr_t)kargs[1];
         uint32_t *ulen  = (uint32_t *)(uintptr_t)kargs[2];
         uint32_t  klen;
-        net_sockaddr_in_t kaddr;
+        net_sockaddr_t kaddr;
         if (!ulen || copy_from_user(&klen, ulen, sizeof(klen)) < 0) return -14;
         if ((int32_t)klen < 0) return -22;
         int r = net_socket_getname(f->socket, call == 7, &kaddr);
         if (r < 0) return r;
         /* Linux copies min(len, sizeof addr) and reports the full size. */
-        if (klen > sizeof(kaddr)) klen = sizeof(kaddr);
-        if (klen && copy_to_user(uaddr, &kaddr, klen) < 0) return -14;
-        klen = sizeof(kaddr);
-        if (copy_to_user(ulen, &klen, sizeof(klen)) < 0) return -14;
-        return 0;
+        return inet_name_out(uaddr, ulen, &kaddr);
     }
 
     if (call == 16 || call == 17)   /* sendmsg / recvmsg */

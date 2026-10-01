@@ -893,6 +893,8 @@ static uint32_t procfs_netif_read(vfs_node_t *n, uint32_t off, uint32_t len,
     for (int i = 0; i < net_interface_count(); i++) {
         netif_t *iface = net_get_interface(i);
         char tmp[256];       /* driver details run to ~200 bytes */
+        if (iface->loopback)
+            continue;             /* NICs only; lo is in /proc/net/dev */
         pappend(content, &pos, sizeof(content), iface->name);
         pappend(content, &pos, sizeof(content), ": ");
         pappend(content, &pos, sizeof(content),
@@ -1132,6 +1134,7 @@ static vfs_node_t *procfs_sys_finddir(vfs_node_t *node, const char *name) {
 static vfs_node_t proc_net_node;
 static vfs_node_t proc_net_dev_node;
 static vfs_node_t proc_net_route_node;
+static vfs_node_t proc_net_if_inet6_node;
 
 static uint32_t procfs_net_text_read(vfs_node_t *n, uint32_t off, uint32_t len,
                                      uint8_t *buf) {
@@ -1140,7 +1143,8 @@ static uint32_t procfs_net_text_read(vfs_node_t *n, uint32_t off, uint32_t len,
     if (!content) return 0;
     net_poll_all();
     uint32_t pos = n == &proc_net_dev_node ? netdev_proc_dev(content, cap)
-                                           : netdev_proc_route(content, cap);
+                 : n == &proc_net_if_inet6_node ? netdev_proc_if_inet6(content, cap)
+                 : netdev_proc_route(content, cap);
     uint32_t avail = 0;
     if (off < pos) {
         avail = pos - off;
@@ -1153,10 +1157,11 @@ static uint32_t procfs_net_text_read(vfs_node_t *n, uint32_t off, uint32_t len,
 
 static int procfs_net_readdir(vfs_node_t *node, uint32_t idx, vfs_dirent_t *out) {
     (void)node;
-    if (idx > 1) return -1;
-    out->ino  = idx ? 85 : 84;
+    static const char *const names[] = { "dev", "route", "if_inet6" };
+    if (idx > 2) return -1;
+    out->ino  = 84 + idx;
     out->type = VFS_FLAG_FILE;
-    strncpy(out->name, idx ? "route" : "dev", 255);
+    strncpy(out->name, names[idx], 255);
     out->name[255] = '\0';
     return 0;
 }
@@ -1165,6 +1170,7 @@ static vfs_node_t *procfs_net_finddir(vfs_node_t *node, const char *name) {
     (void)node;
     if (strcmp(name, "dev") == 0) return &proc_net_dev_node;
     if (strcmp(name, "route") == 0) return &proc_net_route_node;
+    if (strcmp(name, "if_inet6") == 0) return &proc_net_if_inet6_node;
     return NULL;
 }
 
@@ -1441,6 +1447,12 @@ vfs_node_t *procfs_mount(void) {
     proc_net_route_node.inode   = 85;
     proc_net_route_node.mask    = 0444;
     proc_net_route_node.read_fn = procfs_net_text_read;
+    memset(&proc_net_if_inet6_node, 0, sizeof(proc_net_if_inet6_node));
+    strncpy(proc_net_if_inet6_node.name, "if_inet6", 255);
+    proc_net_if_inet6_node.flags   = VFS_FLAG_FILE;
+    proc_net_if_inet6_node.inode   = 86;
+    proc_net_if_inet6_node.mask    = 0444;
+    proc_net_if_inet6_node.read_fn = procfs_net_text_read;
 
     memset(&proc_sys_node, 0, sizeof(proc_sys_node));
     strncpy(proc_sys_node.name, "sys", 255);

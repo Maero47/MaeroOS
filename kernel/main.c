@@ -314,9 +314,10 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     /* Kernel threads come after init, so init is pid 1 (ps -p 1, kill -1
      * semantics).  QEMU's default NIC is an e1000, so most boots have one. */
     acpi_start_thread();
-    /* Network bottom-half: keeps DHCP/TCP alive without userspace polling */
-    if (net_find_interface("eth0"))
-        proc_create_kthread(knetd, "knetd");
+    /* Network bottom-half: keeps DHCP/TCP alive without userspace polling.
+     * Always: lo needs lwIP's timers (retransmits, delayed ACKs, TIME_WAIT)
+     * even on a machine with no NIC. */
+    proc_create_kthread(knetd, "knetd");
     ac97_start_thread();
     hda_start_thread();
     xhci_start_thread();
