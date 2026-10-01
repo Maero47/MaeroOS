@@ -7,6 +7,7 @@
 #include "../lib/string.h"
 #include "../kernel/printk.h"
 #include "../arch/i686/cpu/pit.h"
+#include "../drivers/rtc.h"
 #include "../proc/scheduler.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -246,6 +247,7 @@ static int ext2_create(vfs_node_t *dir, const char *name, uint32_t flags);
 static int ext2_truncate(vfs_node_t *node, uint32_t new_size);
 static int ext2_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid,
                         uint32_t gid);
+static int ext2_settimes(vfs_node_t *node, uint32_t atime, uint32_t mtime);
 static int ext2_unlink(vfs_node_t *dir, const char *name);
 static int ext2_symlink(vfs_node_t *dir, const char *name, const char *target);
 static int ext2_rename(vfs_node_t *old_dir, const char *old_name,
@@ -254,8 +256,11 @@ static int ext2_free_block(uint32_t blk);
 
 /* ── Block I/O ────────────────────────────────────────────────────────────── */
 
+/* Wall-clock seconds: the RTC's boot time plus the uptime.  Files unpacked
+ * from archives (apk, tar) keep their real mtimes, so new files must not be
+ * stamped with the seconds since boot or they would look decades older. */
 static uint32_t ext2_now(void) {
-    return pit_ticks() / 100U;
+    return rtc_boot_epoch() + pit_ticks() / 100U;
 }
 
 /* Read-volume accounting.  The question this profiling round asks is whether
@@ -1715,6 +1720,7 @@ static void ext2_fill_node(vfs_node_t *node, const ext2_inode_t *inode) {
     }
 
     node->setattr_fn = ext2_setattr;
+    node->settimes_fn = ext2_settimes;
 }
 
 /* Return the node for inode `ino_num`, found as `name`, creating it on the
@@ -2160,6 +2166,19 @@ static int ext2_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid,
     inode.i_mode = (uint16_t)((inode.i_mode & EXT2_S_IFMT) | (mode & 0xFFF));
     inode.i_uid  = (uint16_t)uid;
     inode.i_gid  = (uint16_t)gid;
+    return ext2_write_inode(priv->ino, &inode);
+}
+
+/* Persist utimensat()'s atime/mtime; ctime becomes now, as on Linux. */
+static int ext2_settimes(vfs_node_t *node, uint32_t atime, uint32_t mtime) {
+    if (!g_mounted || !node || !node->private) return -1;
+    ext2_priv_t *priv = (ext2_priv_t *)node->private;
+    ext2_inode_t inode;
+    if (ext2_read_inode(priv->ino, &inode) < 0) return -1;
+    inode.i_atime = atime;
+    inode.i_mtime = mtime;
+    inode.i_ctime = ext2_now();
+    node->ctime = inode.i_ctime;
     return ext2_write_inode(priv->ino, &inode);
 }
 

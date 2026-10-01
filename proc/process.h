@@ -216,6 +216,11 @@ struct proc {
     /* Current working directory (absolute path, always starts with '/') */
     char             cwd[256];
 
+    /* chroot(2): the global path of this process's root directory, or "" when
+     * it is not chrooted.  cwd, fd paths and every path the process passes in
+     * are relative to it; vfs_lookup() maps them (fs/vfs.c). */
+    char             root[128];
+
     /* Next available address for anonymous mmap allocations */
     uint32_t         mmap_next;
 

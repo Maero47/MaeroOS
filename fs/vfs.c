@@ -2,6 +2,7 @@
 #include "tmpfs.h"
 #include "../lib/string.h"
 #include "../mm/heap.h"
+#include "../proc/process.h"
 #include <stddef.h>
 
 vfs_node_t *vfs_root = NULL;
@@ -133,6 +134,15 @@ int vfs_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid) {
     node->gid = gid;
     if (node->setattr_fn)
         return node->setattr_fn(node, node->mask, uid, gid);
+    return 0;
+}
+
+int vfs_settimes(vfs_node_t *node, uint32_t atime, uint32_t mtime) {
+    if (!node) return -2;
+    node->atime = atime;
+    node->mtime = mtime;
+    if (node->settimes_fn)
+        return node->settimes_fn(node, atime, mtime);
     return 0;
 }
 
@@ -276,12 +286,25 @@ static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
 }
 
 /*
- * Resolve an absolute path.  Paths outside the reserved mount points are tried
- * on the root overlay (the mounted disk) first and on vfs_root otherwise.  On
- * failure NULL is returned and *err (if given) says why: -ENOENT, -ELOOP past
- * VFS_MAXSYMLINKS links, or -ENAMETOOLONG.
+ * Paths a chrooted process still resolves globally: /dev and /proc are not
+ * bind-mounted into the new root, so they are passed through instead.
  */
-vfs_node_t *vfs_lookup(const char *path, int follow_final, int *err) {
+static int vfs_path_skips_chroot(const char *path) {
+    char first[256];
+    if (path_first_component(path, first) <= 0) return 0;
+    return strcmp(first, "dev") == 0 || strcmp(first, "proc") == 0;
+}
+
+/*
+ * Resolve an absolute path.  With `croot` set (a chrooted caller) the walk
+ * starts there, except under /dev and /proc; otherwise paths outside the
+ * reserved mount points are tried on the root overlay (the mounted disk)
+ * first and on vfs_root otherwise.  On failure NULL is returned and *err (if
+ * given) says why: -ENOENT, -ELOOP past VFS_MAXSYMLINKS links, or
+ * -ENAMETOOLONG.
+ */
+static vfs_node_t *vfs_lookup_in(vfs_node_t *croot, const char *path,
+                                 int follow_final, int *err) {
     char bufs[2][VFS_PATH_MAX];
     if (err) *err = -2;                                       /* -ENOENT */
     if (!path || path[0] != '/' || !vfs_root) return NULL;
@@ -295,13 +318,19 @@ vfs_node_t *vfs_lookup(const char *path, int follow_final, int *err) {
         int may_follow = links < VFS_MAXSYMLINKS;
         vfs_node_t *node = NULL;
         int r = WALK_MISS, e = -2, e2 = -2;
-        if (vfs_root_overlay && vfs_path_uses_root_overlay(pth))
-            r = vfs_walk(vfs_root_overlay, pth, follow_final, may_follow,
-                         alt, &node, &e);
-        if (r == WALK_MISS) {
-            r = vfs_walk(vfs_root, pth, follow_final, may_follow,
-                         alt, &node, &e2);
-            if (e == -2) e = e2;         /* report a loop over a plain miss */
+        if (croot && !vfs_path_skips_chroot(pth)) {
+            /* ".." at the top stays at croot, and an absolute symlink target
+             * comes back through here, so neither leaves the new root. */
+            r = vfs_walk(croot, pth, follow_final, may_follow, alt, &node, &e);
+        } else {
+            if (vfs_root_overlay && vfs_path_uses_root_overlay(pth))
+                r = vfs_walk(vfs_root_overlay, pth, follow_final, may_follow,
+                             alt, &node, &e);
+            if (r == WALK_MISS) {
+                r = vfs_walk(vfs_root, pth, follow_final, may_follow,
+                             alt, &node, &e2);
+                if (e == -2) e = e2;     /* report a loop over a plain miss */
+            }
         }
         if (r == WALK_FOUND) return node;
         if (r == WALK_MISS) {
@@ -311,6 +340,17 @@ vfs_node_t *vfs_lookup(const char *path, int follow_final, int *err) {
         links++;
         cur ^= 1;
     }
+}
+
+vfs_node_t *vfs_lookup(const char *path, int follow_final, int *err) {
+    struct proc *p = current_proc;
+    vfs_node_t *croot = NULL;
+    if (p && p->root[0]) {
+        /* The root is a global path (sys_chroot): resolve it unchrooted. */
+        croot = vfs_lookup_in(NULL, p->root, 1, err);
+        if (!croot) return NULL;
+    }
+    return vfs_lookup_in(croot, path, follow_final, err);
 }
 
 vfs_node_t *vfs_open(const char *path) {

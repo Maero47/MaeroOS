@@ -80,6 +80,9 @@ typedef struct vfs_node {
      * through vfs_rename(), after the permission checks. */
     int               (*rename_fn) (struct vfs_node *old_dir, const char *old_name,
                                     struct vfs_node *new_dir, const char *new_name);
+    /* Persist atime/mtime (utimensat); NULL = in-memory only. */
+    int               (*settimes_fn)(struct vfs_node *, uint32_t atime,
+                                     uint32_t mtime);
 
     /* ── initrd in-memory backing ────────────────────────────────────── */
     const uint8_t   *data;       /* file: pointer into initrd memory */
@@ -176,6 +179,9 @@ int vfs_access_check_groups(vfs_node_t *node, uint32_t uid, uint32_t gid,
 
 /* Update mode/uid/gid (in-memory + persisted via setattr_fn if present). */
 int vfs_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid);
+
+/* utimensat: set atime and mtime (a filesystem hook also sets ctime). */
+int vfs_settimes(vfs_node_t *node, uint32_t atime, uint32_t mtime);
 
 /*
  * vfs_mount — attach `fs_root` at `path` inside the current VFS tree.
