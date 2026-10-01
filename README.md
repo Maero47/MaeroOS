@@ -213,6 +213,15 @@ audio (`ac97.c`), Multiboot VBE framebuffer (`framebuffer.c`), VGA text (`vga.c`
 keyboard and mouse (`keyboard.c`, `mouse.c`), CMOS RTC (`rtc.c`) and 16550 serial
 (`serial.c`).
 
+USB (`drivers/usb/`): an xHCI host controller driver (`xhci.c`) whose kernel thread
+`kusbd` enumerates root-hub ports and USB 2.0 hubs (hot-plug included) and polls the
+event ring every tick; HID keyboards, mice and tablets (`usb_hid.c`: boot protocol, or a
+report-descriptor parser for absolute pointers) feed the same `/dev/input/event0` and
+`event1` as the PS/2 drivers; mass storage (`usb_msc.c`, bulk-only SCSI) appears as the
+raw block device `/dev/usbdisk0`. Not yet: USB 3 hubs, interrupts/MSI, and mounting a
+filesystem from the stick. Run it with `-device qemu-xhci -device usb-kbd -device
+usb-tablet` (and `-device usb-storage,drive=...`).
+
 ### Userland
 
 `userspace/` is about 39,500 lines across 228 source files, built with the same
@@ -539,13 +548,21 @@ about the same time.
 A new app becomes testable by calling `gui_trace("app", ...)` where its state changes,
 with click targets as window-relative points (surface point + `GUI_BODY_X`/`GUI_BODY_Y`).
 
+`make smoke-usb` (`tools/smoke_usb.py`, about 35 s) does the same with USB input only:
+a `qemu-xhci` with a `usb-kbd` and `usb-tablet` bound to the VGA display (so QMP
+`input-send-event` reaches them and never the PS/2 devices), and a `usb-hub` with a
+`usb-mouse` and a `usb-storage` stick behind it. It opens the Terminal and logs in
+(`doas login root`, both passwords typed on the USB keyboard), checks that tablet clicks
+land where sent and that the boot mouse moves the pointer, reads and writes the stick
+through `/dev/usbdisk0` (checksummed against the image file) and unplugs and replugs it.
+
 ### Continuous integration
 
 `make check` runs the suites that need nothing beyond a fresh clone: `smoke`,
 `smoke-cmds`, `smoke-toybox`, `smoke-disk`, `smoke-net`, `smoke-fw`, `smoke-dyn`,
 `smoke-dynlib`, `smoke-x`, `smoke-pkg` (which first builds `repo/` and, on a host
 without one, a repo signing key) and `smoke-gui` (which needs the ISO, so `check` builds
-it). It runs them one after another, writes each suite's
+it), and `smoke-usb`. It runs them one after another, writes each suite's
 console to `build/check/<suite>.log`, prints the tail of the log for any suite that
 fails, carries on with the rest and exits non-zero at the end. `CHECK_SUITES="smoke
 smoke-x" make check` runs a subset.
