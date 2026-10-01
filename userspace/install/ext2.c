@@ -222,16 +222,12 @@ void ext2_scan(const char *srcdir, const char **skip, int nskip,
 
 static uint64_t  g_base;           /* byte offset of block 0 on the disk */
 static uint32_t  g_blocks, g_groups, g_ipg, g_itb, g_gdtb, g_inodes;
-static uint8_t  *g_bmap;           /* whole-filesystem block bitmap */
-static uint8_t  *g_imap;           /* whole-filesystem inode bitmap */
 static uint8_t  *g_itab;           /* inodes 1..g_maxino */
 static uint32_t  g_maxino;
-static uint32_t  g_cursor;         /* next block to try */
+static uint32_t  g_cursor;         /* next block to allocate */
 static uint16_t *g_dirs;           /* directories per group */
 static uint64_t  g_written;
 
-static int bit(const uint8_t *m, uint32_t i) { return (m[i >> 3] >> (i & 7)) & 1; }
-static void set(uint8_t *m, uint32_t i) { m[i >> 3] |= (uint8_t)(1u << (i & 7)); }
 
 static int has_super(uint32_t g) {
     if (g <= 1) return 1;
@@ -250,10 +246,17 @@ static uint32_t group_len(uint32_t g) {
     return g_blocks - f < BPG ? g_blocks - f : BPG;
 }
 
+/* Blocks are handed out in order, skipping each group's metadata, so no
+ * bitmap is kept while copying: a block is in use iff it is metadata or lies
+ * below the cursor, and inode n is in use iff n <= g_maxino.  (A whole-disk
+ * bitmap would be 128 MiB for the largest root.) */
 static uint32_t alloc_block(void) {
-    while (g_cursor < g_blocks && bit(g_bmap, g_cursor)) g_cursor++;
-    if (g_cursor >= g_blocks) die("the root partition is full");
-    set(g_bmap, g_cursor);
+    for (;;) {
+        if (g_cursor >= g_blocks) die("the root partition is full");
+        uint32_t g = (g_cursor - 1) / BPG, off = (g_cursor - 1) % BPG;
+        if (off >= group_meta(g)) break;
+        g_cursor = group_first(g) + group_meta(g);
+    }
     return g_cursor++;
 }
 
@@ -295,7 +298,6 @@ static void inode_fill(const node_t *n, uint32_t links) {
     put32(p + 108, (uint32_t)(n->size >> 32));         /* i_size_high */
     put16(p + 120, n->uid >> 16);
     put16(p + 122, n->gid >> 16);
-    set(g_imap, n->ino - 1);
 }
 
 /* Block map of one file being written: data blocks are allocated in order,
@@ -529,16 +531,20 @@ static void write_super(uint32_t g, const uint8_t *sb, const uint8_t *gdt) {
     dev_write(g_base + (uint64_t)(group_first(g) + 1) * BS, gdt, (size_t)g_gdtb * BS);
 }
 
-void ext2_build(uint64_t start, uint64_t nsect, const char *label,
-                const uint8_t uuid[16]) {
-    g_base = start * 512;
+uint64_t ext2_max_sectors(void) {
+    return (uint64_t)EXT2_MAX_BLOCKS * (BS / 512);
+}
+
+/* Geometry for a filesystem of `nsect` sectors; fills the g_* globals. */
+static void geometry(uint64_t nsect) {
     uint64_t nb = nsect / 2;
-    if (nb > 0xFFFFFFFFull) nb = 0xFFFFFFFFull;
+    if (nb > EXT2_MAX_BLOCKS) nb = EXT2_MAX_BLOCKS;
     g_blocks = (uint32_t)nb;
-    g_groups = (g_blocks - 1 + BPG - 1) / BPG;
-    /* About one inode per 4 KiB, as mke2fs's default; at least enough for
-     * the copy and some room to grow. */
-    uint64_t want = (uint64_t)g_blocks / 4;
+    g_groups = (uint32_t)(((uint64_t)g_blocks - 1 + BPG - 1) / BPG);
+    /* One inode per 16 KiB (mke2fs's ratio for large filesystems keeps the
+     * inode tables, all of which are written, near 1% of the disk); at least
+     * enough for the copy and some room to grow. */
+    uint64_t want = (uint64_t)g_blocks / 16;
     if (want < (uint64_t)g_next_ino + 1024) want = (uint64_t)g_next_ino + 1024;
     for (;;) {
         g_ipg = (uint32_t)((want + g_groups - 1) / g_groups);
@@ -557,21 +563,32 @@ void ext2_build(uint64_t start, uint64_t nsect, const char *label,
     }
     g_inodes = g_ipg * g_groups;
     if (g_inodes < g_next_ino) die("the root partition is too small for the files");
+    /* Group 0 holds the superblock, the whole descriptor table, its bitmaps
+     * and inode table; past that the data and group 1's backup superblock
+     * would land on it.  EXT2_MAX_BLOCKS keeps this far from happening. */
+    if (group_meta(0) + 64 > BPG) die("internal: ext2 group 0 metadata does not fit");
+}
 
-    g_bmap = xcalloc((g_blocks + 7) / 8 + BPG / 8, 1);
-    g_imap = xcalloc((g_inodes + 7) / 8 + 1, 1);
+void ext2_geometry(uint64_t nsect, uint64_t *blocks, uint32_t *groups,
+                   uint32_t *inodes, uint32_t *meta0) {
+    geometry(nsect);
+    *blocks = g_blocks;
+    *groups = g_groups;
+    *inodes = g_inodes;
+    *meta0 = group_meta(0);
+}
+
+void ext2_build(uint64_t start, uint64_t nsect, const char *label,
+                const uint8_t uuid[16]) {
+    g_base = start * 512;
+    geometry(nsect);
+
     g_maxino = g_next_ino - 1;
     g_itab = xcalloc(g_maxino, ISZ);
     g_dirs = xcalloc(g_groups, sizeof(uint16_t));
     g_run  = xmalloc(RUN_MAX * BS);
     g_io   = xmalloc(IO_SIZE);
 
-    set(g_bmap, 0);                                        /* the boot block */
-    for (uint32_t g = 0; g < g_groups; g++) {
-        uint32_t f = group_first(g), m = group_meta(g);
-        for (uint32_t i = 0; i < m; i++) set(g_bmap, f + i);
-    }
-    for (uint32_t i = 0; i < FIRST_INO - 1; i++) set(g_imap, i);   /* 1..10 */
     g_cursor = 1;
 
     printf("  ext2: %u blocks of 1 KiB, %u groups, %u inodes\n",
@@ -591,12 +608,18 @@ void ext2_build(uint64_t start, uint64_t nsect, const char *label,
         uint32_t fb = 0, fi = 0;
         memset(blk, 0xFF, BS);
         for (uint32_t i = 0; i < len; i++) {
-            if (!bit(g_bmap, f + i)) { blk[i >> 3] &= (uint8_t)~(1u << (i & 7)); fb++; }
+            if (i >= group_meta(g) && f + i >= g_cursor) {
+                blk[i >> 3] &= (uint8_t)~(1u << (i & 7));
+                fb++;
+            }
         }
         dev_write(g_base + (uint64_t)bb * BS, blk, BS);
         memset(blk, 0xFF, BS);
         for (uint32_t i = 0; i < g_ipg; i++) {
-            if (!bit(g_imap, g * g_ipg + i)) { blk[i >> 3] &= (uint8_t)~(1u << (i & 7)); fi++; }
+            if (g * g_ipg + i + 1 > g_maxino) {
+                blk[i >> 3] &= (uint8_t)~(1u << (i & 7));
+                fi++;
+            }
         }
         dev_write(g_base + (uint64_t)(bb + 1) * BS, blk, BS);
         /* Inode table: the inodes we filled, zeros after them. */

@@ -336,11 +336,12 @@ static void limine_bios_install(const char *hdd_bin, uint64_t stage2_sector) {
 /* ── Main ────────────────────────────────────────────────────────────────── */
 
 static void usage(void) {
-    printf("usage: maeros-install [-y] [-l] [--source DIR] [--boot-dir DIR]\n"
+    printf("usage: maeros-install [-y] [-l] [-n] [--source DIR] [--boot-dir DIR]\n"
            "                      [--initrd FILE] [--esp-mib N] [/dev/DISK]\n"
            "  Installs the running system onto DISK (GPT: BIOS boot, EFI system,\n"
            "  ext2 root), bootable under BIOS and UEFI.  Everything on DISK is lost.\n"
-           "  -y  do not ask for confirmation    -l  list the disks and exit\n");
+           "  -y  do not ask for confirmation    -l  list the disks and exit\n"
+           "  -n  dry run: print the layout, write nothing\n");
 }
 
 static int ask(const char *q, char *buf, int len) {
@@ -354,12 +355,13 @@ static int ask(const char *q, char *buf, int len) {
 int main(int argc, char **argv) {
     const char *source = "/disk", *boot = "/boot", *initrd = "/dev/initrd";
     const char *target = NULL;
-    int yes = 0, list = 0;
+    int yes = 0, list = 0, dry = 0;
     uint64_t esp_mib = 0;
     g_tty = isatty(1);
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) yes = 1;
         else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--list") == 0) list = 1;
+        else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--dry-run") == 0) dry = 1;
         else if (strcmp(argv[i], "--source") == 0 && i + 1 < argc) source = argv[++i];
         else if (strcmp(argv[i], "--boot-dir") == 0 && i + 1 < argc) boot = argv[++i];
         else if (strcmp(argv[i], "--initrd") == 0 && i + 1 < argc) initrd = argv[++i];
@@ -400,6 +402,11 @@ int main(int argc, char **argv) {
                 g_disk_sect = disks[i].sectors;
             }
         if (!g_disk_sect) die("%s is not a whole disk (see maeros-install -l)", target);
+        /* The block layer counts sectors in 32 bits and saturates: a disk
+         * that shows 2 TiB may be larger, so its last sector (the backup GPT)
+         * is unknown. */
+        if (g_disk_sect >= 0xFFFFFFFEull)
+            die("%s is 2 TiB or larger; MaeroOS addresses disks up to 2 TiB only", target);
     }
 
     /* What goes on the ESP. */
@@ -469,7 +476,12 @@ int main(int argc, char **argv) {
     };
     parts[1].last = parts[1].first + esp_mib * MiB - 1;
     parts[2].first = parts[1].last + 1;
-    parts[2].last = g_disk_sect >= 34 ? ((g_disk_sect - 34 + 1) & ~(uint64_t)7) - 1 : 0;
+    parts[2].last = g_disk_sect >= 34 ? ((g_disk_sect - 34 + 1) & ~(uint64_t)2047) - 1 : 0;
+    /* The root is at most ext2_max_sectors() (1 TiB); the rest of a bigger
+     * disk is left unpartitioned. */
+    if (parts[2].last >= parts[2].first &&
+        parts[2].last - parts[2].first + 1 > ext2_max_sectors())
+        parts[2].last = parts[2].first + ext2_max_sectors() - 1;
     /* Metadata is under 4% of the root; 32 MiB of slack on top. */
     uint64_t root_need = need_blocks * 2 + need_blocks / 12 + (uint64_t)need_inodes / 4 + 32 * MiB;
     if (parts[2].last <= parts[2].first || parts[2].last - parts[2].first + 1 < root_need)
@@ -483,6 +495,18 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 3; i++)
         printf("  partition %d  %-13s %8llu MiB\n", i + 1, parts[i].name,
                (unsigned long long)((parts[i].last - parts[i].first + 1) / MiB));
+    uint64_t unpart = g_disk_sect - 34 - parts[2].last;
+    if (unpart >= MiB)
+        printf("  (%llu MiB at the end left unpartitioned)\n", (unsigned long long)(unpart / MiB));
+    if (dry) {
+        uint64_t b; uint32_t g, in, m0;
+        ext2_geometry(parts[2].last - parts[2].first + 1, &b, &g, &in, &m0);
+        printf("ext2: %llu blocks, %u groups, %u inodes, group 0 metadata %u of 8192 blocks\n"
+               "backup GPT at LBA %llu\nDry run: nothing written.\n",
+               (unsigned long long)b, (unsigned)g, (unsigned)in, (unsigned)m0,
+               (unsigned long long)(g_disk_sect - 1));
+        return 0;
+    }
     if (!yes) {
         if (ask("\nEVERYTHING on this disk will be erased. Type \"yes\" to continue: ",
                 line, sizeof(line)) < 0 || strcmp(line, "yes") != 0) {

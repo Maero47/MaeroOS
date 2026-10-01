@@ -7,7 +7,11 @@
              opens a Terminal running `sudo maeros-install`; it takes the
              password, the disk name sdb and "no", and cancels (screenshot
              gui-cancelled.png; no maeros-install left running).  As root on
-             the serial console: `maeros-install -l` lists both and marks sda in use,
+             the serial console (with a sparse 3 TiB sdc attached too):
+             `maeros-install -y /dev/sdc` is refused (the block layer's
+             32-bit sector count saturates, so its end is unknown),
+             `maeros-install -n /dev/sdb` prints the layout and writes
+             nothing, `maeros-install -l` lists the disks and marks sda in use,
              `maeros-install -y /dev/sda` is refused, `maeros-install -y
              /dev/sdb` installs; then poweroff.
    host      the target's GPT verifies (sgdisk -v), its root partition is
@@ -123,11 +127,16 @@ def live_install(accel):
     prepare_disk(live)
     with open(TARGET, "wb") as f:
         f.truncate(TARGET_SIZE)
+    huge = os.path.join(OUT, "huge.img")         # sparse: nothing is written
+    with open(huge, "wb") as f:
+        f.truncate(3 << 40)
     cmd = ["qemu-system-i386", "-M", "q35", "-accel", accel, "-m", "1024M",
            "-drive", f"file={live},format=raw,if=none,id=live",
            "-device", "ide-hd,drive=live,bus=ide.0",
            "-drive", f"file={TARGET},format=raw,if=none,id=target",
            "-device", "ide-hd,drive=target,bus=ide.1",
+           "-drive", f"file={huge},format=raw,if=none,id=huge",
+           "-device", "ide-hd,drive=huge,bus=ide.3",
            "-drive", f"file={ISO},format=raw,if=none,id=cd,media=cdrom,readonly=on",
            "-device", "ide-cd,drive=cd,bus=ide.2", "-boot", "d"]
     out, sockdir, con, qmp = start_qemu("live", cmd)
@@ -141,6 +150,15 @@ def live_install(accel):
         refused = con.run("maeros-install -y /dev/sda; echo rc=$?", timeout=30)
         if "mounted filesystem" not in refused or "rc=1" not in refused:
             raise AssertionError(f"installing over the live disk was not refused:\n{refused}")
+        big = con.run("maeros-install -y /dev/sdc; echo rc=$?", timeout=30)
+        if "2 TiB or larger" not in big or "rc=1" not in big:
+            raise AssertionError(f"a 3 TiB disk (saturated size) was not refused:\n{big}")
+        dry = con.run("maeros-install -n /dev/sdb; echo rc=$?", timeout=60)
+        if "Dry run: nothing written." not in dry or "rc=0" not in dry:
+            raise AssertionError(f"maeros-install -n failed:\n{dry}")
+        with open(TARGET, "rb") as f:
+            if f.read(1 << 20).strip(b"\0"):
+                raise AssertionError("maeros-install -n wrote to the target")
         t0 = time.time()
         log = con.run("maeros-install -y /dev/sdb; echo rc=$?", timeout=900)
         took = time.time() - t0

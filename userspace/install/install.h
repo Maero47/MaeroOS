@@ -51,6 +51,14 @@ void fat32_build(uint64_t start, uint64_t nsect, const char *label,
 /* Walk `srcdir` and report how many 1 KiB blocks and inodes a copy needs. */
 void ext2_scan(const char *srcdir, const char **skip, int nskip,
                uint64_t *blocks, uint32_t *inodes);
+/* The largest root: 2^30 blocks of 1 KiB (1 TiB).  The group descriptor
+ * table then takes 4096 of group 0's 8192 blocks; much past 1.9 TiB it would
+ * no longer fit there. */
+#define EXT2_MAX_BLOCKS (1u << 30)
+uint64_t ext2_max_sectors(void);
+/* The layout ext2_build() would use on `nsect` sectors (for --dry-run). */
+void ext2_geometry(uint64_t nsect, uint64_t *blocks, uint32_t *groups,
+                   uint32_t *inodes, uint32_t *meta0);
 /* Make an ext2 filesystem (1 KiB blocks, sparse_super, filetype) on
  * [start, start + nsect) holding a copy of the tree ext2_scan() walked. */
 void ext2_build(uint64_t start, uint64_t nsect, const char *label,

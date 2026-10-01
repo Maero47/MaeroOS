@@ -8,6 +8,7 @@ to attached, log in as root and run:
 ```sh
 maeros-install            # lists the disks, asks which one, asks you to type "yes"
 maeros-install -l         # just list the disks
+maeros-install -n /dev/sdb    # dry run: the layout, nothing written
 maeros-install -y /dev/sdb    # no questions (scripts, tools/smoke_install.py)
 ```
 
@@ -23,7 +24,7 @@ afterwards and boot from the disk. It boots under legacy BIOS (Limine's BIOS
 stages) and UEFI (x86_64 `BOOTX64.EFI` and IA32 `BOOTIA32.EFI`). Secure Boot must
 be off, because Limine is not signed.
 
-Options: `--source DIR` (default `/disk`), `--boot-dir DIR` (default `/boot`),
+Options: `-n` (dry run), `--source DIR` (default `/disk`), `--boot-dir DIR` (default `/boot`),
 `--initrd FILE` (default `/dev/initrd`), `--esp-mib N`.
 
 ## What it writes
@@ -82,7 +83,20 @@ and writes it with no changes.
 ### Limits
 
 * The disk must be at least about 128 MiB + 1 MiB + twice the size of `/disk`.
-  Disks up to 2 TiB work (the block layer uses 32-bit sector numbers).
+  Disks of 2 TiB or more are refused. The block layer counts sectors in 32
+  bits and saturates, so the real last sector, where the backup GPT goes, is
+  unknown.
+* The root filesystem is at most 1 TiB (2^30 blocks of 1 KiB). At that size the
+  group descriptor table takes 4096 of group 0's 8192 blocks; much past 1.9 TiB
+  it would no longer fit, and data and group 1's backup superblock would land
+  on group 0's metadata. The rest of a bigger disk is left unpartitioned (the
+  installer says how much). `maeros-install -n` prints the layout and the ext2
+  geometry and writes nothing.
+* The copy keeps no block or inode bitmap in memory: allocation is
+  sequential, so a block is in use when it is metadata or lies below the
+  cursor. Its memory use does not grow with the disk size. There is one
+  inode per 16 KiB, and all inode tables are written (about 1% of the
+  partition).
 * One root partition, no swap and no separate `/home`. Hidden files in the
   live session's `/disk` (shell history, settings) are copied too.
 * The desktop front end is the text installer in a Terminal, not a separate
