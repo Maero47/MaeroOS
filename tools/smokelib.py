@@ -23,6 +23,18 @@ PASSWORD_PROMPT = "Password: "
 _CPU = os.environ.get("SMOKE_CPU", "qemu32,+nx")
 QEMU_DISPLAY = ([] if os.environ.get("SMOKE_DISPLAY") else ["-display", "none"]) + \
                (["-cpu", _CPU] if _CPU else [])
+
+
+def qemu_args(qemu):
+    """QEMU_DISPLAY for a given QEMU binary: qemu-system-x86_64 runs 64-bit
+    firmware (OVMF x64), which a 32-bit CPU model cannot start, so it gets
+    its own default model (qemu64, which has NX) instead of SMOKE_CPU."""
+    if not qemu.endswith("x86_64") or "-cpu" not in QEMU_DISPLAY:
+        return list(QEMU_DISPLAY)
+    i = QEMU_DISPLAY.index("-cpu")
+    return QEMU_DISPLAY[:i] + QEMU_DISPLAY[i + 2:]
+
+
 # The same for suites that boot through a Makefile run target.
 MAKE_DISPLAY = [] if not QEMU_DISPLAY else ["QEMU_DISPLAY=" + " ".join(QEMU_DISPLAY)]
 

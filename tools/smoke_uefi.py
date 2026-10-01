@@ -136,7 +136,7 @@ def boot_one(name, qemu, code, vars_src, firmware, accel):
     qmp_path = os.path.join(sockdir, "qmp")
     cmd = [qemu, "-M", "pc", "-cdrom", ISO,
            "-drive", f"file={disk},format=raw,if=ide",
-           "-accel", accel, "-vga", "std", *smokelib.QEMU_DISPLAY,
+           "-accel", accel, "-vga", "std", *smokelib.qemu_args(qemu),
            # No -no-shutdown: the closing poweroff must make QEMU exit.
            "-serial", "stdio", "-m", "512M", "-no-reboot",
            "-qmp", f"unix:{qmp_path},server=on,wait=off"]
