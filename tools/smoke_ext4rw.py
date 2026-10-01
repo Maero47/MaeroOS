@@ -21,7 +21,8 @@ In the guest, with busybox, on both sdb and nvme0n1: create files and
 directories, a file of more than four extents (depth-1 tree) and a sparse
 one, a hole filled in the middle, a 1000-entry directory, renames (in and
 across directories, over an existing name), deletes, truncates (shrink and
-grow), a 50 MiB file (on sdb), changes in the htree directory; umount and
+grow), a 50 MiB file (on sdb), changes in the htree directories (leaf
+splits on sdb, a new index level on nvme0n1's 1 KiB blocks); umount and
 mount again and everything reads back.  sdc: -o ro is refused, a read-write
 mount replays the journal (hello.txt has the logged contents).  Then
 `poweroff` with sdb and nvme0n1 still mounted read-write.
@@ -140,6 +141,12 @@ def journal_csum_v3(img):
         f.write(j)
 
 
+def htree_levels(img, path):
+    """Indirect levels of an htree directory, None if it has no index."""
+    m = re.search(r"Indirect levels:\s*(\d+)", debugfs(img, f"htree {path}"))
+    return int(m.group(1)) if m else None
+
+
 def build_images():
     shutil.rmtree(OUT, ignore_errors=True)
     os.makedirs(OUT)
@@ -161,22 +168,26 @@ def build_images():
     a_img = os.path.join(OUT, "a.img")
     run(MKE2FS, "-q", "-F", "-t", "ext4", "-L", "ext4a", "-d", src, a_img, "320M")
     subprocess.run([E2FSCK, "-fyD", a_img], capture_output=True)
-    info["a_htree"] = "Index_Flag" in debugfs(a_img, "stat /big") or \
-        re.search(r"Flags: 0x[0-9a-f]*1[0-9a-f]{3}\b", debugfs(a_img, "stat /big")) is not None
+    info["a_htree"] = htree_levels(a_img, "/big") == 0
     info["a"] = {k: md5(v) for k, v in a_files.items() if "/" not in k}
 
     src = os.path.join(OUT, "src-b")
     os.makedirs(os.path.join(src, "dir"))
+    os.makedirs(os.path.join(src, "big2"))
     b_files = {"hello.txt": b"hello from ext4 nvme, no journal\n",
                "dir/inner.txt": b"inner\n",
                "delete-me.txt": b"bye\n"}
     for n, d in b_files.items():
         with open(os.path.join(src, n), "wb") as f:
             f.write(d)
+    for i in range(1500):
+        open(os.path.join(src, "big2", f"entry-{i:05d}-with-a-much-longer-name-for-1k"), "wb").close()
     b_img = os.path.join(OUT, "b.img")
     run(MKE2FS, "-q", "-F", "-t", "ext4", "-O", "^has_journal", "-b", "1024",
         "-L", "ext4b", "-d", src, b_img, "96M")
+    subprocess.run([E2FSCK, "-fyD", b_img], capture_output=True)
     info["b"] = {k: md5(v) for k, v in b_files.items()}
+    info["b_levels"] = htree_levels(b_img, "/big2")
 
     src = os.path.join(OUT, "src-c")
     os.makedirs(src)
@@ -319,6 +330,16 @@ def guest_tests(g, info):
                    "busybox mv /mnt/a/big/entry-00010-with-a-longer-name /mnt/a/big/renamed && "
                    "busybox ls /mnt/a/big | busybox wc -l && busybox cat /mnt/a/big/renamed")
     check(rc == 0 and "1200" in out.split() and "10" in out.split(), f"sdb htree dir changed ({out.strip()!r})")
+    # 600 more names: leaves split, the index stays
+    rc, out = g.sh("cd /mnt/a/big && for i in $(busybox seq 1 600); do "
+                   ": > added-$i-with-a-name-long-enough-to-fill-leaves; done && busybox ls | busybox wc -l",
+                   timeout=300.0)
+    check(rc == 0 and out.strip().endswith("1800"), f"sdb: 600 names added to the htree dir ({out.strip()[-80:]!r})")
+    # 2000 into a 1 KiB-block htree: the root fills and a second level appears
+    rc, out = g.sh("cd /mnt/b/big2 && for i in $(busybox seq 1 2000); do "
+                   ": > new-entry-$i-with-a-fairly-long-name-too; done && busybox rm entry-00003-with-a-much-longer-name-for-1k "
+                   "new-entry-77-with-a-fairly-long-name-too && busybox ls | busybox wc -l", timeout=600.0)
+    check(rc == 0 and out.strip().endswith("3498"), f"nvme0n1: 2000 names added to the htree dir ({out.strip()[-80:]!r})")
     rc, out = g.sh("busybox df -k /mnt/a /mnt/b")
     check(rc == 0, f"df ({out.strip()[-200:]!r})")
 
@@ -386,7 +407,15 @@ def host_checks(a_img, b_img, c_img, d_img, info):
         m = re.search(r"Blockcount:\s+(\d+)", st)
         check(m is not None and int(m.group(1)) <= 64, f"debugfs: {name} sparse.bin is sparse ({m and m.group(1)})")
     big = debugfs(a_img, "ls /big")
-    check("zz-new" in big and "renamed" in big and "entry-00007-" not in big, "debugfs: sdb htree dir changes")
+    check("zz-new" in big and "renamed" in big and "entry-00007-" not in big and "added-600-" in big,
+          "debugfs: sdb htree dir changes")
+    check(htree_levels(a_img, "/big") == 0, "debugfs: sdb /big is still an htree directory")
+    lv = htree_levels(b_img, "/big2")
+    check(info["b_levels"] == 0 and lv == 1,
+          f"debugfs: nvme0n1 /big2 is still an htree directory and grew a level ({info['b_levels']} -> {lv})")
+    big2 = debugfs(b_img, "ls /big2")
+    check("new-entry-2000-" in big2 and "new-entry-77-" not in big2 and "entry-00003-" not in big2,
+          "debugfs: nvme0n1 /big2 changes")
     check(debugfs_cat(c_img, "/hello.txt") == b"replayed content\n", "debugfs: sdc hello.txt replayed")
     check(debugfs_cat(c_img, "/after.txt") == b"after-replay\n", "debugfs: sdc after.txt")
 
@@ -452,6 +481,7 @@ def second_boot(d2_img):
 def main():
     a_img, b_img, c_img, d_img, info = build_images()
     check(info["a_htree"], "host: sdb /big is an htree directory (e2fsck -D)")
+    check(info["b_levels"] == 0, "host: nvme0n1 /big2 is a one-level htree directory")
     check(info["c_dirty"], "host: sdc needs recovery (debugfs jw)")
     accel = ["-accel", "kvm"] if os.access("/dev/kvm", os.R_OK | os.W_OK) else ["-accel", "tcg"]
     proc = subprocess.Popen(
@@ -488,6 +518,7 @@ def main():
         check(len(re.findall(r"\[EXT2\]\s+(sdb|nvme0n1): now read-only", text[at_poweroff:])) >= 2,
               "poweroff took both read-write ext4 mounts read-only")
         check("has no checksum tail" not in text, "no directory block without a checksum tail")
+        check("index dropped" not in text, "no htree index dropped")
         check("journal commit" not in text, "no failed journal commits")
     finally:
         if proc.poll() is None:

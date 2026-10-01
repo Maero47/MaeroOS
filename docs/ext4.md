@@ -117,7 +117,7 @@ ext2, ext3 and a typical ext4 as `mke2fs -t ext4` makes it today:
 | `metadata_csum`, `metadata_csum_seed` | crc32c of the superblock, group descriptors, block and inode bitmaps (in the descriptors), inodes, extent blocks and directory leaf blocks (the 12-byte tail), recomputed on every write |
 | `64bit` | 64-byte group descriptors; filesystems of 2^32 blocks or more are refused (i686: block numbers are 32-bit here) |
 | `flex_bg`, `uninit_bg` semantics | allocation follows the descriptors' bitmap and table locations; `BLOCK_UNINIT` bitmaps are built from the layout (and checked against the free count) on first use, `INODE_UNINIT` ones start empty, `bg_itable_unused` moves past each inode handed out |
-| `dir_index` | lookups are linear; changing an htree directory drops its index (as Linux's ext2 does), turning the index blocks into plain checksummed leaf blocks; new directories are linear |
+| `dir_index` | an htree directory keeps its index: a new name goes into the leaf its hash (legacy, half-MD4 or TEA, signed or unsigned, with the superblock's seed) selects; a full leaf splits at the median hash into a new block and the index gains an entry; a full root moves its entries into a new interior block (one more level), a full interior block splits; root and interior blocks get their dx tail checksum. Deeper than one interior level, the index is dropped instead (turning the index blocks into plain checksummed leaves). Lookups are linear; directories created here are linear |
 | `huge_file`, `extra_isize`, `dir_nlink`, `large_file`, `sparse_super`, `orphan_file` (empty), `resize_inode` | kept intact; new inodes get `i_extra_isize` and a creation time |
 | `has_journal` | jbd2, below |
 
@@ -169,8 +169,8 @@ for `mkfs.ext4` filesystems with and without a journal, a dirty journal and
 the simulated power loss. Both check the result on the host with
 `e2fsck -fn` and `debugfs`.
 
-Not done: htree insertion (directories made here stay linear, which Linux
-and e2fsck accept), the orphan file (a file unlinked while open is released
+Not done: making a directory indexed (directories made here stay linear,
+which Linux and e2fsck accept), htree lookups (linear), the orphan file (a file unlinked while open is released
 when it is closed; after a crash in between it is lost space until `e2fsck`),
 fast commits, and per-file `fsync` (it commits everything).
 

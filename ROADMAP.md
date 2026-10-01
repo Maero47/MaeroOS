@@ -37,7 +37,7 @@ What still stands between MaeroOS and daily use on real hardware:
 
 - **ext4 writes, the rest.** A default `mkfs.ext4` filesystem mounts read-write
   with jbd2 journaling (`make smoke-ext4rw`, `docs/ext4.md`); still missing are
-  htree insertion (new directories are linear), the orphan file, `meta_bg`,
+  indexing new directories (they stay linear), htree lookups, the orphan file, `meta_bg`,
   `inline_data`, `bigalloc`, quotas and filesystems past 2^32 blocks. The
   installed root is ext2.
 - **SMP scaling.** Replace the single Big Kernel Lock with finer locking.
