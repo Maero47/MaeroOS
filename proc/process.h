@@ -77,6 +77,7 @@ void            fdtable_put(struct proc *p);    /* decref; release fds + free at
 void fd_retain(proc_file_t *f);
 void fd_copy(proc_file_t *dst, proc_file_t *src);   /* dup: fid + copy + retain */
 void fd_release(proc_file_t *f);
+uint32_t fd_new_fid(void);                          /* a fresh open-file identity */
 
 /* SCM_RIGHTS fd-passing over AF_UNIX sockets (defined in usocket.c). */
 #define SCM_MAX_FDS 16

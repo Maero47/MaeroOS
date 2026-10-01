@@ -137,7 +137,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-ext4 smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine disk-alpine repo repo-serve start resolutions icons
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-ext4 smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-alpine-net disk-alpine repo repo-serve start resolutions icons
 
 all: $(TARGET)
 
@@ -484,6 +484,12 @@ disk-alpine:
 
 smoke-alpine: $(TARGET) initrd disk-alpine
 	python3 tools/smoke_alpine.py
+
+# Alpine networking and sshd in the chroot (opt-in, like smoke-alpine): ip,
+# ifconfig, udhcpc, ping, flock and apk's lock, then openssh-server from the
+# offline repo and a host login through hostfwd.  Needs ssh on the host.
+smoke-alpine-net: $(TARGET) initrd disk-alpine
+	python3 tools/smoke_alpine_net.py
 
 # Run with full interrupt + CPU-reset logging
 debug: $(TARGET)

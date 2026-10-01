@@ -4,6 +4,7 @@
 #include "../proc/scheduler.h"
 #include "lwip_glue.h"
 #include "socket.h"
+#include "xsock.h"
 #include "../lib/string.h"
 #include "../kernel/printk.h"
 
@@ -76,6 +77,8 @@ int net_send(netif_t *iface, const void *data, uint32_t len) {
         return -90;
 
     int ret = iface->send(iface, data, len);
+    if (ret >= 0)
+        packet_deliver(iface, (const uint8_t *)data, len, 1);
     if (ret >= 0) {
         iface->tx_packets++;
         iface->tx_bytes += len;
@@ -94,6 +97,7 @@ void net_receive_ethernet(netif_t *iface, const void *data, uint32_t len) {
 
     iface->rx_packets++;
     iface->rx_bytes += len;
+    packet_deliver(iface, (const uint8_t *)data, len, 0);
     net_lwip_input(iface, data, len);
 }
 

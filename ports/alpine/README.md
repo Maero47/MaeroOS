@@ -125,13 +125,87 @@ passes on Linux and on MaeroOS:
 | `link` returned EPERM, `linkat` (303) was missing, and `st_nlink` was always 1 | packages that ship hard links could not be installed in the guest (apk-tools 3 links files) | p37 |
 | `sync` (36) and `syncfs` (344) missing | apk-tools 3 syncs after a commit | p38 |
 | `splice` (313) missing | coreutils 9.11 `cat` (Alpine 3.24) splices on pipes and logged ENOSYS. It now gets EINVAL, as for an unspliceable pair on Linux, and falls back to read/write | p39 |
+| `flock` (143) and `fcntl` locks succeeded without excluding anyone | two apk instances were not kept apart | p40 |
+| `renameat2` (353) missing | busybox 1.37 (Alpine 3.24) `mv` logged ENOSYS | p41 |
+| `AF_NETLINK` was `EAFNOSUPPORT`, the `SIOC*` ioctls `ENOTTY`, no `/proc/net/dev` | `ip`, `ifconfig`, `udhcpc` could not see eth0 | p42 |
+
+## Networking and sshd
+
+    make smoke-alpine-net         # needs ssh/ssh-keygen on the host
+
+Inside the chroot the network tools work as on Linux, against the kernel's
+own interface table and lwIP's configuration of eth0:
+
+- **rtnetlink** (`net/netlink.c`): `AF_NETLINK`/`NETLINK_ROUTE` answers
+  `RTM_GETLINK`, `RTM_GETADDR` and `RTM_GETROUTE` dumps (and single
+  `GETLINK`, `ip route get`). `RTM_NEWADDR`/`DELADDR` set or clear eth0's
+  address, `RTM_NEWROUTE`/`DELROUTE` the default route (with its metric),
+  `RTM_NEWLINK`/`SETLINK` `IFF_UP`. lwIP holds one IPv4 address per
+  interface and routes only through the connected subnet and one default
+  gateway, so a second address replaces the first and a route to another
+  prefix is `EOPNOTSUPP` rather than accepted and dropped. Multicast groups
+  can be joined, but no change notifications are sent (`ip monitor` stays
+  quiet).
+- **ioctls**: `SIOCGIFCONF`, `SIOCGIF{FLAGS,ADDR,NETMASK,BRDADDR,MTU,HWADDR,
+  INDEX,NAME,TXQLEN,MAP,METRIC}`, `SIOCSIF{FLAGS,ADDR,NETMASK}` and
+  `SIOCADDRT`/`SIOCDELRT` (default route) on any socket; `/proc/net/dev`
+  and `/proc/net/route`. busybox `ifconfig` and `route` use these.
+- **AF_PACKET** (`net/rawsock.c`): `SOCK_RAW` and `SOCK_DGRAM` packet
+  sockets get a copy of every frame before lwIP sees it (`ETH_P_ALL` ones
+  also the frames sent), and send frames straight to the NIC. Classic BPF
+  filters (`SO_ATTACH_FILTER`) run as on Linux. `AF_INET` `SOCK_RAW` sits on
+  lwIP's raw API (`ping`; udhcpc's interface probe). Both need root.
+- **udhcpc**: `udhcpc -i eth0 -n -q` talks DHCP over `AF_PACKET`, and the
+  Alpine script (`/usr/share/udhcpc/default.script`) flushes and re-adds
+  the address and default route through rtnetlink and writes the chroot's
+  `/etc/resolv.conf`. The first time eth0 is configured by hand (here, the
+  script's flush) the kernel's DHCP client steps aside without a DHCPRELEASE
+  (`[NET] eth0 configured by hand; kernel DHCP client stopped` in
+  `/proc/kmsg`), so its renewals never fight the userland client. Without
+  udhcpc, the kernel's lease stays in charge; both give the same address on
+  QEMU user networking.
+- **Locks** (`proc/flock.c`): `flock(2)` locks belong to the open file
+  description, `fcntl` `F_SETLK`/`F_SETLKW`/`F_GETLK` record locks to the
+  descriptor table (Linux's `current->files`), `F_OFD_*` locks to the
+  description. Conflicts answer `EWOULDBLOCK`/`EAGAIN`, the waiting forms
+  sleep until the holder unlocks (`EINTR` on a signal), and close and exit
+  release them. apk now really keeps a second apk out: "Unable to lock
+  database". There is no deadlock detection (`EDEADLK`) for `F_SETLKW`.
+
+`openssh-server` and `openssh-server-common` are in the offline repo (pinned
+in both lock files), so `apk add openssh-server` works in the guest without
+a network. The smoke then runs `ssh-keygen -A`, puts a throwaway ed25519 key
+from the host in `/root/.ssh/authorized_keys`, starts `/usr/sbin/sshd`, and
+logs in through QEMU `hostfwd` (`ssh -p <port> root@127.0.0.1`): `true`, a
+command with output, and an interactive session with a pty (`ssh -tt`).
+
+To do it by hand:
+
+    qemu-system-i386 -kernel kernel.elf -initrd initrd.tar \
+        -drive file=disk-alpine.img,format=raw,index=0,media=disk \
+        -netdev user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22 \
+        -device e1000,netdev=n0 -serial stdio -m 1024M
+    # in the guest, as root:
+    toybox chroot /disk/alpine /bin/sh -l
+    apk add openssh-server && ssh-keygen -A
+    mkdir -p /root/.ssh && echo 'ssh-ed25519 AAAA...' > /root/.ssh/authorized_keys
+    /usr/sbin/sshd
+    # on the host:
+    ssh -p 2222 root@127.0.0.1
+
+sshd needed three kernel fixes besides the above: `getsockopt(IP_OPTIONS)`
+returned four zero bytes, which sshd-session reads as IP options and drops
+the connection for; `readlink("/proc/self/fd/N")` was `EINVAL`, so musl's
+`ttyname()` failed and sshd refused the pty it had allocated; and `vfork`
+(190), which busybox uses to run udhcpc's script, was missing.
 
 ## Next steps
 
-- **flock is still advisory-only.** `flock()` succeeds without excluding
-  anyone, so two apk instances running at once are not kept apart. Real
-  semantics need a lock table keyed by inode, with owners released on
-  close and exit.
+- **sshd's "Failed to disconnect from controlling tty."** After `setsid()`
+  sshd checks that `open("/dev/tty")` fails; here `/dev/tty` is also the
+  serial console and opens anyway. Only the log line results.
+- **IPv6.** lwIP is built without it: sshd's `::` listener and
+  `ip -6` find nothing.
 - **Hard links on tmpfs.** `link` works on ext2 only; tmpfs answers EPERM
   because a tmpfs node lives in exactly one directory list.
 - **xattrs** are `EOPNOTSUPP` everywhere. apk 2 and 3 tolerate that for
