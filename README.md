@@ -50,7 +50,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | GLib, Cairo, Pango, GTK3 | `GLIB_OK` (v2.78), `CAIRO_OK rect_px=0xe69919`, `PANGO_OK`, `GTK_OK init`, `GTK_WINDOW_SHOWN`, `GTK_DRAWN` (needs probe binaries a fresh clone lacks, see Testing) | `make smoke-gtk` |
 | Intel HDA audio | on 2 CPUs, `tone` plays 1 kHz for 1.5 s and 2.5 kHz at 25 % mixer volume through `/dev/dsp`; QEMU's wav capture must hold each tone at its frequency, for about its length without dropouts, and the second one quieter | `make smoke-hda` |
 | ACPI (uACPI 6.1.0) | on QEMU's `pc` and `q35` machines the kernel finds the RSDP, loads the AML namespace (`[ACPI] ready`), `poweroff` ends QEMU through S5 (`\_PTS`, `\_S5`), `reboot` restarts it through the FADT reset register (q35) or 0xCF9 (pc, whose FADT has none), and the ACPI power button (`system_powerdown`) reaches init as SIGUSR2 and powers off | `make smoke-acpi` |
-| PC without legacy devices | `-M q35,i8042=off -smp 2`: no PS/2 controller (`[KBD]  no PS/2 controller`), `/disk` from `ahci0`, both CPUs from the MADT, the desktop's Terminal opened and typed into with a USB tablet and keyboard, and `doas poweroff` typed there makes QEMU exit through S5 | `make smoke-pc` |
+| PC without legacy devices | `-M q35,i8042=off -smp 2` with an ICH9 HDA: no PS/2 controller (`[KBD]  no PS/2 controller`), `/disk` from `ahci0`, both CPUs from the MADT, the desktop's Terminal opened and typed into with a USB tablet and keyboard, and `doas poweroff` typed there makes QEMU exit through S5 | `make smoke-pc` |
 | Firefox 115.15.0esr | `ff: Firefox painted` (the browser window, about 5 s after `firefox-bin` starts); with `--web`, a page served from the host (HTML, a CSS rule, a PNG) requested and its image on screen about 3 s after Enter (needs the Firefox tree, see `ports/firefox/`) | `make smoke-firefox`, `make smoke-firefox-web` |
 
 ### What does not work
@@ -575,7 +575,7 @@ land where sent and that the boot mouse moves the pointer, reads and writes the 
 through `/dev/usbdisk0` (checksummed against the image file) and unplugs and replugs it.
 
 `make smoke-pc` (`tools/smoke_pc.py`, about 15 s) boots a PC with no legacy devices:
-`-M q35,i8042=off -smp 2`, the disk on q35's AHCI controller, and a `usb-kbd` and
+`-M q35,i8042=off -smp 2` with an ICH9 HDA codec, the disk on q35's AHCI controller, and a `usb-kbd` and
 `usb-tablet` on a `qemu-xhci` as the only input. It checks that the kernel skips the
 missing PS/2 controller, mounts `/disk` from `ahci0`, starts both CPUs from the MADT and
 enumerates the USB devices, opens the Terminal with them, and types `doas poweroff`

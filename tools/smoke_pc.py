@@ -5,12 +5,14 @@ Boots the GRUB ISO on `-M q35,i8042=off -smp 2`: the disk is on q35's
 built-in ICH9 AHCI controller (no IDE), there is no 8042 PS/2 controller at
 all, and the only keyboard and pointer are a usb-kbd and a usb-tablet on a
 qemu-xhci controller.  The drivers from the acpi, ahci and xhci work meet
-here on one boot:
+here on one boot, with an ICH9 HDA codec as on a desktop board:
 
   - the kernel finds no PS/2 controller and carries on (the 8042 drain loops
     used to spin for good when the status port floats to 0xFF);
   - /disk is mounted from ahci0, no ATA drive is present;
   - uACPI comes up, the second CPU is started from the MADT;
+  - the xHCI, AHCI, e1000 (q35's default NIC, an 82574) and ICH9 HDA
+    register BARs all get their windows from mm/mmio.c;
   - the USB keyboard and tablet are enumerated, the desktop starts, and the
     Terminal is opened and used with them (tablet clicks land where sent);
   - in that Terminal, `doas poweroff` (the password typed on the USB
@@ -54,9 +56,13 @@ class PcSmoke(GuiSmoke):
                        "[BOOT] Launching /disk/init",
                        "[ACPI] ready",
                        f"[SMP]  {CPUS} CPU(s) listed in the MADT",
-                       f"[SMP]  {CPUS} CPU(s) online"):
+                       f"[SMP]  {CPUS} CPU(s) online",
+                       "[HDA] controller 8086:293e",
+                       "[E1000] 8086:10d3"):
             if needle not in text:
                 raise AssertionError(f"boot log lacks {needle!r}")
+        if "[MMIO] window full" in text:
+            raise AssertionError("the MMIO window ran out")
         for kind in ("keyboard", "pointer"):
             if not re.search(r"\[USB\] port [\d.]+: \S+ \S+ speed, slot \d+: "
                              r"HID %s " % kind, text):
@@ -128,6 +134,8 @@ def main():
            *smokelib.QEMU_DISPLAY,
            "-serial", "stdio", "-m", "512M", "-no-reboot",
            "-device", "qemu-xhci,id=xhci",
+           "-audiodev", "none,id=snd", "-device", "ich9-intel-hda",
+           "-device", "hda-duplex,audiodev=snd",
            "-device", f"usb-kbd,id={KBD},display={DISPLAY},bus=xhci.0,port=1",
            "-device", f"usb-tablet,id={TABLET},display={DISPLAY},bus=xhci.0,"
                       "port=2",
