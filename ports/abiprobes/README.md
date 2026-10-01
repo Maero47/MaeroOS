@@ -57,6 +57,9 @@ regression tests for the fixes in audit section 5.
 | P37 | `p37_link.c`                | `link`/`linkat` on ext2, `st_nlink` (apk-tools 3, packages with hard links) | — |
 | P38 | `p38_sync.c`                | `sync`/`syncfs` (apk-tools 3) | — |
 | P39 | `p39_splice.c`              | `splice` moves bytes or answers `EINVAL`, never `ENOSYS` (coreutils 9.8+ `cat`) | — |
+| P40 | `p40_flock.c`               | `flock` and `fcntl` record locks exclude, wait and go away on close (apk's database lock) | — |
+| P41 | `p41_renameat2.c`           | `renameat2` with flags 0 and `RENAME_NOREPLACE` (busybox 1.37 in Alpine 3.24) | — |
+| P42 | `p42_netlink.c`             | rtnetlink `RTM_GETLINK` dump and error ack, `SIOCGIFINDEX`/`SIOCGIFNAME`/`SIOCGIFCONF` agree (busybox `ip`, `ifconfig`, udhcpc) | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the
