@@ -649,7 +649,9 @@ static int ext2_update_super_free_counts(ext2_fs_t *fs, int block_delta, int ino
         sb->s_free_inodes_count -= (uint32_t)(-inode_delta);
     else
         sb->s_free_inodes_count += (uint32_t)inode_delta;
-    return ext2_dev_write(fs, fs->st.lba_offset + 2, 4, sb_buf);
+    /* The superblock's 1024 bytes only: with 1 KiB blocks the next two
+     * sectors are the group descriptors, which may have changed meanwhile. */
+    return ext2_dev_write(fs, fs->st.lba_offset + 2, 2, sb_buf);
 }
 
 /* ── Inode reading ────────────────────────────────────────────────────────── */
@@ -2563,7 +2565,7 @@ static int ext2_sb_mark(ext2_fs_t *fs, int mounting) {
         sb->s_wtime = ext2_now();
         if (fs->was_clean) sb->s_state |= EXT2_VALID_FS;
     }
-    return ext2_dev_write(fs, fs->st.lba_offset + 2, 4, sb_buf);
+    return ext2_dev_write(fs, fs->st.lba_offset + 2, 2, sb_buf);   /* see above */
 }
 
 /* Check the superblock in `sb_buf` against the device and fill fs->st.

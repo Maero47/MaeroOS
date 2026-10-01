@@ -80,8 +80,7 @@ static int mount_block(const char *source, const char *target, const char *fstyp
             if (r < 0) ext2_release(e2);
             return r;
         }
-        if (want_rw)
-            return (r == -22 || r == -12 || r == -5) ? r : -30;  /* -EROFS */
+        if (want_rw) return r == -12 ? r : -30;               /* -EROFS */
     }
 
     ext4_fs_t *fs;

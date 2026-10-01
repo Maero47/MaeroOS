@@ -17,8 +17,8 @@ and checks, with busybox:
   * create, write (into double-indirect blocks), append, mkdir, symlink,
     rename within and across directories, unlink, rmdir, a copy and a move
     between the two mounts (EXDEV -> copy), changes in the htree directory
-  * the same device a second time is EBUSY; umount with a file open is
-    EBUSY; remount,ro refuses writes and remount,rw allows them again
+  * the same device a second time is EBUSY; raw /dev writes to it (or its
+    disk) are EBUSY; umount with a file open is EBUSY; remount,ro refuses writes and remount,rw allows them again
   * umount, mount again: everything written is there
   * needs_recovery is refused read-write and read-only alike
   * /disk reads and writes as before
@@ -229,6 +229,10 @@ def guest_tests(g, files):
     # ── EBUSY cases, remount ─────────────────────────────────────────────
     rc, out = g.sh("busybox mount -t ext2 /dev/sdb1 /mnt/c")
     check(rc != 0 and "busy" in out.lower(), f"same device twice: EBUSY ({out.strip()!r})")
+    rc, out = g.sh("busybox dd if=/dev/zero of=/dev/sdb1 bs=512 count=1 seek=32700 conv=notrunc")
+    check(rc != 0 and "busy" in out.lower(), f"raw write to the mounted /dev/sdb1: EBUSY ({out.strip()!r})")
+    rc, out = g.sh("busybox dd if=/dev/zero of=/dev/sdb bs=512 count=1 seek=34748 conv=notrunc")
+    check(rc != 0 and "busy" in out.lower(), f"raw write to its disk /dev/sdb: EBUSY ({out.strip()!r})")
     rc, out = g.sh("exec 3</mnt/a/seq.txt; busybox umount /mnt/a")
     check(rc != 0 and "busy" in out.lower(), f"umount with an open file: EBUSY ({out.strip()!r})")
     rc, out = g.sh("busybox mount -o remount,ro /mnt/b && echo x > /mnt/b/ro-test")

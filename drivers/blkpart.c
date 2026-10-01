@@ -4,6 +4,7 @@
 #include "../lib/string.h"
 #include "../lib/printf.h"
 #include "../kernel/printk.h"
+#include "../fs/vfs.h"
 #include <stddef.h>
 
 /*
@@ -17,6 +18,22 @@ static blkpart_t *g_parts[BLKPART_MAX];
 static uint32_t   g_nparts;
 
 /* ── Raw sector I/O ─────────────────────────────────────────────────────── */
+
+/* A mount(2) filesystem sits on `bp`, or on a partition or disk overlapping
+ * it: its driver caches what it read and is not told about raw writes. */
+static int blkpart_mounted(const blkpart_t *bp) {
+    if (!vfs_mounts_active()) return 0;
+    for (uint32_t i = 0; i < g_nparts; i++) {
+        const blkpart_t *o = g_parts[i];
+        if (o->dev != bp->dev || o->start >= bp->start + bp->nsect ||
+            bp->start >= o->start + o->nsect)
+            continue;
+        char src[24];
+        snprintf(src, sizeof(src), "/dev/%s", o->name);
+        if (vfs_mount_has_fs_source(src)) return 1;
+    }
+    return 0;
+}
 
 int blkpart_read(blkpart_t *bp, uint32_t sector, uint32_t count, void *buf) {
     if (!bp || !count || count > 128) return -1;
@@ -40,6 +57,7 @@ int blkpart_rw(blkpart_t *bp, uint64_t off, uint8_t *buf, uint32_t len, int writ
     if ((uint64_t)len > size - off) len = (uint32_t)(size - off);
     /* The disk ext2 has mounted at /disk is never written behind its back. */
     if (write && blk_disk_busy(bp->dev)) return -16;       /* -EBUSY */
+    if (write && blkpart_mounted(bp)) return -16;          /* -EBUSY */
     uint8_t *sec = NULL;
     uint32_t done = 0;
     int err = 0;
