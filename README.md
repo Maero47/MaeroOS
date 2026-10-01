@@ -112,11 +112,14 @@ What is proven by the automated QEMU tests in `tools/`:
   device models only. There is no Wi-Fi, no Realtek r8169 or virtio device, no GPU
   acceleration (the desktop draws into the boot framebuffer), no ACPI sleep states
   (only S5 power-off), no USB 3 hubs, and xHCI is polled rather than interrupt-driven.
-- **ext4 is read-only.** `mount -t ext4` works, but the driver never writes: it
-  cannot replay or write the journal, so a read-write mount is refused with `EROFS`
-  and busybox `mount` falls back to read-only (`docs/ext4.md`). Writable: the boot
-  disk (`/disk`, ext2) and FAT volumes (`mount -t vfat`, `docs/vfat.md`). There is no
-  exFAT driver: an exFAT stick is recognised and refused.
+- **ext4 with its usual features is read-only.** The ext2 driver mounts ext2
+  read-write, and ext3/ext4 too when they use no incompatible feature and their
+  journal is empty (it writes them like ext2 and never uses the journal). A typical
+  ext4 (extents, `64bit`, `flex_bg`) or a filesystem that `needs_recovery` goes to the
+  read-only ext4 driver: a read-write mount is refused with `EROFS` and busybox
+  `mount` falls back to read-only (`docs/ext4.md`). FAT volumes are writable too
+  (`mount -t vfat`, `docs/vfat.md`). There is no exFAT driver: an exFAT stick is
+  recognised and refused.
 - **Missing Linux interfaces.** There is no SysV IPC and no utmp.
   `/proc/<pid>/` lists only `status` and `stat` and resolves `fd/N` links (the full
   set is under `/proc/self`), and

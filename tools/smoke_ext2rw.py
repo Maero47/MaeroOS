@@ -291,6 +291,15 @@ def guest_tests(g, files):
     check(rc == 0 and "disk-mark\nagain" in out, "/disk reads and writes after")
     check(disk_md5 is not None and md5_of(g, "/disk/busybox") == disk_md5, "/disk/busybox unchanged")
 
+    # ── left mounted read-write for poweroff ─────────────────────────────
+    # vfs_mounts_shutdown must take both read-only (superblocks clean) when
+    # init powers off with them still mounted; the host checks below.
+    rc, out = g.sh("busybox mount -t ext2 /dev/sdb1 /mnt/a && busybox mount -t ext3 /dev/nvme0n1 /mnt/b && "
+                   "echo at-poweroff > /mnt/a/at-poweroff.txt && echo at-poweroff > /mnt/b/at-poweroff.txt && "
+                   "busybox grep -E \" /mnt/(a|b) \" /proc/mounts")
+    check(rc == 0 and "/mnt/a ext2 rw" in out and "/mnt/b ext3 rw" in out,
+          f"sdb1 and nvme0n1 mounted read-write and written, left mounted for poweroff ({out.strip()!r})")
+
 
 def host_checks(a_img, a_fs, b_img, c_img, files):
     seq_md5 = md5(seq_text(SEQ_N))
@@ -329,9 +338,13 @@ def host_checks(a_img, a_fs, b_img, c_img, files):
     for name, img in (("sdb1", part), ("nvme0n1", b_img)):
         st = subprocess.run([tool("dumpe2fs"), "-h", img], capture_output=True, text=True).stdout
         check(re.search(r"Filesystem state:\s+clean", st) is not None,
-              f"{name} superblock state clean after umount")
+              f"{name} superblock state clean after poweroff with it mounted read-write")
     with open(c_img, "rb") as f:
         check(md5(f.read()) == files["c_md5"], "sdc (needs_recovery) byte-identical")
+    for name, img in (("sdb1", part), ("nvme0n1", b_img)):
+        check(subprocess.run([DEBUGFS, "-R", "cat /at-poweroff.txt", img], capture_output=True,
+                             text=True).stdout == "at-poweroff\n",
+              f"debugfs: {name} at-poweroff.txt, written just before poweroff")
 
 
 def main():
@@ -358,6 +371,7 @@ def main():
         guest_tests(g, files)
 
         # poweroff: ACPI S5, and QEMU (no -no-shutdown) exits.
+        at_poweroff = len("".join(log))
         smokelib.send(proc, "poweroff\n")
         deadline = time.time() + 60
         while proc.poll() is None and time.time() < deadline:
@@ -369,6 +383,8 @@ def main():
         check(proc.poll() is not None, "QEMU exited after poweroff")
         text = "".join(log)
         check("not cleanly unmounted" not in text, "no unclean-mount warnings")
+        check(len(re.findall(r"\[EXT2\]\s+\S+: now read-only", text[at_poweroff:])) >= 2,
+              "poweroff took both read-write ext2 mounts read-only")
     finally:
         if proc.poll() is None:
             proc.terminate()

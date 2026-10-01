@@ -620,6 +620,8 @@ typedef struct {
     void  *fs;
     int  (*busy)(void *fs);
     void (*release)(void *fs);
+    int  (*set_ro)(void *fs, int ro);   /* poweroff: flush and mark clean */
+    int    ro;
 } vfs_detached_t;
 static vfs_detached_t g_detached[VFS_MNT_MAX];
 
@@ -670,6 +672,8 @@ int vfs_mount_remove(vfs_mnt_t *m, uint32_t flags) {
             d->fs = fs;
             d->busy = m->busy;
             d->release = release;
+            d->set_ro = m->set_ro;
+            d->ro = (m->flags & VFS_MS_RDONLY) != 0;
             break;
         }
         preempt_enable();
@@ -685,6 +689,12 @@ void vfs_mounts_shutdown(void) {
         if (m->used && !m->boot && m->set_ro && !(m->flags & VFS_MS_RDONLY)) {
             m->set_ro(m->fs, 1);
             m->flags |= VFS_MS_RDONLY;
+        }
+        /* A lazily unmounted instance still in use writes too. */
+        vfs_detached_t *d = &g_detached[i];
+        if (d->used && d->set_ro && !d->ro) {
+            d->set_ro(d->fs, 1);
+            d->ro = 1;
         }
     }
 }
