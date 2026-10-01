@@ -22,7 +22,12 @@ Checks:
     asks for the user's password and then root's, both typed on the USB
     keyboard, and the root shell it starts writes `id -u` to a file;
   - relative motion from the USB boot mouse reaches /dev/input/event1 and
-    moves the desktop pointer by the amount sent.
+    moves the desktop pointer by the amount sent;
+  - a usb-storage stick (an 8 MiB image with markers written here) shows up
+    as /dev/usbdisk0: markers read back at their offsets, a write through
+    the device lands in the image file, the whole device reads back with
+    the image's checksum; then the stick is unplugged and plugged back in
+    (QMP device_del / device_add) and is found again.
 
 The serial console is only used to log in a root shell for those checks (the
 console reads the serial line, never a keyboard; see userspace/init/init.c).
@@ -35,6 +40,7 @@ import re
 import shutil
 import subprocess
 import sys
+import hashlib
 import tempfile
 import time
 
@@ -47,6 +53,19 @@ OUT = os.path.join(ROOT, "build", "smoke-usb")
 smoke_gui.OUT = OUT          # GuiSmoke.shot() writes there
 
 KBD, TABLET, MOUSE = "ukbd", "utab", "umouse"
+STICK = "ustick"
+STICK_SIZE = 8 << 20
+MARKS = {0: b"USBSTICK-START!\n", (1 << 20) + 100: b"MIDDLE-MARKER\n",
+         STICK_SIZE - 16: b"USBSTICK-END!!!\n"}
+WRITE_AT, WRITE_TEXT = 2000000, "written-over-usb"
+
+
+def make_stick(path):
+    data = bytearray(STICK_SIZE)
+    for off, text in MARKS.items():
+        data[off:off + len(text)] = text
+    with open(path, "wb") as f:
+        f.write(data)
 DISPLAY = "vga0"
 ABS_MAX = 0x8000             # QEMU's tablet axis: 0 .. 0x7fff
 
@@ -167,6 +186,56 @@ class UsbSmoke(GuiSmoke):
             raise AssertionError(f"usb-mouse click landed at {got}, not "
                                  f"{(x0 + 40, y0 + 30)}")
 
+    def storage(self):
+        con = self.con
+        if not re.search(r"\[USB-MSC\] /dev/usbdisk0: .* 16384 blocks of 512 "
+                         r"bytes", con.text()):
+            raise AssertionError("the USB stick did not become /dev/usbdisk0")
+        for off, text in MARKS.items():
+            want = text.decode().strip()
+            got = con.run(f"toybox dd if=/dev/usbdisk0 bs=1 skip={off} "
+                          f"count={len(text)} 2>/dev/null")
+            if want not in got:
+                raise AssertionError(f"usbdisk0 at {off}: {got!r}, not {want!r}")
+        con.run(f"echo {WRITE_TEXT} > /tmp/usbw.txt")
+        con.run(f"toybox dd if=/tmp/usbw.txt of=/dev/usbdisk0 bs=1 "
+                f"seek={WRITE_AT} conv=notrunc 2>/dev/null")
+        got = con.run(f"toybox dd if=/dev/usbdisk0 bs=1 skip={WRITE_AT} "
+                      f"count={len(WRITE_TEXT)} 2>/dev/null")
+        if WRITE_TEXT not in got:
+            raise AssertionError(f"write did not read back: {got!r}")
+        with open(self.stick, "rb") as f:
+            image = f.read()
+        if image[WRITE_AT:WRITE_AT + len(WRITE_TEXT)] != WRITE_TEXT.encode():
+            raise AssertionError("the write did not reach the stick's image")
+        out = con.run("toybox dd if=/dev/usbdisk0 of=/tmp/usb.img bs=32768 "
+                      "2>/dev/null; md5sum /tmp/usb.img; rm /tmp/usb.img",
+                      timeout=60)
+        want = hashlib.md5(image).hexdigest()
+        if want not in out:
+            raise AssertionError(f"usbdisk0 checksum {out!r}, image {want}")
+        print(f"\n[SMOKE-USB] usbdisk0 reads back with md5 {want}")
+
+    def hotplug(self):
+        con = self.con
+        start = con.mark()
+        self.qmp.cmd("device_del", id=STICK)
+        con.wait_re(r"\[USB-MSC\] /dev/usbdisk0 removed", start=start)
+        con.wait_re(r"\[USB\] port \d+: device removed", start=start)
+        if "usbdisk0" in con.run("ls /dev"):
+            raise AssertionError("/dev/usbdisk0 still listed after unplug")
+        start = con.mark()
+        # device_del took the drive with it; plug a new one onto the image.
+        self.qmp.cmd("blockdev-add", driver="raw", **{"node-name": "stick2"},
+                     file={"driver": "file", "filename": self.stick})
+        self.qmp.cmd("device_add", driver="usb-storage", drive="stick2",
+                     id=STICK)
+        con.wait_re(r"\[USB-MSC\] /dev/usbdisk0: .* 16384 blocks", timeout=20,
+                    start=start)
+        got = con.run("toybox dd if=/dev/usbdisk0 bs=1 count=16 2>/dev/null")
+        if "USBSTICK-START!" not in got:
+            raise AssertionError(f"replugged stick reads {got!r}")
+
     def run(self):
         steps = []
 
@@ -182,6 +251,8 @@ class UsbSmoke(GuiSmoke):
         step("login over the USB keyboard", self.login, term)
         step("close terminal (tablet click)", self.close, term)
         step("boot mouse", self.boot_mouse)
+        step("mass storage", self.storage)
+        step("unplug and replug the stick", self.hotplug)
         self.settle()
         self.shot("final")
         return steps
@@ -194,6 +265,8 @@ def main():
         if not os.path.exists(os.path.join(ROOT, f)):
             raise RuntimeError(f"{f} is missing (make iso disk)")
     disk = smoke_gui.prepare_disk()
+    stick = os.path.join(OUT, "stick.img")
+    make_stick(stick)
     sockdir = tempfile.mkdtemp(prefix="susb")
     qmp_path = os.path.join(sockdir, "qmp")
     accel = smoke_gui.pick_accel()
@@ -201,10 +274,14 @@ def main():
            "-drive", f"file={disk},format=raw,if=ide",
            "-accel", accel, "-vga", "none", "-device", f"VGA,id={DISPLAY}", *smokelib.QEMU_DISPLAY,
            "-serial", "stdio", "-m", "512M", "-no-reboot", "-no-shutdown",
-           "-device", "qemu-xhci,id=xhci",
+           # 8+8 root ports: with the 4+4 default QEMU puts a hub in front of
+           # the fourth device, and hubs are not supported yet.
+           "-device", "qemu-xhci,id=xhci,p2=8,p3=8",
            "-device", f"usb-kbd,id={KBD},display={DISPLAY}",
            "-device", f"usb-tablet,id={TABLET},display={DISPLAY}",
            "-device", f"usb-mouse,id={MOUSE}",
+           "-drive", f"if=none,id=stick,format=raw,file={stick}",
+           "-device", f"usb-storage,drive=stick,id={STICK}",
            "-qmp", f"unix:{qmp_path},server=on,wait=off"]
     with open(os.path.join(OUT, "qemu-cmdline.txt"), "w") as f:
         f.write(" ".join(cmd) + "\n")
@@ -218,6 +295,7 @@ def main():
     try:
         qmp = Qmp(qmp_path)
         smoke = UsbSmoke(con, qmp)
+        smoke.stick = stick
         steps = smoke.run()
         print("\n[SMOKE-USB] timings: " +
               ", ".join(f"{n} {s:.1f}s" for n, s in steps))

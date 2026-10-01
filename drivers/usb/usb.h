@@ -76,10 +76,46 @@ typedef struct __attribute__((packed)) {
 /* What a class driver gets to see of a device (owned by xhci.c). */
 struct usb_device;
 
+#define USB_MAX_EPS  3       /* endpoints per device besides EP0 */
+#define USB_CLS_HID  1
+#define USB_CLS_MSC  2
+#define USB_STALL    (-2)
+
+/* Physical address of a buffer in the kernel image (.data/.bss), which is
+ * where every DMA buffer of the USB stack lives. */
+#define usb_phys(p)  ((uint32_t)((uintptr_t)(p) - 0xC0000000U))
+
+/* Every call below needs the controller lock, which kusbd holds while it
+ * enumerates and class drivers' attach/detach run under; a process doing
+ * I/O takes it with usb_lock().  It is a sleeping lock. */
+void usb_lock(void);
+void usb_unlock(void);
+int  usb_device_slot(const struct usb_device *dev);
+
 /* Control transfer on endpoint 0.  `data` is a kernel buffer of `setup->
  * wLength` bytes (IN: filled; OUT: sent).  Returns the number of bytes
  * transferred, or a negative value on error.  May sleep. */
 int usb_control(struct usb_device *dev, const usb_setup_t *setup, void *data);
+
+/* Set up endpoints (bulk or interrupt); eps[i] becomes index i below. */
+int usb_configure_eps(struct usb_device *dev,
+                      const usb_endpoint_desc_t *const *eps, int n);
+/* Bulk transfer on endpoint index i: 0 (bytes moved in *actual), USB_STALL,
+ * or -1.  `phys` must not cross a 64 KiB boundary. */
+int usb_bulk(struct usb_device *dev, int i, uint32_t phys, uint32_t len,
+             uint32_t *actual, uint32_t timeout_ms);
+/* Reset a halted endpoint on both sides. */
+int usb_clear_halt(struct usb_device *dev, int i);
+
+/* ── mass storage (usb_msc.c) ─────────────────────────────────────────────── */
+
+/* Does this configuration have a SCSI / bulk-only interface? */
+int  usb_msc_match(const uint8_t *cfg, uint32_t len);
+/* Called by kusbd (lock held) after SET_CONFIGURATION. 0 = attached. */
+int  usb_msc_attach(struct usb_device *dev, const uint8_t *cfg, uint32_t len);
+void usb_msc_detach(struct usb_device *dev);
+/* devfs: the /dev/usbdisk0 node while a disk is attached, else NULL. */
+struct vfs_node *usb_msc_node(void);
 
 /* ── HID class driver (usb_hid.c) ─────────────────────────────────────────── */
 

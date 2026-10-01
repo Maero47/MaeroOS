@@ -13,6 +13,7 @@
 #include "../proc/scheduler.h"
 #include "../proc/signal.h"
 #include "../arch/i686/cpu/pit.h"
+#include "../drivers/usb/usb.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -975,6 +976,7 @@ static vfs_node_t *devdir_finddir(vfs_node_t *node, const char *name) {
     if (strcmp(name, "input")   == 0) return &dev_input_dir;
     if (strcmp(name, "shm")     == 0) return dev_shm_root;
     if (strcmp(name, "random")  == 0) return &dev_urandom;  /* alias */
+    if (strcmp(name, "usbdisk0") == 0) return usb_msc_node(); /* or NULL */
     /* stdin/stdout/stderr → tty (serial console) */
     if (strcmp(name, "stdin")   == 0) return &dev_tty;
     if (strcmp(name, "stdout")  == 0) return &dev_tty;
@@ -986,10 +988,11 @@ static int devdir_readdir(vfs_node_t *node, uint32_t idx, vfs_dirent_t *out) {
     (void)node;
     static const char *names[] = { "null", "zero", "tty", "urandom", "dsp",
                                     "fb0", "input", "ptmx", "pts", "shm",
-                                    "stdin", "stdout", "stderr" };
+                                    "stdin", "stdout", "stderr", "usbdisk0" };
     uint32_t out_idx = 0;
     for (uint32_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         if (i == 5 && !framebuffer_available()) continue;   /* "fb0" */
+        if (i == 13 && !usb_msc_node()) continue;           /* "usbdisk0" */
         if (out_idx == idx) {
             out->ino  = (uint32_t)(idx + 1);
             out->type = (strcmp(names[i], "input") == 0 ||
