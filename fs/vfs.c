@@ -2,6 +2,8 @@
 #include "tmpfs.h"
 #include "../lib/string.h"
 #include "../mm/heap.h"
+#include "../lib/printf.h"
+#include "../proc/scheduler.h"
 #include <stddef.h>
 
 vfs_node_t *vfs_root = NULL;
@@ -187,11 +189,37 @@ enum { WALK_FOUND, WALK_MISS, WALK_RESTART };
  * While walking, `alt` holds the textual path of the directory reached so far;
  * that is the prefix a relative target is resolved against.
  */
+static vfs_mnt_t g_mnt[VFS_MNT_MAX];
+static int g_mnt_active;          /* entries that are crossed (not boot notes) */
+
+/* The mount whose mountpoint is `n`, newest first. */
+static vfs_mnt_t *mnt_on(vfs_node_t *n) {
+    for (int i = VFS_MNT_MAX - 1; i >= 0; i--)
+        if (g_mnt[i].used && !g_mnt[i].boot && g_mnt[i].mp == n)
+            return &g_mnt[i];
+    return NULL;
+}
+
+/* Step from a mountpoint to the root mounted on it, through stacked mounts. */
+static vfs_node_t *mnt_cross(vfs_node_t *n, vfs_mnt_t **m) {
+    if (!g_mnt_active) return n;
+    for (int hops = 0; hops < VFS_MNT_MAX && n; hops++) {
+        vfs_mnt_t *e = mnt_on(n);
+        if (!e) break;
+        *m = e;
+        n = e->root;
+    }
+    return n;
+}
+
 static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
-                    int may_follow, char *alt, vfs_node_t **out, int *err) {
+                    int may_follow, char *alt, vfs_node_t **out, int *err,
+                    vfs_mnt_t **mnt_out) {
     const char *p = path + 1;
     vfs_node_t *cur = root;
     vfs_node_t *parents[64];
+    vfs_mnt_t *mnts[64];
+    vfs_mnt_t *curm = NULL;
     uint32_t depth = 0;
     int alen = 0;                /* length of the prefix in alt; -1: too long */
     char component[256];
@@ -217,10 +245,14 @@ static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
 
         /* handle ".." — walk up (root stays root) */
         if (len == 2 && component[0] == '.' && component[1] == '.') {
-            if (depth > 0)
-                cur = parents[--depth];
-            else
+            if (depth > 0) {
+                --depth;
+                cur = parents[depth];
+                curm = mnts[depth];
+            } else {
                 cur = root;
+                curm = NULL;
+            }
             if (alen > 0) {
                 while (alen > 0 && alt[alen - 1] != '/') alen--;
                 if (alen > 0) alen--;
@@ -229,8 +261,10 @@ static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
         }
 
         vfs_node_t *parent = cur;
+        vfs_mnt_t *parent_m = curm;
         cur = vfs_finddir(cur, component);
         if (!cur) { *err = -2; return WALK_MISS; }            /* -ENOENT */
+        cur = mnt_cross(cur, &curm);
 
         if (cur->flags == VFS_FLAG_SYMLINK && (!is_final || follow_final)) {
             if (!may_follow) { *err = -40; return WALK_MISS; } /* -ELOOP */
@@ -261,8 +295,10 @@ static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
             return WALK_RESTART;
         }
 
-        if (depth < (sizeof(parents) / sizeof(parents[0])))
+        if (depth < (sizeof(parents) / sizeof(parents[0]))) {
+            mnts[depth] = parent_m;
             parents[depth++] = parent;
+        }
         if (alen >= 0 && alen + 1 + len < VFS_PATH_MAX) {
             alt[alen++] = '/';
             memcpy(alt + alen, component, (uint32_t)len);
@@ -272,6 +308,7 @@ static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
         }
     }
     *out = cur;
+    if (mnt_out) *mnt_out = curm;
     return WALK_FOUND;
 }
 
@@ -282,7 +319,13 @@ static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
  * VFS_MAXSYMLINKS links, or -ENAMETOOLONG.
  */
 vfs_node_t *vfs_lookup(const char *path, int follow_final, int *err) {
+    return vfs_lookup_mnt(path, follow_final, err, NULL);
+}
+
+vfs_node_t *vfs_lookup_mnt(const char *path, int follow_final, int *err,
+                           vfs_mnt_t **mnt) {
     char bufs[2][VFS_PATH_MAX];
+    if (mnt) *mnt = NULL;
     if (err) *err = -2;                                       /* -ENOENT */
     if (!path || path[0] != '/' || !vfs_root) return NULL;
     uint32_t plen = (uint32_t)strlen(path);
@@ -297,10 +340,10 @@ vfs_node_t *vfs_lookup(const char *path, int follow_final, int *err) {
         int r = WALK_MISS, e = -2, e2 = -2;
         if (vfs_root_overlay && vfs_path_uses_root_overlay(pth))
             r = vfs_walk(vfs_root_overlay, pth, follow_final, may_follow,
-                         alt, &node, &e);
+                         alt, &node, &e, mnt);
         if (r == WALK_MISS) {
             r = vfs_walk(vfs_root, pth, follow_final, may_follow,
-                         alt, &node, &e2);
+                         alt, &node, &e2, mnt);
             if (e == -2) e = e2;         /* report a loop over a plain miss */
         }
         if (r == WALK_FOUND) return node;
@@ -441,4 +484,136 @@ int vfs_mount(const char *path, vfs_node_t *fs_root) {
     mp->next = vfs_root->children;
     vfs_root->children = mp;
     return 0;
+}
+
+/* ── Mount table ──────────────────────────────────────────────────────────── */
+
+static void mnt_copy_str(char *dst, const char *src, uint32_t size) {
+    strncpy(dst, src ? src : "none", size - 1);
+    dst[size - 1] = '\0';
+}
+
+int vfs_mount_add(const char *target, vfs_node_t *root, const vfs_mnt_t *tmpl) {
+    if (!target || target[0] != '/' || !root || !tmpl) return -22;
+    int err;
+    vfs_mnt_t *pm = NULL;
+    vfs_node_t *mp = vfs_lookup_mnt(target, 1, &err, &pm);
+    if (!mp) return err;
+    if (mp->flags != VFS_FLAG_DIR) return -20;                /* -ENOTDIR */
+    /* "/" itself is not a node any walk crosses from. */
+    if (mp == vfs_root || mp == vfs_root_overlay) return -16; /* -EBUSY */
+    preempt_disable();
+    vfs_mnt_t *m = NULL;
+    for (int i = 0; i < VFS_MNT_MAX; i++)
+        if (!g_mnt[i].used) { m = &g_mnt[i]; break; }
+    if (!m) { preempt_enable(); return -12; }                 /* -ENOMEM */
+    *m = *tmpl;
+    m->used   = 1;
+    m->boot   = 0;
+    m->mp     = mp;
+    m->root   = root;
+    m->parent = pm;
+    mnt_copy_str(m->target, target, sizeof(m->target));
+    mnt_copy_str(m->source, tmpl->source, sizeof(m->source));
+    mnt_copy_str(m->fstype, tmpl->fstype, sizeof(m->fstype));
+    g_mnt_active++;
+    preempt_enable();
+    return 0;
+}
+
+vfs_mnt_t *vfs_mount_find(const char *path, int *err) {
+    vfs_node_t *n = vfs_lookup_mnt(path, 1, err, NULL);
+    if (!n) return NULL;
+    for (int i = VFS_MNT_MAX - 1; i >= 0; i--)
+        if (g_mnt[i].used && !g_mnt[i].boot && g_mnt[i].root == n)
+            return &g_mnt[i];
+    if (err) *err = -22;                                      /* -EINVAL */
+    return NULL;
+}
+
+int vfs_mount_remove(vfs_mnt_t *m, uint32_t flags) {
+    if (!m || !m->used || m->boot) return -22;
+    for (int i = 0; i < VFS_MNT_MAX; i++)
+        if (g_mnt[i].used && g_mnt[i].parent == m) return -16;   /* -EBUSY */
+    int busy = m->busy ? m->busy(m->fs) : 0;
+    if (busy && !(flags & VFS_MNT_DETACH)) return -16;            /* -EBUSY */
+    void (*release)(void *) = m->release;
+    void *fs = m->fs;
+    preempt_disable();
+    m->used = 0;
+    m->mp = m->root = NULL;
+    g_mnt_active--;
+    preempt_enable();
+    /* A lazily detached instance that still has open files is left alive:
+     * its descriptors keep working, and it is never freed. */
+    if (release && !busy) release(fs);
+    return 0;
+}
+
+int vfs_is_mountpoint(vfs_node_t *n) {
+    return g_mnt_active && n && mnt_on(n) != NULL;
+}
+
+void vfs_mount_note(const char *source, const char *target, const char *fstype,
+                    uint32_t flags) {
+    for (int i = 0; i < VFS_MNT_MAX; i++) {
+        if (g_mnt[i].used) continue;
+        memset(&g_mnt[i], 0, sizeof(g_mnt[i]));
+        g_mnt[i].used = 1;
+        g_mnt[i].boot = 1;
+        g_mnt[i].flags = flags;
+        mnt_copy_str(g_mnt[i].source, source, sizeof(g_mnt[i].source));
+        mnt_copy_str(g_mnt[i].target, target, sizeof(g_mnt[i].target));
+        mnt_copy_str(g_mnt[i].fstype, fstype, sizeof(g_mnt[i].fstype));
+        return;
+    }
+}
+
+int vfs_mount_has_fs_source(const char *source) {
+    for (int i = 0; i < VFS_MNT_MAX; i++)
+        if (g_mnt[i].used && strcmp(g_mnt[i].source, source) == 0) return 1;
+    return 0;
+}
+
+uint32_t vfs_mounts_format(char *buf, uint32_t size) {
+    uint32_t pos = 0;
+    if (!size) return 0;
+    buf[0] = '\0';
+    /* Boot notes first, then mounts in the order they were made: a slot
+     * reused after an umount would otherwise list a child before its parent. */
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < VFS_MNT_MAX && pos + 1 < size; i++) {
+            vfs_mnt_t *m = &g_mnt[i];
+            if (!m->used || m->boot != (pass == 0)) continue;
+            pos += (uint32_t)snprintf(buf + pos, size - pos,
+                                      "%s %s %s %s%s%s%s 0 0\n",
+                                      m->source, m->target, m->fstype,
+                                      (m->flags & VFS_MS_RDONLY) ? "ro" : "rw",
+                                      (m->flags & VFS_MS_NOSUID) ? ",nosuid" : "",
+                                      (m->flags & VFS_MS_NODEV) ? ",nodev" : "",
+                                      (m->flags & VFS_MS_NOEXEC) ? ",noexec" : "");
+            if (pos >= size) pos = size - 1;
+        }
+    }
+    return pos;
+}
+
+int vfs_path_rdonly(const char *path, int parent) {
+    if (!g_mnt_active || !path || path[0] != '/') return 0;
+    vfs_mnt_t *m = NULL;
+    int err;
+    if (!parent && vfs_lookup_mnt(path, 1, &err, &m))
+        return m && (m->flags & VFS_MS_RDONLY);
+    /* The directory that holds (or would hold) the last component. */
+    char dir[VFS_PATH_MAX];
+    uint32_t len = (uint32_t)strlen(path);
+    if (len >= sizeof(dir)) return 0;
+    memcpy(dir, path, len + 1);
+    while (len > 1 && dir[len - 1] == '/') dir[--len] = '\0';
+    while (len > 1 && dir[len - 1] != '/') len--;
+    if (len > 1) len--;                       /* drop the separator */
+    dir[len] = '\0';
+    m = NULL;
+    if (!vfs_lookup_mnt(dir, 1, &err, &m)) return 0;
+    return m && (m->flags & VFS_MS_RDONLY);
 }

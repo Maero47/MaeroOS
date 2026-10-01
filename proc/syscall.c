@@ -27,6 +27,7 @@
 #include "../arch/i686/include/io.h"
 #include "../kernel/printk.h"
 #include "../fs/vfs.h"
+#include "../fs/mount.h"
 #include "../fs/devfs.h"
 #include "../fs/ext2.h"
 #include "../net/socket.h"
@@ -601,6 +602,8 @@ static uint8_t vfs_type_to_dt(uint8_t t) {
 
 static void fill_kstat(struct kstat *st, vfs_node_t *n) {
     __builtin_memset(st, 0, sizeof(*st));
+    st->st_dev     = (uint16_t)n->dev;
+    st->st_rdev    = (uint16_t)n->rdev;
     st->st_ino     = n->inode;
     st->st_mode    = (uint16_t)vnode_mode(n);
     st->st_nlink   = 1;
@@ -617,6 +620,8 @@ static void fill_kstat(struct kstat *st, vfs_node_t *n) {
 
 static void fill_kstat64(struct kstat64 *st, vfs_node_t *n) {
     __builtin_memset(st, 0, sizeof(*st));
+    st->st_dev     = n->dev;
+    st->st_rdev    = n->rdev;
     st->st_ino     = n->inode;
     st->__st_ino   = n->inode;
     st->st_mode    = vnode_mode(n);
@@ -1400,6 +1405,10 @@ static void init_new_node(vfs_node_t *dir, vfs_node_t *node, uint32_t mode) {
 }
 
 static int sys_open_kernel_path(const char *path, int flags, uint32_t mode) {
+    /* Anything that could change the object needs a writable mount. */
+    if (((flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC))) &&
+        vfs_path_rdonly(path, 0))
+        return -30;                                           /* -EROFS */
     /* O_CREAT|O_EXCL: the name must not exist in any form — not even as a
      * dangling symlink, which is why the final component is not followed
      * (Linux open(2); mkstemp and lock files rely on this). */
@@ -5201,6 +5210,10 @@ static int sys_statx(registers_t *regs) {
     sx.stx_gid     = kst.st_gid;
     sx.stx_mode    = (uint16_t)kst.st_mode;
     sx.stx_ino     = kst.st_ino;
+    sx.stx_dev_major  = (uint32_t)(kst.st_dev >> 8) & 0xFFFu;
+    sx.stx_dev_minor  = (uint32_t)kst.st_dev & 0xFFu;
+    sx.stx_rdev_major = (uint32_t)(kst.st_rdev >> 8) & 0xFFFu;
+    sx.stx_rdev_minor = (uint32_t)kst.st_rdev & 0xFFu;
     sx.stx_size    = kst.st_size;
     sx.stx_blocks  = (kst.st_size + 511) / 512;
     sx.stx_mtime.sec = kst.st_mtime;
@@ -5437,6 +5450,7 @@ static int sys_umask(registers_t *regs) {
  * absolute path.  Shared by mknod(14) and mknodat(297). */
 static int do_mknod(const char *path, uint32_t mode) {
     char dir_path[256], base[256];
+    if (vfs_path_rdonly(path, 1)) return -30;                 /* -EROFS */
     if (path_split(path, dir_path, base) < 0) return -22;
     if (base[0] == '\0') return -22;
 
@@ -5582,6 +5596,7 @@ static int symlink_at(uint32_t utarget, int dirfd, uint32_t ulinkpath) {
      * the caller's (effective ids). */
     char dir_path[256], base[256];
     if (path_split(abspath, dir_path, base) < 0 || base[0] == '\0') return -22;
+    if (vfs_path_rdonly(abspath, 1)) return -30;              /* -EROFS */
     vfs_node_t *dir = vfs_open_parent_at(abspath, dir_path);
     if (!dir) return -2;
     if (proc_access_check(dir, VFS_WANT_W | VFS_WANT_X) < 0)
@@ -5645,6 +5660,12 @@ static int sys_truncate(registers_t *regs) {
     if (n->flags != VFS_FLAG_FILE) return -22;             /* -EINVAL */
     if (proc_access_check(n, VFS_WANT_W) < 0)
         return -13;                                        /* -EACCES */
+    {
+        char abs[256];
+        if (canonicalize_path_at_cwd(path, abs, sizeof(abs)) == 0 &&
+            vfs_path_rdonly(abs, 0))
+            return -30;                                    /* -EROFS */
+    }
     return vfs_truncate(n, len);
 }
 
@@ -6502,6 +6523,12 @@ static int sys_openat(registers_t *regs) {
 
 static int sys_mkdir_kernel_path(const char *path, uint32_t mode) {
     char dir_path[256], base[256];
+    /* mkdir("/") is -EEXIST on Linux; `mkdir -p /x` starts with it. */
+    if (path[0] == '/' && path[1] == '\0') return -17;
+    /* An existing name is -EEXIST whatever lies behind it, including the
+     * boot mountpoints, whose parent has no create_fn. */
+    if (vfs_open_nofollow(path)) return -17;
+    if (vfs_path_rdonly(path, 1)) return -30;                 /* -EROFS */
     if (path_split(path, dir_path, base) < 0)
         return -2;
     if (base[0] == '\0') return -22;
@@ -6539,6 +6566,7 @@ static int may_delete(vfs_node_t *dir, vfs_node_t *victim) {
  * looked up without following a final symlink: unlink removes the link, and
  * rmdir of a link to a directory is -ENOTDIR, as on Linux. */
 static int remove_kernel_path(const char *path, int want_dir) {
+    if (vfs_path_rdonly(path, 1)) return -30;                 /* -EROFS */
     char dir_path[256], base[256];
     if (path_split(path, dir_path, base) < 0)
         return -2;
@@ -6548,6 +6576,7 @@ static int remove_kernel_path(const char *path, int want_dir) {
     if (!dir) return -2;
     vfs_node_t *victim = vfs_finddir(dir, base);
     if (!victim) return -2;                              /* -ENOENT */
+    if (vfs_is_mountpoint(victim)) return -16;           /* -EBUSY */
     if (want_dir && victim->flags != VFS_FLAG_DIR) return -20;   /* -ENOTDIR */
     /* unlink() never removes a directory; Linux reports -EISDIR (POSIX
      * allows -EPERM), and rmdir() is the call for that. */
@@ -7468,6 +7497,8 @@ static int sys_getrandom(registers_t *regs) {
  * (mv copies in that case). */
 static int sys_rename_kernel_path(const char *oldpath, const char *newpath) {
     char old_dir[256], old_base[256];
+    if (vfs_path_rdonly(oldpath, 1) || vfs_path_rdonly(newpath, 1))
+        return -30;                                           /* -EROFS */
     char new_dir[256], new_base[256];
     if (path_split(oldpath, old_dir, old_base) < 0) return -2;
     if (path_split(newpath, new_dir, new_base) < 0) return -2;
@@ -7560,6 +7591,7 @@ static int sys_chmod(registers_t *regs) {
     if (r < 0) return r;
     r = resolve_path_at_fd(AT_FDCWD, path, resolved, sizeof(resolved));
     if (r < 0) return r;
+    if (vfs_path_rdonly(resolved, 0)) return -30;          /* -EROFS */
     return do_chmod_node(vfs_open(resolved), (uint32_t)regs->ecx);
 }
 
@@ -7576,6 +7608,7 @@ static int sys_chown(registers_t *regs) {
     if (r < 0) return r;
     r = resolve_path_at_fd(AT_FDCWD, path, resolved, sizeof(resolved));
     if (r < 0) return r;
+    if (vfs_path_rdonly(resolved, 0)) return -30;          /* -EROFS */
     return do_chown_node(vfs_open(resolved), (uint32_t)regs->ecx,
                          (uint32_t)regs->edx);
 }
@@ -7594,6 +7627,7 @@ static int sys_lchown(registers_t *regs) {
     if (r < 0) return r;
     r = resolve_path_at_fd(AT_FDCWD, path, resolved, sizeof(resolved));
     if (r < 0) return r;
+    if (vfs_path_rdonly(resolved, 1)) return -30;          /* -EROFS */
     return do_chown_node(vfs_open_nofollow(resolved), (uint32_t)regs->ecx,
                          (uint32_t)regs->edx);
 }
@@ -7615,6 +7649,7 @@ static int sys_fchownat(registers_t *regs) {
     }
     r = resolve_path_at_fd((int)regs->ebx, path, resolved, sizeof(resolved));
     if (r < 0) return r;
+    if (vfs_path_rdonly(resolved, (flags & 0x100) != 0)) return -30;
     vfs_node_t *n = (flags & 0x100) ? vfs_open_nofollow(resolved) : vfs_open(resolved);
     return do_chown_node(n, (uint32_t)regs->edx, (uint32_t)regs->esi);
 }
@@ -7627,7 +7662,51 @@ static int sys_fchmodat(registers_t *regs) {
     if (r < 0) return r;
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
+    if (vfs_path_rdonly(resolved, 0)) return -30;          /* -EROFS */
     return do_chmod_node(vfs_open(resolved), (uint32_t)regs->edx);
+}
+
+/* ── mount(2) / umount(2) / umount2(2) — EAX=21 / 22 / 52 ──────────────────
+ * mount(source, target, fstype, flags, data).  Privileged (euid 0), as on
+ * Linux without user namespaces.  The work is in fs/mount.c. */
+static int copy_user_str_opt(uint32_t uptr, char *kbuf, int max, const char **out) {
+    *out = NULL;
+    if (!uptr) return 0;
+    int r = copy_user_str((const char *)(uintptr_t)uptr, kbuf, max);
+    if (r < 0) return r;
+    *out = kbuf;
+    return 0;
+}
+
+static int sys_mount(registers_t *regs) {
+    if (current_proc->euid != 0) return -1;                  /* -EPERM */
+    char src[256], tgt[256], typ[32], data[256], target[256];
+    const char *psrc, *ptgt, *ptyp, *pdata;
+    int r;
+    if ((r = copy_user_str_opt(regs->ebx, src, sizeof(src), &psrc)) < 0) return r;
+    if ((r = copy_user_str_opt(regs->ecx, tgt, sizeof(tgt), &ptgt)) < 0) return r;
+    if ((r = copy_user_str_opt(regs->edx, typ, sizeof(typ), &ptyp)) < 0) return r;
+    if ((r = copy_user_str_opt(regs->edi, data, sizeof(data), &pdata)) < 0) return r;
+    if (!ptgt) return -14;                                   /* -EFAULT */
+    r = resolve_path_at_fd(AT_FDCWD, ptgt, target, sizeof(target));
+    if (r < 0) return r;
+    /* A source naming a path (block device, bind source) is resolved like
+     * any other; a pseudo-filesystem's source ("none", "proc") is a label. */
+    char srcabs[256];
+    if (psrc && (psrc[0] == '/' || psrc[0] == '.') &&
+        resolve_path_at_fd(AT_FDCWD, psrc, srcabs, sizeof(srcabs)) == 0)
+        psrc = srcabs;
+    return mount_do(psrc, target, ptyp, (uint32_t)regs->esi, pdata);
+}
+
+static int sys_umount2(registers_t *regs, uint32_t flags) {
+    if (current_proc->euid != 0) return -1;                  /* -EPERM */
+    char path[256], target[256];
+    int r = copy_user_str((const char *)(uintptr_t)regs->ebx, path, sizeof(path));
+    if (r < 0) return r;
+    r = resolve_path_at_fd(AT_FDCWD, path, target, sizeof(target));
+    if (r < 0) return r;
+    return umount_do(target, flags);
 }
 
 /* ── sys_dup3(oldfd, newfd, flags) — EAX=330 ────────────────────────────── */
@@ -9067,6 +9146,9 @@ void syscall_dispatch(registers_t *regs) {
     case 6:   ret = sys_close(regs);           break;
     case 7:   ret = sys_waitpid(regs);         break;
     case 10:  ret = sys_unlink(regs);          break;
+    case 21:  ret = sys_mount(regs);           break;  /* mount */
+    case 22:  ret = sys_umount2(regs, 0);      break;  /* umount (oldumount) */
+    case 52:  ret = sys_umount2(regs, regs->ecx); break;  /* umount2 */
     case 14:  ret = sys_mknod(regs);           break;
     case 11:  ret = sys_exec(regs);            break;
     case 12:  ret = sys_chdir(regs);           break;

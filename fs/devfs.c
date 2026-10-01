@@ -1,4 +1,5 @@
 #include "devfs.h"
+#include "../drivers/blkpart.h"
 #include "../drivers/ac97.h"
 #include "vfs.h"
 #include "tmpfs.h"
@@ -979,6 +980,9 @@ static vfs_node_t *devdir_finddir(vfs_node_t *node, const char *name) {
     if (strcmp(name, "stdin")   == 0) return &dev_tty;
     if (strcmp(name, "stdout")  == 0) return &dev_tty;
     if (strcmp(name, "stderr")  == 0) return &dev_tty;
+    /* Disks and partitions: hda, hdb1, ... */
+    blkpart_t *bp = blkpart_find(name);
+    if (bp) return &bp->node;
     return NULL;
 }
 
@@ -1001,6 +1005,14 @@ static int devdir_readdir(vfs_node_t *node, uint32_t idx, vfs_dirent_t *out) {
             return 0;
         }
         out_idx++;
+    }
+    blkpart_t *bp = blkpart_get(idx - out_idx);
+    if (bp) {
+        out->ino  = bp->node.inode;
+        out->type = VFS_FLAG_BLKDEV;
+        strncpy(out->name, bp->name, 255);
+        out->name[255] = '\0';
+        return 0;
     }
     return -1;
 }
