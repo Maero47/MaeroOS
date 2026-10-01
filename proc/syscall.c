@@ -1457,6 +1457,16 @@ static int sys_open_kernel_path(const char *path, int flags, uint32_t mode) {
             vfs_open_nofollow(abspath))
             return -17;   /* -EEXIST */
     }
+    /* O_NOFOLLOW (0400000): a symlink as the final component is -ELOOP
+     * instead of being followed — what a set-uid program opening a name in
+     * a world-writable directory relies on (xapp). */
+    if (flags & 0400000) {
+        char abspath[256];
+        vfs_node_t *ln;
+        if (canonicalize_path_at_cwd(path, abspath, sizeof(abspath)) == 0 &&
+            (ln = vfs_open_nofollow(abspath)) && ln->flags == VFS_FLAG_SYMLINK)
+            return -40;   /* -ELOOP */
+    }
     int lerr;
     vfs_node_t *node = vfs_lookup_at(path, 1, &lerr);
     if (!node) {

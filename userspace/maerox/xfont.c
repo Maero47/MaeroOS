@@ -37,18 +37,22 @@ static const char *const font_names[] = {
 static int lc(int ch) { return (ch >= 'A' && ch <= 'Z') ? ch - 'A' + 'a' : ch; }
 
 /* X font name patterns: '*' any run, '?' one character, case-insensitive. */
+/* XLFD pattern match ('*' any run, '?' one character, case-insensitive).
+ * Iterative with one backtrack point, the classic greedy wildcard matcher:
+ * O(len(p) * len(s)) where the recursive version was exponential in the
+ * number of '*' ("********************Z" hung the server). */
 static int pat_match(const char *p, int pl, const char *s) {
-    if (pl == 0) return *s == 0;
-    if (*p == '*') {
-        for (;;) {
-            if (pat_match(p + 1, pl - 1, s)) return 1;
-            if (!*s) return 0;
-            s++;
-        }
+    int pi = 0, star = -1;
+    const char *mark = NULL;
+    while (*s) {
+        if (pi < pl && p[pi] == '*') { star = pi++; mark = s; continue; }
+        if (pi < pl && (p[pi] == '?' || lc((uint8_t)p[pi]) == lc((uint8_t)*s))) { pi++; s++; continue; }
+        if (star < 0) return 0;
+        pi = star + 1;
+        s = ++mark;
     }
-    if (!*s) return 0;
-    if (*p != '?' && lc((uint8_t)*p) != lc((uint8_t)*s)) return 0;
-    return pat_match(p + 1, pl - 1, s + 1);
+    while (pi < pl && p[pi] == '*') pi++;
+    return pi == pl;
 }
 
 static int name_is_bold(const char *s, int len) {
@@ -61,7 +65,10 @@ static int name_is_bold(const char *s, int len) {
 static font_t *font_of(uint32_t fid) {
     xobj_t *o = res_lookup(fid);
     if (o && o->type == XT_FONT) return (font_t *)o;
-    if (o && o->type == XT_GC) return font_of(((gc_t *)o)->font);
+    if (o && o->type == XT_GC) {               /* QueryFont on a GC: its font, one level only */
+        o = res_lookup(((gc_t *)o)->font);
+        if (o && o->type == XT_FONT) return (font_t *)o;
+    }
     return NULL;
 }
 

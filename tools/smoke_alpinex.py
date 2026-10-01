@@ -22,6 +22,9 @@ smoke_gui.py:
      save dialog, Enter: the file must hold the text.
      galculator (GTK 3, installed in the guest like xeyes): its window, and
      7*6 Enter typed into it changes the display.
+     xappattack, as uid 1000, plants symlinks to root-owned canaries where
+     xapp works (its log in /tmp, the runtime dir, ~/.local) and runs
+     `/disk/xapp run xterm`: every canary must stay untouched.
   4. Each app is closed with the maeroX title bar's close button
      (WM_DELETE_WINDOW) and must exit; maeroX must still be running.
 
@@ -175,6 +178,14 @@ class AlpineX:
         if "typed-in-xterm" not in self.sh("cat /disk/alpine/tmp/xt.txt"):
             self.fail("xterm: text typed into it did not reach its shell")
         self.g.shot("xterm-typed")
+
+        # The set-uid helper against a local user's symlinks (xappattack):
+        # nothing it does as root may follow them.
+        out = self.sh("/xappattack xterm", timeout=60)
+        if "[xappattack] PASS" not in out or "cannot plant" in out:
+            self.fail("xapp followed a user's symlink as root:\n" + out[-600:])
+        else:
+            self.notes.append("xappattack: xapp follows no planted symlink")
 
         xe = step("xeyes", self.launch, "xeyes", "")
         self.inp.move_to(xe["rect"][0] + 5, xe["rect"][1] + 5)

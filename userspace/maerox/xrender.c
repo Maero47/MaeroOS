@@ -435,8 +435,19 @@ static void cov_span(covbuf_t *cb, int row, double xl, double xr) {
 typedef struct { double x, y; } fpt_t;
 
 /* A convex polygon (trapezoid or triangle) between ytop and ybot. */
+/* Rows outside the coverage buffer contribute nothing: clamp the walk to it
+ * (a trapezoid 65535 rows tall cost every row of every sub-row before). */
+static void cov_rows(const covbuf_t *cb, double top, double bot, int *y0, int *y1) {
+    double a = floor(top), b = ceil(bot);
+    if (a < cb->y) a = cb->y;
+    if (b > cb->y + cb->h) b = cb->y + cb->h;
+    *y0 = (int)a; *y1 = b > a ? (int)b : (int)a;
+}
+
 static void cov_convex(covbuf_t *cb, const fpt_t *p, int n, double ytop, double ybot) {
-    int y0 = (int)floor(ytop), y1 = (int)ceil(ybot);
+    int y0, y1;
+    if (!(ybot > ytop)) return;
+    cov_rows(cb, ytop, ybot, &y0, &y1);
     for (int y = y0; y < y1; y++) {
         for (int s = 0; s < SUBROWS; s++) {
             double sy = y + (s + 0.5) / SUBROWS;
@@ -464,7 +475,8 @@ static void cov_trap(covbuf_t *cb, const uint8_t *t) {
     double l1x = fx2d(r32(t + 8)), l1y = fx2d(r32(t + 12)), l2x = fx2d(r32(t + 16)), l2y = fx2d(r32(t + 20));
     double r1x = fx2d(r32(t + 24)), r1y = fx2d(r32(t + 28)), r2x = fx2d(r32(t + 32)), r2y = fx2d(r32(t + 36));
     if (bot <= top || l1y == l2y || r1y == r2y) return;
-    int y0 = (int)floor(top), y1 = (int)ceil(bot);
+    int y0, y1;
+    cov_rows(cb, top, bot, &y0, &y1);
     for (int y = y0; y < y1; y++)
         for (int s = 0; s < SUBROWS; s++) {
             double sy = y + (s + 0.5) / SUBROWS;

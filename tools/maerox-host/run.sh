@@ -31,6 +31,7 @@ if [ "$1" = inner ]; then
     mkdir -p /tmp/.X11-unix && mount -t tmpfs none /tmp/.X11-unix
     mount --rbind /dev "$ROOTFS/dev"; mount -t proc proc "$ROOTFS/proc"
     mount -t tmpfs none "$ROOTFS/tmp"
+    mkdir -p "$ROOTFS/tmp/.X11-unix" && mount --bind /tmp/.X11-unix "$ROOTFS/tmp/.X11-unix"
     HX_CTL=$OUT/ctl "$OUT/maerox" -x -g 1000x700 -L "$OUT/maerox.log" 1 > "$OUT/maerox.out" 2>&1 &
     sleep 0.5
     chroot "$ROOTFS" /usr/bin/env -i PATH=/usr/bin:/bin HOME=/root DISPLAY=:0 LANG=C.UTF-8 \

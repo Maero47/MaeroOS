@@ -211,3 +211,4 @@ ports/alpine/cache/
 build/
 disk-alpine.img
 disk-alpinex.img
+/testfiles/xappattack

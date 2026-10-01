@@ -498,7 +498,7 @@ void configure_window(window_t *w, int x, int y, int ww, int hh, int bw, int syn
  * Opposite are treated as Above/Below/toggle without the occlusion test. */
 static void restack(window_t *w, window_t *sib, int mode) {
     if (!w->parent) return;
-    if (sib && sib->parent != w->parent) return;
+    if (sib && (sib == w || sib->parent != w->parent)) return;
     if (mode == 4) mode = (w->above == NULL) ? 1 : 0;
     if (mode == 2) mode = 0;
     if (mode == 3) mode = 1;
@@ -1245,9 +1245,20 @@ static void do_configure(client_t *c, const uint8_t *q, int qlen) {
     if (mask & 0x04) { ww = (int)r16(v); v += 4; }
     if (mask & 0x08) { hh = (int)r16(v); v += 4; }
     if (mask & 0x10) { bw = (int)r16(v); v += 4; }
-    if (mask & 0x20) { sib = lookup_window(r32(v)); v += 4; }
+    if (mask & 0x20) {
+        sib = lookup_window(r32(v));
+        if (!sib) { x_error(c, BadWindow, r32(v)); return; }
+        v += 4;
+    }
     if (mask & 0x40) { stack = v[0]; v += 4; }
     if (w == root) return;
+    /* Xorg ConfigureWindow: a sibling needs a stack mode, must be a sibling
+     * and not the window itself (that made the sibling list a cycle). */
+    if (sib && (stack < 0 || sib == w || sib->parent != w->parent)) {
+        x_error(c, BadMatch, sib->d.o.id);
+        return;
+    }
+    if (stack > 4) { x_error(c, BadValue, (uint32_t)stack); return; }
     if (w->wm_max && w->parent == root) {      /* kiosk: the toplevel stays full screen */
         x = 0; y = 0; ww = scr_w; hh = scr_h;
     }
@@ -1255,11 +1266,30 @@ static void do_configure(client_t *c, const uint8_t *q, int qlen) {
     configure_window(w, x, y, ww, hh, bw, w->parent == root && !w->override_redirect);
 }
 
+/* The tree walks (destroy, compositing, event delivery) recurse per level:
+ * nesting is capped so a client cannot overflow the server's stack.  Real
+ * toolkits nest a few tens deep. */
+#define MAX_WINDOW_DEPTH 256
+static int window_depth(window_t *w) {
+    int d = 0;
+    for (; w; w = w->parent) d++;
+    return d;
+}
+static int subtree_height(window_t *w) {
+    int h = 0;
+    for (window_t *ch = w->bottom; ch; ch = ch->above) {
+        int t = subtree_height(ch);
+        if (t > h) h = t;
+    }
+    return h + 1;
+}
+
 static void do_reparent(client_t *c, const uint8_t *q) {
     window_t *w = req_window(c, r32(q + 4));
     window_t *p = req_window(c, r32(q + 8));
     if (!w || !p) return;
     if (w == root || window_is_ancestor(w, p)) { x_error(c, BadMatch, 0); return; }
+    if (window_depth(p) + subtree_height(w) > MAX_WINDOW_DEPTH) { x_error(c, BadAlloc, w->d.o.id); return; }
     int was_mapped = w->mapped;
     if (was_mapped) unmap_window(w);
     unlink_sibling(w);
@@ -1486,6 +1516,7 @@ void core_dispatch(client_t *c, const uint8_t *q, int qlen) {
         if (!res_check_new(c, wid)) return;
         window_t *p = req_window(c, r32(q + 8));
         if (!p) return;
+        if (window_depth(p) >= MAX_WINDOW_DEPTH) { x_error(c, BadAlloc, wid); return; }
         int cls = (int)r16(q + 22);
         if (cls == 0) cls = p->cls ? p->cls : 1;
         window_t *w = window_new(wid, c->index, p, rs16(q + 12), rs16(q + 14),

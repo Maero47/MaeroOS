@@ -75,10 +75,14 @@ gc_t *gc_new(uint32_t id, int owner, int depth) {
     return g;
 }
 
+/* Take the new reference before dropping the old one: with p == *slot (a
+ * GC copied onto itself, or the same pixmap set twice) dropping first could
+ * free the pixmap that is about to be stored. */
 static void gc_set_pixmap(pixmap_t **slot, pixmap_t *p) {
-    if (*slot) drawable_unref(*slot);
-    *slot = p;
+    pixmap_t *old = *slot;
     if (p) p->refs++;
+    *slot = p;
+    if (old) drawable_unref(old);
 }
 
 void gc_free(gc_t *g) {
@@ -120,7 +124,12 @@ int gc_change(client_t *c, gc_t *g, uint32_t mask, const uint8_t *v, int nvals) 
         }
         case 12: g->ts_x = (int)(int16_t)val; break;
         case 13: g->ts_y = (int)(int16_t)val; break;
-        case 14: g->font = val; break;
+        case 14: {                    /* must be a font, never a GC (font_of would chase it) */
+            xobj_t *o = res_lookup(val);
+            if (!o || o->type != XT_FONT) { x_error(c, BadFont, val); return -1; }
+            g->font = val;
+            break;
+        }
         case 15: g->subwindow_mode = (int)val; break;
         case 16: g->graphics_exposures = (int)(val & 1); break;
         case 17: g->clip_x = (int)(int16_t)val; break;
@@ -328,6 +337,26 @@ static void fill_polygon(drawable_t *d, gc_t *g, const dpt_t *p, int n, int wind
 
 /* ── lines ───────────────────────────────────────────────────────────────── */
 static void thin_line(drawable_t *d, gc_t *g, int x0, int y0, int x1, int y1, int last) {
+    /* Clip the segment to one pixel around the drawable first (Liang-Barsky):
+     * a PolyLine of many 65535-long segments far outside it walked every
+     * Bresenham step of each and stalled the server. */
+    {
+        double t0 = 0, t1 = 1, fx = x0, fy = y0, ex = x1 - x0, ey = y1 - y0;
+        double pp[4] = { -ex, ex, -ey, ey };
+        double qq[4] = { fx + 1, (double)d->w - fx, fy + 1, (double)d->h - fy };
+        for (int i = 0; i < 4; i++) {
+            if (pp[i] == 0) { if (qq[i] < 0) return; continue; }
+            double t = qq[i] / pp[i];
+            if (pp[i] < 0) { if (t > t1) return; if (t > t0) t0 = t; }
+            else { if (t < t0) return; if (t < t1) t1 = t; }
+        }
+        if (t0 > 0 || t1 < 1) {
+            int nx0 = (int)lround(fx + t0 * ex), ny0 = (int)lround(fy + t0 * ey);
+            int nx1 = (int)lround(fx + t1 * ex), ny1 = (int)lround(fy + t1 * ey);
+            if (t1 < 1) last = 1;            /* the real end is off the drawable */
+            x0 = nx0; y0 = ny0; x1 = nx1; y1 = ny1;
+        }
+    }
     int dx = abs(x1 - x0), dy = -abs(y1 - y0);
     int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
     int err = dx + dy;
@@ -743,6 +772,7 @@ void draw_dispatch(client_t *c, const uint8_t *q, int qlen) {
     case 57: {                                                 /* CopyGC */
         gc_t *s = lookup_gc(r32(q + 4)), *t = lookup_gc(r32(q + 8));
         if (!s || !t) { x_error(c, BadGC, s ? r32(q + 8) : r32(q + 4)); return; }
+        if (s == t || s->depth != t->depth) { x_error(c, BadMatch, r32(q + 8)); return; }
         gc_copy(t, s, r32(q + 12));
         break;
     }

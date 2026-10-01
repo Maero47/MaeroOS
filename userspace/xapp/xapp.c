@@ -19,6 +19,15 @@
  * configured repositories, whose signatures apk verifies.  Apps run with the
  * caller's uid and gid: the root is entered first, then the privileges are
  * dropped for good before the app is executed.
+ *
+ * As root it touches only root-owned places: the Alpine root's /etc/passwd
+ * and /etc/group (rewritten through an O_EXCL temporary and rename), the
+ * user's home directory under the root-owned /home (created there, never
+ * chowned when it already exists), /disk/apps (O_NOFOLLOW) and the desktop's
+ * FIFO (O_NOFOLLOW, must be a FIFO).  Everything in a directory the user can
+ * write — the log in the 1777 /tmp, the runtime dir, ~/.config and the other
+ * XDG dirs — is made after the privileges are gone, so a symlink planted
+ * there can only lead to what the user could reach anyway.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -71,8 +80,12 @@ static int x_up(void) {
 }
 
 static void notify_desktop(const char *cmd) {
-    int fd = open("/tmp/wmctl", O_WRONLY | O_NONBLOCK);
+    /* /tmp is world-writable: never follow a link there, and write only into
+     * the desktop's FIFO, not a file someone put in its place. */
+    int fd = open("/tmp/wmctl", O_WRONLY | O_NONBLOCK | O_NOFOLLOW);
     if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISFIFO(st.st_mode)) { close(fd); return; }
     char line[64];
     int n = snprintf(line, sizeof(line), "%s\n", cmd);
     write(fd, line, (size_t)n);
@@ -114,11 +127,13 @@ static int split(char *s, char **argv, int max, int at) {
 
 static int write_manifest(const xapp_t *a) {
     char dir[96], path[128], buf[256];
-    mkdir(APPS_DIR, 0775);
+    struct stat st;
+    mkdir(APPS_DIR, 0755);
     snprintf(dir, sizeof(dir), APPS_DIR "/%s", a->name);
     mkdir(dir, 0755);
+    if (lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != 0) return -1;
     snprintf(path, sizeof(path), "%s/manifest", dir);
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
     if (fd < 0) return -1;
     int n = snprintf(buf, sizeof(buf), "exec=" XAPP_HELPER "\nargs=%s\ntitle=%s\nalpine=1\n",
                      a->name, a->title);
@@ -166,16 +181,33 @@ static int do_remove(const xapp_t *a) {
     return 0;
 }
 
+/* A user name safe to put in passwd and in a path: [a-z_][a-z0-9_-]{0,30}. */
+static int valid_user_name(const char *u) {
+    if (!*u || !((*u >= 'a' && *u <= 'z') || *u == '_')) return 0;
+    int n = 0;
+    for (; *u; u++, n++)
+        if (!((*u >= 'a' && *u <= 'z') || (*u >= '0' && *u <= '9') || *u == '_' || *u == '-'))
+            return 0;
+    return n <= 31;
+}
+
 /* The caller's uid needs a name inside the Alpine root too: GLib, xterm and
  * the shell look the user up with getpwuid() and fall back badly without one
- * (no home directory, "I have no name!").  Appends "<user>:x:<uid>:<gid>"
- * to the root's /etc/passwd and /etc/group when the id is not there yet. */
+ * (no home directory, "I have no name!").  Adds "<user>:x:<uid>:<gid>..." to
+ * the root's /etc/passwd or /etc/group when the id is not there yet.  The
+ * file is root's in a root-only directory; the new version is written to an
+ * O_EXCL|O_NOFOLLOW temporary next to it and renamed over it. */
 static void ensure_account(const char *file, const char *line, unsigned id) {
-    char buf[8192];
-    int fd = open(file, O_RDONLY);
-    int n = fd >= 0 ? (int)read(fd, buf, sizeof(buf) - 1) : -1;
-    if (fd >= 0) close(fd);
-    if (n < 0) return;
+    static char buf[16384];
+    int fd = open(file, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != 0) { close(fd); return; }
+    int n = 0, r;
+    while (n < (int)sizeof(buf) - 1 && (r = (int)read(fd, buf + n, sizeof(buf) - 1 - (size_t)n)) > 0)
+        n += r;
+    close(fd);
+    if (n >= (int)sizeof(buf) - 1) return;          /* too big to be ours: leave it */
     buf[n] = 0;
     char key[24];
     snprintf(key, sizeof(key), ":x:%u:", id);
@@ -185,11 +217,26 @@ static void ensure_account(const char *file, const char *line, unsigned id) {
         if (k && (!nl || k < nl) && memchr(l, ':', (size_t)(k - l + 1)) == k) return;
         l = nl ? nl + 1 : NULL;
     }
-    fd = open(file, O_WRONLY | O_APPEND);
+    char tmp[96];
+    snprintf(tmp, sizeof(tmp), "%s.xapp", file);
+    unlink(tmp);
+    fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, st.st_mode & 0777);
     if (fd < 0) return;
-    if (n > 0 && buf[n - 1] != '\n') write(fd, "\n", 1);
-    write(fd, line, strlen(line));
+    int ok = write(fd, buf, (size_t)n) == n;
+    if (ok && n > 0 && buf[n - 1] != '\n') ok = write(fd, "\n", 1) == 1;
+    if (ok) ok = write(fd, line, strlen(line)) == (int)strlen(line);
     close(fd);
+    if (!ok || rename(tmp, file) != 0) unlink(tmp);
+}
+
+/* Make dir (under a root-owned parent) for the user: a fresh directory is
+ * the caller's; an existing one must already be a real directory of theirs,
+ * and is never chowned (it could be anything the user pointed it at). */
+static int user_dir_as_root(const char *dir, uid_t uid, gid_t gid) {
+    if (mkdir(dir, 0700) == 0) return chown(dir, uid, gid);
+    struct stat st;
+    if (lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != uid) return -1;
+    return 0;
 }
 
 /* Enter the Alpine root, become the caller and exec the app.  Only returns
@@ -202,6 +249,7 @@ static void exec_app(const xapp_t *a, uid_t uid, gid_t gid, int wait_server) {
     if (uid != 0) {
         struct passwd *pw = getpwuid(uid);
         snprintf(user, sizeof(user), "%s", pw && pw->pw_name ? pw->pw_name : "user");
+        if (!valid_user_name(user)) snprintf(user, sizeof(user), "user%u", (unsigned)uid);
         snprintf(home, sizeof(home), "/home/%s", user);
     }
     char path[128];
@@ -212,44 +260,52 @@ static void exec_app(const xapp_t *a, uid_t uid, gid_t gid, int wait_server) {
         ensure_account(ALPINE_ROOT "/etc/passwd", line, (unsigned)uid);
         snprintf(line, sizeof(line), "%s:x:%u:\n", user, (unsigned)gid);
         ensure_account(ALPINE_ROOT "/etc/group", line, (unsigned)gid);
+        /* /home is root's: the home itself is the only thing made as root. */
+        mkdir(ALPINE_ROOT "/home", 0755);
+        snprintf(path, sizeof(path), ALPINE_ROOT "%s", home);
+        if (user_dir_as_root(path, uid, gid) != 0)
+            printf("xapp: %s is not a directory of uid %u\n", path, (unsigned)uid);
     }
-    snprintf(path, sizeof(path), ALPINE_ROOT "%s", home);
-    mkdir(ALPINE_ROOT "/home", 0755);
-    if (mkdir(path, 0700) == 0 || errno == EEXIST) chown(path, uid, gid);
-    /* XDG directories apps expect to exist (galculator does not create
-     * ~/.config itself and then cannot keep its settings). */
-    static const char *const xdg[] = { "/.config", "/.cache", "/.local", "/.local/share" };
-    for (unsigned i = 0; i < sizeof(xdg) / sizeof(xdg[0]); i++) {
-        char sub[160];
-        snprintf(sub, sizeof(sub), "%s%s", path, xdg[i]);
-        if (mkdir(sub, 0700) == 0) chown(sub, uid, gid);
-    }
-    snprintf(rt, sizeof(rt), "/tmp/runtime-%u", (unsigned)uid);
-    snprintf(path, sizeof(path), ALPINE_ROOT "%s", rt);
-    if (mkdir(path, 0700) == 0 || errno == EEXIST) chown(path, uid, gid);
 
-    /* The app's own output goes to /tmp/xapp-<name>.log in the root. */
-    snprintf(logp, sizeof(logp), ALPINE_ROOT "/tmp/xapp-%s.log", a->name);
-    int lfd = open(logp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (lfd >= 0) {
-        fchown(lfd, uid, gid);
-        dup2(lfd, 1);
-        dup2(lfd, 2);
-        if (lfd > 2) close(lfd);
-    }
-    int nfd = open("/dev/null", O_RDONLY);
+    int nfd = open("/dev/null", O_RDWR);
     if (nfd >= 0) { dup2(nfd, 0); if (nfd > 0) close(nfd); }
 
     if (chroot(ALPINE_ROOT) != 0 || chdir("/") != 0) {
         printf("xapp: cannot enter " ALPINE_ROOT " (%d)\n", errno);
         return;
     }
-    chdir(home);
     gid_t none[1] = { gid };
     if (setgroups(1, none) != 0 || setgid(gid) != 0 || setuid(uid) != 0 ||
-        getuid() != (int)uid || geteuid() != (int)uid || (uid != 0 && setuid(0) == 0)) {
+        getuid() != (int)uid || geteuid() != (int)uid || getegid() != (int)gid ||
+        (uid != 0 && setuid(0) == 0)) {
         printf("xapp: cannot drop privileges\n");
         return;
+    }
+
+    /* From here on as the caller: what follows lives in places the caller
+     * can write (the 1777 /tmp, their home). */
+    if (chdir(home) != 0) chdir("/");
+    /* XDG directories apps expect to exist (galculator does not create
+     * ~/.config itself and then cannot keep its settings). */
+    static const char *const xdg[] = { ".config", ".cache", ".local", ".local/share" };
+    for (unsigned i = 0; i < sizeof(xdg) / sizeof(xdg[0]); i++) mkdir(xdg[i], 0700);
+    snprintf(rt, sizeof(rt), "/tmp/runtime-%u", (unsigned)uid);
+    struct stat st;
+    if (mkdir(rt, 0700) != 0 &&
+        (lstat(rt, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != uid))
+        snprintf(rt, sizeof(rt), "/tmp");          /* someone else's: do without */
+
+    /* The app's own output goes to /tmp/xapp-<name>.log in the root. */
+    snprintf(logp, sizeof(logp), "/tmp/xapp-%s.log", a->name);
+    int lfd = open(logp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
+    if (lfd < 0) {                                 /* not ours: start afresh */
+        unlink(logp);
+        lfd = open(logp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+    }
+    if (lfd >= 0) {
+        dup2(lfd, 1);
+        dup2(lfd, 2);
+        if (lfd > 2) close(lfd);
     }
 
     char cmd[160];

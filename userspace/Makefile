@@ -66,7 +66,7 @@ USER_BINS := $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
      $(TESTFILES)/reboot $(TESTFILES)/shutdown $(TESTFILES)/poweroff $(TESTFILES)/halt \
      $(TESTFILES)/sudo $(TESTFILES)/whoami $(TESTFILES)/uname $(TESTFILES)/clear $(TESTFILES)/hostname \
      $(TESTFILES)/which $(TESTFILES)/free $(TESTFILES)/uptime $(TESTFILES)/du $(TESTFILES)/df $(TESTFILES)/top $(TESTFILES)/wget $(TESTFILES)/bbwrap \
-     $(TESTFILES)/maerox $(TESTFILES)/ff $(TESTFILES)/gfxbench $(TESTFILES)/xapp $(TESTFILES)/linuxapps \
+     $(TESTFILES)/maerox $(TESTFILES)/ff $(TESTFILES)/gfxbench $(TESTFILES)/xapp $(TESTFILES)/linuxapps $(TESTFILES)/xappattack \
      $(TESTFILES)/kwprobe $(TESTFILES)/libctest $(TESTFILES)/wxprobe
 
 all: $(USER_BINS) $(MUSL_BINS)
@@ -706,6 +706,8 @@ $(TESTFILES)/view: view/view.o $(GUIAPP_DEPS)
 xapp/xapp.o xapp/linuxapps.o: xapp/xapps.h
 $(TESTFILES)/xapp: xapp/xapp.o $(CRT0_OBJ) libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) xapp/xapp.o libc/libc.a
+$(TESTFILES)/xappattack: xapp/xappattack.o $(CRT0_OBJ) libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) xapp/xappattack.o libc/libc.a
 $(TESTFILES)/linuxapps: xapp/linuxapps.o $(GUIAPP_DEPS)
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) xapp/linuxapps.o libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o libwm/wm.o libc/libc.a
 
