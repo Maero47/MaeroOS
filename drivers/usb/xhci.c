@@ -181,6 +181,7 @@ struct usb_device {
     int intr_dci;
     int intr_mps;
     int intr_active;
+    int reported;        /* logged the first report */
     /* control transfer in flight */
     uint32_t ctl_data_trb, ctl_status_trb;
     uint32_t ctl_residual;
@@ -591,6 +592,11 @@ static void hid_transfer_done(struct usb_device *d, int code,
         uint32_t got = (uint32_t)d->intr_mps -
                        (residual <= (uint32_t)d->intr_mps ? residual
                                                           : (uint32_t)d->intr_mps);
+        if (!d->reported) {
+            d->reported = 1;
+            printk("[USB] slot %d: first %s report\n", d->slot,
+                   hid_kind_name(d->hid.kind));
+        }
         hid_report(&d->hid, d->dma->report, got);
         queue_report(d);
     } else {

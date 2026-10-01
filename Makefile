@@ -129,7 +129,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui check abiprobes smoke-abi smoke-firefox smoke-firefox-web repo repo-serve start resolutions icons
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-fw smoke-disk smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-usb check abiprobes smoke-abi smoke-firefox smoke-firefox-web repo repo-serve start resolutions icons
 
 all: $(TARGET)
 
@@ -352,6 +352,12 @@ smoke-gtk: $(TARGET) initrd
 smoke-gui: $(TARGET) iso disk
 	python3 tools/smoke_gui.py
 
+# The desktop driven with USB input only: qemu-xhci with usb-kbd, usb-tablet
+# and usb-mouse (drivers/usb/), including a login typed on the USB keyboard.
+# Output in build/smoke-usb/; see tools/smoke_usb.py.
+smoke-usb: $(TARGET) iso disk
+	python3 tools/smoke_usb.py
+
 # The headless suites CI runs (.github/workflows/ci.yml), in one command.
 # Each suite's console goes to $(CHECK_LOG_DIR)/<suite>.log; a failure prints
 # the tail of its log and the rest still run, then check exits non-zero.
@@ -360,7 +366,7 @@ smoke-gui: $(TARGET) iso disk
 # with -display none (tools/smokelib.py), so no display is needed.
 # Pick a subset with CHECK_SUITES="smoke smoke-x".
 CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-fw \
-                 smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui
+                 smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui smoke-usb
 CHECK_LOG_DIR ?= build/check
 
 # repo: smoke-pkg serves packages from repo/ (see the smoke-pkg target).
