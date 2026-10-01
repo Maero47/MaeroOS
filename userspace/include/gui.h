@@ -3,7 +3,7 @@
 #include <draw.h>
 #include <wm.h>
 
-#define GUI_MAX_WIDGETS 40
+#define GUI_MAX_WIDGETS 64
 #define GUI_MAX_ICONDEFS 8
 #define GUI_MAX_LABEL 40
 #define GUI_INPUT_MAX 64
@@ -17,7 +17,10 @@
 typedef struct gui_window gui_window_t;
 typedef void (*gui_button_cb)(gui_window_t *gui, int id);
 typedef void (*gui_layout_cb)(gui_window_t *gui);
-/* Raw input hooks for apps that render their own content (terminals etc.) */
+/* Raw input hooks for apps that render their own content (terminals etc.).
+ * `ascii` is the Unicode code point the keyboard layout gives the key (Ctrl
+ * folded into control bytes; >= 128 for letters like ş); gui->key_mods holds
+ * the WM_MOD_* mask while the hook runs. */
 typedef void (*gui_key_cb)(gui_window_t *gui, int code, int value, int ascii);
 /* Uncooked keys: every press and release, modifier keys included, with the
  * live WM_MOD_* mask.  Set this instead of the cooked hook when the app is
@@ -26,6 +29,9 @@ typedef void (*gui_key_cb)(gui_window_t *gui, int code, int value, int ascii);
 typedef void (*gui_rawkey_cb)(gui_window_t *gui, int code, int value, int mods);
 typedef void (*gui_scroll_cb)(gui_window_t *gui, int delta);
 typedef void (*gui_click_cb)(gui_window_t *gui, int x, int y);
+/* Every mouse event in body coordinates: press, drag motion (buttons held)
+ * and release (buttons = 0).  Takes precedence over the click hook. */
+typedef void (*gui_mouse_cb)(gui_window_t *gui, int x, int y, int buttons);
 
 enum {
     GUI_WIDGET_PANEL = 1,
@@ -76,11 +82,13 @@ struct gui_window {
     int focus_id;             /* widget with keyboard focus (0 = none) */
     int mouse_down;           /* left button held inside the window */
     int drag_id;              /* widget being dragged (scrollbar), 0 = none */
+    int key_mods;             /* WM_MOD_* mask of the key being delivered */
     gui_layout_cb layout;
     gui_key_cb on_key;        /* cooked key hook (bypasses widget routing) */
     gui_rawkey_cb on_rawkey;  /* uncooked key hook (press + release + mods) */
     gui_scroll_cb on_scroll;  /* raw wheel hook (when no widget is hit) */
     gui_click_cb on_click;    /* raw click hook (bypasses widget routing) */
+    gui_mouse_cb on_mouse;    /* raw mouse hook (press/drag/release) */
     char bg[12];
     gui_widget_t widgets[GUI_MAX_WIDGETS];
     int widget_count;
@@ -143,11 +151,22 @@ int gui_icondef_mic(gui_window_t *gui, int index, const char *path,
  * the shown icon later via gui_find(gui,id)->value. */
 int gui_image(gui_window_t *gui, int id, int x, int y, int index);
 
+/* Shared clipboard (all of a user's apps): the text lives in a private
+ * per-user directory ($HOME/.clipboard or /tmp/.clipboard-<uid>) and the
+ * desktop is told about each change.  get returns the length copied (the
+ * buffer is NUL-terminated), 0 when the clipboard is empty. */
+int gui_clipboard_set(gui_window_t *gui, const char *text, int len);
+int gui_clipboard_get(char *buf, int max);
+
 void gui_set_layout(gui_window_t *gui, gui_layout_cb callback);
 void gui_set_key_handler(gui_window_t *gui, gui_key_cb callback);
 void gui_set_rawkey_handler(gui_window_t *gui, gui_rawkey_cb callback);
 void gui_set_scroll_handler(gui_window_t *gui, gui_scroll_cb callback);
 void gui_set_click_handler(gui_window_t *gui, gui_click_cb callback);
+void gui_set_mouse_handler(gui_window_t *gui, gui_mouse_cb callback);
+/* on: deliver Escape to this window instead of letting it close the
+ * window; off: Escape closes it again (the default). */
+void gui_grab_escape(gui_window_t *gui, int on);
 int gui_body_width(const gui_window_t *gui);
 int gui_body_height(const gui_window_t *gui);
 int gui_draw(gui_window_t *gui);

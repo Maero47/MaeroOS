@@ -156,7 +156,10 @@ static int parse_event_line(const char *line, wm_event_t *event) {
         event->button = c;
         return 1;
     }
-    if (sscanf(line, "key %d %d %d %d", &slot, &a, &b, &c) == 4) {
+    /* "key": ascii is the layout's Unicode code point (>= 128 for letters
+     * like ş), mods the WM_MOD_* mask (absent from older desktops). */
+    if (sscanf(line, "key %d %d %d %d %d", &slot, &a, &b, &c,
+               &event->mods) >= 4) {
         event->type = WM_EVENT_KEY;
         event->slot = slot;
         event->code = a;

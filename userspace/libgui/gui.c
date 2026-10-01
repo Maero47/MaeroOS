@@ -1,8 +1,11 @@
+#include <fcntl.h>
 #include <gui.h>
 #include <linux/input.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <syscall.h>
 #include <unistd.h>
 
@@ -321,6 +324,14 @@ void gui_set_key_handler(gui_window_t *gui, gui_key_cb callback) {
     gui->on_key = callback;
 }
 
+void gui_set_mouse_handler(gui_window_t *gui, gui_mouse_cb callback) {
+    if (gui) gui->on_mouse = callback;
+}
+
+void gui_grab_escape(gui_window_t *gui, int on) {
+    if (gui) wm_command(&gui->wm, "grabesc %d %d", gui->slot, on ? 1 : 0);
+}
+
 void gui_set_click_handler(gui_window_t *gui, gui_click_cb callback) {
     if (!gui) return;
     gui->on_click = callback;
@@ -471,6 +482,10 @@ static void handle_mouse(gui_window_t *gui, const wm_event_t *event) {
     int motion = event->button && gui->mouse_down;
 
     gui->mouse_down = event->button ? 1 : 0;
+    if (gui->on_mouse) {
+        gui->on_mouse(gui, x, y, event->button);
+        return;
+    }
 
     if (!event->button) {              /* release ends any drag */
         gui->drag_id = 0;
@@ -569,10 +584,94 @@ static void handle_scroll(gui_window_t *gui, const wm_event_t *event) {
     }
 }
 
+/* The clipboard lives in a directory only its user can enter:
+ * $HOME/.clipboard, else /tmp/.clipboard-<uid>.  A fixed name in the shared
+ * /tmp would let another user plant a symlink at the temp file (and have a
+ * copy overwrite a file of ours) or own the clipboard file itself (and feed
+ * us text that a terminal paste runs as commands). */
+static int clipboard_dir(char *out, int size) {
+    const char *home = getenv("HOME");
+    struct stat st;
+    int uid = getuid();
+
+    if (home && home[0] == '/' && stat(home, &st) == 0 &&
+        S_ISDIR(st.st_mode) && (int)st.st_uid == uid)
+        snprintf(out, (size_t)size, "%s/.clipboard", home);
+    else
+        snprintf(out, (size_t)size, "/tmp/.clipboard-%d", uid);
+    mkdir(out, 0700);                 /* EEXIST is fine: checked below */
+    /* Not a symlink, ours, and closed to everyone else. */
+    if (lstat(out, &st) < 0 || !S_ISDIR(st.st_mode) ||
+        (int)st.st_uid != uid || (st.st_mode & 077))
+        return -1;
+    return 0;
+}
+
+int gui_clipboard_set(gui_window_t *gui, const char *text, int len) {
+    char dir[200], tmp[240], path[240];
+    static int seq;
+    int fd, n;
+
+    if (!text || len < 0 || clipboard_dir(dir, sizeof(dir)) < 0) return -1;
+    snprintf(path, sizeof(path), "%s/clip", dir);
+    snprintf(tmp, sizeof(tmp), "%s/.new-%d-%d", dir, getpid(), seq++);
+    /* Write a fresh file and rename it in, so a reader never sees half. */
+    unlink(tmp);
+    fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) return -1;
+    n = len ? (int)write(fd, text, (size_t)len) : 0;
+    close(fd);
+    if (n != len || rename(tmp, path) < 0) {
+        unlink(tmp);
+        return -1;
+    }
+    if (gui) wm_command(&gui->wm, "clip %d bytes", len);
+    return 0;
+}
+
+int gui_clipboard_get(char *buf, int max) {
+    char dir[200], path[240];
+    struct stat st;
+    int fd, total = 0, n;
+
+    if (!buf || max <= 0) return 0;
+    buf[0] = 0;
+    if (clipboard_dir(dir, sizeof(dir)) < 0) return 0;
+    snprintf(path, sizeof(path), "%s/clip", dir);
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) ||
+        (int)st.st_uid != getuid()) {
+        close(fd);
+        return 0;
+    }
+    while (total < max - 1 &&
+           (n = (int)read(fd, buf + total, (size_t)(max - 1 - total))) > 0)
+        total += n;
+    close(fd);
+    buf[total] = 0;
+    return total;
+}
+
+/* Append a code point to a text input as UTF-8 (if it fits). */
+static int input_append(gui_widget_t *w, unsigned cp) {
+    char u[4];
+    int n;
+
+    if (cp < 32 || cp == 127) return 0;
+    n = draw_utf8_encode(cp, u);
+    if (w->input_len + n >= (int)sizeof(w->input)) return 0;
+    memcpy(w->input + w->input_len, u, (size_t)n);
+    w->input_len += n;
+    w->input[w->input_len] = 0;
+    return 1;
+}
+
 static void handle_key(gui_window_t *gui, const wm_event_t *event) {
     gui_widget_t *w;
 
     if (event->value != 1) return;        /* presses only */
+    gui->key_mods = event->mods;
     if (gui->on_key) {
         gui->on_key(gui, event->code, event->value, event->ascii);
         return;
@@ -583,7 +682,11 @@ static void handle_key(gui_window_t *gui, const wm_event_t *event) {
 
     if (event->code == KEY_BACKSPACE) {
         if (w->input_len) {
-            w->input[--w->input_len] = 0;
+            /* Drop a whole UTF-8 sequence, not one byte of it. */
+            do w->input_len--;
+            while (w->input_len &&
+                   ((unsigned char)w->input[w->input_len] & 0xC0) == 0x80);
+            w->input[w->input_len] = 0;
             gui_draw(gui);
         }
         return;
@@ -592,12 +695,16 @@ static void handle_key(gui_window_t *gui, const wm_event_t *event) {
         if (w->callback) w->callback(gui, w->id);
         return;
     }
-    if (event->ascii >= 32 && event->ascii < 127 &&
-        w->input_len + 1 < (int)sizeof(w->input)) {
-        w->input[w->input_len++] = (char)event->ascii;
-        w->input[w->input_len] = 0;
+    if (event->ascii == 22) {             /* Ctrl+V: paste the first line */
+        char clip[GUI_INPUT_MAX];
+        const char *p = clip;
+        gui_clipboard_get(clip, sizeof(clip));
+        while (*p && *p != '\n') input_append(w, draw_utf8_next(&p));
         gui_draw(gui);
+        return;
     }
+    if (event->ascii >= 32 && input_append(w, (unsigned)event->ascii))
+        gui_draw(gui);
 }
 
 int gui_poll(gui_window_t *gui) {
@@ -626,8 +733,11 @@ int gui_poll(gui_window_t *gui) {
             gui->width = event.w;
             gui->height = event.h;
             if (size_changed) {
-                /* New body size → new shared surface, then re-render. */
-                gui_make_surface(gui);
+                /* New body size → new shared surface, then re-render.  On
+                 * failure the old (smaller) surface stays in use. */
+                if (gui_make_surface(gui) < 0)
+                    gui_trace("gui", "surface %dx%d failed", gui->width,
+                              gui->height);
                 if (gui->layout)
                     gui->layout(gui);
                 gui_draw(gui);

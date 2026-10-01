@@ -101,6 +101,9 @@
 #define KEY_KP3        81
 #define KEY_KP0        82
 #define KEY_KPDOT      83
+#define KEY_102ND      86   /* ISO key left of Z: < > on TR/DE layouts */
+#define KEY_F11        87
+#define KEY_F12        88
 
 static input_event_t ring[KBD_RING_SIZE];
 static volatile uint32_t head;
@@ -135,7 +138,8 @@ static const uint16_t set1_keys[128] = {
     [0x49] = KEY_KP9,        [0x4a] = KEY_KPMINUS,    [0x4b] = KEY_KP4,
     [0x4c] = KEY_KP5,        [0x4d] = KEY_KP6,        [0x4e] = KEY_KPPLUS,
     [0x4f] = KEY_KP1,        [0x50] = KEY_KP2,        [0x51] = KEY_KP3,
-    [0x52] = KEY_KP0,        [0x53] = KEY_KPDOT,
+    [0x52] = KEY_KP0,        [0x53] = KEY_KPDOT,      [0x56] = KEY_102ND,
+    [0x57] = KEY_F11,        [0x58] = KEY_F12,
 };
 
 /* E0-prefixed scancodes: navigation cluster, the right-hand modifiers and the

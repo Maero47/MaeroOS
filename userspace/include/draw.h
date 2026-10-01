@@ -78,6 +78,16 @@ int draw_text_aa(draw_surface_t *s, int x, int y, const char *str,
                  uint32_t color, const draw_font_t *font);
 int draw_text_width(const char *str, const draw_font_t *font);
 
+/* Text is UTF-8.  Latin-1 and Turkish letters (ç ğ ı İ ö ş ü ...) are drawn
+ * as their ASCII glyph plus a painted diacritic; other code points show '?'.
+ * draw_utf8_next decodes one code point and advances *s (0 at the end). */
+unsigned draw_utf8_next(const char **s);
+int draw_utf8_encode(unsigned cp, char *out);     /* returns 1..4 bytes */
+int draw_utf8_len(const char *str);               /* code points */
+int draw_glyph(draw_surface_t *s, int x, int y, unsigned cp,
+               uint32_t color, const draw_font_t *font);
+int draw_glyph_width(unsigned cp, const draw_font_t *font);
+
 /* ── Full-color RGBA raster icons (.mic theme icons from tools/mkicons.py) ── */
 typedef struct draw_image {
     int w, h;

@@ -52,8 +52,8 @@ typedef struct {
     int button;
     int code;
     int value;
-    int ascii;
-    int mods;                 /* WM_EVENT_RAWKEY: WM_MOD_* bitmask */
+    int ascii;                /* KEY: Unicode code point (0 = none) */
+    int mods;                 /* KEY, RAWKEY: WM_MOD_* bitmask */
     int w;
     int h;
 } wm_event_t;

@@ -117,33 +117,256 @@ void draw_round_frame(draw_surface_t *s, int x, int y, int w, int h,
         }
 }
 
+/* ── UTF-8 and composed Latin letters ──────────────────────────────────
+ * The atlases only hold ASCII 32..126.  Latin-1 and Turkish letters are
+ * drawn as their ASCII base glyph plus a small diacritic painted over it
+ * (ç = c + cedilla, ğ = g + breve, İ = I + dot, ı = i without its dot), so
+ * they match the font and need no regenerated atlas. */
+
+enum { MK_NONE, MK_ACUTE, MK_GRAVE, MK_CIRC, MK_TILDE, MK_DIAER, MK_RING,
+       MK_CEDIL, MK_BREVE, MK_DOT, MK_CARON, MK_DOTLESS };
+
+/* Base letter + mark for U+00C0..U+00FF (0 = not composed). */
+static const char latin1_base[64] = {
+    'A','A','A','A','A','A', 0 ,'C','E','E','E','E','I','I','I','I',
+     0 ,'N','O','O','O','O','O', 0 , 0 ,'U','U','U','U','Y', 0 , 0 ,
+    'a','a','a','a','a','a', 0 ,'c','e','e','e','e','i','i','i','i',
+     0 ,'n','o','o','o','o','o', 0 , 0 ,'u','u','u','u','y', 0 ,'y',
+};
+static const unsigned char latin1_mark[64] = {
+    MK_GRAVE, MK_ACUTE, MK_CIRC, MK_TILDE, MK_DIAER, MK_RING, 0, MK_CEDIL,
+    MK_GRAVE, MK_ACUTE, MK_CIRC, MK_DIAER, MK_GRAVE, MK_ACUTE, MK_CIRC, MK_DIAER,
+    0, MK_TILDE, MK_GRAVE, MK_ACUTE, MK_CIRC, MK_TILDE, MK_DIAER, 0,
+    0, MK_GRAVE, MK_ACUTE, MK_CIRC, MK_DIAER, MK_ACUTE, 0, 0,
+    MK_GRAVE, MK_ACUTE, MK_CIRC, MK_TILDE, MK_DIAER, MK_RING, 0, MK_CEDIL,
+    MK_GRAVE, MK_ACUTE, MK_CIRC, MK_DIAER, MK_GRAVE, MK_ACUTE, MK_CIRC, MK_DIAER,
+    0, MK_TILDE, MK_GRAVE, MK_ACUTE, MK_CIRC, MK_TILDE, MK_DIAER, 0,
+    0, MK_GRAVE, MK_ACUTE, MK_CIRC, MK_DIAER, MK_ACUTE, 0, MK_DIAER,
+};
+
+/* Map a code point to an atlas glyph + mark.  dotless: drop the i's dot. */
+static int compose(unsigned cp, int *mark, int *dotless) {
+    *mark = MK_NONE;
+    *dotless = 0;
+    if (cp >= 32 && cp <= 126) return (int)cp;
+    if (cp >= 0xC0 && cp <= 0xFF && latin1_base[cp - 0xC0]) {
+        int base = latin1_base[cp - 0xC0];
+        *mark = latin1_mark[cp - 0xC0];
+        if (base == 'i') *dotless = 1;            /* ì í î ï */
+        return base;
+    }
+    switch (cp) {
+    case 0xA0:  return ' ';
+    case 0x11E: *mark = MK_BREVE; return 'G';
+    case 0x11F: *mark = MK_BREVE; return 'g';
+    case 0x130: *mark = MK_DOT;   return 'I';
+    case 0x131: *dotless = 1;     return 'i';
+    case 0x15E: *mark = MK_CEDIL; return 'S';
+    case 0x15F: *mark = MK_CEDIL; return 's';
+    case 0x160: *mark = MK_CARON; return 'S';
+    case 0x161: *mark = MK_CARON; return 's';
+    case 0x10C: *mark = MK_CARON; return 'C';
+    case 0x10D: *mark = MK_CARON; return 'c';
+    case 0x17D: *mark = MK_CARON; return 'Z';
+    case 0x17E: *mark = MK_CARON; return 'z';
+    case 0x2018: case 0x2019: return '\'';
+    case 0x201C: case 0x201D: return '"';
+    case 0x2013: case 0x2014: case 0x2500: return '-';
+    case 0x2502: return '|';
+    case 0x250C: case 0x2510: case 0x2514: case 0x2518: case 0x253C:
+    case 0x251C: case 0x2524: case 0x252C: case 0x2534: return '+';
+    case 0x2022: case 0xB7: return '*';
+    }
+    return '?';
+}
+
+unsigned draw_utf8_next(const char **sp) {
+    const unsigned char *s = (const unsigned char *)*sp;
+    unsigned c = *s, cp;
+    int n;
+
+    if (!c) return 0;
+    if (c < 0x80) { *sp += 1; return c; }
+    if ((c & 0xE0) == 0xC0)      { cp = c & 0x1F; n = 1; }
+    else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; n = 2; }
+    else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; n = 3; }
+    else { *sp += 1; return 0xFFFD; }
+    for (int i = 1; i <= n; i++) {
+        if ((s[i] & 0xC0) != 0x80) { *sp += i; return 0xFFFD; }
+        cp = (cp << 6) | (s[i] & 0x3F);
+    }
+    *sp += n + 1;
+    return cp;
+}
+
+int draw_utf8_encode(unsigned cp, char *out) {
+    if (cp < 0x80) { out[0] = (char)cp; return 1; }
+    if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | (cp >> 18));
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+int draw_utf8_len(const char *str) {
+    int n = 0;
+    while (str && *str) { draw_utf8_next(&str); n++; }
+    return n;
+}
+
+/* First/last rows of a glyph with real ink. */
+static void ink_rows(const draw_font_t *font, int gi, int *top, int *bot) {
+    int gw = font->widths[gi];
+    const unsigned char *ga = font->alpha + font->offsets[gi];
+    *top = font->line_h;
+    *bot = -1;
+    for (int y = 0; y < font->line_h; y++)
+        for (int x = 0; x < gw; x++)
+            if (ga[y * gw + x] > 96) {
+                if (y < *top) *top = y;
+                *bot = y;
+                break;
+            }
+}
+
+static void mark_px(draw_surface_t *s, int x, int y, uint32_t color) {
+    if (x < 0 || y < 0 || x >= s->w || y >= s->h) return;
+    s->px[y * s->w + x] = draw_blend(s->px[y * s->w + x], color, 235);
+}
+
+static void draw_mark(draw_surface_t *s, int x, int y, int gi, int mark,
+                      uint32_t color, const draw_font_t *font) {
+    int top, bot, cx, my;
+
+    ink_rows(font, gi, &top, &bot);
+    cx = x + font->widths[gi] / 2;
+    if (mark == MK_CEDIL) {
+        int by = y + bot + 1;
+        mark_px(s, cx, by, color);
+        mark_px(s, cx + 1, by + 1, color);
+        mark_px(s, cx, by + 2, color);
+        mark_px(s, cx - 1, by + 2, color);
+        return;
+    }
+    my = y + top - 4;                 /* 3-row mark, one free row above ink */
+    if (my < y) my = y;
+    switch (mark) {
+    case MK_DOT:
+        my += 1;
+        mark_px(s, cx - 1, my, color); mark_px(s, cx, my, color);
+        mark_px(s, cx - 1, my + 1, color); mark_px(s, cx, my + 1, color);
+        break;
+    case MK_DIAER: {
+        int d = font->widths[gi] >= 9 ? 2 : 1;
+        my += 1;
+        for (int k = -1; k <= 1; k += 2) {
+            int px = cx + k * (d + 1) - (k < 0);
+            mark_px(s, px, my, color); mark_px(s, px + 1, my, color);
+            mark_px(s, px, my + 1, color); mark_px(s, px + 1, my + 1, color);
+        }
+        break;
+    }
+    case MK_ACUTE:
+        mark_px(s, cx + 1, my, color); mark_px(s, cx + 2, my, color);
+        mark_px(s, cx, my + 1, color); mark_px(s, cx + 1, my + 1, color);
+        mark_px(s, cx - 1, my + 2, color);
+        break;
+    case MK_GRAVE:
+        mark_px(s, cx - 2, my, color); mark_px(s, cx - 1, my, color);
+        mark_px(s, cx - 1, my + 1, color); mark_px(s, cx, my + 1, color);
+        mark_px(s, cx + 1, my + 2, color);
+        break;
+    case MK_CIRC:
+        mark_px(s, cx, my, color);
+        mark_px(s, cx - 1, my + 1, color); mark_px(s, cx + 1, my + 1, color);
+        mark_px(s, cx - 2, my + 2, color); mark_px(s, cx + 2, my + 2, color);
+        break;
+    case MK_CARON:
+        mark_px(s, cx - 2, my, color); mark_px(s, cx + 2, my, color);
+        mark_px(s, cx - 1, my + 1, color); mark_px(s, cx + 1, my + 1, color);
+        mark_px(s, cx, my + 2, color);
+        break;
+    case MK_TILDE:
+        mark_px(s, cx - 2, my + 2, color); mark_px(s, cx - 1, my + 1, color);
+        mark_px(s, cx, my + 1, color); mark_px(s, cx + 1, my + 2, color);
+        mark_px(s, cx + 2, my + 1, color);
+        break;
+    case MK_BREVE:
+        mark_px(s, cx - 2, my, color); mark_px(s, cx + 2, my, color);
+        mark_px(s, cx - 2, my + 1, color); mark_px(s, cx + 2, my + 1, color);
+        mark_px(s, cx - 1, my + 2, color); mark_px(s, cx, my + 2, color);
+        mark_px(s, cx + 1, my + 2, color);
+        break;
+    case MK_RING:
+        mark_px(s, cx - 1, my, color); mark_px(s, cx, my, color);
+        mark_px(s, cx + 1, my, color); mark_px(s, cx - 1, my + 1, color);
+        mark_px(s, cx + 1, my + 1, color); mark_px(s, cx - 1, my + 2, color);
+        mark_px(s, cx, my + 2, color); mark_px(s, cx + 1, my + 2, color);
+        break;
+    }
+}
+
+int draw_glyph(draw_surface_t *s, int x, int y, unsigned cp,
+               uint32_t color, const draw_font_t *font) {
+    int mark, dotless;
+    int gi = compose(cp, &mark, &dotless) - 32;
+    int gw = font->widths[gi];
+    int skip = 0;
+
+    if (!s || !s->px) return gw;
+    if (dotless) {                     /* clip the dot: rows above 'x' ink */
+        int xt, xb;
+        ink_rows(font, 'x' - 32, &xt, &xb);
+        skip = xt;
+    }
+    {
+        const unsigned char *ga = font->alpha + font->offsets[gi];
+        for (int gy = skip; gy < font->line_h; gy++) {
+            int yy = y + gy;
+            if (yy < 0 || yy >= s->h) continue;
+            uint32_t *row = s->px + yy * s->w;
+            const unsigned char *arow = ga + gy * gw;
+            for (int gx = 0; gx < gw; gx++) {
+                unsigned a = arow[gx];
+                if (!a) continue;
+                int xx = x + gx;
+                if (xx >= 0 && xx < s->w)
+                    row[xx] = draw_blend(row[xx], color, a);
+            }
+        }
+    }
+    if (mark) {
+        int m = mark;
+        /* Marks over a dotless i sit at the x-height, like on other letters. */
+        draw_mark(s, x, y, dotless ? 'x' - 32 : gi, m, color, font);
+    }
+    return gw;
+}
+
+int draw_glyph_width(unsigned cp, const draw_font_t *font) {
+    int mark, dotless;
+    return font->widths[compose(cp, &mark, &dotless) - 32];
+}
+
 int draw_text_aa(draw_surface_t *s, int x, int y, const char *str,
                  uint32_t color, const draw_font_t *font) {
     int pen = x;
 
     if (!str || !font) return 0;
-    for (; *str; str++) {
-        unsigned char ch = (unsigned char)*str;
-        if (ch < 32 || ch > 126) ch = '?';
-        int gi = ch - 32;
-        int gw = font->widths[gi];
-        if (s && s->px) {
-            const unsigned char *ga = font->alpha + font->offsets[gi];
-            for (int gy = 0; gy < font->line_h; gy++) {
-                int yy = y + gy;
-                if (yy < 0 || yy >= s->h) continue;
-                uint32_t *row = s->px + yy * s->w;
-                const unsigned char *arow = ga + gy * gw;
-                for (int gx = 0; gx < gw; gx++) {
-                    unsigned a = arow[gx];
-                    if (!a) continue;
-                    int xx = pen + gx;
-                    if (xx >= 0 && xx < s->w)
-                        row[xx] = draw_blend(row[xx], color, a);
-                }
-            }
-        }
-        pen += gw;
+    while (*str) {
+        unsigned cp = draw_utf8_next(&str);
+        pen += draw_glyph(s, pen, y, cp, color, font);
     }
     return pen - x;
 }
@@ -152,10 +375,7 @@ int draw_text_width(const char *str, const draw_font_t *font) {
     int w = 0;
 
     if (!str || !font) return 0;
-    for (; *str; str++) {
-        unsigned char ch = (unsigned char)*str;
-        if (ch < 32 || ch > 126) ch = '?';
-        w += font->widths[ch - 32];
-    }
+    while (*str)
+        w += draw_glyph_width(draw_utf8_next(&str), font);
     return w;
 }

@@ -302,6 +302,43 @@ static void prime_free_count(void) {
     k_munmap(p, n * PG);
 }
 
+/* A non-root user's objects are capped at SHM_UID_MAX_PAGES (8192 for the
+ * session + 2048 for one transient surface) in all: five 2048-page objects
+ * fit, one more page is -ENOSPC, and dropping one makes room again.  Root
+ * is not capped. */
+#define QUOTA_OBJS 5
+static void test_uid_quota(void) {
+    int pid = fork();
+    if (pid == 0) {
+        int ids[QUOTA_OBJS], res = 0;
+        if (setgid(1000) || setuid(1000)) exit(64);
+        for (int i = 0; i < QUOTA_OBJS; i++) {
+            ids[i] = shm_create(2048);
+            if (ids[i] < 0) exit(1);           /* under the quota: must fit */
+        }
+        if (shm_create(1) != -28) res |= 2;    /* over it: ENOSPC */
+        if (shm_unmap(ids[QUOTA_OBJS - 1]) != 0) res |= 4;
+        ids[QUOTA_OBJS - 1] = shm_create(2048);
+        if (ids[QUOTA_OBJS - 1] < 0) res |= 8; /* freed pages count again */
+        for (int i = 0; i < QUOTA_OBJS; i++)
+            if (ids[i] >= 0) shm_unmap(ids[i]);
+        exit(res);
+    }
+    int st = -1;
+    waitpid(pid, &st, 0);
+    st = (st >> 8) & 0xff;
+    CHECK(st != 64, "quota test: setuid failed");
+    CHECK(st != 1, "quota test: 5 x 2048 pages did not fit under the quota");
+    CHECK(!(st & 2), "quota test: create past the per-uid quota was not ENOSPC");
+    CHECK(!(st & 4), "quota test: shm_unmap failed");
+    CHECK(!(st & 8), "quota test: freed pages did not return to the quota");
+    {
+        int id = shm_create(2048);             /* root: not capped */
+        CHECK(id >= 0, "root could not create a 2048-page object (%d)", id);
+        if (id >= 0) shm_unmap(id);
+    }
+}
+
 int main(int argc, char **argv) {
     /* shmprobe [-v] [test...]: -v names each test as it starts; naming
      * tests runs only those. */
@@ -315,6 +352,7 @@ int main(int argc, char **argv) {
         { "access", test_access },
         { "never-mapped", test_never_mapped },
         { "thread-map", test_thread_map },
+        { "uid-quota", test_uid_quota },
     };
     for (unsigned i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
         int want = first >= argc;
