@@ -11,6 +11,7 @@ wav audiodev captures what the sound card emitted (build/smoke-audio/out.wav):
      alsa-lib's plug -> hw; the kernel takes the format and resamples)
   2. 880 Hz, 22.05 kHz stereo U8,   `aplay -D hw:0 b880.wav`
   3. 1320 Hz, 48 kHz stereo FLOAT_LE, `aplay -D hw:0 c1320.wav`
+  4. 2000 Hz from MaeroOS's own `tone` through /dev/dsp (same drivers)
 
 The capture must contain each tone, in order, at its frequency (DFT peak and
 zero crossings), for about as long as it was played, without dropouts.  Also
@@ -45,6 +46,8 @@ TONES = [
     ("b880.wav", 880, 1.0, 22050, 2, 1, 8, "-D hw:0 "),
     ("c1320.wav", 1320, 1.0, 48000, 2, 3, 32, "-D hw:0 "),
 ]
+# Then the native /dev/dsp path (MaeroOS `tone`), which shares the drivers.
+DSP_TONE = ("tone 2000 500", 2000, 0.5)
 
 
 def make_wav(path, hz, secs, rate, chans, tag, bits):
@@ -72,6 +75,23 @@ def make_wav(path, hz, secs, rate, chans, tag, bits):
 def zero_cross_hz(x, rate):
     c = sum(1 for a, b in zip(x, x[1:]) if (a < 0) != (b < 0))
     return c / 2 / (len(x) / rate)
+
+
+def main_run(labels, j, gap=3):
+    """(first, last, count) of the longest stretch of blocks labelled j,
+    bridging holes of up to `gap` blocks: a stray block at a tone's edge
+    (a partial 10 ms block of the next tone or of its fade) is not part of
+    another tone's span."""
+    best, cur = None, None
+    for i, lab in enumerate(labels + [None] * (gap + 1)):
+        if lab == j:
+            if cur and i - cur[1] <= gap + 1:
+                cur = (cur[0], i, cur[2] + 1)
+            else:
+                cur = (i, i, 1)
+            if not best or cur[2] > best[2]:
+                best = cur
+    return best
 
 
 def main():
@@ -131,6 +151,9 @@ def main():
             run(f"{CHROOT} /bin/sh -c 'aplay {args}/tmp/{name} && echo AP_\"\"OK'",
                 "AP_OK", timeout=60)
             smokelib.wait_for(proc, sel, done, log, 10.0, at)
+        at = smokelib.mark(log)
+        run(DSP_TONE[0], "tone: done", timeout=30)
+        smokelib.wait_for(proc, sel, done, log, 10.0, at)
         run("sleep 1")
     finally:
         proc.send_signal(signal.SIGTERM)       # QEMU finalises the WAV on exit
@@ -141,18 +164,19 @@ def main():
             proc.wait()
 
     rate, _, s = read_wav(WAV)
-    labels = classify(s, rate, [t[1] for t in TONES])
+    checks = [(t[0], t[1], t[2]) for t in TONES] + [("/dev/dsp " + DSP_TONE[0],) + DSP_TONE[1:]]
+    labels = classify(s, rate, [c[1] for c in checks])
     blk = rate // 100
     print(f"\n[smoke-audio] wav: {len(s)} frames @ {rate} Hz, "
           f"{labels.count(None)} silent 10 ms blocks of {len(labels)}")
     prev_end = -1
-    for j, (name, hz, secs, *_rest) in enumerate(TONES):
-        idx = [i for i, l in enumerate(labels) if l == j]
-        if not idx:
+    for j, (name, hz, secs) in enumerate(checks):
+        run = main_run(labels, j)
+        if not run:
             raise AssertionError(f"no {hz} Hz tone in the capture")
-        first, last = idx[0], idx[-1]
-        holes = (last - first + 1) - len(idx)
-        dur = len(idx) / 100
+        first, last, n = run
+        holes = (last - first + 1) - n
+        dur = n / 100
         part = s[first * blk:(last + 1) * blk]
         f = peak_freq(part, rate)
         zc = zero_cross_hz(part, rate)
