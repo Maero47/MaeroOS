@@ -1801,7 +1801,7 @@ int vfat_mount_dev(blkpart_t *bp, int ro, const vfat_opts_t *o,
     int rc = E_INVAL;
     if (blkpart_read(bp, 0, 1, bs) < 0) { rc = E_IO; goto fail; }
     if (memcmp(bs + 3, "EXFAT   ", 8) == 0) {
-        printk("[VFAT] %s: exFAT is not supported (only FAT12/16/32)\n", bp->name);
+        /* exFAT is fs/exfat.c's (mount -t exfat). */
         goto fail;
     }
     uint32_t bps = rd16(bs + 11), spc = bs[13];
