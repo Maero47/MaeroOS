@@ -7,8 +7,10 @@ set-uid helper /disk/xapp) and drives the desktop through QMP like
 smoke_gui.py:
 
   1. Linux Apps (the desktop's front end) installs xterm with a click;
-     /disk/xapp installs xeyes and mousepad (GTK 3) from the serial shell.
-     apk verifies the offline repo's signatures inside the chroot.
+     /disk/xapp installs xeyes from the serial shell.  apk verifies the
+     offline repo's signatures inside the chroot.  Mousepad (GTK 3) comes
+     preinstalled on the image: apk in the guest needs well over 15 minutes
+     for its 67 packages.
   2. Each app is launched through the desktop (`wmctl launch <name>`, the
      launcher entry Linux Apps wrote), which runs `/disk/xapp <slot> <name>`:
      maeroX starts in that slot with the first app, the app runs in the
@@ -144,7 +146,10 @@ class AlpineX:
             raise AssertionError("xapp list:\n" + out)
         step("install xterm (Linux Apps)", self.install_frontend, "xterm")
         step("install xeyes", self.install_cli, "xeyes")
-        step("install mousepad", self.install_cli, "mousepad")
+        # The GTK 3 stack is preinstalled by prepare.py: apk in the guest
+        # takes well over 15 minutes for its 67 packages.
+        if not re.search(r"mousepad\s+installed", out):
+            raise AssertionError("mousepad is not preinstalled:\n" + out)
         if "launch" not in self.sh("ls /disk/apps/xterm/manifest && cat /disk/apps/xterm/manifest && echo launch"):
             raise AssertionError("no launcher entry for xterm")
 

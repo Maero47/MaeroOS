@@ -77,6 +77,7 @@ X_PACKAGES = ["xterm", "xeyes", "xclock", "xev", "xdpyinfo", "xwininfo",
               "mousepad", "galculator", "feh", "ristretto", "mpv", "gimp",
               "font-dejavu", "adwaita-icon-theme", "hicolor-icon-theme"]
 X_LOCK = os.path.join(HERE, "alpine-x.lock")
+X_PREINSTALL = ["mousepad", "font-dejavu", "hicolor-icon-theme"]
 
 IMG = os.environ.get("ALPINE_IMG", os.path.join(
     ROOT, "disk-alpinex.img" if X else "disk-alpine.img"))
@@ -243,6 +244,18 @@ def main():
         add_x_repo(apk_static, root, main_idx, relock)
         repos += "/repo/community\n"
         add_xapp(stage)
+        # apk in the guest needs well over 15 minutes for a GTK 3 stack (the
+        # ICU data alone takes minutes), so the GTK apps' runtime and Mousepad
+        # are installed here; xterm, xeyes & co. are installed in the guest.
+        log("apk add (preinstalled) " + " ".join(X_PREINSTALL))
+        apk(apk_static, root, "--no-network",
+            "--repository", os.path.join(root, "repo", "main"),
+            "--repository", os.path.join(root, "repo", "community"),
+            "add", *X_PREINSTALL)
+        entry = os.path.join(stage, "apps", "mousepad")
+        os.makedirs(entry, exist_ok=True)
+        with open(os.path.join(entry, "manifest"), "w") as f:
+            f.write("exec=/disk/xapp\nargs=mousepad\ntitle=Mousepad\nalpine=1\n")
     with open(os.path.join(root, "etc", "apk", "repositories"), "w") as f:
         f.write("# Offline repo on the MaeroOS disk (ports/alpine/prepare.py).\n"
                 "# Online: " + f"{MIRROR}/{BRANCH}/main\n" + repos)
