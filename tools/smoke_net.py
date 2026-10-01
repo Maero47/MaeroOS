@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+"""smoke-net: the socket ABI over QEMU user networking.
+
+    python3 tools/smoke_net.py               RTL8139, initrd only (smoke-net)
+    python3 tools/smoke_net.py --nic e1000   Intel e1000 with the disk attached
+                                             (smoke-net-e1000), plus DHCP's
+                                             /etc/resolv.conf and name lookups
+                                             against a DNS responder run here
+
+The e1000 run boots with disk.img as a snapshot (nothing is written back): the
+disk makes /etc writable, so the kernel can write the DHCP DNS server to
+/etc/resolv.conf and the test can point the resolver at its own responder.
+"""
+import argparse
 import os
 import selectors
 import socket
@@ -6,6 +19,7 @@ import subprocess
 import sys
 import time
 
+import dns_responder
 import smokelib
 import tempfile
 import threading
@@ -193,7 +207,108 @@ def drain_later(srv, delay):
         c.close()
 
 
+class Http11Handler(SimpleHTTPRequestHandler):
+    """HTTP/1.1 replies: toybox wget only accepts an "HTTP/1.1" status line."""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+
+def line_echo(conn):
+    """Read one line and answer "NC_OK <line>", then close (toybox nc)."""
+    conn.settimeout(20)
+    data = b""
+    try:
+        while b"\n" not in data:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        conn.sendall(b"NC_OK " + data.split(b"\n")[0] + b"\n")
+    except OSError:
+        pass
+    conn.close()
+
+
+def run(proc, sel, log, cmd, timeout=20.0):
+    """Send one shell command and return its output up to the next prompt."""
+    before = len("".join(log))
+    send(proc, cmd)
+    wait_for(proc, sel, PROMPT, log, timeout=timeout, start=before)
+    return "".join(log)[before:]
+
+
+def dns_checks(proc, sel, log, webdir):
+    """DHCP's /etc/resolv.conf, then the libc resolver (getaddrinfo,
+    getnameinfo, gethostbyname via resolve_a) and the toybox network applets
+    against a local DNS responder, with no internet dependency."""
+    dns = dns_responder.DnsResponder({
+        "web.maeros.test": {"A": ["10.0.2.2"], "AAAA": ["fd00::2"]},
+        "alias.maeros.test": {"CNAME": "web.maeros.test"},
+        "rev.maeros.test": {"A": ["192.0.2.7"]},
+    })
+    http11 = ThreadingHTTPServer(("0.0.0.0", 0),
+                                 partial(Http11Handler, directory=webdir))
+    threading.Thread(target=http11.serve_forever, daemon=True).start()
+    nc_port = serve_forever(line_echo)
+    try:
+        out = run(proc, sel, log, "cat /etc/resolv.conf")
+        if "from the DHCP lease" not in out or "nameserver 10.0.2.3" not in out:
+            raise AssertionError("/etc/resolv.conf was not written from the DHCP lease")
+        # OpenBSD's "[address]:port" form points the resolver at our port.
+        run(proc, sel, log,
+            f"echo 'nameserver [10.0.2.2]:{dns.port}' > /etc/resolv.conf")
+        checks = [
+            ("getent hosts web.maeros.test", "10.0.2.2        web.maeros.test"),
+            # A and AAAA together, IPv4 first.
+            ("getent ahosts web.maeros.test", "fd00::2"),
+            ("getent ahostsv6 web.maeros.test", "fd00::2"),
+            # A CNAME: the canonical name comes back with the alias.
+            ("getent hosts alias.maeros.test",
+             "10.0.2.2        web.maeros.test alias.maeros.test"),
+            # getnameinfo: PTR from the responder, /etc/hosts before DNS.
+            ("getent hosts 192.0.2.7", "192.0.2.7       rev.maeros.test"),
+            ("getent hosts 10.0.2.2", "10.0.2.2        qemu-host"),
+            ("getent hosts localhost", "127.0.0.1       localhost"),
+            ("getent hosts nosuch.maeros.test; echo rc=$?",
+             "Name does not resolve"),
+        ]
+        for cmd, want in checks:
+            out = run(proc, sel, log, cmd)
+            if want not in out:
+                raise AssertionError(f"{cmd!r}: expected {want!r}")
+        out = run(proc, sel, log, f"httpget web.maeros.test {http11.server_address[1]} /index.html")
+        if "MAEROS_HTTP_OK" not in out:
+            raise AssertionError("httpget by name failed")
+        out = run(proc, sel, log,
+                  f"toybox wget -O /tmp/w.html http://web.maeros.test:{http11.server_address[1]}/index.html"
+                  " && toybox cat /tmp/w.html")
+        if "MAEROS_HTTP_OK" not in out:
+            raise AssertionError("toybox wget by name failed")
+        out = run(proc, sel, log,
+                  f"toybox echo ping | toybox nc -W 10 alias.maeros.test {nc_port}")
+        if "NC_OK ping" not in out:
+            raise AssertionError("toybox nc by name failed")
+        seen = set(dns.queries)
+        for q in [("web.maeros.test", "A"), ("web.maeros.test", "AAAA"),
+                  ("7.2.0.192.in-addr.arpa", "PTR")]:
+            if q not in seen:
+                raise AssertionError(f"DNS responder never saw {q}: {dns.queries}")
+        print(f"dns ok: {len(dns.queries)} queries answered by the test responder")
+    finally:
+        dns.close()
+        http11.shutdown()
+        http11.server_close()
+
+
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--nic", choices=["rtl8139", "e1000"], default="rtl8139")
+    args = ap.parse_args()
+    nic = args.nic
+    pci_id = {"rtl8139": "10ec:8139", "e1000": "8086:100e"}[nic]
+
     webdir = tempfile.TemporaryDirectory()
     index_path = os.path.join(webdir.name, "index.html")
     with open(index_path, "w", encoding="ascii") as f:
@@ -210,10 +325,14 @@ def main():
     # the host (it turns a guest RST into a plain close of the host socket).
     pcap_dir = tempfile.TemporaryDirectory()
     pcap_path = os.path.join(pcap_dir.name, "net.pcap")
+    disk = []
+    if nic == "e1000":
+        disk = ["-drive", "file=disk.img,format=raw,index=0,media=disk,snapshot=on"]
     proc = subprocess.Popen(
         ["qemu-system-i386", *smokelib.QEMU_DISPLAY, "-kernel", "kernel.elf", "-initrd", "initrd.tar",
+         *disk,
          "-serial", "stdio", "-m", "128M", "-no-reboot", "-no-shutdown",
-         "-netdev", "user,id=n0", "-device", "rtl8139,netdev=n0",
+         "-netdev", "user,id=n0", "-device", f"{nic},netdev=n0",
          "-object", f"filter-dump,id=d0,netdev=n0,file={pcap_path}"],
         cwd=ROOT,
         stdin=subprocess.PIPE,
@@ -227,20 +346,24 @@ def main():
 
     try:
         smokelib.login(proc, sel, log, timeout=25.0)
+        # The DHCP lease is logged once lwIP binds; with the e1000 QEMU drops
+        # the first OFFER while the receiver settles, so the retransmit a
+        # second later is the one that binds.
+        wait_for(proc, sel, "[LWIP] eth0 bound ip=10.0.2.15", log, timeout=15.0)
         before = len("".join(log))
         send(proc, "lspci")
         wait_for(proc, sel, PROMPT, log, timeout=10.0, start=before)
         recent = "".join(log)[before:]
-        if "10ec:8139" not in recent:
-            raise AssertionError("RTL8139 PCI device was not listed")
+        if pci_id not in recent:
+            raise AssertionError(f"{nic} PCI device {pci_id} was not listed")
         if "class=02:00" not in recent:
             raise AssertionError("network class code was not listed")
         before = len("".join(log))
         send(proc, "ifconfig")
         wait_for(proc, sel, PROMPT, log, timeout=10.0, start=before)
         recent = "".join(log)[before:]
-        if "eth0: rtl8139 up" not in recent:
-            raise AssertionError("RTL8139 interface did not initialize")
+        if f"eth0: {nic} up" not in recent:
+            raise AssertionError(f"{nic} interface did not initialize")
         if "ip=10.0.2.15" not in recent or "gw=10.0.2.2" not in recent:
             raise AssertionError("DHCP did not assign the expected QEMU user-net address")
         before = len("".join(log))
@@ -363,7 +486,9 @@ def main():
         recent = "".join(log)[before:]
         if "MAEROS_HTTP_OK" not in recent:
             raise AssertionError("HTTP fetch did not return host response")
-        print("smoke-net ok")
+        if nic == "e1000":
+            dns_checks(proc, sel, log, webdir.name)
+        print(f"smoke-net ok ({nic})")
         return 0
     finally:
         if proc.poll() is None:

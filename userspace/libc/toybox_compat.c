@@ -579,17 +579,6 @@ int poll(struct pollfd *fds, unsigned long nfds, int timeout) {
     errno = 0;
     return ret;
 }
-int setsockopt(int fd, int level, int optname, const void *optval, socklen_t optlen) {
-    (void)fd; (void)level; (void)optname; (void)optval; (void)optlen; return 0;
-}
-int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
-    (void)node; (void)service; (void)hints; if (res) *res = 0; return EAI_FAIL;
-}
-void freeaddrinfo(struct addrinfo *res) { (void)res; }
-const char *gai_strerror(int errcode) { (void)errcode; return "addrinfo"; }
-const char *inet_ntop(int af, const void *src, char *dst, socklen_t size) {
-    (void)af; (void)src; if (size) *dst = 0; return dst;
-}
 
 time_t time(time_t *tloc) { struct timeval tv; gettimeofday(&tv, 0); if (tloc) *tloc = tv.tv_sec; return tv.tv_sec; }
 int clock_gettime(clockid_t clk_id, struct timespec *tp) {
