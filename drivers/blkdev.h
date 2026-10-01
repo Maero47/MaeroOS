@@ -28,6 +28,13 @@ const char *blk_name(void);
 /* The boot disk's /dev path ("/dev/hda", "/dev/sda", "/dev/nvme0n1"). */
 const char *blk_boot_devpath(void);
 
+/* Make `disk` the boot disk (root= on the command line names it). */
+void blk_set_boot(int disk);
+/* A disk is busy while ext2 has it mounted at /disk: /dev writes to it are
+ * refused. */
+void blk_set_busy(int disk);
+int  blk_disk_busy(int disk);
+
 int blk_read(uint32_t lba, uint8_t count, void *buf);
 int blk_write(uint32_t lba, uint8_t count, const void *buf);
 
@@ -36,6 +43,9 @@ int blk_write(uint32_t lba, uint8_t count, const void *buf);
 int         blk_disk_count(void);
 const char *blk_disk_devname(int disk);     /* "hda", "sdb", "nvme0n1" */
 uint32_t    blk_disk_sectors(int disk);     /* saturated to 32 bits */
+/* The real size: for IDE the LBA48 count, which can exceed what
+ * blk_disk_sectors() addresses; otherwise blk_disk_sectors(). */
+uint64_t    blk_disk_capacity(int disk);
 int         blk_disk_is_boot(int disk);
 /* Linux dev_t of the whole disk and of its partition `partno` (1..15; 0 is
  * the disk), as major << 8 | minor: IDE 3/22 (slave minors from 64), SCSI

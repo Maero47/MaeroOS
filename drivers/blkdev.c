@@ -17,6 +17,7 @@ static blk_disk_t disks[BLK_MAX_DISKS];
 static int        ndisks;
 static int        boot = -1;          /* index into disks[], -1 = none */
 static char       boot_label[8];
+static int        busy = -1;          /* the disk mounted at /disk */
 
 static void add_disk(blk_kind_t kind, int unit) {
     if (ndisks >= BLK_MAX_DISKS) return;
@@ -44,12 +45,26 @@ void blk_init(void) {
         for (int i = 0; i < ndisks; i++)
             if (disks[i].kind == order[k] && disks[i].unit == 0) { boot = i; break; }
     if (boot < 0) return;
+    blk_set_boot(boot);
+}
+
+void blk_set_boot(int disk) {
+    if (disk < 0 || disk >= ndisks) return;
+    boot = disk;
     if (disks[boot].kind == BLK_ATA)
         snprintf(boot_label, sizeof(boot_label), "ata");
     else
         snprintf(boot_label, sizeof(boot_label), "%s%d",
                  disks[boot].kind == BLK_AHCI ? "ahci" : "nvme", disks[boot].unit);
     printk("[BLK]  boot disk: %s\n", boot_label);
+}
+
+void blk_set_busy(int disk) {
+    busy = disk;
+}
+
+int blk_disk_busy(int disk) {
+    return disk >= 0 && disk == busy;
 }
 
 int blk_present(void) {
@@ -109,6 +124,12 @@ uint32_t blk_disk_rdev(int disk, int partno) {
                (uint32_t)partno;
     uint32_t minor = ((uint32_t)d->unit * 16u + (uint32_t)partno) & 0xFFu;
     return ((d->kind == BLK_AHCI ? 8u : 259u) << 8) | minor;
+}
+
+uint64_t blk_disk_capacity(int disk) {
+    if (disk < 0 || disk >= ndisks) return 0;
+    if (disks[disk].kind == BLK_ATA) return ata_dev_capacity(disks[disk].unit);
+    return blk_disk_sectors(disk);
 }
 
 int blk_disk_read(int disk, uint32_t lba, uint32_t count, void *buf) {

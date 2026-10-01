@@ -956,12 +956,18 @@ static void on_mouse(gui_window_t *g, int x, int y, int buttons) {
 
 extern char **environ;
 
-static int start_shell(void) {
+/* `command` (argv[2], from the desktop's Install icon): run it with
+ * `shell -c` instead of an interactive shell. */
+static int start_shell(const char *command) {
     char pts_path[20];
     const char *shell_path =
         access("/disk/shell", X_OK) == 0 ? "/disk/shell" : "/shell";
-    char *argv[] = { (char *)shell_path, 0 };
+    char *argv[] = { (char *)shell_path, 0, 0, 0 };
     static char *envp[64];
+    if (command) {
+        argv[1] = "-c";
+        argv[2] = (char *)command;
+    }
     int unlock = 0;
     int pty_num = -1;
     int slave, ne = 0;
@@ -1057,7 +1063,7 @@ int main(int argc, char *argv[]) {
     apply_size();
     reset_terminal();
 
-    if (start_shell() < 0) {
+    if (start_shell(argc > 2 ? argv[2] : 0) < 0) {
         printf("term: pty unavailable\n");
         gui_close(&gui);
         return 1;

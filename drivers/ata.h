@@ -29,5 +29,8 @@ int ata_present(void);
 #define ATA_MAX_DEVS 4
 int      ata_dev_present(int dev);
 uint32_t ata_dev_sectors(int dev);           /* capacity in 512-byte sectors */
+/* The drive's real size in sectors, LBA48 included; above ata_dev_sectors()
+ * when the drive is bigger than LBA28 (128 GiB) reaches. */
+uint64_t ata_dev_capacity(int dev);
 int      ata_dev_read(int dev, uint32_t lba, uint8_t count, void *buf);
 int      ata_dev_write(int dev, uint32_t lba, uint8_t count, const void *buf);

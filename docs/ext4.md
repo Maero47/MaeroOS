@@ -25,7 +25,7 @@ partitions are `sdb2`, `nvme0n1p5`.
 |---|---|
 | `drivers/blkdev.c` | the table of every disk (IDE, then AHCI, then NVMe) with read/write, size and dev_t; which one is the boot disk |
 | `drivers/ata.c` | probes the primary slave and the secondary channel besides the boot disk; `ata_dev_read/write(dev, ...)` with plain LBA28 PIO for them (ATAPI devices are skipped) |
-| `drivers/blkpart.c` | one `blkpart_t` per disk and partition, a view over `blkdev.c`'s table: MBR primaries 1-4, logical partitions from 5 (walking the EBR chain), GPT entries (header and entry-array CRC32 checked, backup header as fallback); `/dev/<name>` nodes (read-only raw access) and `/proc/partitions` |
+| `drivers/blkpart.c` | one `blkpart_t` per disk and partition, a view over `blkdev.c`'s table: MBR primaries 1-4, logical partitions from 5 (walking the EBR chain), GPT entries (header and entry-array CRC32 checked, backup header as fallback); `/dev/<name>` nodes (raw access for root; writes to the disk mounted at `/disk` are `EBUSY`; `docs/install.md`) and `/proc/partitions` |
 | `fs/vfs.c` | the mount table: `vfs_mount_add/find/remove`, crossing in the path walk, the mount each lookup ends on (for `MS_RDONLY`), `/proc/mounts` |
 | `fs/mount.c` | `mount_do()`/`umount_do()`: types `ext4`/`ext3`/`ext2` (block device source), `tmpfs`, `proc`, `devtmpfs`; `MS_REMOUNT`, `MS_BIND`, propagation flags (accepted, no-op) |
 | `fs/ext4.c` | the read-only ext2/3/4 driver |

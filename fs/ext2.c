@@ -2358,7 +2358,7 @@ static int ext2_readdir(vfs_node_t *dir, uint32_t req_idx,
 
 /* ── Mount ────────────────────────────────────────────────────────────────── */
 
-vfs_node_t *ext2_mount(uint32_t lba_offset) {
+vfs_node_t *ext2_mount(uint32_t lba_offset, uint32_t nsect) {
     if (!blk_present()) {
         printk("[EXT2]  No disk, skipping mount.\n");
         return NULL;
@@ -2393,6 +2393,16 @@ vfs_node_t *ext2_mount(uint32_t lba_offset) {
             !sb->s_inodes_count || !sb->s_blocks_count) {
             printk("[EXT2]  Unsupported or corrupt superblock geometry, "
                    "not mounting.\n");
+            return NULL;
+        }
+    }
+
+    {
+        uint64_t need = (uint64_t)sb->s_blocks_count << (sb->s_log_block_size + 1);
+        if (need > nsect) {
+            printk("[EXT2]  Superblock claims %u blocks (%u MiB) but the device "
+                   "has %u MiB; not mounting.\n", (unsigned)sb->s_blocks_count,
+                   (unsigned)(need / 2048u), (unsigned)(nsect / 2048u));
             return NULL;
         }
     }

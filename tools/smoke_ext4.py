@@ -138,6 +138,9 @@ def sata_nvme_boot(gpt, mbr, accel):
               "q35: /proc/partitions lists sda sdb sdb2 nvme0n1 nvme0n1p5")
         rc, out = g.sh("busybox grep /disk /proc/mounts")
         check("/dev/sda /disk ext2" in out, "q35: /proc/mounts names /dev/sda as /disk's source")
+        # /mnt is on disk.img; the first boot made it, but this boot (a
+        # snapshot) must not depend on that boot's writes having landed.
+        g.sh("busybox mkdir -p /mnt")
         rc, out = g.sh("busybox mount -o ro -t ext4 /dev/sda /mnt")
         check(rc != 0, "q35: the boot disk cannot be mounted a second time")
         rc, out = g.sh("busybox mount -o ro -t ext4 /dev/sdb2 /mnt && "

@@ -33,6 +33,7 @@
 #include "../fs/mount.h"
 #include "../fs/devfs.h"
 #include "../fs/ext2.h"
+#include "../drivers/blkpart.h"
 #include "../net/socket.h"
 #include "../net/xsock.h"
 #include "flock.h"
@@ -2997,6 +2998,8 @@ static int ioctl_arg_shape(uint32_t req, uint32_t *len) {
                               *len = 36;            return IOA_IN;    /* TCSETS/W/F */
     case 0x5413:              *len = 8;             return IOA_OUT;   /* TIOCGWINSZ */
     case 0x5414:              *len = 8;             return IOA_IN;    /* TIOCSWINSZ */
+    case 0x1260:              *len = 4;             return IOA_OUT;   /* BLKGETSIZE */
+    case 0x80041272U:         *len = 8;             return IOA_OUT;   /* BLKGETSIZE64 (u64) */
     case 0x540F:              *len = sizeof(int);   return IOA_OUT;   /* TIOCGPGRP */
     case 0x80044D00U:         *len = sizeof(int);   return IOA_OUT;   /* SOUND_MIXER_READ_VOLUME */
     case 0xC0044D00U:         *len = sizeof(int);   return IOA_INOUT; /* SOUND_MIXER_WRITE_VOLUME */
@@ -6623,6 +6626,32 @@ static int sys_sigaltstack(registers_t *regs) {
     return 0;
 }
 
+/* pread64/pwrite64 on a disk or partition node: the full 64-bit offset (the
+ * descriptor's own offset is 32-bit), so an installer can reach the backup GPT
+ * at the end of a disk past 4 GiB. */
+static int blkdev_rw_user(blkpart_t *bp, uint64_t off, char *ubuf, uint32_t len,
+                          int write) {
+    if (len == 0) return 0;
+    uint32_t bsz;
+    uint8_t *kbuf = bounce_alloc(len, &bsz);
+    if (!kbuf) return -12;
+    uint32_t done = 0;
+    int err = 0;
+    while (done < len) {
+        uint32_t want = len - done < bsz ? len - done : bsz;
+        if (write && copy_from_user(kbuf, ubuf + done, want) < 0) { err = -14; break; }
+        int r = blkpart_rw(bp, off + done, kbuf, want, write);
+        if (r < 0) { err = r; break; }
+        if (!write && r && copy_to_user(ubuf + done, kbuf, (uint32_t)r) < 0) {
+            err = -14; break;
+        }
+        done += (uint32_t)r;
+        if ((uint32_t)r < want) break;
+    }
+    kfree(kbuf);
+    return done ? (int)done : err;
+}
+
 /* ── sys_pread64(fd, buf, count, offset_lo, offset_hi) — EAX=180 ─────────── */
 static int sys_pread64(registers_t *regs) {
     int      fd  = (int)regs->ebx;
@@ -6637,6 +6666,10 @@ static int sys_pread64(registers_t *regs) {
     if (f->type != FD_FILE || !f->node) return -9;
     if (!fd_readable(f)) return -9;
     if ((int32_t)regs->edi < 0) return -22;                /* -EINVAL */
+    blkpart_t *bp = blkpart_from_node(f->node);
+    if (bp)
+        return blkdev_rw_user(bp, ((uint64_t)regs->edi << 32) | off, buf,
+                              (uint32_t)len, 0);
     if (regs->edi) return 0;                /* past the largest file: EOF */
 
     return vfs_read_user(f->node, off, buf, (uint32_t)len);
@@ -6657,6 +6690,10 @@ static int sys_pwrite64(registers_t *regs) {
     if (!fd_writable(f) || !f->node->write_fn) return -9;
     /* The offset is 64-bit (esi:edi); files here are at most 4 GiB. */
     if ((int32_t)regs->edi < 0) return -22;                /* -EINVAL */
+    blkpart_t *bp = blkpart_from_node(f->node);
+    if (bp)
+        return blkdev_rw_user(bp, ((uint64_t)regs->edi << 32) | off, (char *)buf,
+                              (uint32_t)len, 1);
     if (regs->edi) return len ? -27 : 0;                   /* -EFBIG */
 
     return vfs_write_user(f->node, off, buf, (uint32_t)len);

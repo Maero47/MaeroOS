@@ -3,11 +3,14 @@
 #include <stdint.h>
 
 /*
- * Mount an ext2 filesystem starting at `lba_offset` on the ATA primary master.
+ * Mount the ext2 filesystem at `lba_offset` on the boot disk (drivers/blkdev.c),
+ * in a device or partition of `nsect` sectors.  A superblock claiming more
+ * blocks than that is refused: block numbers would run past the partition (or
+ * wrap in an LBA28 command) onto other data.
  * Returns a VFS node for the filesystem root, or NULL on failure.
  * Caller should pass the returned node to vfs_mount("/mountpoint", root).
  */
-vfs_node_t *ext2_mount(uint32_t lba_offset);
+vfs_node_t *ext2_mount(uint32_t lba_offset, uint32_t nsect);
 
 /*
  * Live filesystem geometry for statfs(): block size, total/free blocks and

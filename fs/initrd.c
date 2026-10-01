@@ -35,6 +35,14 @@ static uint32_t octal_str(const char *s, int flen) {
     return v;
 }
 
+static const uint8_t *g_image;
+static uint32_t       g_image_size;
+
+const uint8_t *initrd_image(uint32_t *size) {
+    *size = g_image_size;
+    return g_image;
+}
+
 void initrd_init(uint32_t mod_phys_start, uint32_t mod_phys_end) {
     /*
      * The image is read in place through the higher-half direct map
@@ -50,6 +58,8 @@ void initrd_init(uint32_t mod_phys_start, uint32_t mod_phys_end) {
               "(the kernel direct map)", NULL);
     const uint8_t *tar  = (const uint8_t *)(mod_phys_start + KERNEL_VMA);
     uint32_t        size = mod_phys_end - mod_phys_start;
+    g_image = tar;
+    g_image_size = size;
 
     /* Create the root directory node */
     /* FATAL by design (audit category (c)): initrd_init runs from kmain with a

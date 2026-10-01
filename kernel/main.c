@@ -48,6 +48,8 @@
 #include "../kernel/random.h"
 #include "../net/net.h"
 #include "../net/lwip_glue.h"
+#include "../lib/string.h"
+#include "../lib/printf.h"
 #include <stdint.h>
 
 void stack_chk_seed(void);   /* kernel/stack_chk.c */
@@ -80,6 +82,54 @@ static void __attribute__((noreturn)) bsp_scheduler_entry(void) {
 #endif
     scheduler_start();
     for (;;) __asm__ volatile("hlt");   /* unreachable */
+}
+
+/* root=/dev/<name> or root=PARTUUID=<gpt guid> on the command line picks the
+ * partition ext2 mounts at /disk (maeros-install writes the latter).  Without
+ * root= the boot disk's whole device is /disk, as before.  A root= that names
+ * nothing leaves /disk unmounted: mounting some other disk in its place could
+ * hand an installed system the wrong filesystem. */
+static void mount_disk_root(void) {
+    char want[64];
+    const char *cl = boot_info_cmdline();
+    const char *arg = NULL;
+    for (const char *p = cl; *p; p++)
+        if ((p == cl || p[-1] == ' ') && strncmp(p, "root=", 5) == 0) { arg = p + 5; break; }
+    blkpart_t *bp = NULL;
+    char devpath[24];
+    uint32_t start = 0;
+    if (arg) {
+        uint32_t n = 0;
+        while (arg[n] && arg[n] != ' ' && n < sizeof(want) - 1) { want[n] = arg[n]; n++; }
+        want[n] = '\0';
+        if (strncmp(want, "PARTUUID=", 9) == 0)
+            bp = blkpart_find_partuuid(want + 9);
+        else if (strncmp(want, "/dev/", 5) == 0)
+            bp = blkpart_find(want + 5);
+        if (!bp) {
+            printk("[BOOT] root=%s: no such device; /disk is not mounted\n", want);
+            return;
+        }
+        snprintf(devpath, sizeof(devpath), "/dev/%s", bp->name);
+        printk("[BOOT] root=%s is %s (start %u, %u sectors)\n", want, devpath,
+               (unsigned)bp->start, (unsigned)bp->nsect);
+        blk_set_boot(bp->dev);
+        start = bp->start;
+    } else {
+        if (!blk_present()) return;
+        snprintf(devpath, sizeof(devpath), "%s", blk_boot_devpath());
+        bp = blkpart_find(devpath + 5);
+    }
+    /* ext2 checks the superblock's size against the device's. */
+    vfs_node_t *disk_root = ext2_mount(start, bp ? bp->nsect : 0);
+    if (!disk_root) {
+        if (arg) printk("[BOOT] root=%s: no ext2 filesystem on %s\n", want, devpath);
+        return;
+    }
+    if (bp) blk_set_busy(bp->dev);
+    vfs_mount("/disk", disk_root);
+    vfs_set_root_overlay(disk_root);
+    vfs_mount_note(devpath, "/disk", "ext2", 0);
 }
 
 void kernel_main(u32 mb_magic, u32 mb_phys) {
@@ -191,14 +241,7 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     blk_init();
     blkpart_init();       /* /dev/hda, /dev/sda1, ...: partitions for mount(2) */
     vfs_mount_note("rootfs", "/", "rootfs", 0);
-    if (blk_present()) {
-        vfs_node_t *disk_root = ext2_mount(0);
-        if (disk_root) {
-            vfs_mount("/disk", disk_root);
-            vfs_set_root_overlay(disk_root);
-            vfs_mount_note(blk_boot_devpath(), "/disk", "ext2", 0);
-        }
-    }
+    mount_disk_root();
 
     /* ── tmpfs at /tmp ───────────────────────────────────────────────────── */
     {

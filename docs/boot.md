@@ -111,6 +111,13 @@ On real hardware, write the ISO to a USB stick (`dd`). It is a hybrid image
 with an MBR, a BIOS boot sector and an EFI system partition. Secure Boot must
 be off, because Limine is not signed.
 
+## Installed systems
+
+`maeros-install` (`docs/install.md`) puts Limine on a GPT disk with a
+`limine.conf` that passes `root=PARTUUID=<guid>` as the Multiboot 2 command
+line. `kernel/main.c` then mounts that partition at `/disk` instead of the
+whole boot disk (`root=/dev/sda3` works as well).
+
 ## Limine binaries
 
 `tools/fetch-limine.sh` downloads the `v11.4.1-binary` tag tarball, verifies

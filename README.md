@@ -40,6 +40,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | SATA AHCI disk (pc + `-device ahci`, then `-M q35`), no IDE disk | `/disk` mounted from `ahci0`, `diskprobe ok`, `fsprobe ok`, `symprobe ok`, a 3 MiB random file read and copied with matching md5 in the guest and on the host (`debugfs`), persistence across a reboot onto q35, `e2fsck -fn` showing no new damage, `reboot`/`poweroff` ending QEMU | `make smoke-ahci` |
 | NVMe disk (pc + `-device nvme`, then `-M q35` with MDTS=2 and two namespaces), no IDE/AHCI disk | `/disk` mounted from `nvme0`, both namespaces found, `diskprobe ok`, `fsprobe ok`, a 3 MiB random file read and copied with matching md5 in the guest and on the host, transfers using PRP lists and split at MDTS (driver counters at shutdown), persistence across a reboot, `e2fsck -fn` clean of new damage, `reboot`/`poweroff` ending QEMU | `make smoke-nvme` |
 | `mount`/`umount`, partitions, read-only ext4 | busybox `mount -t ext4 /dev/hdb2 /mnt` on a GPT disk (4 KiB blocks, `64bit`, `metadata_csum`, `huge_file`, `flex_bg`) and `/dev/hdc5` on an MBR logical partition (1 KiB blocks): md5 of every file equals the host's, including a 300 MiB sparse file and an unwritten extent; a 5020-entry and a 20000-entry (two-level) htree directory list and resolve completely; fast, slow, relative, absolute and directory symlinks; writes fail with `EROFS`; `umount` is refused while a cwd is inside; tmpfs `remount,ro`; non-root `mount` refused; afterwards both filesystems are byte-identical to their images and `e2fsck -fn` is clean; on q35 the same partitions are found and mounted from AHCI (`/dev/sdb2`) and NVMe (`/dev/nvme0n1p5`) | `make smoke-ext4` |
+| Installing to a disk (`maeros-install`) | from the Limine live ISO on q35 with the live `disk.img` as `sda` and an empty 1 GiB `sdb`: `maeros-install -l` lists both and marks `sda` in use, installing over `sda` is refused, `maeros-install -y /dev/sdb` writes a GPT (BIOS boot, FAT32 ESP, ext2 root) and Limine; on the host `sgdisk -v`, `e2fsck -fn` and `fsck.fat -n` are clean; then the installed disk alone boots under SeaBIOS and OVMF x64: Limine passes `root=PARTUUID=...`, `/dev/sda3` is `/disk`, login and the desktop work, and a file written in the first boot is there in the second | `make smoke-install` |
 | `pkg` and the signed repo index | `tools/test_pkg_sign.py` runs the RFC 8032 vectors through the Python signer and the C verifier and rejects altered, unsigned and foreign-key indexes; in the guest, `pkg update` rejects unsigned, tampered and rolled-back indexes, installs and runs busybox, and `install` rejects a tarball whose SHA-256 does not match | `make smoke-pkg` |
 | TCP/IP over lwIP and RTL8139 | `MAEROS_HTTP_OK` fetched from a host HTTP server; `sockprobe` checks that `send` after `shutdown(SHUT_WR)` fails with `EPIPE`, a two-step shutdown ends in a FIN and no RST, closing TIME_WAIT sockets keeps TCP working, and a non-blocking client gets `EINPROGRESS`, `SO_ERROR`, `EAGAIN`, `ECONNREFUSED` and both socket names; `abi2probe net` checks `MSG_NOSIGNAL` and `EPIPE` after a reset | `make smoke-net` |
 | Intel e1000, DHCP DNS, name resolution | the same suite on an e1000; the DHCP lease's DNS server is in `/etc/resolv.conf`; against a DNS responder in the harness, `getent` resolves A, AAAA, a CNAME, a PTR and an NXDOMAIN, `/etc/hosts` wins over DNS, and `httpget`, `toybox wget` and `toybox nc` connect by name | `make smoke-net-e1000` |
@@ -538,6 +539,12 @@ loader (uACPI uses it; the EBDA/BIOS-ROM scan is only for BIOS boots). The loade
 must end below 8 MiB, where OVMF x64 reserves memory; `linker.ld` asserts it. `docs/boot.md` covers the boot paths, the `boot_info_*()` API, OVMF and
 `make smoke-uefi`.
 
+Booted from that ISO, `maeros-install` (as root) installs the running system onto a
+disk that then boots on its own under BIOS and UEFI: a GPT with a BIOS boot partition,
+a FAT32 EFI system partition (Limine, the kernel and the initrd) and an ext2 root that
+the kernel mounts at `/disk` from `root=PARTUUID=...` on its command line. Run it
+without arguments to pick the disk interactively; `docs/install.md` has the details.
+
 Everything goes to the serial console, so `make run` gives you the boot log and a
 `maeros login:` prompt in your terminal. Log in as `root` (password `root`) or `user`
 (password `user`); `exit` logs out and init starts a new getty. The console reads only
@@ -578,6 +585,7 @@ make smoke-hda      # Intel HDA playback through /dev/dsp, checked from a wav ca
 make smoke-acpi     # poweroff, reboot, power button and halt through ACPI (pc and q35)
 make smoke-pc       # q35 with no PS/2: AHCI disk, USB input, desktop, poweroff
 make smoke-uefi     # the Limine ISO under SeaBIOS, OVMF x64 and OVMF IA32: login, desktop, ACPI poweroff
+make smoke-install  # maeros-install from the live ISO to an empty disk, then boot it (SeaBIOS, OVMF x64)
 make smoke-abi      # Linux-ABI probes (ports/abiprobes/README.md), needs i686-linux-musl-gcc and disk.img
 make smoke-firefox  # does Firefox paint? (README-BROWSER.md)
 make smoke-firefox-web  # ...and load a page served from the host over the network
@@ -655,7 +663,7 @@ there: QEMU, started without `-no-shutdown`, must exit through ACPI S5.
 host without one, a repo signing key), `smoke-gui` (which needs the ISO, so `check`
 builds it), `smoke-ext4`, `smoke-uefi` (the Limine ISO under SeaBIOS, OVMF x64 and OVMF IA32; `check`
 builds the ISO, which fetches the pinned Limine release once, and the test skips a
-firmware that is not installed), `smoke-hda`, `smoke-acpi`, `smoke-ahci`, `smoke-nvme`,
+firmware that is not installed), `smoke-install`, `smoke-hda`, `smoke-acpi`, `smoke-ahci`, `smoke-nvme`,
 `smoke-usb` and `smoke-pc`. It runs them one after another, writes each suite's
 console to `build/check/<suite>.log`, prints the tail of the log for any suite that
 fails, carries on with the rest and exits non-zero at the end. `CHECK_SUITES="smoke

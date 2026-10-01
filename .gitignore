@@ -70,6 +70,7 @@ testfiles/awk
 /testfiles/diskprobe
 /testfiles/fsprobe
 /testfiles/mntprobe
+/testfiles/maeros-install
 /testfiles/dmesg
 /testfiles/doas
 /testfiles/du
