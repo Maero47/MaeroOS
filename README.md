@@ -44,6 +44,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | NVMe disk (pc + `-device nvme`, then `-M q35` with MDTS=2 and two namespaces), no IDE/AHCI disk | `/disk` mounted from `nvme0`, both namespaces found, `diskprobe ok`, `fsprobe ok`, a 3 MiB random file read and copied with matching md5 in the guest and on the host, transfers using PRP lists and split at MDTS (driver counters at shutdown), persistence across a reboot, `e2fsck -fn` clean of new damage, `reboot`/`poweroff` ending QEMU | `make smoke-nvme` |
 | `mount`/`umount`, partitions, read-only ext4 | busybox `mount -t ext4 /dev/hdb2 /mnt` on a GPT disk (4 KiB blocks, `64bit`, `metadata_csum`, `huge_file`, `flex_bg`) and `/dev/hdc5` on an MBR logical partition (1 KiB blocks): md5 of every file equals the host's, including a 300 MiB sparse file and an unwritten extent; a 5020-entry and a 20000-entry (two-level) htree directory list and resolve completely; fast, slow, relative, absolute and directory symlinks; writes fail with `EROFS`; `umount` is refused while a cwd is inside; tmpfs `remount,ro`; non-root `mount` refused; afterwards both filesystems are byte-identical to their images and `e2fsck -fn` is clean; on q35 the same partitions are found and mounted from AHCI (`/dev/sdb2`) and NVMe (`/dev/nvme0n1p5`) | `make smoke-ext4` |
 | Read-write FAT12/16/32 (vfat), USB sticks | volumes made on the host with `mkfs.fat` and `mtools` (long and Turkish names, a 300-entry directory, a 5 MiB file): mounted read-write with busybox `mount -t vfat` from AHCI (`/dev/sdb1`, MBR), a QEMU `usb-storage` stick without a partition table (`/dev/sdd`, mounted without `-t`) and IDE (`/dev/hdb1`); every file's md5 matches; mkdir, create, a 5 MiB copy, a directory that grows to 150 long-name entries, append, write past the end, truncate, renames (across directories, a directory with contents, over an existing file, case-only), unlink, `rm -r`, rmdir; `df` accounting; a file unlinked while open; `ENOSPC` on a full FAT12 volume; `remount,ro`/`rw`; the stick unplugged while mounted and plugged back in; raw writes to `/dev/sdd` and to `/dev/sdc` (whose partitions are mounted) refused with `EBUSY` and `maeros-install -l` marking the mounted stick in use; `poweroff` with the stick still mounted; afterwards `fsck.fat -n` is clean on every volume and `mtools` on the host sees exactly the guest's files and contents | `make smoke-vfat` |
+| Read-write exFAT | volumes made with `mkfs.exfat` and filled by `tools/exfatimg.py`: an MBR partition on AHCI, a USB stick without a partition table and a 64 GiB sparse disk with 4096-byte sectors and a 5 GiB file; every md5 matches (contiguous, FAT-chain and ValidDataLength < DataLength files, Turkish and non-BMP names, case-insensitive lookups through the up-case table); create, append (contiguous files turning into FAT chains), truncate both ways, every rename case, unlink, `rm -r`, a growing directory, statfs, unlink-while-open, ro/remount; a marker written at 4 GiB − 8 KiB of the 5 GiB file; `poweroff` with two volumes mounted; afterwards `fsck.exfat -n` is clean and an independent checker finds exactly the guest's files, checksums, hashes and bitmap; crafted entry sets, boot regions, up-case table and fuzzed volumes are refused or read without a crash | `make smoke-exfat` |
 | ext2 read-write beyond `/disk` | on q35, an ext2 partition on AHCI (`/dev/sdb1`, 1 KiB blocks) and an ext3 with an htree directory on NVMe (`mount -t ext4 /dev/nvme0n1`, 4 KiB blocks) mounted read-write at the same time: files read back, `df` reports each filesystem, create/append/mkdir/symlink/rename/unlink/rmdir on both, a 2 MiB file in double-indirect blocks, copy and move between them, hard link across them refused; the same device again, raw `/dev` writes to it or its disk, and `umount` with a file open are `EBUSY`; `remount,ro` refuses writes and `remount,rw` allows them; everything survives umount and a second mount; `-o ro` through the ext2 driver; `needs_recovery` refused; `/disk` unaffected; after `poweroff`, host `e2fsck -fn` is clean on both, the superblocks say clean, `debugfs` sees every change | `make smoke-ext2rw` |
 | Installing to a disk (`maeros-install`) | from the Limine live ISO on q35 with the live `disk.img` as `sda` and an empty 1 GiB `sdb`: `maeros-install -l` lists both and marks `sda` in use, installing over `sda` is refused, `maeros-install -y /dev/sdb` writes a GPT (BIOS boot, FAT32 ESP, ext2 root) and Limine; on the host `sgdisk -v`, `e2fsck -fn` and `fsck.fat -n` are clean; then the installed disk alone boots under SeaBIOS and OVMF x64: Limine passes `root=PARTUUID=...`, `/dev/sda3` is `/disk`, login and the desktop work, the ESP (`/dev/sda2`) mounts with the vfat driver and its `limine.conf` names the booted root, and a file written in the first boot is there in the second | `make smoke-install` |
 | `pkg` and the signed repo index | `tools/test_pkg_sign.py` runs the RFC 8032 vectors through the Python signer and the C verifier and rejects altered, unsigned and foreign-key indexes; in the guest, `pkg update` rejects unsigned, tampered and rolled-back indexes, installs and runs busybox, and `install` rejects a tarball whose SHA-256 does not match | `make smoke-pkg` |
@@ -118,8 +119,9 @@ What is proven by the automated QEMU tests in `tools/`:
   ext4 (extents, `64bit`, `flex_bg`) or a filesystem that `needs_recovery` goes to the
   read-only ext4 driver: a read-write mount is refused with `EROFS` and busybox
   `mount` falls back to read-only (`docs/ext4.md`). FAT volumes are writable too
-  (`mount -t vfat`, `docs/vfat.md`). There is no exFAT driver: an exFAT stick is
-  recognised and refused.
+  (`mount -t vfat`, `docs/vfat.md`), and so are exFAT volumes (`mount -t exfat`,
+  `docs/exfat.md`); through the 32-bit VFS a file of 4 GiB or more shows its
+  first 4 GiB − 1 bytes.
 - **Missing Linux interfaces.** There is no SysV IPC and no utmp.
   `/proc/<pid>/` lists only `status` and `stat` and resolves `fd/N` links (the full
   set is under `/proc/self`), and
@@ -260,6 +262,9 @@ filesystems at any directory, crossed during the walk, listed in `/proc/mounts`)
 `fs/vfat.c` (read-write FAT12/16/32 with long names for `mount -t vfat`: UTF-8 names,
 8.3 aliases with `~N` tails, FSInfo, the dirty flag, `uid=`/`gid=`/`umask=`; see
 `docs/vfat.md`),
+`fs/exfat.c` (read-write exFAT for `mount -t exfat`: boot checksum, allocation bitmap,
+up-case table, NoFatChain and FAT-chain files, SetChecksum/NameHash, 64-bit lengths,
+VolumeDirty; see `docs/exfat.md`),
 `drivers/blkpart.c` (MBR, logical and GPT partitions, or a FAT filesystem on the
 whole disk, on every disk in `drivers/blkdev.c`'s table: IDE `/dev/hda`..`hdd`, AHCI
 and USB `/dev/sdX`, NVMe `/dev/nvme0nN`, with partitions as `hda1`, `sdb2`,
@@ -744,7 +749,8 @@ there: QEMU, started without `-no-shutdown`, must exit through ACPI S5.
 `smoke-dyn`, `smoke-dynlib`, `smoke-x`, `smoke-pkg` (which first builds `repo/` and, on a
 host without one, a repo signing key), `smoke-gui` (which needs the ISO, so `check`
 builds it), `smoke-ext4`, `smoke-ext2rw`, `smoke-vfat` (needs `mkfs.fat`, `fsck.fat` and mtools on
-the host), `smoke-uefi` (the Limine ISO under SeaBIOS, OVMF x64 and OVMF IA32; `check`
+the host), `smoke-exfat` (needs `mkfs.exfat` and `fsck.exfat` from exfatprogs, and
+about 2 MiB of real disk for a 64 GiB sparse image), `smoke-uefi` (the Limine ISO under SeaBIOS, OVMF x64 and OVMF IA32; `check`
 builds the ISO, which fetches the pinned Limine release once, and the test skips a
 firmware that is not installed), `smoke-install`, `smoke-hda`, `smoke-acpi`, `smoke-ahci`, `smoke-nvme`,
 `smoke-usb` and `smoke-pc`. It runs them one after another, writes each suite's
@@ -856,6 +862,7 @@ A wedged boot prints nothing, so three things exist to make one visible.
 | [docs/install.md](docs/install.md) | `maeros-install`: disk layout, Limine, `root=PARTUUID=` |
 | [docs/ext4.md](docs/ext4.md) | `mount(2)`, partitions, the read-only ext4 driver |
 | [docs/vfat.md](docs/vfat.md) | read-write FAT and USB sticks |
+| [docs/exfat.md](docs/exfat.md) | read-write exFAT (big USB sticks, SD cards) |
 | [docs/audio.md](docs/audio.md) | `/dev/dsp`, the ALSA kernel ABI, Firefox audio |
 | [docs/audit/firefox-first-paint.md](docs/audit/firefox-first-paint.md) | the kernel audit behind the ABI probes |
 | [docs/perf/firefox-startup.md](docs/perf/firefox-startup.md) | where Firefox's startup time goes |

@@ -61,7 +61,7 @@ slot and the name. One stick at a time (the MSC driver's limit).
 * FAT12, FAT16 and FAT32, the type decided as Linux does: no 16-bit FAT size
   in the BPB means FAT32, otherwise the cluster count (fewer than 4085: FAT12).
   Sector sizes 512 to 4096, clusters up to 64 KiB, FAT32 with mirrored FATs or
-  one active FAT (`BPB_ExtFlags`). exFAT is detected and refused with a message.
+  one active FAT (`BPB_ExtFlags`). exFAT is `fs/exfat.c`'s (`docs/exfat.md`).
 * Long names (VFAT): UTF-16 in the entries, UTF-8 in the VFS, surrogate pairs
   for characters outside the BMP; a long name whose checksum does not match its
   short entry is ignored (as Windows does). Names are case-insensitive and
@@ -108,7 +108,7 @@ slot and the name. One stick at a time (the MSC driver's limit).
   `fs/ext4.c` does), because some kernel callers of `vfs_read` take the result
   as a length; write errors return `EIO`.
 
-Not supported: exFAT, symlinks and hard links (`EPERM`), device nodes, FIFOs
+Not supported (exFAT is a separate driver, `docs/exfat.md`): symlinks and hard links (`EPERM`), device nodes, FIFOs
 and sockets on FAT, `chown`, time zones, updating the FAT32 backup boot sector.
 
 ## Sources

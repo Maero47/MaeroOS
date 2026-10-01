@@ -25,7 +25,8 @@ Each is covered by the test named, which README.md's status table describes.
   in through it (`make smoke-alpine-net`), on top of rtnetlink, `AF_PACKET`,
   raw sockets and real `flock`/`fcntl` locks.
 - **Filesystems from USB sticks.** USB disks join the block-device table as
-  `sdX`, and FAT12/16/32 mounts read-write (`make smoke-vfat`).
+  `sdX`, and FAT12/16/32 and exFAT mount read-write (`make smoke-vfat`,
+  `make smoke-exfat`).
 - **Installing to a disk.** `maeros-install` writes a GPT disk that boots
   under BIOS and UEFI (`make smoke-install`).
 - **Sound for Linux programs.** The ALSA PCM/control ABI on HDA and AC'97
@@ -59,7 +60,8 @@ What still stands between MaeroOS and daily use on real hardware:
 - **Missing interfaces.** SysV IPC, utmp, `/proc/stat` and
   the full per-pid `/proc/<pid>/` set, which would let toybox build `killall`,
   `vmstat`, `who`, `netcat` and `wget`; inotify (deliberately `ENOSYS` today).
-- **Filesystems.** exFAT (recognised and refused today).
+- **Filesystems.** 64-bit file offsets in the VFS (exFAT and ext4 files past
+  4 GiB show their first 4 GiB − 1 bytes today).
 - **Packages.** Signing-key rotation and revocation; today the key is per
   build host.
 - **Distribution.** A deterministic release artifact: kernel ELF, initrd,
