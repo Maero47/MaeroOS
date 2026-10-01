@@ -1735,9 +1735,14 @@ static void ext2_close_node(vfs_node_t *node) {
         release = e->orphan;
         e->ino = 0; e->refs = 0; e->orphan = 0;
     }
-    if (fs->open_refs > 0) fs->open_refs--;
     preempt_enable();
     if (release) ext2_release_orphan(fs, ino);
+    /* Only now: while open_refs counts this reference the instance is busy,
+     * so a lazily detached one is not released (vfs.c detached_reap) under
+     * the orphan release's disk I/O. */
+    preempt_disable();
+    if (fs->open_refs > 0) fs->open_refs--;
+    preempt_enable();
 }
 
 /* An open directory only keeps its instance mounted (umount is -EBUSY);
