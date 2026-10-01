@@ -14,7 +14,8 @@ from Limine on the expected firmware (the "(UEFI)"/"(BIOS)" verdict comes
 from the EFI tags in the boot info) with an ACPI RSDP tag; the framebuffer
 came from the boot info (VBE or GOP) and its resolution is logged; getty's
 login works; the desktop starts on that framebuffer; and a QMP screendump is
-that size and not blank.
+that size and not blank; ACPI came up on the RSDP from the boot info (the
+BIOS-area scan is not used on UEFI), and `poweroff` makes QEMU exit through S5.
 
 Firmware lookup: $OVMF_X64_CODE / $OVMF_IA32_CODE (with ..._VARS), else the
 usual distro paths and tools/setup-linux.sh's ~/opt/hostpkgs.  A firmware
@@ -98,6 +99,34 @@ def prepare_disk(dst):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def acpi_poweroff(con):
+    """uACPI must have come up on the RSDP the loader passed (on UEFI there
+    is no BIOS area to scan), and `poweroff` must end QEMU through S5."""
+    text = con.text()
+    if "[ACPI] RSDP at" not in text or "(from the boot loader)" not in text:
+        raise AssertionError("ACPI did not take the RSDP from the boot loader")
+    if "[ACPI] ready" not in text:
+        raise AssertionError("ACPI did not come up")
+    start = con.mark()
+    smokelib.send(con.proc, "poweroff\n")
+    # Console.pump raises once QEMU is gone; read until the line closes.
+    deadline = time.time() + 60
+    while con.sel.get_map() and time.time() < deadline:
+        for k, _ in con.sel.select(0.2):
+            chunk = os.read(k.fd, 4096).decode("latin1", "replace")
+            if chunk:
+                con.log.append(chunk)
+            else:
+                con.sel.unregister(k.fileobj)
+    try:
+        con.proc.wait(timeout=max(1, deadline - time.time()))
+    except subprocess.TimeoutExpired:
+        raise AssertionError("QEMU did not exit after poweroff")
+    after = con.text()[start:]
+    if "[ACPI] powering off" not in after or "S5 failed" in after:
+        raise AssertionError("poweroff did not go through ACPI S5")
+
+
 def boot_one(name, qemu, code, vars_src, firmware, accel):
     out = os.path.join(OUT, name)
     os.makedirs(out)
@@ -108,7 +137,8 @@ def boot_one(name, qemu, code, vars_src, firmware, accel):
     cmd = [qemu, "-M", "pc", "-cdrom", ISO,
            "-drive", f"file={disk},format=raw,if=ide",
            "-accel", accel, "-vga", "std", *smokelib.QEMU_DISPLAY,
-           "-serial", "stdio", "-m", "512M", "-no-reboot", "-no-shutdown",
+           # No -no-shutdown: the closing poweroff must make QEMU exit.
+           "-serial", "stdio", "-m", "512M", "-no-reboot",
            "-qmp", f"unix:{qmp_path},server=on,wait=off"]
     if code:
         cmd += ["-drive", f"if=pflash,format=raw,readonly=on,file={code}"]
@@ -157,9 +187,10 @@ def boot_one(name, qemu, code, vars_src, firmware, accel):
         colors = distinct_colors(img, (0, 0, img.w, img.h))
         if colors < 50:
             raise AssertionError(f"desktop screen has only {colors} colours")
+        acpi_poweroff(con)
         return (f"{loader}, firmware={fw_seen}, fb={fb[0]}x{fb[1]} at {fb_phys}, "
                 f"ACPI RSDP {rsdp}, desktop up, {colors} colours, "
-                f"{time.time() - t0:.1f}s")
+                f"ACPI up and poweroff exits, {time.time() - t0:.1f}s")
     except Exception:
         print(f"\n[SMOKE-UEFI] {name}: last serial output:\n{con.text()[-3000:]}",
               file=sys.stderr)
