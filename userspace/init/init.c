@@ -6,6 +6,7 @@
 #include "../include/string.h"
 #include "../include/signal.h"
 #include "../include/poll.h"
+#include "../include/syscall.h"
 
 static char *initrd_shell_argv[] = { "/shell", (char *)0 };
 static char *initrd_desktop_argv[] = { "/desktop", (char *)0 };
@@ -574,7 +575,29 @@ static void handle_control_line(char *line, char *shell_path, char **envp) {
     printf("[init] Unsupported control command %s\n", cmd);
 }
 
+/* The ACPI power button (drivers/acpi.c) sends init SIGUSR2, busybox init's
+ * "power off" signal.  The handler only records it; the init loops act on it
+ * in poll_initctl, which every one of them calls. */
+static volatile int poweroff_requested;
+
+static void on_sigusr2(int sig) {
+    (void)sig;
+    poweroff_requested = 1;
+}
+
+static void power_off_now(void) {
+    printf("[init] Power button: shutting down\n");
+    init_log("power button: shutting down");
+    kill(-1, SIGTERM);              /* every process but init */
+    usleep(500000);
+    kill(-1, SIGKILL);
+    sync();
+    /* reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, CMD_POWER_OFF) */
+    syscall3(88, (int)0xFEE1DEADu, 672274793, (int)0x4321FEDCu);
+}
+
 static void poll_initctl(char *shell_path, char **envp) {
+    if (poweroff_requested) power_off_now();
     if (initctl_fd < 0) return;
 
     struct pollfd pfd;
@@ -701,6 +724,7 @@ static void monitor_children(char *command_shell_path, char **envp) {
 }
 
 int main(void) {
+    signal(SIGUSR2, on_sigusr2);
     int disk_userland = file_available("/disk/shell");
     char *command_shell_path = disk_userland ? "/disk/shell" : "/shell";
     char *session_path = command_shell_path;

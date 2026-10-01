@@ -232,6 +232,7 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
             for (;;) __asm__ volatile("hlt");
         }
     }
+    acpi_start_thread();
 
     printk("[BOOT] Jumping to scheduler.\n");
     /* The process table is now fully built — release the APs so they can scan

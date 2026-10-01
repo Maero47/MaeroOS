@@ -7,12 +7,15 @@ For each machine type (QEMU's default i440FX/PIIX4 `pc` and the ICH9 `q35`):
     -no-shutdown) must exit within a few seconds, through ACPI S5 — the
     fallback-port path logs "S5 failed" and fails the test;
   - boot again with -no-reboot, run `reboot`: QEMU must exit (a reset with
-    -no-reboot ends QEMU) after the kernel's "[ACPI] restarting".
+    -no-reboot ends QEMU) after the kernel's "[ACPI] restarting";
+  - boot again and press the ACPI power button (monitor `system_powerdown`):
+    the SCI's fixed event reaches init as SIGUSR2 and init powers off.
 Machines can be narrowed with SMOKE_ACPI_MACHINES="pc" etc.; SMOKE_SMP=N adds
 -smp N.
 """
 import os
 import selectors
+import socket
 import subprocess
 import sys
 import time
@@ -54,7 +57,18 @@ def drain_until_exit(proc, sel, log, timeout):
     return False
 
 
+def press_power_button(mon_path):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.connect(mon_path)
+        s.sendall(b"system_powerdown\n")
+        time.sleep(0.5)
+
+
 def run_case(machine, command, extra, expect_msg):
+    mon_path = None
+    if command == "power-button":
+        mon_path = os.path.join(ROOT, f".smoke-acpi-{os.getpid()}.mon")
+        extra = extra + ["-monitor", f"unix:{mon_path},server=on,wait=off"]
     proc, sel = boot(machine, extra)
     log = []
     try:
@@ -63,7 +77,10 @@ def run_case(machine, command, extra, expect_msg):
         if "[ACPI] ready" not in text:
             return f"{machine}: ACPI did not initialise"
         start = time.time()
-        smokelib.send(proc, command + "\n")
+        if mon_path:
+            press_power_button(mon_path)
+        else:
+            smokelib.send(proc, command + "\n")
         if not drain_until_exit(proc, sel, log, EXIT_TIMEOUT):
             return f"{machine}: QEMU still running {EXIT_TIMEOUT:.0f}s after `{command}`"
         took = time.time() - start
@@ -86,6 +103,8 @@ def run_case(machine, command, extra, expect_msg):
         if proc.poll() is None:
             proc.kill()
         proc.wait()
+        if mon_path and os.path.exists(mon_path):
+            os.unlink(mon_path)
 
 
 def main():
@@ -94,7 +113,8 @@ def main():
     for m in machines:
         for command, extra, msg in (
                 ("poweroff", [], "[ACPI] powering off"),
-                ("reboot", ["-no-reboot"], "[ACPI] restarting")):
+                ("reboot", ["-no-reboot"], "[ACPI] restarting"),
+                ("power-button", [], "[init] Power button: shutting down")):
             err = run_case(m, command, extra, msg)
             if err:
                 failures.append(err)
@@ -103,7 +123,7 @@ def main():
         for f in failures:
             print("[smoke-acpi] FAIL:", f)
         return 1
-    print(f"[smoke-acpi] PASS: poweroff and reboot on {', '.join(machines)}")
+    print(f"[smoke-acpi] PASS: poweroff, reboot and power button on {', '.join(machines)}")
     return 0
 
 

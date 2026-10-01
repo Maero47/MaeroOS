@@ -14,6 +14,11 @@
  * page directory then inherits). */
 void acpi_init(void);
 
+/* Start kacpid, which runs GPE/Notify work and forwards the power button to
+ * init.  Call after init is created: a kernel thread made earlier would take
+ * pid 1, which user space and the reparenting code expect to be init. */
+void acpi_start_thread(void);
+
 /* 1 once the namespace is loaded and the hardware is in ACPI mode. */
 int acpi_available(void);
 

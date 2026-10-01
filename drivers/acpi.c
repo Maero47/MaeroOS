@@ -602,11 +602,15 @@ void acpi_init(void) {
     if (st != UACPI_STATUS_OK)
         printk("[ACPI] power button: %s\n", uacpi_status_to_string(st));
 
+    printk("[ACPI] ready (uACPI %u.%u.%u)\n",
+           UACPI_MAJOR, UACPI_MINOR, UACPI_PATCH);
+}
+
+void acpi_start_thread(void) {
+    if (!acpi_ready) return;
     kacpid_proc = proc_create_kthread(kacpid, "kacpid");
     if (!kacpid_proc)
         printk("[ACPI] cannot start kacpid; GPEs and the power button are dead\n");
-    printk("[ACPI] ready (uACPI %u.%u.%u)\n",
-           UACPI_MAJOR, UACPI_MINOR, UACPI_PATCH);
 }
 
 /* ── Power off / reboot ──────────────────────────────────────────────────── */
