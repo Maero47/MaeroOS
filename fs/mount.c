@@ -84,7 +84,10 @@ static int mount_remount(const char *target, uint32_t flags) {
     if (want_ro && !(m->flags & VFS_MS_RDONLY)) {
         for (int i = 0; i < MAX_PROCS; i++) {
             struct proc *p = &ptable[i];
-            if (p->state == PROC_UNUSED) continue;
+            /* Kernel threads have no descriptor table, and an exited
+             * process may have dropped its (shared) one already. */
+            if (p->state == PROC_UNUSED || p->state == PROC_ZOMBIE || !p->ofile)
+                continue;
             for (int fd = 0; fd < MAX_FD; fd++) {
                 proc_file_t *f = &p->ofile[fd];
                 if (f->type != FD_NONE && f->mnt == m && f->mnt_seq == m->seq &&
