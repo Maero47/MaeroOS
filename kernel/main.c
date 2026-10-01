@@ -120,7 +120,8 @@ static void mount_disk_root(void) {
         snprintf(devpath, sizeof(devpath), "%s", blk_boot_devpath());
         bp = blkpart_find(devpath + 5);
     }
-    vfs_node_t *disk_root = ext2_mount(start);
+    /* ext2 checks the superblock's size against the device's. */
+    vfs_node_t *disk_root = ext2_mount(start, bp ? bp->nsect : 0);
     if (!disk_root) {
         if (arg) printk("[BOOT] root=%s: no ext2 filesystem on %s\n", want, devpath);
         return;

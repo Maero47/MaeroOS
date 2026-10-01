@@ -66,6 +66,7 @@ Where the files come from:
 | `proc/syscall.c` | `pread64`/`pwrite64` on a disk node take the full 64-bit offset (descriptor offsets are 32-bit), so the backup GPT at the end of a disk larger than 4 GiB can be reached |
 | `fs/devfs.c`, `fs/initrd.c` | `/dev/initrd` (read-only, root only; Linux's block device 1,250) |
 | `userspace/desktop/desktop.c`, `userspace/term/term.c` | the Install launcher entry and desktop icon; `term <slot> <command>` runs `shell -c <command>` instead of an interactive shell |
+| `fs/ext2.c`, `drivers/ata.c` | `ext2_mount()` refuses a superblock with more blocks than its device or partition has; the IDE master's `ata_read`/`ata_write` reject sectors at or past the drive's end or 2^28 (as the other IDE positions already did), so nothing wraps onto LBA 0 |
 | `kernel/main.c` | `root=/dev/<name>` or `root=PARTUUID=<guid>` picks the partition ext2 mounts at `/disk`. Without `root=`, the boot disk's whole device is used, as before. If `root=` names no device or the device holds no ext2, `/disk` stays unmounted rather than falling back to some other disk |
 
 The installer is plain POSIX C. Built on a Linux host (`cc -O2

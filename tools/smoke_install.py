@@ -18,6 +18,9 @@
    ide       qemu -M pc, -kernel, a sparse 130 GiB IDE hdb: the kernel logs
              that LBA28 reaches only 128 GiB of it, and maeros-install
              refuses it (BLKGETSIZE64 > the addressable size).
+   ext2-size qemu -M pc, -kernel, an hda holding an 8 MiB ext2 cut to 4 MiB:
+             the kernel refuses to mount it at /disk (superblock larger than
+             the device) and boots from the initrd.
    host      the target's GPT verifies (sgdisk -v), its root partition is
              clean under `e2fsck -fn`, its ESP under `fsck.fat -n` (each when
              the tool is installed).
@@ -220,6 +223,37 @@ def ide_lba28(accel):
         os.remove(big)
 
 
+def ext2_oversized(accel):
+    """An ext2 superblock that claims more blocks than its disk has (an 8 MiB
+    filesystem on a 4 MiB hda) is not mounted at /disk: its block numbers
+    would run past the device, or wrap in an LBA28 command."""
+    mke2fs = shutil.which("mke2fs") or (os.path.exists("/usr/sbin/mke2fs") and "/usr/sbin/mke2fs")
+    if not mke2fs:
+        return "SKIP (no mke2fs)"
+    img = os.path.join(OUT, "oversized.img")
+    with open(img, "wb") as f:
+        f.truncate(8 << 20)
+    subprocess.run([mke2fs, "-q", "-F", "-t", "ext2", "-b", "1024", img], check=True)
+    with open(img, "r+b") as f:
+        f.truncate(4 << 20)
+    cmd = ["qemu-system-i386", "-M", "pc", "-accel", accel, "-m", "256M",
+           "-kernel", "kernel.elf", "-initrd", "initrd.tar",
+           "-drive", f"file={img},format=raw,index=0,media=disk"]
+    out, sockdir, con, qmp = start_qemu("ext2-size", cmd)
+    try:
+        con.wait_re(r"\[EXT2\]  Superblock claims 8192 blocks \(8 MiB\) but the device "
+                    r"has 4 MiB; not mounting", timeout=60)
+        con.wait_re(r"\[BOOT\] Launching /init", timeout=60)
+        return "8 MiB ext2 on a 4 MiB disk: not mounted, booted from the initrd"
+    except Exception:
+        print(f"\n[SMOKE-INSTALL] ext2-size: last serial output:\n{con.text()[-3000:]}",
+              file=sys.stderr)
+        raise
+    finally:
+        finish(out, sockdir, con, qmp)
+        os.remove(img)
+
+
 def host_checks(uuid):
     notes = []
     sgdisk = shutil.which("sgdisk")
@@ -342,6 +376,9 @@ def main():
     results.append(("host", "PASS: " + ", ".join(host_checks(uuid))))
     print(f"\n[SMOKE-INSTALL] ide: a disk past LBA28 (accel={accel})")
     results.append(("ide", "PASS: " + ide_lba28(accel)))
+    print(f"\n[SMOKE-INSTALL] ext2-size: an oversized superblock (accel={accel})")
+    r = ext2_oversized(accel)
+    results.append(("ext2-size", r if r.startswith("SKIP") else "PASS: " + r))
 
     token = "persist-%08x" % int.from_bytes(os.urandom(4), "little")
     print(f"\n[SMOKE-INSTALL] bios: booting the installed disk alone (accel={accel})")

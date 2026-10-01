@@ -445,8 +445,17 @@ int ata_present(void) {
     return drive_present;
 }
 
+/* The master's commands carry a 28-bit LBA: anything at or past the end of
+ * the drive, or past 2^28, would wrap onto low sectors (the partition table,
+ * a superblock).  The same rule xdev_rw applies to the other positions. */
+static int master_range_ok(uint32_t lba, uint8_t count) {
+    uint32_t nsect = count ? count : 256u;
+    return lba < master_sectors && nsect <= master_sectors - lba &&
+           lba + nsect <= (1u << 28);
+}
+
 int ata_read(uint32_t lba, uint8_t count, void *buf) {
-    if (!drive_present) return -1;
+    if (!drive_present || !master_range_ok(lba, count)) return -1;
 
     kprof_count(KPE_ATA_RD);
     kprof_add(KPE_ATA_RD_SECT, count ? count : 256);
@@ -512,7 +521,7 @@ int ata_read(uint32_t lba, uint8_t count, void *buf) {
 }
 
 int ata_write(uint32_t lba, uint8_t count, const void *buf) {
-    if (!drive_present) return -1;
+    if (!drive_present || !master_range_ok(lba, count)) return -1;
 
     kprof_count(KPE_ATA_WR);
     kprof_add(KPE_ATA_WR_SECT, count ? count : 256);
@@ -694,7 +703,7 @@ uint64_t ata_dev_capacity(int dev) {
 static int xdev_rw(int dev, uint32_t lba, uint8_t count, void *buf, int write) {
     ata_xdev_t *d = &ata_xdev[dev];
     uint32_t nsect = count ? count : 256u;
-    if (lba >= d->sectors || nsect > d->sectors - lba || lba >= (1u << 28))
+    if (lba >= d->sectors || nsect > d->sectors - lba || lba + nsect > (1u << 28))
         return -1;
     kprof_count(write ? KPE_ATA_WR : KPE_ATA_RD);
     uint32_t irq = ata_irq_save();
