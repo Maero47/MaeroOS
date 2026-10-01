@@ -351,6 +351,16 @@ def guest_tests(g, info):
     rc, out = g.sh("busybox cat /proc/mounts")
     check("/dev/sdb /mnt/a ext4 rw" in out, "/proc/mounts: /mnt/a ext4 rw (journaled)")
     check("/dev/nvme0n1 /mnt/b ext4 rw" in out, "/proc/mounts: /mnt/b ext4 rw (no journal)")
+    # Two instances of the one ext2/ext4 driver: rename(2) and link(2)
+    # between them are EXDEV (fs/vfs.c vfs_path_instance), never run on the
+    # source's volume with the target's directory.
+    rc, out = g.sh("echo xdev > /mnt/a/xdev.txt && fsprobe rename /mnt/a/xdev.txt /mnt/b/xdev.txt; "
+                   "busybox ln /mnt/a/xdev.txt /mnt/b/xdev-link 2>&1; "
+                   "busybox cat /mnt/a/xdev.txt; busybox ls /mnt/b/xdev.txt /mnt/b/xdev-link 2>&1; "
+                   "busybox rm /mnt/a/xdev.txt")
+    check("rename: -18" in out and re.search(r"^xdev\r?$", out, re.M) and
+          out.count("No such file") >= 2,
+          f"rename and link from /mnt/a to /mnt/b are EXDEV, the file stays ({out.strip()[-300:]!r})")
     boot = "".join(g.log)
     check(re.search(r"sdb: mounted read-write \(block 4096.*journal, extents, metadata_csum, 64bit", boot)
           is not None, "sdb mounted by the ext2 driver with journal, extents, metadata_csum, 64bit")
