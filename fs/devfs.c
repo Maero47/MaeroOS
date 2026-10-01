@@ -1,5 +1,6 @@
 #include "devfs.h"
 #include "../drivers/blkpart.h"
+#include "initrd.h"
 #include "../drivers/ac97.h"
 #include "../drivers/hda.h"
 #include "vfs.h"
@@ -38,6 +39,17 @@ static uint32_t null_write(vfs_node_t *n, uint32_t off, uint32_t len,
 }
 
 /* ── /dev/zero ─────────────────────────────────────────────────────────────── */
+
+/* /dev/initrd: the boot module the root filesystem was unpacked from. */
+static uint32_t initrd_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+    (void)n;
+    uint32_t size;
+    const uint8_t *img = initrd_image(&size);
+    if (!img || off >= size) return 0;
+    if (len > size - off) len = size - off;
+    memcpy(buf, img + off, len);
+    return len;
+}
 
 static uint32_t zero_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
     (void)n; (void)off;
@@ -472,6 +484,7 @@ static uint32_t urandom_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t 
 /* ── Static device nodes ───────────────────────────────────────────────────── */
 
 static vfs_node_t dev_null;
+static vfs_node_t dev_initrd;
 static vfs_node_t dev_zero;
 static vfs_node_t dev_tty;
 static vfs_node_t dev_urandom;
@@ -988,6 +1001,7 @@ static vfs_node_t *devdir_finddir(vfs_node_t *node, const char *name) {
     (void)node;
     if (strcmp(name, "null")    == 0) return &dev_null;
     if (strcmp(name, "zero")    == 0) return &dev_zero;
+    if (strcmp(name, "initrd")  == 0 && dev_initrd.size) return &dev_initrd;
     if (strcmp(name, "tty")     == 0) return &dev_tty;
     if (strcmp(name, "ptmx")    == 0) return &dev_ptmx;   /* open_fn clones */
     if (strcmp(name, "pts")     == 0) return &dev_pts_dir;
@@ -1012,11 +1026,13 @@ static int devdir_readdir(vfs_node_t *node, uint32_t idx, vfs_dirent_t *out) {
     (void)node;
     static const char *names[] = { "null", "zero", "tty", "urandom", "dsp",
                                     "fb0", "input", "ptmx", "pts", "shm",
-                                    "stdin", "stdout", "stderr", "usbdisk0" };
+                                    "stdin", "stdout", "stderr", "usbdisk0",
+                                    "initrd" };
     uint32_t out_idx = 0;
     for (uint32_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         if (i == 5 && !framebuffer_available()) continue;   /* "fb0" */
         if (i == 13 && !usb_msc_node()) continue;           /* "usbdisk0" */
+        if (i == 14 && !dev_initrd.size) continue;          /* "initrd" */
         if (out_idx == idx) {
             out->ino  = (uint32_t)(idx + 1);
             out->type = (strcmp(names[i], "input") == 0 ||
@@ -1156,6 +1172,17 @@ vfs_node_t *devfs_mount(void) {
     dev_null.write_fn = null_write;
     dev_null.read_ready_fn = always_ready;
     dev_null.write_ready_fn = always_ready;
+
+    /* /dev/initrd (Linux: block device 1,250), read-only, root only */
+    memset(&dev_initrd, 0, sizeof(dev_initrd));
+    strncpy(dev_initrd.name, "initrd", 255);
+    dev_initrd.flags   = VFS_FLAG_CHARDEV;
+    dev_initrd.inode   = 32;
+    dev_initrd.mask    = 0400;
+    dev_initrd.rdev    = (1u << 8) | 250u;
+    dev_initrd.read_fn = initrd_read;
+    dev_initrd.read_ready_fn = always_ready;
+    initrd_image(&dev_initrd.size);
 
     /* /dev/zero */
     memset(&dev_zero, 0, sizeof(dev_zero));

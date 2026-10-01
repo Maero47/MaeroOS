@@ -28,6 +28,13 @@ const char *blk_name(void);
 /* The boot disk's /dev path ("/dev/hda", "/dev/sda", "/dev/nvme0n1"). */
 const char *blk_boot_devpath(void);
 
+/* Make `disk` the boot disk (root= on the command line names it). */
+void blk_set_boot(int disk);
+/* A disk is busy while ext2 has it mounted at /disk: /dev writes to it are
+ * refused. */
+void blk_set_busy(int disk);
+int  blk_disk_busy(int disk);
+
 int blk_read(uint32_t lba, uint8_t count, void *buf);
 int blk_write(uint32_t lba, uint8_t count, const void *buf);
 

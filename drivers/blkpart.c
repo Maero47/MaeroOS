@@ -30,31 +30,66 @@ int blkpart_write(blkpart_t *bp, uint32_t sector, uint32_t count, const void *bu
     return blk_disk_write(bp->dev, bp->start + sector, count, buf);
 }
 
-/* ── /dev node: read-only raw access ─────────────────────────────────────── */
+/* ── Byte-granular access, used by the /dev node and by pread64/pwrite64 ──── */
+
+int blkpart_rw(blkpart_t *bp, uint64_t off, uint8_t *buf, uint32_t len, int write) {
+    if (!bp) return -19;                                   /* -ENODEV */
+    uint64_t size = (uint64_t)bp->nsect * 512u;
+    if (len == 0) return 0;
+    if (off >= size) return write ? -28 : 0;               /* -ENOSPC / EOF */
+    if ((uint64_t)len > size - off) len = (uint32_t)(size - off);
+    /* The disk ext2 has mounted at /disk is never written behind its back. */
+    if (write && blk_disk_busy(bp->dev)) return -16;       /* -EBUSY */
+    uint8_t *sec = NULL;
+    uint32_t done = 0;
+    int err = 0;
+    while (done < len) {
+        uint64_t pos = off + done;
+        uint32_t in  = (uint32_t)(pos & 511u);
+        uint32_t lba = (uint32_t)(pos >> 9);
+        if (!in && len - done >= 512u) {
+            /* Whole sectors straight to or from the caller's buffer. */
+            uint32_t n = (len - done) >> 9;
+            if (n > 128) n = 128;
+            int r = write ? blkpart_write(bp, lba, n, buf + done)
+                          : blkpart_read(bp, lba, n, buf + done);
+            if (r < 0) { err = -5; break; }                /* -EIO */
+            done += n << 9;
+            continue;
+        }
+        /* A partial sector: read it, patch it, write it back. */
+        if (!sec && !(sec = (uint8_t *)kmalloc(512))) { err = -12; break; }
+        uint32_t n = 512u - in;
+        if (n > len - done) n = len - done;
+        if (blkpart_read(bp, lba, 1, sec) < 0) { err = -5; break; }
+        if (write) {
+            memcpy(sec + in, buf + done, n);
+            if (blkpart_write(bp, lba, 1, sec) < 0) { err = -5; break; }
+        } else {
+            memcpy(buf + done, sec + in, n);
+        }
+        done += n;
+    }
+    if (sec) kfree(sec);
+    return done ? (int)done : err;
+}
+
+/* ── /dev node: raw access (root only: mode 0660, root:root) ─────────────── */
 
 static uint32_t blkpart_node_read(vfs_node_t *node, uint32_t off, uint32_t len,
                                   uint8_t *buf) {
-    blkpart_t *bp = (blkpart_t *)node->private;
-    uint64_t size = (uint64_t)bp->nsect * 512u;
-    if (off >= size) return 0;
-    if ((uint64_t)off + len > size) len = (uint32_t)(size - off);
-    uint8_t *sec = (uint8_t *)kmalloc(512);
-    if (!sec) return 0;
-    uint32_t done = 0;
-    while (done < len) {
-        uint32_t pos = off + done;
-        uint32_t in  = pos & 511u;
-        uint32_t n   = 512u - in;
-        if (n > len - done) n = len - done;
-        if (blkpart_read(bp, pos >> 9, 1, sec) < 0) break;
-        memcpy(buf + done, sec + in, n);
-        done += n;
-    }
-    kfree(sec);
-    return done;
+    int r = blkpart_rw((blkpart_t *)node->private, off, buf, len, 0);
+    return r < 0 ? 0 : (uint32_t)r;
 }
 
-static blkpart_t *blkpart_add(int dev, int partno, uint32_t start, uint32_t nsect) {
+static uint32_t blkpart_node_write(vfs_node_t *node, uint32_t off, uint32_t len,
+                                   const uint8_t *buf) {
+    return (uint32_t)blkpart_rw((blkpart_t *)node->private, off, (uint8_t *)buf,
+                                len, 1);
+}
+
+static blkpart_t *blkpart_add(int dev, int partno, uint32_t start, uint32_t nsect,
+                              const uint8_t *guid) {
     if (g_nparts >= BLKPART_MAX || !nsect) return NULL;
     uint32_t disk = blk_disk_sectors(dev);
     const char *dname = blk_disk_devname(dev);
@@ -77,6 +112,7 @@ static blkpart_t *blkpart_add(int dev, int partno, uint32_t start, uint32_t nsec
     bp->start  = start;
     bp->nsect  = nsect;
     bp->partno = partno;
+    if (guid) { memcpy(bp->guid, guid, 16); bp->has_guid = 1; }
     bp->rdev   = blk_disk_rdev(dev, partno);
     strncpy(bp->node.name, bp->name, 255);
     bp->node.flags   = VFS_FLAG_BLKDEV;
@@ -85,6 +121,7 @@ static blkpart_t *blkpart_add(int dev, int partno, uint32_t start, uint32_t nsec
     bp->node.size    = nsect >= 0x800000u ? 0xFFFFFFFFu : nsect * 512u;
     bp->node.rdev    = bp->rdev;
     bp->node.read_fn = blkpart_node_read;
+    bp->node.write_fn = blkpart_node_write;
     bp->node.private = bp;
     g_parts[g_nparts++] = bp;
     return bp;
@@ -163,7 +200,7 @@ static int gpt_scan(int dev, uint32_t lba) {
         }
         if (i + 1 > 99) break;
         if (blkpart_add(dev, (int)(i + 1), (uint32_t)first,
-                        (uint32_t)(last - first + 1)))
+                        (uint32_t)(last - first + 1), e + 16))
             found++;
     }
 out:
@@ -190,7 +227,7 @@ static void mbr_scan_logical(int dev, uint32_t ext_start, uint32_t ext_len,
         if (sec[510] != 0x55 || sec[511] != 0xAA) return;
         const uint8_t *e0 = sec + 446, *e1 = sec + 462;
         if (e0[4] && rd32(e0 + 12))
-            blkpart_add(dev, partno++, ebr + rd32(e0 + 8), rd32(e0 + 12));
+            blkpart_add(dev, partno++, ebr + rd32(e0 + 8), rd32(e0 + 12), NULL);
         if (!mbr_is_extended(e1[4]) || !rd32(e1 + 12)) return;
         uint32_t next = ext_start + rd32(e1 + 8);
         if (next <= ebr || next >= ext_start + ext_len) return;   /* no loops */
@@ -200,7 +237,7 @@ static void mbr_scan_logical(int dev, uint32_t ext_start, uint32_t ext_len,
 
 static void scan_disk(int dev) {
     uint32_t n = blk_disk_sectors(dev);
-    if (!blkpart_add(dev, 0, 0, n)) return;
+    if (!blkpart_add(dev, 0, 0, n, NULL)) return;
     uint8_t *sec = (uint8_t *)kmalloc(512);
     if (!sec) return;
     if (blk_disk_read(dev, 0, 1, sec) < 0 || sec[510] != 0x55 || sec[511] != 0xAA)
@@ -228,7 +265,7 @@ static void scan_disk(int dev) {
             if (!ext_start) { ext_start = start; ext_len = len; }
             continue;
         }
-        blkpart_add(dev, i + 1, start, len);
+        blkpart_add(dev, i + 1, start, len, NULL);
     }
     if (ext_start)
         mbr_scan_logical(dev, ext_start, ext_len, sec);
@@ -248,6 +285,35 @@ void blkpart_init(void) {
 blkpart_t *blkpart_find(const char *name) {
     for (uint32_t i = 0; i < g_nparts; i++)
         if (strcmp(g_parts[i]->name, name) == 0) return g_parts[i];
+    return NULL;
+}
+
+/* GPT GUIDs are printed with their first three fields little-endian:
+ * bytes 3 2 1 0 - 5 4 - 7 6 - 8 9 - 10..15. */
+void blkpart_guid_str(const uint8_t *g, char *out) {
+    static const uint8_t order[16] = { 3, 2, 1, 0, 5, 4, 7, 6, 8, 9,
+                                       10, 11, 12, 13, 14, 15 };
+    static const char hex[] = "0123456789abcdef";
+    char *p = out;
+    for (int i = 0; i < 16; i++) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) *p++ = '-';
+        *p++ = hex[g[order[i]] >> 4];
+        *p++ = hex[g[order[i]] & 15];
+    }
+    *p = '\0';
+}
+
+static int lower(int c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
+
+blkpart_t *blkpart_find_partuuid(const char *uuid) {
+    char s[37];
+    for (uint32_t i = 0; i < g_nparts; i++) {
+        if (!g_parts[i]->has_guid) continue;
+        blkpart_guid_str(g_parts[i]->guid, s);
+        int k = 0;
+        while (s[k] && lower((unsigned char)uuid[k]) == s[k]) k++;
+        if (!s[k] && !uuid[k]) return g_parts[i];
+    }
     return NULL;
 }
 

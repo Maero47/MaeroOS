@@ -53,7 +53,7 @@ USER_BINS := $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
 	     $(TESTFILES)/diff $(TESTFILES)/tar \
 	     $(TESTFILES)/mkfifo $(TESTFILES)/ln $(TESTFILES)/readlink \
 	     $(TESTFILES)/sysprobe $(TESTFILES)/fcprobe $(TESTFILES)/lspci $(TESTFILES)/ifconfig \
-	     $(TESTFILES)/diskprobe $(TESTFILES)/fsprobe $(TESTFILES)/mntprobe $(TESTFILES)/respawnprobe $(TESTFILES)/heapprobe \
+	     $(TESTFILES)/diskprobe $(TESTFILES)/fsprobe $(TESTFILES)/mntprobe $(TESTFILES)/maeros-install $(TESTFILES)/respawnprobe $(TESTFILES)/heapprobe \
 	     $(TESTFILES)/sockprobe $(TESTFILES)/srvprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget $(TESTFILES)/getent \
 	     $(TESTFILES)/randprobe $(TESTFILES)/sysmiscprobe $(TESTFILES)/abi2probe $(TESTFILES)/sigexecprobe $(TESTFILES)/timerprobe $(TESTFILES)/symprobe $(TESTFILES)/sigshareprobe \
 	     $(TESTFILES)/fbtest $(TESTFILES)/evtest $(TESTFILES)/mousetest \
@@ -395,6 +395,12 @@ symprobe/symprobe.o: symprobe/symprobe.c
 
 $(TESTFILES)/symprobe: $(CRT0_OBJ) symprobe/symprobe.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) symprobe/symprobe.o libc/libc.a
+
+# maeros-install (the same sources build on a Linux host, see install/install.h)
+INSTALL_OBJS := install/install.o install/fat.o install/ext2.o
+$(INSTALL_OBJS): install/install.h
+$(TESTFILES)/maeros-install: $(CRT0_OBJ) $(INSTALL_OBJS) libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) $(INSTALL_OBJS) libc/libc.a
 
 # mntprobe
 mntprobe/mntprobe.o: mntprobe/mntprobe.c

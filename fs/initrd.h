@@ -13,3 +13,8 @@
  * the PMM does not reclaim those frames.
  */
 void initrd_init(uint32_t mod_phys_start, uint32_t mod_phys_end);
+
+/* The whole image as loaded (kernel virtual), and its size; NULL and 0 when
+ * there is none.  devfs serves it read-only as /dev/initrd, which is how
+ * maeros-install copies the running system's initrd to a disk. */
+const uint8_t *initrd_image(uint32_t *size);

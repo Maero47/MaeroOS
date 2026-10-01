@@ -8,7 +8,8 @@
 # source of the `limine` host tool (limine.c, needed for `bios-install`).
 # The tag's tarball is pinned by sha256; the host tool is built with cc.
 #
-# Result (gitignored): third_party/limine/bin/ with those files + `limine`.
+# Result (gitignored): third_party/limine/bin/ with those files + `limine`
+# and limine-bios-hdd.bin.
 # third_party/limine/LICENSE is the upstream licence, kept in the tree and
 # copied into every image.  Idempotent: a matching tree is left alone.
 #
@@ -33,7 +34,16 @@ FILES="limine-bios.sys limine-bios-cd.bin limine-uefi-cd.bin BOOTX64.EFI BOOTIA3
 
 die() { printf 'fetch-limine: %s\n' "$*" >&2; exit 1; }
 
+# limine-bios-hdd.bin: the BIOS stage 1+2 image that `limine bios-install`
+# embeds (as limine-bios-hdd.h), as a plain file for maeros-install, which
+# writes it from inside the guest (userspace/install/install.c).
+hdd_bin() {
+    python3 -c 'import re,sys; d=open(sys.argv[1]).read().split("{",1)[1]; open(sys.argv[2],"wb").write(bytes(int(x,16) for x in re.findall(r"0x([0-9a-fA-F]{2})",d)))' \
+        "$DEST/limine-bios-hdd.h" "$DEST/limine-bios-hdd.bin"
+}
+
 if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$LIMINE_VER" ] && [ -x "$DEST/limine" ]; then
+    [ -f "$DEST/limine-bios-hdd.bin" ] || hdd_bin
     exit 0
 fi
 
@@ -73,5 +83,6 @@ cmp -s "$DEST/LICENSE" "$ROOT/third_party/limine/LICENSE" \
 CC=${HOST_CC:-cc}
 command -v "$CC" >/dev/null 2>&1 || die "need a host C compiler ($CC) to build the limine tool"
 "$CC" -O2 -std=c99 -I"$DEST" "$DEST/limine.c" -o "$DEST/limine" || die "building the limine host tool failed"
+hdd_bin
 echo "$LIMINE_VER" > "$STAMP"
 echo "fetch-limine: Limine $LIMINE_VER ready in third_party/limine/bin"

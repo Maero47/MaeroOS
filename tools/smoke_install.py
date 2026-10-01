@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""smoke-install — install MaeroOS to a disk from the live ISO, then boot it.
+
+1. live      qemu-system-i386 -M q35: maeros-limine.iso on the AHCI CD, a
+             copy of disk.img as sda (the live /disk) and an empty 1 GiB sdb.
+             As root: `maeros-install -l` lists both and marks sda in use,
+             `maeros-install -y /dev/sda` is refused, `maeros-install -y
+             /dev/sdb` installs; then poweroff.
+   host      the target's GPT verifies (sgdisk -v), its root partition is
+             clean under `e2fsck -fn`, its ESP under `fsck.fat -n` (each when
+             the tool is installed).
+2. bios      qemu-system-i386 -M q35, SeaBIOS, ONLY the installed disk: Limine
+             (BIOS) boots it, the kernel takes root=PARTUUID=... as /dev/sda3,
+             /proc/mounts has it at /disk, login works, the desktop comes up;
+             a file is written to /disk; poweroff.
+3. uefi-x64  qemu-system-x86_64 -M q35, OVMF x64, ONLY the installed disk: the
+             same checks, and the file from boot 2 is there.
+
+Output: build/smoke-install/ (serial logs, desktop screenshots, target.img).
+OVMF missing: the uefi-x64 boot is SKIP (SMOKE_UEFI_REQUIRE=1 makes it fail).
+The UEFI boot runs under TCG unless SMOKE_UEFI_ACCEL=kvm (see smoke_uefi.py).
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+import smokelib
+from smoke_gui import Console, Image, Qmp, distinct_colors, pick_accel
+from smoke_uefi import X64_NAMES, FW_DIRS, find_firmware, prepare_disk
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+OUT = os.path.join(ROOT, "build", "smoke-install")
+ISO = os.path.join(ROOT, "maeros-limine.iso")
+TARGET = os.path.join(OUT, "target.img")
+TARGET_SIZE = 1024 * 1024 * 1024
+
+
+def start_qemu(name, cmd):
+    out = os.path.join(OUT, name)
+    os.makedirs(out, exist_ok=True)
+    sockdir = tempfile.mkdtemp(prefix="sinst")
+    qmp_path = os.path.join(sockdir, "qmp")
+    cmd = cmd + ["-vga", "std", *smokelib.QEMU_DISPLAY, "-serial", "stdio",
+                 "-no-reboot", "-qmp", f"unix:{qmp_path},server=on,wait=off"]
+    with open(os.path.join(out, "qemu-cmdline.txt"), "w") as f:
+        f.write(" ".join(cmd) + "\n")
+    proc = subprocess.Popen(cmd, cwd=ROOT, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            bufsize=0)
+    con = Console(proc)
+    return out, sockdir, con, Qmp(qmp_path)
+
+
+def finish(out, sockdir, con, qmp):
+    with open(os.path.join(out, "serial.log"), "w") as f:
+        f.write(con.text())
+    if qmp is not None:
+        qmp.close()
+    if con.proc.poll() is None:
+        con.proc.terminate()
+        try:
+            con.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            con.proc.kill()
+    shutil.rmtree(sockdir, ignore_errors=True)
+
+
+def poweroff(con):
+    smokelib.send(con.proc, "poweroff\n")
+    deadline = time.time() + 60
+    while con.sel.get_map() and time.time() < deadline:
+        for k, _ in con.sel.select(0.2):
+            chunk = os.read(k.fd, 4096).decode("latin1", "replace")
+            if chunk:
+                con.log.append(chunk)
+            else:
+                con.sel.unregister(k.fileobj)
+    try:
+        con.proc.wait(timeout=max(1, deadline - time.time()))
+    except subprocess.TimeoutExpired:
+        raise AssertionError("QEMU did not exit after poweroff")
+
+
+def live_install(accel):
+    live = os.path.join(OUT, "live.img")
+    prepare_disk(live)
+    with open(TARGET, "wb") as f:
+        f.truncate(TARGET_SIZE)
+    cmd = ["qemu-system-i386", "-M", "q35", "-accel", accel, "-m", "1024M",
+           "-drive", f"file={live},format=raw,if=none,id=live",
+           "-device", "ide-hd,drive=live,bus=ide.0",
+           "-drive", f"file={TARGET},format=raw,if=none,id=target",
+           "-device", "ide-hd,drive=target,bus=ide.1",
+           "-drive", f"file={ISO},format=raw,if=none,id=cd,media=cdrom,readonly=on",
+           "-device", "ide-cd,drive=cd,bus=ide.2", "-boot", "d"]
+    out, sockdir, con, qmp = start_qemu("live", cmd)
+    try:
+        con.wait_re(r'\[BOOT\] multiboot2: loader "Limine', timeout=180)
+        smokelib.login(con.proc, con.sel, con.log, timeout=180, start=0)
+        listing = con.run("maeros-install -l", timeout=30)
+        if not re.search(r"/dev/sda .*in use", listing) or not re.search(r"/dev/sdb\s+1024 MiB", listing):
+            raise AssertionError(f"maeros-install -l: unexpected listing:\n{listing}")
+        refused = con.run("maeros-install -y /dev/sda; echo rc=$?", timeout=30)
+        if "mounted filesystem" not in refused or "rc=1" not in refused:
+            raise AssertionError(f"installing over the live disk was not refused:\n{refused}")
+        t0 = time.time()
+        log = con.run("maeros-install -y /dev/sdb; echo rc=$?", timeout=900)
+        took = time.time() - t0
+        m = re.search(r"root=PARTUUID=([0-9a-f-]{36})", log)
+        if "rc=0" not in log or not m:
+            raise AssertionError(f"maeros-install failed:\n{log[-3000:]}")
+        poweroff(con)
+        return m.group(1), took
+    except Exception:
+        print(f"\n[SMOKE-INSTALL] live: last serial output:\n{con.text()[-3000:]}",
+              file=sys.stderr)
+        raise
+    finally:
+        finish(out, sockdir, con, qmp)
+
+
+def host_checks(uuid):
+    notes = []
+    sgdisk = shutil.which("sgdisk")
+    parts = {}
+    if sgdisk:
+        r = subprocess.run([sgdisk, "-v", TARGET], capture_output=True, text=True)
+        if "No problems found" not in r.stdout:
+            raise AssertionError(f"sgdisk -v: {r.stdout}{r.stderr}")
+        for n in (1, 2, 3):
+            r = subprocess.run([sgdisk, "-i", str(n), TARGET], capture_output=True, text=True)
+            first = int(re.search(r"First sector: (\d+)", r.stdout).group(1))
+            last = int(re.search(r"Last sector: (\d+)", r.stdout).group(1))
+            puuid = re.search(r"unique GUID: ([0-9A-F-]+)", r.stdout).group(1).lower()
+            parts[n] = (first, last, puuid)
+        if parts[3][2] != uuid:
+            raise AssertionError(f"partition 3 is {parts[3][2]}, limine.conf says {uuid}")
+        notes.append("GPT ok")
+    else:
+        notes.append("sgdisk missing, GPT unchecked")
+        return notes
+
+    def extract(n, name):
+        first, last, _ = parts[n]
+        path = os.path.join(OUT, name)
+        with open(TARGET, "rb") as src, open(path, "wb") as dst:
+            src.seek(first * 512)
+            left = (last - first + 1) * 512
+            while left:
+                buf = src.read(min(left, 1 << 22))
+                dst.write(buf)
+                left -= len(buf)
+        return path
+
+    for tool, n, args, label in (("e2fsck", 3, ["-fn"], "ext2"), ("fsck.fat", 2, ["-n"], "FAT32")):
+        exe = shutil.which(tool) or (os.path.exists("/usr/sbin/" + tool) and "/usr/sbin/" + tool)
+        if not exe:
+            notes.append(f"{tool} missing, {label} unchecked")
+            continue
+        img = extract(n, f"part{n}.img")
+        r = subprocess.run([exe, *args, img], capture_output=True, text=True)
+        os.remove(img)
+        if r.returncode != 0:
+            raise AssertionError(f"{tool} on partition {n}: rc={r.returncode}\n{r.stdout}{r.stderr}")
+        notes.append(f"{label} clean")
+    return notes
+
+
+def boot_installed(name, qemu, firmware, accel, code=None, vars_src=None,
+                   write=None, expect=None):
+    cmd = [qemu, "-M", "q35", "-accel", accel, "-m", "1024M",
+           "-drive", f"file={TARGET},format=raw,if=none,id=disk",
+           "-device", "ide-hd,drive=disk,bus=ide.0"]
+    out = os.path.join(OUT, name)
+    os.makedirs(out, exist_ok=True)
+    if code:
+        cmd += ["-drive", f"if=pflash,format=raw,readonly=on,file={code}"]
+        if vars_src:
+            vars_copy = os.path.join(out, "vars.fd")
+            shutil.copyfile(vars_src, vars_copy)
+            cmd += ["-drive", f"if=pflash,format=raw,file={vars_copy}"]
+    t0 = time.time()
+    out, sockdir, con, qmp = start_qemu(name, cmd)
+    try:
+        m = con.wait_re(r'\[BOOT\] multiboot2: loader "(Limine[^"]*)" \((\w+)\)', timeout=240)
+        if m.group(2) != firmware:
+            raise AssertionError(f"kernel saw {m.group(2)} firmware, expected {firmware}")
+        m = con.wait_re(r"\[BOOT\] root=PARTUUID=([0-9a-f-]+) is (/dev/\w+)", timeout=60)
+        root_dev = m.group(2)
+        if root_dev != "/dev/sda3":
+            raise AssertionError(f"root is {root_dev}, expected /dev/sda3")
+        con.wait_re(r"\[BOOT\] Launching /disk/init", timeout=60)
+        m = con.wait_re(r"\[FB\]\s+(\d+)x(\d+)@", timeout=60, start=0)
+        fb = (int(m.group(1)), int(m.group(2)))
+        smokelib.login(con.proc, con.sel, con.log, timeout=180, start=0)
+        con.wait_re(r"\[desktop\] ready fb=(\d+)x(\d+)", timeout=120, start=0)
+        mounts = con.run("cat /proc/mounts", timeout=20)
+        if not re.search(r"^/dev/sda3 /disk ext2 ", mounts, re.M):
+            raise AssertionError(f"/disk is not /dev/sda3:\n{mounts}")
+        if expect is not None:
+            got = con.run("cat /disk/persist.txt", timeout=20)
+            if expect not in got:
+                raise AssertionError(f"/disk/persist.txt lost across the reboot: {got!r}")
+        if write is not None:
+            con.run(f"echo {write} > /disk/persist.txt; sync", timeout=20)
+            got = con.run("cat /disk/persist.txt", timeout=20)
+            if write not in got:
+                raise AssertionError(f"could not write /disk/persist.txt: {got!r}")
+        time.sleep(1.5)
+        ppm = os.path.join(out, "screen.ppm")
+        qmp.cmd("screendump", filename=ppm)
+        img = Image.read_ppm(ppm)
+        img.write_png(os.path.join(out, "desktop.png"))
+        os.remove(ppm)
+        colors = distinct_colors(img, (0, 0, img.w, img.h))
+        if colors < 50:
+            raise AssertionError(f"desktop screen has only {colors} colours")
+        poweroff(con)
+        return (f"Limine ({firmware}) -> root {root_dev}, login, desktop {fb[0]}x{fb[1]} "
+                f"({colors} colours), {time.time() - t0:.1f}s")
+    except Exception:
+        print(f"\n[SMOKE-INSTALL] {name}: last serial output:\n{con.text()[-3000:]}",
+              file=sys.stderr)
+        raise
+    finally:
+        finish(out, sockdir, con, qmp)
+
+
+def main():
+    shutil.rmtree(OUT, ignore_errors=True)
+    os.makedirs(OUT)
+    for f in (ISO, os.path.join(ROOT, "disk.img")):
+        if not os.path.exists(f):
+            raise RuntimeError(f"{os.path.basename(f)} is missing (make limine-iso disk)")
+    accel = pick_accel()
+    results, failed = [], []
+
+    print(f"\n[SMOKE-INSTALL] live: installing to an empty AHCI disk (accel={accel})")
+    uuid, took = live_install(accel)
+    results.append(("live", f"PASS: installed in {took:.0f}s, root=PARTUUID={uuid}"))
+    results.append(("host", "PASS: " + ", ".join(host_checks(uuid))))
+
+    token = "persist-%08x" % int.from_bytes(os.urandom(4), "little")
+    print(f"\n[SMOKE-INSTALL] bios: booting the installed disk alone (accel={accel})")
+    try:
+        results.append(("bios", "PASS: " + boot_installed(
+            "bios", "qemu-system-i386", "BIOS", accel, write=token)))
+    except Exception as exc:
+        results.append(("bios", f"FAIL: {exc}"))
+        failed.append("bios")
+
+    code, vars_src = find_firmware("OVMF_X64", X64_NAMES,
+                                   [d for d in FW_DIRS if "ia32" not in d])
+    if not code or not shutil.which("qemu-system-x86_64"):
+        results.append(("uefi-x64", "SKIP (no OVMF x64 or qemu-system-x86_64)"))
+        if os.environ.get("SMOKE_UEFI_REQUIRE") == "1":
+            failed.append("uefi-x64")
+    else:
+        acc = os.environ.get("SMOKE_UEFI_ACCEL", "tcg")
+        print(f"\n[SMOKE-INSTALL] uefi-x64: booting the installed disk alone (accel={acc})")
+        try:
+            results.append(("uefi-x64", "PASS: " + boot_installed(
+                "uefi-x64", "qemu-system-x86_64", "UEFI", acc, code, vars_src,
+                expect=None if "bios" in failed else token) +
+                ("" if "bios" in failed else f", {token} survived the reboot")))
+        except Exception as exc:
+            results.append(("uefi-x64", f"FAIL: {exc}"))
+            failed.append("uefi-x64")
+
+    print()
+    for name, msg in results:
+        print(f"[SMOKE-INSTALL] {name}: {msg}")
+    if failed:
+        print(f"[SMOKE-INSTALL] failed: {' '.join(failed)}; see "
+              f"{os.path.relpath(OUT, ROOT)}/<name>/serial.log")
+        return 1
+    print("[SMOKE-INSTALL] passed")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print(f"\n[SMOKE-INSTALL] failed: {exc}", file=sys.stderr)
+        raise SystemExit(1)

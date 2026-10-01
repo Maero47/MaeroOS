@@ -137,7 +137,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-ext4 smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine disk-alpine repo repo-serve start resolutions icons
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-ext4 smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine disk-alpine repo repo-serve start resolutions icons
 
 all: $(TARGET)
 
@@ -421,7 +421,7 @@ smoke-pc: $(TARGET) iso disk
 # Pick a subset with CHECK_SUITES="smoke smoke-x".
 CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-net-e1000 smoke-tcpsrv \
                  smoke-fw smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui smoke-ext4 smoke-uefi \
-                 smoke-hda smoke-acpi smoke-ahci smoke-nvme smoke-usb smoke-pc
+                 smoke-install smoke-hda smoke-acpi smoke-ahci smoke-nvme smoke-usb smoke-pc
 CHECK_LOG_DIR ?= build/check
 
 # repo: smoke-pkg serves packages from repo/ (see the smoke-pkg target).
@@ -607,6 +607,16 @@ limine-iso: $(TARGET) initrd tools/limine.conf tools/fetch-limine.sh
 	rm -rf isodir-limine
 	mkdir -p isodir-limine/boot/limine isodir-limine/EFI/BOOT
 	cp $(TARGET) initrd.tar isodir-limine/boot/
+	@# The live system carries what maeros-install puts on a disk: the
+	@# kernel and Limine's files under /boot in its initrd (the initrd itself
+	@# it reads back from /dev/initrd).
+	rm -rf build/liveboot && mkdir -p build/liveboot/boot/limine
+	cp $(TARGET) build/liveboot/boot/
+	cp $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-hdd.bin \
+	   $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTIA32.EFI \
+	   third_party/limine/LICENSE build/liveboot/boot/limine/
+	COPYFILE_DISABLE=1 tar --format=ustar --owner=0 --group=0 \
+	    -rf isodir-limine/boot/initrd.tar -C build/liveboot boot
 	cp tools/limine.conf isodir-limine/boot/limine/limine.conf
 	cp third_party/limine/LICENSE isodir-limine/boot/limine/LICENSE
 	cp $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin \
@@ -621,6 +631,12 @@ limine-iso: $(TARGET) initrd tools/limine.conf tools/fetch-limine.sh
 
 smoke-uefi: limine-iso disk
 	python3 tools/smoke_uefi.py
+
+# Install from the live ISO onto an empty AHCI disk with maeros-install, then
+# boot that disk alone under SeaBIOS and OVMF x64 (tools/smoke_install.py,
+# docs/install.md).
+smoke-install: limine-iso disk
+	python3 tools/smoke_install.py
 
 clean:
 	find kernel arch/i686 mm fs drivers proc lib net third_party/lwip/src third_party/uacpi \
