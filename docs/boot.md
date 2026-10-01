@@ -53,7 +53,9 @@ Read `RsdtAddress` / `XsdtAddress` from it and map the tables as usual.
 It returns NULL on every Multiboot 1 boot. An ACPI parser should then scan
 the EBDA and 0xE0000-0xFFFFF for `"RSD PTR "`. That scan is valid only when
 `boot_info_is_efi()` is 0, because UEFI machines need not have those legacy
-areas.
+areas. `drivers/acpi.c` (`uacpi_kernel_get_rsdp`) does exactly this: the
+loader's copy first (its physical address is the direct map's, since it lives
+in kernel .bss), the scan only on a BIOS boot.
 
 ## Things UEFI firmware leaves differently
 
@@ -66,6 +68,12 @@ areas.
 * No VGA text mode. The GOP framebuffer is the only display, and VGA text
   writes go nowhere.
 * No MP table or BIOS-area RSDP. Use `boot_info_rsdp()`.
+* **Memory from 8 MiB up is reserved on OVMF x64** (its MEMFD area: SEC page
+  tables, lock box, work area). Limine needs `[1 MiB, bss_end_addr)` free, and
+  `bss_end_addr` is `_kernel_phys_end + 64 KiB`, so the image must end below
+  that. Otherwise Limine stops with "multiboot2: Could not find viable load
+  address for executable". `linker.ld` asserts the limit. Big tables belong on
+  the heap; the frame refcounts moved there for this reason.
 
 ## Testing: `make smoke-uefi` (part of `make check`)
 
@@ -75,7 +83,8 @@ common real-PC case) and OVMF IA32 (`qemu-system-i386`). For each boot it
 checks the Multiboot 2 summary line (Limine, the expected firmware, a module,
 a framebuffer and an RSDP), logs the framebuffer resolution, logs in on the
 serial getty, waits for the desktop on that framebuffer and takes a QMP
-screendump of it. Artifacts go to `build/smoke-uefi/<name>/`.
+screendump of it. It then requires `[ACPI] ready` with the RSDP taken from the
+loader and runs `poweroff`, which must end QEMU through ACPI S5. Artifacts go to `build/smoke-uefi/<name>/`.
 
 If an OVMF build is missing, the test reports SKIP for that configuration
 (set `SMOKE_UEFI_REQUIRE=1` to make it fail instead). `tools/setup-linux.sh`

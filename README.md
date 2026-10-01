@@ -481,7 +481,8 @@ the host screen and serves the package repository on port 8000.
 For UEFI PCs, `make limine-iso` builds `maeros-limine.iso`. It is a hybrid image that
 Limine boots through Multiboot 2 on legacy BIOS, x86_64 UEFI and IA32 UEFI. Under UEFI
 the desktop runs on the GOP framebuffer, and the kernel receives the ACPI RSDP from the
-loader. `docs/boot.md` covers the boot paths, the `boot_info_*()` API, OVMF and
+loader (uACPI uses it; the EBDA/BIOS-ROM scan is only for BIOS boots). The loaded image
+must end below 8 MiB, where OVMF x64 reserves memory; `linker.ld` asserts it. `docs/boot.md` covers the boot paths, the `boot_info_*()` API, OVMF and
 `make smoke-uefi`.
 
 Everything goes to the serial console, so `make run` gives you the boot log and a
@@ -522,7 +523,7 @@ make smoke-usb      # the same desktop with USB input only, a hub and a USB stic
 make smoke-hda      # Intel HDA playback through /dev/dsp, checked from a wav capture
 make smoke-acpi     # poweroff, reboot, power button and halt through ACPI (pc and q35)
 make smoke-pc       # q35 with no PS/2: AHCI disk, USB input, desktop, poweroff
-make smoke-uefi     # the Limine ISO under SeaBIOS, OVMF x64 and OVMF IA32: login + desktop
+make smoke-uefi     # the Limine ISO under SeaBIOS, OVMF x64 and OVMF IA32: login, desktop, ACPI poweroff
 make smoke-abi      # Linux-ABI probes (ports/abiprobes/README.md), needs i686-linux-musl-gcc and disk.img
 make smoke-firefox  # does Firefox paint? (README-BROWSER.md)
 make smoke-firefox-web  # ...and load a page served from the host over the network
