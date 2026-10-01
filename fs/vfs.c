@@ -399,6 +399,11 @@ static vfs_node_t *vfs_lookup_in(vfs_node_t *croot, const char *path,
     }
 }
 
+vfs_node_t *vfs_lookup_from(vfs_node_t *croot, const char *path,
+                            int follow_final, int *err, vfs_mnt_t **mnt) {
+    return vfs_lookup_in(croot, path, follow_final, err, mnt);
+}
+
 /* A chrooted process walks from the node sys_chroot pinned. */
 vfs_node_t *vfs_lookup_mnt(const char *path, int follow_final, int *err,
                            vfs_mnt_t **mnt) {

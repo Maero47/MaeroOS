@@ -154,11 +154,17 @@ int mount_do(const char *source, const char *target, const char *fstype,
     return vfs_mount_add(target, root, &t);
 }
 
-/* Is `path` at or below `dir`? */
-static int path_within(const char *path, const char *dir) {
-    uint32_t n = (uint32_t)strlen(dir);
-    if (strncmp(path, dir, n) != 0) return 0;
-    return path[n] == '\0' || path[n] == '/';
+/* Is process `p`'s working directory inside mount `m`?  The cwd is a path
+ * relative to p's own root (a chrooted process's "/mnt" is somewhere else
+ * globally), so it is resolved from there, and the mounts crossed to reach
+ * it are compared, not the text. */
+static int cwd_within(struct proc *p, vfs_mnt_t *m) {
+    vfs_mnt_t *cm = NULL;
+    int err;
+    if (!vfs_lookup_from(p->root_node, p->cwd, 1, &err, &cm)) return 0;
+    for (int hops = 0; cm && hops < VFS_MNT_MAX; hops++, cm = cm->parent)
+        if (cm == m) return 1;
+    return 0;
 }
 
 int umount_do(const char *target, uint32_t flags) {
@@ -172,7 +178,7 @@ int umount_do(const char *target, uint32_t flags) {
         for (int i = 0; i < MAX_PROCS; i++) {
             struct proc *p = &ptable[i];
             if (p->state == PROC_UNUSED || p->state == PROC_ZOMBIE) continue;
-            if (path_within(p->cwd, m->target)) return -16;   /* -EBUSY */
+            if (cwd_within(p, m)) return -16;                 /* -EBUSY */
         }
     }
     return vfs_mount_remove(m, flags);

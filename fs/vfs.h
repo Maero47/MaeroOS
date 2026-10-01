@@ -273,6 +273,11 @@ typedef struct vfs_mnt {
 
 /* Like vfs_lookup, and also report the mount the result lives on (NULL for
  * the boot tree). */
+/* vfs_lookup_mnt as seen from `croot` (a process's pinned chroot, NULL for
+ * the global root) rather than the caller's: for checks made on behalf of
+ * another process. */
+vfs_node_t *vfs_lookup_from(vfs_node_t *croot, const char *path,
+                            int follow_final, int *err, vfs_mnt_t **mnt);
 vfs_node_t *vfs_lookup_mnt(const char *path, int follow_final, int *err,
                            vfs_mnt_t **mnt);
 

@@ -133,6 +133,29 @@ def main():
             alpine("test ! -L /usr/bin/tree && apk del tree", "Purging tree")
         # /dev and /proc are the global ones inside the chroot.
         alpine("head -c 8 /dev/urandom | wc -c && test -r /proc/self/status", "8")
+        # Mounts inside the jail lead into their filesystem and back, never
+        # out: the global root has /disk, the Alpine root has none.
+        # ".." from a mount's root, a symlink to "/" and one climbing up from
+        # inside it, and bind mounts of "/", "/proc/.." and "/dev/.." all
+        # land on the Alpine root.
+        # (Each step stays short: the console truncates long input lines.)
+        J = "test -e {0}/etc/alpine-release && test ! -e {0}/disk"
+        alpine("test ! -e /disk && mkdir -p /mnt/j /mnt/b /mnt/p /mnt/d && "
+               "mount -t tmpfs none /mnt/j && " + J.format("/mnt/j/../.."))
+        alpine("cd /mnt/j && cd ../../.. && " + J.format("."))
+        alpine("ln -s / /mnt/j/top && ln -s ../../../.. /mnt/j/up && " +
+               J.format("/mnt/j/top") + " && " + J.format("/mnt/j/up"))
+        alpine("mount --bind / /mnt/b && mount --bind /proc/.. /mnt/p && "
+               "mount --bind /dev/.. /mnt/d && test -d /mnt/b/mnt/j")
+        alpine(J.format("/mnt/b") + " && " + J.format("/mnt/p") + " && " +
+               J.format("/mnt/d"))
+        # umount sees only the jail's mounts, by their place in it; a cwd
+        # inside one keeps it busy.
+        alpine("cd /mnt/j && ! umount /mnt/j 2>/dev/null && cd / && "
+               "umount /mnt/b /mnt/p /mnt/d /mnt/j && test ! -e /mnt/j/top")
+        # Seen from outside: the jail's /mnt/j, empty again.
+        run("test -d /disk/alpine/mnt/j && test ! -e /disk/alpine/mnt/j/top && "
+            "echo JA_\"\"IL", "JA_IL")
         print("\n[SMOKE-ALPINE] passed")
         return 0
     except Exception as e:
