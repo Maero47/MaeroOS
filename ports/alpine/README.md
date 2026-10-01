@@ -58,7 +58,7 @@ How the chroot works (`proc/syscall.c` `sys_chroot`, `fs/vfs.c`
   otherwise).
 - Unlike Linux, a directory opened *before* `chroot()` does not reach
   the old tree. `fchdir`/`*at` calls resolve it by its path string, inside
-  the new root. `/proc/self/fd/N` (also reached as `/dev/fd/N`) gives a
+  the new root. `/proc/self/fd/N` gives a
   chrooted process no directory to walk through: `/proc/self/fd/3/etc/shadow`
   is ENOENT. Open *files* can still be reopened through it. This is
   stricter than Linux, where such a descriptor is the classic chroot
