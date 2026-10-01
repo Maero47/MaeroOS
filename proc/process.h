@@ -216,6 +216,14 @@ struct proc {
     /* Current working directory (absolute path, always starts with '/') */
     char             cwd[256];
 
+    /* chroot(2): this process's root directory, or NULL when it is not
+     * chrooted.  The node is pinned (vfs_retain) when chroot() resolves it,
+     * so renaming or replacing the path it was reached by later changes
+     * nothing; fork and clone take their own reference, exit and fork_abort
+     * drop it.  cwd, fd paths and every path the process passes in are
+     * relative to it; vfs_lookup() walks from it (fs/vfs.c). */
+    struct vfs_node *root_node;
+
     /* Next available address for anonymous mmap allocations */
     uint32_t         mmap_next;
 

@@ -7,6 +7,8 @@
 #include "../proc/pipe.h"
 #include "../proc/scheduler.h"
 #include "../arch/i686/mm/paging.h"
+#include "../arch/i686/cpu/pit.h"
+#include "../drivers/rtc.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -74,6 +76,11 @@ static void              tmpfs_release (vfs_node_t *);
 
 /* ── Node factory ─────────────────────────────────────────────────────────── */
 
+/* Wall-clock seconds, as ext2_now(): new and written files get real times. */
+static uint32_t tmpfs_now(void) {
+    return rtc_boot_epoch() + pit_ticks() / 100U;
+}
+
 static tmpfs_node_t *alloc_tmpfs_node(const char *name, uint32_t flags) {
     tmpfs_node_t *tn = (tmpfs_node_t *)kmalloc(sizeof(tmpfs_node_t));
     if (!tn) return NULL;
@@ -88,6 +95,7 @@ static tmpfs_node_t *alloc_tmpfs_node(const char *name, uint32_t flags) {
      * Numbered well above initrd's and the disk's. */
     static uint32_t tmpfs_next_ino = 0x40000000U;
     tn->vnode.inode = tmpfs_next_ino++;
+    tn->vnode.atime = tn->vnode.mtime = tn->vnode.ctime = tmpfs_now();
     tn->vnode.retain_fn = tmpfs_retain;
     tn->vnode.close_fn  = tmpfs_release;
     /* /tmp is world-writable (like Unix 01777); created files get the
@@ -281,6 +289,7 @@ static uint32_t tmpfs_write(vfs_node_t *node, uint32_t off, uint32_t len,
      * shmem_alloc_and_acct_folio; 0 would spin a libc write loop. */
     if (done == 0 && len) return VFS_WRITE_ENOMEM;
     if (off + done > node->size) node->size = off + done;
+    if (done) node->mtime = node->ctime = tmpfs_now();
     return done;
 }
 
@@ -298,6 +307,7 @@ static int tmpfs_truncate(vfs_node_t *node, uint32_t new_size) {
         tmpfs_drop_pages(tn, (new_size + PAGE_SIZE - 1) / PAGE_SIZE);
     }
     node->size = new_size;
+    node->mtime = node->ctime = tmpfs_now();
     return 0;
 }
 

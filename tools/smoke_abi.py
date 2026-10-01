@@ -90,6 +90,16 @@ PROBES = {
     # times; under TCG that is the bulk of its time.
     "p29_tmpfs_big_file":      (240, ""),
     "p30_waitid":              (60, ""),
+    # Alpine userland (ports/alpine): chroot, timestamps, isatty, statfs, xattr.
+    "p31_chroot":              (60, ""),
+    "p32_utimensat":           (60, "/disk"),
+    "p33_isatty":              (60, ""),
+    "p34_statfs":              (60, ""),
+    "p35_xattr":               (60, ""),
+    "p36_lstat_statx":         (60, "/disk"),
+    "p37_link":                (60, "/disk"),
+    "p38_sync":                (60, ""),
+    "p39_splice":              (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

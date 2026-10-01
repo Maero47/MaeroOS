@@ -2,6 +2,7 @@
 #include "tmpfs.h"
 #include "../lib/string.h"
 #include "../mm/heap.h"
+#include "../proc/process.h"
 #include <stddef.h>
 
 vfs_node_t *vfs_root = NULL;
@@ -136,6 +137,15 @@ int vfs_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid) {
     return 0;
 }
 
+int vfs_settimes(vfs_node_t *node, uint32_t atime, uint32_t mtime) {
+    if (!node) return -2;
+    node->atime = atime;
+    node->mtime = mtime;
+    if (node->settimes_fn)
+        return node->settimes_fn(node, atime, mtime);
+    return 0;
+}
+
 /* ── Path resolution ──────────────────────────────────────────────────────── */
 
 static int path_first_component(const char *path, char *component) {
@@ -188,7 +198,8 @@ enum { WALK_FOUND, WALK_MISS, WALK_RESTART };
  * that is the prefix a relative target is resolved against.
  */
 static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
-                    int may_follow, char *alt, vfs_node_t **out, int *err) {
+                    int may_follow, int top_restarts, char *alt,
+                    vfs_node_t **out, int *err) {
     const char *p = path + 1;
     vfs_node_t *cur = root;
     vfs_node_t *parents[64];
@@ -221,6 +232,17 @@ static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
                 cur = parents[--depth];
             else
                 cur = root;
+            /* A chrooted walk through /dev or /proc that climbs back to the
+             * top is at the chroot's "/", not the global one: start over
+             * with the rest of the path there (a symlink to /proc/.. must
+             * not lead out of the root). */
+            if (top_restarts && depth == 0) {
+                uint32_t rlen = (uint32_t)strlen(after_component);
+                if (rlen + 2 > VFS_PATH_MAX) { *err = -36; return WALK_MISS; }
+                alt[0] = '/';
+                memcpy(alt + 1, after_component, rlen + 1);
+                return WALK_RESTART;
+            }
             if (alen > 0) {
                 while (alen > 0 && alt[alen - 1] != '/') alen--;
                 if (alen > 0) alen--;
@@ -276,12 +298,25 @@ static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
 }
 
 /*
- * Resolve an absolute path.  Paths outside the reserved mount points are tried
- * on the root overlay (the mounted disk) first and on vfs_root otherwise.  On
- * failure NULL is returned and *err (if given) says why: -ENOENT, -ELOOP past
- * VFS_MAXSYMLINKS links, or -ENAMETOOLONG.
+ * Paths a chrooted process still resolves globally: /dev and /proc are not
+ * bind-mounted into the new root, so they are passed through instead.
  */
-vfs_node_t *vfs_lookup(const char *path, int follow_final, int *err) {
+static int vfs_path_skips_chroot(const char *path) {
+    char first[256];
+    if (path_first_component(path, first) <= 0) return 0;
+    return strcmp(first, "dev") == 0 || strcmp(first, "proc") == 0;
+}
+
+/*
+ * Resolve an absolute path.  With `croot` set (a chrooted caller) the walk
+ * starts there, except under /dev and /proc; otherwise paths outside the
+ * reserved mount points are tried on the root overlay (the mounted disk)
+ * first and on vfs_root otherwise.  On failure NULL is returned and *err (if
+ * given) says why: -ENOENT, -ELOOP past VFS_MAXSYMLINKS links, or
+ * -ENAMETOOLONG.
+ */
+static vfs_node_t *vfs_lookup_in(vfs_node_t *croot, const char *path,
+                                 int follow_final, int *err) {
     char bufs[2][VFS_PATH_MAX];
     if (err) *err = -2;                                       /* -ENOENT */
     if (!path || path[0] != '/' || !vfs_root) return NULL;
@@ -295,13 +330,19 @@ vfs_node_t *vfs_lookup(const char *path, int follow_final, int *err) {
         int may_follow = links < VFS_MAXSYMLINKS;
         vfs_node_t *node = NULL;
         int r = WALK_MISS, e = -2, e2 = -2;
-        if (vfs_root_overlay && vfs_path_uses_root_overlay(pth))
-            r = vfs_walk(vfs_root_overlay, pth, follow_final, may_follow,
-                         alt, &node, &e);
-        if (r == WALK_MISS) {
-            r = vfs_walk(vfs_root, pth, follow_final, may_follow,
-                         alt, &node, &e2);
-            if (e == -2) e = e2;         /* report a loop over a plain miss */
+        if (croot && !vfs_path_skips_chroot(pth)) {
+            /* ".." at the top stays at croot, and an absolute symlink target
+             * comes back through here, so neither leaves the new root. */
+            r = vfs_walk(croot, pth, follow_final, may_follow, 0, alt, &node, &e);
+        } else {
+            if (vfs_root_overlay && vfs_path_uses_root_overlay(pth))
+                r = vfs_walk(vfs_root_overlay, pth, follow_final, may_follow,
+                             0, alt, &node, &e);
+            if (r == WALK_MISS) {
+                r = vfs_walk(vfs_root, pth, follow_final, may_follow,
+                             croot != NULL, alt, &node, &e2);
+                if (e == -2) e = e2;     /* report a loop over a plain miss */
+            }
         }
         if (r == WALK_FOUND) return node;
         if (r == WALK_MISS) {
@@ -311,6 +352,12 @@ vfs_node_t *vfs_lookup(const char *path, int follow_final, int *err) {
         links++;
         cur ^= 1;
     }
+}
+
+vfs_node_t *vfs_lookup(const char *path, int follow_final, int *err) {
+    struct proc *p = current_proc;
+    /* A chrooted process walks from the node sys_chroot pinned. */
+    return vfs_lookup_in(p ? p->root_node : NULL, path, follow_final, err);
 }
 
 vfs_node_t *vfs_open(const char *path) {
@@ -366,6 +413,14 @@ int vfs_rename(vfs_node_t *old_dir, const char *old_name,
     if (!old_dir->rename_fn) return -1;                /* -EPERM */
     if (new_dir->rename_fn != old_dir->rename_fn) return -18;   /* -EXDEV */
     return old_dir->rename_fn(old_dir, old_name, new_dir, new_name);
+}
+
+int vfs_link(vfs_node_t *dir, const char *name, vfs_node_t *target) {
+    dir = mnt_resolve(dir);
+    if (!dir || !target) return -2;                    /* -ENOENT */
+    if (!dir->link_fn) return -1;                      /* -EPERM */
+    if (target->link_fn != dir->link_fn) return -18;   /* -EXDEV */
+    return dir->link_fn(dir, name, target);
 }
 
 /* ── Symlink creation ─────────────────────────────────────────────────────── */

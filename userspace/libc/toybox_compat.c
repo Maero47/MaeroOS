@@ -66,7 +66,7 @@ int getresuid(int *ruid, int *euid, int *suid) {
 int getresgid(int *rgid, int *egid, int *sgid) {
     return chkerr(syscall3(211, (int)rgid, (int)egid, (int)sgid));
 }
-int chroot(const char *path) { (void)path; return nosys(); }
+int chroot(const char *path) { return chkerr(syscall1(61, (int)path)); }
 int link(const char *oldpath, const char *newpath) { (void)oldpath; (void)newpath; return nosys(); }
 int fsync(int fd) { (void)fd; return 0; }
 int fchmod(int fd, int mode) { return chkerr(syscall2(94, fd, mode)); }

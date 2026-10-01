@@ -38,6 +38,7 @@ typedef struct vfs_node {
     uint32_t mask;     /* Unix permission bits */
     uint32_t uid, gid;
     uint32_t atime, mtime, ctime;
+    uint32_t nlink;    /* hard links (0 = not tracked, stat reports 1) */
 
     /* ── Operations (NULL = use built-in defaults) ──────────────────── */
     uint32_t          (*read_fn)   (struct vfs_node *, uint32_t off,
@@ -80,6 +81,14 @@ typedef struct vfs_node {
      * through vfs_rename(), after the permission checks. */
     int               (*rename_fn) (struct vfs_node *old_dir, const char *old_name,
                                     struct vfs_node *new_dir, const char *new_name);
+    /* Persist atime/mtime (utimensat); NULL = in-memory only. */
+    int               (*settimes_fn)(struct vfs_node *, uint32_t atime,
+                                     uint32_t mtime);
+    /* link(2): add the name `name` in this directory for `target`, a node of
+     * the same filesystem.  Returns 0 or a negative errno.  NULL = the
+     * filesystem has no hard links (-EPERM). */
+    int               (*link_fn)(struct vfs_node *dir, const char *name,
+                                 struct vfs_node *target);
 
     /* ── initrd in-memory backing ────────────────────────────────────── */
     const uint8_t   *data;       /* file: pointer into initrd memory */
@@ -176,6 +185,13 @@ int vfs_access_check_groups(vfs_node_t *node, uint32_t uid, uint32_t gid,
 
 /* Update mode/uid/gid (in-memory + persisted via setattr_fn if present). */
 int vfs_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid);
+
+/* link(2): `name` in `dir` becomes another name of `target` (-EPERM without
+ * filesystem support, -EXDEV across filesystems). */
+int vfs_link(vfs_node_t *dir, const char *name, vfs_node_t *target);
+
+/* utimensat: set atime and mtime (a filesystem hook also sets ctime). */
+int vfs_settimes(vfs_node_t *node, uint32_t atime, uint32_t mtime);
 
 /*
  * vfs_mount — attach `fs_root` at `path` inside the current VFS tree.

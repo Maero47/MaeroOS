@@ -490,8 +490,16 @@ static vfs_node_t *procfs_fd_finddir(vfs_node_t *node, const char *name) {
      * maps it MAP_SHARED — it MUST share frames with the original fd, or the data
      * written via the first mapping is invisible (SharedStringMap magic mismatch
      * → MOZ_CRASH).  A synthetic empty node breaks that sharing. */
-    if (current_proc->ofile[fd].type == FD_FILE && current_proc->ofile[fd].node)
+    if (current_proc->ofile[fd].type == FD_FILE && current_proc->ofile[fd].node) {
+        /* A chrooted process gets no directory through here: /proc is passed
+         * through into the chroot, and a directory opened before chroot()
+         * would let a walk like /proc/self/fd/3/etc/shadow continue in the
+         * old tree (Linux allows that escape; MaeroOS does not). */
+        if (current_proc->root_node &&
+            current_proc->ofile[fd].node->flags == VFS_FLAG_DIR)
+            return NULL;
         return current_proc->ofile[fd].node;
+    }
 
     /* Non-file fds (pipes/sockets): a placeholder node (can't be reopened). */
     vfs_node_t *fn = &fd_file_nodes[fd];

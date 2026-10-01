@@ -1,7 +1,7 @@
 # Linux-ABI probes
 
-Thirty small C programs.  P1-P20 are the probes of
-`docs/audit/firefox-first-paint.md` section 8; P21-P30 were added with later
+Thirty-nine small C programs.  P1-P20 are the probes of
+`docs/audit/firefox-first-paint.md` section 8; P21-P39 were added with later
 kernel fixes.  Each proves or disproves one kernel-semantics gap and prints
 exactly one final line:
 
@@ -48,6 +48,15 @@ regression tests for the fixes in audit section 5.
 | P28 | `p28_alloc_failure.c`       | kernel allocators must refuse (ENOMEM/EMFILE), not halt | — |
 | P29 | `p29_tmpfs_big_file.c`      | a 288 MiB tmpfs file, bigger than the kernel heap window | — |
 | P30 | `p30_waitid.c`              | `waitid` with `WNOWAIT`/`WNOHANG` (Firefox's process watcher) | — |
+| P31 | `p31_chroot.c`              | `chroot` (absolute symlinks, `..`, fork, nesting; root only) for Alpine (`ports/alpine/`) | — |
+| P32 | `p32_utimensat.c`           | `utimensat`/`futimens`/`utimes`/`utime`, wall-clock mtime of new files (apk preserves mtimes) | — |
+| P33 | `p33_isatty.c`              | `TIOCGWINSZ`/`TCGETS`/`TCSETS` fail with `ENOTTY` on pipes and files (`isatty`) | — |
+| P34 | `p34_statfs.c`              | `statfs("/proc")` is `PROC_SUPER_MAGIC`; `ENOENT`/`EBADF` (apk's procfs check) | — |
+| P35 | `p35_xattr.c`               | `*getxattr` give `ENODATA`/`EOPNOTSUPP`, not `ENOSYS` (GNU `ls -l`) | — |
+| P36 | `p36_lstat_statx.c`         | `lstat`/`fstatat(dirfd, NOFOLLOW)` through musl's `statx` (dirfd and the link itself) | — |
+| P37 | `p37_link.c`                | `link`/`linkat` on ext2, `st_nlink` (apk-tools 3, packages with hard links) | — |
+| P38 | `p38_sync.c`                | `sync`/`syncfs` (apk-tools 3) | — |
+| P39 | `p39_splice.c`              | `splice` moves bytes or answers `EINVAL`, never `ENOSYS` (coreutils 9.8+ `cat`) | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the
@@ -162,7 +171,7 @@ the guest:
 
 | Probes | Watchdog | Driver timeout |
 |---|---|---|
-| P1-P10, P12-P15, P17, P19-P22, P24, P25, P30 | 60 s | 90 s |
+| P1-P10, P12-P15, P17, P19-P22, P24, P25, P30-P39 | 60 s | 90 s |
 | P23 | 90 s | 120 s |
 | P11, P16 | 120 s | 150 s |
 | P26, P27, P29 | 240 s | 270 s |

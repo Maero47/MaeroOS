@@ -449,7 +449,7 @@ static int path_is_root(const char *path) {
 static vfs_node_t *vfs_open_parent_at(const char *full_path,
                                       const char *dir_path) {
     if (full_path && full_path[0] == '/' && path_is_root(dir_path) &&
-        vfs_path_uses_root_overlay(full_path)) {
+        !current_proc->root_node && vfs_path_uses_root_overlay(full_path)) {
         vfs_node_t *overlay = vfs_get_root_overlay();
         if (overlay) return overlay;
     }
@@ -606,7 +606,7 @@ static void fill_kstat(struct kstat *st, vfs_node_t *n) {
     __builtin_memset(st, 0, sizeof(*st));
     st->st_ino     = n->inode;
     st->st_mode    = (uint16_t)vnode_mode(n);
-    st->st_nlink   = 1;
+    st->st_nlink   = n->nlink ? (uint16_t)n->nlink : 1;
     /* Legacy 16-bit ids: anything wider reads as overflowuid (65534). */
     st->st_uid     = n->uid > 0xFFFFU ? 65534U : (uint16_t)n->uid;
     st->st_gid     = n->gid > 0xFFFFU ? 65534U : (uint16_t)n->gid;
@@ -623,7 +623,7 @@ static void fill_kstat64(struct kstat64 *st, vfs_node_t *n) {
     st->st_ino     = n->inode;
     st->__st_ino   = n->inode;
     st->st_mode    = vnode_mode(n);
-    st->st_nlink   = 1;
+    st->st_nlink   = n->nlink ? n->nlink : 1;
     st->st_uid     = n->uid;     /* the owner the permission checks use */
     st->st_gid     = n->gid;
     st->st_size    = (int64_t)n->size;
@@ -920,6 +920,7 @@ static void fork_abort(struct proc *child) {
     sigshared_put(child->sigshared);
     child->sigshared = NULL;
     if (child->ctty) { vfs_close(child->ctty); child->ctty = NULL; }
+    if (child->root_node) { vfs_close(child->root_node); child->root_node = NULL; }
     kstack_free(child->kstack);
     child->kstack = NULL;
     child->state = PROC_UNUSED;
@@ -973,6 +974,8 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
                 fowner = &ptable[i]; break;
             }
     __builtin_memcpy(child->cwd, parent->cwd, sizeof(parent->cwd));
+    child->root_node = parent->root_node;
+    if (child->root_node) vfs_retain(child->root_node);
     child->heap_end  = fowner->heap_end;
     child->umask     = parent->umask;
     child->uid = parent->uid; child->gid = parent->gid;
@@ -2618,6 +2621,38 @@ static int sys_chdir(registers_t *regs) {
     return 0;
 }
 
+/* ── sys_chroot(path) — EAX=61 ───────────────────────────────────────────── */
+/* The directory `path` names now (resolved inside the current root, symlinks
+ * followed) becomes this process's root node, pinned with vfs_retain like an
+ * open descriptor's node: later renames, or a symlink put where the path
+ * was, do not move it.  /dev and /proc stay the global ones inside it (there
+ * is no bind mount to put them there).  The cwd, a string relative to the
+ * root, is reset to "/": Linux leaves the cwd outside the new root, but here
+ * the old string would name a different directory inside it.  For the same
+ * reason a descriptor opened before chroot() is resolved by its path string
+ * inside the new root, and /proc/self/fd/N gives a chrooted process no
+ * directory to walk through (fs/procfs.c), so neither reaches the old tree
+ * (both are the classic escape on Linux). */
+static int sys_chroot(registers_t *regs) {
+    char path[256];
+    if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0)
+        return -14;
+    if (current_proc->euid != 0) return -1;            /* -EPERM */
+    int lerr;
+    vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
+    if (!n) return lerr;
+    if (!(n->flags & VFS_FLAG_DIR)) return -20;        /* -ENOTDIR */
+    if (n == current_proc->root_node) return 0;        /* chroot("/"), "." at / */
+    vfs_node_t *old = current_proc->root_node;
+    if (n == vfs_root && !old) return 0;               /* the global root */
+    vfs_retain(n);
+    current_proc->root_node = n;
+    if (old) vfs_close(old);
+    current_proc->cwd[0] = '/';
+    current_proc->cwd[1] = '\0';
+    return 0;
+}
+
 /* ── sys_fchdir(fd) — EAX=133 ───────────────────────────────────────────── */
 /* An FD_FILE remembers the canonical path it was opened by, which is what
  * the cwd holds. */
@@ -2964,7 +2999,14 @@ static int sys_ioctl(registers_t *regs) {
         return rc;
     }
 
-    /* TCGETS = 0x5401, TCSETS = 0x5402, TIOCGWINSZ = 0x5413 */
+    /* TCGETS = 0x5401, TCSETS = 0x5402, TIOCGWINSZ = 0x5413.  Only the
+     * implicit serial console behind an unopened stdio fd is a terminal here;
+     * on a pipe, socket or plain file these fail with -ENOTTY.  musl's
+     * isatty() is TIOCGWINSZ, so answering them for every fd made every pipe
+     * a tty (less refused piped input, git started a pager into a pipe). */
+    if ((req == 0x5413 || req == 0x5401 || req == 0x5402 || req == 0x5403 ||
+         req == 0x5404) && (f->type != FD_NONE || fd > 2))
+        return -25;                                           /* -ENOTTY */
     if (req == 0x5413) {
         /* TIOCGWINSZ — return fake 80x25 terminal */
         uint16_t *ws = (uint16_t *)(uintptr_t)regs->edx;
@@ -5186,13 +5228,20 @@ static int sys_statx(registers_t *regs) {
 
     struct kstat64 kst;
     /* empty path + AT_EMPTY_PATH(0x1000) → stat dirfd itself, whatever kind of
-     * descriptor it is (musl 1.2 implements fstat() as exactly this call). */
-    if (path[0] == '\0' && dirfd >= 0) {
+     * descriptor it is (musl 1.2 implements fstat() as exactly this call);
+     * without the flag an empty path is -ENOENT (below). */
+    if (path[0] == '\0' && dirfd >= 0 && ((int)regs->edx & 0x1000)) {
         int r = fd_kstat64(dirfd, &kst);
         if (r < 0) return r;
     } else {
+        /* Relative to dirfd, and with AT_SYMLINK_NOFOLLOW (0x100) the link
+         * itself: musl's lstat() and fstatat() on i386 are this call. */
+        if (path[0] == '\0') return -2;                       /* -ENOENT */
+        char resolved[256];
+        int r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
+        if (r < 0) return r;
         int lerr;
-        vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
+        vfs_node_t *n = vfs_lookup(resolved, !((int)regs->edx & 0x100), &lerr);
         if (!n) return lerr;
         fill_kstat64(&kst, n);
     }
@@ -6892,7 +6941,24 @@ static int sys_clock_getres_time64(registers_t *regs) {
  * program can actually observe space being consumed and released; fall back to
  * the old roomy constants when nothing is mounted (initrd-only boots, where
  * there is no block accounting to report). */
-static int sys_statfs64_fill(void *ubuf, uint32_t bufsz) {
+/* f_type for a canonical path: /proc and /dev (and /tmp outside a chroot,
+ * where it is the tmpfs) are not the disk.  apk statfs()es <root>/proc and
+ * mounts procfs there itself unless it reads PROC_SUPER_MAGIC. */
+static uint32_t statfs_magic(const char *path) {
+    char first[256];
+    uint32_t i = 0;
+    const char *p = path;
+    while (*p == '/') p++;
+    while (p[i] && p[i] != '/' && i < sizeof(first) - 1) { first[i] = p[i]; i++; }
+    first[i] = '\0';
+    if (__builtin_strcmp(first, "proc") == 0) return 0x9FA0;   /* PROC_SUPER_MAGIC */
+    if (__builtin_strcmp(first, "dev") == 0 ||
+        (__builtin_strcmp(first, "tmp") == 0 && !current_proc->root_node))
+        return 0x01021994;                                       /* TMPFS_MAGIC */
+    return 0xEF53;                                               /* EXT2_SUPER_MAGIC */
+}
+
+static int sys_statfs64_fill(void *ubuf, uint32_t bufsz, uint32_t magic) {
     /* struct statfs64 (i386): f_type, f_bsize, f_blocks, f_bfree, f_bavail,
      * f_files, f_ffree, f_fsid[2], f_namelen, f_frsize, f_flags, f_spare[4].
      * 64-bit count fields. */
@@ -6903,7 +6969,7 @@ static int sys_statfs64_fill(void *ubuf, uint32_t bufsz) {
         uint32_t f_namelen, f_frsize, f_flags, f_spare[4];
     } s;
     __builtin_memset(&s, 0, sizeof(s));
-    s.f_type    = 0xEF53;              /* EXT2_SUPER_MAGIC */
+    s.f_type    = magic;
     uint32_t bs, blocks, bfree, inodes, ifree;
     if (ext2_statfs(&bs, &blocks, &bfree, &inodes, &ifree) == 0) {
         s.f_bsize  = bs;
@@ -6931,10 +6997,21 @@ static int sys_statfs64_fill(void *ubuf, uint32_t bufsz) {
 static int sys_statfs64(registers_t *regs) {
     char path[256];
     if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0) return -14;
-    return sys_statfs64_fill((void *)(uintptr_t)regs->edx, regs->ecx);
+    char resolved[256];
+    int r = resolve_path_at_fd(AT_FDCWD, path, resolved, sizeof(resolved));
+    if (r < 0) return r;
+    int err;
+    if (!vfs_lookup(resolved, 1, &err)) return err;
+    return sys_statfs64_fill((void *)(uintptr_t)regs->edx, regs->ecx,
+                             statfs_magic(resolved));
 }
 static int sys_fstatfs64(registers_t *regs) {
-    return sys_statfs64_fill((void *)(uintptr_t)regs->edx, regs->ecx);
+    int fd = (int)regs->ebx;
+    if (fd < 0 || fd >= MAX_FD || current_proc->ofile[fd].type == FD_NONE)
+        return -9;                                             /* -EBADF */
+    const char *path = current_proc->ofile[fd].path;
+    return sys_statfs64_fill((void *)(uintptr_t)regs->edx, regs->ecx,
+                             path[0] == '/' ? statfs_magic(path) : 0xEF53);
 }
 
 /* ── sys_memfd_create(name, flags) — EAX=356 ────────────────────────────────
@@ -7529,6 +7606,48 @@ static int sys_rename(registers_t *regs) {
     return sys_rename_kernel_path(oldres, newres);
 }
 
+/* ── link(oldpath, newpath) — EAX=9, linkat(...) — EAX=303 ─────────────────
+ * Linux vfs_link(): the new name must not exist and its directory must be
+ * writable; the old path names the object itself (a symlink, unless
+ * AT_SYMLINK_FOLLOW), never a directory; both on one filesystem (-EXDEV).
+ * ext2 has hard links; tmpfs/initrd answer -EPERM, as a filesystem without
+ * them does on Linux. */
+static int sys_link_paths(int olddirfd, const char *uold, int newdirfd,
+                          const char *unew, int flags) {
+    if (flags & ~(0x400 | 0x1000)) return -22;  /* AT_SYMLINK_FOLLOW, AT_EMPTY_PATH */
+    char oldpath[256], newpath[256], oldres[256], newres[256];
+    int r = copy_user_str(uold, oldpath, sizeof(oldpath));
+    if (r < 0) return r;
+    r = copy_user_str(unew, newpath, sizeof(newpath));
+    if (r < 0) return r;
+    vfs_node_t *target;
+    if (!oldpath[0]) {
+        if (!(flags & 0x1000)) return -2;
+        if (olddirfd < 0 || olddirfd >= MAX_FD ||
+            current_proc->ofile[olddirfd].type != FD_FILE ||
+            !current_proc->ofile[olddirfd].node)
+            return -9;
+        target = current_proc->ofile[olddirfd].node;
+    } else {
+        r = resolve_path_at_fd(olddirfd, oldpath, oldres, sizeof(oldres));
+        if (r < 0) return r;
+        int err;
+        target = vfs_lookup(oldres, (flags & 0x400) != 0, &err);
+        if (!target) return err;
+    }
+    if (target->flags == VFS_FLAG_DIR) return -1;              /* -EPERM */
+    r = resolve_path_at_fd(newdirfd, newpath, newres, sizeof(newres));
+    if (r < 0) return r;
+    char new_dir[256], new_base[256];
+    if (path_split(newres, new_dir, new_base) < 0 || !new_base[0]) return -2;
+    vfs_node_t *dir = vfs_open_parent_at(newres, new_dir);
+    if (!dir) return -2;
+    if (dir->flags != VFS_FLAG_DIR) return -20;                /* -ENOTDIR */
+    if (vfs_finddir(dir, new_base)) return -17;                /* -EEXIST */
+    if (proc_access_check(dir, VFS_WANT_W | VFS_WANT_X) < 0) return -13;
+    return vfs_link(dir, new_base, target);
+}
+
 /* ── chmod / fchmod / chown / fchown / lchown ───────────────────────────── */
 /* chmod: only the file owner or root may change the mode.  An owner who is
  * not in the file's group cannot set its set-group-ID bit: it is silently
@@ -7636,6 +7755,148 @@ static int sys_fchmodat(registers_t *regs) {
     r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
     if (r < 0) return r;
     return do_chmod_node(vfs_open(resolved), (uint32_t)regs->edx);
+}
+
+/* ── utime(30), utimes(271), futimesat(299), utimensat(320/412) ─────────── */
+/* All five come down to do_utimens(): `have` clear means "both now" (a NULL
+ * times pointer); otherwise ns[i] may be UTIME_NOW or UTIME_OMIT.  Setting
+ * explicit times needs ownership (or root); setting both to now also accepts
+ * write access, as on Linux. */
+#define UTIME_NOW_K  ((1u << 30) - 1)
+#define UTIME_OMIT_K ((1u << 30) - 2)
+
+static int do_utimens(vfs_node_t *n, int have, const int64_t sec[2],
+                      const uint32_t ns[2]) {
+    if (!n) return -2;
+    if (have) {
+        for (int i = 0; i < 2; i++)
+            if (ns[i] >= 1000000000u && ns[i] != UTIME_NOW_K &&
+                ns[i] != UTIME_OMIT_K)
+                return -22;                                    /* -EINVAL */
+        if (ns[0] == UTIME_OMIT_K && ns[1] == UTIME_OMIT_K) return 0;
+    }
+    int only_now = !have || (ns[0] == UTIME_NOW_K && ns[1] == UTIME_NOW_K);
+    struct proc *p = current_proc;
+    if (p->euid != 0 && p->euid != n->uid) {
+        if (!only_now) return -1;                              /* -EPERM */
+        if (proc_access_check(n, VFS_WANT_W) < 0) return -13;  /* -EACCES */
+    }
+    int64_t now; uint32_t now_ns;
+    kclock_get(CLK_REALTIME_K, &now, &now_ns);
+    uint32_t t[2] = { n->atime, n->mtime };
+    for (int i = 0; i < 2; i++) {
+        if (!have || ns[i] == UTIME_NOW_K) t[i] = (uint32_t)now;
+        else if (ns[i] != UTIME_OMIT_K)    t[i] = (uint32_t)sec[i];
+    }
+    return vfs_settimes(n, t[0], t[1]) < 0 ? -5 : 0;           /* -EIO */
+}
+
+/* The node utimensat()-style calls act on: `upath` under `dirfd`, or with a
+ * NULL or (AT_EMPTY_PATH) empty path the descriptor itself. */
+static int utimens_target(int dirfd, const char *upath, int flags,
+                          vfs_node_t **out) {
+    if (flags & ~(0x100 | 0x1000)) return -22;  /* AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH */
+    char path[256], resolved[256];
+    if (upath) {
+        int r = copy_user_str(upath, path, sizeof(path));
+        if (r < 0) return r;
+    }
+    if (!upath || (!path[0] && (flags & 0x1000))) {
+        if (dirfd < 0 || dirfd >= MAX_FD ||
+            current_proc->ofile[dirfd].type == FD_NONE || !current_proc->ofile[dirfd].node)
+            return -9;                                         /* -EBADF */
+        *out = current_proc->ofile[dirfd].node;
+        return 0;
+    }
+    if (!path[0]) return -2;
+    int r = resolve_path_at_fd(dirfd, path, resolved, sizeof(resolved));
+    if (r < 0) return r;
+    int err;
+    *out = vfs_lookup(resolved, !(flags & 0x100), &err);
+    return *out ? 0 : err;
+}
+
+static int sys_utimensat_common(registers_t *regs, int time64) {
+    vfs_node_t *n;
+    int r = utimens_target((int)regs->ebx, (const char *)(uintptr_t)regs->ecx,
+                           (int)regs->esi, &n);
+    if (r < 0) return r;
+    int64_t sec[2] = { 0, 0 };
+    uint32_t ns[2] = { 0, 0 };
+    const void *ut = (const void *)(uintptr_t)regs->edx;
+    if (ut) {
+        if (time64) {
+            int64_t k[4];
+            if (copy_from_user(k, ut, sizeof(k)) < 0) return -14;
+            sec[0] = k[0]; ns[0] = (uint32_t)k[1];
+            sec[1] = k[2]; ns[1] = (uint32_t)k[3];
+        } else {
+            int32_t k[4];
+            if (copy_from_user(k, ut, sizeof(k)) < 0) return -14;
+            sec[0] = k[0]; ns[0] = (uint32_t)k[1];
+            sec[1] = k[2]; ns[1] = (uint32_t)k[3];
+        }
+    }
+    return do_utimens(n, ut != NULL, sec, ns);
+}
+
+/* futimesat(dirfd, path, timeval[2]) and utimes(path, timeval[2]). */
+static int do_futimesat(int dirfd, const char *upath, const void *utv) {
+    vfs_node_t *n;
+    int r = utimens_target(dirfd, upath, 0, &n);
+    if (r < 0) return r;
+    int64_t sec[2] = { 0, 0 };
+    uint32_t ns[2] = { 0, 0 };
+    if (utv) {
+        int32_t k[4];
+        if (copy_from_user(k, utv, sizeof(k)) < 0) return -14;
+        for (int i = 0; i < 2; i++) {
+            if (k[2 * i + 1] < 0 || k[2 * i + 1] >= 1000000) return -22;
+            sec[i] = k[2 * i];
+            ns[i] = (uint32_t)k[2 * i + 1] * 1000u;
+        }
+    }
+    return do_utimens(n, utv != NULL, sec, ns);
+}
+
+static int sys_utime(registers_t *regs) {
+    const char *upath = (const char *)(uintptr_t)regs->ebx;
+    const void *ub = (const void *)(uintptr_t)regs->ecx;
+    if (!upath) return -14;
+    vfs_node_t *n;
+    int r = utimens_target(AT_FDCWD, upath, 0, &n);
+    if (r < 0) return r;
+    int64_t sec[2] = { 0, 0 };
+    uint32_t ns[2] = { 0, 0 };
+    if (ub) {
+        int32_t k[2];                       /* struct utimbuf { actime, modtime } */
+        if (copy_from_user(k, ub, sizeof(k)) < 0) return -14;
+        sec[0] = k[0]; sec[1] = k[1];
+    }
+    return do_utimens(n, ub != NULL, sec, ns);
+}
+
+/* ── xattr family, EAX=226..237 ─────────────────────────────────────────── */
+/* No filesystem here stores extended attributes: after the usual path or fd
+ * checks every call fails with -EOPNOTSUPP, which is what Linux returns on a
+ * filesystem without xattr support, and what coreutils (ls, cp) and apk
+ * treat as "no ACLs / labels" instead of an error. */
+static int sys_xattr(registers_t *regs, int nr) {
+    int kind = (nr - 226) % 3;                 /* 0 path, 1 lpath, 2 fd */
+    if (kind == 2) {
+        int fd = (int)regs->ebx;
+        if (fd < 0 || fd >= MAX_FD || current_proc->ofile[fd].type == FD_NONE)
+            return -9;                                         /* -EBADF */
+        return -95;                                            /* -EOPNOTSUPP */
+    }
+    char path[256], resolved[256];
+    int r = copy_user_str((const char *)(uintptr_t)regs->ebx, path, sizeof(path));
+    if (r < 0) return r;
+    r = resolve_path_at_fd(AT_FDCWD, path, resolved, sizeof(resolved));
+    if (r < 0) return r;
+    int err;
+    if (!vfs_lookup(resolved, kind == 0, &err)) return err;
+    return -95;                                                /* -EOPNOTSUPP */
 }
 
 /* ── sys_dup3(oldfd, newfd, flags) — EAX=330 ────────────────────────────── */
@@ -7834,6 +8095,8 @@ static int sys_clone(registers_t *regs) {
                          sizeof(child->sighand->mask));
     }
     __builtin_memcpy(child->cwd, parent->cwd, sizeof(parent->cwd));
+    child->root_node = parent->root_node;
+    if (child->root_node) vfs_retain(child->root_node);
     child->heap_end  = parent->heap_end;
     child->umask     = parent->umask;
     child->uid = parent->uid; child->gid = parent->gid;
@@ -9113,6 +9376,7 @@ void syscall_dispatch(registers_t *regs) {
     case 55:  ret = sys_fcntl(regs);           break;
     case 57:  ret = sys_setpgid(regs);         break;
     case 60:  ret = sys_umask(regs);           break;
+    case 61:  ret = sys_chroot(regs);          break;
     case 63:  ret = sys_dup2(regs);            break;
     case 64:  ret = sys_getppid(regs);         break;
     case 65:  ret = sys_getpgrp(regs);         break;
@@ -9167,6 +9431,16 @@ void syscall_dispatch(registers_t *regs) {
      * (Firefox's startupCache / sqlite / prefs) can then error out. */
     case 118: ret = 0;                         break;  /* fsync */
     case 148: ret = 0;                         break;  /* fdatasync */
+    /* sync(36)/syncfs(344): for the same reason there is nothing to flush
+     * (ext2 writes through); syncfs still wants a valid descriptor. */
+    case 36:  ret = 0;                         break;  /* sync */
+    /* splice(313)/tee(315): not implemented, answered the way Linux answers
+     * for descriptors that cannot be spliced (-EINVAL), on which callers
+     * (coreutils cat 9.8+) fall back to read/write.  vmsplice (316) too. */
+    case 313: case 315: case 316: ret = -22;  break;
+    case 344: ret = ((int)regs->ebx < 0 || (int)regs->ebx >= MAX_FD ||
+                     current_proc->ofile[(int)regs->ebx].type == FD_NONE) ? -9 : 0;
+              break;  /* syncfs */
     /* posix_fadvise (250=fadvise64, 272=fadvise64_64): pure advisory hints; safe
      * and correct to accept as a no-op success. */
     case 250: ret = 0;                         break;  /* fadvise64 */
@@ -9198,7 +9472,13 @@ void syscall_dispatch(registers_t *regs) {
     case 158: yield(); ret = 0;                break;  /* sched_yield */
     case 351: ret = sys_sched_setattr(regs);   break;  /* sched_setattr */
     case 352: ret = sys_sched_getattr(regs);   break;  /* sched_getattr */
-    case 9:   ret = -1;                        break;  /* link: -EPERM → FF falls back */
+    case 9:   ret = sys_link_paths(AT_FDCWD, (const char *)(uintptr_t)regs->ebx,
+                                   AT_FDCWD, (const char *)(uintptr_t)regs->ecx, 0);
+              break;  /* link (-EPERM where the filesystem has none: tmpfs) */
+    case 303: ret = sys_link_paths((int)regs->ebx, (const char *)(uintptr_t)regs->ecx,
+                                   (int)regs->edx, (const char *)(uintptr_t)regs->esi,
+                                   (int)regs->edi);
+              break;  /* linkat */
     case 356: ret = sys_memfd_create(regs);    break;  /* memfd_create */
     case 258: ret = sys_set_tid_address(regs); break;
     case 311:                                          /* set_robust_list(head, len) */
@@ -9306,6 +9586,18 @@ void syscall_dispatch(registers_t *regs) {
     case 302: ret = sys_renameat(regs);        break;
     case 305: ret = sys_readlinkat(regs);      break;
     case 306: ret = sys_fchmodat(regs);        break;
+    case 30:  ret = sys_utime(regs);           break;
+    case 226: case 227: case 228: case 229: case 230: case 231:
+    case 232: case 233: case 234: case 235: case 236: case 237:
+              ret = sys_xattr(regs, (int)num); break;  /* *xattr */
+    case 271: ret = regs->ebx ? do_futimesat(AT_FDCWD,
+                  (const char *)(uintptr_t)regs->ebx,
+                  (const void *)(uintptr_t)regs->ecx) : -14;   break;  /* utimes */
+    case 299: ret = do_futimesat((int)regs->ebx,
+                  (const char *)(uintptr_t)regs->ecx,
+                  (const void *)(uintptr_t)regs->edx);         break;  /* futimesat */
+    case 320: ret = sys_utimensat_common(regs, 0); break;
+    case 412: ret = sys_utimensat_common(regs, 1); break;  /* utimensat_time64 */
     case 307: ret = sys_faccessat(regs);       break;
     case 439: ret = sys_faccessat2(regs);      break;
     case 212: ret = sys_chown(regs);           break;  /* chown32 (musl chown) */
