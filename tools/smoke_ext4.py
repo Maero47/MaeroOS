@@ -15,6 +15,8 @@ disk, and checks from inside the guest, with busybox mount/umount:
   * writes fail with EROFS; umount is refused while a cwd is inside, works
     otherwise, and the directory underneath comes back
   * tmpfs mount + remount,ro; unprivileged mount refused; unknown types refused
+  * on q35, the same partitions found and mounted on AHCI (sdb2) and NVMe
+    (nvme0n1p5), with the boot disk on AHCI as /disk (/dev/sda)
 
 and afterwards, on the host, that neither filesystem was modified (byte
 comparison with the image it was copied from) and that e2fsck -fn is clean.
@@ -106,6 +108,53 @@ def region_unchanged(image, fs, start):
                 return False
 
 
+def sata_nvme_boot(gpt, mbr, accel):
+    """q35: the boot disk and the GPT disk on its AHCI (sda, sdb), the MBR
+    disk as an NVMe namespace (nvme0n1).  Partitions and mount(2) work on
+    every kind of disk, not only IDE (drivers/blkdev.c's disk table)."""
+    proc = subprocess.Popen(
+        ["qemu-system-i386", *smokelib.QEMU_DISPLAY, *accel, "-M", "q35",
+         "-kernel", "kernel.elf", "-initrd", "initrd.tar",
+         "-drive", "file=disk.img,format=raw,index=0,media=disk,snapshot=on",
+         "-drive", f"file={gpt['image']},format=raw,index=1,media=disk,snapshot=on",
+         "-drive", f"file={mbr['image']},format=raw,if=none,id=nv,snapshot=on",
+         "-device", "nvme,serial=ext4test,drive=nv",
+         "-serial", "stdio", "-m", "256M", "-no-reboot", "-no-shutdown"],
+        cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, bufsize=0)
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+    log = []
+    g = Guest(proc, sel, log)
+    try:
+        smokelib.login(proc, sel, log, timeout=90.0)
+        boot = "".join(log)
+        check("[BLK]  boot disk: ahci0" in boot, "q35: boot disk on AHCI")
+        check("[PART] sdb2:" in boot and "[PART] nvme0n1p5:" in boot,
+              "q35: GPT partition sdb2 (AHCI) and MBR logical nvme0n1p5 (NVMe) found")
+        rc, out = g.sh("busybox cat /proc/partitions")
+        check(all(re.search(rf"\b{p}\b", out)
+                  for p in ("sda", "sdb", "sdb2", "nvme0n1", "nvme0n1p5")),
+              "q35: /proc/partitions lists sda sdb sdb2 nvme0n1 nvme0n1p5")
+        rc, out = g.sh("busybox grep /disk /proc/mounts")
+        check("/dev/sda /disk ext2" in out, "q35: /proc/mounts names /dev/sda as /disk's source")
+        rc, out = g.sh("busybox mount -o ro -t ext4 /dev/sda /mnt")
+        check(rc != 0, "q35: the boot disk cannot be mounted a second time")
+        rc, out = g.sh("busybox mount -o ro -t ext4 /dev/sdb2 /mnt && "
+                       "busybox cat /mnt/hello.txt && busybox umount /mnt")
+        check(rc == 0 and "hello from ext4" in out, "q35: mount /dev/sdb2 (AHCI)")
+        rc, out = g.sh("busybox mount -o ro -t ext4 /dev/nvme0n1p5 /mnt && "
+                       "busybox cat /mnt/readme-link && busybox umount /mnt")
+        check(rc == 0 and "logical partition" in out, "q35: mount /dev/nvme0n1p5 (NVMe)")
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
 def main():
     if not os.environ.get("SMOKE_EXT4_KEEP_IMAGES") or \
             not os.path.exists(os.path.join(OUT, "manifest.json")):
@@ -195,7 +244,7 @@ def main():
         rc, out = g.sh("cd /mnt/deep/a && busybox cat ../../hello.txt b/c/d/leaf.txt && cd .. && busybox pwd")
         check("hello from ext4" in out and "deep leaf" in out and "/mnt/deep" in out,
               "relative paths and .. inside the mount")
-        rc, out = g.sh("cd /mnt && busybox ls .. | busybox grep -c disk")
+        rc, out = g.sh("cd /mnt && busybox ls -1 .. | busybox grep -cx disk")
         check(out.strip().endswith("1"), ".. from the mount root leaves the mount")
 
         rc, out = g.sh("echo new > /mnt/newfile")
@@ -304,6 +353,8 @@ def main():
         for fs in (gpt["fs"], mbr["fs"], e3["fs"]):
             r = subprocess.run([e2fsck, "-fn", fs], capture_output=True, text=True)
             check(r.returncode == 0, f"e2fsck -fn {os.path.basename(fs)} clean")
+
+        sata_nvme_boot(gpt, mbr, accel)
 
         if failures:
             print(f"\n[SMOKE-EXT4] {len(failures)} check(s) failed:")
