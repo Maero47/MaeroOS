@@ -30,6 +30,12 @@ vfs_node_t *ext2_mount(uint32_t lba_offset, uint32_t nsect);
  */
 int ext2_mount_dev(blkpart_t *bp, int ro, vfs_node_t **root, ext2_fs_t **fs);
 
+/* sync(2)/fsync(2): commit the journal of every ext3/ext4 instance. */
+void ext2_sync_all(void);
+
+/* Test hook: lose power after the commit that ends the next write(2). */
+void ext2_test_crash(ext2_fs_t *fs);
+
 /* Hooks for the mount table (vfs_mnt_t busy/release/set_ro). */
 int  ext2_busy(void *fs);
 void ext2_release(void *fs);

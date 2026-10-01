@@ -141,7 +141,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-ext4 smoke-ext2rw smoke-vfat smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-alpine-net smoke-audio disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-alpine-net smoke-audio disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched
 
 all: $(TARGET)
 
@@ -373,6 +373,11 @@ smoke-ext4: $(TARGET) initrd disk
 smoke-ext2rw: $(TARGET) initrd disk
 	python3 tools/smoke_ext2rw.py
 
+# ext4 read-write (extents, metadata_csum, jbd2 journal) on host mkfs.ext4
+# images, checked afterwards with e2fsck/debugfs (tools/smoke_ext4rw.py).
+smoke-ext4rw: $(TARGET) initrd disk
+	python3 tools/smoke_ext4rw.py
+
 # FAT32/FAT16/FAT12 volumes made by tools/mkvfatimg.py (mkfs.fat + mtools)
 # into build/vfattest/, mounted read-write on AHCI, a USB stick (qemu-xhci +
 # usb-storage, also unplugged and replugged) and IDE; afterwards fsck.fat -n
@@ -451,7 +456,7 @@ smoke-pc: $(TARGET) iso disk
 # with -display none (tools/smokelib.py), so no display is needed.
 # Pick a subset with CHECK_SUITES="smoke smoke-x".
 CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-net-e1000 smoke-tcpsrv \
-                 smoke-fw smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui smoke-ext4 smoke-ext2rw smoke-vfat smoke-uefi \
+                 smoke-fw smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-uefi \
                  smoke-install smoke-hda smoke-acpi smoke-ahci smoke-nvme smoke-usb smoke-pc
 CHECK_LOG_DIR ?= build/check
 
