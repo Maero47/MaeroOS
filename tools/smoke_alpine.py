@@ -13,25 +13,55 @@ Boots with disk-alpine.img (ports/alpine/prepare.py: the Alpine root at
 
 Offline: everything comes from the image.  No [SYSCALL] unimplemented line
 may appear while the Alpine programs run.  The image is copied first, so
-the apk cycle never changes disk-alpine.img itself.
+the apk cycle never changes disk-alpine.img itself.  ALPINE_IMG picks
+another image (e.g. one built with ALPINE_BRANCH=v3.24, apk-tools 3).
+
+--net (opt-in) adds an RTL8139 on QEMU user networking and serves the
+repo prepare.py staged (build/alpine/stage/alpine/repo) over HTTP on the
+host; the guest then also installs `tree` from http://10.0.2.2:<port>/main,
+which is apk's own fetch code over the kernel's TCP/IP.
 """
 import os
 import selectors
 import shutil
 import subprocess
 import sys
+import threading
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 import smokelib
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-IMG = os.path.join(ROOT, "disk-alpine.img")
+IMG = os.path.abspath(os.environ.get("ALPINE_IMG", os.path.join(ROOT, "disk-alpine.img")))
 WORK = os.path.join(ROOT, "build", "smoke-alpine.img")
+REPO = os.path.join(ROOT, "build", "alpine", "stage", "alpine", "repo")
+
+
+class QuietHandler(SimpleHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        sys.stderr.write("[http] " + (fmt % args) + "\n")
+
+
+def serve_repo():
+    """Serve REPO on an ephemeral host port; returns (server, port)."""
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0),
+                                partial(QuietHandler, directory=REPO))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, httpd.server_address[1]
 
 ENV = "/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=vt100"
 CHROOT = "toybox chroot /disk/alpine " + ENV
 
 
 def main():
+    net = "--net" in sys.argv[1:]
+    httpd = port = None
+    if net:
+        if not os.path.isdir(REPO):
+            raise SystemExit("smoke_alpine --net: no staged repo at " + REPO +
+                             " - run ports/alpine/prepare.py")
+        httpd, port = serve_repo()
     if not os.path.exists(IMG):
         raise SystemExit("smoke_alpine: disk-alpine.img is missing - run "
                          "`python3 ports/alpine/prepare.py` (or make smoke-alpine)")
@@ -42,6 +72,7 @@ def main():
         ["qemu-system-i386", "-kernel", "kernel.elf", "-initrd", "initrd.tar",
          "-drive", f"file={WORK},format=raw,index=0,media=disk",
          "-serial", "stdio", "-m", "1024M", "-no-reboot", "-no-shutdown"]
+        + (["-netdev", "user,id=n0", "-device", "rtl8139,netdev=n0"] if net else [])
         + accel + smokelib.QEMU_DISPLAY,
         cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, bufsize=0)
@@ -94,6 +125,12 @@ def main():
         # `tree` applet back as a symlink, as on any Alpine system.
         alpine("! apk info -e tree && test -L /usr/bin/tree")
         alpine("apk verify", absent=("ERROR",))
+        if net:
+            # The same package, fetched by apk over HTTP from the host.
+            url = f"http://10.0.2.2:{port}/main"
+            alpine(f"apk add --repositories-file /dev/null -X {url} tree",
+                   "Installing tree", absent=("ERROR", "WARNING"), timeout=180)
+            alpine("test ! -L /usr/bin/tree && apk del tree", "Purging tree")
         # /dev and /proc are the global ones inside the chroot.
         alpine("head -c 8 /dev/urandom | wc -c && test -r /proc/self/status", "8")
         print("\n[SMOKE-ALPINE] passed")
@@ -105,6 +142,8 @@ def main():
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+        if httpd:
+            httpd.shutdown()
 
 
 if __name__ == "__main__":

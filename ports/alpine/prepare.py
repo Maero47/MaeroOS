@@ -39,15 +39,25 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 CACHE = os.path.join(HERE, "cache")
-APK_CACHE = os.path.join(CACHE, "apk")
 BUILD = os.path.join(ROOT, "build", "alpine")
-LOCK = os.path.join(HERE, "alpine.lock")
 
-BRANCH = "v3.22"
+# ALPINE_BRANCH picks a release: its minirootfs, its apk.static and its lock
+# file.  v3.22 (apk-tools 2) is what smoke-alpine is proven with; v3.24 has
+# apk-tools 3 (see README.md).
+RELEASES = {
+    "v3.22": ("alpine-minirootfs-3.22.6-x86.tar.gz",
+              "apk-tools-static-2.14.12-r0.apk", "alpine.lock"),
+    "v3.24": ("alpine-minirootfs-3.24.2-x86.tar.gz",
+              "apk-tools-static-3.0.8-r0.apk", "alpine-v3.24.lock"),
+}
+BRANCH = os.environ.get("ALPINE_BRANCH", "v3.22")
+if BRANCH not in RELEASES:
+    sys.exit(f"[alpine] ALPINE_BRANCH must be one of {sorted(RELEASES)}")
+MINIROOTFS, APK_STATIC, _lock = RELEASES[BRANCH]
+LOCK = os.path.join(HERE, _lock)
+APK_CACHE = os.path.join(CACHE, "apk" if BRANCH == "v3.22" else "apk-" + BRANCH)
 MIRROR = os.environ.get("ALPINE_MIRROR", "https://dl-cdn.alpinelinux.org/alpine")
 ARCH = "x86"
-MINIROOTFS = "alpine-minirootfs-3.22.6-x86.tar.gz"
-APK_STATIC = "apk-tools-static-2.14.12-r0.apk"
 
 # Installed on the host into the image.
 PACKAGES = ["bash", "coreutils", "python3", "vim", "less", "nano",

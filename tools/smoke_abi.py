@@ -97,6 +97,9 @@ PROBES = {
     "p34_statfs":              (60, ""),
     "p35_xattr":               (60, ""),
     "p36_lstat_statx":         (60, "/disk"),
+    "p37_link":                (60, "/disk"),
+    "p38_sync":                (60, ""),
+    "p39_splice":              (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

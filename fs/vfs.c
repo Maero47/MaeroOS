@@ -408,6 +408,14 @@ int vfs_rename(vfs_node_t *old_dir, const char *old_name,
     return old_dir->rename_fn(old_dir, old_name, new_dir, new_name);
 }
 
+int vfs_link(vfs_node_t *dir, const char *name, vfs_node_t *target) {
+    dir = mnt_resolve(dir);
+    if (!dir || !target) return -2;                    /* -ENOENT */
+    if (!dir->link_fn) return -1;                      /* -EPERM */
+    if (target->link_fn != dir->link_fn) return -18;   /* -EXDEV */
+    return dir->link_fn(dir, name, target);
+}
+
 /* ── Symlink creation ─────────────────────────────────────────────────────── */
 
 int vfs_symlink(const char *target, const char *path) {

@@ -603,7 +603,7 @@ static void fill_kstat(struct kstat *st, vfs_node_t *n) {
     __builtin_memset(st, 0, sizeof(*st));
     st->st_ino     = n->inode;
     st->st_mode    = (uint16_t)vnode_mode(n);
-    st->st_nlink   = 1;
+    st->st_nlink   = n->nlink ? (uint16_t)n->nlink : 1;
     /* Legacy 16-bit ids: anything wider reads as overflowuid (65534). */
     st->st_uid     = n->uid > 0xFFFFU ? 65534U : (uint16_t)n->uid;
     st->st_gid     = n->gid > 0xFFFFU ? 65534U : (uint16_t)n->gid;
@@ -620,7 +620,7 @@ static void fill_kstat64(struct kstat64 *st, vfs_node_t *n) {
     st->st_ino     = n->inode;
     st->__st_ino   = n->inode;
     st->st_mode    = vnode_mode(n);
-    st->st_nlink   = 1;
+    st->st_nlink   = n->nlink ? n->nlink : 1;
     st->st_uid     = n->uid;     /* the owner the permission checks use */
     st->st_gid     = n->gid;
     st->st_size    = (int64_t)n->size;
@@ -7592,6 +7592,48 @@ static int sys_rename(registers_t *regs) {
     return sys_rename_kernel_path(oldres, newres);
 }
 
+/* ── link(oldpath, newpath) — EAX=9, linkat(...) — EAX=303 ─────────────────
+ * Linux vfs_link(): the new name must not exist and its directory must be
+ * writable; the old path names the object itself (a symlink, unless
+ * AT_SYMLINK_FOLLOW), never a directory; both on one filesystem (-EXDEV).
+ * ext2 has hard links; tmpfs/initrd answer -EPERM, as a filesystem without
+ * them does on Linux. */
+static int sys_link_paths(int olddirfd, const char *uold, int newdirfd,
+                          const char *unew, int flags) {
+    if (flags & ~(0x400 | 0x1000)) return -22;  /* AT_SYMLINK_FOLLOW, AT_EMPTY_PATH */
+    char oldpath[256], newpath[256], oldres[256], newres[256];
+    int r = copy_user_str(uold, oldpath, sizeof(oldpath));
+    if (r < 0) return r;
+    r = copy_user_str(unew, newpath, sizeof(newpath));
+    if (r < 0) return r;
+    vfs_node_t *target;
+    if (!oldpath[0]) {
+        if (!(flags & 0x1000)) return -2;
+        if (olddirfd < 0 || olddirfd >= MAX_FD ||
+            current_proc->ofile[olddirfd].type != FD_FILE ||
+            !current_proc->ofile[olddirfd].node)
+            return -9;
+        target = current_proc->ofile[olddirfd].node;
+    } else {
+        r = resolve_path_at_fd(olddirfd, oldpath, oldres, sizeof(oldres));
+        if (r < 0) return r;
+        int err;
+        target = vfs_lookup(oldres, (flags & 0x400) != 0, &err);
+        if (!target) return err;
+    }
+    if (target->flags == VFS_FLAG_DIR) return -1;              /* -EPERM */
+    r = resolve_path_at_fd(newdirfd, newpath, newres, sizeof(newres));
+    if (r < 0) return r;
+    char new_dir[256], new_base[256];
+    if (path_split(newres, new_dir, new_base) < 0 || !new_base[0]) return -2;
+    vfs_node_t *dir = vfs_open_parent_at(newres, new_dir);
+    if (!dir) return -2;
+    if (dir->flags != VFS_FLAG_DIR) return -20;                /* -ENOTDIR */
+    if (vfs_finddir(dir, new_base)) return -17;                /* -EEXIST */
+    if (proc_access_check(dir, VFS_WANT_W | VFS_WANT_X) < 0) return -13;
+    return vfs_link(dir, new_base, target);
+}
+
 /* ── chmod / fchmod / chown / fchown / lchown ───────────────────────────── */
 /* chmod: only the file owner or root may change the mode.  An owner who is
  * not in the file's group cannot set its set-group-ID bit: it is silently
@@ -9374,6 +9416,16 @@ void syscall_dispatch(registers_t *regs) {
      * (Firefox's startupCache / sqlite / prefs) can then error out. */
     case 118: ret = 0;                         break;  /* fsync */
     case 148: ret = 0;                         break;  /* fdatasync */
+    /* sync(36)/syncfs(344): for the same reason there is nothing to flush
+     * (ext2 writes through); syncfs still wants a valid descriptor. */
+    case 36:  ret = 0;                         break;  /* sync */
+    /* splice(313)/tee(315): not implemented, answered the way Linux answers
+     * for descriptors that cannot be spliced (-EINVAL), on which callers
+     * (coreutils cat 9.8+) fall back to read/write.  vmsplice (316) too. */
+    case 313: case 315: case 316: ret = -22;  break;
+    case 344: ret = ((int)regs->ebx < 0 || (int)regs->ebx >= MAX_FD ||
+                     current_proc->ofile[(int)regs->ebx].type == FD_NONE) ? -9 : 0;
+              break;  /* syncfs */
     /* posix_fadvise (250=fadvise64, 272=fadvise64_64): pure advisory hints; safe
      * and correct to accept as a no-op success. */
     case 250: ret = 0;                         break;  /* fadvise64 */
@@ -9405,7 +9457,13 @@ void syscall_dispatch(registers_t *regs) {
     case 158: yield(); ret = 0;                break;  /* sched_yield */
     case 351: ret = sys_sched_setattr(regs);   break;  /* sched_setattr */
     case 352: ret = sys_sched_getattr(regs);   break;  /* sched_getattr */
-    case 9:   ret = -1;                        break;  /* link: -EPERM → FF falls back */
+    case 9:   ret = sys_link_paths(AT_FDCWD, (const char *)(uintptr_t)regs->ebx,
+                                   AT_FDCWD, (const char *)(uintptr_t)regs->ecx, 0);
+              break;  /* link (-EPERM where the filesystem has none: tmpfs) */
+    case 303: ret = sys_link_paths((int)regs->ebx, (const char *)(uintptr_t)regs->ecx,
+                                   (int)regs->edx, (const char *)(uintptr_t)regs->esi,
+                                   (int)regs->edi);
+              break;  /* linkat */
     case 356: ret = sys_memfd_create(regs);    break;  /* memfd_create */
     case 258: ret = sys_set_tid_address(regs); break;
     case 311:                                          /* set_robust_list(head, len) */

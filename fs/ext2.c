@@ -248,6 +248,7 @@ static int ext2_truncate(vfs_node_t *node, uint32_t new_size);
 static int ext2_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid,
                         uint32_t gid);
 static int ext2_settimes(vfs_node_t *node, uint32_t atime, uint32_t mtime);
+static int ext2_link(vfs_node_t *dir, const char *name, vfs_node_t *target);
 static int ext2_unlink(vfs_node_t *dir, const char *name);
 static int ext2_symlink(vfs_node_t *dir, const char *name, const char *target);
 static int ext2_rename(vfs_node_t *old_dir, const char *old_name,
@@ -1669,6 +1670,7 @@ static void ext2_fill_node(vfs_node_t *node, const ext2_inode_t *inode) {
     node->atime = inode->i_atime;
     node->mtime = inode->i_mtime;
     node->ctime = inode->i_ctime;
+    node->nlink = inode->i_links_count;
 
     uint16_t type = inode->i_mode & EXT2_S_IFMT;
 
@@ -1721,6 +1723,7 @@ static void ext2_fill_node(vfs_node_t *node, const ext2_inode_t *inode) {
 
     node->setattr_fn = ext2_setattr;
     node->settimes_fn = ext2_settimes;
+    node->link_fn = ext2_link;
 }
 
 /* Return the node for inode `ino_num`, found as `name`, creating it on the
@@ -2180,6 +2183,38 @@ static int ext2_settimes(vfs_node_t *node, uint32_t atime, uint32_t mtime) {
     inode.i_ctime = ext2_now();
     node->ctime = inode.i_ctime;
     return ext2_write_inode(priv->ino, &inode);
+}
+
+/* link(2): one more directory entry for an existing inode.  Directories
+ * cannot be linked (-EPERM, as on Linux). */
+static int ext2_link(vfs_node_t *dir, const char *name, vfs_node_t *target) {
+    if (!g_mounted || !dir || !dir->private || !target || !target->private)
+        return -22;
+    if (ext2_finddir(dir, name)) return -17;                    /* -EEXIST */
+    ext2_priv_t *dpriv = (ext2_priv_t *)dir->private;
+    ext2_priv_t *tpriv = (ext2_priv_t *)target->private;
+    ext2_inode_t dir_inode, inode;
+    if (ext2_read_inode(dpriv->ino, &dir_inode) < 0) return -5;
+    if ((dir_inode.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) return -20;
+    if (ext2_read_inode(tpriv->ino, &inode) < 0) return -5;
+    uint16_t type = inode.i_mode & EXT2_S_IFMT;
+    if (type == EXT2_S_IFDIR) return -1;                        /* -EPERM */
+    if (inode.i_links_count == 0) return -2;                    /* -ENOENT */
+    if (inode.i_links_count >= 65000) return -31;               /* -EMLINK */
+    uint8_t ftype = type == EXT2_S_IFREG  ? 1 : type == EXT2_S_IFLNK ? 7
+                  : type == EXT2_S_IFSOCK ? EXT2_FT_SOCK
+                  : type == 0x2000 ? 3 : type == 0x6000 ? 4 : type == 0x1000 ? 5 : 0;
+    if (ext2_add_dirent(dpriv->ino, &dir_inode, tpriv->ino, name, ftype) < 0)
+        return -28;                                             /* -ENOSPC */
+    uint32_t now = ext2_now();
+    inode.i_links_count++;
+    inode.i_ctime = now;
+    if (ext2_write_inode(tpriv->ino, &inode) < 0) return -5;
+    target->nlink = inode.i_links_count;
+    target->ctime = now;
+    dir_inode.i_mtime = dir_inode.i_ctime = now;
+    ext2_write_inode(dpriv->ino, &dir_inode);
+    return 0;
 }
 
 static int ext2_truncate(vfs_node_t *node, uint32_t new_size) {

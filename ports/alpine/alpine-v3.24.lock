@@ -1,0 +1,112 @@
+# Pins for ports/alpine/prepare.py (ALPINE_RELOCK=1 rewrites it).
+# file: sha256 of a downloaded file; pkg: an installed name-version.
+file acl-libs-2.3.2-r1.af260bc0.apk 9dd329380b583bbabe5f685bf7d2623a0886aa45236ff9d88ba9046fecd2a065
+file alpine-minirootfs-3.24.2-x86.tar.gz 757f07c5a3476ba3947cfbea2323b7f02fb6fb2fba8a3a3c2b9d17f0a54c9226
+file apk-tools-static-3.0.8-r0.apk f97a89e9af2d481434f7fd4917888a509290810e2a8132ae102de1beecaff64d
+file bash-5.3.9-r1.e8a6b00a.apk f5f0956b8464729577b1021bb6301f23d9e7b010bf11aac3678409827484ee52
+file brotli-libs-1.2.0-r1.224add79.apk ecb54296acafc3bb9a21dea29514c0d2214a005ada676677f8ef68e05a54d282
+file c-ares-1.34.8-r0.0a94f1d3.apk 7569757070dc3130c9e97ab1fb3ccfd66301e816645942f02cb99e9d5b680bde
+file coreutils-9.11-r0.58094241.apk b8043313c5649665e2b09676fc0c3804010bde5bfcd59e30bd94f32d55f0bc2b
+file coreutils-env-9.11-r0.7cb75b68.apk c3b899dea89a67fb86a9d81fbf5b3427832b118a5b43761639459448ebe63aa7
+file coreutils-fmt-9.11-r0.a3776696.apk 672ae780a6acf8eecd00eaf9d8de318e806f2b92432264ed5a8b3d700feaea7e
+file coreutils-sha512sum-9.11-r0.a50e57e2.apk 70424777d41b8b652a3432ebdeca42c8f0decded674fe31f93e5f1391a1ad566
+file gdbm-1.26-r0.d185e299.apk 7744f4fe12bd6e81744e79bf8fd09ead3e8edd54c86872f8d7ee8375329e1a65
+file git-2.54.0-r0.e1f31fa5.apk ea4728fd0c3598905aee5bb654e81122830f17a5e0c80a8b5abc18738b4ce062
+file git-init-template-2.54.0-r0.02d0c461.apk ca41f4fd1ece7df2331a913b39d361bbe5fa96cc44f75bb50649b64e1178fafa
+file less-702-r0.cc421a35.apk 56fdad28f71c0a5eb4bcab90678165e55b40d7771e6013fd6e80457e7e9e7208
+file libattr-2.5.2-r2.5079ebdf.apk dd86a0dfe316100d30a6c6aeebda984f36ded395145d77765a16f3dd3ba670bc
+file libbz2-1.0.8-r6.efd1b7c2.apk 636ace113aaf002da7b28dfb9e99e0d04df466cc177ffa27f68c4e6ebbb4ce2c
+file libcurl-8.22.0-r0.0feef69d.apk 3900dc04661880c2882376f89264ea7eb9840dd15ba92127628f62ea3432a2a6
+file libedit-20260508.3.1-r1.754ec8ae.apk 3fc0fcfe011bcea8ed32f97c8088740e8d02d085b05c401834d97f40a06524fc
+file libexpat-2.8.5-r0.d04ae3df.apk 49fe8fcd2a8eba8fbebf005612950440bd0287c6ccf7c0b4128ff136ca001b34
+file libffi-3.5.2-r1.98ec9e75.apk b1c7cbf073a96066a84eb28fb15071e20838320f860df83d6609fa50af21cf97
+file libgcc-15.2.0-r5.e4a64372.apk 8c7854c5671b7bec32768d47cb4086b3e78b9ff347a24cad5cf42e8c6e9b9551
+file libidn2-2.3.8-r0.4984bb8f.apk cae318b487162b91342504a6e85c3d6381b83988f5904a1099d212184d1a8afd
+file libncursesw-6.6_p20260516-r0.aa6466d6.apk 49a048c29a93046b3fc5e72a21bb55ef537558d026f1064a42d25f42f19a90e9
+file libpanelw-6.6_p20260516-r0.7c0d7157.apk 8f591e6c968ef4a6e388b02503a895c15716c5b92fc4b39f2beaae10b77939c6
+file libpsl-0.21.5-r3.156cf905.apk b1877322d6a3e54c156e7f838e03dfaf723dae86859508b63fc8193961b9022d
+file libstdc++-15.2.0-r5.2b42bfc6.apk 84bcdc89b255412fdf4ea3284be1953560ba5567e6ca972f356452c583f10de8
+file libunistring-1.4.2-r0.e6cd428f.apk 5d7e61eea90b783075bb995f3346165f25fd0fc2f1b5975e9d0ec70ade3c8c34
+file mpdecimal-4.0.1-r0.ed0e4e95.apk d1fee342fc98fb4ac4832c01a63e22486b9b28ab1e8d7a80f8e4bd6a49989ed9
+file nano-9.2-r0.05ccd8a4.apk 6b3a2c3219a982ef2e847ef5555982d4395c180ac8f91f47d06465a83b681026
+file ncurses-terminfo-base-6.6_p20260516-r0.9d551d82.apk dbb8268b7a8c9e98b109dc6bd1a989f846bd49b71a186308a2224f3195620501
+file nghttp2-libs-1.69.0-r0.4568b55a.apk a177a6eaea80d31064e657542cf4897a513343746ca49e954e926bace2e4fe33
+file openssh-client-common-10.3_p1-r1.3596e1d1.apk ac5dcf88fa595534c16523afb534145f514b879e9acb61950c4a04420d4588c0
+file openssh-client-default-10.3_p1-r1.985c24b8.apk a1b6571e1f716fda6e2d950e95aa6a7f1f9ffd96870a551e1f2c82252cb4fa89
+file openssh-keygen-10.3_p1-r1.cca32ee1.apk 9bdc310c2176776ae4aa4bc922571ac1847444de850f0e2c84c3b73432ab6ab0
+file pcre2-10.48-r0.7e4ff4c8.apk c81252e0408af97f23e3480ad197a9153c663cfd3aabf433e2c852dcc25c62e9
+file python3-3.14.7-r1.4da7e55e.apk 1ca1b8b9f9dba7f8b20ad8a7de0835e1a0ca264cf2b717f1d1a9802de6bd8cc6
+file python3-pycache-pyc0-3.14.7-r1.81b7110b.apk 36c144826ede25a6a10325ffad9f571a31d1ed4113b1ca9e27a49ba232bf9bcf
+file readline-8.3.3-r1.288b8d94.apk 1d2a80bdfc66bfef11a9ed9715fa0189d646e562d2bddda6a1fec6ea815b9285
+file skalibs-libs-2.15.0.0-r0.a7e03627.apk fc48c928a0e1fc83447cde4e3d5afb2494a9f3cdb238bc21ef1f0cec1825af69
+file sqlite-libs-3.53.4-r0.249d24c5.apk 9b6f373cda00e66e0cb62651e47ed32483eabee12597c5d1da3cdf0ce487568a
+file tree-2.3.2-r0.apk 0259e3aa65fd275f0a681ceef37e212af1d34c59f877f8af6d6737d17901ea49
+file utmps-libs-0.1.3.3-r0.7b1b6a32.apk 8b75262151ebd102ecb1d89430e50ba93986fff4ecd61b57f14ba997f5816c76
+file vim-9.2.1091-r0.bc02879a.apk 4818ebf4eea3575f74266bcbde6cff9c345915ccb3dd46a0e46b62f75d17dc7b
+file vim-common-9.2.1091-r0.e814b082.apk 3ef666726a865bd854b84a2c3fb95bd299b7b24fb49d44370bfa683b60e29ce7
+file xxd-9.2.1091-r0.198bdc9d.apk 804baec51b2160703e7e66654b1fe9647b6f720b3314ef254eb2e8cbf788b7d4
+file xz-libs-5.8.4-r0.f61437be.apk 180d250c97ef95f7fec5d7190d64d39ebfbd8f6247c8b4d45a6295aa087372d2
+file zstd-libs-1.5.7-r2.587d9d59.apk 3808b97766907956179fe94ce61ead63220e957dc7789f81eb961a6e94dd8f61
+pkg acl-libs-2.3.2-r1
+pkg alpine-baselayout-3.7.2-r1
+pkg alpine-baselayout-data-3.7.2-r1
+pkg alpine-keys-2.6-r0
+pkg alpine-release-3.24.2-r0
+pkg apk-tools-3.0.8-r0
+pkg bash-5.3.9-r1
+pkg brotli-libs-1.2.0-r1
+pkg busybox-1.37.0-r31
+pkg busybox-binsh-1.37.0-r31
+pkg c-ares-1.34.8-r0
+pkg ca-certificates-bundle-20260909-r0
+pkg coreutils-9.11-r0
+pkg coreutils-env-9.11-r0
+pkg coreutils-fmt-9.11-r0
+pkg coreutils-sha512sum-9.11-r0
+pkg gdbm-1.26-r0
+pkg git-2.54.0-r0
+pkg git-init-template-2.54.0-r0
+pkg less-702-r0
+pkg libapk-3.0.8-r0
+pkg libattr-2.5.2-r2
+pkg libbz2-1.0.8-r6
+pkg libcrypto3-3.5.8-r0
+pkg libcurl-8.22.0-r0
+pkg libedit-20260508.3.1-r1
+pkg libexpat-2.8.5-r0
+pkg libffi-3.5.2-r1
+pkg libgcc-15.2.0-r5
+pkg libidn2-2.3.8-r0
+pkg libncursesw-6.6_p20260516-r0
+pkg libpanelw-6.6_p20260516-r0
+pkg libpsl-0.21.5-r3
+pkg libssl3-3.5.8-r0
+pkg libstdc++-15.2.0-r5
+pkg libunistring-1.4.2-r0
+pkg mpdecimal-4.0.1-r0
+pkg musl-1.2.6-r2
+pkg musl-utils-1.2.6-r2
+pkg nano-9.2-r0
+pkg ncurses-terminfo-base-6.6_p20260516-r0
+pkg nghttp2-libs-1.69.0-r0
+pkg openssh-client-common-10.3_p1-r1
+pkg openssh-client-default-10.3_p1-r1
+pkg openssh-keygen-10.3_p1-r1
+pkg pcre2-10.48-r0
+pkg pyc-3.14.7-r1
+pkg python3-3.14.7-r1
+pkg python3-pyc-3.14.7-r1
+pkg python3-pycache-pyc0-3.14.7-r1
+pkg readline-8.3.3-r1
+pkg repo:tree-2.3.2-r0
+pkg scanelf-1.3.9-r1
+pkg skalibs-libs-2.15.0.0-r0
+pkg sqlite-libs-3.53.4-r0
+pkg ssl_client-1.37.0-r31
+pkg utmps-libs-0.1.3.3-r0
+pkg vim-9.2.1091-r0
+pkg vim-common-9.2.1091-r0
+pkg xxd-9.2.1091-r0
+pkg xz-libs-5.8.4-r0
+pkg zlib-1.3.2-r0
+pkg zstd-libs-1.5.7-r2
