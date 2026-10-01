@@ -460,6 +460,23 @@ static vfs_node_t *mnt_resolve(vfs_node_t *dir) {
     return dir;
 }
 
+const void *vfs_mnt_instance(const vfs_mnt_t *m) {
+    /* A bind mount ("none") shows a directory of the mount in src. */
+    for (int hops = 0; m && hops < VFS_MNT_MAX; hops++) {
+        if (strcmp(m->fstype, "none") != 0)
+            return m->fs ? m->fs : (const void *)m->root;
+        m = m->src;
+    }
+    return NULL;
+}
+
+const void *vfs_path_instance(const char *path, int *ok) {
+    int err;
+    vfs_mnt_t *m = NULL;
+    *ok = vfs_lookup_mnt(path, 1, &err, &m) != NULL;
+    return vfs_mnt_instance(m);
+}
+
 int vfs_rename(vfs_node_t *old_dir, const char *old_name,
                vfs_node_t *new_dir, const char *new_name) {
     old_dir = mnt_resolve(old_dir);

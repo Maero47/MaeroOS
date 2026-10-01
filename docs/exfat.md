@@ -28,7 +28,9 @@ device (`EBUSY`), raw writes to a disk with a mounted filesystem are `EBUSY`,
   boot checksum sector (the 32-bit checksum over sectors 0-10, VolumeFlags and
   PercentInUse excluded). If the main region fails and the backup region
   (sectors 12-23) is good, the volume is mounted read-only from the backup
-  (`EROFS` for read-write; busybox `mount` then retries read-only itself). The
+  (`EROFS` for read-write; busybox `mount` then retries read-only itself), and
+  `remount,rw` is refused (`EROFS`) as well: VolumeDirty would go into the
+  broken main boot sector. The
   FAT, the cluster heap and the cluster count must fit inside the volume, and
   the volume inside its partition.
 * **Root directory**: a FAT chain; a chain that loops or exceeds 256 MiB is
@@ -37,7 +39,8 @@ device (`EBUSY`), raw writes to a disk with a mounted filesystem are `EBUSY`,
   table that does not match its checksum, or a missing one, is replaced by a
   built-in mapping (ASCII, Latin-1, Latin Extended-A, Greek, Cyrillic) and the
   volume is read-only, so no name is written with a hash other systems would
-  not compute. Two FATs (TexFAT) are read-only too.
+  not compute; `remount,rw` is refused too. Two FATs (TexFAT) are read-only
+  in the same way.
 * **Names**: UTF-16 in the file-name entries (up to 255 units, 15 per entry),
   UTF-8 in the VFS, surrogate pairs for characters outside the BMP. Lookups
   compare names through the volume's up-case table, so they are
@@ -74,7 +77,10 @@ device (`EBUSY`), raw writes to a disk with a mounted filesystem are `EBUSY`,
   case-only change, and over an existing entry (whose clusters are freed, or
   freed at its last close if open). The new set is written before the old and
   the replaced ones are deleted, all in one locked operation flushed at its
-  end. A directory cannot move below itself (`EINVAL`).
+  end. A directory cannot move below itself (`EINVAL`). Between two mounted
+  volumes it is `EXDEV` (checked in `rename(2)` against the mount instances,
+  since every exFAT volume shares the driver's rename hook, and again in the
+  driver); `mv` then copies.
 * **Timestamps**: written in UTC with UtcOffset `0x80` (valid, +0) and the
   10 ms field; read with the stored offset applied (a set without a valid
   offset is taken as UTC). Create, modify and access times; `utimensat` sets

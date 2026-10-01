@@ -7873,6 +7873,12 @@ static int sys_rename_kernel_path(const char *oldpath, const char *newpath) {
     if (src_is_dir && __builtin_strcmp(old_dir, new_dir) != 0 &&
         proc_access_check(src, VFS_WANT_W) < 0)
         return -13;
+    /* Two mounts of one driver share rename_fn, so vfs_rename cannot see
+     * that they are different volumes. */
+    int ok1, ok2;
+    const void *i1 = vfs_path_instance(old_dir, &ok1);
+    const void *i2 = vfs_path_instance(new_dir, &ok2);
+    if (ok1 && ok2 && i1 != i2) return -18;              /* -EXDEV */
 
     return vfs_rename(src_dir, old_base, dst_dir, new_base);
 }
@@ -7907,6 +7913,8 @@ static int sys_link_paths(int olddirfd, const char *uold, int newdirfd,
     r = copy_user_str(unew, newpath, sizeof(newpath));
     if (r < 0) return r;
     vfs_node_t *target;
+    const void *tinst = NULL;
+    int tinst_ok = 0;
     if (!oldpath[0]) {
         if (!(flags & 0x1000)) return -2;
         if (olddirfd < 0 || olddirfd >= MAX_FD ||
@@ -7914,12 +7922,20 @@ static int sys_link_paths(int olddirfd, const char *uold, int newdirfd,
             !current_proc->ofile[olddirfd].node)
             return -9;
         target = current_proc->ofile[olddirfd].node;
+        proc_file_t *of = &current_proc->ofile[olddirfd];
+        if (!of->mnt || (of->mnt->used && of->mnt->seq == of->mnt_seq)) {
+            tinst = vfs_mnt_instance(of->mnt);
+            tinst_ok = 1;
+        }
     } else {
         r = resolve_path_at_fd(olddirfd, oldpath, oldres, sizeof(oldres));
         if (r < 0) return r;
         int err;
-        target = vfs_lookup(oldres, (flags & 0x400) != 0, &err);
+        vfs_mnt_t *tm = NULL;
+        target = vfs_lookup_mnt(oldres, (flags & 0x400) != 0, &err, &tm);
         if (!target) return err;
+        tinst = vfs_mnt_instance(tm);
+        tinst_ok = 1;
     }
     if (target->flags == VFS_FLAG_DIR) return -1;              /* -EPERM */
     r = resolve_path_at_fd(newdirfd, newpath, newres, sizeof(newres));
@@ -7933,6 +7949,9 @@ static int sys_link_paths(int olddirfd, const char *uold, int newdirfd,
     if (dir->flags != VFS_FLAG_DIR) return -20;                /* -ENOTDIR */
     if (vfs_finddir(dir, new_base)) return -17;                /* -EEXIST */
     if (proc_access_check(dir, VFS_WANT_W | VFS_WANT_X) < 0) return -13;
+    int dok;
+    const void *dinst = vfs_path_instance(new_dir, &dok);
+    if (tinst_ok && dok && tinst != dinst) return -18;         /* -EXDEV */
     return vfs_link(dir, new_base, target);
 }
 

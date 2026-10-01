@@ -13,6 +13,9 @@
  *     used to keep serving its first copy).
  *
  * Prints "fsprobe ok" when everything holds, "fsprobe FAIL: ..." otherwise.
+ *
+ * `fsprobe rename OLD NEW` instead makes one raw rename(2) and prints
+ * "rename: 0" or "rename: -ERRNO" (mv would hide EXDEV by copying).
  */
 #include "../include/errno.h"
 #include "../include/fcntl.h"
@@ -240,7 +243,12 @@ static void check_mmap_after_write(const char *path) {
     unlink(path);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc == 4 && strcmp(argv[1], "rename") == 0) {
+        int r = syscall2(38, (int)argv[2], (int)argv[3]);
+        printf("rename: %d\n", r);
+        return r < 0;
+    }
     check_tmpfs();
     check_symlinks();
     check_fifo();

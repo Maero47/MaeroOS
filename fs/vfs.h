@@ -317,6 +317,16 @@ int vfs_mount_remove(vfs_mnt_t *m, uint32_t flags);
  * read-only (flushed, its volume marked clean). */
 void vfs_mounts_shutdown(void);
 
+/* The filesystem instance a path lives on, for rename(2) and link(2), which
+ * must stay within one (-EXDEV): two mounts of the same driver share their
+ * node operations, so comparing those cannot tell instances apart.  Bind
+ * mounts answer for the mount their source is on; NULL is the boot tree
+ * (whose filesystems differ in their operations).  `path` is resolved like
+ * vfs_lookup_mnt (following the final symlink); *ok is 0 when it does not
+ * resolve. */
+const void *vfs_path_instance(const char *path, int *ok);
+const void *vfs_mnt_instance(const vfs_mnt_t *m);
+
 /* 1 when a mount sits on `n` (rmdir/unlink of it is -EBUSY). */
 int vfs_is_mountpoint(vfs_node_t *n);
 

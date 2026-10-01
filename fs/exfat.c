@@ -102,7 +102,8 @@ struct exfat_fs {
     blkpart_t *bp;
     volatile int lock;
     int        ro;
-    int        ro_only;                 /* never read-write (two FATs) */
+    int        ro_only;                 /* never read-write: two FATs, the backup boot
+                                         * region, or no usable up-case table */
     uint32_t   bps, s512;               /* bytes per sector, 512-byte units per sector */
     uint32_t   spc, cshift, cb;         /* sectors per cluster, log2 and bytes per cluster */
     uint32_t   total;                   /* sectors in the volume */
@@ -1469,6 +1470,9 @@ static int node_move(exfat_fs_t *fs, xf_vnode_t *vn, xf_vnode_t *d, uint32_t idx
 static int xf_rename(vfs_node_t *odir, const char *oname, vfs_node_t *ndir, const char *nname) {
     xf_vnode_t *od = (xf_vnode_t *)odir, *nd = (xf_vnode_t *)ndir;
     exfat_fs_t *fs = od->fs;
+    /* Another exFAT volume shares this rename_fn: never treat its nodes as
+     * ours (its entries would be read with this volume's geometry). */
+    if (nd->fs != fs) return -18;                        /* -EXDEV */
     uint16_t u[NAME_UNITS];
     uint32_t nu;
     int r = name_to_u16(nname, u, &nu, 1);
@@ -1782,6 +1786,7 @@ int exfat_mount_dev(blkpart_t *bp, int ro, const vfat_opts_t *o,
     int rc = E_INVAL;
     if (!bs || !tmp) { rc = E_NOMEM; goto fail; }
     if (bp->nsect < 64) goto fail;
+    int from_backup = 0;
     int ok = boot_region_ok(bp, 0, 0, bs, tmp);
     if (ok < 0) { rc = E_IO; goto fail; }
     if (!ok) {
@@ -1796,6 +1801,7 @@ int exfat_mount_dev(blkpart_t *bp, int ro, const vfat_opts_t *o,
             goto fail;
         }
         printk("[EXFAT] %s: main boot region invalid, using the backup read-only\n", bp->name);
+        from_backup = 1;
         if (!ro) { rc = E_ROFS; goto fail; }
     }
     uint32_t bshift = bs[108], cshift_s = bs[109];
@@ -1843,7 +1849,10 @@ int exfat_mount_dev(blkpart_t *bp, int ro, const vfat_opts_t *o,
         printk("[EXFAT] %s: bad root directory cluster\n", bp->name);
         goto fail;
     }
-    fs->ro_only = nfats != 1;
+    /* Two FATs (TexFAT), or geometry from the backup boot region (VolumeDirty
+     * would be written into the broken main boot sector): never read-write,
+     * not even by remount. */
+    fs->ro_only = nfats != 1 || from_backup;
     fs->was_dirty = (vflags & VF_DIRTY) != 0;
     fs->free_count = 0xFFFFFFFFu;
     fs->next_free = 2;
@@ -1954,6 +1963,7 @@ int exfat_mount_dev(blkpart_t *bp, int ro, const vfat_opts_t *o,
         /* Names written with another mapping would get hashes other
          * implementations do not expect: read-only. */
         for (uint32_t i = 0; i < 65536; i++) fs->upcase[i] = (uint16_t)uc_default(i);
+        fs->ro_only = 1;                    /* remount,rw is refused too */
         if (!ro) {
             printk("[EXFAT] %s: no usable up-case table: read-only\n", bp->name);
             rc = E_ROFS;

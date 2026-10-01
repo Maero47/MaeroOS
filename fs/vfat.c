@@ -1502,6 +1502,9 @@ static int node_move(vfat_fs_t *fs, vfat_vnode_t *vn, vfat_vnode_t *d, uint32_t 
 static int vfat_rename(vfs_node_t *odir, const char *oname, vfs_node_t *ndir, const char *nname) {
     vfat_vnode_t *od = (vfat_vnode_t *)odir, *nd = (vfat_vnode_t *)ndir;
     vfat_fs_t *fs = od->fs;
+    /* Another FAT volume shares this rename_fn: never treat its nodes as
+     * ours (its entries would be read with this volume's geometry). */
+    if (nd->fs != fs) return -18;                        /* -EXDEV */
     fs_lock(fs);
     int r;
     dent_t *src = (dent_t *)kmalloc(sizeof(dent_t));

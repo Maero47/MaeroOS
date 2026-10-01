@@ -87,7 +87,9 @@ slot and the name. One stick at a time (the MSC driver's limit).
   (".." follows), case-only changes, and over an existing entry: the existing
   short entry is pointed at the moved object in one sector write, so the
   target name never disappears, then the old entries are deleted. A directory
-  cannot move below itself (`EINVAL`).
+  cannot move below itself (`EINVAL`). Between two FAT mounts it is `EXDEV`
+  (`mv` copies): `rename(2)` compares the mount instances, not the shared
+  rename hook, and the driver checks again.
 * Timestamps: creation, modification and access date; `utimensat` sets them.
   FAT stores local time without a zone; it is read and written as UTC here.
 * Metadata (FAT, directories, boot sector, FSInfo) goes through a 256 KiB

@@ -428,9 +428,13 @@ def crafted(man, accel):
         # Read-write is refused with EROFS; busybox mount then retries
         # read-only by itself.
         rc, out = g.sh("busybox mount -t exfat /dev/sdc1 /c && busybox grep sdc1 /proc/mounts && "
-                       "busybox cat /c/boot.txt && busybox umount /c")
+                       "busybox cat /c/boot.txt")
         check(rc == 0 and "exfat ro" in out and "boot test" in out,
               f"main boot region checksum broken: mounted read-only from the backup region ({out.strip()[-120:]!r})")
+        rc, out = g.sh("busybox mount -o remount,rw /c; busybox grep sdc1 /proc/mounts; "
+                       "echo x > /c/x.txt; busybox umount /c")
+        check("exfat ro" in out and "Read-only" in out,
+              f"... and remount,rw is refused: still ro, writes EROFS ({out.strip()[-160:]!r})")
         results = {}
         for n, what in ((2, "ClusterCount past the volume"), (3, "root cluster 1"),
                         (4, "both boot checksums broken")):
@@ -443,9 +447,13 @@ def crafted(man, accel):
         check("inconsistent boot sector" in bad_log and "checksum mismatch" in bad_log,
               "the refusals are named in the log")
         rc, out = g.sh("busybox mount -t exfat /dev/sdd /c && busybox grep sdd /proc/mounts && "
-                       "busybox cat \"/c/UPCASE TEST.TXT\" && busybox umount /c")
+                       "busybox cat \"/c/UPCASE TEST.TXT\"")
         check(rc == 0 and "exfat ro" in out and "upcase" in out,
               f"an up-case table that fails its checksum: read-only, with the built-in mapping ({out.strip()[-120:]!r})")
+        rc, out = g.sh("busybox mount -o remount,rw /c; busybox grep sdd /proc/mounts; "
+                       "echo x > /c/x.txt; busybox umount /c")
+        check("exfat ro" in out and "Read-only" in out,
+              f"... and remount,rw is refused: still ro, writes EROFS ({out.strip()[-160:]!r})")
         at_f = smokelib.mark(log)
         for dev in ("/dev/sde", "/dev/sdf"):
             g.sh(f"busybox mount -t exfat -o ro {dev} /c && "
@@ -502,6 +510,16 @@ def main():
         want_ahci = ahci_session(g, man, big)
         newmark, yeni = big_session(g, man)
         want_usb = usb_session(g, man)
+        # Two exFAT volumes share xf_rename: rename(2) between them must be
+        # EXDEV (it used to run with one volume's lock, cache and geometry on
+        # the other's entries), and mv falls back to copy + unlink.
+        rc, out = g.sh("fsprobe rename \"/big/Arşiv/küçük.txt\" /usb/küçük.txt")
+        check("rename: -18" in out, f"rename(2) between two exFAT mounts is EXDEV ({out.strip()!r})")
+        rc, out = g.sh("busybox mv \"/big/Arşiv/küçük.txt\" /usb/ && busybox cat /usb/küçük.txt && "
+                       "busybox test ! -e \"/big/Arşiv/küçük.txt\"")
+        check(rc == 0 and "small file on a big volume" in out,
+              f"mv between two exFAT mounts copies the file ({out.strip()[-120:]!r})")
+        want_usb["küçük.txt"] = md5(b"small file on a big volume\n")
         rc, out = g.sh("busybox mount -t exfat /dev/sda /mnt")
         check(rc != 0, "the boot disk (ext2) is not mountable as exfat")
         rc, out = g.sh("busybox setuidgid user busybox mount -t exfat /dev/sdb1 /mnt")
@@ -541,6 +559,7 @@ def main():
           and md5(v.read_at("huge.bin", 4 * GiB - 4096, 4096)) == b["marks"][str(4 * GiB - 4096)],
           "the markers past 4 GiB and next to the written one are untouched")
     check(files.get("yeni.bin") == yeni, "the 20 MiB file written on the big volume reads back")
+    check("Arşiv/küçük.txt" not in files, "the file moved to the stick is gone from the big volume")
     v.close()
 
     crafted(man, accel)
