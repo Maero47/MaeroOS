@@ -1673,7 +1673,14 @@ static void launch_by_name(const char *arg) {
     else if (!strcmp(app, "view"))
         start_multi_file(disk_or_initrd("/disk/view", "/view"),
                          "VIEWER LAUNCHED", file);
-    else if (!strcmp(app, "term"))
+    else if (!strcmp(app, "files")) {
+        /* "launch files <dir>": a fresh Files window starts there. */
+        if (file && client_pids[2] >= 0 && app_pid_running(client_pids[2]))
+            add_log("FILES ALREADY OPEN");
+        else if (file)
+            spawn_app2(preferred_files_path(), 2, "FILES LAUNCHED", file);
+        start_files();
+    } else if (!strcmp(app, "term"))
         start_term();
     else if (!strcmp(app, "browse"))
         start_browse();
@@ -2156,11 +2163,12 @@ static void handle_wmctl_line(char *line) {
     }
     /* An app put something on the shared clipboard (/tmp/clipboard, see
      * gui_clipboard_set); the desktop only records it. */
-    arg = command_arg(line, "grabesc");
+    arg = command_arg(line, "grabesc");      /* grabesc <slot> [0|1] */
     if (arg) {
         int slot = atoi(arg);
+        const char *on = strchr(arg, ' ');
         if (slot >= 1 && slot <= MAX_CLIENT_WINDOWS)
-            client_grab_esc[slot - 1] = 1;
+            client_grab_esc[slot - 1] = on ? atoi(on) != 0 : 1;
         return;
     }
     arg = command_arg(line, "clip");

@@ -326,8 +326,8 @@ void gui_set_mouse_handler(gui_window_t *gui, gui_mouse_cb callback) {
     if (gui) gui->on_mouse = callback;
 }
 
-void gui_grab_escape(gui_window_t *gui) {
-    if (gui) wm_command(&gui->wm, "grabesc %d", gui->slot);
+void gui_grab_escape(gui_window_t *gui, int on) {
+    if (gui) wm_command(&gui->wm, "grabesc %d %d", gui->slot, on ? 1 : 0);
 }
 
 void gui_set_click_handler(gui_window_t *gui, gui_click_cb callback) {

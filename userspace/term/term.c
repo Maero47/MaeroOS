@@ -1010,7 +1010,7 @@ int main(int argc, char *argv[]) {
     gui_set_scroll_handler(&gui, on_scroll);
     gui_set_mouse_handler(&gui, on_mouse);
     gui_set_layout(&gui, on_layout);
-    gui_grab_escape(&gui);                /* vi needs Escape */
+    gui_grab_escape(&gui, 1);                /* vi needs Escape */
 
     rows = cols = 0;
     reset_tabs();

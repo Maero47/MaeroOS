@@ -73,8 +73,9 @@ static void set_status(const char *s) {
 static void update_title(void) {
     char t[64];
     const char *base = strrchr(path, '/');
-    snprintf(t, sizeof(t), "%s%s - Editor", modified ? "*" : "",
-             base ? base + 1 : path);
+    /* "Editor" first: the taskbar picks the icon by the title's prefix. */
+    snprintf(t, sizeof(t), "Editor - %s%s", base ? base + 1 : path,
+             modified ? " *" : "");
     wm_title(&gui.wm, gui.slot, t);
 }
 
@@ -749,7 +750,7 @@ int main(int argc, char *argv[]) {
     gui_set_key_handler(&gui, on_key);
     gui_set_mouse_handler(&gui, on_mouse);
     gui_set_scroll_handler(&gui, on_scroll);
-    gui_grab_escape(&gui);           /* Esc cancels prompts / selection */
+    gui_grab_escape(&gui, 1);           /* Esc cancels prompts / selection */
 
     if (argc > 2) {
         if (load_file(argv[2]) < 0) {

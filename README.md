@@ -43,7 +43,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | Dynamic linker | `DYNPROBE_OK` from a PIE loaded through musl `ld.so`; `WXPIE_OK` (the PIE's text and RELRO, libc's text and a `PROT_READ\|PROT_EXEC` library mapping are read-only) | `make smoke-dyn` |
 | External shared libraries and pthreads | `GREET_OK sum=42`, `ZLIB_OK ver=1.3`, `THREADS_OK count=200000`, `UNIX_SOCK_OK` | `make smoke-dynlib` |
 | X11 server | `XHANDSHAKE_OK`, `XDRAW_OK` (`w=320 h=200` from `GetGeometry`), `XEVENT_OK`, and `XREAL_PAINTED` from a client linked against the cross-built libX11 | `make smoke-x` |
-| Desktop and its apps | driven with QMP mouse and keyboard input on the ISO: the launcher opens the terminal, a command typed into it runs in the terminal's own shell (its pid is checked), the image viewer shows `/disk/wallpaper.ppm`, Files enters a directory by double-click, Settings applies an accent (the desktop reloads, `desktop.conf` changes), the Store shows its verified list or the "run pkg update" state, the Task Manager lists the desktop and the Store, windows close by button, Esc and Alt-Tab and the focus passes to the topmost window left; every window must also show up in a screendump | `make smoke-gui` |
+| Desktop and its apps | driven with QMP mouse and keyboard input on the ISO: the launcher opens the terminal, a command typed into it runs in the terminal's own shell (its pid is checked), the pty reports the terminal's grid size, `vi` edits and writes a file inside it, the image viewer shows `/disk/wallpaper.ppm`, Files enters a directory by double-click, then copies and pastes a file into a folder, renames it, deletes it after the confirmation, makes a folder and shows hidden files (each checked on disk), the editor copies and pastes through the desktop clipboard, finds text, saves, and asks before closing with unsaved changes, Settings applies an accent, the Turkish Q layout, a 12-hour clock and UTC+3 (the desktop reloads, `desktop.conf` changes, the taskbar clock is checked against the host's UTC time), Turkish letters typed into the editor are saved as UTF-8, the Store shows its verified list or the "run pkg update" state, the Task Manager lists the desktop and the Store, windows close by button, Esc and Alt-Tab and the focus passes to the topmost window left; every window must also show up in a screendump | `make smoke-gui` |
 | GLib, Cairo, Pango, GTK3 | `GLIB_OK` (v2.78), `CAIRO_OK rect_px=0xe69919`, `PANGO_OK`, `GTK_OK init`, `GTK_WINDOW_SHOWN`, `GTK_DRAWN` (needs probe binaries a fresh clone lacks, see Testing) | `make smoke-gtk` |
 | Firefox 115.15.0esr | `ff: Firefox painted` (the browser window, about 5 s after `firefox-bin` starts); with `--web`, a page served from the host (HTML, a CSS rule, a PNG) requested and its image on screen about 3 s after Enter (needs the Firefox tree, see `ports/firefox/`) | `make smoke-firefox`, `make smoke-firefox-web` |
 
@@ -273,8 +273,27 @@ buffer that it presents once per frame. It draws a PPM wallpaper (kept in a blur
 for the window backdrop), desktop icons that launch on double-click, and a taskbar with a
 start menu that has a search filter and a right-click context menu. Windows have title
 bars with minimize, maximize and close, plus drag, edge resize, half-screen snapping, a
-show-desktop toggle, a minimize animation and a clock. The accent colour and wallpaper
-path are read from `/etc/desktop.conf`. Two windows belong to the desktop itself: `Console`,
+show-desktop toggle, a minimize animation and a clock with the date. Alt-Tab cycles the
+windows; closing one hands the focus to the topmost window left.
+
+`/disk/etc/desktop.conf` (written by Settings) holds `wallpaper=`, `accent=#RRGGBB`,
+`keymap=us|tr`, `tz=+03:00` (offset from UTC; the RTC is UTC) and `clock=24|12`. The
+keyboard layout is applied in the desktop's input path, not in the kernel: the desktop
+turns each key into a Unicode code point with the configured table (US, or Turkish Q
+with AltGr on the right Alt, Caps Lock pairing i/İ and ı/I, and the ISO `<>` key) and
+sends it with the modifier mask in the client's `key` event; text widgets, the editor
+and the terminal store it as UTF-8. `libdraw` decodes UTF-8 and draws Latin-1 and
+Turkish letters as the ASCII glyph plus a painted diacritic (the font atlases hold ASCII
+only); other code points show `?`. The display resolution is the framebuffer mode the
+boot loader sets (`gfxpayload` in GRUB's config, `make start RES=WxH`), so Settings does
+not offer it.
+
+The clipboard is shared by all apps: `gui_clipboard_set()` writes `/tmp/clipboard`
+(through a rename) and tells the desktop (`clip N bytes`), `gui_clipboard_get()` reads
+it. The editor copies text there, the terminal its selection, and Files the absolute
+path of a file, which it pastes as a copy (or a move after Cut).
+
+Two windows belong to the desktop itself: `Console`,
 a fallback shell, and `System`, an event log. Themed icons come from `.mic` files generated
 by `tools/mkicons.py`, and text is drawn with antialiased fonts generated by
 `tools/mkfont.py`.
@@ -287,8 +306,28 @@ desktop composites it; that is what the kernel's shm syscalls are for. `libgui` 
 panels, labels, buttons, text inputs, checkboxes, scrollbars, list boxes and images on top
 of `libdraw` (rectangles, rounded frames, alpha blending, antialiased text, `.mic`
 images). `term`, `edit`, `calc`, `view`, `files`, `taskmgr`, `settings`, `store` and
-`browse` are written this way; `term` runs a real shell on a PTY and several instances can
-run side by side.
+`browse` are written this way. An app can ask for Escape (`grabesc`), which otherwise
+closes the focused window.
+
+- `term` runs a shell on a PTY in its own session and emulates a VT100/xterm subset:
+  a cell grid sized to the window (the size goes to the PTY with `TIOCSWINSZ`, and the
+  foreground job gets `SIGWINCH` on a resize), cursor addressing, scroll regions,
+  insert/delete, 16/256 colours and SGR attributes, the alternate screen, application
+  cursor keys, function keys, DEC line drawing and bracketed paste, with
+  `TERM=xterm-256color`. `vi`, `less` and `top` work full-screen. The main screen keeps
+  500 lines of scrollback (wheel, Shift+PgUp/PgDn); a mouse drag selects,
+  Ctrl+Shift+C copies and Ctrl+Shift+V pastes. Several instances run side by side.
+- `edit` edits UTF-8 text: mouse and Shift+arrow selection, Ctrl+A/C/X/V, Ctrl+F find
+  (F3 next), Ctrl+O open, Ctrl+S save, Ctrl+Shift+S save as, Ctrl+N new, a toolbar for
+  the same, and a Save/Discard/Cancel prompt when the window is closed (or another file
+  opened) with unsaved changes.
+- `files` sorts folders first, opens a file with the app for its type (images in
+  `view`, text in `edit`, else its built-in viewer), and has New folder, Rename, Delete
+  (with a confirmation, recursive for folders), Copy, Cut, Paste and a Hidden toggle;
+  keys: Enter, Backspace (up), Delete, F2, F5, Ctrl+C/X/V/N. `wmctl launch files DIR`
+  opens it in DIR.
+- `settings` sets the wallpaper, accent colour, keyboard layout, clock format and time
+  zone, keeping the `desktop.conf` lines it does not manage.
 
 `maerox` (`userspace/maerox/maerox.c`) is the X11 server. It takes a desktop
 slot like any other libgui application, listens on the AF_UNIX socket `/tmp/.X11-unix/X0`
@@ -521,8 +560,8 @@ The desktop and the apps print one line per state change to the serial console
 ```
 [desktop] launcher open settings=325,542
 [desktop] window opened: Files slot=3 x=436 y=116 w=430 h=390 close=837,126
-[files] dir proc at 55,120
-[files] cwd /proc entries=17
+[files] row proc at 55,120
+[files] cwd /proc entries=17 hidden=0
 [desktop] window closed: Files slot=3
 ```
 

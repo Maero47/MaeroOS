@@ -165,7 +165,8 @@ def key(down, qcode):
 KEYMAP = {" ": ("spc", False), "\n": ("ret", False), "-": ("minus", False),
           "_": ("minus", True), ".": ("dot", False), "/": ("slash", False),
           ">": ("dot", True), "=": ("equal", False), ",": ("comma", False),
-          "$": ("4", True), ";": ("semicolon", False)}
+          "$": ("4", True), ";": ("semicolon", False),
+          ":": ("semicolon", True), "*": ("8", True), "'": ("apostrophe", False)}
 for _c in "abcdefghijklmnopqrstuvwxyz":
     KEYMAP[_c] = (_c, False)
 for _c in "0123456789":
@@ -209,6 +210,16 @@ class Input:
         self.qmp.events([key(True, qcode)])
         time.sleep(0.02)
         self.qmp.events([key(False, qcode)])
+        time.sleep(0.02)
+
+    def combo(self, mods, qcode):
+        """Press qcode with modifier keys (qcodes, e.g. ["ctrl", "shift"])
+        held."""
+        for m in mods:
+            self.qmp.events([key(True, m)])
+        self.press(qcode)
+        for m in reversed(mods):
+            self.qmp.events([key(False, m)])
         time.sleep(0.02)
 
     def type(self, text):
@@ -413,7 +424,8 @@ class GuiSmoke:
             self.click(*win["close"])
         else:
             self.inp.press("esc")
-        self.con.wait_re(r"\[desktop\] window closed: %s slot=%d\b"
+        # Apps may retitle themselves ("Editor - name"): match the prefix.
+        self.con.wait_re(r"\[desktop\] window closed: %s[^\n]* slot=%d\b"
                          % (re.escape(win["title"]), win["slot"]))
         self.con.wait_re(r"\[desktop\] app exited: slot=%d\b" % win["slot"],
                          timeout=15)
@@ -472,7 +484,45 @@ class GuiSmoke:
         if "guismoke-term-ok" not in out:
             raise AssertionError(f"terminal command wrote {out!r}")
         self.shot("term-command")
+        # The grid the terminal traced is what the pty reports (TIOCSWINSZ).
+        at = self.con.at
+        m = self.con.wait_re(r"\[term\] grid (\d+)x(\d+)", start=self.launched_at)
+        self.con.at = at
+        cols, rows = int(m.group(1)), int(m.group(2))
+        self.type_in_terminal(win, "busybox stty size > /tmp/guismoke.size",
+                              "/tmp/guismoke.term")
+        out = self.con.run("cat /tmp/guismoke.size")
+        size = re.findall(r"^(\d+) (\d+)\r?$", out, re.M)
+        size = list(size[-1]) if size else out
+        if size != [str(rows), str(cols)]:
+            raise AssertionError(f"pty size {size} != terminal grid "
+                                 f"{rows}x{cols}")
         return win
+
+    def term_vi(self, win):
+        """A full-screen program: vi edits and writes a file, which needs
+        the cursor addressing, the Escape key (grabbed from the desktop) and
+        the line discipline to work together."""
+        self.con.run("busybox rm -f /tmp/guismoke.vi")
+        self.expect_focus(win)
+        self.inp.type("vi /tmp/guismoke.vi\n")
+        self.settle(1.5)
+        self.inp.type("ihello from vi")
+        self.settle(0.5)
+        self.shot("term-vi")
+        self.inp.press("esc")
+        self.settle(0.3)
+        self.inp.type(":wq\n")
+        deadline = time.time() + 15
+        while True:
+            out = self.con.run("cat /tmp/guismoke.vi")
+            if "hello from vi" in out:
+                break
+            if time.time() >= deadline:
+                raise AssertionError(f"vi did not write the file: {out!r}")
+            self.settle(0.5)
+        self.settle(0.5)
+        self.shot("term-after-vi")
 
     def viewer(self, term):
         """Launch the viewer from the terminal, which still has the focus."""
@@ -512,6 +562,154 @@ class GuiSmoke:
                                  f"/{name}")
         return win
 
+    def editor(self):
+        """Editor: type, select all + copy, paste (desktop clipboard), find,
+        save; then the unsaved-changes prompt on close."""
+        self.con.run("busybox rm -f /tmp/guismoke.txt")
+        start = self.con.mark()
+        self.con.run("wmctl launch edit /tmp/guismoke.txt")
+        win = self.wait_window("Editor", start=start)
+        self.con.wait_re(r"\[edit\] ready path=/tmp/guismoke\.txt", start=start)
+        self.expect_focus(win)
+        self.inp.type("hello world\n")
+        self.inp.combo(["ctrl"], "a")
+        self.inp.combo(["ctrl"], "c")
+        self.con.wait_re(r"\[edit\] copied 12 bytes")
+        self.con.wait_re(r"\[desktop\] clipboard 12 bytes")
+        self.inp.press("down")
+        self.inp.combo(["ctrl"], "v")
+        self.con.wait_re(r"\[edit\] pasted 12 bytes")
+        self.inp.combo(["ctrl"], "f")
+        self.con.wait_re(r"\[edit\] prompt find")
+        self.inp.type("world\n")
+        self.con.wait_re(r"\[edit\] found world at 1:6")
+        self.inp.combo(["ctrl"], "s")
+        self.con.wait_re(r"\[edit\] saved /tmp/guismoke\.txt bytes=24")
+        out = self.con.run("cat /tmp/guismoke.txt")
+        if out.replace("\r", "").count("hello world") != 2:
+            raise AssertionError(f"editor saved {out!r}")
+        self.settle()
+        self.shot("editor")
+        # Unsaved change + close button: the editor asks; N discards.
+        self.inp.type("x")
+        self.click(*win["close"])
+        self.con.wait_re(r"\[edit\] prompt unsaved")
+        self.settle()
+        self.shot("editor-unsaved")
+        self.inp.type("n")
+        self.con.wait_re(r"\[edit\] discarded changes")
+        self.con.wait_re(r"\[desktop\] app exited: slot=%d\b" % win["slot"],
+                         timeout=15)
+        out = self.con.run("cat /tmp/guismoke.txt")
+        text = [l for l in out.replace("\r", "").split("\n")
+                if l and not l.startswith("[SYSCALL]")]
+        if text != ["hello world", "hello world"]:
+            raise AssertionError(f"discarded edit reached the file: {out!r}")
+
+    def file_ops(self):
+        """Files: copy + paste into a folder, rename, delete (confirmed),
+        new folder, show hidden; each checked on disk."""
+        self.con.run("busybox rm -rf /tmp/fm; mkdir /tmp/fm; mkdir /tmp/fm/sub; "
+                     "echo hi > /tmp/fm/a.txt; echo s > /tmp/fm/.secret; "
+                     "busybox chown -R user /tmp/fm")
+        start = self.con.mark()
+        self.con.run("wmctl launch files /tmp/fm")
+        win = self.wait_window("Files", start=start)
+        m = self.con.wait_re(
+            r"\[files\] toolbar newdir=(\d+),(\d+) rename=(\d+),(\d+) "
+            r"delete=(\d+),(\d+) copy=(\d+),(\d+) cut=(\d+),(\d+) "
+            r"paste=(\d+),(\d+) hidden=(\d+),(\d+)", start=start)
+        v = [int(g) for g in m.groups()]
+        tb = {k: (v[2 * i], v[2 * i + 1]) for i, k in enumerate(
+            ("newdir", "rename", "delete", "copy", "cut", "paste", "hidden"))}
+        self.con.wait_re(r"\[files\] cwd /tmp/fm entries=3 hidden=0",
+                         start=start)
+
+        def row(name):
+            text = self.con.text()
+            found = re.findall(r"\[files\] row %s at (\d+),(\d+)\n"
+                               % re.escape(name), text)
+            if not found:
+                raise AssertionError(f"Files traced no row {name}")
+            return self.rel(win, int(found[-1][0]), int(found[-1][1]))
+
+        def button(name):
+            self.click(*self.rel(win, *tb[name]))
+
+        self.settle()
+        self.click(*row("a.txt"))
+        self.con.wait_re(r"\[files\] selected a\.txt")
+        button("copy")
+        self.con.wait_re(r"\[files\] copied /tmp/fm/a\.txt")
+        self.con.wait_re(r"\[desktop\] clipboard \d+ bytes")
+        self.click(*row("sub"), double=True)
+        self.con.wait_re(r"\[files\] cwd /tmp/fm/sub entries=1")
+        button("paste")
+        self.con.wait_re(r"\[files\] pasted /tmp/fm/a\.txt -> /tmp/fm/sub/a\.txt")
+        self.con.wait_re(r"\[files\] cwd /tmp/fm/sub entries=2")
+        # The pasted file is selected: rename it.
+        button("rename")
+        self.con.wait_re(r"\[files\] prompt rename a\.txt")
+        for _ in range(5):
+            self.inp.press("backspace")
+        self.inp.type("b.txt\n")
+        self.con.wait_re(r"\[files\] renamed /tmp/fm/sub/a\.txt -> "
+                         r"/tmp/fm/sub/b\.txt")
+        self.settle()
+        self.shot("files-renamed")
+        button("delete")
+        m = self.con.wait_re(r"\[files\] prompt delete b\.txt ok=(\d+),(\d+)")
+        self.settle()
+        self.shot("files-confirm-delete")
+        self.click(*self.rel(win, int(m.group(1)), int(m.group(2))))
+        self.con.wait_re(r"\[files\] deleted /tmp/fm/sub/b\.txt")
+        button("newdir")
+        self.con.wait_re(r"\[files\] prompt newdir")
+        for _ in range(10):
+            self.inp.press("backspace")
+        self.inp.type("made\n")
+        self.con.wait_re(r"\[files\] mkdir /tmp/fm/sub/made")
+        self.inp.press("backspace")              # up to /tmp/fm
+        self.con.wait_re(r"\[files\] cwd /tmp/fm entries=3 hidden=0")
+        button("hidden")
+        self.con.wait_re(r"\[files\] cwd /tmp/fm entries=4 hidden=1")
+        out = self.con.run("busybox ls -a /tmp/fm /tmp/fm/sub")
+        for want in ("a.txt", ".secret", "made"):
+            if want not in out:
+                raise AssertionError(f"{want} missing after file ops: {out!r}")
+        if "b.txt" in out:
+            raise AssertionError(f"b.txt was not deleted: {out!r}")
+        self.settle()
+        self.shot("files-ops")
+        return win
+
+    def turkish(self):
+        """Turkish Q (set in settings): the letters typed in the editor are
+        saved as UTF-8 and drawn with their diacritics."""
+        self.con.run("busybox rm -f /tmp/guismoke-tr.txt")
+        start = self.con.mark()
+        self.con.run("wmctl launch edit /tmp/guismoke-tr.txt")
+        win = self.wait_window("Editor", start=start)
+        self.con.wait_re(r"\[edit\] ready path=/tmp/guismoke-tr\.txt",
+                         start=start)
+        self.expect_focus(win)
+        # i ı ş ö ç ğ ü, then Shift+i (İ) and Shift+ı (I)
+        for q in ("apostrophe", "i", "semicolon", "comma", "dot",
+                  "bracket_left", "bracket_right"):
+            self.inp.press(q)
+        self.inp.combo(["shift"], "apostrophe")
+        self.inp.combo(["shift"], "i")
+        self.inp.combo(["ctrl"], "s")
+        self.con.wait_re(r"\[edit\] saved /tmp/guismoke-tr\.txt bytes=(\d+)")
+        want = "iışöçğüİI\n".encode("utf-8")
+        got = self.con.run("cat /tmp/guismoke-tr.txt").encode("latin1")
+        got = got.replace(b"\r", b"")
+        if want not in got:
+            raise AssertionError(f"Turkish text saved as {got!r}, want {want!r}")
+        self.settle()
+        self.shot("editor-turkish")
+        self.close(win, "button")
+
     def settings(self):
         before = self.shot("before-settings")
         target = self.open_launcher()
@@ -524,14 +722,40 @@ class GuiSmoke:
                              r"apply=(\d+),(\d+)", start=self.launched_at)
         accent = self.rel(win, int(m.group(1)), int(m.group(2)))
         apply_btn = self.rel(win, int(m.group(3)), int(m.group(4)))
+        m = self.con.wait_re(r"\[settings\] controls us=(\d+),(\d+) "
+                             r"tr=(\d+),(\d+) clock24=(\d+),(\d+) "
+                             r"clock12=(\d+),(\d+) tzprev=(\d+),(\d+) "
+                             r"tznext=(\d+),(\d+)", start=self.launched_at)
+        v = [int(g) for g in m.groups()]
         self.click(*accent)
         self.con.wait_re(r"\[settings\] accent 5 selected")
+        self.click(*self.rel(win, v[2], v[3]))
+        self.con.wait_re(r"\[settings\] keymap tr selected")
+        self.click(*self.rel(win, v[6], v[7]))
+        self.con.wait_re(r"\[settings\] clock 12 selected")
+        for _ in range(3):                   # London -> Berlin -> Athens -> Istanbul
+            self.click(*self.rel(win, v[10], v[11]))
+        self.con.wait_re(r"\[settings\] tz 180 selected")
         self.click(*apply_btn)
-        self.con.wait_re(r"\[settings\] applied wallpaper=-1 accent=5")
-        self.con.wait_re(r"\[desktop\] conf reloaded accent=#4c9a8f")
+        self.con.wait_re(r"\[settings\] applied wallpaper=-1 accent=5 "
+                         r"keymap=tr clock=12 tz=180")
+        m = self.con.wait_re(r"\[desktop\] conf reloaded accent=#4c9a8f "
+                             r"keymap=tr tz=180 clock=12 now=(\d+):(\d\d) "
+                             r"(AM|PM)")
+        # The taskbar clock: UTC+3 in 12-hour form (the guest RTC is UTC).
+        hh = (int(m.group(1)) % 12) + (12 if m.group(3) == "PM" else 0)
+        clock = hh * 60 + int(m.group(2))
+        utc = time.gmtime()
+        want = ((utc.tm_hour + 3) * 60 + utc.tm_min) % 1440
+        if min((clock - want) % 1440, (want - clock) % 1440) > 2:
+            raise AssertionError(f"taskbar clock {m.group(0)} is not UTC+3 "
+                                 f"({want // 60:02d}:{want % 60:02d})")
         conf = self.con.run("cat /disk/etc/desktop.conf")
-        if "accent=#4c9a8f" not in conf:
-            raise AssertionError(f"desktop.conf lacks the new accent: {conf!r}")
+        for want_line in ("accent=#4c9a8f", "keymap=tr", "clock=12",
+                          "tz=+03:00", "wallpaper="):
+            if want_line not in conf:
+                raise AssertionError(f"desktop.conf lacks {want_line}: "
+                                     f"{conf!r}")
         self.settle()
         self.shot("settings-applied")
         return win
@@ -580,11 +804,16 @@ class GuiSmoke:
         term = step("terminal", self.terminal)
         view = step("viewer", self.viewer, term)
         step("close viewer (button)", self.close, view, "button", term)
+        step("terminal vi", self.term_vi, term)
         step("close terminal (button)", self.close, term)
         files = step("files", self.files)
         step("close files (button)", self.close, files)
+        fops = step("file operations", self.file_ops)
+        step("close files (button) 2", self.close, fops)
+        step("editor", self.editor)
         settings = step("settings", self.settings)
         step("close settings (Esc)", self.close, settings, "esc")
+        step("turkish keyboard", self.turkish)
         store = step("store", self.store)
         tm = step("taskmgr", self.taskmgr)
         step("close task manager (button)", self.close, tm, "button", store)

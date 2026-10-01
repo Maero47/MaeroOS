@@ -3,7 +3,7 @@
 #include <draw.h>
 #include <wm.h>
 
-#define GUI_MAX_WIDGETS 40
+#define GUI_MAX_WIDGETS 64
 #define GUI_MAX_ICONDEFS 8
 #define GUI_MAX_LABEL 40
 #define GUI_INPUT_MAX 64
@@ -163,8 +163,9 @@ void gui_set_rawkey_handler(gui_window_t *gui, gui_rawkey_cb callback);
 void gui_set_scroll_handler(gui_window_t *gui, gui_scroll_cb callback);
 void gui_set_click_handler(gui_window_t *gui, gui_click_cb callback);
 void gui_set_mouse_handler(gui_window_t *gui, gui_mouse_cb callback);
-/* Deliver Escape to this window instead of letting it close the window. */
-void gui_grab_escape(gui_window_t *gui);
+/* on: deliver Escape to this window instead of letting it close the
+ * window; off: Escape closes it again (the default). */
+void gui_grab_escape(gui_window_t *gui, int on);
 int gui_body_width(const gui_window_t *gui);
 int gui_body_height(const gui_window_t *gui);
 int gui_draw(gui_window_t *gui);
