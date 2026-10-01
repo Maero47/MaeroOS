@@ -1728,6 +1728,20 @@ static int start_settings(void) {
 }
 
 /* wmctl "launch <app> [path]": apps open files in other apps (Files!). */
+static void launch_installed(const inst_app_t *a);
+
+/* Linux Apps (userspace/xapp): the Alpine X11 applications, offered when an
+ * Alpine root with its helper is on the disk (disk-alpinex.img). */
+static int linuxapps_available(void) {
+    return access("/disk/alpine/etc/alpine-release", 0) == 0 &&
+           access("/disk/xapp", 0) == 0;
+}
+
+static int start_linuxapps(void) {
+    return start_multi(disk_or_initrd("/disk/linuxapps", "/linuxapps"),
+                       "LINUX APPS LAUNCHED");
+}
+
 static void launch_by_name(const char *arg) {
     char app[24];
     int ai = 0;
@@ -1757,8 +1771,18 @@ static void launch_by_name(const char *arg) {
         start_term();
     else if (!strcmp(app, "browse"))
         start_browse();
-    else
+    else if (!strcmp(app, "linuxapps"))
+        start_linuxapps();
+    else {
+        /* An installed package's entry (/disk/apps/<name>), e.g. an Alpine
+         * X11 app added by Linux Apps. */
+        for (int i = 0; i < inst_app_count; i++)
+            if (!strcmp(inst_apps[i].name, app)) {
+                launch_installed(&inst_apps[i]);
+                return;
+            }
         add_log("LAUNCH: UNKNOWN APP");
+    }
 }
 
 static void stop_apps(void) {
@@ -2700,6 +2724,7 @@ static void launcher_menu_action(int item) {
                     "STORE LAUNCHED");
         break;
     case 12: start_install(); break;
+    case 13: start_linuxapps(); break;
     }
 }
 
@@ -3139,7 +3164,7 @@ static int sm_search_len;
 /* Left-pane program list (action = launcher_menu_action index). */
 typedef struct { const char *label; int action; } sm_item_t;
 static const sm_item_t sm_items[] = {
-    { "Store",        11 }, { "Terminal", 0 }, { "Browser",      1 },
+    { "Store",        11 }, { "Linux Apps", 13 }, { "Terminal", 0 }, { "Browser", 1 },
     { "Files",        2 }, { "Editor",   3 }, { "Calculator",   4 },
     { "Task Manager", 5 }, { "Console",  8 }, { "System Monitor", 9 },
     { "Install MaeroOS", 12 },          /* last: only when install_available() */
@@ -3173,7 +3198,8 @@ static int sm_filtered(int *out, int max) {
     int n = 0;
     for (int i = 0; i < SM_ITEMS && n < max; i++)
         if (sm_match(sm_items[i].label) &&
-            (sm_items[i].action != 12 || install_available()))
+            (sm_items[i].action != 12 || install_available()) &&
+            (sm_items[i].action != 13 || linuxapps_available()))
             out[n++] = i;
     for (int i = 0; i < inst_app_count && n < max; i++)
         if (sm_match(inst_apps[i].name))

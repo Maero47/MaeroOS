@@ -242,6 +242,7 @@ def main():
     if X:
         add_x_repo(apk_static, root, main_idx, relock)
         repos += "/repo/community\n"
+        add_xapp(stage)
     with open(os.path.join(root, "etc", "apk", "repositories"), "w") as f:
         f.write("# Offline repo on the MaeroOS disk (ports/alpine/prepare.py).\n"
                 "# Online: " + f"{MIRROR}/{BRANCH}/main\n" + repos)
@@ -340,6 +341,21 @@ def add_x_repo(apk_static, root, main_idx, relock):
         for p in sorted(pkgs):
             out.write(f"pkg {p}\n")
     log(f"X repo: {len(have)} packages")
+
+
+def add_xapp(stage):
+    """The desktop side of the X apps image: the set-uid helper /disk/xapp
+    (userspace/xapp, installs/removes/runs the curated apps in the chroot)
+    and the launcher-entry directory /disk/apps.  mke2fs -d keeps the modes;
+    under unshare -r every file is root's."""
+    helper = os.path.join(ROOT, "testfiles", "xapp")
+    if not os.path.exists(helper):
+        sys.exit("[alpine] testfiles/xapp is missing: run make userspace first")
+    dst = os.path.join(stage, "xapp")
+    shutil.copy(helper, dst)
+    os.chmod(dst, 0o4755)
+    os.makedirs(os.path.join(stage, "apps"), exist_ok=True)
+    os.chmod(os.path.join(stage, "apps"), 0o755)
 
 
 def find_tool(name):

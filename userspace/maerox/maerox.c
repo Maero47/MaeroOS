@@ -238,6 +238,8 @@ static window_t *transient_parent(window_t *w) {
     return NULL;
 }
 
+static void title_of(window_t *w, char *out, int cap);
+
 void wm_map_toplevel(client_t *c, window_t *w) {
     (void)c;
     if (w->wm_placed) {
@@ -275,6 +277,10 @@ void wm_map_toplevel(client_t *c, window_t *w) {
     raise_window(w);
     pending_focus = w->d.o.id;
     damage_all();
+    char title[64];
+    title_of(w, title, sizeof(title));
+    xlog("map toplevel 0x%x client=%d %dx%d @%d,%d title='%s'\n", (unsigned)w->d.o.id,
+         w->d.o.owner, w->d.w, w->d.h, w->x, w->y, title);
 }
 
 void wm_window_gone(window_t *w);
