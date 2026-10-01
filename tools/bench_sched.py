@@ -14,7 +14,7 @@ arithmetic loop, 200 fork+exec, tar|gzip of /lib /bin /usr, and four sh loops
 at once (each three times).  Every result line is appended to build/bench-sched/results.txt
 under a header naming the run (--tag, default the git HEAD).
 
-  python3 tools/bench_sched.py [--smp N] [--tag NAME] [--tcg] [--iters N]
+  python3 tools/bench_sched.py [--smp N] [--tag NAME] [--tcg] [--iters N] [--kernel ELF]
 """
 import argparse
 import os
@@ -49,13 +49,14 @@ def main():
     ap.add_argument("--tag", default=None)
     ap.add_argument("--tcg", action="store_true")
     ap.add_argument("--iters", type=int, default=500)
+    ap.add_argument("--kernel", default="kernel.elf", help="kernel to boot (compare builds)")
     a = ap.parse_args()
 
     kvm = not a.tcg and os.access("/dev/kvm", os.R_OK | os.W_OK)
     tag = a.tag or subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
                                   capture_output=True, text=True).stdout.strip()
     os.makedirs(OUT, exist_ok=True)
-    cmd = ["qemu-system-i386", *smokelib.QEMU_DISPLAY, "-kernel", "kernel.elf",
+    cmd = ["qemu-system-i386", *smokelib.QEMU_DISPLAY, "-kernel", a.kernel,
            "-initrd", "initrd.tar", "-serial", "stdio", "-m", "512M",
            "-no-reboot", "-no-shutdown", "-smp", str(a.smp)]
     if kvm:

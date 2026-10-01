@@ -19,6 +19,15 @@
 #define USER_CODE_BASE  0x08048000U
 
 struct proc ptable[MAX_PROCS];
+/* One past the highest slot ever handed out: the scheduler's scans stop here
+ * instead of touching all MAX_PROCS slots (each its own cache line, most of
+ * them never used) on every context switch and tick.  Only grows. */
+int ptable_hwm;
+
+static void ptable_note_slot(struct proc *p) {
+    int i = (int)(p - ptable) + 1;
+    if (i > ptable_hwm) ptable_hwm = i;
+}
 /* current_proc is now a per-CPU macro (see process.h) — no global definition. */
 
 static int next_pid = 1;
@@ -88,6 +97,7 @@ struct proc *allocproc(void) {
     }
     if (!p) { printk("[proc] table FULL (%d/%d) — clone/fork fails\n",
                      live, MAX_PROCS); return NULL; }
+    ptable_note_slot(p);
 
     /* Start from a blank slot.  Everything in a reaped one belongs to its
      * previous occupant (proc_release has already freed its kernel stack and
@@ -260,6 +270,7 @@ struct proc *proc_create_kthread(void (*fn)(void), const char *name) {
         if (ptable[i].state == PROC_UNUSED) { p = &ptable[i]; break; }
     }
     if (!p) return NULL;
+    ptable_note_slot(p);
 
     p->state       = PROC_EMBRYO;
     p->pid         = next_pid++;

@@ -45,9 +45,12 @@ extern void swtch(struct context **old, struct context *new_ctx);
  * (input, audio, compositor, a pipe reader) is always behind a CPU hog.
  *
  *  - Placement.  A thread that blocked is put back at no less than the queue
- *    minimum minus SCHED_SLEEP_CREDIT when it wakes: a sleeper is ahead of the
- *    threads that kept running, but cannot bank an hour of sleep and then
- *    monopolise the CPU.  A new thread starts at the minimum.
+ *    minimum minus the time it slept, capped at SCHED_SLEEP_CREDIT, when it
+ *    wakes: a sleeper is ahead of the threads that kept running, but cannot
+ *    bank an hour of sleep and then monopolise the CPU — and a thread that
+ *    blocks for microseconds at a time (a server answering a client that
+ *    floods it) earns microseconds, so it batches instead of preempting the
+ *    client on every request.  A new thread starts at the minimum.
  *  - Wakeup preemption.  A wake (from a syscall, an IRQ, the tick or another
  *    CPU) compares the woken thread with what the CPUs are running.  If a CPU
  *    is idle it is kicked; otherwise, when the woken thread is ahead of the
@@ -62,7 +65,7 @@ extern void swtch(struct context **old, struct context *new_ctx);
  */
 #define SCHED_SLICE_NS      4000000ULL   /* 4 ms; the 100 Hz tick rounds up   */
 #define SCHED_SLEEP_CREDIT  3000000ULL   /* sleeper bonus (CFS: latency / 2)  */
-#define SCHED_WAKEUP_GRAN   1000000ULL   /* lead needed to preempt on wakeup  */
+#define SCHED_WAKEUP_GRAN    500000ULL   /* lead needed to preempt on wakeup  */
 #define RESCHED_IPI_VECTOR  0xFCU
 
 /* Linux sched_prio_to_weight: nice 0 = 1024, each step ~1.25x. */
@@ -98,8 +101,10 @@ static void sched_place(struct proc *p) {
         p->vr_placed = 1;
         p->vr_slept  = 0;
     } else if (p->vr_slept) {
-        uint64_t floor = sched_min_vr > SCHED_SLEEP_CREDIT
-                       ? sched_min_vr - SCHED_SLEEP_CREDIT : 0;
+        uint64_t now = clock_mono_ns();
+        uint64_t credit = now > p->vr_sleep_t0 ? now - p->vr_sleep_t0 : 0;
+        if (credit > SCHED_SLEEP_CREDIT) credit = SCHED_SLEEP_CREDIT;
+        uint64_t floor = sched_min_vr > credit ? sched_min_vr - credit : 0;
         if (p->vruntime < floor) p->vruntime = floor;
         p->vr_slept = 0;
     }
@@ -122,7 +127,7 @@ static void resched_cpu(uint32_t c) {
 
 /* p was just made RUNNABLE (caller holds the BKL).  Place it and preempt
  * whatever CPU it should displace, if any. */
-static void sched_wakeup(struct proc *p) {
+static void sched_wakeup(struct proc *p, int sync) {
     sched_place(p);
     uint32_t ncpu = smp_cpu_count();
     if (ncpu > MAX_CPUS) ncpu = MAX_CPUS;
@@ -133,14 +138,12 @@ static void sched_wakeup(struct proc *p) {
     for (uint32_t c = 0; c < ncpu; c++)
         if (cpus[c].online || c == 0)
             if (cpus[c].idle && !cpus[c].need_resched) { resched_cpu(c); return; }
-    /* A syscall waking another thread (a pipe write, a condvar signal, an X
-     * request): the waker steps behind it at the syscall's exit, so the woken
-     * thread runs before the waker can act again — what the old round-robin
-     * yield guaranteed.  glibc-2.36's Riegel condvar relies on the signalled
-     * waiter running before the signaller comes back to steal the signal, and
-     * a client writing to two channels (X socket, then key FIFO) relies on the
-     * server handling the first before the second. */
-    if (!cpus[self].in_irq && current_proc && current_proc != p &&
+    /* A sync wake from a syscall (futex wake, wake_up_n: a condvar signal,
+     * a mutex hand-off, pthread_join): the waker steps behind the woken
+     * thread at the syscall's exit, so it runs before the waker can act
+     * again.  glibc-2.36's Riegel condvar relies on the signalled waiter
+     * running before the signaller comes back to steal the signal. */
+    if (sync && !cpus[self].in_irq && current_proc && current_proc != p &&
         p->vruntime + 1 > cpus[self].wake_vr)
         cpus[self].wake_vr = p->vruntime + 1;
     /* Otherwise the CPU running the thread furthest ahead of p. */
@@ -162,14 +165,21 @@ static void sched_wakeup(struct proc *p) {
 /* Make a sleeping/stopped thread runnable: the one wake primitive. */
 void sched_make_runnable(struct proc *p) {
     p->state = PROC_RUNNABLE;
-    sched_wakeup(p);
+    sched_wakeup(p, 0);
+}
+
+/* The same for a targeted hand-off from a syscall (futex wake, wake_up_n):
+ * the waker also yields to it at the syscall's exit. */
+void sched_make_runnable_sync(struct proc *p) {
+    p->state = PROC_RUNNABLE;
+    sched_wakeup(p, 1);
 }
 
 /* The RUNNABLE thread to run next: least vruntime, passing over a yielder
  * once (its skip flag is consumed).  NULL if nothing is runnable. */
 static struct proc *sched_pick(void) {
     struct proc *best = NULL, *skipped = NULL;
-    for (int i = 0; i < MAX_PROCS; i++) {
+    for (int i = 0; i < ptable_hwm; i++) {
         struct proc *p = &ptable[i];
         if (p->state != PROC_RUNNABLE) continue;
         sched_place(p);
@@ -219,6 +229,7 @@ void scheduler_start(void) {
         kwatch_poll();          /* emit a stall the timer tick spotted */
         uint64_t scan_t0 = kprof_probe_begin();
         me->need_resched = 0;
+        me->wake_vr = 0;        /* a kthread's sync wake owes no one a yield */
         struct proc *p = sched_pick();
 
         if (p) {
@@ -320,7 +331,7 @@ void scheduler_tick(int user_mode) {
     kwatch_tick();
     struct proc *cur = current_proc;
     uint64_t min_runnable = ~0ULL;
-    for (int i = 0; i < MAX_PROCS; i++) {
+    for (int i = 0; i < ptable_hwm; i++) {
         struct proc *p = &ptable[i];
         if (p->state == PROC_SLEEPING && p->wake_tick &&
             (int32_t)(now - p->wake_tick) >= 0) {
@@ -338,6 +349,22 @@ void scheduler_tick(int user_mode) {
 
     /* Expire alarm/setitimer/POSIX timers: queues their signals only. */
     ktimer_tick(user_mode);
+
+    /* Advance the queue floor with the threads on the CPUs, as Linux's
+     * update_curr does: picks alone leave it stale while one thread runs
+     * unopposed, and a thread waking (or forked) after that would be placed
+     * so far behind that it could hold the CPU for as long as the other ran. */
+    {
+        uint64_t t = clock_mono_ns(), m = min_runnable;
+        int any = min_runnable != ~0ULL;
+        for (uint32_t c = 0; c < MAX_CPUS; c++)
+            if (cpus[c].proc) {
+                uint64_t cv = cpu_curr_vr(c, t);
+                if (cv < m) m = cv;
+                any = 1;
+            }
+        if (any && m != ~0ULL && m > sched_min_vr) sched_min_vr = m;
+    }
 
     if (!cur) return;
     cur->utime_ticks++;
@@ -423,6 +450,7 @@ int sleep_on(void *chan) {
     current_proc->sleep_seq  = ++g_sleep_seq;
     current_proc->sleep_timed_out = 0;
     current_proc->vr_slept  = 1;
+    current_proc->vr_sleep_t0 = clock_mono_ns();
     current_proc->state     = PROC_SLEEPING;
     int slp_sys = current_proc->last_syscall;
     uint64_t slp_t0 = kprof_sleep_begin();
@@ -443,6 +471,7 @@ int sleep_on(void *chan) {
 void proc_stop_self(void) {
     if (!current_proc) return;
     current_proc->vr_slept = 1;
+    current_proc->vr_sleep_t0 = clock_mono_ns();
     current_proc->state = PROC_STOPPED;
     kprof_park();
     __asm__ volatile("cli");
@@ -451,7 +480,7 @@ void proc_stop_self(void) {
 }
 
 void wake_up(void *chan) {
-    for (int i = 0; i < MAX_PROCS; i++) {
+    for (int i = 0; i < ptable_hwm; i++) {
         struct proc *p = &ptable[i];
         if (p->state == PROC_SLEEPING && p->sleep_chan == chan) {
             p->sleep_chan = (void *)0;
@@ -473,24 +502,24 @@ int wake_up_n(void *chan, int n) {
 
     /* count matching waiters; if n covers them all, order doesn't matter */
     int matches = 0;
-    for (int i = 0; i < MAX_PROCS; i++)
+    for (int i = 0; i < ptable_hwm; i++)
         if (ptable[i].state == PROC_SLEEPING && ptable[i].sleep_chan == chan)
             matches++;
 
     if (n >= matches) {                 /* wake all matching (single pass) */
-        for (int i = 0; i < MAX_PROCS; i++) {
+        for (int i = 0; i < ptable_hwm; i++) {
             struct proc *p = &ptable[i];
             if (p->state == PROC_SLEEPING && p->sleep_chan == chan) {
                 p->sleep_chan = (void *)0;
                 p->wake_tick  = 0;
-                sched_make_runnable(p);
+                sched_make_runnable_sync(p);
                 woken++;
             }
         }
     } else {                            /* wake the n OLDEST (min sleep_seq) */
         while (woken < n) {
             struct proc *best = (void *)0;
-            for (int i = 0; i < MAX_PROCS; i++) {
+            for (int i = 0; i < ptable_hwm; i++) {
                 struct proc *p = &ptable[i];
                 if (p->state == PROC_SLEEPING && p->sleep_chan == chan &&
                     (!best || p->sleep_seq < best->sleep_seq))
@@ -499,7 +528,7 @@ int wake_up_n(void *chan, int n) {
             if (!best) break;
             best->sleep_chan = (void *)0;
             best->wake_tick  = 0;
-            sched_make_runnable(best);
+            sched_make_runnable_sync(best);
             woken++;
         }
     }
@@ -516,7 +545,7 @@ int wake_up_n_tgid(void *chan, int n, int tgid) {
     if (n <= 0) return 0;
     while (woken < n) {
         struct proc *best = (void *)0;
-        for (int i = 0; i < MAX_PROCS; i++) {
+        for (int i = 0; i < ptable_hwm; i++) {
             struct proc *p = &ptable[i];
             if (p->state == PROC_SLEEPING && p->sleep_chan == chan &&
                 p->tgid == tgid && (!best || p->sleep_seq < best->sleep_seq))
@@ -525,7 +554,7 @@ int wake_up_n_tgid(void *chan, int n, int tgid) {
         if (!best) break;
         best->sleep_chan = (void *)0;
         best->wake_tick  = 0;
-        sched_make_runnable(best);
+        sched_make_runnable_sync(best);
         woken++;
     }
     return woken;
@@ -538,9 +567,9 @@ int wake_up_n_tgid(void *chan, int n, int tgid) {
  * non-reentrant kernel state is in flight).  need_resched is set when a wake
  * made a thread runnable that should displace this one (sched_wakeup: the
  * wakee is SCHED_WAKEUP_GRAN ahead in vruntime — the usual case for a thread
- * that was blocked), or when the tick ended the slice; and a syscall that
- * woke threads no idle CPU took queues the waker behind them and yields (sync
- * wake, see sched_wakeup).  Guarded by no_preempt so lwIP and other non-reentrant sections
+ * that was blocked), or when the tick ended the slice; and a futex or
+ * wake_up_n wake of threads no idle CPU took queues the waker behind them and
+ * yields (sync wake, see sched_wakeup).  Guarded by no_preempt so lwIP and other non-reentrant sections
  * are never interrupted. */
 void resched_on_return(void) {
     struct cpu *me = &cpus[this_cpu_id()];
@@ -550,7 +579,9 @@ void resched_on_return(void) {
     if (wvr) {
         /* Sync wake: queue behind the woken threads, then let them run. */
         uint64_t cv = cpu_curr_vr(this_cpu_id(), clock_mono_ns());
-        if (wvr > cv) current_proc->vruntime += wvr - cv;
+        uint64_t d = wvr > cv ? wvr - cv : 0;
+        if (d > SCHED_SLICE_NS) d = SCHED_SLICE_NS;   /* the skip does the rest */
+        current_proc->vruntime += d;
         me->need_resched = 0;
         kprof_count(KPE_RESCHED);
         yield();
@@ -734,9 +765,9 @@ void proc_exit(int status) {
          * be blocked in a per-child waitpid() while a burst of them (a watchdog
          * SIGKILL of a process tree) accumulates and exhausts the table. */
         struct proc *init = (void *)0;
-        for (int i = 0; i < MAX_PROCS; i++)
+        for (int i = 0; i < ptable_hwm; i++)
             if (ptable[i].pid == 1 && ptable[i].state != PROC_UNUSED) { init = &ptable[i]; break; }
-        for (int i = 0; i < MAX_PROCS; i++)
+        for (int i = 0; i < ptable_hwm; i++)
             if (ptable[i].state != PROC_UNUSED && ptable[i].parent == leader)
                 ptable[i].parent = init;
         { extern void reap_orphan_zombies(void); reap_orphan_zombies(); }

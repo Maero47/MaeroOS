@@ -20,6 +20,9 @@ void yield(void);
  * preempts the CPU it should displace (wakeup preemption).  BKL held. */
 struct proc;
 void sched_make_runnable(struct proc *p);
+/* ... and, called from a syscall, have the caller yield to it at the syscall's
+ * exit (futex wake, wake_up_n: a targeted hand-off). */
+void sched_make_runnable_sync(struct proc *p);
 
 /* Return-to-user point of an IRQ or exception: switch away if this CPU's
  * need_resched is set and the trap came from ring 3 (from_user). */

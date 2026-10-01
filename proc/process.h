@@ -260,6 +260,7 @@ struct proc {
      * blocked and gets sleeper placement when it is next made runnable;
      * vr_skip: it called yield() and is passed over by the next pick. */
     uint64_t         vruntime;
+    uint64_t         vr_sleep_t0;   /* clock_mono_ns() when it last blocked */
     uint8_t          vr_placed;
     uint8_t          vr_slept;
     uint8_t          vr_skip;
@@ -378,6 +379,7 @@ static inline uint32_t proc_prot_adjust(const struct proc *p, uint32_t prot) {
 
 /* Process table and current process */
 extern struct proc ptable[];
+extern int ptable_hwm;   /* one past the highest slot ever used */
 
 /* SMP: `current_proc` is PER-CPU — the process running on the calling CPU.  It
  * expands to that CPU's slot in cpus[] (indexed by logical CPU id), so reads and

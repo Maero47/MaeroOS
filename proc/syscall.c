@@ -7598,23 +7598,23 @@ static int futex_wake_n(uint32_t uaddr, int is_private, uint32_t phys,
             : ((p)->futex_shared && phys && (p)->futex_phys == phys)))
 
     int matches = 0;
-    for (int i = 0; i < MAX_PROCS; i++)
+    for (int i = 0; i < ptable_hwm; i++)
         if (FUTEX_MATCH(&ptable[i])) matches++;
 
     int woken = 0;
     if (n >= matches) {                 /* wake all matching (single pass) */
-        for (int i = 0; i < MAX_PROCS; i++) {
+        for (int i = 0; i < ptable_hwm; i++) {
             struct proc *p = &ptable[i];
             if (FUTEX_MATCH(p)) {
                 p->sleep_chan = (void *)0; p->wake_tick = 0;
                 p->futex_wait = 2;         /* woken by a FUTEX_WAKE */
-                sched_make_runnable(p); woken++;
+                sched_make_runnable_sync(p); woken++;
             }
         }
     } else {                            /* wake the n OLDEST (min sleep_seq) */
         while (woken < n) {
             struct proc *best = (void *)0;
-            for (int i = 0; i < MAX_PROCS; i++) {
+            for (int i = 0; i < ptable_hwm; i++) {
                 struct proc *p = &ptable[i];
                 if (FUTEX_MATCH(p) && (!best || p->sleep_seq < best->sleep_seq))
                     best = p;
@@ -7622,7 +7622,7 @@ static int futex_wake_n(uint32_t uaddr, int is_private, uint32_t phys,
             if (!best) break;
             best->sleep_chan = (void *)0; best->wake_tick = 0;
             best->futex_wait = 2;          /* woken by a FUTEX_WAKE */
-            sched_make_runnable(best); woken++;
+            sched_make_runnable_sync(best); woken++;
         }
     }
     #undef FUTEX_MATCH
