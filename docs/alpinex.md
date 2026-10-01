@@ -34,7 +34,13 @@ just joins it.  The app's output goes to `/disk/alpine/tmp/xapp-<name>.log`.
 Privilege: `chroot` and `apk` need root, so `xapp` is set-uid (the initrd
 cannot carry set-uid files, so it lives on the image).  It accepts only the
 names in `xapps.h` — no package names, paths or commands from the caller — and
-apps always run as the caller.
+apps always run as the caller.  As root it touches only root-owned places
+(the root's passwd/group via an O_EXCL temporary and rename, a freshly made
+home under /home, /disk/apps with O_NOFOLLOW, the desktop FIFO); the log in
+the chroot's 1777 /tmp, the runtime dir and ~/.config etc. are made after the
+privilege drop.  `xappattack` (run by smoke-alpinex) plants a local user's
+symlinks to root-owned canaries in those places and checks xapp leaves them
+alone; the xapp before this fix failed all three.
 
 The chroot's `/tmp` is its own, so the filesystem socket
 `/tmp/.X11-unix/X0` is invisible inside it.  maeroX also listens on the
