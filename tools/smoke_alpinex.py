@@ -53,6 +53,14 @@ class AlpineX:
         self.g = smoke_gui.GuiSmoke(con, qmp)
         self.maerox = None        # the maeroX desktop window
         self.notes = []
+        self.failures = []
+
+    def fail(self, what):
+        """A failed check that does not stop the run: the remaining apps are
+        still exercised so one run reports all of them; main() fails at the
+        end."""
+        print(f"\n[SMOKE-ALPINEX] CHECK FAILED: {what}")
+        self.failures.append(what)
 
     def sh(self, cmd, timeout=30.0):
         return self.con.run(cmd, timeout)
@@ -108,7 +116,7 @@ class AlpineX:
         colors = distinct_colors(img, vis)
         print(f"\n[SMOKE-ALPINEX] {name}: toplevel {w}x{h} at {x},{y}, "
               f"{colors} colours on screen")
-        if colors < 3:
+        if colors < 2:          # xterm with a bitmap core font: black on white
             raise AssertionError(f"{name}: its window shows {colors} colour(s)")
         return {"rect": rect, "x": x, "y": y, "w": w, "h": h, "img": img,
                 "id": m.group(1)}
@@ -158,7 +166,7 @@ class AlpineX:
         self.inp.type("echo typed-in-xterm > /tmp/xt.txt\n")
         self.g.settle(2.0)
         if "typed-in-xterm" not in self.sh("cat /disk/alpine/tmp/xt.txt"):
-            raise AssertionError("text typed into xterm did not reach its shell")
+            self.fail("xterm: text typed into it did not reach its shell")
         self.g.shot("xterm-typed")
 
         xe = step("xeyes", self.launch, "xeyes", "")
@@ -186,7 +194,7 @@ class AlpineX:
         self.g.shot("mousepad-saved")
         saved = self.sh("cat /disk/alpine/home/*/maerox-note.txt")
         if "hello from maeroX" not in saved:
-            raise AssertionError("mousepad did not save the typed text:\n" + saved)
+            self.fail("mousepad: the typed text was not saved")
 
         step("close mousepad", self.close, "mousepad", mp, "mousepad")
         step("close xeyes", self.close, "xeyes", xe, "xeyes")
@@ -221,6 +229,8 @@ def main():
         qmp = Qmp(qmp_path)
         ax = AlpineX(con, qmp)
         steps = ax.run()
+        if ax.failures:
+            raise AssertionError("; ".join(ax.failures))
         print("\n[SMOKE-ALPINEX] " + "; ".join(ax.notes))
         print("[SMOKE-ALPINEX] timings: " + ", ".join(f"{n} {s:.1f}s" for n, s in steps))
         print(f"[SMOKE-ALPINEX] passed in {time.time() - t0:.1f}s (accel={accel})")
