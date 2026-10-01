@@ -11,9 +11,13 @@
              `maeros-install -y /dev/sdc` is refused (the block layer's
              32-bit sector count saturates, so its end is unknown),
              `maeros-install -n /dev/sdb` prints the layout and writes
-             nothing, `maeros-install -l` lists the disks and marks sda in use,
+             nothing, `-n` on a 1 GiB + 1 sector sdd puts the backup GPT in
+             its exact last sector (BLKGETSIZE64, not /proc/partitions' KiB), `maeros-install -l` lists the disks and marks sda in use,
              `maeros-install -y /dev/sda` is refused, `maeros-install -y
              /dev/sdb` installs; then poweroff.
+   ide       qemu -M pc, -kernel, a sparse 130 GiB IDE hdb: the kernel logs
+             that LBA28 reaches only 128 GiB of it, and maeros-install
+             refuses it (BLKGETSIZE64 > the addressable size).
    host      the target's GPT verifies (sgdisk -v), its root partition is
              clean under `e2fsck -fn`, its ESP under `fsck.fat -n` (each when
              the tool is installed).
@@ -45,6 +49,7 @@ OUT = os.path.join(ROOT, "build", "smoke-install")
 ISO = os.path.join(ROOT, "maeros-limine.iso")
 TARGET = os.path.join(OUT, "target.img")
 TARGET_SIZE = 1024 * 1024 * 1024
+ODD_SECTORS = 2 * 1024 * 1024 + 1          # /proc/partitions counts 1 KiB
 
 
 def start_qemu(name, cmd):
@@ -130,6 +135,9 @@ def live_install(accel):
     huge = os.path.join(OUT, "huge.img")         # sparse: nothing is written
     with open(huge, "wb") as f:
         f.truncate(3 << 40)
+    odd = os.path.join(OUT, "odd.img")           # 1 GiB + one sector
+    with open(odd, "wb") as f:
+        f.truncate(ODD_SECTORS * 512)
     cmd = ["qemu-system-i386", "-M", "q35", "-accel", accel, "-m", "1024M",
            "-drive", f"file={live},format=raw,if=none,id=live",
            "-device", "ide-hd,drive=live,bus=ide.0",
@@ -137,6 +145,8 @@ def live_install(accel):
            "-device", "ide-hd,drive=target,bus=ide.1",
            "-drive", f"file={huge},format=raw,if=none,id=huge",
            "-device", "ide-hd,drive=huge,bus=ide.3",
+           "-drive", f"file={odd},format=raw,if=none,id=odd",
+           "-device", "ide-hd,drive=odd,bus=ide.4",
            "-drive", f"file={ISO},format=raw,if=none,id=cd,media=cdrom,readonly=on",
            "-device", "ide-cd,drive=cd,bus=ide.2", "-boot", "d"]
     out, sockdir, con, qmp = start_qemu("live", cmd)
@@ -156,6 +166,10 @@ def live_install(accel):
         dry = con.run("maeros-install -n /dev/sdb; echo rc=$?", timeout=60)
         if "Dry run: nothing written." not in dry or "rc=0" not in dry:
             raise AssertionError(f"maeros-install -n failed:\n{dry}")
+        dry = con.run("maeros-install -n /dev/sdd; echo rc=$?", timeout=60)
+        if f"backup GPT at LBA {ODD_SECTORS - 1}\n" not in dry.replace("\r", ""):
+            raise AssertionError(f"odd-sized disk: backup GPT not at its last LBA "
+                                 f"{ODD_SECTORS - 1}:\n{dry}")
         with open(TARGET, "rb") as f:
             if f.read(1 << 20).strip(b"\0"):
                 raise AssertionError("maeros-install -n wrote to the target")
@@ -173,6 +187,37 @@ def live_install(accel):
         raise
     finally:
         finish(out, sockdir, con, qmp)
+
+
+def ide_lba28(accel):
+    """pc + IDE: a 130 GiB disk is reached by LBA28 only up to 128 GiB; the
+    kernel says so, BLKGETSIZE64 reports the real size and maeros-install
+    refuses the disk (its backup GPT would not be at the end)."""
+    big = os.path.join(OUT, "ide130g.img")       # sparse
+    with open(big, "wb") as f:
+        f.truncate(130 << 30)
+    cmd = ["qemu-system-i386", "-M", "pc", "-accel", accel, "-m", "512M",
+           "-kernel", "kernel.elf", "-initrd", "initrd.tar",
+           "-drive", "file=disk.img,format=raw,index=0,media=disk,snapshot=on",
+           "-drive", f"file={big},format=raw,index=1,media=disk,snapshot=on"]
+    out, sockdir, con, qmp = start_qemu("ide", cmd)
+    try:
+        smokelib.login(con.proc, con.sel, con.log, timeout=120, start=0)
+        if not re.search(r"\[ATA\]  hdb: 133120 MiB, but LBA28 reaches only the first 131071 MiB",
+                         con.text()):
+            raise AssertionError("the kernel did not report hdb's LBA28 limit")
+        got = con.run("maeros-install -y /dev/hdb; echo rc=$?", timeout=30)
+        if "can address only its first" not in got or "rc=1" not in got:
+            raise AssertionError(f"a 130 GiB IDE disk was not refused:\n{got}")
+        poweroff(con)
+        return "130 GiB IDE disk: LBA28 limit reported, install refused"
+    except Exception:
+        print(f"\n[SMOKE-INSTALL] ide: last serial output:\n{con.text()[-3000:]}",
+              file=sys.stderr)
+        raise
+    finally:
+        finish(out, sockdir, con, qmp)
+        os.remove(big)
 
 
 def host_checks(uuid):
@@ -295,6 +340,8 @@ def main():
     uuid, took = live_install(accel)
     results.append(("live", f"PASS: installed in {took:.0f}s, root=PARTUUID={uuid}"))
     results.append(("host", "PASS: " + ", ".join(host_checks(uuid))))
+    print(f"\n[SMOKE-INSTALL] ide: a disk past LBA28 (accel={accel})")
+    results.append(("ide", "PASS: " + ide_lba28(accel)))
 
     token = "persist-%08x" % int.from_bytes(os.urandom(4), "little")
     print(f"\n[SMOKE-INSTALL] bios: booting the installed disk alone (accel={accel})")

@@ -41,8 +41,11 @@
 #include <sys/stat.h>
 #ifdef __linux__
 #include <sys/random.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
 #else
 #include <syscall.h>
+#define BLKGETSIZE64 0x80041272u           /* <linux/fs.h>, i386: u64 bytes */
 #endif
 
 #define MiB (1024u * 1024u / 512u)          /* sectors */
@@ -402,6 +405,20 @@ int main(int argc, char **argv) {
                 g_disk_sect = disks[i].sectors;
             }
         if (!g_disk_sect) die("%s is not a whole disk (see maeros-install -l)", target);
+        /* /proc/partitions counts 1 KiB blocks, which loses an odd last
+         * sector, and shows only what the kernel can address.  BLKGETSIZE64
+         * is the drive's exact size: the backup GPT goes in its last sector,
+         * so the two must agree. */
+        uint64_t bytes = 0;
+        if (ioctl(g_fd, BLKGETSIZE64, &bytes) < 0 || bytes < 512)
+            die("cannot get the size of %s (BLKGETSIZE64)", target);
+        uint64_t exact = bytes / 512;
+        if (exact / 2 != g_disk_sect / 2)
+            die("%s has %llu MiB, but MaeroOS can address only its first %llu MiB "
+                "(an IDE disk past 128 GiB: LBA28); the backup GPT would not be at "
+                "its end", target, (unsigned long long)(exact / MiB),
+                (unsigned long long)(g_disk_sect / MiB));
+        g_disk_sect = exact;
         /* The block layer counts sectors in 32 bits and saturates: a disk
          * that shows 2 TiB may be larger, so its last sector (the backup GPT)
          * is unknown. */

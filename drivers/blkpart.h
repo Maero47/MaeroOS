@@ -14,6 +14,10 @@
  */
 #define BLKPART_MAX 32
 
+/* Linux <linux/fs.h> ioctls on the /dev nodes (i386 encodings). */
+#define BLKGETSIZE    0x1260u          /* unsigned long *: sectors */
+#define BLKGETSIZE64  0x80041272u      /* uint64_t *: bytes */
+
 typedef struct blkpart {
     char       name[16];    /* "hdb1", "nvme0n1p2" */
     int        dev;         /* disk index in drivers/blkdev.c's table */

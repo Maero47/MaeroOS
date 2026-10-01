@@ -43,6 +43,9 @@ int blk_write(uint32_t lba, uint8_t count, const void *buf);
 int         blk_disk_count(void);
 const char *blk_disk_devname(int disk);     /* "hda", "sdb", "nvme0n1" */
 uint32_t    blk_disk_sectors(int disk);     /* saturated to 32 bits */
+/* The real size: for IDE the LBA48 count, which can exceed what
+ * blk_disk_sectors() addresses; otherwise blk_disk_sectors(). */
+uint64_t    blk_disk_capacity(int disk);
 int         blk_disk_is_boot(int disk);
 /* Linux dev_t of the whole disk and of its partition `partno` (1..15; 0 is
  * the disk), as major << 8 | minor: IDE 3/22 (slave minors from 64), SCSI

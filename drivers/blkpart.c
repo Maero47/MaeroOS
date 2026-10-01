@@ -88,6 +88,25 @@ static uint32_t blkpart_node_write(vfs_node_t *node, uint32_t off, uint32_t len,
                                 len, 1);
 }
 
+/* BLKGETSIZE (sectors, unsigned long) and BLKGETSIZE64 (bytes, u64), as on
+ * Linux: the exact size.  For a whole disk that is the drive's real size,
+ * which for an IDE disk past 128 GiB is more than the LBA28 part this kernel
+ * reads and writes (/proc/partitions shows that part). */
+static int blkpart_node_ioctl(vfs_node_t *node, uint32_t req, void *arg) {
+    blkpart_t *bp = (blkpart_t *)node->private;
+    uint64_t sect = bp->partno ? bp->nsect : blk_disk_capacity(bp->dev);
+    if (req == BLKGETSIZE) {
+        *(uint32_t *)arg = sect > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)sect;
+        return 0;
+    }
+    if (req == BLKGETSIZE64) {
+        uint64_t bytes = sect * 512u;
+        memcpy(arg, &bytes, sizeof(bytes));
+        return 0;
+    }
+    return -25;                                            /* -ENOTTY */
+}
+
 static blkpart_t *blkpart_add(int dev, int partno, uint32_t start, uint32_t nsect,
                               const uint8_t *guid) {
     if (g_nparts >= BLKPART_MAX || !nsect) return NULL;
@@ -122,6 +141,7 @@ static blkpart_t *blkpart_add(int dev, int partno, uint32_t start, uint32_t nsec
     bp->node.rdev    = bp->rdev;
     bp->node.read_fn = blkpart_node_read;
     bp->node.write_fn = blkpart_node_write;
+    bp->node.ioctl_fn = blkpart_node_ioctl;
     bp->node.private = bp;
     g_parts[g_nparts++] = bp;
     return bp;

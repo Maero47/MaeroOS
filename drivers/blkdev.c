@@ -126,6 +126,12 @@ uint32_t blk_disk_rdev(int disk, int partno) {
     return ((d->kind == BLK_AHCI ? 8u : 259u) << 8) | minor;
 }
 
+uint64_t blk_disk_capacity(int disk) {
+    if (disk < 0 || disk >= ndisks) return 0;
+    if (disks[disk].kind == BLK_ATA) return ata_dev_capacity(disks[disk].unit);
+    return blk_disk_sectors(disk);
+}
+
 int blk_disk_read(int disk, uint32_t lba, uint32_t count, void *buf) {
     if (disk < 0 || disk >= ndisks || !count || count > 256) return -1;
     const blk_disk_t *d = &disks[disk];

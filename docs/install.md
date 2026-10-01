@@ -62,6 +62,7 @@ Where the files come from:
 | `userspace/install/fat.c` | FAT32 formatter: BPB, FSInfo, backup boot sector, two FATs, one contiguous cluster run per file, VFAT long names |
 | `userspace/install/ext2.c` | a populated ext2 in one pass, as `mke2fs -d` builds one: revision 1, 1 KiB blocks, 128-byte inodes, `sparse_super`, `filetype`, `large_file`, direct/indirect block maps up to triple, lost+found with 12 blocks |
 | `drivers/blkpart.c` | `/dev/<disk>` nodes are writable (root only, mode 0660), with partial sectors read-modify-written; writes to the disk mounted at `/disk` are `EBUSY`; GPT unique GUIDs are kept for `root=PARTUUID=` |
+| `drivers/ata.c`, `drivers/blkdev.c` | the drive's real size (LBA48 IDENTIFY words) next to the LBA28 part used for I/O; `BLKGETSIZE`/`BLKGETSIZE64` on `/dev` nodes report the exact size |
 | `proc/syscall.c` | `pread64`/`pwrite64` on a disk node take the full 64-bit offset (descriptor offsets are 32-bit), so the backup GPT at the end of a disk larger than 4 GiB can be reached |
 | `fs/devfs.c`, `fs/initrd.c` | `/dev/initrd` (read-only, root only; Linux's block device 1,250) |
 | `userspace/desktop/desktop.c`, `userspace/term/term.c` | the Install launcher entry and desktop icon; `term <slot> <command>` runs `shell -c <command>` instead of an interactive shell |
@@ -83,6 +84,12 @@ and writes it with no changes.
 ### Limits
 
 * The disk must be at least about 128 MiB + 1 MiB + twice the size of `/disk`.
+  The installer sizes the disk with `BLKGETSIZE64` (exact, odd sectors
+  included; `/proc/partitions` counts 1 KiB blocks). It refuses a disk whose
+  real size exceeds what the kernel can address: IDE I/O here is LBA28, so on
+  an IDE disk past 128 GiB the backup GPT could not go at the real end. The
+  kernel reads the LBA48 size from IDENTIFY words 100-103 and logs
+  `[ATA]  hdX: N MiB, but LBA28 reaches only the first M MiB`.
   Disks of 2 TiB or more are refused. The block layer counts sectors in 32
   bits and saturates, so the real last sector, where the backup GPT goes, is
   unknown.

@@ -56,6 +56,25 @@ static inline void ata_irq_restore(uint32_t f) {
 
 static int drive_present = 0;
 static uint32_t master_sectors = 0;   /* LBA28 capacity, IDENTIFY words 60-61 */
+static uint64_t master_capacity = 0;  /* whole drive, LBA48 words 100-103 */
+
+/* The drive's real size: the LBA48 count (words 100-103) when word 83 bit 10
+ * says the feature set is there, else the LBA28 count.  I/O here is LBA28
+ * only, so a drive past 128 GiB is used up to its first 2^28 - 1 sectors;
+ * this tells BLKGETSIZE64 (and so maeros-install) how big it really is. */
+static uint64_t ident_capacity(const uint16_t *ident) {
+    uint64_t lba28 = (uint32_t)ident[60] | ((uint32_t)ident[61] << 16);
+    if (!(ident[83] & (1u << 10))) return lba28;
+    uint64_t lba48 = (uint64_t)ident[100] | ((uint64_t)ident[101] << 16) |
+                     ((uint64_t)ident[102] << 32) | ((uint64_t)ident[103] << 48);
+    return lba48 > lba28 ? lba48 : lba28;
+}
+
+static void note_lba28_limit(const char *name, uint32_t sectors, uint64_t capacity) {
+    if (capacity > sectors)
+        printk("[ATA]  %s: %u MiB, but LBA28 reaches only the first %u MiB\n", name,
+               (unsigned)(capacity / 2048u), (unsigned)(sectors / 2048u));
+}
 
 /*
  * Sectors the drive transfers per DRQ assertion (READ MULTIPLE block size), or
@@ -392,6 +411,8 @@ void ata_init(void) {
 
     drive_present = 1;
     master_sectors = (uint32_t)ident[60] | ((uint32_t)ident[61] << 16);
+    master_capacity = ident_capacity(ident);
+    note_lba28_limit("hda", master_sectors, master_capacity);
 
     uint32_t max_multi = ident[47] & 0xFFu;
     if (max_multi) {
@@ -557,13 +578,14 @@ typedef struct {
     uint8_t  slave;       /* 0 master, 1 slave */
     uint8_t  present;
     uint32_t sectors;
+    uint64_t capacity;    /* ident_capacity() */
 } ata_xdev_t;
 
 static ata_xdev_t ata_xdev[ATA_MAX_DEVS] = {
-    { 0x1F0, 0x3F6, 0, 0, 0 },     /* hda: served by the code above */
-    { 0x1F0, 0x3F6, 1, 0, 0 },     /* hdb */
-    { 0x170, 0x376, 0, 0, 0 },     /* hdc */
-    { 0x170, 0x376, 1, 0, 0 },     /* hdd */
+    { 0x1F0, 0x3F6, 0, 0, 0, 0 },     /* hda: served by the code above */
+    { 0x1F0, 0x3F6, 1, 0, 0, 0 },     /* hdb */
+    { 0x170, 0x376, 0, 0, 0, 0 },     /* hdc */
+    { 0x170, 0x376, 1, 0, 0, 0 },     /* hdd */
 };
 
 static int xdev_wait_bsy(const ata_xdev_t *d, uint32_t ms) {
@@ -641,9 +663,11 @@ static void ata_probe_others(void) {
         if (!ok) continue;
         d->sectors = (uint32_t)ident[60] | ((uint32_t)ident[61] << 16);
         if (!d->sectors) continue;
+        d->capacity = ident_capacity(ident);
         d->present = 1;
         printk("[ATA]  %s: %u sectors (%u MiB), PIO.\n", names[i],
                (unsigned)d->sectors, (unsigned)(d->sectors / 2048u));
+        note_lba28_limit(names[i], d->sectors, d->capacity);
     }
     /* Leave the primary channel pointing at the master, as before. */
     if (drive_present) {
@@ -660,6 +684,11 @@ int ata_dev_present(int dev) {
 uint32_t ata_dev_sectors(int dev) {
     if (!ata_dev_present(dev)) return 0;
     return dev == 0 ? master_sectors : ata_xdev[dev].sectors;
+}
+
+uint64_t ata_dev_capacity(int dev) {
+    if (!ata_dev_present(dev)) return 0;
+    return dev == 0 ? master_capacity : ata_xdev[dev].capacity;
 }
 
 static int xdev_rw(int dev, uint32_t lba, uint8_t count, void *buf, int write) {
