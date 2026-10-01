@@ -15,6 +15,7 @@
  * by net_poll_all(), because lwIP is not reentrant.
  */
 #include "e1000.h"
+#include "e1000_txq.h"
 #include "pci.h"
 #include "../arch/i686/cpu/irq.h"
 #include "../arch/i686/cpu/pit.h"
@@ -140,6 +141,7 @@ static const uint16_t e1000_ids[] = {
 };
 
 static e1000_info_t info;
+static struct e1000_txq txq;
 static volatile uint8_t *mmio;
 static netif_t *e1000_netif;
 
@@ -258,61 +260,36 @@ static void tx_setup(void) {
     wr32(REG_TDLEN, sizeof(tx_ring));
     wr32(REG_TDH, 0);
     wr32(REG_TDT, 0);
-    info.tx_next = 0;
-    info.tx_clean = 0;
-    info.tx_stall_tick = 0;
+    e1000_txq_init(&txq, TX_DESCS);
     /* Recommended values for full duplex copper (SDM 13.4.33/13.4.34). */
     wr32(REG_TCTL, TCTL_EN | TCTL_PSP | TCTL_CT(0x0F) | TCTL_COLD(0x40) |
                    TCTL_RTLC);
     wr32(REG_TIPG, 10U | (8U << 10) | (6U << 20));
 }
 
-/*
- * TX ring bookkeeping.  Slots tx_clean .. tx_next-1 are posted to the chip;
- * tx_reclaim() walks tx_clean forward over the ones it has finished (DD set).
- * One slot always stays empty: TDT == TDH means "ring empty" to the chip
- * (SDM 3.3.1), so a ring filled to the last slot would look empty to it and
- * the frames in it would never go out -- nor would any later ones.
- */
-static uint32_t tx_reclaim(void) {
-    uint32_t freed = 0;
-    while (info.tx_clean != info.tx_next &&
-           (((volatile struct e1000_tx_desc *)&tx_ring[info.tx_clean])->status &
-            TXD_STAT_DD)) {
-        info.tx_clean = (info.tx_clean + 1) % TX_DESCS;
-        freed++;
-    }
-    return freed;
+static int tx_done(uint32_t idx, void *ctx) {
+    (void)ctx;
+    return (((volatile struct e1000_tx_desc *)&tx_ring[idx])->status &
+            TXD_STAT_DD) != 0;
 }
 
-static int tx_full(void) {
-    return (info.tx_next + 1) % TX_DESCS == info.tx_clean;
+static uint32_t tx_reclaim(void) {
+    return e1000_txq_reclaim(&txq, tx_done, 0);
 }
 
 /*
  * TX watchdog: posted frames that make no progress for 2 s mean the chip
  * stopped transmitting (link down on real hardware, a hung DMA engine).
  * Reset the transmit unit with an empty ring, as Linux's e1000 watchdog does
- * (dropping what was queued; TCP retransmits).  Called with the ring idle or
- * from send/poll, both in process context under preempt_disable().
+ * (dropping what was queued; TCP retransmits).  Called from send/poll, both
+ * in process context under preempt_disable().
  */
-#define TX_STALL_TICKS 200   /* PIT at 100 Hz */
-
 static void tx_watchdog(void) {
-    if (tx_reclaim() || info.tx_clean == info.tx_next) {
-        info.tx_stall_tick = 0;
-        return;
-    }
-    uint32_t now = pit_ticks();
-    if (!info.tx_stall_tick) {
-        info.tx_stall_tick = now ? now : 1;
-        return;
-    }
-    if (now - info.tx_stall_tick < TX_STALL_TICKS)
+    if (!e1000_txq_stalled(&txq, pit_ticks(), tx_done, 0))
         return;
     info.tx_resets++;
     printk_klog("[E1000] transmit stalled (%u frames queued, link %s); resetting TX\n",
-                (unsigned)((info.tx_next + TX_DESCS - info.tx_clean) % TX_DESCS),
+                (unsigned)e1000_txq_pending(&txq),
                 (rd32(REG_STATUS) & STATUS_LU) ? "up" : "down");
     wr32(REG_TCTL, 0);
     tx_setup();
@@ -327,17 +304,17 @@ int e1000_send(const void *data, uint32_t len) {
     /* Ring full: give the chip a moment to finish a frame before giving up
      * (the caller drops this one; the watchdog deals with a dead chip). */
     tx_reclaim();
-    for (int i = 0; i < 100000 && tx_full(); i++) {
+    for (int i = 0; i < 100000 && e1000_txq_full(&txq); i++) {
         __asm__ volatile("pause");
         tx_reclaim();
     }
-    if (tx_full()) {
+    if (e1000_txq_full(&txq)) {
         tx_watchdog();
-        if (tx_full())
+        if (e1000_txq_full(&txq))
             return -11;
     }
 
-    uint32_t idx = info.tx_next;
+    uint32_t idx = e1000_txq_post(&txq);
     volatile struct e1000_tx_desc *d = &tx_ring[idx];
     memcpy(tx_bufs[idx], data, len);
     d->length = (uint16_t)len;
@@ -347,9 +324,8 @@ int e1000_send(const void *data, uint32_t len) {
     d->cmd = TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS;
     d->status = 0;
 
-    info.tx_next = (idx + 1) % TX_DESCS;
     __asm__ volatile("" ::: "memory");
-    wr32(REG_TDT, info.tx_next);
+    wr32(REG_TDT, txq.next);
     return (int)len;
 }
 

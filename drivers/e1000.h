@@ -10,9 +10,6 @@ typedef struct e1000_info {
     uint8_t mac[6];
     int mac_from_eeprom;   /* 1: EEPROM words 0-2, 0: RAL0/RAH0 fallback */
     uint32_t rx_next;      /* next RX descriptor to look at */
-    uint32_t tx_next;      /* next free TX descriptor */
-    uint32_t tx_clean;     /* oldest posted TX descriptor not yet reclaimed */
-    uint32_t tx_stall_tick;/* pit tick TX was first seen stalled, 0 = not */
     uint32_t tx_resets;    /* TX watchdog resets so far */
 } e1000_info_t;
 
