@@ -3,8 +3,9 @@
  *
  *   - uacpi_kernel_* host API: memory mapping, port I/O, PCI config space,
  *     heap, time, locks, events, the SCI and deferred work;
- *   - acpi_init(): RSDP scan, tables, namespace load + init, SCI hookup and
- *     a summary of FADT / MADT / HPET on the log;
+ *   - acpi_init(): RSDP (from the loader, else a BIOS-area scan), tables,
+ *     namespace load + init, SCI hookup and a summary of FADT / MADT / HPET
+ *     on the log;
  *   - acpi_poweroff() / acpi_reboot(): S5 and the FADT reset register, behind
  *     reboot(2) (proc/syscall.c);
  *   - the power button: a fixed event that kacpid turns into SIGUSR2 for init
@@ -28,6 +29,7 @@
 #include "../mm/heap.h"
 #include "../arch/i686/mm/paging.h"
 #include "../arch/i686/cpu/irq.h"
+#include <kernel/boot_info.h>
 #include "../arch/i686/cpu/pic.h"
 #include "../arch/i686/cpu/pit.h"
 #include "../arch/i686/cpu/tsc.h"
@@ -99,9 +101,21 @@ static uint32_t rsdp_scan(uint32_t start, uint32_t len) {
 }
 
 static uint32_t rsdp_phys;
+static int      rsdp_from_loader;
 
+/* The loader's RSDP first (Multiboot 2 tags 14/15, kernel/boot_info.c): it
+ * is a checked copy in kernel .bss, so its physical address is the direct
+ * map's.  UEFI firmware need not have an EBDA or a BIOS ROM area at all, so
+ * the scan is for BIOS boots only. */
 uacpi_status uacpi_kernel_get_rsdp(uacpi_phys_addr *out) {
     if (!rsdp_phys) {
+        const void *copy = boot_info_rsdp(0);
+        if (copy) {
+            rsdp_phys = (uint32_t)(uintptr_t)copy - (uint32_t)KERNEL_VMA;
+            rsdp_from_loader = 1;
+        }
+    }
+    if (!rsdp_phys && !boot_info_is_efi()) {
         uint32_t ebda = (uint32_t)*(volatile uint16_t *)(uintptr_t)(0x40E + KERNEL_VMA) << 4;
         if (ebda >= 0x80000 && ebda < 0xA0000) rsdp_phys = rsdp_scan(ebda, 1024);
         if (!rsdp_phys) rsdp_phys = rsdp_scan(0xE0000, 0x20000);
@@ -602,7 +616,8 @@ void acpi_init(void) {
         printk("[ACPI] no RSDP found — ACPI disabled\n");
         return;
     }
-    printk("[ACPI] RSDP at 0x%08x\n", (unsigned)rsdp_phys);
+    printk("[ACPI] RSDP at 0x%08x (%s)\n", (unsigned)rsdp_phys,
+           rsdp_from_loader ? "from the boot loader" : "BIOS area scan");
 
     ACPI_TRY(uacpi_initialize(0));
     log_tables();
