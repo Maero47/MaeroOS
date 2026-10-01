@@ -54,3 +54,15 @@ int net_socket_getopt(net_socket_t *s, int level, int name,
 int net_socket_read_ready(net_socket_t *s);
 int net_socket_write_ready(net_socket_t *s);
 int net_socket_poll_err(net_socket_t *s);
+
+/* AF_NETLINK, AF_PACKET and AF_INET SOCK_RAW sockets (net/xsock.h) share
+ * the slot table but take their own sockaddr: the syscall layer passes the
+ * raw bytes.  xrecvfrom returns the datagram's full size (MSG_TRUNC). */
+int net_socket_is_x(net_socket_t *s);
+int net_socket_xbind(net_socket_t *s, const void *addr, uint32_t alen);
+int net_socket_xconnect(net_socket_t *s, const void *addr, uint32_t alen);
+int net_socket_xgetname(net_socket_t *s, int peer, void *addr, uint32_t *alen);
+int net_socket_xsendto(net_socket_t *s, const void *buf, uint32_t len,
+                       const void *addr, uint32_t alen, int flags);
+int net_socket_xrecvfrom(net_socket_t *s, void *buf, uint32_t len,
+                         void *addr, uint32_t *alen, int flags);

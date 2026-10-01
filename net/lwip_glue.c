@@ -7,6 +7,7 @@
 
 #include "lwip/init.h"
 #include "lwip/dhcp.h"
+#include "lwip/prot/dhcp.h"
 #include "lwip/dns.h"
 #include "lwip/ip4_addr.h"
 #include "lwip/etharp.h"
@@ -219,4 +220,81 @@ int net_lwip_addr_is_local(uint32_t addr) {
         ip4_addr_ismulticast(&a) || addr == 0xFFFFFFFFu)
         return 1;
     return lwip_ready && ip4_addr_eq(&a, netif_ip4_addr(&lwip_eth0));
+}
+
+/* ── Interface configuration for netlink, SIOC* ioctls and /proc/net ──────
+ * Addresses are in network byte order, as in sockaddr_in.  lwIP keeps one
+ * IPv4 address per interface and its default gateway is the only route
+ * besides the connected subnet; net/netlink.c maps rtnetlink onto that. */
+
+int net_lwip_iface_is_ip(netif_t *iface) {
+    return lwip_ready && iface && iface == host_eth0;
+}
+
+void net_lwip_get_config(uint32_t *ip, uint32_t *mask, uint32_t *gw) {
+    *ip = *mask = *gw = 0;
+    if (!lwip_ready)
+        return;
+    *ip = ip4_addr_get_u32(netif_ip4_addr(&lwip_eth0));
+    *mask = ip4_addr_get_u32(netif_ip4_netmask(&lwip_eth0));
+    *gw = ip4_addr_get_u32(netif_ip4_gw(&lwip_eth0));
+}
+
+int net_lwip_is_up(void) {
+    return lwip_ready && netif_is_up(&lwip_eth0);
+}
+
+int net_lwip_dhcp_owned(void) {
+    return lwip_ready && dhcp_supplied_address(&lwip_eth0);
+}
+
+/* Someone configures the interface by hand (ip addr, ifconfig, udhcpc's
+ * script): the kernel's own DHCP client lets go of it, without a RELEASE,
+ * so a later renewal cannot overwrite the address it was given. */
+static void take_over(void) {
+    /* Not dhcp_stop(): that sends a RELEASE and clears the address.  With
+     * the state OFF lwIP's DHCP timers skip the interface (dhcp_coarse_tmr,
+     * dhcp_fine_tmr) and replies no longer match a request. */
+    struct dhcp *d = netif_dhcp_data(&lwip_eth0);
+    if (!d || d->state == DHCP_STATE_OFF)
+        return;
+    d->state = DHCP_STATE_OFF;
+    d->t0_timeout = d->t1_renew_time = d->t2_rebind_time = 0;
+    d->request_timeout = 0;
+    printk_klog("[NET] eth0 configured by hand; kernel DHCP client stopped\n");
+}
+
+int net_lwip_set_addr(uint32_t ip, uint32_t mask) {
+    if (!lwip_ready)
+        return -19;                                    /* -ENODEV */
+    ip4_addr_t a, m;
+    ip4_addr_set_u32(&a, ip);
+    ip4_addr_set_u32(&m, mask);
+    uint32_t cur_ip, cur_mask, cur_gw;
+    net_lwip_get_config(&cur_ip, &cur_mask, &cur_gw);
+    if (cur_ip == ip && cur_mask == mask)
+        return 0;
+    take_over();
+    netif_set_netmask(&lwip_eth0, &m);
+    netif_set_ipaddr(&lwip_eth0, &a);
+    return 0;
+}
+
+int net_lwip_set_gw(uint32_t gw) {
+    if (!lwip_ready)
+        return -19;
+    ip4_addr_t g;
+    ip4_addr_set_u32(&g, gw);
+    if (ip4_addr_get_u32(netif_ip4_gw(&lwip_eth0)) == gw)
+        return 0;
+    take_over();
+    netif_set_gw(&lwip_eth0, &g);
+    return 0;
+}
+
+void net_lwip_set_up(int up) {
+    if (!lwip_ready)
+        return;
+    if (up) netif_set_up(&lwip_eth0);
+    else    netif_set_down(&lwip_eth0);
 }

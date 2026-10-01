@@ -34,6 +34,7 @@
 #include "../fs/devfs.h"
 #include "../fs/ext2.h"
 #include "../net/socket.h"
+#include "../net/xsock.h"
 #include "flock.h"
 #include <registers.h>
 #include <kernel/config.h>
@@ -3010,6 +3011,13 @@ static int sys_ioctl(registers_t *regs) {
 
     if (fd < 0 || fd >= MAX_FD) return -9;
     proc_file_t *f = &current_proc->ofile[fd];
+    /* Interface and routing ioctls (SIOCGIFCONF, SIOCGIFADDR, SIOCADDRT...)
+     * work on any socket, as on Linux (net/netlink.c). */
+    if ((f->type == FD_SOCKET || f->type == FD_USOCKET) &&
+        ((uint32_t)req & 0xFF00) == 0x8900) {
+        int r = netdev_ioctl((uint32_t)req, (void *)(uintptr_t)regs->edx);
+        if (r != 1) return r;
+    }
     if (f->type == FD_FILE && f->node && f->node->ioctl_fn) {
         /* Drivers read and write their argument with plain loads and stores,
          * which fault (and panic, not being in __ex_table) on a read-only or
@@ -8328,6 +8336,18 @@ static int sys_clone3(registers_t *regs) {
     return sys_clone(&fake);
 }
 
+/* ── sys_vfork() — EAX=190 ──────────────────────────────────────────────────
+ * clone(CLONE_VM | CLONE_VFORK | SIGCHLD) with the caller's own stack, as
+ * Linux implements it: the parent sleeps until the child execs or exits.
+ * busybox (udhcpc running its script, ash) calls it. */
+static int sys_vfork(registers_t *regs) {
+    registers_t fake = *regs;
+    fake.ebx = CLONE_VM | CLONE_VFORK | 17;   /* SIGCHLD */
+    fake.ecx = regs->useresp;                 /* the caller's stack */
+    fake.edx = fake.esi = fake.edi = 0;
+    return sys_clone(&fake);
+}
+
 /* ── sys_socketcall(call, args) — EAX=102 ────────────────────────────────── */
 #define AF_UNIX_K  1    /* local IPC sockets (X11 / Wayland / D-Bus) */
 
@@ -9149,6 +9169,170 @@ static int inet_accept(proc_file_t *f, uint32_t *kargs, int flags) {
     return nfd;
 }
 
+/* ── AF_NETLINK / AF_PACKET / AF_INET SOCK_RAW (net/xsock.h) ─────────────
+ * These carry their own sockaddr (sockaddr_nl, sockaddr_ll, sockaddr_in), so
+ * the address bytes go through as they are, up to sockaddr_storage's 128.
+ * Datagram sockets: one send or receive is one message, MSG_TRUNC on a
+ * receive reports the full length.  setsockopt/getsockopt other than
+ * SO_ATTACH_FILTER take the generic path (XSOCK_GENERIC). */
+#define XSOCK_GENERIC (-1000)
+#define XADDR_MAX     128
+
+static int xaddr_in(uint32_t uaddr, uint32_t alen, uint8_t *k, uint32_t *klen) {
+    *klen = 0;
+    if (!uaddr) return 0;
+    if ((int32_t)alen < 0 || alen > XADDR_MAX) return -22;
+    if (alen && copy_from_user(k, (void *)(uintptr_t)uaddr, alen) < 0) return -14;
+    *klen = alen;
+    return 0;
+}
+
+/* Linux move_addr_to_user: min(user len, size) bytes, then the full size. */
+static int xaddr_out(uint32_t uaddr, uint32_t ulenp, const uint8_t *k,
+                     uint32_t klen) {
+    if (!uaddr || !ulenp) return 0;
+    uint32_t ulen;
+    if (copy_from_user(&ulen, (void *)(uintptr_t)ulenp, 4) < 0) return -14;
+    if ((int32_t)ulen < 0) return -22;
+    uint32_t n = ulen < klen ? ulen : klen;
+    if (n && copy_to_user((void *)(uintptr_t)uaddr, k, n) < 0) return -14;
+    return copy_to_user((void *)(uintptr_t)ulenp, &klen, 4) < 0 ? -14 : 0;
+}
+
+static int xsock_call(int call, uint32_t *kargs, proc_file_t *f) {
+    net_socket_t *so = f->socket;
+    uint8_t ka[XADDR_MAX];
+    uint32_t kl;
+    int r;
+    switch (call) {
+    case 2: case 3:                                   /* bind / connect */
+        if ((r = xaddr_in(kargs[1], kargs[2], ka, &kl)) < 0) return r;
+        if (!kargs[1]) return -14;
+        return call == 2 ? net_socket_xbind(so, ka, kl)
+                         : net_socket_xconnect(so, ka, kl);
+    case 4: case 5: case 13:                          /* listen/accept/shutdown */
+        return -95;
+    case 6: case 7:                                   /* getsockname/getpeername */
+        __builtin_memset(ka, 0, sizeof(ka));
+        kl = 0;
+        if ((r = net_socket_xgetname(so, call == 7, ka, &kl)) < 0) return r;
+        if (!kargs[2]) return -14;
+        return xaddr_out(kargs[1], kargs[2], ka, kl);
+    case 14:
+        /* SO_ATTACH_FILTER: struct sock_fprog { u16 len; filter * } names
+         * the program in user memory; the family gets a kernel copy. */
+        if (kargs[1] == 1 && kargs[2] == 26) {
+            uint32_t fprog[2];
+            if (kargs[4] < 8 ||
+                copy_from_user(fprog, (void *)(uintptr_t)kargs[3], 8) < 0)
+                return -14;
+            uint32_t n = fprog[0] & 0xFFFF;
+            if (n == 0 || n > 4096) return -22;
+            void *prog = kmalloc(n * 8);
+            if (!prog) return -12;
+            r = copy_from_user(prog, (void *)(uintptr_t)fprog[1], n * 8) < 0
+                ? -14 : net_socket_setopt(so, 1, 26, prog, n * 8);
+            kfree(prog);
+            return r;
+        }
+        return XSOCK_GENERIC;
+    case 15:
+        return XSOCK_GENERIC;
+    }
+
+    if (call == 9 || call == 10 || call == 11 || call == 12) {
+        /* send(fd,buf,len,flags) recv(...) sendto(...,addr,alen)
+         * recvfrom(...,addr,*alen) */
+        uint32_t len = kargs[2] > 65536 ? 65536 : kargs[2];
+        int flags = (int)kargs[3];
+        int mf = (flags & (NET_MSG_PEEK | NET_MSG_DONTWAIT)) |
+                 ((f->flags & O_NONBLOCK) ? NET_MSG_DONTWAIT : 0);
+        if (!access_ok((void *)(uintptr_t)kargs[1], kargs[2])) return -14;
+        uint8_t *kb = (uint8_t *)kmalloc(len ? len : 1);
+        if (!kb) return -12;
+        if (call == 9 || call == 11) {
+            kl = 0;
+            r = call == 11 ? xaddr_in(kargs[4], kargs[5], ka, &kl) : 0;
+            if (r >= 0 && copy_from_user(kb, (void *)(uintptr_t)kargs[1], len) < 0)
+                r = -14;
+            if (r >= 0)
+                r = net_socket_xsendto(so, kb, len, kl ? ka : NULL, kl, mf);
+        } else {
+            kl = 0;
+            r = net_socket_xrecvfrom(so, kb, len, ka, &kl, mf);
+            if (r >= 0) {
+                uint32_t got = (uint32_t)r < len ? (uint32_t)r : len;
+                if (got && copy_to_user((void *)(uintptr_t)kargs[1], kb, got) < 0)
+                    r = -14;
+                else if (call == 12) {
+                    int ar = xaddr_out(kargs[4], kargs[5], ka, kl);
+                    if (ar < 0) r = ar;
+                }
+                if (r >= 0 && !(flags & MSG_TRUNC_K)) r = (int)got;
+            }
+        }
+        kfree(kb);
+        return r;
+    }
+
+    if (call == 16 || call == 17) {                   /* sendmsg / recvmsg */
+        uint32_t umsg = kargs[1];
+        uint32_t mh[7];      /* name,namelen,iov,iovlen,control,controllen,flags */
+        if (copy_from_user(mh, (void *)(uintptr_t)umsg, sizeof(mh)) < 0) return -14;
+        int flags = (int)kargs[2];
+        int mf = (flags & (NET_MSG_PEEK | NET_MSG_DONTWAIT)) |
+                 ((f->flags & O_NONBLOCK) ? NET_MSG_DONTWAIT : 0);
+        usock_iov_t *iv = NULL;
+        r = usock_iov_from_user(mh[2], mh[3], &iv);
+        if (r < 0) return r;
+        uint32_t total = 0;
+        for (uint32_t i = 0; i < mh[3]; i++) total += iv[i].len;
+        uint32_t cap = total > 65536 ? 65536 : total;
+        uint8_t *kb = (uint8_t *)kmalloc(cap ? cap : 1);
+        if (!kb) { kfree(iv); return -12; }
+        if (call == 16) {
+            kl = 0;
+            r = xaddr_in(mh[0], mh[0] ? mh[1] : 0, ka, &kl);
+            if (r >= 0 && total > cap) r = -90;          /* -EMSGSIZE */
+            uint32_t off = 0;
+            for (uint32_t i = 0; r >= 0 && i < mh[3]; i++) {
+                if (iv[i].len && copy_from_user(kb + off, iv[i].base, iv[i].len) < 0)
+                    r = -14;
+                off += iv[i].len;
+            }
+            if (r >= 0)
+                r = net_socket_xsendto(so, kb, total, kl ? ka : NULL, kl, mf);
+        } else {
+            kl = 0;
+            r = net_socket_xrecvfrom(so, kb, cap, ka, &kl, mf);
+            if (r >= 0) {
+                uint32_t got = (uint32_t)r < cap ? (uint32_t)r : cap;
+                uint32_t left = got, off = 0;
+                for (uint32_t i = 0; i < mh[3] && left; i++) {
+                    uint32_t c = iv[i].len < left ? iv[i].len : left;
+                    if (copy_to_user(iv[i].base, kb + off, c) < 0) { r = -14; break; }
+                    off += c; left -= c;
+                }
+                if (r >= 0) {
+                    uint32_t mflags = (uint32_t)r > got ? MSG_TRUNC_K : 0;
+                    uint32_t nl = mh[0] ? kl : 0, zero = 0;
+                    uint32_t n = mh[1] < nl ? mh[1] : nl;
+                    if (n && copy_to_user((void *)(uintptr_t)mh[0], ka, n) < 0) r = -14;
+                    if (copy_to_user((void *)(uintptr_t)(umsg + 4), &nl, 4) < 0 ||
+                        copy_to_user((void *)(uintptr_t)(umsg + 20), &zero, 4) < 0 ||
+                        copy_to_user((void *)(uintptr_t)(umsg + 24), &mflags, 4) < 0)
+                        r = -14;
+                    if (r >= 0 && !(flags & MSG_TRUNC_K)) r = (int)got;
+                }
+            }
+        }
+        kfree(kb);
+        kfree(iv);
+        return r;
+    }
+    return -22;
+}
+
 static int socketcall_core_inner(int call, uint32_t *kargs) {
     /* accept4(fd, addr, addrlen, flags) is socketcall index 18 (Linux
      * SYS_ACCEPT4).  Its SOCK_CLOEXEC/SOCK_NONBLOCK apply to the NEW
@@ -9255,6 +9439,15 @@ static int socketcall_core_inner(int call, uint32_t *kargs) {
 
     if (f->type != FD_SOCKET || !f->socket)
         return -88;
+
+    if (net_socket_is_x(f->socket)) {
+        net_socket_t *so = f->socket;
+        net_socket_retain(so);      /* the descriptor may close meanwhile */
+        int r = xsock_call(call, kargs, f);
+        net_socket_release(so);
+        if (r != XSOCK_GENERIC)
+            return r;
+    }
 
     if (call == 2 || call == 3) { /* bind/connect */
         net_sockaddr_in_t *uaddr = (net_sockaddr_in_t *)(uintptr_t)kargs[1];
@@ -9569,6 +9762,7 @@ void syscall_dispatch(registers_t *regs) {
     case 119: sys_sigreturn(regs);             return; /* regs fully restored —
         the dispatcher must NOT stomp the restored eax with its ret value */
     case 120: ret = sys_clone(regs);           break;
+    case 190: ret = sys_vfork(regs);           break;
     case 435: ret = sys_clone3(regs);          break;  /* clone3 */
     case 122: ret = sys_uname(regs);           break;
     case 125: ret = sys_mprotect(regs);        break;

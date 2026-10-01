@@ -6,6 +6,7 @@
 #include "../net/net.h"
 #include "../net/lwip_glue.h"
 #include "../net/firewall.h"
+#include "../net/xsock.h"
 #include "../lib/string.h"
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
@@ -1046,6 +1047,46 @@ static vfs_node_t *procfs_sys_finddir(vfs_node_t *node, const char *name) {
     return NULL;
 }
 
+/* ── /proc/net: dev and route, the files busybox ifconfig and route read ─── */
+static vfs_node_t proc_net_node;
+static vfs_node_t proc_net_dev_node;
+static vfs_node_t proc_net_route_node;
+
+static uint32_t procfs_net_text_read(vfs_node_t *n, uint32_t off, uint32_t len,
+                                     uint8_t *buf) {
+    uint32_t cap = 4096;
+    char *content = (char *)kmalloc(cap);
+    if (!content) return 0;
+    net_poll_all();
+    uint32_t pos = n == &proc_net_dev_node ? netdev_proc_dev(content, cap)
+                                           : netdev_proc_route(content, cap);
+    uint32_t avail = 0;
+    if (off < pos) {
+        avail = pos - off;
+        if (avail > len) avail = len;
+        __builtin_memcpy(buf, content + off, avail);
+    }
+    kfree(content);
+    return avail;
+}
+
+static int procfs_net_readdir(vfs_node_t *node, uint32_t idx, vfs_dirent_t *out) {
+    (void)node;
+    if (idx > 1) return -1;
+    out->ino  = idx ? 85 : 84;
+    out->type = VFS_FLAG_FILE;
+    strncpy(out->name, idx ? "route" : "dev", 255);
+    out->name[255] = '\0';
+    return 0;
+}
+
+static vfs_node_t *procfs_net_finddir(vfs_node_t *node, const char *name) {
+    (void)node;
+    if (strcmp(name, "dev") == 0) return &proc_net_dev_node;
+    if (strcmp(name, "route") == 0) return &proc_net_route_node;
+    return NULL;
+}
+
 static int procfs_root_readdir(vfs_node_t *node, uint32_t idx,
                                 vfs_dirent_t *out) {
     (void)node;
@@ -1063,6 +1104,7 @@ static int procfs_root_readdir(vfs_node_t *node, uint32_t idx,
         { "uptime",  VFS_FLAG_FILE, 10 },
         { "mounts",  VFS_FLAG_FILE, 11 },
         { "partitions", VFS_FLAG_FILE, 12 },
+        { "net",     VFS_FLAG_DIR,  83 },
     };
     static const uint32_t nentries =
         sizeof(entries) / sizeof(entries[0]);
@@ -1108,6 +1150,7 @@ static vfs_node_t *procfs_root_finddir(vfs_node_t *node, const char *name) {
     if (strcmp(name, "kmsg")    == 0) return &proc_kmsg_node;
     if (strcmp(name, "mounts")  == 0) return &proc_mounts_node;
     if (strcmp(name, "partitions") == 0) return &proc_partitions_node;
+    if (strcmp(name, "net")     == 0) return &proc_net_node;
 
     int pid = procfs_parse_pid(name);
     if (pid > 0) {
@@ -1281,6 +1324,25 @@ vfs_node_t *procfs_mount(void) {
     proc_root_node.finddir_fn  = procfs_root_finddir;
 
     /* /proc/sys, /proc/sys/vm, /proc/sys/vm/overcommit_memory */
+    memset(&proc_net_node, 0, sizeof(proc_net_node));
+    strncpy(proc_net_node.name, "net", 255);
+    proc_net_node.flags      = VFS_FLAG_DIR;
+    proc_net_node.inode      = 83;
+    proc_net_node.readdir_fn = procfs_net_readdir;
+    proc_net_node.finddir_fn = procfs_net_finddir;
+    memset(&proc_net_dev_node, 0, sizeof(proc_net_dev_node));
+    strncpy(proc_net_dev_node.name, "dev", 255);
+    proc_net_dev_node.flags   = VFS_FLAG_FILE;
+    proc_net_dev_node.inode   = 84;
+    proc_net_dev_node.mask    = 0444;
+    proc_net_dev_node.read_fn = procfs_net_text_read;
+    memset(&proc_net_route_node, 0, sizeof(proc_net_route_node));
+    strncpy(proc_net_route_node.name, "route", 255);
+    proc_net_route_node.flags   = VFS_FLAG_FILE;
+    proc_net_route_node.inode   = 85;
+    proc_net_route_node.mask    = 0444;
+    proc_net_route_node.read_fn = procfs_net_text_read;
+
     memset(&proc_sys_node, 0, sizeof(proc_sys_node));
     strncpy(proc_sys_node.name, "sys", 255);
     proc_sys_node.flags      = VFS_FLAG_DIR;

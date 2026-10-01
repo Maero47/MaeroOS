@@ -2,6 +2,7 @@
 #include "lwip_glue.h"
 #include "net.h"
 #include "firewall.h"
+#include "xsock.h"
 #include "../lib/string.h"
 #include "../mm/heap.h"
 #include "../kernel/printk.h"
@@ -32,6 +33,9 @@ static int timed_out(uint32_t ms, uint32_t start) {
 #define AF_INET_K      2
 #define SOCK_STREAM_K  1
 #define SOCK_DGRAM_K   2
+#define SOCK_RAW_K     3
+#define AF_NETLINK_K  16
+#define AF_PACKET_K   17
 #define IPPROTO_TCP_K  6
 #define IPPROTO_IP_K   0
 #define IP_OPTIONS_K   4
@@ -111,6 +115,10 @@ struct net_socket {
     uint32_t keep_idle_ms, keep_intvl_ms, keep_cnt;   /* 0 = lwIP default */
     uint32_t rcvtimeo_ms;   /* SO_RCVTIMEO: 0 = wait forever */
     uint32_t sndtimeo_ms;   /* SO_SNDTIMEO */
+    /* AF_NETLINK, AF_PACKET and AF_INET SOCK_RAW (net/xsock.h): the
+     * family's operations and state; NULL for lwIP TCP/UDP. */
+    const xsock_ops_t *xops;
+    void *xs;
 };
 
 static net_socket_t sockets[MAX_NET_SOCKETS];
@@ -320,7 +328,34 @@ static net_socket_t *socket_free_slot(void) {
     return NULL;
 }
 
+static int xsocket_create_locked(int domain, int type, int protocol,
+                                 net_socket_t **out) {
+    net_socket_t *s = socket_free_slot();
+    if (!s)
+        return -24;
+    const xsock_ops_t *ops = NULL;
+    void *x = NULL;
+    int r = domain == AF_NETLINK_K ? netlink_create(type, protocol, &ops, &x)
+          : domain == AF_PACKET_K  ? packet_create(type, protocol, &ops, &x)
+          : rawip_create(protocol, &ops, &x);
+    if (r < 0)
+        return r;
+    memset(s, 0, sizeof(*s));
+    s->used = 1;
+    s->refs = 1;
+    s->domain = domain;
+    s->type = type;
+    s->protocol = protocol;
+    s->xops = ops;
+    s->xs = x;
+    *out = s;
+    return 0;
+}
+
 static int socket_create_locked(int domain, int type, int protocol, net_socket_t **out) {
+    if (domain == AF_NETLINK_K || domain == AF_PACKET_K ||
+        (domain == AF_INET_K && type == SOCK_RAW_K))
+        return xsocket_create_locked(domain, type, protocol, out);
     if (domain != AF_INET_K)
         return -97;
     if (type != SOCK_DGRAM_K && type != SOCK_STREAM_K)
@@ -415,6 +450,11 @@ static void socket_release_locked(net_socket_t *s) {
         return;
     if (--s->refs > 0)
         return;
+    if (s->xops) {
+        s->xops->release(s->xs);
+        memset(s, 0, sizeof(*s));
+        return;
+    }
     if (s->udp)
         udp_remove(s->udp);
     socket_detach_pcb(s, 0);
@@ -834,7 +874,9 @@ int net_socket_read_ready(net_socket_t *s) {
     net_poll_all();
     preempt_disable();
     int r;
-    if (s->listening)
+    if (s->xops)
+        r = s->xops->read_ready(s->xs);
+    else if (s->listening)
         r = s->aq_count > 0 || !s->lpcb;    /* accept() would not block */
     else if (s->type == SOCK_STREAM_K)
         r = s->tcp_rx_count > 0 || s->tcp_state == TCP_STATE_CLOSED ||
@@ -981,6 +1023,9 @@ int net_socket_take_error(net_socket_t *s) {
 
 int net_socket_sendto(net_socket_t *s, const void *buf, uint32_t len,
                       const net_sockaddr_in_t *addr, int flags) {
+    if (s && s->used && s->xops)
+        return net_socket_xsendto(s, buf, len, addr, addr ? sizeof(*addr) : 0,
+                                  flags);
     /* TCP send BLOCKS while the send buffer is full, like recv and like a
      * blocking Linux socket: it returns once all of buf is queued, or with
      * the partial count when a signal or a connection error cuts it short.
@@ -1029,6 +1074,14 @@ int net_socket_sendto(net_socket_t *s, const void *buf, uint32_t len,
 
 int net_socket_recvfrom(net_socket_t *s, void *buf, uint32_t len,
                         net_sockaddr_in_t *addr, int flags) {
+    if (s && s->used && s->xops) {
+        uint32_t alen = sizeof(*addr);
+        uint8_t abuf[128];
+        int r = net_socket_xrecvfrom(s, buf, len, addr ? abuf : NULL, &alen,
+                                     flags);
+        if (addr) memcpy(addr, abuf, sizeof(*addr));
+        return r > (int)len ? (int)len : r;
+    }
     /* recv BLOCKS until data/EOF (TCP) or a datagram (UDP), as on Linux:
      * the io_activity sleep wakes instantly on NIC interrupts.  O_NONBLOCK/
      * MSG_DONTWAIT make it -EAGAIN instead, and SO_RCVTIMEO bounds the wait
@@ -1209,6 +1262,12 @@ int net_socket_setopt(net_socket_t *s, int level, int name,
     int is_tv = level == SOL_SOCKET_K &&
         (name == SO_RCVTIMEO_OLD_K || name == SO_SNDTIMEO_OLD_K ||
          name == SO_RCVTIMEO_NEW_K || name == SO_SNDTIMEO_NEW_K);
+    if (s->xops && !is_tv) {
+        preempt_disable();
+        int r = s->xops->setopt(s->xs, level, name, val, len);
+        preempt_enable();
+        return r == 1 ? 0 : r;    /* the rest are accepted and ignored */
+    }
     if (is_tv) {
         uint32_t ms;
         int wide = name == SO_RCVTIMEO_NEW_K || name == SO_SNDTIMEO_NEW_K;
@@ -1259,6 +1318,17 @@ int net_socket_getopt(net_socket_t *s, int level, int name,
     uint8_t buf[16];
     uint32_t n = 4;
     int32_t v = 0;
+    if (s->xops) {
+        preempt_disable();
+        int r = s->xops->getopt(s->xs, level, name, val, len);
+        preempt_enable();
+        if (r != 1)
+            return r;
+        if (level == SOL_SOCKET_K && name == SO_ERROR_K) {
+            v = 0;
+            goto out;
+        }
+    }
     if (level == SOL_SOCKET_K) {
         switch (name) {
         case SO_REUSEADDR_K:  v = s->opt_reuseaddr; break;
@@ -1295,10 +1365,82 @@ int net_socket_getopt(net_socket_t *s, int level, int name,
     } else {
         return 1;
     }
+out:
     if (n == 4)
         memcpy(buf, &v, 4);
     uint32_t c = *len < n ? *len : n;
     memcpy(val, buf, c);
     *len = c;
     return 0;
+}
+
+/* ── AF_NETLINK / AF_PACKET / raw IP (net/xsock.h) ──────────────────────── */
+
+int net_socket_is_x(net_socket_t *s) {
+    return s && s->used && s->xops != NULL;
+}
+
+int net_socket_xbind(net_socket_t *s, const void *addr, uint32_t alen) {
+    if (!net_socket_is_x(s)) return -9;
+    preempt_disable();
+    int r = s->xops->bind(s->xs, addr, alen);
+    preempt_enable();
+    return r;
+}
+
+int net_socket_xconnect(net_socket_t *s, const void *addr, uint32_t alen) {
+    if (!net_socket_is_x(s)) return -9;
+    preempt_disable();
+    int r = s->xops->connect(s->xs, addr, alen);
+    preempt_enable();
+    return r;
+}
+
+int net_socket_xgetname(net_socket_t *s, int peer, void *addr, uint32_t *alen) {
+    if (!net_socket_is_x(s)) return -9;
+    preempt_disable();
+    int r = s->xops->getname(s->xs, peer, addr, alen);
+    preempt_enable();
+    return r;
+}
+
+/* A datagram never waits for room: it goes out or fails whole. */
+int net_socket_xsendto(net_socket_t *s, const void *buf, uint32_t len,
+                       const void *addr, uint32_t alen, int flags) {
+    (void)flags;
+    if (!net_socket_is_x(s)) return -9;
+    preempt_disable();
+    int r = s->xops->send(s->xs, buf, len, addr, alen);
+    preempt_enable();
+    return r;
+}
+
+/* The next datagram, waiting for one unless MSG_DONTWAIT/O_NONBLOCK, up to
+ * SO_RCVTIMEO.  Returns the datagram's full size, which may exceed len. */
+int net_socket_xrecvfrom(net_socket_t *s, void *buf, uint32_t len,
+                         void *addr, uint32_t *alen, int flags) {
+    preempt_disable();
+    int pinned = net_socket_is_x(s);
+    if (pinned) s->refs++;
+    preempt_enable();
+    if (!pinned) return -9;
+    uint32_t start = pit_ticks();
+    int r;
+    for (;;) {
+        preempt_disable();
+        r = s->xops->recv(s->xs, buf, len, addr, alen,
+                          (flags & NET_MSG_PEEK) != 0);
+        preempt_enable();
+        if (r != -11) break;
+        if (flags & NET_MSG_DONTWAIT) break;
+        if (timed_out(s->rcvtimeo_ms, start)) break;
+        if (current_proc && signal_interrupt_pending(current_proc)) {
+            r = -4;
+            break;
+        }
+        net_poll_all();
+        net_io_sleep(2);
+    }
+    net_socket_release(s);
+    return r;
 }
