@@ -82,6 +82,18 @@ def debugfs(img, req):
                           text=True).stdout
 
 
+def live_names(img, path):
+    """Names in a directory as debugfs lists them, minus the inode-0 entries
+    `ls` also prints (a deleted entry that was first in its block keeps its
+    name with inode 0, in ext4 as here)."""
+    out = []
+    for line in debugfs(img, f"ls -l {path}").splitlines():
+        f = line.split()
+        if len(f) >= 2 and f[0].isdigit() and f[0] != "0":
+            out.append(f[-1])
+    return out
+
+
 def debugfs_cat(img, path):
     return subprocess.run([DEBUGFS, "-R", f"cat {path}", img], capture_output=True).stdout
 
@@ -349,6 +361,10 @@ def guest_tests(g, info):
     rc, out = g.sh("busybox mount -t ext4 /dev/sdb /mnt/a && busybox mount -t ext4 /dev/nvme0n1 /mnt/b")
     check(rc == 0, f"mount both again ({out.strip()!r})")
     check(md5_of(g, "/mnt/a/big50.bin") == big_md5, "sdb: 50 MiB file survives umount/mount")
+    rc, out = g.sh("busybox ls /mnt/b/big2 | busybox wc -l; busybox ls /mnt/b/big2 | busybox grep -c entry-00003; "
+                   "busybox ls /mnt/a/big | busybox wc -l")
+    check(out.split()[:3] == ["3498", "0", "1800"],
+          f"htree directories after umount/mount: 3498 (no entry-00003) and 1800 names ({out.split()!r})")
     for m, name in (("/mnt/a", "sdb"), ("/mnt/b", "nvme0n1")):
         check(md5_of(g, f"{m}/frag.bin") == md5(frag_bytes()), f"{name}: frag.bin survives umount/mount")
         rc, out = g.sh(f"busybox cat {m}/link {m}/d1/sub/moved.txt {m}/victim.txt && "
@@ -393,11 +409,11 @@ def host_checks(a_img, b_img, c_img, d_img, info):
         ex = debugfs(img, "ex /frag.bin")
         check(re.search(r"^\s*0/\s*1\s", ex, re.M) is not None,
               f"debugfs: {name} frag.bin has a depth-1 extent tree")
-        root = debugfs(img, "ls -l /")
+        root = " ".join(live_names(img, "/"))
         check("hello-renamed.txt" in root and "delete-me.txt" not in root and "new.txt" in root
               and "gone" not in root, f"debugfs: {name} root has the guest's changes")
-        many = debugfs(img, "ls /d1/many")
-        check(len(re.findall(r"\bf\d+\b", many)) == 997 and "first" in many,
+        many = live_names(img, "/d1/many")
+        check(len([n for n in many if re.fullmatch(r"f\d+", n)]) == 997 and "first" in many,
               f"debugfs: {name} /d1/many has 998 entries")
         check(debugfs_cat(img, "/victim.txt") == b"replacement\n", f"debugfs: {name} rename over existing")
         check(debugfs_cat(img, "/trunc.txt") == trunc_bytes(), f"debugfs: {name} truncated file")
@@ -406,16 +422,19 @@ def host_checks(a_img, b_img, c_img, d_img, info):
         st = debugfs(img, "stat /sparse.bin")
         m = re.search(r"Blockcount:\s+(\d+)", st)
         check(m is not None and int(m.group(1)) <= 64, f"debugfs: {name} sparse.bin is sparse ({m and m.group(1)})")
-    big = debugfs(a_img, "ls /big")
-    check("zz-new" in big and "renamed" in big and "entry-00007-" not in big and "added-600-" in big,
-          "debugfs: sdb htree dir changes")
+    big = live_names(a_img, "/big")
+    check("zz-new" in big and "renamed" in big and "added-600-with-a-name-long-enough-to-fill-leaves" in big
+          and "entry-00007-with-a-longer-name" not in big and len(big) == 1800 + 2,
+          f"debugfs: sdb htree dir changes ({len(big)} names)")
     check(htree_levels(a_img, "/big") == 0, "debugfs: sdb /big is still an htree directory")
     lv = htree_levels(b_img, "/big2")
     check(info["b_levels"] == 0 and lv == 1,
           f"debugfs: nvme0n1 /big2 is still an htree directory and grew a level ({info['b_levels']} -> {lv})")
-    big2 = debugfs(b_img, "ls /big2")
-    check("new-entry-2000-" in big2 and "new-entry-77-" not in big2 and "entry-00003-" not in big2,
-          "debugfs: nvme0n1 /big2 changes")
+    big2 = live_names(b_img, "/big2")
+    check("new-entry-2000-with-a-fairly-long-name-too" in big2 and
+          "new-entry-77-with-a-fairly-long-name-too" not in big2 and
+          "entry-00003-with-a-much-longer-name-for-1k" not in big2 and len(big2) == 3498 + 2,
+          f"debugfs: nvme0n1 /big2 changes ({len(big2)} names)")
     check(debugfs_cat(c_img, "/hello.txt") == b"replayed content\n", "debugfs: sdc hello.txt replayed")
     check(debugfs_cat(c_img, "/after.txt") == b"after-replay\n", "debugfs: sdc after.txt")
 

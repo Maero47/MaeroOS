@@ -74,6 +74,17 @@ def debugfs(img, req):
                           text=True).stdout
 
 
+def live_names(img, path):
+    """debugfs `ls -l` names minus the inode-0 entries it also prints (a
+    deleted entry that was first in its block keeps its name, inode 0)."""
+    out = []
+    for line in debugfs(img, f"ls -l {path}").splitlines():
+        f = line.split()
+        if len(f) >= 2 and f[0].isdigit() and f[0] != "0":
+            out.append(f[-1])
+    return out
+
+
 def seq_text(n):
     return "".join(f"{i}\n" for i in range(1, n + 1)).encode()
 
@@ -316,19 +327,20 @@ def host_checks(a_img, a_fs, b_img, c_img, files):
         r = subprocess.run([E2FSCK, "-fn", img], capture_output=True, text=True)
         check(r.returncode == 0, f"host e2fsck -fn {name} clean (rc={r.returncode})"
               + ("" if r.returncode == 0 else "\n" + r.stdout[-1500:]))
-    root = debugfs(part, "ls -l /")
+    root = " ".join(live_names(part, "/"))
     check("seq.txt" in root and "new.txt" in root and "newdir" in root and
           "hello.txt" not in root and "delete-me.txt" not in root and
           "emptydir" not in root and "to-move.txt" not in root,
           "debugfs: sdb1 root has the guest's creates and deletes")
-    d = debugfs(part, "ls /dir")
+    d = " ".join(live_names(part, "/dir"))
     check("hello2.txt" in d and "inner-renamed.txt" in d and not re.search(r"\binner\.txt\b", d),
           "debugfs: renames in sdb1 /dir")
     check(md5(subprocess.run([DEBUGFS, "-R", "cat /seq.txt", part], capture_output=True).stdout)
           == seq_md5, "debugfs: sdb1 seq.txt content")
     check("../dir/hello2.txt" in debugfs(part, "stat /newdir/link"), "debugfs: symlink target")
-    big = debugfs(b_img, "ls /big")
-    check("zz-new" in big and "renamed" in big and "entry-00007-" not in big,
+    big = live_names(b_img, "/big")
+    check("zz-new" in big and "renamed" in big and
+          "entry-00007-with-a-longer-name" not in big and len(big) == 400 + 2,
           "debugfs: nvme0n1 htree dir changes")
     check(subprocess.run([DEBUGFS, "-R", "cat /lazy.txt", part], capture_output=True,
                          text=True).stdout == "before\nafter-detach\n",
