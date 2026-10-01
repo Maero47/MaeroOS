@@ -55,11 +55,20 @@ missing-glyph box in sans/serif/mono/system-ui and named families, and
 whether serif, mono, bold and italic are real faces; any failure FAILs the
 run and the report is saved as fonts.json.
 
+--audio (opt-in, implies --net) is the <audio> check (docs/audio.md): a copy
+of the disk gets /audio.html and a 3 s 440 Hz /tone.wav plus autoplay prefs,
+the guest gets an Intel HDA recorded by QEMU into audio.wav, and after the
+paint verdict file:///disk/audio.html is typed into the address bar.  The
+page reports its media events to the host; the capture must hold the tone at
+440 Hz for about 3 s with few silent 10 ms blocks inside.  Firefox plays
+through cubeb's PulseAudio backend on apulse (libpulse over alsa-lib, in the
+Firefox tree) and the kernel's ALSA ABI.
+
 Usage:
   python3 tools/smoke_firefox.py [--accel kvm|tcg|<qemu -accel value>]
                                  [--smp N] [--timeout SEC] [--mem SIZE]
                                  [--iso PATH] [--disk PATH] [--out DIR]
-                                 [--tag NAME] [--net] [--web] [-v]
+                                 [--tag NAME] [--net] [--web] [--audio] [-v]
 Defaults: -accel kvm when /dev/kvm is writable, else tcg; -smp 1; -m 2048M;
 timeout 360 s under KVM, 900 s under TCG.
 """
@@ -291,25 +300,31 @@ def audio_load(qmp, args, run, pump, web):
 
 
 def audio_capture_check(args, run):
+    """Judge build/.../audio.wav: the 440 Hz stretch (blocks labelled against
+    the login chime's notes too, so the chime is not counted) must last about
+    AUDIO_SECS, sit at 440 Hz, and have few silent 10 ms blocks inside it."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from smoke_hda import classify, peak_freq, read_wav, rms
+    from smoke_hda import classify, peak_freq, read_wav
+    from smoke_audio import main_run
     path = os.path.join(args.outdir, "audio.wav")
     try:
         rate, _, s = read_wav(path)
     except Exception as e:  # noqa: BLE001
         return "no usable capture (%s)" % e, False
-    labels = classify(s, rate, [AUDIO_HZ])
-    n = sum(1 for x in labels if x == 0)
-    if n == 0:
-        return "capture of %.2f s holds no tone (all silent)" % (len(s) / rate), False
-    idx = [i for i, x in enumerate(labels) if x == 0]
+    labels = classify(s, rate, [AUDIO_HZ, 523, 659, 784, 1047])
+    span = main_run(labels, 0, gap=25)
+    if not span:
+        return "capture of %.2f s holds no %d Hz tone" % (len(s) / rate, AUDIO_HZ), False
+    first, last, n = span
     blk = rate // 100
-    part = s[idx[0] * blk:(idx[-1] + 1) * blk]
+    part = s[first * blk:(last + 1) * blk]
     f = peak_freq(part, rate)
-    zc = sum(1 for a, b in zip(part, part[1:]) if (a < 0) != (b < 0)) / 2 / (len(part) / rate)
-    msg = ("capture: %.2f s of sound in %.2f s, peak %d Hz, zero crossings %.0f Hz, rms %.0f"
-           % (n / 100, len(s) / rate, f, zc, rms(part)))
-    ok = abs(f - AUDIO_HZ) <= AUDIO_HZ * 0.02 and n / 100 >= AUDIO_SECS * 0.8
+    holes = sum(1 for x in labels[first:last + 1] if x is None)
+    msg = ("capture: %d Hz from %.2f s to %.2f s (%.2f s, %d tone blocks, %d silent blocks "
+           "inside), peak %d Hz" % (AUDIO_HZ, first / 100, (last + 1) / 100,
+                                     (last + 1 - first) / 100, n, holes, f))
+    ok = (abs(f - AUDIO_HZ) <= AUDIO_HZ * 0.02 and n >= AUDIO_SECS * 100 * 0.9
+          and (last + 1 - first) <= AUDIO_SECS * 100 * 1.15 and holes <= 10)
     return msg, ok
 
 

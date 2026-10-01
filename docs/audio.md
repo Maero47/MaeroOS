@@ -99,3 +99,57 @@ about its length and without dropouts:
 `make smoke-hda` (in `make check`) still covers `/dev/dsp` on HDA.
 
 Firefox: `python3 tools/smoke_firefox.py --audio` (see below).
+
+## Firefox
+
+Firefox 115 ESR reaches the sound card, but the sound is choppy.
+
+**How the path works.** Mozilla's Linux builds do not compile cubeb's ALSA
+backend. `libxul.so` has no `snd_pcm_open_lconf`, no `snd_config_*` and no
+`cubeb_alsa` strings, and its `libasound.so.2` dependency comes from WebMIDI's
+Rust `alsa` crate. The only audio backends are cubeb's two PulseAudio ones,
+so `media.cubeb.backend=alsa` falls through to them. Without a
+`libpulse.so.0`, `cubeb_init` fails and `<audio>` ends in
+`MEDIA_ERR_DECODE` ("Failed to decode media").
+`ports/firefox/fetch-runtime.sh` therefore installs Debian's **apulse** (MIT)
+as `testfiles/firefox/apulse/`. apulse is a `libpulse.so.0` that plays
+through alsa-lib. The script also installs alsa-lib's configuration tree as
+`testfiles/firefox/alsa/`. The `ff` launcher puts the apulse directory on
+`LD_LIBRARY_PATH` and sets `ALSA_CONFIG_DIR=/disk/firefox/alsa`. The path is:
+
+    <audio> -> cubeb pulse-rust -> apulse -> Debian libasound (glibc, 32-bit time_t)
+            -> /dev/snd/pcmC0D0p -> drivers/alsa.c -> HDA
+
+Debian's own `aplay` from the same glibc and libasound plays a clean 440 Hz
+tone through this ABI. That run used the 108-byte `STATUS` and 132-byte
+`SYNC_PTR` layouts.
+
+**What `smoke_firefox.py --audio` shows.** The page opens from
+`file:///disk/audio.html` with no network involved. The clip's `play`,
+`playing` and `ended` events fire, and `ended` comes at `currentTime` 3. The
+kernel takes about 44,100 frames/s from apulse, which is real time. For
+roughly the first 1.3 s the capture holds a clean 440 Hz tone. After that it
+alternates tone and silence in 10 ms blocks, and the 3 s clip takes 10 to
+19 s to finish.
+
+**The remaining blocker is inside Firefox, not in the kernel.** Firefox
+logs `W/AudioStream ... lost N frames` (MOZ_LOG `AudioStream:2`) on almost
+every cubeb callback. In each callback its AudioSink has only about one
+decoded packet (about 1000 frames) ready, whatever the period: with 25 ms
+periods (1104 frames) it loses about 900 frames, and with 125 ms periods
+(`media.cubeb_latency_playback_ms=500`) it loses about 4,400 of 5,514. So
+decoded audio reaches the sink at about a third of real time, and apulse
+fills the gaps with silence: 25k-33k of every 45k frames that arrive in the
+kernel are zero. Raising `media.audio.audiosink.threshold_ms` (200, 500)
+and running with `-smp 2` did not change this. The rate is the same for a
+plain WAV, so the decode work itself is not the limit. Each packet makes a
+round trip from MediaDecoderStateMachine to the decoder task queue and back
+to the AudioSink, and that round trip is slow on this kernel's scheduler (a
+20 ms quantum; wakeups from interrupts do not preempt). Fixing it belongs
+to the Firefox/scheduler latency work.
+
+Two earlier failures were also fixed on the way. The `/dev/snd` nodes were
+0660 root and Firefox runs as `user`; they are now 0666 like `/dev/dsp`.
+Tracing every ALSA ioctl to the serial console (`ALSA_TRACE` in
+`drivers/alsa.c`) slowed playback enough to cause XRUNs on its own, so the
+trace is off by default.

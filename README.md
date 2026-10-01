@@ -69,6 +69,10 @@ What is proven by the automated QEMU tests in `tools/`:
   its own profile (`testfiles/ffprofile`) that turns off first-run dialogs, telemetry
   and add-on scans. `docs/audit/firefox-first-paint.md` and `docs/perf/firefox-startup.md` record how it
   got here.
+- **Firefox sound is choppy.** `<audio>` reaches the sound card through cubeb's
+  PulseAudio backend, apulse and the kernel's ALSA ABI, but Firefox's own
+  AudioSink receives decoded audio at about a third of real time. The clip plays
+  to its end with gaps of silence in between (`docs/audio.md`, `smoke_firefox.py --audio`).
 - **No execute protection (NX).** The kernel runs i686 page tables without PAE, which
   have no no-execute bit, so every readable user page is also executable. Write
   protection is enforced: `proc/elf.c` maps each `PT_LOAD` segment with its own
