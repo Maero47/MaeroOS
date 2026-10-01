@@ -149,9 +149,9 @@ static void sig_wake_sleeper(struct proc *p, int sig) {
     if (p->state == PROC_SLEEPING) {
         p->sleep_chan = (void *)0;
         p->wake_tick  = 0;
-        p->state      = PROC_RUNNABLE;
+        sched_make_runnable(p);
     } else if (p->state == PROC_STOPPED && sig == SIGKILL) {
-        p->state      = PROC_RUNNABLE;   /* a stopped task can still be killed */
+        sched_make_runnable(p);          /* a stopped task can still be killed */
     }
 }
 
@@ -202,7 +202,7 @@ static void prepare_job_control(struct proc *p, int sig) {
             struct proc *q = &ptable[i];
             if (!proc_live(q) || q->tgid != tg) continue;
             q->jobctl_stop = 0;
-            if (q->state == PROC_STOPPED) { q->state = PROC_RUNNABLE; was_stopped = 1; }
+            if (q->state == PROC_STOPPED) { sched_make_runnable(q); was_stopped = 1; }
         }
         if (leader && (leader->group_stop || was_stopped)) {
             leader->group_stop      = 0;

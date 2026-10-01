@@ -16,6 +16,15 @@ void scheduler_tick(int user_mode);
 /* Yield the current process back to the scheduler */
 void yield(void);
 
+/* Make a SLEEPING/STOPPED thread RUNNABLE: places it in the fair queue and
+ * preempts the CPU it should displace (wakeup preemption).  BKL held. */
+struct proc;
+void sched_make_runnable(struct proc *p);
+
+/* Return-to-user point of an IRQ or exception: switch away if this CPU's
+ * need_resched is set and the trap came from ring 3 (from_user). */
+void sched_irq_exit(int from_user);
+
 /* Reschedule at the kernel→user return boundary if a wake happened during this
  * syscall (Linux TIF_NEED_RESCHED on kernel exit).  Called by syscall_dispatch
  * after all syscall work + signal delivery. */

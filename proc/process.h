@@ -253,6 +253,18 @@ struct proc {
     uint32_t         run_us_mark;   /* run_us at the last KTRACE cpu dump */
     uint32_t         sched_count;   /* times scheduled */
 
+    /* Fair scheduling (proc/scheduler.c): on-CPU time in ns, weighted by
+     * nice, and the flags that place it.  The runnable thread with the least
+     * vruntime runs next.  vr_placed: vruntime was set from the run queue's
+     * minimum (0 = fresh slot, placed on first pick); vr_slept: the thread
+     * blocked and gets sleeper placement when it is next made runnable;
+     * vr_skip: it called yield() and is passed over by the next pick. */
+    uint64_t         vruntime;
+    uint8_t          vr_placed;
+    uint8_t          vr_slept;
+    uint8_t          vr_skip;
+    int8_t           nice;          /* -20..19, setpriority(2) */
+
     /* Non-zero: the PIT tick must not preempt this process (it is inside a
      * non-reentrant critical section, e.g. the lwIP stack).  Nests. */
     int              no_preempt;

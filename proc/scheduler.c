@@ -17,6 +17,8 @@ extern void vma_clear(struct proc *p);   /* free demand-paged VMAs (syscall.c) *
 #include "../arch/i686/cpu/pit.h"
 #include "../arch/i686/cpu/tsc.h"
 #include "../arch/i686/cpu/percpu.h"
+#include "../arch/i686/cpu/apic.h"
+#include "../arch/i686/cpu/smp.h"
 #include "../arch/i686/mm/paging.h"
 #include "../mm/heap.h"
 #include "../kernel/printk.h"
@@ -34,10 +36,162 @@ extern void swtch(struct context **old, struct context *new_ctx);
  * swtch(&scheduler_ctx, ...) / swtch(..., scheduler_ctx) all act per-CPU. */
 #define scheduler_ctx (cpus[this_cpu_id()].sched_ctx)
 
-#define DEFAULT_TIMESLICE  2   /* ticks per quantum (20ms): lower round-robin
-                                * latency for multithreaded/interactive apps.
-                                * (Verified NOT the cause of the GTK heap race —
-                                * it reproduces identically at 50ms.) */
+/*
+ * Fair scheduling with wakeup preemption (Linux CFS's model, simplified).
+ *
+ * Every thread carries a vruntime: the ns it has spent on a CPU, scaled by
+ * its nice weight.  Each CPU's loop runs the RUNNABLE thread with the least
+ * vruntime, so CPU time is shared out evenly and a thread that sleeps a lot
+ * (input, audio, compositor, a pipe reader) is always behind a CPU hog.
+ *
+ *  - Placement.  A thread that blocked is put back at no less than the queue
+ *    minimum minus SCHED_SLEEP_CREDIT when it wakes: a sleeper is ahead of the
+ *    threads that kept running, but cannot bank an hour of sleep and then
+ *    monopolise the CPU.  A new thread starts at the minimum.
+ *  - Wakeup preemption.  A wake (from a syscall, an IRQ, the tick or another
+ *    CPU) compares the woken thread with what the CPUs are running.  If a CPU
+ *    is idle it is kicked; otherwise, when the woken thread is ahead of the
+ *    running one by SCHED_WAKEUP_GRAN, that CPU's need_resched is set — and a
+ *    reschedule IPI sent if it is another CPU.  The switch itself happens only
+ *    at a return to user mode (syscall exit, IRQ exit), never in the middle of
+ *    kernel code: the kernel is not preemptible (BKL, lwIP, temp maps).
+ *  - Slice.  The tick preempts a thread that has run SCHED_SLICE_NS since its
+ *    dispatch when another runnable thread is behind it.
+ *  - yield() (sched_yield, kernel spin-waits) passes the yielder over once,
+ *    so it cannot keep the CPU from the thread it waits for.
+ */
+#define SCHED_SLICE_NS      4000000ULL   /* 4 ms; the 100 Hz tick rounds up   */
+#define SCHED_SLEEP_CREDIT  3000000ULL   /* sleeper bonus (CFS: latency / 2)  */
+#define SCHED_WAKEUP_GRAN   1000000ULL   /* lead needed to preempt on wakeup  */
+#define RESCHED_IPI_VECTOR  0xFCU
+
+/* Linux sched_prio_to_weight: nice 0 = 1024, each step ~1.25x. */
+static const uint32_t nice_weight[40] = {
+    88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916,
+    9548,  7620,  6100,  4904,  3906,  3121,  2501,  1991,  1586,  1277,
+    1024,  820,   655,   526,   423,   335,   272,   215,   172,   137,
+    110,   87,    70,    56,    45,    36,    29,    23,    18,    15,
+};
+
+static uint64_t sched_min_vr;   /* monotonic floor of the queue's vruntime */
+
+static inline uint64_t vr_scale(const struct proc *p, uint64_t ns) {
+    int n = p->nice;
+    if (n == 0) return ns;
+    if (n < -20) n = -20;
+    if (n > 19) n = 19;
+    return ns * 1024U / nice_weight[n + 20];
+}
+
+/* The vruntime a running thread has now, including its current stint. */
+static uint64_t cpu_curr_vr(uint32_t c, uint64_t now) {
+    struct proc *p = cpus[c].proc;
+    if (!p) return 0;
+    uint64_t t0 = cpus[c].run_t0;
+    return p->vruntime + (now > t0 ? vr_scale(p, now - t0) : 0);
+}
+
+/* Put a thread that is being made runnable where it belongs in the queue. */
+static void sched_place(struct proc *p) {
+    if (!p->vr_placed) {
+        p->vruntime  = sched_min_vr;
+        p->vr_placed = 1;
+        p->vr_slept  = 0;
+    } else if (p->vr_slept) {
+        uint64_t floor = sched_min_vr > SCHED_SLEEP_CREDIT
+                       ? sched_min_vr - SCHED_SLEEP_CREDIT : 0;
+        if (p->vruntime < floor) p->vruntime = floor;
+        p->vr_slept = 0;
+    }
+}
+
+static void resched_ipi(uint32_t c) {
+    if (!apic_available() || !cpus[c].online) return;
+    apic_write(LAPIC_REG_ICR_HI, cpus[c].apicid << 24);
+    apic_write(LAPIC_REG_ICR_LO, RESCHED_IPI_VECTOR | (1U << 14));
+}
+
+/* Ask CPU c to reschedule: a flag for itself, an IPI for another CPU (the
+ * idle APs poll the flag; the BSP halts and needs the interrupt). */
+static void resched_cpu(uint32_t c) {
+    if (cpus[c].need_resched) return;
+    cpus[c].need_resched = 1;
+    if (c != this_cpu_id() && !(cpus[c].idle && c != 0))
+        resched_ipi(c);
+}
+
+/* p was just made RUNNABLE (caller holds the BKL).  Place it and preempt
+ * whatever CPU it should displace, if any. */
+static void sched_wakeup(struct proc *p) {
+    sched_place(p);
+    uint32_t ncpu = smp_cpu_count();
+    if (ncpu > MAX_CPUS) ncpu = MAX_CPUS;
+    uint32_t self = this_cpu_id();
+    /* A syscall waking another thread (a pipe write, a condvar signal): the
+     * waker yields to it at the syscall's exit if no CPU has taken it by
+     * then, as Linux's sync wakeups do in practice — glibc-2.36's Riegel
+     * condvar relies on the signalled waiter running before the signaller
+     * can come back and steal the signal. */
+    if (!cpus[self].in_irq && current_proc && current_proc != p)
+        cpus[self].wake_last = p;
+    /* An idle CPU takes it at once.  Prefer this one if idle (a wake from an
+     * IRQ that interrupted the idle wait). */
+    if (cpus[self].idle) { cpus[self].need_resched = 1; return; }
+    for (uint32_t c = 0; c < ncpu; c++)
+        if (cpus[c].online || c == 0)
+            if (cpus[c].idle) { resched_cpu(c); return; }
+    /* Otherwise the CPU running the thread furthest ahead of p. */
+    uint64_t now = clock_mono_ns();
+    int best = -1;
+    uint64_t best_lead = 0;
+    for (uint32_t c = 0; c < ncpu; c++) {
+        if (!(cpus[c].online || c == 0) || !cpus[c].proc) continue;
+        if (cpus[c].proc == p) continue;
+        uint64_t cv = cpu_curr_vr(c, now);
+        if (cv > p->vruntime + SCHED_WAKEUP_GRAN && cv - p->vruntime > best_lead) {
+            best_lead = cv - p->vruntime;
+            best = (int)c;
+        }
+    }
+    if (best >= 0) resched_cpu((uint32_t)best);
+}
+
+/* Make a sleeping/stopped thread runnable: the one wake primitive. */
+void sched_make_runnable(struct proc *p) {
+    p->state = PROC_RUNNABLE;
+    sched_wakeup(p);
+}
+
+/* The RUNNABLE thread to run next: least vruntime, passing over a yielder
+ * once (its skip flag is consumed).  NULL if nothing is runnable. */
+static struct proc *sched_pick(void) {
+    struct proc *best = NULL, *skipped = NULL;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *p = &ptable[i];
+        if (p->state != PROC_RUNNABLE) continue;
+        sched_place(p);
+        if (p->vr_skip) {
+            p->vr_skip = 0;
+            if (!skipped || p->vruntime < skipped->vruntime) skipped = p;
+            continue;
+        }
+        if (!best || p->vruntime < best->vruntime) best = p;
+    }
+    if (!best) best = skipped;
+    if (best) {
+        /* Advance the floor to the least vruntime in play: the pick and
+         * whatever the other CPUs are running. */
+        uint64_t m = best->vruntime;
+        uint64_t now = clock_mono_ns();
+        for (uint32_t c = 0; c < MAX_CPUS; c++)
+            if (cpus[c].proc) {
+                uint64_t cv = cpu_curr_vr(c, now);
+                if (cv < m) m = cv;
+            }
+        if (m > sched_min_vr) sched_min_vr = m;
+    }
+    return best;
+}
 
 void scheduler_init(void) {
     /* Nothing to initialize — ptable is already set up by proc_init */
@@ -57,21 +211,18 @@ static void add_ns(uint32_t *us, uint32_t *rem, uint64_t ns) {
 }
 
 void scheduler_start(void) {
+    struct cpu *me = &cpus[this_cpu_id()];
     for (;;) {
-        int ran = 0;
         kwatch_poll();          /* emit a stall the timer tick spotted */
         uint64_t scan_t0 = kprof_probe_begin();
+        me->need_resched = 0;
+        struct proc *p = sched_pick();
 
-        for (int i = 0; i < MAX_PROCS; i++) {
-            struct proc *p = &ptable[i];
-            if (p->state != PROC_RUNNABLE) continue;
-
-            ran = 1;
+        if (p) {
             kprof_probe_end(KPP_SCHED_SCAN, scan_t0);
             uint64_t disp_t0 = kprof_probe_begin();
             current_proc   = p;
             p->state       = PROC_RUNNING;
-            p->time_slice  = DEFAULT_TIMESLICE;
             p->sched_count++;
 
             uint64_t d_t = kprof_probe_begin();
@@ -95,8 +246,11 @@ void scheduler_start(void) {
             kprof_count(KPE_CTXSW);
             kprof_switch(p->kprof_bucket);   /* charge the dispatch to KPB_SCHED */
             uint64_t run_t0 = clock_mono_ns();
+            me->run_t0 = run_t0;
             swtch(&scheduler_ctx, p->context);
-            add_ns(&p->run_us, &p->run_ns_rem, clock_mono_ns() - run_t0);
+            uint64_t ran = clock_mono_ns() - run_t0;
+            add_ns(&p->run_us, &p->run_ns_rem, ran);
+            p->vruntime += vr_scale(p, ran);
             /* Back in the scheduler: the outgoing thread already parked its own
              * bucket and left KPB_SCHED current (see kprof_park below). */
             uint64_t s_f = kprof_probe_begin();
@@ -115,42 +269,54 @@ void scheduler_start(void) {
             if (p->state == PROC_ZOMBIE && p->pid != p->tgid)
                 proc_release(p);
             __asm__ volatile("sti");
-            scan_t0 = kprof_probe_begin();
+            continue;
         }
 
         /* Nothing runnable: halt until the next interrupt (PIT tick, key,
-         * IRQ) instead of spinning — drops host CPU to ~0 when idle.  RELEASE
-         * the Big Kernel Lock first so the other CPU(s) and the waking IRQ can
-         * run kernel code; re-acquire on wake before re-scanning the shared
-         * ptable. */
-        if (!ran) {
-            int kp_old = kprof_switch(KPB_IDLE);
-            uint64_t idle_t0 = clock_mono_ns();
-            bkl_release();
-            if (this_cpu_id() == 0) {
-                /* BSP: woken by the PIT/keyboard/IRQ (all routed here via the
-                 * PIC→LINT0).  hlt drops the host CPU to ~0 when idle. */
+         * IRQ, reschedule IPI) instead of spinning — drops host CPU to ~0 when
+         * idle.  RELEASE the Big Kernel Lock first so the other CPU(s) and the
+         * waking IRQ can run kernel code; re-acquire on wake before re-scanning
+         * the shared ptable.  `idle` is published under the lock, so a waker
+         * (which holds it) either sees it and kicks us, or ran before our scan
+         * and we found its thread. */
+        int kp_old = kprof_switch(KPB_IDLE);
+        uint64_t idle_t0 = clock_mono_ns();
+        __asm__ volatile("cli");
+        me->idle = 1;
+        bkl_release();
+        if (this_cpu_id() == 0) {
+            /* BSP: woken by the PIT/keyboard/IRQ (all routed here via the
+             * PIC→LINT0) or a reschedule IPI.  Interrupts stay off from the
+             * need_resched test to the hlt (sti's one-instruction shadow), so
+             * a kick cannot slip in between and leave us halted until the
+             * next tick. */
+            if (!me->need_resched)
                 __asm__ volatile("sti; hlt");
-            } else {
-                /* AP: the PIC delivers only to the BSP, but the AP DOES have
-                 * its own LAPIC timer (S6) and takes IPIs, so service any TLB
-                 * shootdown while idling and spin-back-off before re-scanning
-                 * the shared ptable for newly-runnable work. */
-                for (volatile int i = 0; i < 200000; i++) {
-                    tlb_serve_pending();
-                    __asm__ volatile("pause");
-                }
+            __asm__ volatile("sti");
+        } else {
+            /* AP: the PIC delivers only to the BSP, but the AP DOES have
+             * its own LAPIC timer (S6) and takes IPIs, so service any TLB
+             * shootdown while idling and spin-back-off before re-scanning
+             * the shared ptable for newly-runnable work — at once when a
+             * waker kicks us through need_resched. */
+            __asm__ volatile("sti");
+            for (volatile int i = 0; i < 200000 && !me->need_resched; i++) {
+                tlb_serve_pending();
+                __asm__ volatile("pause");
             }
-            bkl_acquire();
-            add_ns(&sched_idle_us, &sched_idle_ns_rem, clock_mono_ns() - idle_t0);
-            kprof_switch(kp_old);
         }
+        bkl_acquire();
+        me->idle = 0;
+        add_ns(&sched_idle_us, &sched_idle_ns_rem, clock_mono_ns() - idle_t0);
+        kprof_switch(kp_old);
     }
 }
 
 void scheduler_tick(int user_mode) {
     uint32_t now = pit_ticks();
     kwatch_tick();
+    struct proc *cur = current_proc;
+    uint64_t min_runnable = ~0ULL;
     for (int i = 0; i < MAX_PROCS; i++) {
         struct proc *p = &ptable[i];
         if (p->state == PROC_SLEEPING && p->wake_tick &&
@@ -161,20 +327,49 @@ void scheduler_tick(int user_mode) {
             p->wake_tick = 0;
             p->sleep_chan = (void *)0;
             p->sleep_timed_out = 1;
-            p->state = PROC_RUNNABLE;
+            sched_make_runnable(p);
         }
+        if (p->state == PROC_RUNNABLE && p->vr_placed && p->vruntime < min_runnable)
+            min_runnable = p->vruntime;
     }
 
     /* Expire alarm/setitimer/POSIX timers: queues their signals only. */
     ktimer_tick(user_mode);
 
-    if (!current_proc) return;
-    current_proc->utime_ticks++;
-    /* Never preempt kernel-mode execution (see pit_handler) or a held
-     * preemption guard — both protect non-reentrant kernel state. */
-    if (!user_mode || current_proc->no_preempt) return;
-    if (--current_proc->time_slice <= 0)
-        yield();
+    if (!cur) return;
+    cur->utime_ticks++;
+    /* Slice expiry: the thread has had SCHED_SLICE_NS and another runnable
+     * one is behind it.  The switch happens at the IRQ's return to user mode
+     * (sched_irq_exit); kernel-mode execution is never preempted. */
+    struct cpu *me = &cpus[this_cpu_id()];
+    uint64_t t = clock_mono_ns();
+    if (min_runnable != ~0ULL && t - me->run_t0 >= SCHED_SLICE_NS &&
+        cpu_curr_vr(this_cpu_id(), t) > min_runnable)
+        me->need_resched = 1;
+    (void)user_mode;
+}
+
+/* Involuntary switch: back to the scheduler without the yield skip. */
+static void sched_preempt(void) {
+    current_proc->state = PROC_RUNNABLE;
+    kprof_count(KPE_RESCHED);
+    if (current_proc) current_proc->kprof_bucket = kprof_switch(KPB_SCHED);
+    __asm__ volatile("cli");
+    swtch(&current_proc->context, scheduler_ctx);
+    __asm__ volatile("sti");
+}
+
+/* Return-to-user point of an interrupt or exception (Linux
+ * exit_to_user_mode): switch away if a wake or the tick asked this CPU to.
+ * Only when the trap came from ring 3 — then no kernel state is in flight —
+ * and never inside a preemption guard. */
+void sched_irq_exit(int from_user) {
+    struct proc *cur = current_proc;
+    if (!from_user || !cur || cur->no_preempt) return;
+    struct cpu *me = &cpus[this_cpu_id()];
+    if (!me->need_resched || cur->state != PROC_RUNNING) return;
+    me->need_resched = 0;
+    sched_preempt();
 }
 
 /*
@@ -204,6 +399,7 @@ void yield(void) {
     if (!current_proc) return;
     uint64_t yp = kprof_probe_begin();
     current_proc->state = PROC_RUNNABLE;
+    current_proc->vr_skip = 1;
     kprof_probe_end(KPP_YIELD_PRE, yp);
     kprof_park();
     __asm__ volatile("cli");
@@ -223,6 +419,7 @@ int sleep_on(void *chan) {
     current_proc->sleep_tick = pit_ticks();
     current_proc->sleep_seq  = ++g_sleep_seq;
     current_proc->sleep_timed_out = 0;
+    current_proc->vr_slept  = 1;
     current_proc->state     = PROC_SLEEPING;
     int slp_sys = current_proc->last_syscall;
     uint64_t slp_t0 = kprof_sleep_begin();
@@ -242,6 +439,7 @@ int sleep_on(void *chan) {
 
 void proc_stop_self(void) {
     if (!current_proc) return;
+    current_proc->vr_slept = 1;
     current_proc->state = PROC_STOPPED;
     kprof_park();
     __asm__ volatile("cli");
@@ -255,20 +453,10 @@ void wake_up(void *chan) {
         if (p->state == PROC_SLEEPING && p->sleep_chan == chan) {
             p->sleep_chan = (void *)0;
             p->wake_tick  = 0;
-            p->state     = PROC_RUNNABLE;
+            sched_make_runnable(p);
         }
     }
 }
-
-/* Linux-style wakeup preemption (try_to_wake_up → check_preempt_curr): when a
- * waker makes another thread runnable, Linux can run it almost immediately.  Our
- * cooperative scheduler otherwise lets the waker keep running until its 20ms
- * quantum ends — a wake-to-run delay long enough for glibc-2.36's Riegel condvar
- * to "steal" a signal meant for the just-woken thread.  We don't preempt mid-
- * syscall (non-reentrant kernel); instead we set this flag and the syscall
- * dispatcher yields at the safe return-to-user boundary so the woken thread runs
- * next. */
-volatile int g_resched_pending = 0;
 
 /* Wake up to n waiters on `chan`, OLDEST-FIRST (ascending sleep_seq) — FIFO, as
  * Linux's futex wakes its plist chain in enqueue order.  glibc's condvar (and its
@@ -292,7 +480,7 @@ int wake_up_n(void *chan, int n) {
             if (p->state == PROC_SLEEPING && p->sleep_chan == chan) {
                 p->sleep_chan = (void *)0;
                 p->wake_tick  = 0;
-                p->state      = PROC_RUNNABLE;
+                sched_make_runnable(p);
                 woken++;
             }
         }
@@ -308,11 +496,11 @@ int wake_up_n(void *chan, int n) {
             if (!best) break;
             best->sleep_chan = (void *)0;
             best->wake_tick  = 0;
-            best->state      = PROC_RUNNABLE;
+            sched_make_runnable(best);
             woken++;
         }
     }
-    if (woken > 0) { g_resched_pending = 1; kprof_add(KPE_WAKE, (uint32_t)woken); }
+    if (woken > 0) kprof_add(KPE_WAKE, (uint32_t)woken);
     return woken;
 }
 
@@ -334,10 +522,9 @@ int wake_up_n_tgid(void *chan, int n, int tgid) {
         if (!best) break;
         best->sleep_chan = (void *)0;
         best->wake_tick  = 0;
-        best->state      = PROC_RUNNABLE;
+        sched_make_runnable(best);
         woken++;
     }
-    if (woken > 0) g_resched_pending = 1;
     return woken;
 }
 
@@ -345,17 +532,23 @@ int wake_up_n_tgid(void *chan, int n, int tgid) {
  * Linux checks TIF_NEED_RESCHED on every kernel→user exit and reschedules if
  * set.  We mirror that: the syscall dispatcher calls this at the return-to-user
  * boundary (after all syscall work + signal delivery, NOT mid-syscall, so no
- * non-reentrant kernel state is in flight).  If a wake happened during this
- * syscall (g_resched_pending), the waker yields so the just-woken thread runs
- * promptly (Linux try_to_wake_up -> check_preempt_curr).  Applies to every
- * wake, not just to one application's launch phase.  Guarded by no_preempt so
- * lwIP and other non-reentrant sections are never interrupted. */
+ * non-reentrant kernel state is in flight).  need_resched is set when a wake
+ * made a thread runnable that should displace this one (sched_wakeup: the
+ * wakee is SCHED_WAKEUP_GRAN ahead in vruntime — the usual case for a thread
+ * that was blocked), or when the tick ended the slice; and a syscall that
+ * woke a thread no CPU has picked up yet yields to it (sync wake, see
+ * sched_wakeup).  Guarded by no_preempt so lwIP and other non-reentrant sections
+ * are never interrupted. */
 void resched_on_return(void) {
+    struct cpu *me = &cpus[this_cpu_id()];
+    struct proc *w = me->wake_last;
+    me->wake_last = NULL;
     if (!current_proc || current_proc->no_preempt) return;
-    if (!g_resched_pending) return;
-    g_resched_pending = 0;
-    kprof_count(KPE_RESCHED);
-    yield();
+    if (me->need_resched) { sched_irq_exit(1); return; }
+    if (w && w->state == PROC_RUNNABLE) {
+        kprof_count(KPE_RESCHED);
+        yield();
+    }
 }
 
 int io_activity;

@@ -116,6 +116,16 @@ lapic_timer_isr:
     push dword 0xF0
     jmp irq_common_stub
 
+; ─── Reschedule IPI stub (vector 0xFC) ───────────────────────────────────────
+; Sent by a CPU that woke a thread this CPU should run (proc/scheduler.c
+; resched_cpu).  Routed through irq_common_stub (takes the BKL) so the handler
+; can switch threads on the way back to user mode; LAPIC EOI, no PIC EOI.
+global resched_ipi_isr
+resched_ipi_isr:
+    push dword 0
+    push dword 0xFC
+    jmp irq_common_stub
+
 ; ─── TLB shootdown IPI stub (vector 0xFD) ────────────────────────────────────
 ; Bare handler: flush this CPU's TLB + EOI.  Must NOT acquire the Big Kernel
 ; Lock — the sending CPU holds it, so taking it here would deadlock.  No

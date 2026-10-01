@@ -273,6 +273,10 @@ struct proc *proc_create_kthread(void (*fn)(void), const char *name) {
     p->utime_ticks = 0;
     p->run_us      = 0;
     p->run_ns_rem  = 0;
+    p->vr_placed   = 0;     /* placed at the queue minimum on first pick */
+    p->vr_slept    = 0;
+    p->vr_skip     = 0;
+    p->nice        = 0;
     p->run_us_mark = 0;
     p->sched_count = 0;
     p->no_preempt  = 0;

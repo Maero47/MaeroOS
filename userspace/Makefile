@@ -23,9 +23,10 @@ TESTFILES := ../testfiles
 # committed (like testfiles/dynprobe) and rebuilt only where the musl cross
 # compiler is installed.  wxpie: the W^X probe as a PIE started by ld-musl.
 # unixprobe: AF_UNIX semantics, static, so the same binary is the Linux
-# reference when run on a Linux host.
+# reference when run on a Linux host.  schedlat: wake and 10 ms hand-off latency
+# under CPU hogs (the scheduler benchmark).
 MUSL_CC   := $(shell command -v i686-linux-musl-gcc 2>/dev/null)
-MUSL_BINS := $(if $(MUSL_CC),$(TESTFILES)/wxpie $(TESTFILES)/unixprobe)
+MUSL_BINS := $(if $(MUSL_CC),$(TESTFILES)/wxpie $(TESTFILES)/unixprobe $(TESTFILES)/schedlat)
 
 LIBC_SRCS := libc/syscalls.c libc/stdio.c libc/stdlib.c libc/pthread.c \
              libc/string.c libc/dirent.c libc/termios.c libc/socket.c \
@@ -787,6 +788,8 @@ ifneq ($(MUSL_CC),)
 $(TESTFILES)/wxpie: wxprobe/wxpie.c
 	$(MUSL_CC) -O2 -Wall -Wextra -fpie -pie $< -o $@
 $(TESTFILES)/unixprobe: unixprobe/unixprobe.c
+	$(MUSL_CC) -O2 -Wall -Wextra -static $< -o $@ -lpthread
+$(TESTFILES)/schedlat: schedlat/schedlat.c
 	$(MUSL_CC) -O2 -Wall -Wextra -static $< -o $@ -lpthread
 endif
 

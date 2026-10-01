@@ -24,6 +24,19 @@ struct cpu {
      * before the newer request was posted). */
     volatile uint32_t tlb_req_gen;
     volatile uint32_t tlb_ack_gen;
+    /* Scheduler (proc/scheduler.c): need_resched asks this CPU to switch
+     * away from its thread at the next return to user mode (Linux
+     * TIF_NEED_RESCHED) or, when idle, to re-scan at once.  idle: in the idle
+     * wait with nothing to run.  run_t0: clock_mono_ns() at the dispatch of
+     * `proc`, so its running vruntime can be read from another CPU. */
+    volatile int need_resched;
+    volatile int idle;
+    uint64_t run_t0;
+    /* A syscall on this CPU woke wake_last (sync wake): the syscall exit
+     * yields to it if it is still waiting for a CPU.  in_irq: nesting of
+     * hardware interrupt handlers, whose wakes are not the thread's own. */
+    struct proc *wake_last;
+    int in_irq;
 };
 
 extern struct cpu cpus[MAX_CPUS];

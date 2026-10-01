@@ -2,9 +2,13 @@
 #include "isr.h"
 #include "pic.h"
 #include "apic.h"
+#include "percpu.h"
 #include <io.h>
 #include <stddef.h>
 #include <kernel/kprof.h>
+
+#define RESCHED_IPI_VECTOR 0xFCU   /* proc/scheduler.c */
+extern void sched_irq_exit(int from_user);
 
 /* Signal delivery on return from an interrupt to ring 3 (Linux
  * exit_to_user_mode_loop -> arch_do_signal_or_restart on every IRQ return):
@@ -61,8 +65,17 @@ static void irq_handler_body(registers_t *regs);
 
 void irq_handler(registers_t *regs) {
     int kp_old = kprof_switch(KPB_IRQ);
+    struct cpu *c = &cpus[this_cpu_id()];
+    c->in_irq++;
     irq_handler_body(regs);
+    c->in_irq--;
     kprof_switch(kp_old);
+    /* A wake from this IRQ (a device's reader, a tick-expired sleeper, a
+     * reschedule IPI from another CPU) or the tick's slice expiry asked for a
+     * switch: take it on the way back to user mode — Linux's IRQ-exit
+     * preemption, so the woken thread runs now, not when the slice ends.  The
+     * handler is done (EOI sent, signals delivered), so nothing is in flight. */
+    sched_irq_exit((regs->cs & 3) != 0);
 }
 
 static void irq_handler_body(registers_t *regs) {
@@ -75,6 +88,15 @@ static void irq_handler_body(registers_t *regs) {
         int user_mode = (regs->cs & 3) != 0;
         extern void scheduler_tick(int user_mode);
         scheduler_tick(user_mode);
+        irq_return_signals(regs);
+        return;
+    }
+
+    /* ── Reschedule IPI (vector 0xFC): another CPU woke a thread that should
+     * displace ours, or kicked us out of the idle halt.  It set our
+     * need_resched; the switch is irq_handler's return-to-user check. */
+    if (regs->int_no == RESCHED_IPI_VECTOR) {
+        apic_eoi();
         irq_return_signals(regs);
         return;
     }
