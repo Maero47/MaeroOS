@@ -7,9 +7,11 @@
  *
  * QEMU emulates none of these parts, so this was written from documentation
  * (see r8169_hw.h and docs/r8169.md) and has to be tried on a real PC.  It
- * probes nothing but the PCI IDs below and refuses TxConfig revisions it
- * does not know, so on a machine without one it prints "not present" and
- * touches no hardware.
+ * probes nothing but the PCI IDs below, so on a machine without one it
+ * prints "not present" and touches no hardware.  A TxConfig revision it
+ * does not know is left as found: PCI COMMAND and power state restored,
+ * nothing written to the chip.  Bus mastering stays off from probe until
+ * the chip has been stopped, reset and given fresh rings.
  *
  * Model, as for the e1000: rings and buffers in .bss (physical = virtual -
  * KERNEL_VMA, inside the low 16 MiB, so below 4 GiB with or without PAE and
@@ -161,17 +163,43 @@ static uint8_t pci_cap(const pci_device_t *d, uint8_t id) {
     return 0;
 }
 
+/* PCI state at probe, put back if the device turns out not to be ours to
+ * drive (unknown revision, no usable BAR): COMMAND as firmware left it and
+ * the power state.  pm_off is 0 when there is no PM capability. */
+static const pci_device_t *pdev;
+static uint32_t orig_cmd, orig_pmcsr;
+static uint8_t pm_off;
+
 /* Firmware may leave the NIC in D3hot; registers read all-ones there. */
 static void pci_to_d0(const pci_device_t *d) {
-    uint8_t pm = pci_cap(d, 0x01);
-    if (!pm)
+    pm_off = pci_cap(d, 0x01);
+    if (!pm_off)
         return;
-    uint32_t pmcsr = pci_read_config32(d->bus, d->slot, d->func, (uint8_t)(pm + 4));
-    if (pmcsr & 3U) {
-        pci_write_config32(d->bus, d->slot, d->func, (uint8_t)(pm + 4),
-                           pmcsr & ~3U);
+    orig_pmcsr = pci_read_config32(d->bus, d->slot, d->func, (uint8_t)(pm_off + 4));
+    if (orig_pmcsr & 3U) {
+        pci_write_config32(d->bus, d->slot, d->func, (uint8_t)(pm_off + 4),
+                           orig_pmcsr & ~3U);
         udelay_io(0, 10000);          /* D3hot -> D0: 10 ms */
     }
+}
+
+/* Give up on the device: decode and bus mastering as they were, back to the
+ * power state it was found in. */
+static void pci_restore(const pci_device_t *d) {
+    pci_write_config32(d->bus, d->slot, d->func, 0x04, orig_cmd & 0xFFFFU);
+    if (pm_off && (orig_pmcsr & 3U))
+        pci_write_config32(d->bus, d->slot, d->func, (uint8_t)(pm_off + 4),
+                           orig_pmcsr & 0xFFFFU & ~(1U << 15));   /* PME_Status RW1C */
+}
+
+/* io.bus_master: r8169_hw_start() calls it once the chip has been stopped,
+ * reset and given fresh rings. */
+static void bus_master_on(void *ctx) {
+    (void)ctx;
+    uint32_t cmd = pci_read_config32(pdev->bus, pdev->slot, pdev->func, 0x04);
+    if (!(cmd & 0x4U))
+        pci_write_config32(pdev->bus, pdev->slot, pdev->func, 0x04,
+                           (cmd & 0xFFFFU) | 0x4U);
 }
 
 /* ASPM L0s/L1 and clock PM off (as re(4) does by default): implicated in TX
@@ -230,7 +258,8 @@ static void write_mac(void) {
 }
 
 /* ── Bring-up ────────────────────────────────────────────────────────────── */
-/* Stop, reset, fresh rings, start.  Used at attach and to recover. */
+/* Stop, reset, fresh rings, start (which turns bus mastering on).  Used at
+ * attach and to recover. */
 static int hw_restart(void) {
     r8169_hw_stop(&io, info.flags);
     int r = r8169_hw_reset(&io, info.flags);
@@ -394,25 +423,33 @@ void r8169_init(void) {
             i++;
     }
 
-    pci_to_d0(dev);
-    uint32_t cmd = pci_read_config32(dev->bus, dev->slot, dev->func, 0x04);
-    cmd |= 0x00000007U;               /* I/O, memory, bus master */
-    cmd &= ~(1U << 10);               /* INTx enabled */
-    pci_write_config32(dev->bus, dev->slot, dev->func, 0x04, cmd);
-
+    /* Nothing is written to the device before the BAR is known usable. */
     if (mem)
         mmio = mmio_map(mem, 0x100);
     if (mmio) {
         info.bar_phys = mem;
-        io = (struct r8169_io){ 0, m_rd8, m_rd16, m_rd32, m_wr8, m_wr16, m_wr32, udelay_io };
+        io = (struct r8169_io){ 0, m_rd8, m_rd16, m_rd32, m_wr8, m_wr16, m_wr32,
+                                udelay_io, bus_master_on };
     } else if (port) {
         info.io_base = port;
-        io = (struct r8169_io){ 0, p_rd8, p_rd16, p_rd32, p_wr8, p_wr16, p_wr32, udelay_io };
+        io = (struct r8169_io){ 0, p_rd8, p_rd16, p_rd32, p_wr8, p_wr16, p_wr32,
+                                udelay_io, bus_master_on };
     } else {
         printk("[R8169] %04x:%04x has no usable BAR\n",
                (unsigned)dev->vendor_id, (unsigned)dev->device_id);
         return;
     }
+
+    /* Register decode on, bus mastering OFF: firmware (a PXE ROM, UEFI's
+     * network stack) can leave RX DMA armed on rings in memory the kernel
+     * now owns.  With BME clear the chip cannot reach memory; it comes back
+     * on in r8169_hw_start(), after stop, reset and fresh rings.  INTx stays
+     * as firmware left it until the device is ours. */
+    pdev = dev;
+    orig_cmd = pci_read_config32(dev->bus, dev->slot, dev->func, 0x04);
+    pci_write_config32(dev->bus, dev->slot, dev->func, 0x04,
+                       ((orig_cmd & 0xFFFFU) | 0x3U) & ~0x4U);
+    pci_to_d0(dev);
 
     info.txcfg = R8169_RD32(&io, R8169_TXCFG);
     const struct r8169_chip *chip = r8169_chip_lookup(info.txcfg);
@@ -420,6 +457,7 @@ void r8169_init(void) {
         printk("[R8169] %04x:%04x TxConfig=0x%08x: unknown chip revision, not used\n",
                (unsigned)dev->vendor_id, (unsigned)dev->device_id,
                (unsigned)info.txcfg);
+        pci_restore(dev);
         return;
     }
     info.chip = chip->name;
@@ -429,6 +467,9 @@ void r8169_init(void) {
 
     r8169_hw_stop(&io, info.flags);   /* firmware may have left DMA running */
     r8169_hw_wake(&io, info.flags);
+    uint32_t cmd = pci_read_config32(dev->bus, dev->slot, dev->func, 0x04);
+    pci_write_config32(dev->bus, dev->slot, dev->func, 0x04,
+                       (cmd & 0xFFFFU) & ~(1U << 10));     /* INTx enabled */
     read_mac(dev);
     int rst = hw_restart();
     info.phy_ok = r8169_phy_init(&io, info.flags) == 0;

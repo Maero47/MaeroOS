@@ -288,6 +288,10 @@ struct r8169_io {
     void (*wr16)(void *ctx, uint32_t reg, uint16_t v);
     void (*wr32)(void *ctx, uint32_t reg, uint32_t v);
     void (*udelay)(void *ctx, uint32_t us);
+    /* PCI bus mastering on; optional.  Called by r8169_hw_start() only, so
+     * the chip can DMA only once it is stopped, reset and has fresh rings:
+     * a ring firmware left armed must never reach kernel memory. */
+    void (*bus_master)(void *ctx);
 };
 
 #define R8169_RD8(io, r)     ((io)->rd8((io)->ctx, (r)))
@@ -554,7 +558,8 @@ static inline int r8169_hw_reset(const struct r8169_io *io, uint32_t flags) {
 }
 
 /*
- * Program a freshly reset chip: C+ mode, ring addresses, TX/RX config, all
+ * Program a freshly reset chip (rings already initialised): bus mastering
+ * on, then C+ mode, ring addresses, TX/RX config, all
  * multicast accepted (the 8168F's hash filter is broken anyway, and lwIP
  * filters what it does not want), interrupts on.  The 8169..8168F want the
  * MAC enabled before TxConfig/RxConfig are written; the 8168G+ after, with
@@ -564,6 +569,8 @@ static inline int r8169_hw_reset(const struct r8169_io *io, uint32_t flags) {
 static inline void r8169_hw_start(const struct r8169_io *io, uint32_t flags,
                                    uint32_t rx_ring_phys, uint32_t tx_ring_phys,
                                    uint16_t rms) {
+    if (io->bus_master)
+        io->bus_master(io->ctx);
     uint16_t cp = R8169_CPCMD_PCI_MRW;
     if (flags & R8169_F_MACSTAT)
         cp |= R8169_CPCMD_MACSTAT_DIS | 0x0001;   /* re(4): vendor magic */

@@ -50,6 +50,10 @@ static struct chip {
     uint64_t delay_us;
     int resets;
     int eor_violation;
+    int bme;                 /* PCI bus mastering: no DMA without it */
+    int bme_calls, bme_at_log;   /* log position when it was turned on */
+    int reset_with_bme;      /* resets issued while BME was on */
+    int dma_blocked;         /* DMA attempts refused for lack of BME */
 } C;
 
 static uint32_t get32(uint32_t reg) {
@@ -83,6 +87,10 @@ static void chip_reset_state(uint32_t xid) {
 static void chip_tx_run(void) {
     if (C.tx_hold || !(C.r[R8169_CMD] & R8169_CMD_TE))
         return;
+    if (!C.bme) {
+        C.dma_blocked++;
+        return;
+    }
     CHECK(get32(R8169_TNPDS_LO) == TX_RING_PHYS, "TX ring address 0x%x",
           get32(R8169_TNPDS_LO));
     for (uint32_t n = 0; n < C.tx_size; n++) {
@@ -114,6 +122,10 @@ static void chip_tx_run(void) {
 static int chip_rx_frame(uint32_t len, uint8_t tag, int err) {
     uint32_t left = len;
     int first = 1;
+    if (!C.bme) {
+        C.dma_blocked++;
+        return -1;
+    }
     while (left) {
         struct r8169_desc *d = &C.rx_ring[C.rx_idx];
         if (!(d->opts1 & R8169_DESC_OWN) || !(C.r[R8169_CMD] & R8169_CMD_RE) ||
@@ -176,6 +188,8 @@ static void s_wr8(void *c, uint32_t reg, uint8_t v) {
     if (reg == R8169_CMD) {
         if (v & R8169_CMD_RST) {
             C.resets++;
+            if (C.bme)
+                C.reset_with_bme++;
             C.rst_reads = 3;
             C.r[reg] = R8169_CMD_RST;
             put32(R8169_RXCFG, 0);
@@ -229,9 +243,15 @@ static void s_wr32(void *c, uint32_t reg, uint32_t v) {
     put32(reg, v);
 }
 static void s_udelay(void *c, uint32_t us) { (void)c; C.delay_us += us; }
+static void s_bus_master(void *c) {
+    (void)c;
+    C.bme = 1;
+    C.bme_calls++;
+    C.bme_at_log = C.nlog;
+}
 
 static const struct r8169_io sim = {
-    0, s_rd8, s_rd16, s_rd32, s_wr8, s_wr16, s_wr32, s_udelay
+    0, s_rd8, s_rd16, s_rd32, s_wr8, s_wr16, s_wr32, s_udelay, s_bus_master
 };
 
 /* Index of the first logged write of `val` (masked) to reg, -1 if none. */
@@ -264,9 +284,15 @@ static void attach(uint32_t txcfg, uint16_t device_id, uint32_t *flags_out) {
     C.rx_ring = rx_ring; C.tx_ring = tx_ring;
     C.rx_bufs = rx_bufs; C.tx_bufs = tx_bufs;
     C.rx_size = C.tx_size = NDESC;
-    /* Firmware left the MAC running with frames accepted. */
+    /* Firmware left the MAC running with frames accepted and its RX ring
+     * armed; the driver has turned bus mastering off (r8169_init), so a
+     * frame arriving now must not be DMA'd anywhere. */
     C.r[R8169_CMD] = R8169_CMD_TE | R8169_CMD_RE;
     put32(R8169_RXCFG, 0xE70F);
+    for (int i = 0; i < NDESC; i++)
+        rx_ring[i].opts1 = R8169_DESC_OWN | BUFSZ;
+    CHECK(chip_rx_frame(100, 0x99, 0) < 0 && C.dma_blocked == 1,
+          "DMA with bus mastering off");
 
     r8169_hw_stop(&sim, flags);
     r8169_hw_wake(&sim, flags);
@@ -276,8 +302,12 @@ static void attach(uint32_t txcfg, uint16_t device_id, uint32_t *flags_out) {
         phys[i] = RX_BUF_PHYS + (uint32_t)i * BUFSZ;
     r8169_rx_init(&rxq, rx_ring, NDESC, phys, BUFSZ);
     r8169_tx_init(&txq, tx_ring, NDESC);
+    CHECK(!C.bme && C.reset_with_bme == 0, "bus mastering on before start");
     C.nlog = 0;                       /* check the start sequence alone */
     r8169_hw_start(&sim, flags, RX_RING_PHYS, TX_RING_PHYS, BUFSZ);
+    CHECK(C.bme && C.bme_calls == 1 && C.bme_at_log == 0,
+          "bus mastering not turned on first in start (calls %d, at write %d)",
+          C.bme_calls, C.bme_at_log);
     *flags_out = flags;
 }
 
