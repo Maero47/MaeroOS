@@ -3233,9 +3233,11 @@ static void handle_click(int x, int y) {
                     (unsigned)((int)fb_h - TASKBAR_H - 4),
                     ORB_SIZE, ORB_SIZE)) {
             launcher_open = 1;
-            trace("launcher open settings=%d,%d",
+            trace("launcher open settings=%d,%d power=%d,%d",
                   sm_x() + SM_LEFT_W + SM_RIGHT_W / 2,
-                  sm_y() + 100 + 3 * 32 + 16);
+                  sm_y() + 100 + 3 * 32 + 16,
+                  sm_x() + SM_LEFT_W + SM_RIGHT_W / 2,
+                  sm_y() + SM_H - 42 + 14);
             return;
         }
         if (x >= (int)fb_w - 10) {         /* Show Desktop sliver */

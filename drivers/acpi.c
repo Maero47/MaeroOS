@@ -44,6 +44,16 @@ static volatile int kacpid_running;   /* the scheduler is up: sleeping is legal 
 int acpi_available(void) { return acpi_ready; }
 uint32_t acpi_madt_cpu_count(void) { return madt_cpus; }
 
+#define MADT_MAX_IDS 64
+static uint8_t madt_ids[MADT_MAX_IDS];
+
+uint32_t acpi_madt_lapic_ids(uint8_t *out, uint32_t max) {
+    uint32_t n = madt_cpus < MADT_MAX_IDS ? madt_cpus : MADT_MAX_IDS;
+    if (n > max) n = max;
+    for (uint32_t i = 0; i < n; i++) out[i] = madt_ids[i];
+    return n;
+}
+
 /* ── Waiting ─────────────────────────────────────────────────────────────── */
 
 /* Busy-wait about `us` microseconds: a port-0x80 write takes ~1 us on every
@@ -523,8 +533,12 @@ static uacpi_iteration_decision madt_entry(uacpi_handle user,
                                            struct acpi_entry_hdr *e) {
     (void)user;
     if (e->type == ACPI_MADT_ENTRY_TYPE_LAPIC) {
+        /* Online-capable but disabled entries are hot-plug slots, not CPUs. */
         struct acpi_madt_lapic *l = (void *)e;
-        if (l->flags & (ACPI_PIC_ENABLED | ACPI_PIC_ONLINE_CAPABLE)) madt_cpus++;
+        if (l->flags & ACPI_PIC_ENABLED) {
+            if (madt_cpus < MADT_MAX_IDS) madt_ids[madt_cpus] = l->id;
+            madt_cpus++;
+        }
     } else if (e->type == ACPI_MADT_ENTRY_TYPE_IOAPIC) {
         struct acpi_madt_ioapic *io = (void *)e;
         printk("[ACPI] MADT: I/O APIC id %u at 0x%08x, GSI base %u\n",

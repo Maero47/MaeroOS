@@ -25,6 +25,10 @@ int acpi_available(void);
 /* Number of enabled processors the MADT lists (0: no MADT). */
 uint32_t acpi_madt_cpu_count(void);
 
+/* Their local APIC ids, in MADT order (the BSP's included); returns how many
+ * were stored in out[0..max). */
+uint32_t acpi_madt_lapic_ids(uint8_t *out, uint32_t max);
+
 /* Enter S5 (\_PTS, \_S5 SLP_TYPa/b, PM1 control) — falls back to the
  * well-known emulator ports when ACPI is unavailable or S5 fails. */
 void acpi_poweroff(void) __attribute__((noreturn));
