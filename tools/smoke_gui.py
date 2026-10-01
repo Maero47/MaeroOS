@@ -772,7 +772,46 @@ class GuiSmoke:
             raise AssertionError(f"Turkish text saved as {got!r}, want {want!r}")
         self.settle()
         self.shot("editor-turkish")
+        # Copy the line and paste it into a terminal: UTF-8 (continuation
+        # bytes like the 0x9F of ğ) must pass the paste filter intact.
+        self.inp.combo(["ctrl"], "a")
+        self.inp.combo(["ctrl"], "c")
+        line = want.rstrip(b"\n")                  # the buffer's one line
+        self.con.wait_re(r"\[edit\] copied %d bytes" % len(line))
         self.close(win, "button")
+        self.con.run("busybox rm -f /tmp/gp")
+        start = self.con.mark()
+        self.con.run("wmctl launch term")
+        term = self.wait_window("Terminal", start=start)
+        self.con.wait_re(r"\[term\] shell pid=\d+", start=start)
+        self.expect_focus(term)
+        self.settle(0.5)
+        # "cat >/tmp/gp" typed by key position on Turkish Q.
+        tr_keys = {" ": ("spc", False), "/": ("7", True), ">": ("less", True),
+                   "\n": ("ret", False)}
+        for ch in "cat >/tmp/gp\n":
+            qcode, shifted = tr_keys.get(ch, (ch, False))
+            if shifted:
+                self.inp.combo(["shift"], qcode)
+            else:
+                self.inp.press(qcode)
+        self.settle(0.5)
+        self.inp.combo(["ctrl", "shift"], "v")
+        self.con.wait_re(r"\[term\] pasted %d bytes" % len(line))
+        self.settle(0.5)
+        self.inp.press("ret")
+        self.inp.combo(["ctrl"], "d")
+        deadline = time.time() + 10
+        while True:
+            got = self.con.run("cat /tmp/gp").encode("latin1").replace(b"\r", b"")
+            if want in got:
+                break
+            if time.time() >= deadline:
+                raise AssertionError(f"pasted Turkish text arrived as {got!r}, "
+                                     f"want {want!r}")
+            self.settle(0.5)
+        self.shot("term-turkish-paste")
+        self.close(term, "button")
 
     def settings(self):
         before = self.shot("before-settings")

@@ -813,7 +813,10 @@ static void paste_clipboard(void) {
             if (c < 32 || c == 127) continue;
             if (c == 0xC2 && i + 1 < n &&
                 (unsigned char)buf[i + 1] >= 0x80 &&
-                (unsigned char)buf[i + 1] <= 0x9F) {   /* U+0080..U+009F */
+                (unsigned char)buf[i + 1] <= 0x9F) {
+                /* C2 80..C2 9F encodes U+0080..U+009F (C1 controls).  Bare
+                 * 0x80..0x9F bytes are UTF-8 continuation bytes (ğ = C4 9F)
+                 * and stay. */
                 i++;
                 continue;
             }
