@@ -54,6 +54,14 @@
 #define LWIP_DHCP_DOES_ACD_CHECK        0
 #define LWIP_DNS_SUPPORT_MDNS_QUERIES   0
 
+/* Server sockets (net/socket.c listen/accept): SO_REUSEADDR lets a server
+ * rebind its port while old connections sit in TIME_WAIT; the backlog makes
+ * a listener with a full accept queue ignore new SYNs (the client retries),
+ * as Linux does; keepalive takes TCP_KEEPIDLE/KEEPINTVL/KEEPCNT per pcb. */
+#define SO_REUSE                        1
+#define TCP_LISTEN_BACKLOG              1
+#define LWIP_TCP_KEEPALIVE              1
+
 #define TCP_MSS                         1460
 #define TCP_SND_BUF                     (16 * TCP_MSS)
 /* 16*MSS ≈ 23 KB receive window: comfortably under the 64 KB per-socket RX

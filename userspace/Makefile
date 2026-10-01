@@ -54,7 +54,7 @@ USER_BINS := $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
 	     $(TESTFILES)/mkfifo $(TESTFILES)/ln $(TESTFILES)/readlink \
 	     $(TESTFILES)/sysprobe $(TESTFILES)/fcprobe $(TESTFILES)/lspci $(TESTFILES)/ifconfig \
 	     $(TESTFILES)/diskprobe $(TESTFILES)/fsprobe $(TESTFILES)/respawnprobe $(TESTFILES)/heapprobe \
-	     $(TESTFILES)/sockprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget $(TESTFILES)/getent \
+	     $(TESTFILES)/sockprobe $(TESTFILES)/srvprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget $(TESTFILES)/getent \
 	     $(TESTFILES)/randprobe $(TESTFILES)/sysmiscprobe $(TESTFILES)/abi2probe $(TESTFILES)/sigexecprobe $(TESTFILES)/timerprobe $(TESTFILES)/symprobe $(TESTFILES)/sigshareprobe \
 	     $(TESTFILES)/fbtest $(TESTFILES)/evtest $(TESTFILES)/mousetest \
 	     $(TESTFILES)/polltest $(TESTFILES)/ptytest $(TESTFILES)/cttytest \
@@ -480,6 +480,13 @@ sockprobe/sockprobe.o: sockprobe/sockprobe.c
 
 $(TESTFILES)/sockprobe: $(CRT0_OBJ) sockprobe/sockprobe.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) sockprobe/sockprobe.o libc/libc.a
+
+# srvprobe (AF_INET listen/accept, blocking UDP; tools/smoke_tcpsrv.py)
+srvprobe/srvprobe.o: srvprobe/srvprobe.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TESTFILES)/srvprobe: $(CRT0_OBJ) srvprobe/srvprobe.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) srvprobe/srvprobe.o libc/libc.a
 
 # netprobe
 netprobe/netprobe.o: netprobe/netprobe.c

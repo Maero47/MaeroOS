@@ -43,10 +43,7 @@ int open(const char *path, int flags, ...) {
     return __chkerr(syscall3(5, (int)path, flags, mode));
 }
 
-void __socket_forget(int fd);   /* libc/socket.c: SO_RCVTIMEO table */
-
 int close(int fd) {
-    __socket_forget(fd);
     return __chkerr(syscall1(6, fd));
 }
 

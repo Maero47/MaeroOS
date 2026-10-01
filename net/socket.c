@@ -23,6 +23,12 @@ static void net_io_sleep(uint32_t ticks) {
     sleep_on(&io_activity);
 }
 
+/* SO_RCVTIMEO/SO_SNDTIMEO: a wait of `ms` (0 = none) started at `start`
+ * has run out.  The PIT runs at 100 Hz. */
+static int timed_out(uint32_t ms, uint32_t start) {
+    return ms && (uint32_t)(pit_ticks() - start) >= (ms + 9) / 10;
+}
+
 #define AF_INET_K      2
 #define SOCK_STREAM_K  1
 #define SOCK_DGRAM_K   2
@@ -38,6 +44,11 @@ static void net_io_sleep(uint32_t ticks) {
 #define UDP_QUEUE_DEPTH 4
 #define UDP_PACKET_MAX 1536
 #define TCP_RX_SIZE 65536   /* per-socket RX ring (burst headroom) */
+/* listen() backlog ceiling (Linux clamps to somaxconn).  Established
+ * connections waiting for accept() and half-open ones together count against
+ * it (lwIP's TCP_LISTEN_BACKLOG with tcp_backlog_delayed), and each queued one
+ * holds a socket slot and a TCP pcb (MEMP_NUM_TCP_PCB). */
+#define ACCEPTQ_MAX 32
 
 enum {
     TCP_STATE_NONE = 0,
@@ -80,6 +91,24 @@ struct net_socket {
     int qhead;
     int qtail;
     int qcount;
+    /* listen(): the listening pcb replaces s->tcp (which stays NULL, so the
+     * connection paths see "no connection"), and accepted connections wait
+     * in acceptq (ACCEPTQ_MAX slots from kmalloc), each holding the one
+     * reference accept() hands to the new descriptor. */
+    int listening;
+    struct tcp_pcb *lpcb;
+    net_socket_t **acceptq;
+    int aq_head;
+    int aq_count;
+    int backlog;
+    /* setsockopt state, also applied to every pcb the socket gets later
+     * (an accepted connection inherits its listener's). */
+    int opt_reuseaddr;
+    int opt_keepalive;
+    int opt_nodelay;
+    uint32_t keep_idle_ms, keep_intvl_ms, keep_cnt;   /* 0 = lwIP default */
+    uint32_t rcvtimeo_ms;   /* SO_RCVTIMEO: 0 = wait forever */
+    uint32_t sndtimeo_ms;   /* SO_SNDTIMEO */
 };
 
 static net_socket_t sockets[MAX_NET_SOCKETS];
@@ -260,8 +289,33 @@ static err_t tcp_poll_cb(void *arg, struct tcp_pcb *pcb) {
     return s && s->used ? ERR_OK : ERR_ABRT;
 }
 
+/* The socket's options onto a TCP pcb (a new connection or the listener). */
+static void tcp_apply_opts(net_socket_t *s, struct tcp_pcb *pcb) {
+    if (!pcb)
+        return;
+    if (s->opt_reuseaddr) ip_set_option(pcb, SOF_REUSEADDR);
+    else                  ip_reset_option(pcb, SOF_REUSEADDR);
+    if (s->opt_keepalive) ip_set_option(pcb, SOF_KEEPALIVE);
+    else                  ip_reset_option(pcb, SOF_KEEPALIVE);
+    if (pcb->state == LISTEN)
+        return;             /* a tcp_pcb_listen has no more fields */
+    if (s->opt_nodelay) tcp_nagle_disable(pcb);
+    else                tcp_nagle_enable(pcb);
+    if (s->keep_idle_ms)  pcb->keep_idle = s->keep_idle_ms;
+    if (s->keep_intvl_ms) pcb->keep_intvl = s->keep_intvl_ms;
+    if (s->keep_cnt)      pcb->keep_cnt = s->keep_cnt;
+}
+
 void net_sockets_init(void) {
     memset(sockets, 0, sizeof(sockets));
+}
+
+static net_socket_t *socket_free_slot(void) {
+    for (int i = 0; i < MAX_NET_SOCKETS; i++)
+        if (!sockets[i].used)
+            return &sockets[i];
+    printk("[NET] socket: all %d sockets in use\n", MAX_NET_SOCKETS);
+    return NULL;
 }
 
 static int socket_create_locked(int domain, int type, int protocol, net_socket_t **out) {
@@ -274,14 +328,9 @@ static int socket_create_locked(int domain, int type, int protocol, net_socket_t
     if (type == SOCK_STREAM_K && protocol != 0 && protocol != IPPROTO_TCP_K)
         return -93;
 
-    net_socket_t *s = NULL;
-    for (int i = 0; i < MAX_NET_SOCKETS && !s; i++)
-        if (!sockets[i].used)
-            s = &sockets[i];
-    if (!s) {
-        printk("[NET] socket: all %d sockets in use\n", MAX_NET_SOCKETS);
+    net_socket_t *s = socket_free_slot();
+    if (!s)
         return -24;
-    }
 
     /* kmalloc takes the heap lock with interrupts off and never sleeps, so
      * it is safe under the caller's preempt_disable. */
@@ -336,6 +385,29 @@ void net_socket_retain(net_socket_t *s) {
         s->refs++;
 }
 
+static void socket_release_locked(net_socket_t *s);
+
+/* Close the listening pcb (lwIP frees it at once; half-open connections lose
+ * their listener and are dropped) and release every connection still waiting
+ * for accept(): their pcbs are closed, so the peers see the connection end
+ * (Linux resets them).  accept() then fails with EINVAL. */
+static void listen_stop(net_socket_t *s) {
+    if (s->lpcb) {
+        tcp_arg(s->lpcb, NULL);
+        tcp_accept(s->lpcb, NULL);
+        tcp_close(s->lpcb);
+        s->lpcb = NULL;
+    }
+    while (s->aq_count > 0) {
+        net_socket_t *c = s->acceptq[s->aq_head];
+        s->aq_head = (s->aq_head + 1) % ACCEPTQ_MAX;
+        s->aq_count--;
+        if (c->tcp)
+            tcp_backlog_accepted(c->tcp);
+        socket_release_locked(c);
+    }
+}
+
 static void socket_release_locked(net_socket_t *s) {
     if (!s || !s->used)
         return;
@@ -344,10 +416,12 @@ static void socket_release_locked(net_socket_t *s) {
     if (s->udp)
         udp_remove(s->udp);
     socket_detach_pcb(s, 0);
+    listen_stop(s);
     /* No lwIP callback can reach s any more (udp_remove, and the detach
      * cleared the TCP pcb's arg), so the buffers can go. */
     kfree(s->tcp_rx);
     kfree(s->queue);
+    kfree(s->acceptq);
     memset(s, 0, sizeof(*s));
 }
 
@@ -356,12 +430,131 @@ static int socket_bind_locked(net_socket_t *s, const net_sockaddr_in_t *addr) {
         return -9;
     if (addr->family != AF_INET_K)
         return -97;
+    /* Linux inet_bind: a socket binds once (EINVAL after that, also once
+     * it listens or connected), and only to an address of this host. */
+    if (s->type == SOCK_STREAM_K &&
+        (!s->tcp || s->tcp->local_port != 0 || s->tcp->state != CLOSED))
+        return -22;
+    if (s->type == SOCK_DGRAM_K && s->udp->local_port != 0)
+        return -22;
+    if (!net_lwip_addr_is_local(addr->addr))
+        return -99;                                      /* -EADDRNOTAVAIL */
     ip_addr_t ip;
     ip_addr_set_ip4_u32(&ip, addr->addr);
     err_t e = s->type == SOCK_DGRAM_K
         ? udp_bind(s->udp, &ip, bswap16(addr->port))
         : tcp_bind(s->tcp, &ip, bswap16(addr->port));
-    return e == ERR_OK ? 0 : -98;
+    if (e == ERR_OK) return 0;
+    return e == ERR_USE ? -98 : -22;                     /* -EADDRINUSE */
+}
+
+/* lwIP accept callback: a connection to a listening socket completed its
+ * handshake.  It becomes a socket of its own at once (so data the peer sends
+ * before accept() lands in its ring) and waits in the listener's queue,
+ * counted against the backlog until accept() takes it.  Returning an error
+ * makes lwIP abort the new pcb. */
+static err_t tcp_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err) {
+    net_socket_t *ls = (net_socket_t *)arg;
+    if (!ls || !ls->listening || !newpcb || err != ERR_OK)
+        return ERR_VAL;
+    if (ls->aq_count >= ACCEPTQ_MAX)
+        return ERR_MEM;
+    net_socket_t *c = socket_free_slot();
+    if (!c)
+        return ERR_MEM;
+    uint8_t *ring = (uint8_t *)kmalloc(TCP_RX_SIZE);
+    if (!ring)
+        return ERR_MEM;
+    memset(c, 0, sizeof(*c));
+    c->used = 1;
+    c->refs = 1;
+    c->domain = AF_INET_K;
+    c->type = SOCK_STREAM_K;
+    c->protocol = IPPROTO_TCP_K;
+    c->tcp = newpcb;
+    c->tcp_rx = ring;
+    c->tcp_state = TCP_STATE_CONNECTED;
+    c->connected = 1;
+    c->was_connected = 1;
+    ip_addr_copy(c->remote_addr, newpcb->remote_ip);
+    c->remote_port = newpcb->remote_port;
+    c->opt_reuseaddr = ls->opt_reuseaddr;
+    c->opt_keepalive = ls->opt_keepalive;
+    c->opt_nodelay = ls->opt_nodelay;
+    c->keep_idle_ms = ls->keep_idle_ms;
+    c->keep_intvl_ms = ls->keep_intvl_ms;
+    c->keep_cnt = ls->keep_cnt;
+    c->rcvtimeo_ms = ls->rcvtimeo_ms;
+    c->sndtimeo_ms = ls->sndtimeo_ms;
+    tcp_arg(newpcb, c);
+    tcp_recv(newpcb, tcp_recv_cb);
+    tcp_err(newpcb, tcp_err_cb);
+    tcp_poll(newpcb, tcp_poll_cb, 2);
+    tcp_apply_opts(c, newpcb);
+    tcp_backlog_delayed(newpcb);
+    ls->acceptq[(ls->aq_head + ls->aq_count) % ACCEPTQ_MAX] = c;
+    ls->aq_count++;
+    return ERR_OK;
+}
+
+static int socket_listen_locked(net_socket_t *s, int backlog) {
+    if (!s || !s->used)
+        return -9;
+    if (s->type != SOCK_STREAM_K)
+        return -95;                                      /* -EOPNOTSUPP */
+    if (backlog < 1) backlog = 1;
+    if (backlog > ACCEPTQ_MAX) backlog = ACCEPTQ_MAX;
+    if (s->listening) {
+        /* listen() again only changes the backlog (Linux inet_listen). */
+        if (!s->lpcb)
+            return -22;
+        s->backlog = backlog;
+        tcp_backlog_set(s->lpcb, (u8_t)backlog);
+        return 0;
+    }
+    if (!s->tcp || s->tcp->state != CLOSED || s->was_connected)
+        return -22;
+    net_socket_t **q = (net_socket_t **)kmalloc(ACCEPTQ_MAX * sizeof(*q));
+    if (!q)
+        return -12;
+    /* An unbound socket gets an ephemeral port (Linux inet_autobind). */
+    if (s->tcp->local_port == 0 && tcp_bind(s->tcp, IP4_ADDR_ANY, 0) != ERR_OK) {
+        kfree(q);
+        return -98;
+    }
+    err_t e = ERR_OK;
+    struct tcp_pcb *l = tcp_listen_with_backlog_and_err(s->tcp, (u8_t)backlog, &e);
+    if (!l) {
+        kfree(q);
+        return e == ERR_USE ? -98 : -12;
+    }
+    /* lwIP freed the original pcb; the listener carries s as its arg. */
+    s->tcp = NULL;
+    s->lpcb = l;
+    s->acceptq = q;
+    s->aq_head = s->aq_count = 0;
+    s->backlog = backlog;
+    s->listening = 1;
+    tcp_arg(l, s);
+    tcp_accept(l, tcp_accept_cb);
+    tcp_apply_opts(s, l);
+    return 0;
+}
+
+/* One accept attempt: the next queued connection (its reference passes to
+ * the caller), -EAGAIN when none waits, -EINVAL when not listening. */
+static int socket_accept_locked(net_socket_t *s, net_socket_t **out) {
+    if (!s->listening || !s->lpcb)
+        return -22;
+    if (s->aq_count == 0)
+        return -11;
+    net_socket_t *c = s->acceptq[s->aq_head];
+    s->aq_head = (s->aq_head + 1) % ACCEPTQ_MAX;
+    s->aq_count--;
+    if (c->tcp)
+        tcp_backlog_accepted(c->tcp);   /* frees a backlog place */
+    *out = c;
+    return 0;
 }
 
 /* A blocking connect()'s wait for its handshake (Linux inet_wait_for_connect):
@@ -639,7 +832,9 @@ int net_socket_read_ready(net_socket_t *s) {
     net_poll_all();
     preempt_disable();
     int r;
-    if (s->type == SOCK_STREAM_K)
+    if (s->listening)
+        r = s->aq_count > 0 || !s->lpcb;    /* accept() would not block */
+    else if (s->type == SOCK_STREAM_K)
         r = s->tcp_rx_count > 0 || s->tcp_state == TCP_STATE_CLOSED ||
             s->tcp_state == TCP_STATE_ERROR || s->peer_fin || s->rx_shut;
     else
@@ -653,7 +848,9 @@ int net_socket_write_ready(net_socket_t *s) {
         return 0;
     preempt_disable();
     int r = 1;
-    if (s->type == SOCK_STREAM_K)
+    if (s->listening)
+        r = 0;
+    else if (s->type == SOCK_STREAM_K)
         /* Also "writable" once a send can no longer block: the connection
          * failed or is gone (the send then reports why), as Linux tcp_poll
          * reports a finished non-blocking connect either way. */
@@ -687,9 +884,10 @@ int net_socket_getname(net_socket_t *s, int peer, net_sockaddr_in_t *out) {
             out->addr = ip4_addr_get_u32(ip_2_ip4(&s->remote_addr));
             out->port = bswap16(s->remote_port);
         }
-    } else if (s->tcp) {
-        out->addr = ip4_addr_get_u32(ip_2_ip4(&s->tcp->local_ip));
-        out->port = bswap16(s->tcp->local_port);
+    } else if (s->tcp || s->lpcb) {
+        struct tcp_pcb *pcb = s->tcp ? s->tcp : s->lpcb;
+        out->addr = ip4_addr_get_u32(ip_2_ip4(&pcb->local_ip));
+        out->port = bswap16(pcb->local_port);
     } else if (s->udp) {
         out->addr = ip4_addr_get_u32(ip_2_ip4(&s->udp->local_ip));
         out->port = bswap16(s->udp->local_port);
@@ -703,6 +901,13 @@ static int socket_shutdown_locked(net_socket_t *s, int how) {
         return -9;
     if (s->type != SOCK_STREAM_K)
         return 0;
+    if (s->listening) {
+        /* Linux inet_shutdown: shutting a listener's receive side stops it
+         * (a waiting accept() returns EINVAL); SHUT_WR alone does nothing. */
+        if (how == 0 || how == 2)
+            listen_stop(s);
+        return 0;
+    }
     if (!s->tcp)
         return -107;
     int shut_rx = (how == 0 || how == 2);
@@ -788,6 +993,7 @@ int net_socket_sendto(net_socket_t *s, const void *buf, uint32_t len,
 
     const uint8_t *p = (const uint8_t *)buf;
     uint32_t done = 0;
+    uint32_t start = pit_ticks();
     int r;
     for (;;) {
         preempt_disable();
@@ -805,6 +1011,8 @@ int net_socket_sendto(net_socket_t *s, const void *buf, uint32_t len,
             break;           /* error: reported unless something went out */
         if (flags & NET_MSG_DONTWAIT)
             break;           /* O_NONBLOCK/MSG_DONTWAIT: -EAGAIN or partial */
+        if (timed_out(s->sndtimeo_ms, start))
+            break;           /* SO_SNDTIMEO: -EAGAIN or partial */
         if (current_proc && signal_interrupt_pending(current_proc)) {
             r = -4;          /* -EINTR */
             break;
@@ -819,10 +1027,10 @@ int net_socket_sendto(net_socket_t *s, const void *buf, uint32_t len,
 
 int net_socket_recvfrom(net_socket_t *s, void *buf, uint32_t len,
                         net_sockaddr_in_t *addr, int flags) {
-    /* TCP recv BLOCKS until data/EOF (Linux default semantics) — the
-     * io_activity sleep wakes instantly on NIC interrupts.  UDP stays
-     * non-blocking (-EAGAIN): existing probes and the DNS resolver use
-     * retry loops and some intentionally test for EAGAIN. */
+    /* recv BLOCKS until data/EOF (TCP) or a datagram (UDP), as on Linux:
+     * the io_activity sleep wakes instantly on NIC interrupts.  O_NONBLOCK/
+     * MSG_DONTWAIT make it -EAGAIN instead, and SO_RCVTIMEO bounds the wait
+     * (then -EAGAIN too). */
     /* Pin the socket while we may sleep: a sibling thread sharing the fd
      * table can close() it meanwhile, and without our ref the slot would be
      * wiped and possibly reused by an unrelated socket under us. */
@@ -837,6 +1045,7 @@ int net_socket_recvfrom(net_socket_t *s, void *buf, uint32_t len,
      * a signal ends it early with the bytes so far (Linux tcp_recvmsg). */
     int peek = (flags & NET_MSG_PEEK) != 0;
     uint32_t done = 0;
+    uint32_t start = pit_ticks();
     int idle_polls = 0;
     int r;
     for (;;) {
@@ -844,7 +1053,7 @@ int net_socket_recvfrom(net_socket_t *s, void *buf, uint32_t len,
         r = socket_recvfrom_locked(s, (uint8_t *)buf + done, len - done,
                                    addr, peek);
         preempt_enable();
-        if (s->type != SOCK_STREAM_K) break;
+        if (s->type != SOCK_STREAM_K && r != -11) break;   /* one datagram */
         if (r > 0) {
             done += (uint32_t)r;
             if (!(flags & NET_MSG_WAITALL) || peek || done >= len) break;
@@ -852,6 +1061,7 @@ int net_socket_recvfrom(net_socket_t *s, void *buf, uint32_t len,
         }
         if (r != -11) break;
         if (flags & NET_MSG_DONTWAIT) break;
+        if (timed_out(s->rcvtimeo_ms, start)) break;
         if (current_proc && signal_interrupt_pending(current_proc)) {
             r = -4;      /* -EINTR */
             break;
@@ -860,7 +1070,7 @@ int net_socket_recvfrom(net_socket_t *s, void *buf, uint32_t len,
          * (open) receive window with a forced ACK.  TCP window-update ACKs
          * are not retransmitted, so if one is dropped the peer can stall
          * forever believing our window is still 0.  This nudge recovers it. */
-        if (++idle_polls >= 25) {        /* ~0.5s of waiting */
+        if (s->type == SOCK_STREAM_K && ++idle_polls >= 25) {   /* ~0.5s */
             idle_polls = 0;
             preempt_disable();
             if (s->tcp && s->tcp_state == TCP_STATE_CONNECTED) {
@@ -882,3 +1092,205 @@ int net_socket_shutdown(net_socket_t *s, int how) {
     return r;
 }
 
+
+int net_socket_listen(net_socket_t *s, int backlog) {
+    preempt_disable();
+    int r = socket_listen_locked(s, backlog);
+    preempt_enable();
+    return r;
+}
+
+int net_socket_is_listening(net_socket_t *s) {
+    return s && s->used && s->listening;
+}
+
+int net_socket_accept(net_socket_t *s, net_socket_t **out, int nonblock) {
+    /* Blocks until a connection is queued (pinned across the sleeps, as in
+     * recvfrom); -EAGAIN for O_NONBLOCK or once SO_RCVTIMEO runs out, -EINTR
+     * on a signal. */
+    preempt_disable();
+    int pinned = s && s->used;
+    if (pinned) s->refs++;
+    preempt_enable();
+    if (!pinned) return -9;
+    if (s->type != SOCK_STREAM_K) {
+        net_socket_release(s);
+        return -95;                                      /* -EOPNOTSUPP */
+    }
+    uint32_t start = pit_ticks();
+    int r;
+    for (;;) {
+        net_poll_all();
+        preempt_disable();
+        r = socket_accept_locked(s, out);
+        preempt_enable();
+        if (r != -11 || nonblock || timed_out(s->rcvtimeo_ms, start))
+            break;
+        if (current_proc && signal_interrupt_pending(current_proc)) {
+            r = -4;
+            break;
+        }
+        net_io_sleep(2);
+    }
+    net_socket_release(s);
+    return r;
+}
+
+/* Socket options (Linux values).  Timeouts come as struct timeval: 8 bytes
+ * for SO_RCVTIMEO_OLD/SO_SNDTIMEO_OLD (20/21, 32-bit time_t) or 16 for the
+ * _NEW (66/67, 64-bit time_t; musl on i386 tries these first). */
+#define SOL_SOCKET_K        1
+#define SO_REUSEADDR_K      2
+#define SO_TYPE_K           3
+#define SO_ERROR_K          4
+#define SO_SNDBUF_K         7
+#define SO_RCVBUF_K         8
+#define SO_KEEPALIVE_K      9
+#define SO_RCVTIMEO_OLD_K   20
+#define SO_SNDTIMEO_OLD_K   21
+#define SO_ACCEPTCONN_K     30
+#define SO_PROTOCOL_K       38
+#define SO_DOMAIN_K         39
+#define SO_RCVTIMEO_NEW_K   66
+#define SO_SNDTIMEO_NEW_K   67
+#define TCP_NODELAY_K       1
+#define TCP_KEEPIDLE_K      4
+#define TCP_KEEPINTVL_K     5
+#define TCP_KEEPCNT_K       6
+
+static int timeval_to_ms(const void *val, uint32_t len, int wide, uint32_t *ms) {
+    int64_t sec, usec;
+    if (wide) {
+        if (len < 16) return -22;
+        sec = ((const int64_t *)val)[0];
+        usec = ((const int64_t *)val)[1];
+    } else {
+        if (len < 8) return -22;
+        sec = ((const int32_t *)val)[0];
+        usec = ((const int32_t *)val)[1];
+    }
+    if (usec < 0 || usec >= 1000000) return -33;          /* -EDOM */
+    if (sec < 0) { *ms = 0; return 0; }                   /* Linux: no timeout */
+    if (sec > 0x7FFFFFFF / 1000) sec = 0x7FFFFFFF / 1000;
+    int64_t t = sec * 1000 + ((uint32_t)usec + 999) / 1000;
+    *ms = t > 0x7FFFFFFF ? 0x7FFFFFFF : (uint32_t)t;
+    return 0;
+}
+
+static uint32_t timeval_from_ms(uint32_t ms, int wide, void *val) {
+    if (wide) {
+        ((int64_t *)val)[0] = (int64_t)(ms / 1000);
+        ((int64_t *)val)[1] = (ms % 1000) * 1000;
+        return 16;
+    }
+    ((int32_t *)val)[0] = (int32_t)(ms / 1000);
+    ((int32_t *)val)[1] = (int32_t)((ms % 1000) * 1000);
+    return 8;
+}
+
+static void socket_apply_opts_locked(net_socket_t *s) {
+    tcp_apply_opts(s, s->tcp);
+    tcp_apply_opts(s, s->lpcb);
+    if (s->udp) {
+        if (s->opt_reuseaddr) ip_set_option(s->udp, SOF_REUSEADDR);
+        else                  ip_reset_option(s->udp, SOF_REUSEADDR);
+    }
+}
+
+/* setsockopt.  Options this stack has no use for are accepted and ignored,
+ * as before (SO_SNDBUF, SO_LINGER, IP_TOS, ...). */
+int net_socket_setopt(net_socket_t *s, int level, int name,
+                      const void *val, uint32_t len) {
+    if (!s || !s->used)
+        return -9;
+    int iv = 0;
+    int is_tv = level == SOL_SOCKET_K &&
+        (name == SO_RCVTIMEO_OLD_K || name == SO_SNDTIMEO_OLD_K ||
+         name == SO_RCVTIMEO_NEW_K || name == SO_SNDTIMEO_NEW_K);
+    if (is_tv) {
+        uint32_t ms;
+        int wide = name == SO_RCVTIMEO_NEW_K || name == SO_SNDTIMEO_NEW_K;
+        int r = timeval_to_ms(val, len, wide, &ms);
+        if (r < 0) return r;
+        if (name == SO_RCVTIMEO_OLD_K || name == SO_RCVTIMEO_NEW_K)
+            s->rcvtimeo_ms = ms;
+        else
+            s->sndtimeo_ms = ms;
+        return 0;
+    }
+    if (len >= 4)
+        iv = *(const int32_t *)val;
+    else if (len >= 1)
+        iv = *(const uint8_t *)val;
+    preempt_disable();
+    int r = 0;
+    if (level == SOL_SOCKET_K && name == SO_REUSEADDR_K) {
+        s->opt_reuseaddr = iv != 0;
+    } else if (level == SOL_SOCKET_K && name == SO_KEEPALIVE_K) {
+        s->opt_keepalive = iv != 0;
+    } else if (level == IPPROTO_TCP_K && s->type == SOCK_STREAM_K) {
+        if (len < 4)
+            r = -22;
+        else if (name == TCP_NODELAY_K)
+            s->opt_nodelay = iv != 0;
+        else if (name == TCP_KEEPIDLE_K || name == TCP_KEEPINTVL_K ||
+                 name == TCP_KEEPCNT_K) {
+            if (iv < 1 || iv > 32767)
+                r = -22;
+            else if (name == TCP_KEEPIDLE_K)  s->keep_idle_ms = (uint32_t)iv * 1000;
+            else if (name == TCP_KEEPINTVL_K) s->keep_intvl_ms = (uint32_t)iv * 1000;
+            else                              s->keep_cnt = (uint32_t)iv;
+        }
+    }
+    if (r == 0)
+        socket_apply_opts_locked(s);
+    preempt_enable();
+    return r;
+}
+
+/* getsockopt: writes up to *len bytes of the value, sets *len to its size.
+ * 1 when the option is unknown here (the caller reports 0, as before). */
+int net_socket_getopt(net_socket_t *s, int level, int name,
+                      void *val, uint32_t *len) {
+    if (!s || !s->used)
+        return -9;
+    uint8_t buf[16];
+    uint32_t n = 4;
+    int32_t v = 0;
+    if (level == SOL_SOCKET_K) {
+        switch (name) {
+        case SO_REUSEADDR_K:  v = s->opt_reuseaddr; break;
+        case SO_KEEPALIVE_K:  v = s->opt_keepalive; break;
+        case SO_TYPE_K:       v = s->type; break;
+        case SO_ERROR_K:      v = -net_socket_take_error(s); break;
+        case SO_SNDBUF_K:
+        case SO_RCVBUF_K:     v = 65536; break;
+        case SO_ACCEPTCONN_K: v = s->listening; break;
+        case SO_PROTOCOL_K:   v = s->protocol; break;
+        case SO_DOMAIN_K:     v = s->domain; break;
+        case SO_RCVTIMEO_OLD_K: case SO_RCVTIMEO_NEW_K:
+            n = timeval_from_ms(s->rcvtimeo_ms, name == SO_RCVTIMEO_NEW_K, buf);
+            break;
+        case SO_SNDTIMEO_OLD_K: case SO_SNDTIMEO_NEW_K:
+            n = timeval_from_ms(s->sndtimeo_ms, name == SO_SNDTIMEO_NEW_K, buf);
+            break;
+        default: return 1;
+        }
+    } else if (level == IPPROTO_TCP_K && s->type == SOCK_STREAM_K) {
+        switch (name) {
+        case TCP_NODELAY_K:   v = s->opt_nodelay; break;
+        case TCP_KEEPIDLE_K:  v = s->keep_idle_ms ? (int32_t)(s->keep_idle_ms / 1000) : 7200; break;
+        case TCP_KEEPINTVL_K: v = s->keep_intvl_ms ? (int32_t)(s->keep_intvl_ms / 1000) : 75; break;
+        case TCP_KEEPCNT_K:   v = s->keep_cnt ? (int32_t)s->keep_cnt : 9; break;
+        default: return 1;
+        }
+    } else {
+        return 1;
+    }
+    if (n == 4)
+        memcpy(buf, &v, 4);
+    uint32_t c = *len < n ? *len : n;
+    memcpy(val, buf, c);
+    *len = c;
+    return 0;
+}

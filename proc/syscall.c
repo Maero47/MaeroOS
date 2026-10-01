@@ -8736,6 +8736,59 @@ out:
     return r;
 }
 
+static int free_fd_slot(void) {
+    for (int nfd = 0; nfd < MAX_FD; nfd++)
+        if (current_proc->ofile[nfd].type == FD_NONE)
+            return nfd;
+    return -1;
+}
+
+/* accept/accept4 on an AF_INET listener: the new connection gets the lowest
+ * free descriptor, SOCK_NONBLOCK/SOCK_CLOEXEC from accept4, and the peer's
+ * address in addr/addrlen when asked (Linux copies min(len, 16) and stores
+ * the full size).  EMFILE is reported before waiting, as Linux allocates the
+ * descriptor first. */
+static int inet_accept(proc_file_t *f, uint32_t *kargs, int flags) {
+    if (flags & ~(SOCK_NONBLOCK_K | SOCK_CLOEXEC_K))
+        return -22;
+    uint32_t *ulen = (uint32_t *)(uintptr_t)kargs[2];
+    uint32_t klen = 0;
+    if (kargs[1]) {
+        if (!ulen || copy_from_user(&klen, ulen, sizeof(klen)) < 0) return -14;
+        if ((int32_t)klen < 0) return -22;
+    }
+    if (free_fd_slot() < 0)
+        return -24;
+    net_socket_t *ns = NULL;
+    int r = net_socket_accept(f->socket, &ns, (f->flags & O_NONBLOCK) != 0);
+    if (r < 0)
+        return r;
+    if (kargs[1]) {
+        net_sockaddr_in_t pa;
+        if (net_socket_getname(ns, 1, &pa) < 0) {
+            __builtin_memset(&pa, 0, sizeof(pa));
+            pa.family = 2;
+        }
+        uint32_t c = klen < sizeof(pa) ? klen : sizeof(pa);
+        uint32_t full = sizeof(pa);
+        if ((c && copy_to_user((void *)(uintptr_t)kargs[1], &pa, c) < 0) ||
+            copy_to_user(ulen, &full, sizeof(full)) < 0) {
+            net_socket_release(ns);
+            return -14;
+        }
+    }
+    int nfd = free_fd_slot();       /* another thread may have taken it */
+    if (nfd < 0) {
+        net_socket_release(ns);
+        return -24;
+    }
+    current_proc->ofile[nfd].type = FD_SOCKET;
+    current_proc->ofile[nfd].socket = ns;
+    current_proc->ofile[nfd].flags = O_RDWR | ((flags & SOCK_NONBLOCK_K) ? O_NONBLOCK : 0);
+    current_proc->ofile[nfd].cloexec = (flags & SOCK_CLOEXEC_K) ? 1 : 0;
+    return nfd;
+}
+
 static int socketcall_core_inner(int call, uint32_t *kargs) {
     /* accept4(fd, addr, addrlen, flags) is socketcall index 18 (Linux
      * SYS_ACCEPT4).  Its SOCK_CLOEXEC/SOCK_NONBLOCK apply to the NEW
@@ -8931,8 +8984,24 @@ static int socketcall_core_inner(int call, uint32_t *kargs) {
     if (call == 13)
         return net_socket_shutdown(f->socket, (int)kargs[1]);
 
-    if (call == 14)                 /* setsockopt: accept and ignore */
-        return 0;
+    if (call == 4)                  /* listen(fd, backlog) */
+        return net_socket_listen(f->socket, (int)kargs[1]);
+
+    if (call == 5)                  /* accept / accept4 */
+        return inet_accept(f, kargs, accept4_flags);
+
+    if (call == 14) {               /* setsockopt */
+        /* The options net/socket.c knows (SO_REUSEADDR, SO_KEEPALIVE,
+         * SO_RCVTIMEO/SO_SNDTIMEO, TCP_NODELAY, TCP_KEEP*); the rest are
+         * accepted and ignored. */
+        uint8_t kv[16] = {0};
+        uint32_t len = kargs[4];
+        if (len > sizeof(kv)) len = sizeof(kv);
+        if (len && (!kargs[3] ||
+                    copy_from_user(kv, (void *)(uintptr_t)kargs[3], len) < 0))
+            return -14;
+        return net_socket_setopt(f->socket, (int)kargs[1], (int)kargs[2], kv, len);
+    }
 
     if (call == 15) {               /* getsockopt */
         int       level   = (int)kargs[1];
@@ -8943,18 +9012,21 @@ static int socketcall_core_inner(int call, uint32_t *kargs) {
         if (optlen) {
             if (copy_from_user(&len, optlen, sizeof(len)) < 0) return -14;
         }
-        if (optval && len >= 4) {
-            uint32_t v = 0;
-            if (level == 1 && (optname == 7 || optname == 8)) v = 65536; /* SO_SNDBUF/RCVBUF */
-            /* SO_ERROR (4): the pending error as a positive errno, cleared by
-             * the read — how a non-blocking connect's outcome is learnt. */
-            if (level == 1 && optname == 4)
-                v = (uint32_t)-net_socket_take_error(f->socket);
-            if (copy_to_user(optval, &v, 4) < 0) return -14;
-            len = 4;
-            if (optlen && copy_to_user(optlen, &len, sizeof(len)) < 0)
-                return -14;
+        if ((int32_t)len < 0) return -22;
+        uint8_t kv[16];
+        uint32_t klen = len < sizeof(kv) ? len : sizeof(kv);
+        /* SO_ERROR (4) is the pending error as a positive errno, cleared by
+         * the read — how a non-blocking connect's outcome is learnt. */
+        int r = net_socket_getopt(f->socket, level, optname, kv, &klen);
+        if (r < 0) return r;
+        if (r == 1) {               /* unknown here: reads as 0, as before */
+            if (len < 4) return 0;
+            __builtin_memset(kv, 0, 4);
+            klen = 4;
         }
+        if (!optval || !optlen) return klen ? -14 : 0;
+        if (klen && copy_to_user(optval, kv, klen) < 0) return -14;
+        if (copy_to_user(optlen, &klen, sizeof(klen)) < 0) return -14;
         return 0;
     }
 
@@ -8978,7 +9050,7 @@ static int socketcall_core_inner(int call, uint32_t *kargs) {
     if (call == 16 || call == 17)   /* sendmsg / recvmsg */
         return inet_msg(call, kargs, f);
 
-    if (call == 4 || call == 5 || call == 8)
+    if (call == 8)
         return -95;
 
     return -22;

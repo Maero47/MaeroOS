@@ -37,6 +37,20 @@ int net_socket_take_error(net_socket_t *s);
 int net_socket_is_stream(net_socket_t *s);   /* SOCK_STREAM (TCP) vs UDP */
 int net_socket_shutdown(net_socket_t *s, int how);
 int net_socket_getname(net_socket_t *s, int peer, net_sockaddr_in_t *out);
+/* listen(): -EOPNOTSUPP for UDP, -EINVAL once connected; again on a
+ * listener it only changes the backlog (clamped to 1..32). */
+int net_socket_listen(net_socket_t *s, int backlog);
+int net_socket_is_listening(net_socket_t *s);
+/* accept(): the next established connection, as a new socket holding one
+ * reference for the caller.  Blocks unless nonblock (-EAGAIN), bounded by
+ * SO_RCVTIMEO; -EINTR on a signal, -EINVAL when not listening. */
+int net_socket_accept(net_socket_t *s, net_socket_t **out, int nonblock);
+/* setsockopt/getsockopt (Linux level/optname values).  `val` is a kernel
+ * copy.  getopt returns 1 for an option it does not know. */
+int net_socket_setopt(net_socket_t *s, int level, int name,
+                      const void *val, uint32_t len);
+int net_socket_getopt(net_socket_t *s, int level, int name,
+                      void *val, uint32_t *len);
 int net_socket_read_ready(net_socket_t *s);
 int net_socket_write_ready(net_socket_t *s);
 int net_socket_poll_err(net_socket_t *s);

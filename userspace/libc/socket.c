@@ -42,6 +42,12 @@ int accept(int fd, struct sockaddr *addr, socklen_t *len) {
     return socketcall(5, args);
 }
 
+/* accept4 is socketcall 18: SOCK_NONBLOCK/SOCK_CLOEXEC for the new fd. */
+int accept4(int fd, struct sockaddr *addr, socklen_t *len, int flags) {
+    uint32_t args[4] = { (uint32_t)fd, (uint32_t)addr, (uint32_t)len, (uint32_t)flags };
+    return socketcall(18, args);
+}
+
 int send(int fd, const void *buf, size_t len, int flags) {
     uint32_t args[4] = {
         (uint32_t)fd, (uint32_t)buf, (uint32_t)len, (uint32_t)flags
@@ -49,41 +55,8 @@ int send(int fd, const void *buf, size_t len, int flags) {
     return socketcall(9, args);
 }
 
-/*
- * SO_RCVTIMEO, emulated here: the kernel accepts setsockopt() and ignores it,
- * and its UDP recv never blocks, so a program that sets a receive timeout and
- * then calls recv() (toybox host, ports) would get EAGAIN at once.  A socket
- * with a timeout set waits in poll() for up to that long first.  close()
- * forgets the setting (libc/syscalls.c).
- */
-#define RCVTIMEO_FDS 256
-static int rcvtimeo_ms[RCVTIMEO_FDS];
-
-void __socket_forget(int fd) {
-    if (fd >= 0 && fd < RCVTIMEO_FDS) rcvtimeo_ms[fd] = 0;
-}
-
-static int wait_rcvtimeo(int fd, int flags) {
-    if (fd < 0 || fd >= RCVTIMEO_FDS || !rcvtimeo_ms[fd] ||
-        (flags & MSG_DONTWAIT))
-        return 0;
-    struct pollfd p = { fd, POLLIN, 0 };
-    int r = poll(&p, 1, rcvtimeo_ms[fd]);
-    if (r == 0) {
-        errno = EAGAIN;
-        return -1;
-    }
-    return r < 0 ? -1 : 0;
-}
-
 int setsockopt(int fd, int level, int optname, const void *optval,
                socklen_t optlen) {
-    if (level == SOL_SOCKET && optname == SO_RCVTIMEO && fd >= 0 &&
-        fd < RCVTIMEO_FDS && optval && optlen >= sizeof(struct timeval)) {
-        const struct timeval *tv = optval;
-        long ms = tv->tv_sec * 1000L + (tv->tv_usec + 999) / 1000;
-        rcvtimeo_ms[fd] = ms > 0x7FFFFFFF ? 0x7FFFFFFF : (int)ms;
-    }
     uint32_t args[5] = {
         (uint32_t)fd, (uint32_t)level, (uint32_t)optname,
         (uint32_t)optval, (uint32_t)optlen
@@ -102,7 +75,6 @@ int getpeername(int fd, struct sockaddr *addr, socklen_t *len) {
 }
 
 int recv(int fd, void *buf, size_t len, int flags) {
-    if (wait_rcvtimeo(fd, flags) < 0) return -1;
     uint32_t args[4] = {
         (uint32_t)fd, (uint32_t)buf, (uint32_t)len, (uint32_t)flags
     };
@@ -120,7 +92,6 @@ int sendto(int fd, const void *buf, size_t len, int flags,
 
 int recvfrom(int fd, void *buf, size_t len, int flags,
              struct sockaddr *addr, socklen_t *addrlen) {
-    if (wait_rcvtimeo(fd, flags) < 0) return -1;
     uint32_t args[6] = {
         (uint32_t)fd, (uint32_t)buf, (uint32_t)len, (uint32_t)flags,
         (uint32_t)addr, (uint32_t)addrlen

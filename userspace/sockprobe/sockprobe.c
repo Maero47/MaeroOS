@@ -418,7 +418,7 @@ static int msgprobe(int port, int uport) {
         memset(&from, 0, sizeof(from));
         m.name = &from; m.namelen = sizeof(from);
         m.iov = eiov; m.iovlen = 2;
-        r = xrecvmsg(u, &m, 0);
+        r = xrecvmsg(u, &m, MSG_DONTWAIT);
         if (r >= 0 || errno != EAGAIN) break;
         usleep(10000);
     }
@@ -527,8 +527,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* A blocking UDP recv now waits for a datagram, as on Linux; the
+     * empty-queue answer is EAGAIN with MSG_DONTWAIT. */
     char ch;
-    if (recv(fd, &ch, 1, 0) != -1 || errno != EAGAIN) {
+    if (recv(fd, &ch, 1, MSG_DONTWAIT) != -1 || errno != EAGAIN) {
         printf("sockprobe: empty udp recv errno=%d\n", errno);
         close(fd);
         return 1;
