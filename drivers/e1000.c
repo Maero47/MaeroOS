@@ -126,12 +126,9 @@ struct e1000_tx_desc {
 #define TX_DESCS   32
 #define BUF_SIZE   2048
 
-/* The register file is 128 KiB (BAR0).  It is mapped at a fixed kernel
- * window, uncached: inside the PDEs 768-1022 every page directory snapshots
- * at creation, and clear of the LAPIC/IOAPIC identity mappings
- * (0xFEC00000-0xFEE00FFF) and the recursive page tables (0xFFC00000+). */
-#define E1000_MMIO_VIRT 0xFF400000U
-#define E1000_MMIO_SIZE 0x20000U
+/* The register file is 128 KiB (BAR0).  It is mapped uncached at
+ * E1000_MMIO_VIRT, inside the PDEs 768-1022 every page directory snapshots
+ * at creation (see the kernel virtual map in include/kernel/config.h). */
 
 static const uint16_t e1000_ids[] = {
     0x1000, 0x1001, 0x1004, 0x1008, 0x1009, 0x100C, 0x100D, 0x100E, 0x100F,

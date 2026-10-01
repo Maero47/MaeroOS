@@ -53,10 +53,11 @@
  *   0xFD000000-0xFE000000  ACPI tables and operation regions (ACPI_MAP_*)
  *   0xFEC00000             I/O APIC (not mapped; MADT only)
  *   0xFEE00000             local APIC, identity-mapped (LAPIC_PHYS_BASE)
+ *   0xFF400000-0xFF420000  e1000 register BAR, 128 KiB (E1000_MMIO_*)
  *   0xFFC00000-0xFFFFFFFF  recursive page tables and page directory
  *
  * The gaps (0xF2000000-0xF6000000, 0xF6100000-0xF7000000,
- * 0xF7008000-0xFD000000) are free.  The _Static_asserts below keep the
+ * 0xF7008000-0xFD000000, 0xFF420000-0xFFC00000) are free.  The _Static_asserts below keep the
  * windows from growing into each other.
  */
 #define HEAP_START      0xD0000000UL
@@ -84,13 +85,16 @@
 #define ACPI_MAP_START      0xFD000000UL
 #define ACPI_MAP_END        0xFE000000UL
 
-/* MMIO windows for the register BARs of the disk and USB controllers, mapped
- * uncached at boot (drivers/usb/xhci.c, drivers/ahci.c). */
+/* MMIO windows for the register BARs of the disk, USB and network
+ * controllers, mapped uncached at boot (drivers/usb/xhci.c, drivers/ahci.c,
+ * drivers/e1000.c). */
 #define XHCI_MMIO_VIRT      0xF6000000UL
 #define XHCI_MMIO_MAX       0x00100000UL   /* map at most 1 MiB of the BAR */
 #define AHCI_MMIO_VIRT      0xF7000000UL
 #define AHCI_MMIO_STRIDE    0x2000UL       /* ABAR is at most 0x1100 bytes */
 #define AHCI_MAX_CTRL       4
+#define E1000_MMIO_VIRT     0xFF400000UL
+#define E1000_MMIO_SIZE     0x20000UL      /* the whole 128 KiB register file */
 
 _Static_assert(KSTACK_REGION_END <= XHCI_MMIO_VIRT,
                "kernel stacks overlap the xHCI window");
@@ -100,6 +104,9 @@ _Static_assert(AHCI_MMIO_VIRT + AHCI_MAX_CTRL * AHCI_MMIO_STRIDE <= ACPI_MAP_STA
                "AHCI window overlaps the ACPI window");
 _Static_assert(ACPI_MAP_END <= 0xFEC00000UL,
                "ACPI window overlaps the I/O APIC");
+_Static_assert(E1000_MMIO_VIRT >= 0xFEE01000UL &&
+               E1000_MMIO_VIRT + E1000_MMIO_SIZE <= 0xFFC00000UL,
+               "e1000 window overlaps the LAPIC or the recursive page tables");
 
 #define USER_STACK_TOP    0xC0000000UL
 #define USER_STACK_PAGES  64
