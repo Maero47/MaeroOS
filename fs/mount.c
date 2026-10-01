@@ -60,6 +60,18 @@ static int ext2_statfs_hook(void *fs, vfs_statfs_t *out) {
     return 0;
 }
 
+/* Is `opt` one of the comma-separated options in `data`? */
+static int mount_has_opt(const char *data, const char *opt) {
+    size_t n = strlen(opt);
+    for (const char *p = data; *p; ) {
+        const char *e = p;
+        while (*e && *e != ',') e++;
+        if ((size_t)(e - p) == n && strncmp(p, opt, n) == 0) return 1;
+        p = *e ? e + 1 : e;
+    }
+    return 0;
+}
+
 static int mount_block(const char *source, const char *target, const char *fstype,
                        uint32_t flags, const char *data) {
     if (!source) return -22;                                  /* -EINVAL */
@@ -128,6 +140,9 @@ static int mount_block(const char *source, const char *target, const char *fstyp
         ext2_fs_t *e2;
         r = ext2_mount_dev(bp, !want_rw, &root, &e2);
         if (r == 0) {
+            if (data && want_rw && mount_has_opt(data, "x4crash")) ext2_test_crash(e2);
+            if (data && want_rw && mount_has_opt(data, "x4smalltxn")) ext2_test_opt(e2, "x4smalltxn");
+            if (data && want_rw && mount_has_opt(data, "x4crashunlink")) ext2_test_opt(e2, "x4crashunlink");
             t.fs      = e2;
             t.busy    = ext2_busy;
             t.release = ext2_release;

@@ -45,7 +45,8 @@ What is proven by the automated QEMU tests in `tools/`:
 | `mount`/`umount`, partitions, read-only ext4 | busybox `mount -t ext4 /dev/hdb2 /mnt` on a GPT disk (4 KiB blocks, `64bit`, `metadata_csum`, `huge_file`, `flex_bg`) and `/dev/hdc5` on an MBR logical partition (1 KiB blocks): md5 of every file equals the host's, including a 300 MiB sparse file and an unwritten extent; a 5020-entry and a 20000-entry (two-level) htree directory list and resolve completely; fast, slow, relative, absolute and directory symlinks; writes fail with `EROFS`; `umount` is refused while a cwd is inside; tmpfs `remount,ro`; non-root `mount` refused; afterwards both filesystems are byte-identical to their images and `e2fsck -fn` is clean; on q35 the same partitions are found and mounted from AHCI (`/dev/sdb2`) and NVMe (`/dev/nvme0n1p5`) | `make smoke-ext4` |
 | Read-write FAT12/16/32 (vfat), USB sticks | volumes made on the host with `mkfs.fat` and `mtools` (long and Turkish names, a 300-entry directory, a 5 MiB file): mounted read-write with busybox `mount -t vfat` from AHCI (`/dev/sdb1`, MBR), a QEMU `usb-storage` stick without a partition table (`/dev/sdd`, mounted without `-t`) and IDE (`/dev/hdb1`); every file's md5 matches; mkdir, create, a 5 MiB copy, a directory that grows to 150 long-name entries, append, write past the end, truncate, renames (across directories, a directory with contents, over an existing file, case-only), unlink, `rm -r`, rmdir; `df` accounting; a file unlinked while open; `ENOSPC` on a full FAT12 volume; `remount,ro`/`rw`; the stick unplugged while mounted and plugged back in; raw writes to `/dev/sdd` and to `/dev/sdc` (whose partitions are mounted) refused with `EBUSY` and `maeros-install -l` marking the mounted stick in use; `poweroff` with the stick still mounted; afterwards `fsck.fat -n` is clean on every volume and `mtools` on the host sees exactly the guest's files and contents | `make smoke-vfat` |
 | Read-write exFAT | volumes made with `mkfs.exfat` and filled by `tools/exfatimg.py`: an MBR partition on AHCI, a USB stick without a partition table and a 64 GiB sparse disk with 4096-byte sectors and a 5 GiB file; every md5 matches (contiguous, FAT-chain and ValidDataLength < DataLength files, Turkish and non-BMP names, case-insensitive lookups through the up-case table); create, append (contiguous files turning into FAT chains), truncate both ways, every rename case, unlink, `rm -r`, a growing directory, statfs, unlink-while-open, ro/remount; a marker written at 4 GiB − 8 KiB of the 5 GiB file; `poweroff` with two volumes mounted; afterwards `fsck.exfat -n` is clean and an independent checker finds exactly the guest's files, checksums, hashes and bitmap; crafted entry sets, boot regions, up-case table and fuzzed volumes are refused or read without a crash | `make smoke-exfat` |
-| ext2 read-write beyond `/disk` | on q35, an ext2 partition on AHCI (`/dev/sdb1`, 1 KiB blocks) and an ext3 with an htree directory on NVMe (`mount -t ext4 /dev/nvme0n1`, 4 KiB blocks) mounted read-write at the same time: files read back, `df` reports each filesystem, create/append/mkdir/symlink/rename/unlink/rmdir on both, a 2 MiB file in double-indirect blocks, copy and move between them, hard link across them refused; the same device again, raw `/dev` writes to it or its disk, and `umount` with a file open are `EBUSY`; `remount,ro` refuses writes and `remount,rw` allows them; everything survives umount and a second mount; `-o ro` through the ext2 driver; `needs_recovery` refused; `/disk` unaffected; after `poweroff`, host `e2fsck -fn` is clean on both, the superblocks say clean, `debugfs` sees every change | `make smoke-ext2rw` |
+| ext2 read-write beyond `/disk` | on q35, an ext2 partition on AHCI (`/dev/sdb1`, 1 KiB blocks) and an ext3 with an htree directory on NVMe (`mount -t ext4 /dev/nvme0n1`, 4 KiB blocks) mounted read-write at the same time: files read back, `df` reports each filesystem, create/append/mkdir/symlink/rename/unlink/rmdir on both, a 2 MiB file in double-indirect blocks, copy and move between them, hard link across them refused; the same device again, raw `/dev` writes to it or its disk, and `umount` with a file open are `EBUSY`; `remount,ro` refuses writes and `remount,rw` allows them; everything survives umount and a second mount; `-o ro` through the ext2 driver; `needs_recovery` refused read-only and replayed (an empty journal) by a read-write mount; `/disk` unaffected; after `poweroff`, host `e2fsck -fn` is clean on both, the superblocks say clean, `debugfs` sees every change | `make smoke-ext2rw` |
+| ext4 read-write with jbd2 | on q35, `mkfs.ext4` defaults (journal, extents, `64bit`, `flex_bg`, `metadata_csum`, `orphan_file`; 4 KiB blocks, a 1200-entry htree directory) on AHCI and `mkfs.ext4 -O ^has_journal` (1 KiB blocks) on NVMe mounted read-write together: create/mkdir/rename (in and across directories, over an existing file)/unlink/rmdir, fast and slow symlinks, a file of eleven extents with a hole filled in the middle (a depth-1 extent tree), a 10 MiB sparse file, a 1000-entry directory, truncate down and back up, a 50 MiB file, 600 names added to the htree directory (leaf splits) and 2000 to a 1 KiB-block one (the root fills and a second index level appears); all of it survives umount and a second mount; a `needs_recovery` image whose journal (checksum v3) holds a transaction written by `debugfs` is refused read-only and replayed by a read-write mount; `mount -o x4crash` stops after a commit as if the power had gone; `poweroff` with both mounted; afterwards host `e2fsck -fn` is clean (no checksum errors) and the superblocks clean without `needs_recovery`, `debugfs` sees every change, the depth-1 extent tree and both directories still indexed, `e2fsck` replays the journal the guest left behind, and a second boot has this driver replay a copy of it | `make smoke-ext4rw` |
 | Installing to a disk (`maeros-install`) | from the Limine live ISO on q35 with the live `disk.img` as `sda` and an empty 1 GiB `sdb`: `maeros-install -l` lists both and marks `sda` in use, installing over `sda` is refused, `maeros-install -y /dev/sdb` writes a GPT (BIOS boot, FAT32 ESP, ext2 root) and Limine; on the host `sgdisk -v`, `e2fsck -fn` and `fsck.fat -n` are clean; then the installed disk alone boots under SeaBIOS and OVMF x64: Limine passes `root=PARTUUID=...`, `/dev/sda3` is `/disk`, login and the desktop work, the ESP (`/dev/sda2`) mounts with the vfat driver and its `limine.conf` names the booted root, and a file written in the first boot is there in the second | `make smoke-install` |
 | `pkg` and the signed repo index | `tools/test_pkg_sign.py` runs the RFC 8032 vectors through the Python signer and the C verifier and rejects altered, unsigned and foreign-key indexes; in the guest, `pkg update` rejects unsigned, tampered and rolled-back indexes, installs and runs busybox, and `install` rejects a tarball whose SHA-256 does not match | `make smoke-pkg` |
 | TCP/IP over lwIP and RTL8139 | `MAEROS_HTTP_OK` fetched from a host HTTP server; `sockprobe` checks that `send` after `shutdown(SHUT_WR)` fails with `EPIPE`, a two-step shutdown ends in a FIN and no RST, closing TIME_WAIT sockets keeps TCP working, and a non-blocking client gets `EINPROGRESS`, `SO_ERROR`, `EAGAIN`, `ECONNREFUSED` and both socket names; `abi2probe net` checks `MSG_NOSIGNAL` and `EPIPE` after a reset | `make smoke-net` |
@@ -114,12 +115,13 @@ What is proven by the automated QEMU tests in `tools/`:
   device models only. There is no Wi-Fi, no Realtek r8169 or virtio device, no GPU
   acceleration (the desktop draws into the boot framebuffer), no ACPI sleep states
   (only S5 power-off), and USB 3 hubs are untested (QEMU has none).
-- **ext4 with its usual features is read-only.** The ext2 driver mounts ext2
-  read-write, and ext3/ext4 too when they use no incompatible feature and their
-  journal is empty (it writes them like ext2 and never uses the journal). A typical
-  ext4 (extents, `64bit`, `flex_bg`) or a filesystem that `needs_recovery` goes to the
-  read-only ext4 driver: a read-write mount is refused with `EROFS` and busybox
-  `mount` falls back to read-only (`docs/ext4.md`). FAT volumes are writable too
+- **ext4 writes cover what `mkfs.ext4` makes, not every feature.** The ext2 driver
+  mounts ext2, ext3 and a default ext4 (extents, `64bit`, `flex_bg`, `metadata_csum`)
+  read-write, with jbd2 journaling (ordered mode, 1 s commits) and journal replay;
+  `meta_bg`, `inline_data`, `encrypt`, `casefold`, `bigalloc`, quotas and filesystems of
+  2^32 blocks or more stay read-only (busybox `mount` falls back to the read-only ext4
+  driver). Directories it creates are linear (existing htree directories keep their index), and a file unlinked
+  while open is not recorded in the orphan file (`docs/ext4.md`). FAT volumes are writable too
   (`mount -t vfat`, `docs/vfat.md`), and so are exFAT volumes (`mount -t exfat`,
   `docs/exfat.md`); through the 32-bit VFS a file of 4 GiB or more shows its
   first 4 GiB − 1 bytes.
@@ -259,7 +261,7 @@ measures wake latency under CPU hogs (`testfiles/schedlat`).
 `fs/vfs.c` mount table with a root overlay and path lookup (symlinks are followed
 iteratively with a 40-link budget, then `ELOOP`; `mount(2)`/`umount2(2)` attach
 filesystems at any directory, crossed during the walk, listed in `/proc/mounts`),
-`fs/ext4.c` (read-only ext2/3/4 for `mount -t ext4`: extents, `64bit`, `flex_bg`,
+`fs/ext4.c` (read-only ext2/3/4 for `mount -o ro -t ext4`: extents, `64bit`, `flex_bg`,
 `meta_bg`, htree lookups, `metadata_csum` verified; see `docs/ext4.md`),
 `fs/vfat.c` (read-write FAT12/16/32 with long names for `mount -t vfat`: UTF-8 names,
 8.3 aliases with `~N` tails, FSInfo, the dirty flag, `uid=`/`gid=`/`umask=`; see
@@ -274,7 +276,9 @@ and USB `/dev/sdX`, NVMe `/dev/nvme0nN`, with partitions as `hda1`, `sdb2`,
 filesystem, which is `EBUSY`; `BLKGETSIZE64`; `/proc/partitions`), `fs/initrd.c` ustar archive read from
 the Multiboot module, `fs/ext2.c` (read and write, mounted at `/disk` and overlaid on
 `/`, symlinks included; per-instance, so `mount -t ext2 /dev/sdb1 /mnt` mounts more
-read-write, and so does an ext3/ext4 without incompatible features or a pending journal), `fs/tmpfs.c` at `/tmp` (file bodies in page frames rather than
+read-write, and so does an ext3 or a default ext4: extent trees, `metadata_csum`, `64bit`,
+`flex_bg`, uninitialised groups, and a jbd2 journal written in ordered mode and replayed
+at mount; see `docs/ext4.md`), `fs/tmpfs.c` at `/tmp` (file bodies in page frames rather than
 the kernel heap, capped at 1 GiB per file, `EFBIG` beyond), `fs/devfs.c` at
 `/dev` (`null`, `zero`, `tty`,
 `ptmx`, `pts/`, `random`, `urandom`, `fb0`, `dsp`, `snd/controlC0`, `snd/pcmC0D0p`, `shm`, `input/event0`, `input/event1`,
@@ -669,6 +673,7 @@ make smoke-nvme     # /disk on an NVMe namespace only (pc and q35)
 make smoke-ext4     # mount/umount, GPT+MBR partitions, read-only ext4 vs host md5s
 make smoke-vfat     # read-write FAT on AHCI, a USB stick and IDE; fsck.fat + mtools after
 make smoke-ext2rw   # two more ext2/ext3 mounted read-write at once, then host e2fsck/debugfs
+make smoke-ext4rw   # mkfs.ext4 images read-write (extents, csums, jbd2), then host e2fsck/debugfs
 make smoke-net      # DHCP, TCP, HTTP GET from the host
 make smoke-net-e1000  # the same on an e1000, plus resolv.conf from DHCP and DNS lookups
 make smoke-tcpsrv   # listen/accept and blocking UDP, from the host through hostfwd
@@ -771,7 +776,7 @@ there: QEMU, started without `-no-shutdown`, must exit through ACPI S5.
 `smoke-cmds`, `smoke-toybox`, `smoke-disk`, `smoke-net`, `smoke-net-e1000`, `smoke-tcpsrv`, `smoke-fw`,
 `smoke-dyn`, `smoke-dynlib`, `smoke-x`, `smoke-pkg` (which first builds `repo/` and, on a
 host without one, a repo signing key), `smoke-gui` (which needs the ISO, so `check`
-builds it), `smoke-ext4`, `smoke-ext2rw`, `smoke-vfat` (needs `mkfs.fat`, `fsck.fat` and mtools on
+builds it), `smoke-ext4`, `smoke-ext2rw`, `smoke-ext4rw`, `smoke-vfat` (needs `mkfs.fat`, `fsck.fat` and mtools on
 the host), `smoke-exfat` (needs `mkfs.exfat` and `fsck.exfat` from exfatprogs, and
 about 2 MiB of real disk for a 64 GiB sparse image), `smoke-uefi` (the Limine ISO under SeaBIOS, OVMF x64 and OVMF IA32; `check`
 builds the ISO, which fetches the pinned Limine release once, and the test skips a

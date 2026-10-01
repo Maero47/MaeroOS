@@ -10119,22 +10119,23 @@ void syscall_dispatch(registers_t *regs) {
     case 175: ret = sys_rt_sigprocmask(regs);  break;
     case 176: ret = sys_rt_sigpending(regs);   break;
     case 73:  ret = sys_rt_sigpending(regs);   break;  /* sigpending */
-    /* fsync(118)/fdatasync(148): our filesystems are RAM/simple-backed and every
-     * write is already durable to our backing store, so a sync is a correct
-     * no-op.  MUST return 0 (success), not -ENOSYS — glibc's fsync propagates
-     * ENOSYS to the app, and code that treats a failed fsync as a failed write
-     * (Firefox's startupCache / sqlite / prefs) can then error out. */
-    case 118: ret = 0;                         break;  /* fsync */
-    case 148: ret = 0;                         break;  /* fdatasync */
-    /* sync(36)/syncfs(344): for the same reason there is nothing to flush
-     * (ext2 writes through); syncfs still wants a valid descriptor. */
-    case 36:  ret = 0;                         break;  /* sync */
+    /* fsync(118)/fdatasync(148): every filesystem here writes through except
+     * a journaled ext3/ext4, whose open transaction is committed (all of
+     * them: cheap, and no per-file tracking).  MUST return 0 (success), not
+     * -ENOSYS — glibc's fsync propagates ENOSYS to the app, and code that
+     * treats a failed fsync as a failed write (Firefox's startupCache /
+     * sqlite / prefs) can then error out. */
+    case 118: ext2_sync_all(); ret = 0;        break;  /* fsync */
+    case 148: ext2_sync_all(); ret = 0;        break;  /* fdatasync */
+    /* sync(36)/syncfs(344): the same; syncfs still wants a valid descriptor. */
+    case 36:  ext2_sync_all(); ret = 0;        break;  /* sync */
     /* splice(313)/tee(315): not implemented, answered the way Linux answers
      * for descriptors that cannot be spliced (-EINVAL), on which callers
      * (coreutils cat 9.8+) fall back to read/write.  vmsplice (316) too. */
     case 313: case 315: case 316: ret = -22;  break;
     case 344: ret = ((int)regs->ebx < 0 || (int)regs->ebx >= MAX_FD ||
                      current_proc->ofile[(int)regs->ebx].type == FD_NONE) ? -9 : 0;
+              if (ret == 0) ext2_sync_all();
               break;  /* syncfs */
     /* posix_fadvise (250=fadvise64, 272=fadvise64_64): pure advisory hints; safe
      * and correct to accept as a no-op success. */

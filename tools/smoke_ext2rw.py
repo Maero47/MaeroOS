@@ -20,10 +20,12 @@ and checks, with busybox:
   * the same device a second time is EBUSY; raw /dev writes to it (or its
     disk) are EBUSY; umount with a file open is EBUSY; remount,ro refuses writes and remount,rw allows them again
   * umount, mount again: everything written is there
-  * needs_recovery is refused read-write and read-only alike
+  * needs_recovery is refused read-only; read-write replays the (empty)
+    journal and mounts
   * /disk reads and writes as before
   * `poweroff` (ACPI S5), then on the host: e2fsck -fn is clean on both
-    filesystems, debugfs sees the guest's changes, sdc is byte-identical
+    filesystems, debugfs sees the guest's changes, sdc is clean and no longer
+    needs recovery
 """
 import hashlib
 import os
@@ -70,6 +72,17 @@ def run(*cmd):
 def debugfs(img, req):
     return subprocess.run([DEBUGFS, "-R", req, img], capture_output=True,
                           text=True).stdout
+
+
+def live_names(img, path):
+    """debugfs `ls -l` names minus the inode-0 entries it also prints (a
+    deleted entry that was first in its block keeps its name, inode 0)."""
+    out = []
+    for line in debugfs(img, f"ls -l {path}").splitlines():
+        f = line.split()
+        if len(f) >= 2 and f[0].isdigit() and f[0] != "0":
+            out.append(f[-1])
+    return out
 
 
 def seq_text(n):
@@ -280,10 +293,12 @@ def guest_tests(g, files):
     check(rc == 0, "umount the read-only mount")
 
     # ── needs_recovery ───────────────────────────────────────────────────
-    rc, out = g.sh("busybox mount -t ext3 /dev/sdc /mnt/c")
-    check(rc != 0, f"needs_recovery: read-write mount refused ({out.strip()!r})")
     rc, out = g.sh("busybox mount -t ext2 -o ro /dev/sdc /mnt/c")
-    check(rc != 0, f"needs_recovery: read-only mount refused too ({out.strip()!r})")
+    check(rc != 0, f"needs_recovery: read-only mount refused ({out.strip()!r})")
+    rc, out = g.sh("busybox mount -t ext3 /dev/sdc /mnt/c && busybox cat /mnt/c/readme.txt && "
+                   "busybox umount /mnt/c")
+    check(rc == 0 and "ext3 on nvme" in out,
+          f"needs_recovery: read-write mount replays the journal and mounts ({out.strip()!r})")
 
     # ── /disk after ──────────────────────────────────────────────────────
     rc, out = g.sh("busybox cat /disk/ext2rw-mark && echo again >> /disk/ext2rw-mark && "
@@ -312,19 +327,20 @@ def host_checks(a_img, a_fs, b_img, c_img, files):
         r = subprocess.run([E2FSCK, "-fn", img], capture_output=True, text=True)
         check(r.returncode == 0, f"host e2fsck -fn {name} clean (rc={r.returncode})"
               + ("" if r.returncode == 0 else "\n" + r.stdout[-1500:]))
-    root = debugfs(part, "ls -l /")
+    root = " ".join(live_names(part, "/"))
     check("seq.txt" in root and "new.txt" in root and "newdir" in root and
           "hello.txt" not in root and "delete-me.txt" not in root and
           "emptydir" not in root and "to-move.txt" not in root,
           "debugfs: sdb1 root has the guest's creates and deletes")
-    d = debugfs(part, "ls /dir")
+    d = " ".join(live_names(part, "/dir"))
     check("hello2.txt" in d and "inner-renamed.txt" in d and not re.search(r"\binner\.txt\b", d),
           "debugfs: renames in sdb1 /dir")
     check(md5(subprocess.run([DEBUGFS, "-R", "cat /seq.txt", part], capture_output=True).stdout)
           == seq_md5, "debugfs: sdb1 seq.txt content")
     check("../dir/hello2.txt" in debugfs(part, "stat /newdir/link"), "debugfs: symlink target")
-    big = debugfs(b_img, "ls /big")
-    check("zz-new" in big and "renamed" in big and "entry-00007-" not in big,
+    big = live_names(b_img, "/big")
+    check("zz-new" in big and "renamed" in big and
+          "entry-00007-with-a-longer-name" not in big and len(big) == 400 + 2,
           "debugfs: nvme0n1 htree dir changes")
     check(subprocess.run([DEBUGFS, "-R", "cat /lazy.txt", part], capture_output=True,
                          text=True).stdout == "before\nafter-detach\n",
@@ -339,8 +355,10 @@ def host_checks(a_img, a_fs, b_img, c_img, files):
         st = subprocess.run([tool("dumpe2fs"), "-h", img], capture_output=True, text=True).stdout
         check(re.search(r"Filesystem state:\s+clean", st) is not None,
               f"{name} superblock state clean after poweroff with it mounted read-write")
-    with open(c_img, "rb") as f:
-        check(md5(f.read()) == files["c_md5"], "sdc (needs_recovery) byte-identical")
+    r = subprocess.run([E2FSCK, "-fn", c_img], capture_output=True, text=True)
+    st = subprocess.run([tool("dumpe2fs"), "-h", c_img], capture_output=True, text=True).stdout
+    check(r.returncode == 0 and "needs_recovery" not in st,
+          f"sdc: clean, journal recovered (rc={r.returncode})")
     for name, img in (("sdb1", part), ("nvme0n1", b_img)):
         check(subprocess.run([DEBUGFS, "-R", "cat /at-poweroff.txt", img], capture_output=True,
                              text=True).stdout == "at-poweroff\n",

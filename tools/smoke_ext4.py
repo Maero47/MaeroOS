@@ -7,8 +7,7 @@ with a two-level htree), attaches them as hdb and hdc next to the usual boot
 disk, and checks from inside the guest, with busybox mount/umount:
 
   * the partitions show up in /proc/partitions and /dev
-  * mount -t ext4 works (read-only; a read-write request gets EROFS and
-    busybox falls back to read-only), /proc/mounts lists it
+  * mount -t ext4 -o ro works (fs/ext4.c), /proc/mounts lists it
   * every file's md5 matches the host, including the 300 MiB sparse file and
     an unwritten extent; the 5000- and 20000-entry htree directories list
     and resolve completely; fast/slow/relative/absolute/dir symlinks resolve
@@ -196,8 +195,10 @@ def main():
         g.sh("busybox mkdir -p /mnt; busybox rm -f /mnt/underneath; echo UNDER-MARK > /mnt/underneath")
 
         # ── GPT / 4 KiB ext4 ────────────────────────────────────────────
-        rc, out = g.sh("busybox mount -t ext4 /dev/hdb2 /mnt")
-        check(rc == 0, f"mount -t ext4 /dev/hdb2 /mnt (rc={rc}, {out.strip()!r})")
+        # -o ro: this one is for the read-only driver (fs/ext4.c); a
+        # read-write mount of the same features is smoke-ext4rw's.
+        rc, out = g.sh("busybox mount -t ext4 -o ro /dev/hdb2 /mnt")
+        check(rc == 0, f"mount -t ext4 -o ro /dev/hdb2 /mnt (rc={rc}, {out.strip()!r})")
         rc, out = g.sh("busybox cat /proc/mounts")
         check("/dev/hdb2 /mnt ext4 ro" in out, "/proc/mounts shows /dev/hdb2 on /mnt ext4 ro")
         check("/dev/hda /disk ext2 rw" in out, "/proc/mounts still shows the boot ext2 /disk")
