@@ -126,7 +126,10 @@ static int       dumpmode;       /* -D: composite off-screen + dump painted fram
 static int       dumps_done;
 static int       listen_fd = -1;
 static xclient_t clients[MAX_XCLIENTS];
-static int       dirty = 1;
+static int       dirty = 1;      /* the whole surface needs repainting */
+static unsigned  last_render_ms;
+#define FRAME_MS      16
+#define STATUS_BAND_H 40          /* the status line's rows at the top */
 static unsigned  res_seq;      /* monotonic; stamped on every window created */
 
 /* ── A0 diagnostic trace ─────────────────────────────────────────────────────
@@ -352,6 +355,7 @@ static xres_t *res_find(xclient_t *c, uint32_t xid) {
 
 /* Release everything a resource owns and free its slot. */
 static void res_free(xres_t *r) {
+    if (r->kind == R_WINDOW && r->mapped) dirty = 1;   /* it leaves the screen */
     if (r->px) { free(r->px); r->px = NULL; }
     if (r->gset) {
         glyphset_t *gs = (glyphset_t *)r->gset;
@@ -964,16 +968,59 @@ static int clip_span(int *d, int *s, int *n, int dl, int sl, int *skip) {
     return 1;
 }
 
+/* ── damage ──────────────────────────────────────────────────────────────────
+ * What the next render() must put back on screen, in surface coordinates.
+ * `dirty` means everything (a window mapped, moved, restacked or destroyed, a
+ * client came or went, the desktop sent an event); otherwise the bounding box
+ * below collects what drawing requests touched in mapped windows.  Drawing
+ * into a pixmap damages nothing: it reaches the screen only through a later
+ * CopyArea/Composite into a window, which damages its destination.  This is
+ * the X Damage extension's model (accumulate, then report a region), with the
+ * report being the rectangle handed to wm_commit_rect(). */
+static int pd_x0, pd_y0, pd_x1, pd_y1;   /* empty when pd_x0 >= pd_x1 */
+
+static void damage_surface(int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    if (pd_x0 >= pd_x1) {
+        pd_x0 = x; pd_y0 = y; pd_x1 = x + w; pd_y1 = y + h;
+        return;
+    }
+    if (x < pd_x0) pd_x0 = x;
+    if (y < pd_y0) pd_y0 = y;
+    if (x + w > pd_x1) pd_x1 = x + w;
+    if (y + h > pd_y1) pd_y1 = y + h;
+}
+
+/* Drawn: the (already clipped) rectangle x,y,w,h of drawable d. */
+static void damage_drawable(xres_t *d, int x, int y, int w, int h) {
+    if (d && d->kind == R_WINDOW && d->mapped)
+        damage_surface(d->x + x, d->y + y, w, h);
+}
+
+/* The first drawing into a window makes all of it composited (see `painted`),
+ * not just the part drawn. */
+static void mark_painted(xres_t *d) {
+    if (!d->painted) {
+        d->painted = 1;
+        damage_drawable(d, 0, 0, d->w, d->h);
+    }
+}
+
+/* Fill n pixels with one value: `rep stosl`, a dword per step. */
+static inline void fill32(uint32_t *p, uint32_t v, int n) {
+    if (n <= 0) return;
+    __asm__ volatile("rep stosl" : "+D"(p), "+c"(n) : "a"(v) : "memory");
+}
+
 /* ── drawing into a drawable's backing buffer ────────────────────────────── */
 static void fill_rect(xres_t *d, int x, int y, int w, int h, uint32_t color) {
     if (!d || !d->px) return;
-    d->painted = 1;
+    mark_painted(d);
     if (!clip_span(&x, NULL, &w, d->w, 0, NULL) ||
         !clip_span(&y, NULL, &h, d->h, 0, NULL)) return;
-    for (int yy = y; yy < y + h; yy++) {
-        uint32_t *row = d->px + (size_t)yy * d->w + x;
-        for (int xx = 0; xx < w; xx++) row[xx] = color;
-    }
+    for (int yy = y; yy < y + h; yy++)
+        fill32(d->px + (size_t)yy * d->w + x, color, w);
+    damage_drawable(d, x, y, w, h);
 }
 
 /* ── XRender ─────────────────────────────────────────────────────────────────
@@ -1023,11 +1070,12 @@ static xglyph_t *glyph_find(glyphset_t *gs, uint32_t id) {
 /* Blit one A8 glyph (coverage) in colour `col` onto drawable dd at pen (px,py). */
 static void glyph_blit(xres_t *dd, xglyph_t *g, int px, int py, uint32_t col) {
     if (!g || !g->bits || !dd || !dd->px) return;
-    dd->painted = 1;
+    mark_painted(dd);
     int ox = px - g->x, oy = py - g->y;
     int gx = 0, gy = 0, w = g->w, h = g->h;
     if (!clip_span(&ox, &gx, &w, dd->w, g->w, NULL) ||
         !clip_span(&oy, &gy, &h, dd->h, g->h, NULL)) return;
+    damage_drawable(dd, ox, oy, w, h);
     uint32_t cr = (col >> 16) & 0xff, cg = (col >> 8) & 0xff, cb = col & 0xff;
     for (int yy = 0; yy < h; yy++) {
         int ty = oy + yy;
@@ -1137,7 +1185,7 @@ static void dispatch_render(xclient_t *c, const uint8_t *q, int qlen) {
         if (!dstp || dstp->kind != R_PICTURE) break;
         xres_t *dd = res_find(c, dstp->pic_drawable);
         if (!dd || !dd->px) break;
-        dd->painted = 1;
+        mark_painted(dd);
         int    solid = (srcp && srcp->kind == R_PICTURE && srcp->pic_solid);
         uint32_t sc  = solid ? srcp->fg : 0;
         xres_t *sd   = (!solid && srcp && srcp->kind == R_PICTURE)
@@ -1149,6 +1197,7 @@ static void dispatch_render(xclient_t *c, const uint8_t *q, int qlen) {
         if (have_src &&
             clip_span(&dx, solid ? NULL : &sx, &w, dd->w, solid ? 0 : sd->w, NULL) &&
             clip_span(&dy, solid ? NULL : &sy, &h, dd->h, solid ? 0 : sd->h, NULL)) {
+            damage_drawable(dd, dx, dy, w, h);
             for (int yy = 0; yy < h; yy++) {
                 uint32_t *drow = dd->px + (size_t)(dy + yy) * dd->w + dx;
                 const uint32_t *srow = solid ? NULL
@@ -1164,7 +1213,6 @@ static void dispatch_render(xclient_t *c, const uint8_t *q, int qlen) {
         render_n++;
         if (render_n <= 8) xt("XT Composite op=%d dst-win=0x%x %dx%d @%d,%d\n",
                               op, (unsigned)dstp->pic_drawable, w, h, dx, dy);
-        if (dd->kind == R_WINDOW) dirty = 1;
         break;
     }
     case 26: {       /* FillRectangles(op, dst, color[4xCARD16], rects...) */
@@ -1176,7 +1224,7 @@ static void dispatch_render(xclient_t *c, const uint8_t *q, int qlen) {
         if (!dstp || dstp->kind != R_PICTURE) break;
         xres_t *dd = res_find(c, dstp->pic_drawable);
         if (!dd || !dd->px) break;
-        dd->painted = 1;
+        mark_painted(dd);
         int nr = (qlen - 20) / 8;
         for (int i = 0; i < nr; i++) {
             const uint8_t *rr = q + 20 + i * 8;
@@ -1184,17 +1232,14 @@ static void dispatch_render(xclient_t *c, const uint8_t *q, int qlen) {
             int rw = (int)r16(rr + 4), rh = (int)r16(rr + 6);
             if (!clip_span(&x, NULL, &rw, dd->w, 0, NULL) ||
                 !clip_span(&y, NULL, &rh, dd->h, 0, NULL)) continue;
+            if (op != 1 && ca == 0) continue;            /* Over, transparent */
+            damage_drawable(dd, x, y, rw, rh);
             for (int yy = 0; yy < rh; yy++) {
-                int ty = y + yy;
-                for (int xx = 0; xx < rw; xx++) {
-                    int tx = x + xx;
-                    uint32_t *dp = &dd->px[(size_t)ty * dd->w + tx];
-                    if (op == 1 || ca == 255) *dp = color & 0x00FFFFFF;
-                    else if (ca > 0)          *dp = blend_over(color, *dp);
-                }
+                uint32_t *dp = &dd->px[(size_t)(y + yy) * dd->w + x];
+                if (op == 1 || ca == 255) { fill32(dp, color & 0x00FFFFFF, rw); continue; }
+                for (int xx = 0; xx < rw; xx++) dp[xx] = blend_over(color, dp[xx]);
             }
         }
-        if (dd->kind == R_WINDOW) dirty = 1;
         break;
     }
     case 33: {       /* CreateSolidFill(pid, color[4xCARD16]) */
@@ -1283,7 +1328,7 @@ static void dispatch_render(xclient_t *c, const uint8_t *q, int qlen) {
         if (!dstp || dstp->kind != R_PICTURE) break;
         xres_t *dd = res_find(c, dstp->pic_drawable);
         if (!dd || !dd->px) break;
-        dd->painted = 1;
+        mark_painted(dd);
         uint32_t col = (srcp && srcp->kind == R_PICTURE && srcp->pic_solid)
                      ? srcp->fg : 0xFF000000;          /* default opaque black */
         int penx = 0, peny = 0, off = 28;              /* glyph-element list */
@@ -1307,7 +1352,7 @@ static void dispatch_render(xclient_t *c, const uint8_t *q, int qlen) {
             }
             off = (off + 3) & ~3;                       /* pad to 4 */
         }
-        if (drew && dd->kind == R_WINDOW) dirty = 1;
+        (void)drew;                    /* glyph_blit() damaged what it drew */
         render_n++;
         if (render_n <= 8) xt("XT CompositeGlyphs dst-win=0x%x drew=%d\n",
                               (unsigned)dstp->pic_drawable, drew);
@@ -1538,7 +1583,7 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
         if (copyarea_n <= 8) xt("XT CopyArea src=0x%x dst=0x%x\n",
                                 (unsigned)r32(q + 4), (unsigned)r32(q + 8));
         if (src && src->px && dst && dst->px) {
-            dst->painted = 1;
+            mark_painted(dst);
             int sx = rs16(q + 16), sy = rs16(q + 18);
             int dx = rs16(q + 20), dy = rs16(q + 22);
             int w  = (int)r16(q + 24), h = (int)r16(q + 26);
@@ -1554,8 +1599,8 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
                             src->px + (size_t)(sy + yy) * src->w + sx,
                             (size_t)w * 4);
                 }
+                damage_drawable(dst, dx, dy, w, h);
             }
-            dirty = 1;
         }
         break;
     }
@@ -1598,7 +1643,6 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
             const uint8_t *rr = q + 12 + i * 8;
             fill_rect(d, rs16(rr), rs16(rr + 2), (int)r16(rr + 4), (int)r16(rr + 6), fg);
         }
-        dirty = 1;
         break;
     }
     case 67: {       /* PolyRectangle (outline) */
@@ -1612,7 +1656,6 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
             fill_rect(d, x, y, w, 1, fg); fill_rect(d, x, y + h, w + 1, 1, fg);
             fill_rect(d, x, y, 1, h, fg); fill_rect(d, x + w, y, 1, h, fg);
         }
-        dirty = 1;
         break;
     }
     case 72: {       /* PutImage (ZPixmap, depth 24/32) */
@@ -1627,9 +1670,18 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
         /* Drop a "Firefox painted" marker the ff watchdog polls.  Re-created
          * after each launch (the launcher deletes it first), so check-then-create
          * makes it reappear on the first PutImage of a launch that reaches paint. */
-        if (access("/tmp/ff_painted", F_OK) != 0) {
-            int mfd = open("/tmp/ff_painted", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (mfd >= 0) close(mfd);
+        /* At most once a second, though: a path lookup per PutImage was a
+         * syscall per request on a browser's hottest path. */
+        {
+            static unsigned last_mark;
+            unsigned t = now_ms();
+            if (putimage_n == 1 || t - last_mark >= 1000) {
+                last_mark = t;
+                if (access("/tmp/ff_painted", F_OK) != 0) {
+                    int mfd = open("/tmp/ff_painted", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                    if (mfd >= 0) close(mfd);
+                }
+            }
         }
         /* Only ZPixmap at 24/32 bpp is drawn; bitmaps and XY formats stay a
          * silent no-op as before.  The image must fit inside the request: the
@@ -1643,19 +1695,23 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
                 break;
             }
             if (d && d->px) {
-                d->painted = 1;
+                mark_painted(d);
                 const uint8_t *img = q + 24;
                 int ix = 0, iy = 0, cw = iw, ch = ih;
                 if (clip_span(&dx, &ix, &cw, d->w, iw, NULL) &&
                     clip_span(&dy, &iy, &ch, d->h, ih, NULL)) {
+                    /* Clients are LSBFirst on x86 (see r32), so a ZPixmap row
+                     * is already our pixel layout: copy dwords, dropping the
+                     * pad byte, instead of assembling every pixel from bytes. */
                     for (int yy = 0; yy < ch; yy++) {
-                        const uint8_t *row = img + (size_t)(iy + yy) * stride + (size_t)ix * 4;
+                        const uint32_t *in = (const uint32_t *)(const void *)
+                            (img + (size_t)(iy + yy) * stride + (size_t)ix * 4);
                         uint32_t *out = d->px + (size_t)(dy + yy) * d->w + dx;
                         for (int xx = 0; xx < cw; xx++)
-                            out[xx] = r32(row + (size_t)xx * 4) & 0x00FFFFFF;
+                            out[xx] = in[xx] & 0x00FFFFFF;
                     }
+                    damage_drawable(d, dx, dy, cw, ch);
                 }
-                dirty = 1;
             }
         }
         break;
@@ -1663,7 +1719,6 @@ static void dispatch(xclient_t *c, const uint8_t *q, int qlen) {
     case 61: {       /* ClearArea */
         xres_t *d = res_find(c, r32(q + 4));
         fill_rect(d, rs16(q + 8), rs16(q + 10), (int)r16(q + 12), (int)r16(q + 14), 0x00202830);
-        dirty = 1;
         break;
     }
     case 73: {       /* GetImage → return the drawable's pixels (ZPixmap) */
@@ -1998,10 +2053,12 @@ static void process_client(xclient_t *c) {
  * screen untouched until the dump ends would show the user a window frozen
  * minutes behind what they typed. */
 static void render(void);   /* fwd */
+static int render_due(void);
+static int poll_desktop(void);
 static void pump_input(void) {
     if (!headless) {
-        gui_poll(&gui);
-        if (dirty) render();
+        poll_desktop();
+        if (render_due()) render();
     }
     keyfifo_poll();
 }
@@ -2041,7 +2098,7 @@ static void b64_write(int fd, const uint8_t *in, int len) {
  * FFDUMP/FFDUMPEND markers a host script decodes into a PNG.  This makes the
  * proven-but-invisible headless paint (putimg>0, no framebuffer) actually
  * viewable.  Half-res keeps the serial transfer to ~0.5MB. */
-static void composite_windows(draw_surface_t *s);   /* fwd */
+static void composite_windows(draw_surface_t *s, int cx0, int cy0, int cx1, int cy1);
 static void frame_dump(void) {
     if (trace_fd < 0) return;
     int W = 1280, H = 800;
@@ -2050,7 +2107,7 @@ static void frame_dump(void) {
     s.px = (uint32_t *)malloc((size_t)W * H * 4);
     if (!s.px) return;
     for (int i = 0; i < W * H; i++) s.px[i] = 0x00202830;   /* desktop bg */
-    composite_windows(&s);
+    composite_windows(&s, 0, 0, s.w, s.h);
     /* Downsample 2x into a packed RGB buffer. */
     int dw = W / 2, dh = H / 2;
     uint8_t *rgb = (uint8_t *)malloc((size_t)dw * dh * 3);
@@ -2080,7 +2137,7 @@ static void frame_dump(void) {
  * could land below the blank toplevel: the browser painted normally
  * (putimg=24) while the screen showed the toplevel's empty background.  That
  * was a coin flip - 10 of 20 runs. */
-static void composite_windows(draw_surface_t *s) {
+static void composite_windows(draw_surface_t *s, int cx0, int cy0, int cx1, int cy1) {
     xres_t *order[MAX_XCLIENTS * MAX_RES];
     int n = 0;
     for (int ci = 0; ci < MAX_XCLIENTS; ci++) {
@@ -2100,9 +2157,22 @@ static void composite_windows(draw_surface_t *s) {
     }
     for (int k = 0; k < n; k++) {
         xres_t *w = order[k];
-        int tx = w->x, ty = w->y, sx = 0, sy = 0, cw = w->w, ch = w->h;
-        if (!clip_span(&tx, &sx, &cw, s->w, w->w, NULL) ||
-            !clip_span(&ty, &sy, &ch, s->h, w->h, NULL)) continue;
+        /* Clip to the surface and to the clip rectangle [cx0,cx1)x[cy0,cy1):
+         * the part of each window outside it is already on screen. */
+        int tx = w->x - cx0, ty = w->y - cy0, sx = 0, sy = 0, cw = w->w, ch = w->h;
+        if (!clip_span(&tx, &sx, &cw, cx1 - cx0, w->w, NULL) ||
+            !clip_span(&ty, &sy, &ch, cy1 - cy0, w->h, NULL)) continue;
+        tx += cx0;
+        ty += cy0;
+        /* Skip a window wholly covered by an opaque one above it (every
+         * composited window is opaque: its own pixels, no alpha). */
+        int hidden = 0;
+        for (int a = k + 1; a < n && !hidden; a++) {
+            xres_t *o = order[a];
+            hidden = o->x <= tx && o->y <= ty &&
+                     o->x + o->w >= tx + cw && o->y + o->h >= ty + ch;
+        }
+        if (hidden) continue;
         for (int yy = 0; yy < ch; yy++)
             memcpy(s->px + (size_t)(ty + yy) * s->w + tx,
                    w->px + (size_t)(sy + yy) * w->w + sx, (size_t)cw * 4);
@@ -2133,16 +2203,80 @@ static void on_x_click(gui_window_t *g, int x, int y) {
     }
 }
 
+static unsigned render_n_full, render_n_part;   /* "renders" in -T traces */
+
+/* The backdrop's top band (status line on the background colour), rendered
+ * once per text or width change, so a partial render that reaches it copies
+ * just its part instead of redrawing the text whole. */
+static uint32_t *strip_px;
+static int strip_w;
+static char strip_text[sizeof(status)];
+
+static void backdrop_rows(draw_surface_t *s, int x0, int y0, int x1, int y1) {
+    snprintf(status, sizeof(status), "maeroX :0 - %d client%s, DISPLAY=:0",
+             count_clients(), count_clients() == 1 ? "" : "s");
+    if (y0 < STATUS_BAND_H && (strip_w != s->w || strcmp(strip_text, status))) {
+        uint32_t *np = (uint32_t *)realloc(strip_px, (size_t)s->w * STATUS_BAND_H * 4);
+        if (np) {
+            draw_surface_t t = { np, s->w, STATUS_BAND_H };
+            strip_px = np;
+            strip_w = s->w;
+            strcpy(strip_text, status);
+            draw_fill(&t, draw_rgb(24, 28, 36));
+            draw_text_aa(&t, 12, 14, status, draw_rgb(150, 200, 255), &draw_font_ui);
+        }
+    }
+    for (int y = y0; y < y1; y++) {
+        uint32_t *d = s->px + (size_t)y * s->w + x0;
+        if (y < STATUS_BAND_H && strip_px && strip_w == s->w)
+            memcpy(d, strip_px + (size_t)y * strip_w + x0, (size_t)(x1 - x0) * 4);
+        else
+            fill32(d, draw_rgb(24, 28, 36), x1 - x0);
+    }
+}
+
+/* Put what changed on the desktop surface and tell the compositor which part.
+ * A full render repaints the backdrop and every window; a damaged one only the
+ * damage rectangle, and reports just that to the compositor. */
 static void render(void) {
     draw_surface_t *s = &gui.surf;
     if (!s->px) return;
-    draw_fill(s, draw_rgb(24, 28, 36));
-    snprintf(status, sizeof(status), "maeroX :0 - %d client%s, DISPLAY=:0",
-             count_clients(), count_clients() == 1 ? "" : "s");
-    draw_text_aa(s, 12, 14, status, draw_rgb(150, 200, 255), &draw_font_ui);
-    composite_windows(s);
-    wm_commit(&gui.wm, gui.slot);
+    int x0 = 0, y0 = 0, x1 = s->w, y1 = s->h;
+    if (!dirty) {
+        if (pd_x0 >= pd_x1) return;                  /* nothing changed */
+        x0 = pd_x0 < 0 ? 0 : pd_x0;
+        y0 = pd_y0 < 0 ? 0 : pd_y0;
+        x1 = pd_x1 > s->w ? s->w : pd_x1;
+        y1 = pd_y1 > s->h ? s->h : pd_y1;
+    }
+    pd_x0 = pd_x1 = 0;
+    if (x0 < x1 && y0 < y1) {
+        backdrop_rows(s, x0, y0, x1, y1);
+        composite_windows(s, x0, y0, x1, y1);
+        if (dirty) { wm_commit(&gui.wm, gui.slot); render_n_full++; }
+        else { wm_commit_rect(&gui.wm, gui.slot, x0, y0, x1 - x0, y1 - y0); render_n_part++; }
+    }
     dirty = 0;
+    last_render_ms = now_ms();
+}
+
+/* Take the desktop's events for our window.  Input is forwarded to X clients
+ * by the handlers (they repaint and that damages); only a resize gives us a
+ * new, blank surface that must be repainted whole. */
+static int poll_desktop(void) {
+    uint32_t *px = gui.surf.px;
+    int w = gui.surf.w, h = gui.surf.h;
+    int n = gui_poll(&gui);
+    if (gui.surf.px != px || gui.surf.w != w || gui.surf.h != h) dirty = 1;
+    return n;
+}
+
+/* Frame pacing: drawing requests are taken as fast as clients send them, but
+ * the result is put on screen at most once per FRAME_MS (~60 Hz) - one render
+ * and one compositor commit per frame instead of one per request batch. */
+static int render_due(void) {
+    if (!dirty && pd_x0 >= pd_x1) return 0;
+    return now_ms() - last_render_ms >= FRAME_MS;
 }
 
 /* ── connection setup ────────────────────────────────────────────────────── */
@@ -2238,7 +2372,7 @@ int main(int argc, char *argv[]) {
     unsigned last_hist = now_ms();
     unsigned last_dump = last_hist;
     while (headless || !gui.closed) {
-        int events = headless ? 0 : gui_poll(&gui);
+        if (!headless) poll_desktop();
         keyfifo_poll();
         accept_clients();
         for (int i = 0; i < MAX_XCLIENTS; i++)
@@ -2247,7 +2381,7 @@ int main(int argc, char *argv[]) {
          * here, never from inside a handler that may still reference them. */
         for (int i = 0; i < MAX_XCLIENTS; i++)
             if (clients[i].used && clients[i].dead) client_close(&clients[i]);
-        if (!headless && (dirty || events > 0)) render();
+        if (!headless && render_due()) render();
         unsigned now = now_ms();
         if (trace_fd >= 0 && now - last_hist >= 2000) {   /* every 2 s */
             xt_dump_hist();
@@ -2269,7 +2403,14 @@ int main(int argc, char *argv[]) {
             }
             if (have_top) { frame_dump(); dumps_done++; last_dump = now; }
         }
-        wait_for_clients(12);
+        /* Owed a frame: wake no later than its slot. */
+        int wait = 12;
+        if (!headless && (dirty || pd_x0 < pd_x1)) {
+            unsigned since = now_ms() - last_render_ms;
+            int left = since >= FRAME_MS ? 0 : (int)(FRAME_MS - since);
+            if (left < wait) wait = left;
+        }
+        wait_for_clients(wait);
     }
 
     close(listen_fd);

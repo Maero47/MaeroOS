@@ -55,6 +55,16 @@ missing-glyph box in sans/serif/mono/system-ui and named families, and
 whether serif, mono, bold and italic are real faces; any failure FAILs the
 run and the report is saved as fonts.json.
 
+--scroll SEC (implies --web) is the compositor benchmark: after the page-load
+check it opens a long served page (/long: text and colour blocks) and holds
+the Down arrow for SEC seconds, so Firefox scrolls and repaints the whole
+time.  For the numbers, build the kernel with KTRACE=1: its periodic dump then
+carries a per-thread line ("[kprof] cpu window=... idle=... desktop=...")
+every 10 s, and the run puts /gfxstats on the disk so the desktop traces its
+compositor counters ("[desktop] stats frames=... render_ms=...") alongside.
+The dump windows that fall inside the scroll are averaged into scroll.txt
+(CPU share per process, desktop frames/s and ms per frame) and the summary.
+
 Usage:
   python3 tools/smoke_firefox.py [--accel kvm|tcg|<qemu -accel value>]
                                  [--smp N] [--timeout SEC] [--mem SIZE]
@@ -223,11 +233,28 @@ class WebServer:
                    FONT_JS % (json.dumps([list(f) for f in FONT_FAMILIES]), json.dumps(FONT_TEXT))))
         return WebServer.PAGE_HEAD + body.encode("utf-8")
 
+    @staticmethod
+    def long_page():
+        """--scroll's page: tall enough to scroll for minutes, with text and
+        coloured blocks so every scrolled frame differs."""
+        parts = [b"<!doctype html><html><head><meta charset=\"utf-8\"><title>long</title>"
+                 b"<style>body{font-family:sans-serif;margin:8px}div.b{height:40px;margin:4px 0}"
+                 b"</style></head><body><h1>Scrolling</h1>"]
+        for i in range(600):
+            parts.append(("<p>%d. The quick brown fox jumps over the lazy dog; "
+                          "pack my box with five dozen liquor jugs.</p>"
+                          "<div class=b style=\"background:hsl(%d,70%%,60%%)\"></div>"
+                          % (i, (i * 37) % 360)).encode())
+        parts.append(b"</body></html>")
+        return b"".join(parts)
+
     def __init__(self):
         self.requests = []          # (host time, path, status)
         self.font_report = None     # (host time, parsed JSON) from the page
-        files = {"/": self.page(), "/mark.png": png_bytes(WEB_MARK_W, WEB_MARK_H, (255, 0, 0))}
-        types = {"/": "text/html; charset=utf-8", "/mark.png": "image/png"}
+        files = {"/": self.page(), "/mark.png": png_bytes(WEB_MARK_W, WEB_MARK_H, (255, 0, 0)),
+                 "/long": self.long_page()}
+        types = {"/": "text/html; charset=utf-8", "/mark.png": "image/png",
+                 "/long": "text/html; charset=utf-8"}
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -1007,6 +1034,78 @@ def web_load(qmp, args, run, pump, web):
                        "(no missing-glyph boxes in %d families)." % (t_red - t_enter, len(rep.get("families", {}))))
 
 
+CPU_LINE = re.compile(r"\[kprof\] cpu window=(\d+)ms idle=(\d+)ms(.*)")
+STATS_LINE = re.compile(r"\[desktop\] stats frames=(\d+) rows=(\d+) commits=(\d+) "
+                        r"present_kb=(\d+) render_ms=(\d+)")
+
+
+def scroll_run(qmp, args, run, pump, web):
+    """Open /long and hold Down for --scroll seconds; average the KTRACE
+    per-thread CPU windows and the desktop's counters over that time."""
+    url = "http://10.0.2.2:%d/long" % web.port
+    send_text(qmp, args, pump, url)
+    qmp.hmp("sendkey ret")
+    end = time.time() + 60
+    while web.first("/long") is None and time.time() < end:
+        if not pump(1.0):
+            return
+    pump(10.0)                                   # layout, first paint
+    t_start = time.time() - run.t0
+    end = time.time() + args.scroll
+    presses = 0
+    while time.time() < end:
+        qmp.hmp("sendkey down")
+        presses += 1
+        if not pump(0.08):
+            break
+    t_end = time.time() - run.t0
+    pump(12.0)                                   # the dump that closes the window
+    shot_p = qmp.screendump(os.path.join(args.outdir, "screen-scroll.png"),
+                            os.path.join(args.outdir, "screen-scroll.ppm"))
+    if shot_p:
+        run.shots["screen-scroll"] = shot_p
+
+    # CPU windows wholly inside the scroll.
+    tot, idle, procs, nwin = 0, 0, {}, 0
+    for t, line in run.lines:
+        m = CPU_LINE.search(line)
+        if not m:
+            continue
+        win = int(m.group(1)) / 1000.0
+        if t - win < t_start or t > t_end + 1.0:
+            continue
+        nwin += 1
+        tot += int(m.group(1))
+        idle += int(m.group(2))
+        for name, ms in re.findall(r" (\S+)=(\d+)ms", m.group(3)):
+            procs[name] = procs.get(name, 0) + int(ms)
+    stats = [(t, [int(x) for x in m.groups()]) for t, line in run.lines
+             for m in [STATS_LINE.search(line)] if m and t_start - 10 <= t <= t_end + 10]
+    notes = ["scroll %.0fs: %d Down presses on %s" % (t_end - t_start, presses, url)]
+    if nwin:
+        top = sorted(procs.items(), key=lambda kv: -kv[1])[:8]
+        notes.append("cpu over %d KTRACE windows (%.0fs): idle %.1f%%, %s" % (
+            nwin, tot / 1000.0, 100.0 * idle / tot,
+            ", ".join("%s %.1f%%" % (k, 100.0 * v / tot) for k, v in top)))
+    else:
+        notes.append("cpu: no '[kprof] cpu' lines inside the scroll (build with KTRACE=1)")
+    if len(stats) >= 2:
+        (ta, a), (tb, b) = stats[0], stats[-1]
+        frames = b[0] - a[0]
+        notes.append("desktop over %.0fs: %d frames (%.1f/s), %.2f ms compositing per frame, "
+                     "%d rows/frame, %d KB presented/frame, %d client commits" % (
+                         tb - ta, frames, frames / max(tb - ta, 1e-6),
+                         (b[4] - a[4]) / max(frames, 1), (b[1] - a[1]) // max(frames, 1),
+                         (b[3] - a[3]) // max(frames, 1), b[2] - a[2]))
+    else:
+        notes.append("desktop counters: not traced (no /disk/gfxstats, or an older desktop)")
+    with open(os.path.join(args.outdir, "scroll.txt"), "w") as f:
+        f.write("\n".join(notes) + "\n")
+    for n in notes:
+        print("smoke-firefox:   " + n)
+    run.web_notes.extend(notes)
+
+
 def type_into_guest(qmp, args, run, pump, shot):
     """Focus Firefox's address bar and type args.type_text into it.
 
@@ -1215,6 +1314,19 @@ def site_row_text(r):
     return " | ".join(parts)
 
 
+def set_gfxstats_marker(disk, tmp, on):
+    """Put /gfxstats on the disk image (the desktop then traces its
+    compositor counters every 10 s) or take it off again."""
+    debugfs = shutil.which("debugfs") or "/sbin/debugfs"
+    cmd = "rm gfxstats"
+    if on:
+        empty = os.path.join(tmp, "gfxstats")
+        open(empty, "w").close()
+        cmd = "write %s gfxstats" % empty
+    subprocess.run([debugfs, "-w", "-R", cmd, disk],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--accel", default=None, help="kvm, tcg, or any QEMU -accel value (default: kvm if usable else tcg)")
@@ -1268,10 +1380,15 @@ def main():
                          "via quick find. LIST is 'default' or a comma list of URL[|link text]")
     ap.add_argument("--site-timeout", type=float, default=150.0,
                     help="seconds to wait for a site's frame to settle (default 150)")
+    ap.add_argument("--scroll", type=float, default=0, metavar="SEC",
+                    help="after --web, hold Down on a long page for SEC seconds and report "
+                         "the CPU split (KTRACE=1 kernel) and compositor counters")
     ap.add_argument("-v", "--verbose", action="store_true", help="echo every serial line")
     args = ap.parse_args()
 
     os.chdir(ROOT)
+    if args.scroll:
+        args.web = True
     if args.web or args.sites:
         args.net = True
     accel = args.accel or ("kvm" if kvm_usable() else "tcg")
@@ -1308,6 +1425,8 @@ def main():
 
     tmp = tempfile.mkdtemp(prefix="ffsmoke-")
     qmp_path = os.path.join(tmp, "qmp.sock")
+    if args.scroll:
+        set_gfxstats_marker(args.disk, tmp, True)
     cmd = [qemu,
            "-cdrom", args.iso,
            "-drive", "file=%s,format=raw,if=ide" % args.disk,
@@ -1425,6 +1544,8 @@ def main():
                 web = WebServer()
                 try:
                     web_load(qmp, args, run, pump, web)
+                    if args.scroll and run.result == "PASS":
+                        scroll_run(qmp, args, run, pump, web)
                 finally:
                     web.close()
         elif run.panic_lines:
@@ -1466,6 +1587,8 @@ def main():
         if run.partial:
             run.lines.append((time.time() - run.t0, run.partial))
         run.raw.close()
+        if args.scroll:
+            set_gfxstats_marker(args.disk, tmp, False)
         shutil.rmtree(tmp, ignore_errors=True)
 
     text = run.write_summary(cmd, accel, time.time() - run.t0)

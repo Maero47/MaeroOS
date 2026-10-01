@@ -1,28 +1,60 @@
 #include "../include/string.h"
 #include "../include/stdlib.h"
 
+/*
+ * The block primitives are string instructions, not byte loops.  The
+ * compositor (desktop, maeroX) moves whole scanlines of 32-bit pixels through
+ * these, and a byte loop ran at well under a byte per cycle: the desktop's
+ * per-frame shadow compare and copy of a 4 MiB frame alone cost several ms.
+ * `rep movsl` / `rep stosl` move a dword per step (and on any CPU of the last
+ * decade the microcode streams whole cache lines), with the 0-3 byte tail
+ * done by `rep movsb`.  Userspace is built -mno-sse, and these stay that way:
+ * no FPU/SSE state is touched.
+ */
 void *memcpy(void *dst, const void *src, size_t n) {
-    char *d = dst;
-    const char *s = src;
-    while (n--) *d++ = *s++;
+    void *d = dst;
+    const void *s = src;
+    size_t words = n >> 2, tail = n & 3;
+    __asm__ volatile("rep movsl\n\t"
+                     "movl %3, %%ecx\n\t"
+                     "rep movsb"
+                     : "+D"(d), "+S"(s), "+c"(words)
+                     : "r"(tail)
+                     : "memory");
     return dst;
 }
 
 void *memmove(void *dst, const void *src, size_t n) {
-    char *d = dst;
-    const char *s = src;
-    if (d < s || d >= s + n) {
-        while (n--) *d++ = *s++;
-    } else {
-        d += n; s += n;
-        while (n--) *--d = *--s;
+    unsigned char *d = dst;
+    const unsigned char *s = src;
+    if (d == s || n == 0) return dst;
+    if (d < s || d >= s + n) return memcpy(dst, src, n);
+    /* Overlapping with dst above src: copy backwards, a dword at a time.
+     * Not `std; rep movs`: sigreturn here does not restore the direction
+     * flag, so a signal taken mid-copy would resume it running forwards. */
+    d += n;
+    s += n;
+    while (n & 3) { *--d = *--s; n--; }
+    {
+        unsigned *dw = (unsigned *)(void *)d;
+        const unsigned *sw = (const unsigned *)(const void *)s;
+        for (n >>= 2; n; n--) *--dw = *--sw;
     }
     return dst;
 }
 
 void *memset(void *dst, int c, size_t n) {
-    char *d = dst;
-    while (n--) *d++ = (char)c;
+    void *d = dst;
+    unsigned v = (unsigned char)c;
+    size_t words = n >> 2, tail = n & 3;
+    v |= v << 8;
+    v |= v << 16;
+    __asm__ volatile("rep stosl\n\t"
+                     "movl %3, %%ecx\n\t"
+                     "rep stosb"
+                     : "+D"(d), "+c"(words)
+                     : "a"(v), "r"(tail)
+                     : "memory");
     return dst;
 }
 
@@ -174,6 +206,16 @@ char *strtok_r(char *s, const char *delim, char **saveptr) {
 
 int memcmp(const void *a, const void *b, size_t n) {
     const unsigned char *ua = a, *ub = b;
+    /* Skip the equal prefix a dword at a time (the common case for the
+     * compositor's scanline compares is "all equal"), then settle the order
+     * on the first differing bytes. */
+    while (n >= 16) {
+        const unsigned *wa = (const unsigned *)(const void *)ua;
+        const unsigned *wb = (const unsigned *)(const void *)ub;
+        if ((wa[0] ^ wb[0]) | (wa[1] ^ wb[1]) | (wa[2] ^ wb[2]) | (wa[3] ^ wb[3]))
+            break;
+        ua += 16; ub += 16; n -= 16;
+    }
     while (n--) {
         if (*ua != *ub) return (int)*ua - (int)*ub;
         ua++; ub++;

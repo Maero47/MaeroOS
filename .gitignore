@@ -103,6 +103,7 @@ testfiles/awk
 /testfiles/ls
 /testfiles/lspci
 /testfiles/maerox
+/testfiles/gfxbench
 /testfiles/mkdir
 /testfiles/mkfifo
 /testfiles/mousetest

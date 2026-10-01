@@ -137,7 +137,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-ext4 smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine disk-alpine repo repo-serve start resolutions icons
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-ext4 smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine disk-alpine repo repo-serve start resolutions icons bench-gfx
 
 all: $(TARGET)
 
@@ -398,6 +398,13 @@ smoke-hda: $(TARGET) initrd
 # build/smoke-gui/; see tools/smoke_gui.py.
 smoke-gui: $(TARGET) iso disk
 	python3 tools/smoke_gui.py
+
+# Compositor benchmark: what a small animating region (and a full-window
+# redraw) costs the desktop and maeroX, libgui and X clients, max rate and
+# 60 Hz; exact per-process CPU from /proc/cputime.  Results are appended to
+# build/bench-gfx/results.txt; see tools/bench_gfx.py.
+bench-gfx: $(TARGET) iso disk
+	python3 tools/bench_gfx.py
 
 # The desktop driven with USB input only: qemu-xhci with usb-kbd, usb-tablet
 # and usb-mouse (drivers/usb/), including a login typed on the USB keyboard.
