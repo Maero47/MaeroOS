@@ -1,4 +1,5 @@
 #include "mount.h"
+#include "ext2.h"
 #include "ext4.h"
 #include "tmpfs.h"
 #include "../drivers/blkpart.h"
@@ -50,20 +51,42 @@ static int mount_block(const char *source, const char *target, const char *fstyp
     strncpy(devname, "/dev/", sizeof(devname));
     strncat(devname, bp->name, sizeof(devname) - strlen(devname) - 1);
     if (vfs_mount_has_fs_source(devname)) return -16;         /* -EBUSY */
-    /* This driver cannot honour an ext4 journal and never writes, so a
-     * read-write mount is refused rather than silently downgraded; mount(8)
-     * then retries read-only ("is write-protected, mounting read-only"). */
-    if (!(flags & VFS_MS_RDONLY)) return -30;                 /* -EROFS */
 
-    vfs_node_t *root;
-    ext4_fs_t *fs;
-    int r = ext4_mount_dev(bp, &root, &fs);
-    if (r < 0) return r;
     vfs_mnt_t t;
     memset(&t, 0, sizeof(t));
     strncpy(t.source, devname, sizeof(t.source) - 1);
     strncpy(t.fstype, fstype, sizeof(t.fstype) - 1);
-    t.flags   = flags & MS_KEEP;
+    t.flags = flags & MS_KEEP;
+    vfs_node_t *root;
+    int r;
+
+    /* Read-write, whatever the type asked for, is fs/ext2.c's: it writes
+     * ext2, and ext3/ext4 that use no incompatible feature and whose journal
+     * is empty.  Anything else is refused with -EROFS rather than silently
+     * downgraded; mount(8) then retries read-only ("is write-protected,
+     * mounting read-only"), which the read-only ext4 driver serves.  An
+     * explicit read-only ext2 mount stays with the ext2 driver when it can
+     * read the filesystem, so remount,rw works on it. */
+    int want_rw = !(flags & VFS_MS_RDONLY);
+    if (want_rw || strcmp(fstype, "ext2") == 0) {
+        ext2_fs_t *e2;
+        r = ext2_mount_dev(bp, !want_rw, &root, &e2);
+        if (r == 0) {
+            t.fs      = e2;
+            t.busy    = ext2_busy;
+            t.release = ext2_release;
+            t.set_ro  = ext2_set_ro;
+            r = vfs_mount_add(target, root, &t);
+            if (r < 0) ext2_release(e2);
+            return r;
+        }
+        if (want_rw)
+            return (r == -22 || r == -12 || r == -5) ? r : -30;  /* -EROFS */
+    }
+
+    ext4_fs_t *fs;
+    r = ext4_mount_dev(bp, &root, &fs);
+    if (r < 0) return r;
     t.fs      = fs;
     t.busy    = ext4_busy;
     t.release = ext4_release;
@@ -77,7 +100,9 @@ static int mount_remount(const char *target, uint32_t flags) {
     vfs_mnt_t *m = vfs_mount_find(target, &err);
     if (!m) return err;
     int want_ro = (flags & VFS_MS_RDONLY) != 0;
-    if (!want_ro && (m->flags & VFS_MS_RDONLY) && is_ext_type(m->fstype))
+    /* The read-only ext4 driver has no set_ro: it cannot go read-write. */
+    if (!want_ro && (m->flags & VFS_MS_RDONLY) && is_ext_type(m->fstype) &&
+        !m->set_ro)
         return -30;                                           /* -EROFS */
     /* Linux: going read-only while a file of the mount is open for writing
      * is -EBUSY, so no descriptor can write to a read-only mount. */
@@ -95,6 +120,10 @@ static int mount_remount(const char *target, uint32_t flags) {
                     return -16;                               /* -EBUSY */
             }
         }
+    }
+    if (m->set_ro && want_ro != ((m->flags & VFS_MS_RDONLY) != 0)) {
+        int r = m->set_ro(m->fs, want_ro);
+        if (r < 0) return r;
     }
     m->flags = flags & MS_KEEP;
     return 0;

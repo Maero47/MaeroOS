@@ -7151,7 +7151,14 @@ static uint32_t statfs_magic(const char *path) {
     return 0xEF53;                                               /* EXT2_SUPER_MAGIC */
 }
 
-static int sys_statfs64_fill(void *ubuf, uint32_t bufsz, uint32_t magic) {
+/* The ext2 instance behind mount `m` (mount(2) of an ext2 filesystem), or
+ * NULL for /disk and everything else. */
+static ext2_fs_t *statfs_ext2(const vfs_mnt_t *m) {
+    return (m && m->used && m->release == ext2_release) ? (ext2_fs_t *)m->fs : NULL;
+}
+
+static int sys_statfs64_fill(void *ubuf, uint32_t bufsz, uint32_t magic,
+                             ext2_fs_t *e2) {
     /* struct statfs64 (i386): f_type, f_bsize, f_blocks, f_bfree, f_bavail,
      * f_files, f_ffree, f_fsid[2], f_namelen, f_frsize, f_flags, f_spare[4].
      * 64-bit count fields. */
@@ -7164,7 +7171,8 @@ static int sys_statfs64_fill(void *ubuf, uint32_t bufsz, uint32_t magic) {
     __builtin_memset(&s, 0, sizeof(s));
     s.f_type    = magic;
     uint32_t bs, blocks, bfree, inodes, ifree;
-    if (ext2_statfs(&bs, &blocks, &bfree, &inodes, &ifree) == 0) {
+    if ((e2 ? ext2_statfs_fs(e2, &bs, &blocks, &bfree, &inodes, &ifree)
+            : ext2_statfs(&bs, &blocks, &bfree, &inodes, &ifree)) == 0) {
         s.f_bsize  = bs;
         s.f_frsize = bs;
         s.f_blocks = blocks;
@@ -7194,17 +7202,20 @@ static int sys_statfs64(registers_t *regs) {
     int r = resolve_path_at_fd(AT_FDCWD, path, resolved, sizeof(resolved));
     if (r < 0) return r;
     int err;
-    if (!vfs_lookup(resolved, 1, &err)) return err;
+    vfs_mnt_t *m = NULL;
+    if (!vfs_lookup_mnt(resolved, 1, &err, &m)) return err;
     return sys_statfs64_fill((void *)(uintptr_t)regs->edx, regs->ecx,
-                             statfs_magic(resolved));
+                             statfs_magic(resolved), statfs_ext2(m));
 }
 static int sys_fstatfs64(registers_t *regs) {
     int fd = (int)regs->ebx;
     if (fd < 0 || fd >= MAX_FD || current_proc->ofile[fd].type == FD_NONE)
         return -9;                                             /* -EBADF */
-    const char *path = current_proc->ofile[fd].path;
+    proc_file_t *f = &current_proc->ofile[fd];
+    const char *path = f->path;
+    ext2_fs_t *e2 = (f->mnt && f->mnt->seq == f->mnt_seq) ? statfs_ext2(f->mnt) : NULL;
     return sys_statfs64_fill((void *)(uintptr_t)regs->edx, regs->ecx,
-                             path[0] == '/' ? statfs_magic(path) : 0xEF53);
+                             path[0] == '/' ? statfs_magic(path) : 0xEF53, e2);
 }
 
 /* ── sys_memfd_create(name, flags) — EAX=356 ────────────────────────────────
