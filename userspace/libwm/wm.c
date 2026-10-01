@@ -187,6 +187,17 @@ static int parse_event_line(const char *line, wm_event_t *event) {
         event->mods = c;
         return 1;
     }
+    /* "ptr": the raw pointer stream a client asks for with "rawptr" (every
+     * motion and every button, button = the held-button mask; value = 1
+     * while the pointer is over the window body). */
+    if (sscanf(line, "ptr %d %d %d %d %d", &slot, &a, &b, &c, &event->value) == 5) {
+        event->type = WM_EVENT_PTR;
+        event->slot = slot;
+        event->x = a;
+        event->y = b;
+        event->button = c;
+        return 1;
+    }
     if (sscanf(line, "focus %d", &slot) == 1) {
         event->type = WM_EVENT_FOCUS;
         event->slot = slot;

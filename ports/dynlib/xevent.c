@@ -35,13 +35,14 @@ static int handshake(void){
     unsigned extra=u16(h+6)*4; unsigned char body[1024]; if(extra>sizeof(body))extra=sizeof(body);
     if((unsigned)rd(X,body,extra)!=extra)return -1;
     id_base=u32(body+4); id_mask=u32(body+8);
-    unsigned vlen=u16(body+16), off=32+((vlen+3)&~3u)+2*8;
+    unsigned vlen=u16(body+16), off=32+((vlen+3)&~3u)+body[21]*8;   /* pixmap formats: 8 bytes each */
     root=u32(body+off); visual=u32(body+off+32); return 0;
 }
+/* ExposureMask | ButtonPressMask: X delivers only the events a client selects. */
 static void create_window(unsigned wid,int x,int y,int w,int h){
-    unsigned char b[64],*p=b; w8(&p,1); w8(&p,24); w16(&p,8);
+    unsigned char b[64],*p=b; w8(&p,1); w8(&p,24); w16(&p,9);
     w32(&p,wid); w32(&p,root); w16(&p,x); w16(&p,y); w16(&p,w); w16(&p,h);
-    w16(&p,0); w16(&p,1); w32(&p,visual); w32(&p,0); write(X,b,p-b);
+    w16(&p,0); w16(&p,1); w32(&p,visual); w32(&p,0x800); w32(&p,0x8004); write(X,b,p-b);
 }
 static void create_gc(unsigned gc,unsigned d,unsigned fg){
     unsigned char b[32],*p=b; w8(&p,55); w8(&p,0); w16(&p,5);

@@ -303,7 +303,7 @@ int main(void) {
     int dump = access("/disk/ffcfg/ffdump", F_OK) == 0;
     int pid = fork();
     if (pid == 0) {
-        char *a[] = { "/disk/maerox", "3", dump ? "-D" : "-T", (char *)0 };
+        char *a[] = { "/disk/maerox", "3", "-k", dump ? "-D" : "-T", (char *)0 };
         execve(a[0], a, envp);
         _exit(127);
     }

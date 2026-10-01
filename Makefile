@@ -149,7 +149,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-net6 smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-ext4 smoke-ext2rw smoke-vfat smoke-exfat smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-alpine-net smoke-audio disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-net6 smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-ext4 smoke-ext2rw smoke-vfat smoke-exfat smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-alpinex disk-alpinex smoke-alpine-net smoke-audio disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched
 
 all: $(TARGET)
 
@@ -533,6 +533,17 @@ smoke-firefox-web: $(TARGET) iso disk-ff
 # then runs offline: bash, coreutils, python3, vim, git, ssh, less, apk add/del.
 disk-alpine:
 	python3 ports/alpine/prepare.py
+
+# The X11 apps image (docs/alpinex.md): the same Alpine root plus an offline
+# repo of X11/GTK applications and the set-uid helper /disk/xapp.
+disk-alpinex: userspace
+	ALPINE_X=1 python3 ports/alpine/prepare.py
+
+# Alpine X11 apps on maeroX (opt-in): installs xterm, xeyes and mousepad from
+# the offline repo, runs each, checks its window on screen, types and saves a
+# file in mousepad.  Output in build/smoke-alpinex/; see tools/smoke_alpinex.py.
+smoke-alpinex: $(TARGET) iso disk-alpinex
+	python3 tools/smoke_alpinex.py
 
 smoke-alpine: $(TARGET) initrd disk-alpine
 	python3 tools/smoke_alpine.py

@@ -34,3 +34,4 @@ void devfs_console_session_exit(int sid);
 
 /* Hang up and detach the controlling terminal for a session. */
 void devfs_session_tty_hangup(int sid, vfs_node_t *tty);
+void devfs_tty_opened(vfs_node_t *n);   /* open() without O_NOCTTY: may become the ctty */

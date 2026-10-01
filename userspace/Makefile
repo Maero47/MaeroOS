@@ -66,7 +66,7 @@ USER_BINS := $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
      $(TESTFILES)/reboot $(TESTFILES)/shutdown $(TESTFILES)/poweroff $(TESTFILES)/halt \
      $(TESTFILES)/sudo $(TESTFILES)/whoami $(TESTFILES)/uname $(TESTFILES)/clear $(TESTFILES)/hostname \
      $(TESTFILES)/which $(TESTFILES)/free $(TESTFILES)/uptime $(TESTFILES)/du $(TESTFILES)/df $(TESTFILES)/top $(TESTFILES)/wget $(TESTFILES)/bbwrap \
-     $(TESTFILES)/maerox $(TESTFILES)/ff $(TESTFILES)/gfxbench \
+     $(TESTFILES)/maerox $(TESTFILES)/ff $(TESTFILES)/gfxbench $(TESTFILES)/xapp $(TESTFILES)/linuxapps $(TESTFILES)/xappattack \
      $(TESTFILES)/kwprobe $(TESTFILES)/libctest $(TESTFILES)/wxprobe
 
 all: $(USER_BINS) $(MUSL_BINS)
@@ -708,10 +708,24 @@ view/view.o: view/view.c include/gui.h include/draw.h
 $(TESTFILES)/view: view/view.o $(GUIAPP_DEPS)
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) view/view.o libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o libwm/wm.o libc/libc.a
 
-maerox/maerox.o: maerox/maerox.c include/gui.h include/draw.h
-	$(CC) $(CFLAGS) -c $< -o $@
-$(TESTFILES)/maerox: maerox/maerox.o $(GUIAPP_DEPS)
-	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) maerox/maerox.o libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o libwm/wm.o libc/libc.a
+# Alpine X11 apps (docs/alpinex.md): the set-uid helper prepare.py puts on
+# disk-alpinex.img as /disk/xapp, and the Linux Apps window.
+xapp/xapp.o xapp/linuxapps.o: xapp/xapps.h
+$(TESTFILES)/xapp: xapp/xapp.o $(CRT0_OBJ) libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) xapp/xapp.o libc/libc.a
+$(TESTFILES)/xappattack: xapp/xappattack.o $(CRT0_OBJ) libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) xapp/xappattack.o libc/libc.a
+$(TESTFILES)/linuxapps: xapp/linuxapps.o $(GUIAPP_DEPS)
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) xapp/linuxapps.o libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o libwm/wm.o libc/libc.a
+
+MAEROX_OBJS := maerox/maerox.o maerox/xcore.o maerox/xdraw.o maerox/xfont.o maerox/xrender.o
+$(MAEROX_OBJS): maerox/xs.h include/gui.h include/draw.h
+maerox/xcore.o: maerox/rgbnames.h
+maerox/maerox.o: maerox/opnames.h
+maerox/xfont.o: include/font8x16.h
+
+$(TESTFILES)/maerox: $(MAEROX_OBJS) $(GUIAPP_DEPS)
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) $(MAEROX_OBJS) libgui/gui.o libdraw/draw.o libdraw/fonts.o libdraw/image.o libwm/wm.o libc/libc.a
 
 gfxbench/gfxbench.o: gfxbench/gfxbench.c include/gui.h include/wm.h include/draw.h
 	$(CC) $(CFLAGS) -c $< -o $@

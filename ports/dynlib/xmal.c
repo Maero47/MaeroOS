@@ -15,6 +15,13 @@
  *   msb         an MSB-first setup                       -> setup Failed
  *   exitmid     a client exits with replies pending      -> server survives
  *   stall       a client never reads 20+ MB of replies   -> others unaffected
+ *   (dos runs right after glyphs, while id_base is still this client's)
+ *   dos         CopyGC onto itself with a freed tile     -> BadMatch, no crash
+ *               a GC's font set to a GC (itself)         -> BadFont
+ *               ConfigureWindow with sibling = itself    -> BadMatch
+ *               ListFonts "********************Z"        -> reply in < 3 s
+ *               windows nested 300 deep                  -> BadAlloc, no crash
+ *               PolyLine of long segments off-window     -> done in < 3 s
  * and afterwards a normal client still draws: this connection round-trips a
  * fill through GetImage, then xdraw and the real-Xlib xreal run against the
  * same server (xreal's own server cannot bind the socket, so it uses ours).
@@ -100,7 +107,7 @@ static int handshake(int X){
     if (rd_to(X,body,(int)extra,5000)!=(int)extra) return -1;
     id_base = u32(body+4); id_mask = u32(body+8);
     unsigned vlen=u16(body+16);
-    unsigned off = 32 + ((vlen+3)&~3u) + 2*8;
+    unsigned off = 32 + ((vlen+3)&~3u) + body[21]*8;   /* pixmap formats: 8 bytes each */
     root   = u32(body+off);
     visual = u32(body+off+32);
     return 0;
@@ -487,6 +494,88 @@ static int case_stall(int X){
     return Z;                                 /* kept open through the end */
 }
 
+
+/* Requests a single client used to crash or hang the whole server with. */
+static void create_window_in(int X, unsigned wid, unsigned parent){
+    unsigned char b[32], *p=b;
+    w8(&p,1); w8(&p,24); w16(&p,8);
+    w32(&p,wid); w32(&p,parent);
+    w16(&p,0); w16(&p,0); w16(&p,4); w16(&p,4);
+    w16(&p,0); w16(&p,1);
+    w32(&p,visual); w32(&p,0);
+    wr(X,b,32);
+}
+static void destroy_window(int X, unsigned wid){
+    unsigned char b[8], *p=b; w8(&p,4); w8(&p,0); w16(&p,2); w32(&p,wid); wr(X,b,8);
+}
+static void case_dos(int X, unsigned win){
+    /* 4: tile pixmap freed while the GC holds it, then CopyGC(gc, gc). */
+    unsigned pm = alloc_id(), g = alloc_id();
+    unsigned char b[64], *p;
+    p=b; w8(&p,53); w8(&p,24); w16(&p,4); w32(&p,pm); w32(&p,win); w16(&p,8); w16(&p,8); wr(X,b,16);
+    create_gc(X, g, win, 0x00112233);
+    p=b; w8(&p,56); w8(&p,0); w16(&p,4); w32(&p,g); w32(&p,0x400); w32(&p,pm); wr(X,b,16);
+    p=b; w8(&p,54); w8(&p,0); w16(&p,2); w32(&p,pm); wr(X,b,8);
+    p=b; w8(&p,57); w8(&p,0); w16(&p,4); w32(&p,g); w32(&p,g); w32(&p,0x400); wr(X,b,16);
+    expect_error(X, 8, "CopyGC onto itself");
+    p=b; w8(&p,56); w8(&p,0); w16(&p,5); w32(&p,g); w32(&p,0x500); w32(&p,1); w32(&p,0); wr(X,b,20);
+    fill_rect(X, win, g, 0, 0, 8, 8);          /* tiled fill through the kept tile */
+    if (sync_x(X, 5000) < 0) FAIL("server gone after CopyGC onto itself");
+    /* 5: the GC's font set to a GC id (its own): no font, no recursion. */
+    p=b; w8(&p,56); w8(&p,0); w16(&p,4); w32(&p,g); w32(&p,0x4000); w32(&p,g); wr(X,b,16);
+    expect_error(X, 7, "GC font = the GC itself");
+    p=b; w8(&p,47); w8(&p,0); w16(&p,2); w32(&p,g); wr(X,b,8);   /* QueryFont on the GC */
+    if (sync_x(X, 5000) < 0) FAIL("server gone after QueryFont on a GC");
+    p=b; w8(&p,60); w8(&p,0); w16(&p,2); w32(&p,g); wr(X,b,8);
+    /* 6: ConfigureWindow with the window as its own sibling. */
+    unsigned w2 = alloc_id();
+    create_window_in(X, w2, root);
+    p=b; w8(&p,12); w8(&p,0); w16(&p,5); w32(&p,w2); w16(&p,0x60); w16(&p,0);
+    w32(&p,w2); w32(&p,0); wr(X,b,20);
+    expect_error(X, 8, "ConfigureWindow sibling = itself");
+    destroy_window(X, w2);
+    if (sync_x(X, 5000) < 0) FAIL("server gone after the self-sibling window");
+    /* 7: a pattern with 20 stars against every font name. */
+    const char *pat = "********************Z";
+    int n = (int)strlen(pat), len = 2 + (n + 3) / 4;
+    memset(b, 0, sizeof(b));
+    p=b; w8(&p,49); w8(&p,0); w16(&p,len); w16(&p,10); w16(&p,n); memcpy(p, pat, n);
+    long t0 = now_ms();
+    wr(X,b,len*4);
+    unsigned char pkt[32];
+    if (next_packet(X, pkt, 0, 0, 5000) != 1) FAIL("ListFonts star pattern: no reply");
+    else if (now_ms() - t0 > 3000) FAIL("ListFonts star pattern took %ld ms", now_ms() - t0);
+    else printf("xmal: ListFonts with 20 stars in %ld ms ok\n", now_ms() - t0);
+    /* 8: nesting 300 deep: refused somewhere, the server survives, and
+     * destroying the chain (a recursive walk) is fine. */
+    unsigned top = alloc_id(), parent = top, refused = 0;
+    create_window_in(X, top, root);
+    for (int i = 0; i < 300; i++) { unsigned c2 = alloc_id(); create_window_in(X, c2, parent); parent = c2; }
+    for (int i = 0; i < 300; i++) {
+        int t = next_packet(X, pkt, 0, 0, 300);
+        if (t < 0) break;
+        if (t == 0 && pkt[1] == 11) refused++;
+    }
+    if (!refused) FAIL("300-deep window nesting was not refused");
+    else printf("xmal: deep nesting refused (%u BadAlloc) ok\n", refused);
+    destroy_window(X, top);
+    if (sync_x(X, 5000) < 0) FAIL("server gone after the deep window chain");
+    /* 9: 2000 segments of +-32000 pixels, all far off the window. */
+    int np = 2000, plen = 3 + np;
+    unsigned char *pl = malloc((size_t)plen * 4);
+    p = pl; w8(&p,65); w8(&p,0); w16(&p,plen); w32(&p,win); w32(&p,g = alloc_id());
+    for (int i = 0; i < np; i++) { w16(&p, (unsigned)(i & 1 ? 32000 : -32000)); w16(&p, (unsigned)-30000); }
+    create_gc(X, g, win, 0x00FF00FF);
+    t0 = now_ms();
+    wr(X, pl, plen * 4);
+    free(pl);
+    long dt = sync_x(X, 10000);
+    if (dt < 0) FAIL("server gone after the off-window PolyLine");
+    else if (now_ms() - t0 > 3000) FAIL("off-window PolyLine took %ld ms", now_ms() - t0);
+    else printf("xmal: off-window PolyLine in %ld ms ok\n", now_ms() - t0);
+    p=b; w8(&p,60); w8(&p,0); w16(&p,2); w32(&p,g); wr(X,b,8);
+}
+
 static int run_child(const char *path, const char *arg){
     pid_t pid = fork();
     if (pid == 0) {
@@ -525,6 +614,7 @@ int main(int argc, char **argv){
     case_ids(X, win, gc);
     case_clip(X, win, gc);
     case_glyphs(X, gc);
+    case_dos(X, win);      /* before the cases that open clients (and reset id_base) */
     case_len0(X);
     case_msb(X);
     case_exitmid(X);

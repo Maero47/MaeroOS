@@ -104,6 +104,8 @@ testfiles/awk
 /testfiles/ls
 /testfiles/lspci
 /testfiles/maerox
+/testfiles/xapp
+/testfiles/linuxapps
 /testfiles/gfxbench
 /testfiles/mkdir
 /testfiles/mkfifo
@@ -209,3 +211,5 @@ __pycache__/
 ports/alpine/cache/
 build/
 disk-alpine.img
+disk-alpinex.img
+/testfiles/xappattack

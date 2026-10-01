@@ -43,6 +43,7 @@ struct flock {
 #define O_DSYNC     0x1000
 #define O_SYNC      0x101000
 #define O_DIRECTORY 0x10000
+#define O_NOFOLLOW  0x20000
 #define O_LARGEFILE 0
 #define O_NDELAY    O_NONBLOCK
 

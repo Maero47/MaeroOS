@@ -237,6 +237,9 @@ static int altgr_down;           /* right Alt: third level on the TR layout */
 /* Clients that asked for Escape ("grabesc"): terminals and editors need the
  * key itself, so Esc does not close their window. */
 static int client_grab_esc[MAX_CLIENT_WINDOWS];
+/* Slots that asked for the raw pointer stream ("rawptr <slot> 1"), see
+ * emit_client_ptr(). */
+static int client_rawptr[MAX_CLIENT_WINDOWS];
 static int running = 1;
 /* desktop.conf: keyboard layout, time zone and clock format. */
 enum { KEYMAP_US = 0, KEYMAP_TR = 1 };
@@ -1566,6 +1569,7 @@ static void drop_app_window(int idx) {
 
     forget_client_rawkeys(idx);
     client_grab_esc[idx] = 0;
+    client_rawptr[idx] = 0;
     if (win && win->visible) win->visible = 0;
     drop_client_pixels(idx);   /* release its shared surface */
     if (active_window == WIN_CLIENT_BASE + idx)
@@ -1728,6 +1732,20 @@ static int start_settings(void) {
 }
 
 /* wmctl "launch <app> [path]": apps open files in other apps (Files!). */
+static void launch_installed(const inst_app_t *a);
+
+/* Linux Apps (userspace/xapp): the Alpine X11 applications, offered when an
+ * Alpine root with its helper is on the disk (disk-alpinex.img). */
+static int linuxapps_available(void) {
+    return access("/disk/alpine/etc/alpine-release", 0) == 0 &&
+           access("/disk/xapp", 0) == 0;
+}
+
+static int start_linuxapps(void) {
+    return start_multi(disk_or_initrd("/disk/linuxapps", "/linuxapps"),
+                       "LINUX APPS LAUNCHED");
+}
+
 static void launch_by_name(const char *arg) {
     char app[24];
     int ai = 0;
@@ -1757,8 +1775,18 @@ static void launch_by_name(const char *arg) {
         start_term();
     else if (!strcmp(app, "browse"))
         start_browse();
-    else
+    else if (!strcmp(app, "linuxapps"))
+        start_linuxapps();
+    else {
+        /* An installed package's entry (/disk/apps/<name>), e.g. an Alpine
+         * X11 app added by Linux Apps. */
+        for (int i = 0; i < inst_app_count; i++)
+            if (!strcmp(inst_apps[i].name, app)) {
+                launch_installed(&inst_apps[i]);
+                return;
+            }
         add_log("LAUNCH: UNKNOWN APP");
+    }
 }
 
 static void stop_apps(void) {
@@ -2311,6 +2339,14 @@ static void handle_wmctl_line(char *line) {
             client_grab_esc[slot - 1] = on ? atoi(on) != 0 : 1;
         return;
     }
+    arg = command_arg(line, "rawptr");       /* rawptr <slot> [0|1] */
+    if (arg) {
+        int slot = atoi(arg);
+        const char *on = strchr(arg, ' ');
+        if (slot >= 1 && slot <= MAX_CLIENT_WINDOWS)
+            client_rawptr[slot - 1] = on ? atoi(on) != 0 : 1;
+        return;
+    }
     arg = command_arg(line, "clip");
     if (arg) {
         trace("clipboard %s", arg);
@@ -2692,6 +2728,7 @@ static void launcher_menu_action(int item) {
                     "STORE LAUNCHED");
         break;
     case 12: start_install(); break;
+    case 13: start_linuxapps(); break;
     }
 }
 
@@ -3131,7 +3168,7 @@ static int sm_search_len;
 /* Left-pane program list (action = launcher_menu_action index). */
 typedef struct { const char *label; int action; } sm_item_t;
 static const sm_item_t sm_items[] = {
-    { "Store",        11 }, { "Terminal", 0 }, { "Browser",      1 },
+    { "Store",        11 }, { "Linux Apps", 13 }, { "Terminal", 0 }, { "Browser", 1 },
     { "Files",        2 }, { "Editor",   3 }, { "Calculator",   4 },
     { "Task Manager", 5 }, { "Console",  8 }, { "System Monitor", 9 },
     { "Install MaeroOS", 12 },          /* last: only when install_available() */
@@ -3165,7 +3202,8 @@ static int sm_filtered(int *out, int max) {
     int n = 0;
     for (int i = 0; i < SM_ITEMS && n < max; i++)
         if (sm_match(sm_items[i].label) &&
-            (sm_items[i].action != 12 || install_available()))
+            (sm_items[i].action != 12 || install_available()) &&
+            (sm_items[i].action != 13 || linuxapps_available()))
             out[n++] = i;
     for (int i = 0; i < inst_app_count && n < max; i++)
         if (sm_match(inst_apps[i].name))
@@ -4018,6 +4056,53 @@ static void end_client_drag(void) {
     client_drag_slot = 0;
 }
 
+/* The raw pointer stream, for a client that is itself a pointer consumer
+ * (maeroX turns it into X11 MotionNotify, ButtonPress/Release for every
+ * button and Enter/LeaveNotify).  The cooked "mouse" events only report the
+ * left button and only while it is held.  "ptr <slot> <x> <y> <buttons>
+ * <inside>" goes out on every motion and button change to the slot under
+ * the pointer (window-relative coordinates, like "mouse"), with inside = 1
+ * while the pointer is over the window's body.  A press that began in a
+ * body holds the stream on that slot until every button is up, as an X
+ * server's implicit grab does, and the slot the pointer leaves gets one
+ * last event with inside = 0. */
+static int ptr_grab_slot;              /* slot holding a press, 0 = none */
+static int ptr_hover_slot;             /* slot that last got inside = 1 */
+
+static void emit_ptr_to(int slot, int inside) {
+    desktop_window_t *win = find_window(WIN_CLIENT_BASE + slot - 1);
+
+    if (!win) return;
+    emit_wm_event5("ptr %d %d %d %d %d", slot, mouse_x - win->x,
+                   mouse_y - win->y, mouse_buttons, inside);
+}
+
+static void emit_client_ptr(void) {
+    desktop_window_t *win = window_at(mouse_x, mouse_y);
+    int slot = 0;
+
+    if (win && is_client_window(win->id) && !drag_mode && !launcher_open &&
+        !in_titlebar(win, mouse_x, mouse_y) &&
+        !resize_edges_at(win, mouse_x, mouse_y)) {
+        int idx = client_index_for_window(win->id);
+        if (idx >= 0 && client_rawptr[idx]) slot = idx + 1;
+    }
+    if (ptr_grab_slot) {
+        if (ptr_grab_slot >= 1 && client_rawptr[ptr_grab_slot - 1])
+            emit_ptr_to(ptr_grab_slot, slot == ptr_grab_slot);
+        if (!mouse_buttons) ptr_grab_slot = 0;
+        ptr_hover_slot = slot == ptr_grab_slot ? slot : 0;
+        return;
+    }
+    if (ptr_hover_slot && ptr_hover_slot != slot &&
+        client_rawptr[ptr_hover_slot - 1])
+        emit_ptr_to(ptr_hover_slot, 0);
+    ptr_hover_slot = slot;
+    if (!slot) return;
+    if (mouse_buttons & ~prev_mouse_buttons) ptr_grab_slot = slot;
+    emit_ptr_to(slot, 1);
+}
+
 static void handle_mouse(const struct input_event *ev) {
     if (ev->type == EV_REL) {
         if (ev->code == REL_WHEEL) {
@@ -4030,6 +4115,7 @@ static void handle_mouse(const struct input_event *ev) {
         update_window_drag(mouse_x, mouse_y);
         if (mouse_buttons & 1)
             emit_client_drag_motion();
+        emit_client_ptr();
         return;
     }
 
@@ -4056,6 +4142,8 @@ static void handle_mouse(const struct input_event *ev) {
             }
             if (bit == 2 && (mouse_buttons & 2) && !(prev_mouse_buttons & 2))
                 handle_right_click(mouse_x, mouse_y);
+            emit_client_ptr();
+            prev_mouse_buttons = mouse_buttons;
         }
     }
 }
