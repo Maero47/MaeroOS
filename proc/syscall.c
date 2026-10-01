@@ -2627,7 +2627,9 @@ static int sys_chdir(registers_t *regs) {
  * root, is reset to "/": Linux leaves the cwd outside the new root, but here
  * the old string would name a different directory inside it.  For the same
  * reason a descriptor opened before chroot() is resolved by its path string
- * inside the new root; it cannot reach the old one. */
+ * inside the new root, and /proc/self/fd/N gives a chrooted process no
+ * directory to walk through (fs/procfs.c), so neither reaches the old tree
+ * (both are the classic escape on Linux). */
 static int sys_chroot(registers_t *regs) {
     char path[256];
     if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0)

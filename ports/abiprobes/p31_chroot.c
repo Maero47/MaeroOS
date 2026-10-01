@@ -18,6 +18,13 @@
  * through to the global /proc and /dev) led to the real root.  Both are
  * checked below: the jail lives in a child while the parent renames it.
  *
+ * Review round 2: /proc/self/fd/N handed out the descriptor's own node, so a
+ * directory opened before chroot() was a way back into the old tree through
+ * the passed-through /proc ("/proc/self/fd/3/etc/hello").  Linux allows that
+ * (its /proc is not in the jail unless mounted there); MaeroOS refuses to
+ * walk through a directory descriptor for a chrooted process.  The probe
+ * checks that only on MaeroOS (where the jail's /proc is the global one).
+ *
  * On a Linux host this needs root (else SKIP).  MaeroOS keeps /dev and /proc
  * reachable inside a chroot (nothing can mount them there); Linux does not,
  * so that is not checked here but in tools/smoke_alpine.py.
@@ -97,6 +104,7 @@ int main(void)
     mkdir(OUTER "/jail/proc", 0755);
     mkdir(OUTER "/jail/dev", 0755);
     put(OUTER "/jail/etc/hello", "jailed");
+    put(OUTER "/jail.marker", "outside");
     unlink(OUTER "/jail/esc1");
     unlink(OUTER "/jail/esc2");
     if (symlink("/proc/..", OUTER "/jail/esc1") != 0 ||
@@ -110,8 +118,17 @@ int main(void)
         char c;
         char b[16] = {0};
         int fd;
+        int outside = open(OUTER, O_RDONLY | O_DIRECTORY);
+        if (outside < 0)
+            _exit(16);
         if (chroot(OUTER "/jail") != 0 || chdir("/") != 0)
             _exit(10);
+        /* Only meaningful where the jail's /proc is the real one: on Linux
+         * the jail has an empty /proc directory and this path is ENOENT. */
+        char via[64];
+        snprintf(via, sizeof via, "/proc/self/fd/%d/jail.marker", outside);
+        if (access(via, F_OK) == 0)
+            _exit(17);                    /* walked through a pre-chroot fd */
         memset(b, 0, sizeof b);
         fd = open("/esc1/etc/hello", O_RDONLY);
         if (fd < 0 || read(fd, b, 6) != 6 || strcmp(b, "jailed") != 0)
@@ -149,6 +166,8 @@ int main(void)
     switch (WEXITSTATUS(st)) {
     case 0: break;
     case 12: probe_fail("after the jail was renamed, /etc/hello is gone inside it");
+    case 16: probe_fail("open(%s): cannot open the jail's parent", OUTER);
+    case 17: probe_fail("/proc/self/fd/N of a pre-chroot directory leads out of the jail");
     case 13: probe_fail("after the jail path became a symlink to /, the jail sees the real root");
     case 14: probe_fail("a symlink to /proc/.. inside the jail leads out of it");
     case 15: probe_fail("a symlink to /dev/../etc inside the jail leads out of it");

@@ -56,14 +56,17 @@ How the chroot works (`proc/syscall.c` `sys_chroot`, `fs/vfs.c`
   different directory inside the new root. A nested `chroot()` resolves
   its argument inside the current root. Only euid 0 may chroot (EPERM
   otherwise).
-- Unlike Linux, a descriptor opened *before* `chroot()` does not reach
-  the old tree: `fchdir`/`*at` calls resolve it by its path string, inside
-  the new root. This is stricter than Linux, where such a descriptor is
-  the classic chroot escape.
+- Unlike Linux, a directory opened *before* `chroot()` does not reach
+  the old tree. `fchdir`/`*at` calls resolve it by its path string, inside
+  the new root. `/proc/self/fd/N` (also reached as `/dev/fd/N`) gives a
+  chrooted process no directory to walk through: `/proc/self/fd/3/etc/shadow`
+  is ENOENT. Open *files* can still be reopened through it. This is
+  stricter than Linux, where such a descriptor is the classic chroot
+  escape.
 
 Probe `p31_chroot` covers all of this, including a rename and a symlink to
-`/` under a running jail and symlinks to `/proc/..` and `/dev/../etc`
-inside one.
+`/` under a running jail, symlinks to `/proc/..` and `/dev/../etc`
+inside one, and `/proc/self/fd/N` of a directory opened before the chroot.
 
 ## How the image is built (`prepare.py`)
 
