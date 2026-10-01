@@ -1,8 +1,8 @@
 /*
- * xHCI host controller driver: enough of it to run low/full/high/super-speed
- * devices plugged straight into the root hub, with control transfers on
- * endpoint 0 and one interrupt-IN endpoint per device (HID keyboards, mice
- * and tablets, see usb_hid.c).
+ * xHCI host controller driver: low/full/high/super-speed devices on the root
+ * hub and behind USB 2.0 and USB 3 hubs, with control transfers on endpoint
+ * 0, bulk endpoints (mass storage, usb_msc.c) and interrupt-IN endpoints
+ * (every HID interface of a device, see usb_hid.c; hub status changes).
  *
  * Written from the eXtensible Host Controller Interface specification (Intel,
  * revision 1.2), sections cited as "xHCI 4.x".  The OSDev wiki's xHCI page
@@ -14,21 +14,30 @@
  *     virt - KERNEL_VMA, like the other drivers' DMA buffers.  32-bit
  *     addresses only, which every controller accepts.
  *   - One kernel thread (kusbd) owns the controller: it resets it, enumerates
- *     the ports, and then polls the event ring every timer tick.  Nothing runs
- *     in interrupt context, so the driver needs no locking of its own; the
- *     input rings it feeds are protected by keyboard.c/mouse.c.  Polling at
- *     the 100 Hz tick matches the 10 ms report interval of most HID devices.
+ *     the ports, and then sleeps until the controller interrupts (MSI when
+ *     the function has it and there is a Local APIC, else INTx on its PIC
+ *     line, which may be shared), with a slow fallback poll in case an
+ *     interrupt is lost.  The interrupt handler only acknowledges it and
+ *     wakes the sleepers; the event ring is read in thread context by
+ *     whoever holds the USB lock (kusbd, or a process waiting for its own
+ *     transfer), so the driver needs no locking of its own; the input rings
+ *     it feeds are protected by keyboard.c/mouse.c.  Interrupter moderation
+ *     caps the rate at 4000 interrupts a second.  Without an interrupt line,
+ *     or with "xhci=poll" on the command line, kusbd polls every tick.
  *   - Ports are scanned at start and rescanned on Port Status Change events,
  *     so devices plugged in later are picked up; unplugging frees the slot.
+ *     A device whose root port lost its connection is marked gone at once,
+ *     so transfers waiting on it fail without running into their timeouts.
  *
  * Class drivers: usb_hid.c (keyboards, mice, tablets) and usb_msc.c (mass
- * storage, bulk-only transport); USB 2.0 hubs are handled here (hub_*),
- * their ports polled by kusbd four times a second.  They call back in through usb.h:
+ * storage, bulk-only transport); USB 2.0 and USB 3 hubs are handled here
+ * (hub_*), their ports looked at when the hub's status-change endpoint says
+ * so (and every few seconds regardless).  They call back in through usb.h:
  * usb_control(), usb_configure_eps() and usb_bulk().  usb_lock() serialises
  * every use of the controller between kusbd and processes doing disk I/O.
  *
- * Not done (see the report / ROADMAP): USB 3 hubs, MSI, isochronous
- * transfers, streams, 64-bit DMA addresses.
+ * Not done (see the report / ROADMAP): MSI-X, isochronous transfers,
+ * streams, 64-bit DMA addresses.
  */
 #include "xhci.h"
 #include "usb.h"
@@ -42,6 +51,11 @@
 #include "../../mm/pmm.h"
 #include "../../proc/process.h"
 #include "../../proc/scheduler.h"
+#include "../../arch/i686/cpu/irq.h"
+#include "../../arch/i686/cpu/apic.h"
+#include "../../arch/i686/cpu/pic.h"
+#include "../../include/kernel/boot_info.h"
+#include "../keyboard.h"
 #include <stdint.h>
 
 /* The register BAR is mapped uncached through mmio_map(), at most this much
@@ -80,6 +94,7 @@
 
 #define USBCMD_RS       (1U << 0)
 #define USBCMD_HCRST    (1U << 1)
+#define USBCMD_INTE     (1U << 2)
 #define USBSTS_HCH      (1U << 0)
 #define USBSTS_HSE      (1U << 2)
 #define USBSTS_EINT     (1U << 3)
@@ -105,6 +120,11 @@
 #define RT_ERSTBA       0x30
 #define RT_ERDP         0x38
 #define ERDP_EHB        (1U << 3)
+#define IMAN_IP         (1U << 0)
+#define IMAN_IE         (1U << 1)
+/* Interrupter moderation interval, in 250 ns units: at most one interrupt
+ * per 250 us (xHCI 5.5.2.2). */
+#define IMOD_INTERVAL   1000U
 
 /* ── TRBs (xHCI 6.4) ─────────────────────────────────────────────────────── */
 
@@ -174,7 +194,7 @@ typedef struct {
     xhci_trb_t ep0[XFER_RING_TRBS];          /* 1 KiB */
     xhci_trb_t rings[USB_MAX_EPS][XFER_RING_TRBS];   /* 1 KiB each */
     uint8_t    buf[CTRL_BUF_SIZE];           /* control transfer data */
-    uint8_t    report[REPORT_BUF_SIZE];      /* interrupt-IN data */
+    uint8_t    report[USB_MAX_EPS][REPORT_BUF_SIZE];   /* interrupt-IN data */
 } __attribute__((aligned(4096))) dev_dma_t;
 
 static dev_dma_t dev_dma[XHCI_MAX_DEVS];
@@ -209,6 +229,11 @@ struct usb_device {
     int hub_ports;
     struct usb_device *child[HUB_MAX_PORTS + 1];
     uint16_t hub_bad;        /* ports whose device failed to enumerate */
+    uint32_t hub_ttt;        /* high-speed hub: TT think time */
+    int hub_ss;              /* a USB 3 (SuperSpeed) hub */
+    int hub_change;          /* the status-change endpoint reported */
+    uint32_t hub_next_scan;  /* tick of the next unprompted port scan */
+    int gone;                /* unplugged: fail transfers at once */
     dev_dma_t *dma;
     ring_t ep0;
     struct {
@@ -223,15 +248,19 @@ struct usb_device {
         int ntrb;
         int done, code;
         uint32_t actual;
+        /* interrupt-IN endpoints: what the reports are for, and whether a
+         * TD is queued (a failed one is not queued again) */
+        int role;            /* EP_BULK, EP_HID or EP_HUB */
+        int active;
+        int reported;        /* HID: logged the first report */
     } eps[USB_MAX_EPS];
     int cls;                 /* USB_CLS_* */
-    int intr_active;         /* HID: eps[0] has a report queued */
-    int reported;            /* HID: logged the first report */
+    int nhid;                /* HID interfaces, eps[0..nhid-1] */
     /* control transfer in flight */
     uint32_t ctl_data_trb, ctl_status_trb;
     uint32_t ctl_residual;
     int ctl_done, ctl_code;
-    hid_state_t hid;
+    hid_state_t hid[USB_MAX_EPS];
     uint16_t vid, pid;
 };
 
@@ -243,6 +272,7 @@ static struct usb_device *port_dev[256];
 
 static const pci_device_t *hc_pci;
 static volatile uint8_t *cap_regs, *op_regs, *rt_regs;
+static uint32_t mmio_size;
 static volatile uint32_t *db_regs;
 static uint32_t max_slots, max_ports, ctx_size;
 static ring_t cmd_ring;
@@ -255,6 +285,23 @@ static uint32_t cmd_done_trb;
 static int cmd_done_code, cmd_done_slot;
 
 static int sleep_chan;
+
+/* Interrupts: how they arrive, and a count of them (plus kicks from other
+ * code) that sleepers compare against to see whether anything happened
+ * since they last looked at the event ring. */
+#define IRQ_POLL 0
+#define IRQ_INTX 1
+#define IRQ_MSI  2
+static int irq_mode;
+static int irq_line;
+static volatile uint32_t evt_seq;
+static volatile uint32_t irq_count;
+static int evt_chan;
+/* kusbd's fallback poll, in ticks, when interrupts are on */
+#define FALLBACK_TICKS   50
+/* unprompted hub port scans: with a status-change endpoint, and without */
+#define HUB_SCAN_SLOW    500
+#define HUB_SCAN_FAST    25
 
 /* Register accessors are also compiler barriers: the controller reads the
  * DMA structures this file fills with plain stores, which must not be moved
@@ -299,6 +346,62 @@ static int wait_reg(volatile uint8_t *base, uint32_t off, uint32_t mask,
         sleep_ticks(1);
     }
     return (rd32(base, off) & mask) == want ? 0 : -1;
+}
+
+/* ── interrupts ──────────────────────────────────────────────────────────── */
+
+/* The interrupt handler (MSI vector, or a PIC line that other devices may
+ * share).  It only acknowledges the interrupt and wakes whoever waits for
+ * the controller; the event ring itself is read by process_events() under
+ * the USB lock.  Interrupter 0 interrupts again only once the event ring
+ * dequeue pointer is written back with EHB cleared (xHCI 4.17.2), which
+ * process_events() does after draining the ring. */
+static void xhci_irq(registers_t *regs) {
+    (void)regs;
+    if (!rt_regs) return;
+    uint32_t iman = rd32(rt_regs, RT_IMAN);
+    if (irq_mode == IRQ_INTX) {
+        /* A shared line: IP set means it was us.  With MSI the controller
+         * clears IP itself once the message is sent (xHCI 5.5.2.1). */
+        if (!(iman & IMAN_IP)) return;
+        wr32(rt_regs, RT_IMAN, iman | IMAN_IP);           /* RW1C */
+    }
+    wr32(op_regs, OP_USBSTS, USBSTS_EINT);                /* RW1C */
+    irq_count++;
+    evt_seq++;
+    wake_up(&evt_chan);
+}
+
+/* Something outside the event ring wants kusbd to look (keyboard LEDs). */
+void usb_kick(void) {
+    evt_seq++;
+    wake_up(&evt_chan);
+}
+
+/* Sleep until the controller interrupts, or `ticks` pass.  `seen` is the
+ * evt_seq the caller read before it last drained the event ring: if it moved
+ * since, an interrupt came in between and there is no sleeping.  Polled,
+ * this is a plain timed sleep.  (An interrupt landing on another CPU right
+ * between the check and the sleep is caught by the timeout.) */
+static void wait_event(uint32_t seen, uint32_t ticks) {
+    if (!current_proc) return;
+    uint32_t fl;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+    if (irq_mode != IRQ_POLL && evt_seq != seen) {
+        if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
+        return;
+    }
+    current_proc->wake_tick = pit_ticks() + (ticks ? ticks : 1);
+    sleep_on(irq_mode != IRQ_POLL ? (void *)&evt_chan : (void *)&sleep_chan);
+    if (!(fl & 0x200)) __asm__ volatile("cli" ::: "memory");
+}
+
+/* Waiting for a transfer or command: spin briefly (QEMU and fast devices
+ * complete within microseconds), then sleep until an interrupt, with a
+ * one-tick safety net when interrupts are on. */
+static void wait_progress(uint32_t seen, uint32_t spin) {
+    if (spin <= 200) return;
+    wait_event(seen, irq_mode != IRQ_POLL ? 2 : 1);
 }
 
 /* ── rings ───────────────────────────────────────────────────────────────── */
@@ -373,8 +476,8 @@ static inline void ring_doorbell(uint32_t slot, uint32_t target) {
 
 /* ── events ──────────────────────────────────────────────────────────────── */
 
-static void hid_transfer_done(struct usb_device *d, int code,
-                              uint32_t residual);
+static void intr_transfer_done(struct usb_device *d, int i, int code,
+                               uint32_t residual);
 
 /* A transfer event for a bulk transfer in flight.  Only the last TRB
  * interrupts on completion; a short packet in an earlier piece reports that
@@ -431,8 +534,8 @@ static void handle_event(const xhci_trb_t *ev) {
         } else {
             for (int i = 0; i < USB_MAX_EPS; i++) {
                 if (d->eps[i].dci != ep) continue;
-                if (d->cls == USB_CLS_HID && i == 0) {
-                    hid_transfer_done(d, code, ev->status & 0xFFFFFF);
+                if (d->eps[i].role != EP_BULK) {
+                    intr_transfer_done(d, i, code, ev->status & 0xFFFFFF);
                 } else {
                     bulk_event(d, i, ev->param_lo, code,
                                ev->status & 0xFFFFFF);
@@ -445,6 +548,13 @@ static void handle_event(const xhci_trb_t *ev) {
     case TRB_EV_PORT: {
         uint32_t port = ev->param_lo >> 24;
         if (port < 256) port_pending[port / 32] |= 1U << (port % 32);
+        /* Disconnected: everything behind this root port is gone, and a
+         * transfer waiting on it should not sit out its timeout. */
+        if (port >= 1 && port <= max_ports &&
+            !(rd32(op_regs, OP_PORTSC(port)) & PORTSC_CCS))
+            for (int i = 0; i < XHCI_MAX_DEVS; i++)
+                if (devs[i].used && devs[i].port == (int)port)
+                    devs[i].gone = 1;
         break;
     }
     case TRB_EV_HC:
@@ -491,13 +601,14 @@ static int run_command(uint32_t p_lo, uint32_t status, uint32_t control,
     ring_doorbell(0, 0);
     uint32_t end = pit_ticks() + 100 + 1;    /* 1 s */
     for (uint32_t spin = 0;; spin++) {
+        uint32_t seen = evt_seq;
         process_events();
         if (cmd_done_trb == trb) {
             if (slot_out) *slot_out = cmd_done_slot;
             return cmd_done_code;
         }
         if ((int32_t)(pit_ticks() - end) >= 0) break;
-        if (spin > 200) sleep_ticks(1);
+        wait_progress(seen, spin);
     }
     printk("[XHCI] command type %u timed out (usbsts %x crcr %x evt0 %x/%x "
            "cmd %x trb %x)\n",
@@ -549,7 +660,7 @@ static int ep_abort(struct usb_device *d, int dci, ring_t *r) {
 int usb_control(struct usb_device *d, const usb_setup_t *setup, void *data) {
     uint32_t len = setup->wLength;
     int in = (setup->bmRequestType & USB_DIR_IN) != 0;
-    if (len > CTRL_BUF_SIZE) return -1;
+    if (len > CTRL_BUF_SIZE || d->gone) return -1;
     if (!in && len) memcpy(d->dma->buf, data, len);
 
     uint32_t s_lo, s_hi;
@@ -575,15 +686,17 @@ int usb_control(struct usb_device *d, const usb_setup_t *setup, void *data) {
 
     uint32_t end = pit_ticks() + 100 + 1;
     for (uint32_t spin = 0; !d->ctl_done; spin++) {
+        uint32_t seen = evt_seq;
         process_events();
         if (d->ctl_done) break;
+        if (d->gone) return -1;              /* unplugged: slot goes soon */
         if ((int32_t)(pit_ticks() - end) >= 0) {
             printk("[USB] slot %d: control request %02x/%02x timed out\n",
                    d->slot, setup->bmRequestType, setup->bRequest);
             ep_abort(d, 1, &d->ep0);
             return -1;
         }
-        if (spin > 200) sleep_ticks(1);
+        wait_progress(seen, spin);
     }
     if (d->ctl_code != CC_SUCCESS && d->ctl_code != CC_SHORT_PACKET) {
         if (d->ctl_code != CC_STALL)
@@ -699,7 +812,7 @@ static void free_device(struct usb_device *d) {
     }
     if (d->cls == USB_CLS_MSC) usb_msc_detach(d);
     d->cls = 0;
-    d->intr_active = 0;
+    for (int i = 0; i < USB_MAX_EPS; i++) d->eps[i].active = 0;
     if (d->slot) {
         run_command(0, 0, TRB_TYPE(TRB_DISABLE_SLOT) | TRB_SLOT(d->slot), 0);
         dcbaa[d->slot] = 0;
@@ -714,17 +827,22 @@ static void free_device(struct usb_device *d) {
     d->used = 0;
 }
 
-/* Find the HID interface to drive, its interrupt-IN endpoint and the length
- * of its report descriptor in a configuration descriptor. */
-static int pick_hid(const uint8_t *cfg, uint32_t len,
-                    const usb_interface_desc_t **intf_out,
-                    const usb_endpoint_desc_t **ep_out, uint16_t *rdlen_out) {
+/* The HID interfaces of a configuration (alternate setting 0, with an
+ * interrupt-IN endpoint), at most USB_MAX_EPS: a keyboard often has a boot
+ * keyboard interface and a second one for its media keys.  Fills the
+ * interface, its endpoint and its report descriptor length per entry and
+ * returns how many there are. */
+typedef struct {
+    const usb_interface_desc_t *intf;
+    const usb_endpoint_desc_t *ep;
+    uint16_t rdlen;
+} hid_intf_t;
+
+static int find_hids(const uint8_t *cfg, uint32_t len, hid_intf_t *out) {
     const usb_interface_desc_t *cur = 0;
-    const usb_interface_desc_t *best = 0;
-    const usb_endpoint_desc_t *best_ep = 0;
-    uint16_t cur_rdlen = 0, best_rdlen = 0;
-    int best_score = 0;
-    for (uint32_t off = 0; off + 2 <= len;) {
+    uint16_t cur_rdlen = 0;
+    int n = 0;
+    for (uint32_t off = 0; off + 2 <= len && n < USB_MAX_EPS;) {
         uint8_t blen = cfg[off], type = cfg[off + 1];
         if (blen < 2 || off + blen > len) break;
         if (type == USB_DT_INTERFACE && blen >= 9) {
@@ -741,28 +859,16 @@ static int pick_hid(const uint8_t *cfg, uint32_t len,
             const usb_endpoint_desc_t *ep =
                 (const usb_endpoint_desc_t *)(cfg + off);
             if ((ep->bEndpointAddress & 0x80) && (ep->bmAttributes & 3) == 3) {
-                /* boot keyboard > boot mouse > any other HID function */
-                int score = 1;
-                if (cur->bInterfaceSubClass == 1 &&
-                    cur->bInterfaceProtocol == 1) score = 3;
-                else if (cur->bInterfaceSubClass == 1 &&
-                         cur->bInterfaceProtocol == 2) score = 2;
-                if (score > best_score) {
-                    best_score = score;
-                    best = cur;
-                    best_ep = ep;
-                    best_rdlen = cur_rdlen;
-                }
+                out[n].intf = cur;
+                out[n].ep = ep;
+                out[n].rdlen = cur_rdlen;
+                n++;
                 cur = 0;   /* one endpoint per interface */
             }
         }
         off += blen;
     }
-    if (!best) return -1;
-    *intf_out = best;
-    *ep_out = best_ep;
-    *rdlen_out = best_rdlen;
-    return 0;
+    return n;
 }
 
 /* ── endpoints and bulk transfers (class driver interface) ──────────────── */
@@ -780,6 +886,16 @@ void usb_unlock(void) {
 
 int usb_device_slot(const struct usb_device *d) {
     return d->slot;
+}
+
+/* A hub's slot context fields (xHCI 6.2.2): Hub, Number of Ports and, for
+ * a high-speed hub, the TT think time from wHubCharacteristics. */
+static void hub_slot_bits(struct usb_device *d, uint32_t *sc) {
+    if (!d->hub_ports) return;
+    sc[0] |= 1U << 26;
+    sc[1] = (sc[1] & 0x00FFFFFFU) | ((uint32_t)d->hub_ports << 24);
+    if (d->speed == USB_SPEED_HIGH)
+        sc[2] = (sc[2] & ~(3U << 16)) | ((d->hub_ttt & 3) << 16);
 }
 
 /* Configure Endpoint (xHCI 4.6.6) for up to USB_MAX_EPS endpoints; eps[i]
@@ -800,6 +916,9 @@ int usb_configure_eps(struct usb_device *d,
         d->eps[i].dci = dci;
         d->eps[i].addr = ep->bEndpointAddress;
         d->eps[i].mps = (int)mps;
+        d->eps[i].role = EP_BULK;
+        d->eps[i].active = 0;
+        d->eps[i].reported = 0;
         ring_init(&d->eps[i].ring, d->dma->rings[i], XFER_RING_TRBS);
         add |= 1U << dci;
         if (dci > max_dci) max_dci = dci;
@@ -821,6 +940,7 @@ int usb_configure_eps(struct usb_device *d,
     sc[0] = (oc[0] & ~(0x1FU << 27)) | ((uint32_t)max_dci << 27);
     sc[1] = oc[1];
     sc[2] = oc[2];
+    hub_slot_bits(d, sc);
     int cc = run_command(phys_of(d->dma->in_ctx), 0,
                          TRB_TYPE(TRB_CONFIG_EP) | TRB_SLOT(d->slot), 0);
     if (cc != CC_SUCCESS) {
@@ -839,7 +959,7 @@ int usb_configure_eps(struct usb_device *d,
 int usb_bulk(struct usb_device *d, int i, uint32_t phys, uint32_t len,
              uint32_t *actual, uint32_t timeout_ms) {
     if (i < 0 || i >= USB_MAX_EPS || !d->eps[i].dci || len == 0 ||
-        len > 0x10000) return -1;
+        len > 0x10000 || d->gone) return -1;
     int n = 0;
     uint32_t p = phys, left = len, piece[XFER_MAX_PIECES];
     while (left && n < XFER_MAX_PIECES) {
@@ -868,8 +988,10 @@ int usb_bulk(struct usb_device *d, int i, uint32_t phys, uint32_t len,
     ring_doorbell((uint32_t)d->slot, (uint32_t)d->eps[i].dci);
     uint32_t end = pit_ticks() + (timeout_ms + 9) / 10 + 1;
     for (uint32_t spin = 0; !d->eps[i].done; spin++) {
+        uint32_t seen = evt_seq;
         process_events();
         if (d->eps[i].done) break;
+        if (d->gone) return -1;
         if ((int32_t)(pit_ticks() - end) >= 0) {
             printk("[USB] slot %d: bulk transfer on endpoint %02x timed out\n",
                    d->slot, d->eps[i].addr);
@@ -877,7 +999,7 @@ int usb_bulk(struct usb_device *d, int i, uint32_t phys, uint32_t len,
             ep_abort(d, d->eps[i].dci, &d->eps[i].ring);
             return -1;
         }
-        if (spin > 200) sleep_ticks(1);
+        wait_progress(seen, spin);
     }
     int cc = d->eps[i].code;
     if (cc == CC_STALL) return USB_STALL;
@@ -902,40 +1024,67 @@ int usb_clear_halt(struct usb_device *d, int i) {
     return usb_control(d, &s, 0) < 0 ? -1 : 0;
 }
 
-static void queue_report(struct usb_device *d) {
-    ring_push(&d->eps[0].ring, phys_of(d->dma->report), 0,
-              (uint32_t)d->eps[0].mps, TRB_TYPE(TRB_NORMAL) | TRB_IOC | TRB_ISP);
-    ring_doorbell((uint32_t)d->slot, (uint32_t)d->eps[0].dci);
+/* Queue one interrupt-IN TD on endpoint index i (HID report, hub status). */
+static void queue_intr(struct usb_device *d, int i) {
+    ring_push(&d->eps[i].ring, phys_of(d->dma->report[i]), 0,
+              (uint32_t)d->eps[i].mps, TRB_TYPE(TRB_NORMAL) | TRB_IOC | TRB_ISP);
+    ring_doorbell((uint32_t)d->slot, (uint32_t)d->eps[i].dci);
 }
 
-static void hid_transfer_done(struct usb_device *d, int code,
-                              uint32_t residual) {
-    if (!d->intr_active) return;
+static void intr_transfer_done(struct usb_device *d, int i, int code,
+                               uint32_t residual) {
+    if (!d->eps[i].active) return;
     if (CC_IS_STOPPED(code)) return;     /* a TD ep_abort() took back */
     if (code == CC_SUCCESS || code == CC_SHORT_PACKET) {
-        uint32_t mps = (uint32_t)d->eps[0].mps;
+        uint32_t mps = (uint32_t)d->eps[i].mps;
         uint32_t got = mps - (residual <= mps ? residual : mps);
-        if (!d->reported) {
-            d->reported = 1;
-            printk("[USB] slot %d: first %s report\n", d->slot,
-                   hid_kind_name(d->hid.kind));
+        if (d->eps[i].role == EP_HUB) {
+            /* Ports changed: kusbd looks at them (clearing the change
+             * bits) and queues the next status TD. */
+            if (got) d->hub_change = 1;
+            else queue_intr(d, i);
+            return;
         }
-        hid_report(&d->hid, d->dma->report, got);
-        queue_report(d);
+        if (!d->eps[i].reported) {
+            d->eps[i].reported = 1;
+            printk("[USB] slot %d: first %s report\n", d->slot,
+                   hid_kind_name(d->hid[i].kind));
+        }
+        hid_report(&d->hid[i], d->dma->report[i], got);
+        queue_intr(d, i);
     } else {
         /* A halted endpoint would need Reset Endpoint + Set TR Dequeue;
-         * a HID device that stalls its interrupt pipe is rare enough to
-         * just stop listening to it. */
-        printk("[USB] slot %d: interrupt transfer failed, code %d; "
-               "device stopped\n", d->slot, code);
-        d->intr_active = 0;
+         * a device that stalls its interrupt pipe is rare enough to just
+         * stop listening to it (a hub's ports are then polled). */
+        if (!d->gone)
+            printk("[USB] slot %d: interrupt transfer failed, code %d; "
+                   "endpoint %02x stopped\n", d->slot, code, d->eps[i].addr);
+        d->eps[i].active = 0;
     }
 }
 
-static int setup_hid(struct usb_device *d, const usb_interface_desc_t *intf,
-                     const usb_endpoint_desc_t *ep, uint16_t rdlen) {
+#define HID_REQ_SET_REPORT  0x09
+
+/* Keyboard LEDs (HID 1.11 7.2.2, boot output report B.1): SET_REPORT of a
+ * one-byte output report, bit 0 Num Lock, 1 Caps Lock, 2 Scroll Lock. */
+static void hid_set_leds(struct usb_device *d, int i, uint8_t leds) {
+    usb_setup_t s = { USB_TYPE_CLASS | USB_RECIP_INTERFACE, HID_REQ_SET_REPORT,
+                      0x0200, d->hid[i].ifnum, 1 };
+    int r = usb_control(d, &s, &leds);
+    d->hid[i].leds = leds;
+    printk("[USB] slot %d: keyboard LEDs num %s caps %s scroll %s "
+           "(SET_REPORT %s)\n", d->slot, (leds & 1) ? "on" : "off",
+           (leds & 2) ? "on" : "off", (leds & 4) ? "on" : "off",
+           r < 0 ? "failed" : "ok");
+}
+
+/* Set up one HID interface as endpoint index `i`'s function: protocol,
+ * report descriptor, idle rate.  0 when the driver handles it. */
+static int setup_hid_intf(struct usb_device *d, int i, const hid_intf_t *h) {
+    const usb_interface_desc_t *intf = h->intf;
     uint8_t ifn = intf->bInterfaceNumber;
     const uint8_t *rdesc = 0;
+    uint16_t rdlen = h->rdlen;
     static uint8_t rbuf[CTRL_BUF_SIZE];
     int boot = intf->bInterfaceSubClass == 1 &&
                (intf->bInterfaceProtocol == 1 || intf->bInterfaceProtocol == 2);
@@ -956,15 +1105,32 @@ static int setup_hid(struct usb_device *d, const usb_interface_desc_t *intf,
     control_out(d, USB_TYPE_CLASS | USB_RECIP_INTERFACE, HID_REQ_SET_IDLE,
                 0, ifn);
 
-    memset(&d->hid, 0, sizeof(d->hid));
-    hid_setup(&d->hid, intf, rdesc, rdesc ? rdlen : 0);
-    if (d->hid.kind == HID_KIND_NONE) return -1;
+    memset(&d->hid[i], 0, sizeof(d->hid[i]));
+    hid_setup(&d->hid[i], intf, rdesc, rdesc ? rdlen : 0);
+    d->hid[i].ifnum = ifn;
+    d->hid[i].leds = 0xFF;                   /* unknown: set on first look */
+    if (d->hid[i].kind == HID_KIND_NONE) return -1;
+    if ((h->ep->wMaxPacketSize & 0x7FF) > REPORT_BUF_SIZE) return -1;
+    return 0;
+}
 
-    if ((ep->wMaxPacketSize & 0x7FF) > REPORT_BUF_SIZE) return -1;
-    if (usb_configure_eps(d, &ep, 1) != 0) return -1;
+/* Every HID interface the driver handles, each on its own interrupt-IN
+ * endpoint; returns how many (0: none, the device is left alone). */
+static int setup_hid(struct usb_device *d, const hid_intf_t *hids, int n) {
+    const usb_endpoint_desc_t *eps[USB_MAX_EPS];
+    int used = 0;
+    for (int k = 0; k < n; k++) {
+        if (setup_hid_intf(d, used, &hids[k]) != 0) continue;
+        eps[used++] = hids[k].ep;
+    }
+    if (!used || usb_configure_eps(d, eps, used) != 0) return 0;
     d->cls = USB_CLS_HID;
-    d->intr_active = 1;
-    queue_report(d);
+    d->nhid = used;
+    for (int i = 0; i < used; i++) {
+        d->eps[i].role = EP_HID;
+        d->eps[i].active = 1;
+        queue_intr(d, i);
+    }
     static int abort_checked;
     if (!abort_checked) {
         /* Check the timeout path once per boot on a real endpoint: the
@@ -976,12 +1142,13 @@ static int setup_hid(struct usb_device *d, const usb_interface_desc_t *intf,
         printk("[XHCI] self-test: abort of a pending TD on a %s endpoint "
                "%s\n", was == EP_STATE_RUNNING ? "running" : "non-running",
                ok ? "ok" : "FAILED");
-        queue_report(d);
+        queue_intr(d, 0);
     }
-    return 0;
+    return used;
 }
 
-static void hub_attach(struct usb_device *d, const usb_device_desc_t *dd);
+static void hub_attach(struct usb_device *d, const usb_device_desc_t *dd,
+                       const uint8_t *cfg, uint32_t clen);
 
 /* Address and configure the device on root port `port`, or on port `pport`
  * of hub `parent`.  Returns it (also when no driver claims it, so that the
@@ -1099,12 +1266,10 @@ static struct usb_device *enumerate(int port, int speed,
     }
     uint8_t cfg_value = ((usb_config_desc_t *)cfg)->bConfigurationValue;
 
-    const usb_interface_desc_t *intf;
-    const usb_endpoint_desc_t *ep;
-    uint16_t rdlen;
+    hid_intf_t hids[USB_MAX_EPS];
     int is_hub = dd.bDeviceClass == USB_CLASS_HUB;
-    int is_hid = !is_hub &&
-                 pick_hid(cfg, (uint32_t)clen, &intf, &ep, &rdlen) == 0;
+    int nhids = is_hub ? 0 : find_hids(cfg, (uint32_t)clen, hids);
+    int is_hid = nhids > 0;
     int is_msc = !is_hub && !is_hid && usb_msc_match(cfg, (uint32_t)clen);
     if (!is_hub && !is_hid && !is_msc) {
         printk("[USB] port %s: device %04x:%04x class %u, %s speed: "
@@ -1119,7 +1284,7 @@ static struct usb_device *enumerate(int port, int speed,
         return 0;
     }
     if (is_hub) {
-        hub_attach(d, &dd);
+        hub_attach(d, &dd, cfg, (uint32_t)clen);
         return d;
     }
     if (is_msc) {
@@ -1129,27 +1294,32 @@ static struct usb_device *enumerate(int port, int speed,
             d->cls = USB_CLS_MSC;
         return d;
     }
-    if (setup_hid(d, intf, ep, rdlen) != 0) {
+    if (!setup_hid(d, hids, nhids)) {
         printk("[USB] port %s: device %04x:%04x: HID setup failed\n",
                where(d), dd.idVendor, dd.idProduct);
         return d;
     }
-    printk("[USB] port %s: %04x:%04x %s speed, slot %d: HID %s "
-           "(endpoint %d, %d bytes)\n", where(d), dd.idVendor, dd.idProduct,
-           speed_name(speed), slot, hid_kind_name(d->hid.kind),
-           d->eps[0].addr & 0x0F, d->eps[0].mps);
+    for (int i = 0; i < d->nhid; i++)
+        printk("[USB] port %s: %04x:%04x %s speed, slot %d: HID %s "
+               "(interface %d, endpoint %d, %d bytes)\n", where(d),
+               dd.idVendor, dd.idProduct, speed_name(speed), slot,
+               hid_kind_name(d->hid[i].kind), d->hid[i].ifnum,
+               d->eps[i].addr & 0x0F, d->eps[i].mps);
     return d;
 }
 
-/* ── USB 2.0 hubs (USB 2.0 chapter 11.24) ────────────────────────────────── */
+/* ── hubs (USB 2.0 chapter 11.24, USB 3.2 chapter 10.16) ────────────────── */
 
 #define HUB_RT_PORT_OUT   0x23     /* class, other (port), host-to-device */
 #define HUB_RT_PORT_IN    0xA3
+#define HUB_RT_HUB_OUT    0x20
 #define HUB_RT_HUB_IN     0xA0
 #define HUB_REQ_GET_STATUS     0
 #define HUB_REQ_CLEAR_FEATURE  1
 #define HUB_REQ_SET_FEATURE    3
+#define HUB_REQ_SET_HUB_DEPTH  12  /* USB 3 hubs only (USB 3.2 10.16.2.9) */
 #define HUB_DT_HUB        0x29
+#define HUB_DT_SS_HUB     0x2A
 #define PORT_RESET        4
 #define PORT_POWER        8
 #define C_PORT_CONNECTION 16       /* change features: 16 + change bit */
@@ -1159,6 +1329,12 @@ static struct usb_device *enumerate(int port, int speed,
 #define PS_LOW_SPEED      (1U << 9)
 #define PS_HIGH_SPEED     (1U << 10)
 #define PC_RESET          (1U << 4)
+
+/* wPortChange bit -> the feature that clears it.  USB 2.0 hubs: C_PORT_
+ * CONNECTION, ENABLE, SUSPEND, OVER_CURRENT, RESET (16..20).  USB 3 hubs
+ * (USB 3.2 table 10-11): CONNECTION 16, OVER_CURRENT 19, RESET 20,
+ * BH_RESET 29, LINK_STATE 25, CONFIG_ERROR 26; bits 1 and 2 are reserved. */
+static const uint8_t ss_change_feature[8] = { 16, 0, 0, 19, 20, 29, 25, 26 };
 
 static int hub_port_feature(struct usb_device *h, int set, int feature,
                             int port) {
@@ -1177,19 +1353,46 @@ static uint32_t hub_port_status(struct usb_device *h, int port) {
            ((uint32_t)st[2] << 16) | ((uint32_t)st[3] << 24);
 }
 
-static void hub_attach(struct usb_device *d, const usb_device_desc_t *dd) {
-    uint8_t hd[9];
-    if (d->speed >= USB_SPEED_SUPER) {
-        printk("[USB] port %s: USB 3 hub %04x:%04x not supported\n",
-               where(d), dd->idVendor, dd->idProduct);
-        return;
+/* Acknowledge every change bit in `change` on port `p`. */
+static void hub_clear_changes(struct usb_device *h, int p, uint32_t change) {
+    for (int bit = 0; bit < 8; bit++) {
+        if (!(change & (1U << bit))) continue;
+        int f = h->hub_ss ? ss_change_feature[bit]
+                          : (bit < 5 ? C_PORT_CONNECTION + bit : 0);
+        if (f) hub_port_feature(h, 0, f, p);
     }
+}
+
+/* The hub's interrupt-IN status-change endpoint (USB 2.0 11.12.1). */
+static const usb_endpoint_desc_t *hub_status_ep(const uint8_t *cfg,
+                                                uint32_t len) {
+    for (uint32_t off = 0; off + 2 <= len;) {
+        uint8_t blen = cfg[off], type = cfg[off + 1];
+        if (blen < 2 || off + blen > len) break;
+        if (type == USB_DT_ENDPOINT && blen >= 7) {
+            const usb_endpoint_desc_t *ep =
+                (const usb_endpoint_desc_t *)(cfg + off);
+            if ((ep->bEndpointAddress & 0x80) && (ep->bmAttributes & 3) == 3)
+                return ep;
+        }
+        off += blen;
+    }
+    return 0;
+}
+
+static void hub_attach(struct usb_device *d, const usb_device_desc_t *dd,
+                       const uint8_t *cfg, uint32_t clen) {
+    uint8_t hd[12];
+    int ss = d->speed >= USB_SPEED_SUPER;
     if (d->depth >= HUB_MAX_DEPTH) {
         printk("[USB] port %s: hub too deep, ignored\n", where(d));
         return;
     }
+    /* USB 3 hubs have their own descriptor type (USB 3.2 10.15.2.1): the
+     * number of ports and the power-on time sit where USB 2.0's do. */
     usb_setup_t s = { HUB_RT_HUB_IN, USB_REQ_GET_DESCRIPTOR,
-                      HUB_DT_HUB << 8, 0, sizeof(hd) };
+                      (uint16_t)((ss ? HUB_DT_SS_HUB : HUB_DT_HUB) << 8), 0,
+                      (uint16_t)(ss ? 12 : 9) };
     if (usb_control(d, &s, hd) < 7) {
         printk("[USB] port %s: no hub descriptor\n", where(d));
         return;
@@ -1197,31 +1400,55 @@ static void hub_attach(struct usb_device *d, const usb_device_desc_t *dd) {
     int nports = hd[2] > HUB_MAX_PORTS ? HUB_MAX_PORTS : hd[2];
     uint32_t chars = (uint32_t)hd[3] | ((uint32_t)hd[4] << 8);
     uint32_t pwr_ms = (uint32_t)hd[5] * 2;
+    if (ss) {
+        /* The hub's tier below the root hub, so it can take its port
+         * number out of the route string (USB 3.2 10.16.2.9, 8.9). */
+        if (control_out(d, HUB_RT_HUB_OUT, HUB_REQ_SET_HUB_DEPTH,
+                        (uint16_t)d->depth, 0) < 0)
+            printk("[USB] port %s: SET_HUB_DEPTH failed\n", where(d));
+    }
 
-    /* Tell the controller this slot is a hub (xHCI 4.6.6, 6.2.2): Hub,
-     * Number of Ports and, for a high-speed hub, the TT think time. */
-    memset(d->dma->in_ctx, 0, sizeof(d->dma->in_ctx));
-    in_ctrl(d)[1] = 1;
-    uint32_t *sc = in_entry(d, 0);
-    uint32_t *oc = out_entry(d, 0);
-    sc[0] = oc[0] | (1U << 26);
-    sc[1] = (oc[1] & 0x00FFFFFFU) | ((uint32_t)nports << 24);
-    sc[2] = oc[2];
-    if (d->speed == USB_SPEED_HIGH)
-        sc[2] = (sc[2] & ~(3U << 16)) | (((chars >> 5) & 3) << 16);
-    int cc = run_command(phys_of(d->dma->in_ctx), 0,
-                         TRB_TYPE(TRB_CONFIG_EP) | TRB_SLOT(d->slot), 0);
-    if (cc != CC_SUCCESS)
-        printk("[USB] slot %d: hub configure failed, code %d\n", d->slot, cc);
-
+    /* Tell the controller this slot is a hub (xHCI 4.6.6, 6.2.2), and
+     * set up the status-change endpoint in the same Configure Endpoint. */
     d->hub_ports = nports;
+    d->hub_ss = ss;
+    d->hub_ttt = (chars >> 5) & 3;
+    const usb_endpoint_desc_t *sep = hub_status_ep(cfg, clen);
+    int have_ep = 0;
+    if (sep && (sep->wMaxPacketSize & 0x7FF) <= REPORT_BUF_SIZE &&
+        usb_configure_eps(d, &sep, 1) == 0) {
+        have_ep = 1;
+    } else {
+        memset(d->dma->in_ctx, 0, sizeof(d->dma->in_ctx));
+        in_ctrl(d)[1] = 1;
+        uint32_t *sc = in_entry(d, 0);
+        uint32_t *oc = out_entry(d, 0);
+        sc[0] = oc[0];
+        sc[1] = oc[1];
+        sc[2] = oc[2];
+        hub_slot_bits(d, sc);
+        int cc = run_command(phys_of(d->dma->in_ctx), 0,
+                             TRB_TYPE(TRB_CONFIG_EP) | TRB_SLOT(d->slot), 0);
+        if (cc != CC_SUCCESS)
+            printk("[USB] slot %d: hub configure failed, code %d\n",
+                   d->slot, cc);
+    }
+
     d->cls = USB_CLS_HUB;
     for (int p = 1; p <= nports; p++)
         hub_port_feature(d, 1, PORT_POWER, p);
     sleep_ms(pwr_ms < 100 ? 100 : pwr_ms);
-    printk("[USB] port %s: %04x:%04x %s speed, slot %d: hub, %d ports\n",
+    /* Look at the ports right away; then when the hub says so. */
+    d->hub_change = 1;
+    d->hub_next_scan = pit_ticks();
+    if (have_ep) {
+        d->eps[0].role = EP_HUB;
+        d->eps[0].active = 1;
+    }
+    printk("[USB] port %s: %04x:%04x %s speed, slot %d: %shub, %d ports%s\n",
            where(d), dd->idVendor, dd->idProduct, speed_name(d->speed),
-           d->slot, nports);
+           d->slot, ss ? "USB 3 " : "", nports,
+           have_ep ? ", status endpoint" : ", polled");
 }
 
 /* Look at every port of hub `h`: acknowledge changes, drop unplugged
@@ -1231,14 +1458,13 @@ static void hub_scan(struct usb_device *h) {
         uint32_t st = hub_port_status(h, p);
         if (st == 0xFFFFFFFFU) return;          /* the hub itself is gone */
         uint32_t change = st >> 16;
-        for (int bit = 0; bit < 5; bit++)
-            if (change & (1U << bit))
-                hub_port_feature(h, 0, C_PORT_CONNECTION + bit, p);
+        hub_clear_changes(h, p, change);
 
         if (!(st & PS_CONNECTION) || (change & 1)) {
             /* Gone, or replaced since the last look. */
             h->hub_bad &= (uint16_t)~(1U << p);
             if (h->child[p]) {
+                h->child[p]->gone = 1;
                 printk("[USB] port %s: device removed\n", where(h->child[p]));
                 free_device(h->child[p]);
             }
@@ -1246,22 +1472,29 @@ static void hub_scan(struct usb_device *h) {
         }
         if (h->child[p] || (h->hub_bad & (1U << p))) continue;
 
-        hub_port_feature(h, 1, PORT_RESET, p);
-        uint32_t end = pit_ticks() + 50 + 1;               /* 500 ms */
-        do {
+        /* USB 2.0 ports are enabled by a reset; a USB 3 port enables
+         * itself after link training, and is reset only if it did not. */
+        if (!h->hub_ss || !(st & PS_ENABLE)) {
+            hub_port_feature(h, 1, PORT_RESET, p);
+            uint32_t end = pit_ticks() + 50 + 1;               /* 500 ms */
+            do {
+                sleep_ms(10);
+                st = hub_port_status(h, p);
+            } while (st != 0xFFFFFFFFU && !((st >> 16) & PC_RESET) &&
+                     (int32_t)(pit_ticks() - end) < 0);
+            if (st == 0xFFFFFFFFU) return;
+            hub_clear_changes(h, p, (st >> 16) & PC_RESET);
             sleep_ms(10);
             st = hub_port_status(h, p);
-        } while (st != 0xFFFFFFFFU && !((st >> 16) & PC_RESET) &&
-                 (int32_t)(pit_ticks() - end) < 0);
-        if (st == 0xFFFFFFFFU) return;
-        hub_port_feature(h, 0, C_PORT_CONNECTION + 4, p);   /* C_PORT_RESET */
-        sleep_ms(10);
-        st = hub_port_status(h, p);
+        }
         if (st == 0xFFFFFFFFU || !(st & PS_ENABLE)) {
             h->hub_bad |= (uint16_t)(1U << p);
             continue;
         }
-        int speed = (st & PS_LOW_SPEED) ? USB_SPEED_LOW :
+        /* Behind a USB 3 hub everything is SuperSpeed (its USB 2.0 half
+         * is a separate hub on the companion root port). */
+        int speed = h->hub_ss ? USB_SPEED_SUPER :
+                    (st & PS_LOW_SPEED) ? USB_SPEED_LOW :
                     (st & PS_HIGH_SPEED) ? USB_SPEED_HIGH : USB_SPEED_FULL;
         if (!enumerate(h->port, speed, h, p))
             h->hub_bad |= (uint16_t)(1U << p);
@@ -1279,6 +1512,7 @@ static void port_check(int port) {
 
     if (!(sc & PORTSC_CCS)) {
         if (port_dev[port]) {
+            port_dev[port]->gone = 1;
             printk("[USB] port %s: device removed\n", where(port_dev[port]));
             free_device(port_dev[port]);
         }
@@ -1337,6 +1571,8 @@ static void bios_handoff(void) {
 static int hc_start(void) {
     printk("[XHCI] self-test: ring wrap with chained TD %s\n",
            ring_selftest() == 0 ? "ok" : "FAILED");
+    printk("[USB-HID] self-test: consumer control (array, variables) %s\n",
+           hid_selftest() == 0 ? "ok" : "FAILED");
     bios_handoff();
 
     /* Stop, then reset. */
@@ -1394,9 +1630,16 @@ static int hc_start(void) {
     wr32(rt_regs, RT_ERSTSZ, 1);
     wr64(rt_regs, RT_ERDP, phys_of(evt_trbs));
     wr64(rt_regs, RT_ERSTBA, phys_of(erst));
-    /* Interrupts stay off (IMAN.IE = 0, USBCMD.INTE = 0): kusbd polls. */
+    /* Interrupter 0 on, moderated (xHCI 4.17.2, 5.5.2); polled, it stays
+     * off (IMAN.IE = 0, USBCMD.INTE = 0). */
+    uint32_t cmd = USBCMD_RS;
+    if (irq_mode != IRQ_POLL) {
+        wr32(rt_regs, RT_IMOD, IMOD_INTERVAL);
+        wr32(rt_regs, RT_IMAN, IMAN_IE | IMAN_IP);
+        cmd |= USBCMD_INTE;
+    }
 
-    wr32(op_regs, OP_USBCMD, USBCMD_RS);
+    wr32(op_regs, OP_USBCMD, cmd);
     if (wait_reg(op_regs, OP_USBSTS, USBSTS_HCH, 0, 100) != 0) {
         printk("[XHCI] controller did not start\n");
         return -1;
@@ -1417,6 +1660,13 @@ static int hc_start(void) {
     return 0;
 }
 
+/* Count the devices in use (the replug test checks nothing leaks). */
+static int devs_in_use(void) {
+    int n = 0;
+    for (int i = 0; i < XHCI_MAX_DEVS; i++) n += devs[i].used;
+    return n;
+}
+
 static void kusbd(void) {
     usb_lock();
     if (hc_start() != 0) {
@@ -1431,10 +1681,11 @@ static void kusbd(void) {
     for (uint32_t p = 1; p <= max_ports; p++)
         port_check((int)p);
     memset(port_pending, 0, sizeof(port_pending));
-    uint32_t next_hub_poll = pit_ticks();
     usb_unlock();
+    int last_in_use = -1;
 
     for (;;) {
+        uint32_t seen = evt_seq;
         usb_lock();
         process_events();
         for (uint32_t w = 0; w < 8; w++) {
@@ -1445,15 +1696,39 @@ static void kusbd(void) {
                 if (p >= 1 && p <= max_ports) port_check((int)p);
             }
         }
-        for (int i = 0; i < XHCI_MAX_DEVS; i++)
-            if (devs[i].used && devs[i].cls == USB_CLS_HID &&
-                devs[i].intr_active)
-                hid_tick(&devs[i].hid);
-        if ((int32_t)(pit_ticks() - next_hub_poll) >= 0) {
-            next_hub_poll = pit_ticks() + 25;
-            for (int i = 0; i < XHCI_MAX_DEVS; i++)
-                if (devs[i].used && devs[i].cls == USB_CLS_HUB)
-                    hub_scan(&devs[i]);
+        /* Hubs: when the status-change endpoint reported, and every so
+         * often anyway (often when there is no working endpoint). */
+        uint32_t now = pit_ticks();
+        for (int i = 0; i < XHCI_MAX_DEVS; i++) {
+            struct usb_device *h = &devs[i];
+            if (!h->used || h->cls != USB_CLS_HUB) continue;
+            if (!h->hub_change && (int32_t)(now - h->hub_next_scan) < 0)
+                continue;
+            int prompted = h->hub_change;
+            h->hub_change = 0;
+            h->hub_next_scan = now + (h->eps[0].active ? HUB_SCAN_SLOW
+                                                       : HUB_SCAN_FAST);
+            hub_scan(h);
+            if (h->used && prompted && h->eps[0].active) queue_intr(h, 0);
+        }
+        int repeating = 0;
+        uint8_t leds = keyboard_leds();
+        for (int i = 0; i < XHCI_MAX_DEVS; i++) {
+            struct usb_device *d = &devs[i];
+            if (!d->used || d->cls != USB_CLS_HID) continue;
+            for (int k = 0; k < d->nhid; k++) {
+                if (!d->eps[k].active) continue;
+                hid_tick(&d->hid[k]);
+                if (d->hid[k].repeat_key) repeating = 1;
+                if (d->hid[k].kind == HID_KIND_KEYBOARD &&
+                    d->hid[k].leds != leds)
+                    hid_set_leds(d, k, leds);
+            }
+        }
+        if (devs_in_use() != last_in_use) {
+            last_in_use = devs_in_use();
+            printk("[USB] %d device(s) in use, %u interrupts\n", last_in_use,
+                   (unsigned)irq_count);
         }
         if (rd32(op_regs, OP_USBSTS) & USBSTS_HSE) {
             printk("[XHCI] host system error; controller stopped\n");
@@ -1461,8 +1736,67 @@ static void kusbd(void) {
         }
         usb_unlock();
         usb_msc_service();
-        sleep_ticks(1);
+        /* Key repeat needs the tick; otherwise sleep until the controller
+         * interrupts, or the fallback poll. */
+        wait_event(seen, (repeating || irq_mode == IRQ_POLL) ? 1
+                                                             : FALLBACK_TICKS);
     }
+}
+
+/* Interrupts: MSI-X or MSI on the BSP's Local APIC if the function has
+ * them, else its INTx line through the PIC ("xhci=intx" skips MSI,
+ * "xhci=poll" both). */
+static void irq_setup(void) {
+    const char *cl = boot_info_cmdline();
+    int want = 2;
+    for (const char *c = cl; c && *c; c++)
+        if ((c == cl || c[-1] == ' ') && strncmp(c, "xhci=", 5) == 0) {
+            if (strncmp(c + 5, "poll", 4) == 0) want = 0;
+            else if (strncmp(c + 5, "intx", 4) == 0) want = 1;
+        }
+    irq_mode = IRQ_POLL;
+    uint8_t bir;
+    uint32_t toff;
+    uint8_t xcap = pci_msix_table(hc_pci, &bir, &toff);
+    if (want >= 2 && xcap && bir == 0 && toff + 16 <= mmio_size) {
+        /* MSI-X entry 0 (interrupter 0's), in the register BAR we map. */
+        int vec = msi_install_handler(xhci_irq);
+        if (vec >= 0) {
+            volatile uint8_t *e = cap_regs + toff;
+            wr32(e, 0, 0xFEE00000U | (apic_id() << 12));
+            wr32(e, 4, 0);
+            wr32(e, 8, (uint32_t)vec);
+            wr32(e, 12, 0);                               /* unmasked */
+            pci_msix_enable(hc_pci, xcap);
+            irq_mode = IRQ_MSI;
+            printk("[XHCI] interrupts: MSI-X, vector 0x%02x to APIC %u\n",
+                   vec, (unsigned)apic_id());
+            return;
+        }
+    }
+    if (want >= 2 && pci_find_cap(hc_pci, 0x05)) {
+        int vec = msi_install_handler(xhci_irq);
+        if (vec >= 0 &&
+            pci_enable_msi(hc_pci, (uint8_t)vec, (uint8_t)apic_id()) == 0) {
+            irq_mode = IRQ_MSI;
+            printk("[XHCI] interrupts: MSI, vector 0x%02x to APIC %u\n", vec,
+                   (unsigned)apic_id());
+            return;
+        }
+    }
+    if (want >= 1 && hc_pci->irq_line >= 1 && hc_pci->irq_line <= 15) {
+        irq_line = hc_pci->irq_line;
+        irq_install_handler((uint8_t)irq_line, xhci_irq);
+        pic_unmask((uint8_t)irq_line);
+        /* INTx back on in case firmware (or an earlier MSI) disabled it. */
+        uint8_t b = hc_pci->bus, s = hc_pci->slot, f = hc_pci->func;
+        uint32_t cmd = pci_read_config32(b, s, f, 0x04);
+        pci_write_config32(b, s, f, 0x04, (cmd & 0xFFFFU) & ~(1U << 10));
+        irq_mode = IRQ_INTX;
+        printk("[XHCI] interrupts: INTx on IRQ %d (shared)\n", irq_line);
+        return;
+    }
+    printk("[XHCI] interrupts: none, polling every tick\n");
 }
 
 void xhci_init(void) {
@@ -1517,6 +1851,7 @@ void xhci_init(void) {
     pci_write_config32(b, s, f, 0x04, (cmd & 0xFFFFU) | 0x6U);
     if (size == 0 || size > XHCI_MMIO_MAX) size = XHCI_MMIO_MAX;
 
+    mmio_size = size;
     cap_regs = mmio_map(base, size);
     if (!cap_regs) {
         printk("[XHCI] cannot map registers\n");
@@ -1537,6 +1872,7 @@ void xhci_init(void) {
 
 void xhci_start_thread(void) {
     if (!hc_pci) return;
+    irq_setup();
     if (!proc_create_kthread(kusbd, "kusbd"))
         printk("[XHCI] cannot start kusbd\n");
 }

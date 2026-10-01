@@ -127,3 +127,63 @@ const pci_device_t *pci_find_class(uint8_t class_code, uint8_t subclass) {
     return 0;
 }
 
+
+/* Capability list (PCI Local Bus 3.0, 6.7): config offset of the first
+ * capability with ID `id`, or 0. */
+uint8_t pci_find_cap(const pci_device_t *d, uint8_t id) {
+    if (!(pci_read_config16(d->bus, d->slot, d->func, 0x06) & 0x10))
+        return 0;                                   /* no capability list */
+    uint8_t off = pci_read_config8(d->bus, d->slot, d->func, 0x34) & 0xFC;
+    for (int guard = 0; off && guard < 48; guard++) {
+        uint32_t v = pci_read_config32(d->bus, d->slot, d->func, off);
+        if ((v & 0xFF) == id) return off;
+        off = (uint8_t)((v >> 8) & 0xFC);
+    }
+    return 0;
+}
+
+/* MSI (PCI Local Bus 3.0, 6.8.1): one message, fixed delivery, edge, to the
+ * Local APIC `apic_id` (physical destination) with `vector`; INTx is turned
+ * off.  The x86 message format is the Intel SDM's (vol. 3, 11.11).
+ * Returns 0, or -1 when the function has no MSI capability. */
+int pci_enable_msi(const pci_device_t *d, uint8_t vector, uint8_t apic_id) {
+    uint8_t cap = pci_find_cap(d, 0x05);
+    if (!cap) return -1;
+    uint8_t b = d->bus, s = d->slot, f = d->func;
+    uint32_t hdr = pci_read_config32(b, s, f, cap);
+    uint32_t ctl = hdr >> 16;
+    int is64 = (ctl & 0x80) != 0;
+    pci_write_config32(b, s, f, (uint8_t)(cap + 4),
+                       0xFEE00000U | ((uint32_t)apic_id << 12));
+    if (is64) pci_write_config32(b, s, f, (uint8_t)(cap + 8), 0);
+    uint8_t data_off = (uint8_t)(cap + (is64 ? 12 : 8));
+    uint32_t data = pci_read_config32(b, s, f, data_off);
+    pci_write_config32(b, s, f, data_off, (data & 0xFFFF0000U) | vector);
+    ctl = (ctl & ~0x70U) | 1U;                       /* MME = 1 vector, enable */
+    pci_write_config32(b, s, f, cap, (hdr & 0xFFFFU) | (ctl << 16));
+    uint32_t cmd = pci_read_config32(b, s, f, 0x04);
+    pci_write_config32(b, s, f, 0x04, (cmd & 0xFFFFU) | (1U << 10));
+    return 0;
+}
+
+/* MSI-X (PCI Local Bus 3.0, 6.8.2): where the vector table lives.  Returns
+ * the capability offset (0: none) with the table's BAR index and offset. */
+uint8_t pci_msix_table(const pci_device_t *d, uint8_t *bir, uint32_t *offset) {
+    uint8_t cap = pci_find_cap(d, 0x11);
+    if (!cap) return 0;
+    uint32_t t = pci_read_config32(d->bus, d->slot, d->func, (uint8_t)(cap + 4));
+    *bir = (uint8_t)(t & 7);
+    *offset = t & ~7U;
+    return cap;
+}
+
+/* Turn MSI-X on (function unmasked) with the table already programmed, and
+ * INTx off. */
+void pci_msix_enable(const pci_device_t *d, uint8_t cap) {
+    uint8_t b = d->bus, s = d->slot, f = d->func;
+    uint32_t hdr = pci_read_config32(b, s, f, cap);
+    uint32_t ctl = ((hdr >> 16) & ~(1U << 14)) | (1U << 15);
+    pci_write_config32(b, s, f, cap, (hdr & 0xFFFFU) | (ctl << 16));
+    uint32_t cmd = pci_read_config32(b, s, f, 0x04);
+    pci_write_config32(b, s, f, 0x04, (cmd & 0xFFFFU) | (1U << 10));
+}

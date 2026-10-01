@@ -111,6 +111,13 @@ void idt_init(void) {
     extern void lapic_timer_isr(void);
     idt_set_gate(0xF0, (uint32_t)lapic_timer_isr, 0x08, 0x8E);
 
+    /* MSI vectors 0xE0-0xE3 (arch/i686/cpu/irq.c msi_install_handler). */
+    extern void msi_isr0(void), msi_isr1(void), msi_isr2(void), msi_isr3(void);
+    idt_set_gate(0xE0, (uint32_t)msi_isr0, 0x08, 0x8E);
+    idt_set_gate(0xE1, (uint32_t)msi_isr1, 0x08, 0x8E);
+    idt_set_gate(0xE2, (uint32_t)msi_isr2, 0x08, 0x8E);
+    idt_set_gate(0xE3, (uint32_t)msi_isr3, 0x08, 0x8E);
+
     /* Reschedule IPI (vector 0xFC): wakeup preemption across CPUs. */
     extern void resched_ipi_isr(void);
     idt_set_gate(0xFC, (uint32_t)resched_ipi_isr, 0x08, 0x8E);

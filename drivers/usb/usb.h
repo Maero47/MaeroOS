@@ -81,6 +81,10 @@ struct usb_device;
 #define USB_CLS_MSC  2
 #define USB_CLS_HUB  3
 #define USB_STALL    (-2)
+/* what an endpoint carries (xhci.c) */
+#define EP_BULK      0
+#define EP_HID       1       /* interrupt-IN HID reports */
+#define EP_HUB       2       /* interrupt-IN hub status changes */
 
 /* Physical address of a buffer in the kernel image (.data/.bss), which is
  * where every DMA buffer of the USB stack lives. */
@@ -91,6 +95,9 @@ struct usb_device;
  * I/O takes it with usb_lock().  It is a sleeping lock. */
 void usb_lock(void);
 void usb_unlock(void);
+/* Ask kusbd to look around now (keyboard.c: the lock keys changed, so the
+ * keyboard LEDs need updating).  Safe from any context. */
+void usb_kick(void);
 int  usb_device_slot(const struct usb_device *dev);
 
 /* Control transfer on endpoint 0.  `data` is a kernel buffer of `setup->
@@ -110,18 +117,24 @@ int usb_clear_halt(struct usb_device *dev, int i);
 
 /* ── mass storage (usb_msc.c) ─────────────────────────────────────────────── */
 
+/* Disks (one per LUN) attached at once; disk `unit` is /dev/usbdisk<unit>
+ * and unit <unit> in drivers/blkdev.c's table. */
+#define USB_MSC_MAX_DISKS 8
+
 /* Does this configuration have a SCSI / bulk-only interface? */
 int  usb_msc_match(const uint8_t *cfg, uint32_t len);
 /* Called by kusbd (lock held) after SET_CONFIGURATION. 0 = attached. */
 int  usb_msc_attach(struct usb_device *dev, const uint8_t *cfg, uint32_t len);
 void usb_msc_detach(struct usb_device *dev);
-/* devfs: the /dev/usbdisk0 node while a disk is attached, else NULL. */
-struct vfs_node *usb_msc_node(void);
+/* devfs: the /dev/usbdisk<unit> node while that disk is attached, else
+ * NULL; by name ("usbdisk1"), or by unit for listing. */
+struct vfs_node *usb_msc_node(const char *name);
+struct vfs_node *usb_msc_node_at(int unit);
 /* For drivers/blkdev.c: size in 512-byte sectors (saturated), and sector
  * I/O (0 or -1); they take the USB lock, so never call them with it held. */
-uint32_t usb_msc_sectors(void);
-int usb_msc_read(uint32_t lba, uint32_t count, void *buf);
-int usb_msc_write(uint32_t lba, uint32_t count, const void *buf);
+uint32_t usb_msc_sectors(int unit);
+int usb_msc_read(int unit, uint32_t lba, uint32_t count, void *buf);
+int usb_msc_write(int unit, uint32_t lba, uint32_t count, const void *buf);
 /* kusbd, without the USB lock: put a newly attached disk into the disk
  * table and scan its partitions. */
 void usb_msc_service(void);
@@ -133,6 +146,9 @@ void usb_msc_service(void);
 #define HID_KIND_KEYBOARD 1
 #define HID_KIND_MOUSE    2   /* boot protocol, relative */
 #define HID_KIND_POINTER  3   /* report protocol: parsed (tablet, mice) */
+#define HID_KIND_CONSUMER 4   /* report protocol: media keys (volume ...) */
+
+#define HID_CC_MAX 16
 
 typedef struct {
     uint16_t offset;   /* bit offset within the report (after any report ID) */
@@ -155,6 +171,19 @@ typedef struct {
     /* absolute pointer state */
     int      have_abs;
     int32_t  last_x, last_y;
+    /* consumer control (page 0x0C): either an array field whose values
+     * index usages cc_umin..cc_umax, or cc_n one-bit variable fields with
+     * their usages; and the evdev keys held down after the last report */
+    hid_field_t cc;
+    uint8_t  cc_array;
+    uint8_t  cc_n;
+    uint16_t cc_umin, cc_umax;
+    uint16_t cc_usage[HID_CC_MAX];
+    uint16_t cc_down[HID_CC_MAX];
+    /* interface number, and the LED byte last sent (keyboards; 0xFF: none
+     * yet) */
+    uint8_t  ifnum;
+    uint8_t  leds;
 } hid_state_t;
 
 /* Choose a HID function for an interface: fills st->kind (HID_KIND_NONE when
@@ -167,3 +196,6 @@ void hid_report(hid_state_t *st, const uint8_t *data, uint32_t len);
 /* Called by kusbd every tick: key repeat for keyboards. */
 void hid_tick(hid_state_t *st);
 const char *hid_kind_name(int kind);
+/* Boot-time check of the report descriptor parser and the media-key path
+ * on canned descriptors and reports; 0 = passed. */
+int hid_selftest(void);
