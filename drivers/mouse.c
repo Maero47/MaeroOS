@@ -104,7 +104,19 @@ static void handle_packet(void) {
 
     int32_t dx = (int8_t)packet[1];
     int32_t dy = -(int8_t)packet[2];
-    uint8_t new_buttons = packet[0] & 0x07;
+    /* IntelliMouse Z: +1 = wheel toward user (down); Linux REL_WHEEL
+     * is +1 for up, so negate. */
+    int32_t dz = packet_size == 4 ? -(int8_t)packet[3] : 0;
+    mouse_input(dx, dy, dz, packet[0] & 0x07);
+}
+
+/* One movement/button report from any pointer (PS/2 above, USB HID in
+ * drivers/usb/usb_hid.c): relative motion with y growing downwards, wheel +1
+ * = up, buttons bit 0 left, 1 right, 2 middle.  Runs with interrupts off: the
+ * PS/2 IRQ and a USB poll may both be feeding the ring. */
+void mouse_input(int32_t dx, int32_t dy, int32_t wheel, uint8_t new_buttons) {
+    uint32_t fl;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
     int changed = 0;
 
     if (dx) {
@@ -115,16 +127,12 @@ static void handle_packet(void) {
         push_event(EV_REL, REL_Y, dy);
         changed = 1;
     }
-    if (packet_size == 4) {
-        /* IntelliMouse Z: +1 = wheel toward user (down); Linux REL_WHEEL
-         * is +1 for up, so negate. */
-        int32_t dz = (int8_t)packet[3];
-        if (dz) {
-            push_event(EV_REL, REL_WHEEL, -dz);
-            changed = 1;
-        }
+    if (wheel) {
+        push_event(EV_REL, REL_WHEEL, wheel);
+        changed = 1;
     }
 
+    new_buttons &= 0x07;
     uint32_t before = head;
     emit_button(new_buttons, 0x01, BTN_LEFT);
     emit_button(new_buttons, 0x02, BTN_RIGHT);
@@ -133,6 +141,7 @@ static void handle_packet(void) {
     buttons = new_buttons;
 
     if (changed) push_event(EV_SYN, SYN_REPORT, 0);
+    if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
 }
 
 static void mouse_irq(registers_t *regs) {
