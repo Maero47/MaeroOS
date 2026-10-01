@@ -3,6 +3,8 @@
 #include "../lib/string.h"
 #include "../mm/heap.h"
 #include "../proc/process.h"
+#include "../lib/printf.h"
+#include "../proc/scheduler.h"
 #include <stddef.h>
 
 vfs_node_t *vfs_root = NULL;
@@ -197,12 +199,41 @@ enum { WALK_FOUND, WALK_MISS, WALK_RESTART };
  * While walking, `alt` holds the textual path of the directory reached so far;
  * that is the prefix a relative target is resolved against.
  */
+static vfs_mnt_t g_mnt[VFS_MNT_MAX];
+static int g_mnt_active;          /* entries that are crossed (not boot notes) */
+static uint32_t g_mnt_seq;        /* last mount number handed out */
+
+/* The newest mount whose mountpoint is `n` (by mount order, not by slot: a
+ * slot freed by umount is reused by a later mount). */
+static vfs_mnt_t *mnt_on(vfs_node_t *n) {
+    vfs_mnt_t *best = NULL;
+    for (int i = 0; i < VFS_MNT_MAX; i++)
+        if (g_mnt[i].used && !g_mnt[i].boot && g_mnt[i].mp == n &&
+            (!best || g_mnt[i].seq > best->seq))
+            best = &g_mnt[i];
+    return best;
+}
+
+/* Step from a mountpoint to the root mounted on it, through stacked mounts. */
+static vfs_node_t *mnt_cross(vfs_node_t *n, vfs_mnt_t **m) {
+    if (!g_mnt_active) return n;
+    for (int hops = 0; hops < VFS_MNT_MAX && n; hops++) {
+        vfs_mnt_t *e = mnt_on(n);
+        if (!e) break;
+        *m = e;
+        n = e->root;
+    }
+    return n;
+}
+
 static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
                     int may_follow, int top_restarts, char *alt,
-                    vfs_node_t **out, int *err) {
+                    vfs_node_t **out, int *err, vfs_mnt_t **mnt_out) {
     const char *p = path + 1;
     vfs_node_t *cur = root;
     vfs_node_t *parents[64];
+    vfs_mnt_t *mnts[64];
+    vfs_mnt_t *curm = NULL;
     uint32_t depth = 0;
     int alen = 0;                /* length of the prefix in alt; -1: too long */
     char component[256];
@@ -228,10 +259,14 @@ static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
 
         /* handle ".." — walk up (root stays root) */
         if (len == 2 && component[0] == '.' && component[1] == '.') {
-            if (depth > 0)
-                cur = parents[--depth];
-            else
+            if (depth > 0) {
+                --depth;
+                cur = parents[depth];
+                curm = mnts[depth];
+            } else {
                 cur = root;
+                curm = NULL;
+            }
             /* A chrooted walk through /dev or /proc that climbs back to the
              * top is at the chroot's "/", not the global one: start over
              * with the rest of the path there (a symlink to /proc/.. must
@@ -251,8 +286,10 @@ static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
         }
 
         vfs_node_t *parent = cur;
+        vfs_mnt_t *parent_m = curm;
         cur = vfs_finddir(cur, component);
         if (!cur) { *err = -2; return WALK_MISS; }            /* -ENOENT */
+        cur = mnt_cross(cur, &curm);
 
         if (cur->flags == VFS_FLAG_SYMLINK && (!is_final || follow_final)) {
             if (!may_follow) { *err = -40; return WALK_MISS; } /* -ELOOP */
@@ -283,8 +320,10 @@ static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
             return WALK_RESTART;
         }
 
-        if (depth < (sizeof(parents) / sizeof(parents[0])))
+        if (depth < (sizeof(parents) / sizeof(parents[0]))) {
+            mnts[depth] = parent_m;
             parents[depth++] = parent;
+        }
         if (alen >= 0 && alen + 1 + len < VFS_PATH_MAX) {
             alt[alen++] = '/';
             memcpy(alt + alen, component, (uint32_t)len);
@@ -294,6 +333,7 @@ static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
         }
     }
     *out = cur;
+    if (mnt_out) *mnt_out = curm;
     return WALK_FOUND;
 }
 
@@ -311,13 +351,17 @@ static int vfs_path_skips_chroot(const char *path) {
  * Resolve an absolute path.  With `croot` set (a chrooted caller) the walk
  * starts there, except under /dev and /proc; otherwise paths outside the
  * reserved mount points are tried on the root overlay (the mounted disk)
- * first and on vfs_root otherwise.  On failure NULL is returned and *err (if
- * given) says why: -ENOENT, -ELOOP past VFS_MAXSYMLINKS links, or
- * -ENAMETOOLONG.
+ * first and on vfs_root otherwise.  Mounts are crossed either way, and ".."
+ * at the top of a chroot stays there, so a mountpoint inside the new root
+ * leads only into its mount and back.  On failure NULL is returned and *err
+ * (if given) says why: -ENOENT, -ELOOP past VFS_MAXSYMLINKS links, or
+ * -ENAMETOOLONG.  *mnt (if given) gets the mount the node was reached
+ * through (NULL for the boot filesystems).
  */
 static vfs_node_t *vfs_lookup_in(vfs_node_t *croot, const char *path,
-                                 int follow_final, int *err) {
+                                 int follow_final, int *err, vfs_mnt_t **mnt) {
     char bufs[2][VFS_PATH_MAX];
+    if (mnt) *mnt = NULL;
     if (err) *err = -2;                                       /* -ENOENT */
     if (!path || path[0] != '/' || !vfs_root) return NULL;
     uint32_t plen = (uint32_t)strlen(path);
@@ -333,14 +377,15 @@ static vfs_node_t *vfs_lookup_in(vfs_node_t *croot, const char *path,
         if (croot && !vfs_path_skips_chroot(pth)) {
             /* ".." at the top stays at croot, and an absolute symlink target
              * comes back through here, so neither leaves the new root. */
-            r = vfs_walk(croot, pth, follow_final, may_follow, 0, alt, &node, &e);
+            r = vfs_walk(croot, pth, follow_final, may_follow, 0, alt, &node,
+                         &e, mnt);
         } else {
             if (vfs_root_overlay && vfs_path_uses_root_overlay(pth))
                 r = vfs_walk(vfs_root_overlay, pth, follow_final, may_follow,
-                             0, alt, &node, &e);
+                             0, alt, &node, &e, mnt);
             if (r == WALK_MISS) {
                 r = vfs_walk(vfs_root, pth, follow_final, may_follow,
-                             croot != NULL, alt, &node, &e2);
+                             croot != NULL, alt, &node, &e2, mnt);
                 if (e == -2) e = e2;     /* report a loop over a plain miss */
             }
         }
@@ -354,10 +399,15 @@ static vfs_node_t *vfs_lookup_in(vfs_node_t *croot, const char *path,
     }
 }
 
-vfs_node_t *vfs_lookup(const char *path, int follow_final, int *err) {
+/* A chrooted process walks from the node sys_chroot pinned. */
+vfs_node_t *vfs_lookup_mnt(const char *path, int follow_final, int *err,
+                           vfs_mnt_t **mnt) {
     struct proc *p = current_proc;
-    /* A chrooted process walks from the node sys_chroot pinned. */
-    return vfs_lookup_in(p ? p->root_node : NULL, path, follow_final, err);
+    return vfs_lookup_in(p ? p->root_node : NULL, path, follow_final, err, mnt);
+}
+
+vfs_node_t *vfs_lookup(const char *path, int follow_final, int *err) {
+    return vfs_lookup_mnt(path, follow_final, err, NULL);
 }
 
 vfs_node_t *vfs_open(const char *path) {
@@ -496,4 +546,162 @@ int vfs_mount(const char *path, vfs_node_t *fs_root) {
     mp->next = vfs_root->children;
     vfs_root->children = mp;
     return 0;
+}
+
+/* ── Mount table ──────────────────────────────────────────────────────────── */
+
+static void mnt_copy_str(char *dst, const char *src, uint32_t size) {
+    strncpy(dst, src ? src : "none", size - 1);
+    dst[size - 1] = '\0';
+}
+
+int vfs_mount_add(const char *target, vfs_node_t *root, const vfs_mnt_t *tmpl) {
+    if (!target || target[0] != '/' || !root || !tmpl) return -22;
+    int err;
+    vfs_mnt_t *pm = NULL;
+    vfs_node_t *mp = vfs_lookup_mnt(target, 1, &err, &pm);
+    if (!mp) return err;
+    if (mp->flags != VFS_FLAG_DIR) return -20;                /* -ENOTDIR */
+    /* "/" itself is not a node any walk crosses from. */
+    if (mp == vfs_root || mp == vfs_root_overlay) return -16; /* -EBUSY */
+    preempt_disable();
+    vfs_mnt_t *m = NULL;
+    for (int i = 0; i < VFS_MNT_MAX; i++)
+        if (!g_mnt[i].used) { m = &g_mnt[i]; break; }
+    if (!m) { preempt_enable(); return -12; }                 /* -ENOMEM */
+    *m = *tmpl;
+    m->used   = 1;
+    m->boot   = 0;
+    m->mp     = mp;
+    m->root   = root;
+    m->parent = pm;
+    m->seq    = ++g_mnt_seq;
+    mnt_copy_str(m->target, target, sizeof(m->target));
+    mnt_copy_str(m->source, tmpl->source, sizeof(m->source));
+    mnt_copy_str(m->fstype, tmpl->fstype, sizeof(m->fstype));
+    g_mnt_active++;
+    preempt_enable();
+    return 0;
+}
+
+vfs_mnt_t *vfs_mount_find(const char *path, int *err) {
+    /* The walk reports the mount it crossed last to reach the result: that
+     * is the one `path` names, even when two mounts share a root node (a
+     * bind of a mounted root). */
+    vfs_mnt_t *m = NULL;
+    vfs_node_t *n = vfs_lookup_mnt(path, 1, err, &m);
+    if (!n) return NULL;
+    if (m && m->used && !m->boot && m->root == n) return m;
+    if (err) *err = -22;                                      /* -EINVAL */
+    return NULL;
+}
+
+int vfs_mounts_active(void) {
+    return g_mnt_active;
+}
+
+int vfs_mnt_rdonly(const vfs_mnt_t *m, uint32_t seq) {
+    return m && m->used && !m->boot && m->seq == seq &&
+           (m->flags & VFS_MS_RDONLY);
+}
+
+int vfs_mount_remove(vfs_mnt_t *m, uint32_t flags) {
+    if (!m || !m->used || m->boot) return -22;
+    /* Busy while a mount sits inside it, or a bind mount shows one of its
+     * directories elsewhere. */
+    for (int i = 0; i < VFS_MNT_MAX; i++)
+        if (g_mnt[i].used && (g_mnt[i].parent == m || g_mnt[i].src == m))
+            return -16;                                           /* -EBUSY */
+    int busy = m->busy ? m->busy(m->fs) : 0;
+    if (busy && !(flags & VFS_MNT_DETACH)) return -16;            /* -EBUSY */
+    void (*release)(void *) = m->release;
+    void *fs = m->fs;
+    preempt_disable();
+    m->used = 0;
+    m->mp = m->root = NULL;
+    m->src = NULL;
+    g_mnt_active--;
+    preempt_enable();
+    /* A lazily detached instance that still has open files is left alive:
+     * its descriptors keep working, and it is never freed. */
+    if (release && !busy) release(fs);
+    return 0;
+}
+
+int vfs_is_mountpoint(vfs_node_t *n) {
+    return g_mnt_active && n && mnt_on(n) != NULL;
+}
+
+void vfs_mount_note(const char *source, const char *target, const char *fstype,
+                    uint32_t flags) {
+    for (int i = 0; i < VFS_MNT_MAX; i++) {
+        if (g_mnt[i].used) continue;
+        memset(&g_mnt[i], 0, sizeof(g_mnt[i]));
+        g_mnt[i].used = 1;
+        g_mnt[i].boot = 1;
+        g_mnt[i].flags = flags;
+        mnt_copy_str(g_mnt[i].source, source, sizeof(g_mnt[i].source));
+        mnt_copy_str(g_mnt[i].target, target, sizeof(g_mnt[i].target));
+        mnt_copy_str(g_mnt[i].fstype, fstype, sizeof(g_mnt[i].fstype));
+        return;
+    }
+}
+
+int vfs_mount_has_fs_source(const char *source) {
+    for (int i = 0; i < VFS_MNT_MAX; i++)
+        if (g_mnt[i].used && strcmp(g_mnt[i].source, source) == 0) return 1;
+    return 0;
+}
+
+uint32_t vfs_mounts_format(char *buf, uint32_t size) {
+    uint32_t pos = 0;
+    if (!size) return 0;
+    buf[0] = '\0';
+    /* Boot notes first (slot order), then mounts in the order they were
+     * made, so a parent is always listed before what is mounted inside it. */
+    uint32_t last = 0;
+    for (int i = 0; ; i++) {
+        vfs_mnt_t *m = NULL;
+        if (i < VFS_MNT_MAX) {
+            if (!g_mnt[i].used || !g_mnt[i].boot) continue;
+            m = &g_mnt[i];
+        } else {
+            for (int j = 0; j < VFS_MNT_MAX; j++)
+                if (g_mnt[j].used && !g_mnt[j].boot && g_mnt[j].seq > last &&
+                    (!m || g_mnt[j].seq < m->seq))
+                    m = &g_mnt[j];
+            if (!m) break;
+            last = m->seq;
+        }
+        if (pos + 1 >= size) break;
+        pos += (uint32_t)snprintf(buf + pos, size - pos,
+                                  "%s %s %s %s%s%s%s 0 0\n",
+                                  m->source, m->target, m->fstype,
+                                  (m->flags & VFS_MS_RDONLY) ? "ro" : "rw",
+                                  (m->flags & VFS_MS_NOSUID) ? ",nosuid" : "",
+                                  (m->flags & VFS_MS_NODEV) ? ",nodev" : "",
+                                  (m->flags & VFS_MS_NOEXEC) ? ",noexec" : "");
+        if (pos >= size) pos = size - 1;
+    }
+    return pos;
+}
+
+int vfs_path_rdonly(const char *path, int parent) {
+    if (!g_mnt_active || !path || path[0] != '/') return 0;
+    vfs_mnt_t *m = NULL;
+    int err;
+    if (!parent && vfs_lookup_mnt(path, 1, &err, &m))
+        return m && (m->flags & VFS_MS_RDONLY);
+    /* The directory that holds (or would hold) the last component. */
+    char dir[VFS_PATH_MAX];
+    uint32_t len = (uint32_t)strlen(path);
+    if (len >= sizeof(dir)) return 0;
+    memcpy(dir, path, len + 1);
+    while (len > 1 && dir[len - 1] == '/') dir[--len] = '\0';
+    while (len > 1 && dir[len - 1] != '/') len--;
+    if (len > 1) len--;                       /* drop the separator */
+    dir[len] = '\0';
+    m = NULL;
+    if (!vfs_lookup_mnt(dir, 1, &err, &m)) return 0;
+    return m && (m->flags & VFS_MS_RDONLY);
 }

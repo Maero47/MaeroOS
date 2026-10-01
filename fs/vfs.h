@@ -39,6 +39,8 @@ typedef struct vfs_node {
     uint32_t uid, gid;
     uint32_t atime, mtime, ctime;
     uint32_t nlink;    /* hard links (0 = not tracked, stat reports 1) */
+    uint32_t dev;      /* st_dev: device of the filesystem (0 = unspecified) */
+    uint32_t rdev;     /* st_rdev: the device a BLKDEV/CHARDEV node stands for */
 
     /* ── Operations (NULL = use built-in defaults) ──────────────────── */
     uint32_t          (*read_fn)   (struct vfs_node *, uint32_t off,
@@ -219,3 +221,96 @@ int vfs_symlink(const char *target, const char *path);
  * Used by readlink().
  */
 vfs_node_t *vfs_open_nofollow(const char *path);
+
+/* ── Mount table (mount(2) / umount2(2)) ───────────────────────────────────
+ *
+ * A mount attaches the root of a filesystem instance to a directory node.
+ * Path walks cross it: whenever vfs_finddir() yields a node that is mounted
+ * on, the walk continues from the mounted root instead (repeatedly, so mounts
+ * stack).  ".." out of a mounted root returns to the directory that held the
+ * mountpoint, since the walk keeps its own parent stack.
+ *
+ * Mountpoints are matched by node identity.  That holds for every filesystem
+ * here: initrd, devfs and procfs nodes are static, tmpfs nodes live as long as
+ * their link, and ext2/ext4 keep one node per inode for the life of the mount.
+ *
+ * The boot-time mounts made with vfs_mount() above (/disk, /tmp, /dev, /proc)
+ * stay as they are; vfs_mount_note() only lists them in /proc/mounts.
+ */
+#define VFS_MS_RDONLY   0x0001u     /* Linux MS_RDONLY */
+#define VFS_MS_NOSUID   0x0002u
+#define VFS_MS_NODEV    0x0004u
+#define VFS_MS_NOEXEC   0x0008u
+#define VFS_MS_REMOUNT  0x0020u
+#define VFS_MNT_FORCE   0x0001u     /* umount2 flags */
+#define VFS_MNT_DETACH  0x0002u
+
+#define VFS_MNT_MAX 16
+
+typedef struct vfs_mnt {
+    int          used;
+    int          boot;          /* listed only; not crossed, never unmounted */
+    vfs_node_t  *mp;            /* the directory mounted on */
+    vfs_node_t  *root;          /* the mounted filesystem's root */
+    struct vfs_mnt *parent;     /* mount `mp` lives on, NULL for the boot tree */
+    uint32_t     flags;         /* VFS_MS_* */
+    uint32_t     seq;           /* mount order (newer = larger), never reused */
+    /* Bind mounts: the mount the source directory lives on.  It cannot be
+     * unmounted while this entry exists (its nodes would be freed under us). */
+    struct vfs_mnt *src;
+    char         source[64];
+    char         target[256];
+    char         fstype[16];
+    void        *fs;            /* instance, for the two hooks below */
+    /* Nonzero while the instance has files open (umount gets -EBUSY). */
+    int        (*busy)(void *fs);
+    /* Called once the mount is gone; frees the instance. */
+    void       (*release)(void *fs);
+    /* Switch the instance between read-only and read-write (remount);
+     * NULL = only read-only is possible for a read-write request. */
+    int        (*set_ro)(void *fs, int ro);
+} vfs_mnt_t;
+
+/* Like vfs_lookup, and also report the mount the result lives on (NULL for
+ * the boot tree). */
+vfs_node_t *vfs_lookup_mnt(const char *path, int follow_final, int *err,
+                           vfs_mnt_t **mnt);
+
+/* Attach `root` at the directory `target` (an absolute, canonical path).
+ * The other fields of `tmpl` (source, fstype, flags, fs, hooks) are copied.
+ * 0 or -errno: -ENOENT, -ENOTDIR, -EBUSY (already a mount root of the same
+ * instance), -ENOMEM (table full). */
+int vfs_mount_add(const char *target, vfs_node_t *root, const vfs_mnt_t *tmpl);
+
+/* Nonzero while any mount(2) mount exists. */
+int vfs_mounts_active(void);
+
+/* 1 when `m` is still the mount numbered `seq` and is read-only (open files
+ * keep both, so a slot reused after umount is not mistaken for theirs). */
+int vfs_mnt_rdonly(const vfs_mnt_t *m, uint32_t seq);
+
+/* The mount whose root `path` names, or NULL (with *err set). */
+vfs_mnt_t *vfs_mount_find(const char *path, int *err);
+
+/* Detach a mount found with vfs_mount_find.  -EBUSY when another mount sits
+ * on top of it, or when its instance is busy and VFS_MNT_DETACH is not given.
+ * Calls the release hook unless the instance is still busy. */
+int vfs_mount_remove(vfs_mnt_t *m, uint32_t flags);
+
+/* 1 when a mount sits on `n` (rmdir/unlink of it is -EBUSY). */
+int vfs_is_mountpoint(vfs_node_t *n);
+
+/* List a boot-time mount in /proc/mounts. */
+void vfs_mount_note(const char *source, const char *target, const char *fstype,
+                    uint32_t flags);
+
+/* /proc/mounts text; returns its length (at most `size`). */
+uint32_t vfs_mounts_format(char *buf, uint32_t size);
+
+/* 1 when the object `path` names (or, if it does not exist or `parent` is
+ * set, the directory that would hold it) is on a read-only mount. */
+int vfs_path_rdonly(const char *path, int parent);
+
+/* 1 when some mount's instance is `fs` (used to refuse a second mount of a
+ * device). */
+int vfs_mount_has_fs_source(const char *source);

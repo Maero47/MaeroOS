@@ -31,6 +31,8 @@
 #include "../fs/tmpfs.h"
 #include "../fs/devfs.h"
 #include "../fs/procfs.h"
+#include "../fs/mount.h"
+#include "../drivers/blkpart.h"
 #include "../drivers/ata.h"
 #include "../drivers/ahci.h"
 #include "../drivers/nvme.h"
@@ -177,11 +179,14 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     ahci_init();
     nvme_init();
     blk_init();
+    blkpart_init();       /* /dev/hda.., partitions for mount(2) */
+    vfs_mount_note("rootfs", "/", "rootfs", 0);
     if (blk_present()) {
         vfs_node_t *disk_root = ext2_mount(0);
         if (disk_root) {
             vfs_mount("/disk", disk_root);
             vfs_set_root_overlay(disk_root);
+            vfs_mount_note("/dev/hda", "/disk", "ext2", 0);
         }
     }
 
@@ -189,19 +194,23 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     {
         vfs_node_t *tmp_root = tmpfs_mount();
         if (tmp_root) vfs_mount("/tmp", tmp_root);
+        if (tmp_root) vfs_mount_note("tmpfs", "/tmp", "tmpfs", 0);
     }
 
     /* ── devfs at /dev ───────────────────────────────────────────────────── */
-    {
-        vfs_node_t *dev_root = devfs_mount();
-        if (dev_root) vfs_mount("/dev", dev_root);
+    vfs_node_t *dev_root = devfs_mount();
+    if (dev_root) {
+        vfs_mount("/dev", dev_root);
+        vfs_mount_note("devtmpfs", "/dev", "devtmpfs", 0);
     }
 
     /* ── procfs at /proc ─────────────────────────────────────────────────── */
-    {
-        vfs_node_t *proc_root = procfs_mount();
-        if (proc_root) vfs_mount("/proc", proc_root);
+    vfs_node_t *proc_root = procfs_mount();
+    if (proc_root) {
+        vfs_mount("/proc", proc_root);
+        vfs_mount_note("proc", "/proc", "proc", 0);
     }
+    mount_set_boot_roots(proc_root, dev_root);
 
     /* ── M8/M9/M10: Scheduler + user mode ───────────────────────────────── */
     proc_init();

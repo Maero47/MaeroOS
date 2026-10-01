@@ -23,7 +23,10 @@ the test that proves it, is in the status table of [README.md](README.md).
   path lookup walks through.
 - **Sockets.** A loopback interface for AF_INET; `SO_LINGER`; sshd on top of
   the server sockets once an Alpine root is available.
-- **Missing interfaces.** A `mount` syscall, SysV IPC, utmp, `/proc/stat` and
+- **ext4 writes.** Journaled writes (extent allocation, bitmaps and group
+  descriptors with checksums, jbd2 transactions) so `mount -t ext4` can be
+  read-write; today it is read-only (`docs/ext4.md`).
+- **Missing interfaces.** SysV IPC, utmp, `/proc/stat` and
   the full per-pid `/proc/<pid>/` set, which would let toybox build `killall`,
   `vmstat`, `who`, `netcat` and `wget`.
 - **Packages.** Signing-key rotation and revocation; today the key is per

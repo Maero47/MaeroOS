@@ -55,6 +55,7 @@ static inline void ata_irq_restore(uint32_t f) {
 #define ATA_CMD_SET_MULT   0xC6
 
 static int drive_present = 0;
+static uint32_t master_sectors = 0;   /* LBA28 capacity, IDENTIFY words 60-61 */
 
 /*
  * Sectors the drive transfers per DRQ assertion (READ MULTIPLE block size), or
@@ -374,6 +375,8 @@ static int ata_read_dma(uint32_t lba, uint8_t count, uint32_t nsect) {
     return 0;
 }
 
+static void ata_probe_others(void);
+
 void ata_init(void) {
     /* Read the 256-word identify data; word 47 low byte is the largest block
      * READ/WRITE MULTIPLE may use (0 means the drive does not support it). */
@@ -383,10 +386,12 @@ void ata_init(void) {
         r = ata_probe(ident);
     if (r <= 0) {
         printk("[ATA]  Drive not present.\n");
+        ata_probe_others();
         return;
     }
 
     drive_present = 1;
+    master_sectors = (uint32_t)ident[60] | ((uint32_t)ident[61] << 16);
 
     uint32_t max_multi = ident[47] & 0xFFu;
     if (max_multi) {
@@ -411,6 +416,8 @@ void ata_init(void) {
                (unsigned)ata_multi, ata_bm ? ", bus-master DMA" : "");
     else
         printk("[ATA]  Primary master ready%s.\n", ata_bm ? " (bus-master DMA)" : "");
+
+    ata_probe_others();
 }
 
 int ata_present(void) {
@@ -530,4 +537,183 @@ out:
     ata_irq_restore(irq);
     kprof_switch(kp_old);
     return rc;
+}
+
+/* ── The other three drive positions (hdb, hdc, hdd) ─────────────────────────
+ *
+ * Everything above serves the primary master, the boot disk, and is tuned for
+ * it (READ MULTIPLE, bus-master DMA).  The other positions get a plain LBA28
+ * PIO path: they hold disks that are mounted later with mount(2), and are read
+ * far less.  Each transaction runs with interrupts off like the master's, and
+ * selects its drive explicitly; the master's own commands select the master
+ * again before they start, so the two never confuse the shared channel.
+ *
+ * Primary slave is probed without a channel reset (a reset would drop the
+ * master's READ MULTIPLE setting); the secondary channel is reset once.  A
+ * packet (ATAPI) device, such as QEMU's CD-ROM, answers IDENTIFY with an abort
+ * and the packet signature and is skipped. */
+typedef struct {
+    uint16_t io, ctl;     /* command block base, control/alt-status port */
+    uint8_t  slave;       /* 0 master, 1 slave */
+    uint8_t  present;
+    uint32_t sectors;
+} ata_xdev_t;
+
+static ata_xdev_t ata_xdev[ATA_MAX_DEVS] = {
+    { 0x1F0, 0x3F6, 0, 0, 0 },     /* hda: served by the code above */
+    { 0x1F0, 0x3F6, 1, 0, 0 },     /* hdb */
+    { 0x170, 0x376, 0, 0, 0 },     /* hdc */
+    { 0x170, 0x376, 1, 0, 0 },     /* hdd */
+};
+
+static int xdev_wait_bsy(const ata_xdev_t *d, uint32_t ms) {
+    ata_timer_t t;
+    ata_timer_start(&t, ms);
+    do {
+        if (!(inb(d->io + 7) & ATA_SR_BSY))
+            return 0;
+    } while (!ata_timer_expired(&t));
+    return -1;
+}
+
+static int xdev_wait_drq(const ata_xdev_t *d) {
+    ata_timer_t t;
+    ata_timer_start(&t, ATA_TIMEOUT_MS);
+    do {
+        uint8_t s = inb(d->io + 7);
+        if (s & ATA_SR_BSY)
+            continue;
+        if (s & (ATA_SR_ERR | ATA_SR_DF))
+            return -1;
+        if (s & ATA_SR_DRQ)
+            return 0;
+    } while (!ata_timer_expired(&t));
+    return -1;
+}
+
+static void xdev_delay(const ata_xdev_t *d) {
+    inb(d->ctl); inb(d->ctl); inb(d->ctl); inb(d->ctl);
+}
+
+/* IDENTIFY one position; 1 when an ATA disk answered. */
+static int xdev_probe(ata_xdev_t *d, uint16_t *ident) {
+    uint8_t s = inb(d->ctl);
+    if (s == 0xFF) return 0;                       /* floating bus */
+    if (xdev_wait_bsy(d, 1000) < 0) return 0;
+    outb(d->io + 6, d->slave ? 0xB0 : 0xA0);
+    xdev_delay(d);
+    s = inb(d->io + 7);
+    if (s == 0 || s == 0xFF) return 0;             /* nothing at this position */
+    outb(d->io + 2, 0);
+    outb(d->io + 3, 0);
+    outb(d->io + 4, 0);
+    outb(d->io + 5, 0);
+    outb(d->io + 7, ATA_CMD_IDENT);
+    xdev_delay(d);
+    if (inb(d->io + 7) == 0) return 0;
+    if (xdev_wait_bsy(d, 2000) < 0) return 0;
+    if (inb(d->io + 4) || inb(d->io + 5)) return 0;   /* ATAPI / SATA packet */
+    if (xdev_wait_drq(d) < 0) return 0;
+    for (int i = 0; i < 256; i++)
+        ident[i] = inw(d->io);
+    return 1;
+}
+
+static void ata_probe_others(void) {
+    static const char *names[ATA_MAX_DEVS] = { "hda", "hdb", "hdc", "hdd" };
+    uint16_t ident[256];
+    ata_xdev[0].present = (uint8_t)drive_present;
+    ata_xdev[0].sectors = master_sectors;
+
+    /* Reset the secondary channel once, if there is one. */
+    if (inb(0x376) != 0xFF) {
+        outb(0x376, 0x04);
+        xdev_delay(&ata_xdev[2]);
+        outb(0x376, 0x00);
+        xdev_delay(&ata_xdev[2]);
+        xdev_wait_bsy(&ata_xdev[2], 2000);
+    }
+    for (int i = 1; i < ATA_MAX_DEVS; i++) {
+        ata_xdev_t *d = &ata_xdev[i];
+        uint32_t irq = ata_irq_save();
+        int ok = xdev_probe(d, ident);
+        ata_irq_restore(irq);
+        if (!ok) continue;
+        d->sectors = (uint32_t)ident[60] | ((uint32_t)ident[61] << 16);
+        if (!d->sectors) continue;
+        d->present = 1;
+        printk("[ATA]  %s: %u sectors (%u MiB), PIO.\n", names[i],
+               (unsigned)d->sectors, (unsigned)(d->sectors / 2048u));
+    }
+    /* Leave the primary channel pointing at the master, as before. */
+    if (drive_present) {
+        outb(ATA_DRIVE, 0xA0);
+        ata_delay();
+    }
+}
+
+int ata_dev_present(int dev) {
+    if (dev < 0 || dev >= ATA_MAX_DEVS) return 0;
+    return dev == 0 ? drive_present : ata_xdev[dev].present;
+}
+
+uint32_t ata_dev_sectors(int dev) {
+    if (!ata_dev_present(dev)) return 0;
+    return dev == 0 ? master_sectors : ata_xdev[dev].sectors;
+}
+
+static int xdev_rw(int dev, uint32_t lba, uint8_t count, void *buf, int write) {
+    ata_xdev_t *d = &ata_xdev[dev];
+    uint32_t nsect = count ? count : 256u;
+    if (lba >= d->sectors || nsect > d->sectors - lba || lba >= (1u << 28))
+        return -1;
+    kprof_count(write ? KPE_ATA_WR : KPE_ATA_RD);
+    uint32_t irq = ata_irq_save();
+    int rc = -1;
+    if (xdev_wait_bsy(d, ATA_TIMEOUT_MS) < 0)
+        goto out;
+    outb(d->io + 6, (uint8_t)((d->slave ? 0xF0 : 0xE0) | ((lba >> 24) & 0x0F)));
+    xdev_delay(d);
+    outb(d->io + 1, 0);
+    outb(d->io + 2, count);
+    outb(d->io + 3, (uint8_t)lba);
+    outb(d->io + 4, (uint8_t)(lba >> 8));
+    outb(d->io + 5, (uint8_t)(lba >> 16));
+    outb(d->io + 7, write ? ATA_CMD_WRITE : ATA_CMD_READ);
+    xdev_delay(d);
+    uint16_t *p = (uint16_t *)buf;
+    for (uint32_t s = 0; s < nsect; s++) {
+        if (xdev_wait_drq(d) < 0)
+            goto out;
+        if (write) outsw(d->io, p, 256);
+        else       insw(d->io, p, 256);
+        p += 256;
+        inb(d->ctl);
+    }
+    if (write) {
+        if (xdev_wait_bsy(d, ATA_TIMEOUT_MS) < 0 ||
+            (inb(d->io + 7) & (ATA_SR_ERR | ATA_SR_DF)))
+            goto out;
+        outb(d->io + 7, ATA_CMD_FLUSH);
+        xdev_delay(d);
+        if (xdev_wait_bsy(d, ATA_FLUSH_TIMEOUT_MS) < 0 ||
+            (inb(d->io + 7) & (ATA_SR_ERR | ATA_SR_DF)))
+            goto out;
+    }
+    rc = 0;
+out:
+    ata_irq_restore(irq);
+    return rc;
+}
+
+int ata_dev_read(int dev, uint32_t lba, uint8_t count, void *buf) {
+    if (!ata_dev_present(dev)) return -1;
+    if (dev == 0) return ata_read(lba, count, buf);
+    return xdev_rw(dev, lba, count, buf, 0);
+}
+
+int ata_dev_write(int dev, uint32_t lba, uint8_t count, const void *buf) {
+    if (!ata_dev_present(dev)) return -1;
+    if (dev == 0) return ata_write(lba, count, buf);
+    return xdev_rw(dev, lba, count, (void *)(uintptr_t)buf, 1);
 }

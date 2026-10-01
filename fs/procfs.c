@@ -1,4 +1,5 @@
 #include "procfs.h"
+#include "../drivers/blkpart.h"
 #include "vfs.h"
 #include "../proc/process.h"
 #include "../drivers/pci.h"
@@ -223,6 +224,41 @@ static uint32_t procfs_version_read(vfs_node_t *n, uint32_t off, uint32_t len,
     if (avail > len) avail = len;
     __builtin_memcpy(buf, content + off, avail);
     return avail;
+}
+
+/* ── /proc/mounts, /proc/partitions ───────────────────────────────────────── */
+
+static uint32_t procfs_text_window(char *content, uint32_t total, uint32_t off,
+                                   uint32_t len, uint8_t *buf) {
+    if (off >= total) return 0;
+    uint32_t avail = total - off;
+    if (avail > len) avail = len;
+    __builtin_memcpy(buf, content + off, avail);
+    return avail;
+}
+
+static uint32_t procfs_mounts_read(vfs_node_t *n, uint32_t off, uint32_t len,
+                                   uint8_t *buf) {
+    (void)n;
+    enum { CAP = 8192 };
+    char *content = (char *)kmalloc(CAP);
+    if (!content) return 0;
+    uint32_t r = procfs_text_window(content, vfs_mounts_format(content, CAP),
+                                    off, len, buf);
+    kfree(content);
+    return r;
+}
+
+static uint32_t procfs_partitions_read(vfs_node_t *n, uint32_t off, uint32_t len,
+                                       uint8_t *buf) {
+    (void)n;
+    enum { CAP = 4096 };
+    char *content = (char *)kmalloc(CAP);
+    if (!content) return 0;
+    uint32_t r = procfs_text_window(content, blkpart_format(content, CAP),
+                                    off, len, buf);
+    kfree(content);
+    return r;
 }
 
 /* ── /proc/kmsg ───────────────────────────────────────────────────────────── */
@@ -679,6 +715,8 @@ static vfs_node_t proc_netif_node;
 static vfs_node_t proc_firewall_node;
 static vfs_node_t proc_processes_node;
 static vfs_node_t proc_kmsg_node;
+static vfs_node_t proc_mounts_node;
+static vfs_node_t proc_partitions_node;
 static vfs_node_t proc_root_node;
 
 /* ── /proc/meminfo ────────────────────────────────────────────────────────── */
@@ -1023,6 +1061,8 @@ static int procfs_root_readdir(vfs_node_t *node, uint32_t idx,
         { "kmsg",    VFS_FLAG_FILE, 8 },
         { "firewall", VFS_FLAG_FILE, 9 },
         { "uptime",  VFS_FLAG_FILE, 10 },
+        { "mounts",  VFS_FLAG_FILE, 11 },
+        { "partitions", VFS_FLAG_FILE, 12 },
     };
     static const uint32_t nentries =
         sizeof(entries) / sizeof(entries[0]);
@@ -1066,6 +1106,8 @@ static vfs_node_t *procfs_root_finddir(vfs_node_t *node, const char *name) {
     if (strcmp(name, "firewall") == 0) return &proc_firewall_node;
     if (strcmp(name, "processes") == 0) return &proc_processes_node;
     if (strcmp(name, "kmsg")    == 0) return &proc_kmsg_node;
+    if (strcmp(name, "mounts")  == 0) return &proc_mounts_node;
+    if (strcmp(name, "partitions") == 0) return &proc_partitions_node;
 
     int pid = procfs_parse_pid(name);
     if (pid > 0) {
@@ -1078,6 +1120,20 @@ static vfs_node_t *procfs_root_finddir(vfs_node_t *node, const char *name) {
 /* ── Public API ───────────────────────────────────────────────────────────── */
 
 vfs_node_t *procfs_mount(void) {
+    memset(&proc_mounts_node, 0, sizeof(proc_mounts_node));
+    strncpy(proc_mounts_node.name, "mounts", 255);
+    proc_mounts_node.flags   = VFS_FLAG_FILE;
+    proc_mounts_node.inode   = 11;
+    proc_mounts_node.mask    = 0444;
+    proc_mounts_node.read_fn = procfs_mounts_read;
+
+    memset(&proc_partitions_node, 0, sizeof(proc_partitions_node));
+    strncpy(proc_partitions_node.name, "partitions", 255);
+    proc_partitions_node.flags   = VFS_FLAG_FILE;
+    proc_partitions_node.inode   = 12;
+    proc_partitions_node.mask    = 0444;
+    proc_partitions_node.read_fn = procfs_partitions_read;
+
     /* /proc/version */
     memset(&proc_version_node, 0, sizeof(proc_version_node));
     strncpy(proc_version_node.name, "version", 255);

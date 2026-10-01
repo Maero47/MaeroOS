@@ -39,6 +39,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | ext2 disk, symlinks, login/passwd/doas, permissions, init services, sessions | 169 checks including `passwd` keeping `/etc/shadow` root-only 0600, `login` dropping to `uid=1000`, `doas` ignoring a planted `./ls`, `credprobe ok`, `fsprobe ok`, `symprobe ok` (ext2 symlinks, checked on the image with `debugfs` too) and `svc` state transitions | `make smoke-disk` |
 | SATA AHCI disk (pc + `-device ahci`, then `-M q35`), no IDE disk | `/disk` mounted from `ahci0`, `diskprobe ok`, `fsprobe ok`, `symprobe ok`, a 3 MiB random file read and copied with matching md5 in the guest and on the host (`debugfs`), persistence across a reboot onto q35, `e2fsck -fn` showing no new damage, `reboot`/`poweroff` ending QEMU | `make smoke-ahci` |
 | NVMe disk (pc + `-device nvme`, then `-M q35` with MDTS=2 and two namespaces), no IDE/AHCI disk | `/disk` mounted from `nvme0`, both namespaces found, `diskprobe ok`, `fsprobe ok`, a 3 MiB random file read and copied with matching md5 in the guest and on the host, transfers using PRP lists and split at MDTS (driver counters at shutdown), persistence across a reboot, `e2fsck -fn` clean of new damage, `reboot`/`poweroff` ending QEMU | `make smoke-nvme` |
+| `mount`/`umount`, partitions, read-only ext4 | busybox `mount -t ext4 /dev/hdb2 /mnt` on a GPT disk (4 KiB blocks, `64bit`, `metadata_csum`, `huge_file`, `flex_bg`) and `/dev/hdc5` on an MBR logical partition (1 KiB blocks): md5 of every file equals the host's, including a 300 MiB sparse file and an unwritten extent; a 5020-entry and a 20000-entry (two-level) htree directory list and resolve completely; fast, slow, relative, absolute and directory symlinks; writes fail with `EROFS`; `umount` is refused while a cwd is inside; tmpfs `remount,ro`; non-root `mount` refused; afterwards both filesystems are byte-identical to their images and `e2fsck -fn` is clean | `make smoke-ext4` |
 | `pkg` and the signed repo index | `tools/test_pkg_sign.py` runs the RFC 8032 vectors through the Python signer and the C verifier and rejects altered, unsigned and foreign-key indexes; in the guest, `pkg update` rejects unsigned, tampered and rolled-back indexes, installs and runs busybox, and `install` rejects a tarball whose SHA-256 does not match | `make smoke-pkg` |
 | TCP/IP over lwIP and RTL8139 | `MAEROS_HTTP_OK` fetched from a host HTTP server; `sockprobe` checks that `send` after `shutdown(SHUT_WR)` fails with `EPIPE`, a two-step shutdown ends in a FIN and no RST, closing TIME_WAIT sockets keeps TCP working, and a non-blocking client gets `EINPROGRESS`, `SO_ERROR`, `EAGAIN`, `ECONNREFUSED` and both socket names; `abi2probe net` checks `MSG_NOSIGNAL` and `EPIPE` after a reset | `make smoke-net` |
 | Intel e1000, DHCP DNS, name resolution | the same suite on an e1000; the DHCP lease's DNS server is in `/etc/resolv.conf`; against a DNS responder in the harness, `getent` resolves A, AAAA, a CNAME, a PTR and an NXDOMAIN, `/etc/hosts` wins over DNS, and `httpget`, `toybox wget` and `toybox nc` connect by name | `make smoke-net-e1000` |
@@ -89,7 +90,11 @@ What is proven by the automated QEMU tests in `tools/`:
   owns.
 - **No SMP scaling.** One Big Kernel Lock serialises all kernel execution
   (`arch/i686/cpu/bkl.c`).
-- **Missing Linux interfaces.** There is no `mount` syscall, no SysV IPC and no utmp.
+- **ext4 is read-only.** `mount -t ext4` works, but the driver never writes: it
+  cannot replay or write the journal, so a read-write mount is refused with `EROFS`
+  and busybox `mount` falls back to read-only (`docs/ext4.md`). Only the boot disk
+  (`/disk`, ext2) is writable.
+- **Missing Linux interfaces.** There is no SysV IPC and no utmp.
   `/proc/<pid>/` has only `status` and `stat` (the full set is under `/proc/self`), and
   there is no `/proc/stat`, so toybox is built without `killall` (it matches names
   through other processes' `cmdline`), `vmstat` and `who`. There is no IPv6 stack:
@@ -193,7 +198,12 @@ deadlock the sender.
 ### Filesystems
 
 `fs/vfs.c` mount table with a root overlay and path lookup (symlinks are followed
-iteratively with a 40-link budget, then `ELOOP`), `fs/initrd.c` ustar archive read from
+iteratively with a 40-link budget, then `ELOOP`; `mount(2)`/`umount2(2)` attach
+filesystems at any directory, crossed during the walk, listed in `/proc/mounts`),
+`fs/ext4.c` (read-only ext2/3/4 for `mount -t ext4`: extents, `64bit`, `flex_bg`,
+`meta_bg`, htree lookups, `metadata_csum` verified; see `docs/ext4.md`),
+`drivers/blkpart.c` (MBR, logical and GPT partitions of all four IDE disks as
+`/dev/hda`..`/dev/hdd5`, `/proc/partitions`), `fs/initrd.c` ustar archive read from
 the Multiboot module, `fs/ext2.c` (read and write, mounted at `/disk` and overlaid on
 `/`, symlinks included), `fs/tmpfs.c` at `/tmp` (file bodies in page frames rather than
 the kernel heap, capped at 1 GiB per file, `EFBIG` beyond), `fs/devfs.c` at
@@ -509,6 +519,7 @@ make smoke-toybox   # toybox as a static guest binary
 make smoke-disk     # ext2, login/passwd, init sessions, service supervision, overlay
 make smoke-ahci     # /disk on a SATA AHCI controller only (pc and q35)
 make smoke-nvme     # /disk on an NVMe namespace only (pc and q35)
+make smoke-ext4     # mount/umount, GPT+MBR partitions, read-only ext4 vs host md5s
 make smoke-net      # DHCP, TCP, HTTP GET from the host
 make smoke-net-e1000  # the same on an e1000, plus resolv.conf from DHCP and DNS lookups
 make smoke-tcpsrv   # listen/accept and blocking UDP, from the host through hostfwd
@@ -599,7 +610,7 @@ there: QEMU, started without `-no-shutdown`, must exit through ACPI S5.
 `smoke-cmds`, `smoke-toybox`, `smoke-disk`, `smoke-net`, `smoke-net-e1000`, `smoke-tcpsrv`, `smoke-fw`,
 `smoke-dyn`, `smoke-dynlib`, `smoke-x`, `smoke-pkg` (which first builds `repo/` and, on a
 host without one, a repo signing key), `smoke-gui` (which needs the ISO, so `check`
-builds it), `smoke-uefi` (the Limine ISO under SeaBIOS, OVMF x64 and OVMF IA32; `check`
+builds it), `smoke-ext4`, `smoke-uefi` (the Limine ISO under SeaBIOS, OVMF x64 and OVMF IA32; `check`
 builds the ISO, which fetches the pinned Limine release once, and the test skips a
 firmware that is not installed), `smoke-hda`, `smoke-acpi`, `smoke-ahci`, `smoke-nvme`,
 `smoke-usb` and `smoke-pc`. It runs them one after another, writes each suite's

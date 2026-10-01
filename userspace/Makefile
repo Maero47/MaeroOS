@@ -53,7 +53,7 @@ USER_BINS := $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
 	     $(TESTFILES)/diff $(TESTFILES)/tar \
 	     $(TESTFILES)/mkfifo $(TESTFILES)/ln $(TESTFILES)/readlink \
 	     $(TESTFILES)/sysprobe $(TESTFILES)/fcprobe $(TESTFILES)/lspci $(TESTFILES)/ifconfig \
-	     $(TESTFILES)/diskprobe $(TESTFILES)/fsprobe $(TESTFILES)/respawnprobe $(TESTFILES)/heapprobe \
+	     $(TESTFILES)/diskprobe $(TESTFILES)/fsprobe $(TESTFILES)/mntprobe $(TESTFILES)/respawnprobe $(TESTFILES)/heapprobe \
 	     $(TESTFILES)/sockprobe $(TESTFILES)/srvprobe $(TESTFILES)/netprobe $(TESTFILES)/httpget $(TESTFILES)/getent \
 	     $(TESTFILES)/randprobe $(TESTFILES)/sysmiscprobe $(TESTFILES)/abi2probe $(TESTFILES)/sigexecprobe $(TESTFILES)/timerprobe $(TESTFILES)/symprobe $(TESTFILES)/sigshareprobe \
 	     $(TESTFILES)/fbtest $(TESTFILES)/evtest $(TESTFILES)/mousetest \
@@ -395,6 +395,12 @@ symprobe/symprobe.o: symprobe/symprobe.c
 
 $(TESTFILES)/symprobe: $(CRT0_OBJ) symprobe/symprobe.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) symprobe/symprobe.o libc/libc.a
+
+# mntprobe
+mntprobe/mntprobe.o: mntprobe/mntprobe.c
+	$(CC) $(CFLAGS) -c $< -o $@
+$(TESTFILES)/mntprobe: $(CRT0_OBJ) mntprobe/mntprobe.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) mntprobe/mntprobe.o libc/libc.a
 
 # fsprobe
 fsprobe/fsprobe.o: fsprobe/fsprobe.c

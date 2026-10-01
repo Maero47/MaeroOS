@@ -137,7 +137,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine disk-alpine repo repo-serve start resolutions icons
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-ext4 smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine disk-alpine repo repo-serve start resolutions icons
 
 all: $(TARGET)
 
@@ -358,6 +358,11 @@ smoke-nvme: $(TARGET) initrd disk
 	python3 tools/smoke_nvme.py
 
 # pkg against a host HTTP repo: signed-index checks, install, rollback.
+# Second and third disks (GPT and MBR) with ext4 filesystems built on the host
+# by tools/mkext4img.py into build/ext4test/; mounted with busybox mount.
+smoke-ext4: $(TARGET) initrd disk
+	python3 tools/smoke_ext4.py
+
 smoke-pkg: $(TARGET) initrd disk repo
 	python3 tools/smoke_pkg.py
 
@@ -415,8 +420,8 @@ smoke-pc: $(TARGET) iso disk
 # with -display none (tools/smokelib.py), so no display is needed.
 # Pick a subset with CHECK_SUITES="smoke smoke-x".
 CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-net-e1000 smoke-tcpsrv \
-                 smoke-fw smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui smoke-uefi smoke-hda \
-                 smoke-acpi smoke-ahci smoke-nvme smoke-usb smoke-pc
+                 smoke-fw smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui smoke-ext4 smoke-uefi \
+                 smoke-hda smoke-acpi smoke-ahci smoke-nvme smoke-usb smoke-pc
 CHECK_LOG_DIR ?= build/check
 
 # repo: smoke-pkg serves packages from repo/ (see the smoke-pkg target).
