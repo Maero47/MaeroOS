@@ -9,7 +9,7 @@ mode, driven by `knetd` and by the socket calls themselves
 | ifindex | name | addresses | notes |
 |---|---|---|---|
 | 1 | `lo` | `127.0.0.1/8`, `::1/128` | lwIP's loop netif; no driver |
-| 2 | `eth0` | DHCPv4 lease; `fe80::/64` (EUI-64) and SLAAC `/64`s | e1000 or RTL8139 |
+| 2 | `eth0` | DHCPv4 lease; `fe80::/64` (EUI-64) and SLAAC `/64`s | e1000, RTL8139 or r8169 |
 
 `lo` is registered first, so it is interface 1 and the NIC is 2, as on Linux.
 Traffic to `127.0.0.0/8`, `::1` and to eth0's own addresses goes through
@@ -26,7 +26,7 @@ advertisements. QEMU user networking advertises `fec0::/64` and answers at
 `fec0::2` (the host) and `fec0::3` (DNS); recent QEMU versions turn this on by
 default. Be careful with `-netdev user,ipv6=on` on its own: QEMU then turns
 IPv4 off, so pass `ipv4=on,ipv6=on`. The NIC drivers accept all multicast
-(e1000 `RCTL.MPE`, RTL8139 `MAR` all ones), so neighbour discovery reaches
+(e1000 `RCTL.MPE`, RTL8139 and r8169 `MAR` all ones), so neighbour discovery reaches
 lwIP. There is no DHCPv6. RDNSS is off, so the DHCPv4 lease still writes
 `/etc/resolv.conf`.
 

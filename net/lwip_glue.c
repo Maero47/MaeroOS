@@ -58,7 +58,7 @@ static err_t maero_lwip_init_if(struct netif *lwif) {
     lwif->mtu = host_eth0->mtu;
     lwif->output_ip6 = ethip6_output;
     /* MLD6: lwIP joins the solicited-node groups and reports them; the NIC
-     * takes every multicast frame (e1000 MPE, rtl8139 MAR all ones). */
+     * takes every multicast frame (e1000 MPE, rtl8139 and r8169 MAR all ones). */
     lwif->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP |
                   NETIF_FLAG_ETHERNET | NETIF_FLAG_MLD6 | NETIF_FLAG_LINK_UP;
     return ERR_OK;
