@@ -21,8 +21,8 @@ the test that proves it, is in the status table of [README.md](README.md).
   (`docs/perf/firefox-startup.md`).
 - **Credentials.** A separate fsuid; search permission on the directories a
   path lookup walks through.
-- **Sockets.** AF_INET `listen`/`accept`; a blocking UDP `recv` that waits
-  (it returns `EAGAIN` today); a real `getaddrinfo` in the libc.
+- **Sockets.** A loopback interface for AF_INET; `SO_LINGER`; sshd on top of
+  the server sockets once an Alpine root is available.
 - **Missing interfaces.** A `mount` syscall, SysV IPC, utmp, `/proc/stat` and
   the full per-pid `/proc/<pid>/` set, which would let toybox build `killall`,
   `vmstat`, `who`, `netcat` and `wget`.

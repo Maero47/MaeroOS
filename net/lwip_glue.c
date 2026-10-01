@@ -215,7 +215,8 @@ int net_lwip_ipv4(char *buf, uint32_t cap) {
 int net_lwip_addr_is_local(uint32_t addr) {
     ip4_addr_t a;
     ip4_addr_set_u32(&a, addr);
-    if (ip4_addr_isany_val(a) || ip4_addr1(&a) == 127)
+    if (ip4_addr_isany_val(a) || ip4_addr1(&a) == 127 ||
+        ip4_addr_ismulticast(&a) || addr == 0xFFFFFFFFu)
         return 1;
     return lwip_ready && ip4_addr_eq(&a, netif_ip4_addr(&lwip_eth0));
 }
