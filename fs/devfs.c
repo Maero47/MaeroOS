@@ -66,6 +66,7 @@ static uint32_t zero_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *bu
 #define TCSETSW         0x5403
 #define TCSETSF         0x5404
 #define TIOCGWINSZ      0x5413
+#define TIOCSWINSZ      0x5414
 #define TIOCGPGRP       0x540F   /* Linux asm-generic/ioctls.h numbers */
 #define TIOCSPGRP       0x5410
 #define TIOCSCTTY       0x540E
@@ -483,6 +484,7 @@ typedef struct {
     tty_termios_t termios;
     int sid;
     int fg_pgrp;
+    uint16_t ws_row, ws_col;     /* TIOCSWINSZ; 0 = never set (25x80) */
     vfs_node_t master;
     vfs_node_t slave;
 } pty_pair_t;
@@ -784,10 +786,22 @@ static int pty_ioctl(vfs_node_t *n, uint32_t req, void *arg) {
     if (req == TIOCGWINSZ) {
         uint16_t *ws = (uint16_t *)arg;
         if (!ws) return -14;
-        ws[0] = 25;
-        ws[1] = 80;
+        ws[0] = p->ws_row ? p->ws_row : 25;
+        ws[1] = p->ws_col ? p->ws_col : 80;
         ws[2] = 0;
         ws[3] = 0;
+        return 0;
+    }
+    /* The GUI terminal sizes its grid to the window; full-screen programs
+     * (vi, less) learn it here and from SIGWINCH. */
+    if (req == TIOCSWINSZ) {
+        const uint16_t *ws = (const uint16_t *)arg;
+        if (!ws) return -14;
+        if (ws[0] != p->ws_row || ws[1] != p->ws_col) {
+            p->ws_row = ws[0];
+            p->ws_col = ws[1];
+            if (p->fg_pgrp) signal_send_pgrp(p->fg_pgrp, 28 /* SIGWINCH */);
+        }
         return 0;
     }
     if (req == TIOCGPGRP) {

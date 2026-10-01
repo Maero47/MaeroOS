@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <gui.h>
 #include <linux/input.h>
 #include <stdarg.h>
@@ -321,6 +322,14 @@ void gui_set_key_handler(gui_window_t *gui, gui_key_cb callback) {
     gui->on_key = callback;
 }
 
+void gui_set_mouse_handler(gui_window_t *gui, gui_mouse_cb callback) {
+    if (gui) gui->on_mouse = callback;
+}
+
+void gui_grab_escape(gui_window_t *gui) {
+    if (gui) wm_command(&gui->wm, "grabesc %d", gui->slot);
+}
+
 void gui_set_click_handler(gui_window_t *gui, gui_click_cb callback) {
     if (!gui) return;
     gui->on_click = callback;
@@ -471,6 +480,10 @@ static void handle_mouse(gui_window_t *gui, const wm_event_t *event) {
     int motion = event->button && gui->mouse_down;
 
     gui->mouse_down = event->button ? 1 : 0;
+    if (gui->on_mouse) {
+        gui->on_mouse(gui, x, y, event->button);
+        return;
+    }
 
     if (!event->button) {              /* release ends any drag */
         gui->drag_id = 0;
@@ -569,10 +582,59 @@ static void handle_scroll(gui_window_t *gui, const wm_event_t *event) {
     }
 }
 
+#define CLIPBOARD_PATH "/tmp/clipboard"
+
+int gui_clipboard_set(gui_window_t *gui, const char *text, int len) {
+    int fd, n;
+
+    if (!text || len < 0) return -1;
+    /* Write a sibling file and rename it in, so a reader never sees half. */
+    fd = open(CLIPBOARD_PATH ".new", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) return -1;
+    n = len ? (int)write(fd, text, (size_t)len) : 0;
+    close(fd);
+    if (n != len || rename(CLIPBOARD_PATH ".new", CLIPBOARD_PATH) < 0) {
+        unlink(CLIPBOARD_PATH ".new");
+        return -1;
+    }
+    if (gui) wm_command(&gui->wm, "clip %d bytes", len);
+    return 0;
+}
+
+int gui_clipboard_get(char *buf, int max) {
+    int fd, total = 0, n;
+
+    if (!buf || max <= 0) return 0;
+    buf[0] = 0;
+    fd = open(CLIPBOARD_PATH, O_RDONLY);
+    if (fd < 0) return 0;
+    while (total < max - 1 &&
+           (n = (int)read(fd, buf + total, (size_t)(max - 1 - total))) > 0)
+        total += n;
+    close(fd);
+    buf[total] = 0;
+    return total;
+}
+
+/* Append a code point to a text input as UTF-8 (if it fits). */
+static int input_append(gui_widget_t *w, unsigned cp) {
+    char u[4];
+    int n;
+
+    if (cp < 32 || cp == 127) return 0;
+    n = draw_utf8_encode(cp, u);
+    if (w->input_len + n >= (int)sizeof(w->input)) return 0;
+    memcpy(w->input + w->input_len, u, (size_t)n);
+    w->input_len += n;
+    w->input[w->input_len] = 0;
+    return 1;
+}
+
 static void handle_key(gui_window_t *gui, const wm_event_t *event) {
     gui_widget_t *w;
 
     if (event->value != 1) return;        /* presses only */
+    gui->key_mods = event->mods;
     if (gui->on_key) {
         gui->on_key(gui, event->code, event->value, event->ascii);
         return;
@@ -583,7 +645,11 @@ static void handle_key(gui_window_t *gui, const wm_event_t *event) {
 
     if (event->code == KEY_BACKSPACE) {
         if (w->input_len) {
-            w->input[--w->input_len] = 0;
+            /* Drop a whole UTF-8 sequence, not one byte of it. */
+            do w->input_len--;
+            while (w->input_len &&
+                   ((unsigned char)w->input[w->input_len] & 0xC0) == 0x80);
+            w->input[w->input_len] = 0;
             gui_draw(gui);
         }
         return;
@@ -592,12 +658,16 @@ static void handle_key(gui_window_t *gui, const wm_event_t *event) {
         if (w->callback) w->callback(gui, w->id);
         return;
     }
-    if (event->ascii >= 32 && event->ascii < 127 &&
-        w->input_len + 1 < (int)sizeof(w->input)) {
-        w->input[w->input_len++] = (char)event->ascii;
-        w->input[w->input_len] = 0;
+    if (event->ascii == 22) {             /* Ctrl+V: paste the first line */
+        char clip[GUI_INPUT_MAX];
+        const char *p = clip;
+        gui_clipboard_get(clip, sizeof(clip));
+        while (*p && *p != '\n') input_append(w, draw_utf8_next(&p));
         gui_draw(gui);
+        return;
     }
+    if (event->ascii >= 32 && input_append(w, (unsigned)event->ascii))
+        gui_draw(gui);
 }
 
 int gui_poll(gui_window_t *gui) {

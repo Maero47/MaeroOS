@@ -174,7 +174,16 @@ static int ctrl_down;
 static int caps_on;
 static int super_down;           /* either Super/Windows key held (Mod4) */
 static int num_on;               /* Num Lock latched (Mod2) */
+static int altgr_down;           /* right Alt: third level on the TR layout */
+/* Clients that asked for Escape ("grabesc"): terminals and editors need the
+ * key itself, so Esc does not close their window. */
+static int client_grab_esc[MAX_CLIENT_WINDOWS];
 static int running = 1;
+/* desktop.conf: keyboard layout, time zone and clock format. */
+enum { KEYMAP_US = 0, KEYMAP_TR = 1 };
+static int conf_keymap = KEYMAP_US;
+static int conf_tz_min;          /* local time = UTC + this many minutes */
+static int conf_clock24 = 1;     /* 0 = 12-hour clock with AM/PM */
 
 static const char *preferred_shell_path(void) {
     return access("/disk/shell", X_OK) == 0 ? "/disk/shell" : "/shell";
@@ -271,6 +280,25 @@ static void copy_text(char *dst, unsigned size, const char *src);
 static void focus_client_app(int idx);
 static void load_desktop_conf(void);
 static void load_wallpaper(void);
+/* Wall-clock time in the configured zone (desktop.conf tz=). */
+static int local_timeofday(struct timeval *tv) {
+    if (gettimeofday(tv, 0) != 0) return -1;
+    tv->tv_sec += (long)conf_tz_min * 60;
+    return 0;
+}
+
+/* Taskbar clock text: "14:05" or "2:05 PM" in the configured zone. */
+static void format_clock(char *out) {
+    long t = (clock_secs < 0 ? 0 : clock_secs) + (long)conf_tz_min * 60;
+    int s = (int)(((t % 86400) + 86400) % 86400);
+    int hh = s / 3600, mm = (s / 60) % 60;
+    if (conf_clock24)
+        sprintf(out, "%02d:%02d", hh, mm);
+    else
+        sprintf(out, "%d:%02d %s", hh % 12 ? hh % 12 : 12, mm,
+                hh < 12 ? "AM" : "PM");
+}
+
 static void civil_from_days(long z, int *yy, unsigned *mm, unsigned *dd);
 static void note_save(void);
 static int in_note(int x, int y);
@@ -1478,6 +1506,7 @@ static void drop_app_window(int idx) {
     desktop_window_t *win = find_window(WIN_CLIENT_BASE + idx);
 
     forget_client_rawkeys(idx);
+    client_grab_esc[idx] = 0;
     if (win && win->visible) win->visible = 0;
     drop_client_pixels(idx);   /* release its shared surface */
     if (active_window == WIN_CLIENT_BASE + idx)
@@ -2113,7 +2142,30 @@ static void handle_wmctl_line(char *line) {
         load_wallpaper();
         make_wallpaper_blur();
         add_log("CONF RELOADED");
-        trace("conf reloaded accent=#%06x", (unsigned)(col_accent & 0xffffff));
+        {
+            char now[16];
+            struct timeval tv;
+            if (gettimeofday(&tv, 0) == 0) clock_secs = (int)tv.tv_sec;
+            format_clock(now);
+            trace("conf reloaded accent=#%06x keymap=%s tz=%d clock=%d "
+                  "now=%s", (unsigned)(col_accent & 0xffffff),
+                  conf_keymap == KEYMAP_TR ? "tr" : "us", conf_tz_min,
+                  conf_clock24 ? 24 : 12, now);
+        }
+        return;
+    }
+    /* An app put something on the shared clipboard (/tmp/clipboard, see
+     * gui_clipboard_set); the desktop only records it. */
+    arg = command_arg(line, "grabesc");
+    if (arg) {
+        int slot = atoi(arg);
+        if (slot >= 1 && slot <= MAX_CLIENT_WINDOWS)
+            client_grab_esc[slot - 1] = 1;
+        return;
+    }
+    arg = command_arg(line, "clip");
+    if (arg) {
+        trace("clipboard %s", arg);
         return;
     }
     arg = command_arg(line, "status");
@@ -2388,12 +2440,17 @@ static void emit_client_mouse_event(int x, int y, int button) {
     emit_wm_event("mouse %d %d %d %d", slot, x - win->x, y - win->y, button);
 }
 
-static void emit_client_key_event(uint16_t code, int value, char ch) {
+/* "key <slot> <code> <value> <char> <mods>": char is the Unicode code point
+ * the layout gives the key (Ctrl already folded into control bytes), mods
+ * the WM_MOD_* mask so apps can tell Ctrl+Shift+C from Ctrl+C. */
+static int current_mods(void);
+static void emit_client_key_event(uint16_t code, int value, unsigned cp) {
     int slot;
 
     if (!is_client_window(active_window)) return;
     slot = client_index_for_window(active_window) + 1;
-    emit_wm_event("key %d %d %d %d", slot, (int)code, value, (int)ch);
+    emit_wm_event5("key %d %d %d %d %d", slot, (int)code, value, (int)cp,
+                   current_mods());
 }
 
 /* The uncooked key stream.  "key" above is cooked for text widgets: presses
@@ -2851,7 +2908,7 @@ static void draw_calendar_on_row(unsigned y) {
 
     if (!cal_open) return;
     if ((int)y < cy - SHADOW_R || (int)y >= cy + CAL_H + SHADOW_R) return;
-    if (gettimeofday(&tv, 0) != 0) return;
+    if (local_timeofday(&tv) != 0) return;
     days = tv.tv_sec / 86400;
     civil_from_days(days, &yy, &mm, &dd);
     {
@@ -3439,7 +3496,8 @@ static void end_window_drag(void) {
     drag_win_id = -1;
 }
 
-static char key_to_char(uint16_t key) {
+/* The US layout: the key's ASCII character (0 for keys without one). */
+static char us_char(uint16_t key, int shift) {
     static const char normal[] = {
         [KEY_1] = '1', [KEY_2] = '2', [KEY_3] = '3', [KEY_4] = '4',
         [KEY_5] = '5', [KEY_6] = '6', [KEY_7] = '7', [KEY_8] = '8',
@@ -3453,7 +3511,8 @@ static char key_to_char(uint16_t key) {
         [KEY_N] = 'n', [KEY_M] = 'm', [KEY_SPACE] = ' ',
         [KEY_COMMA] = ',', [KEY_DOT] = '.', [KEY_SLASH] = '/',
         [KEY_SEMICOLON] = ';', [KEY_APOSTROPHE] = '\'', [KEY_LEFTBRACE] = '[',
-        [KEY_RIGHTBRACE] = ']', [KEY_BACKSLASH] = '\\', [KEY_GRAVE] = '`'
+        [KEY_RIGHTBRACE] = ']', [KEY_BACKSLASH] = '\\', [KEY_GRAVE] = '`',
+        [KEY_102ND] = '\\',
     };
     static const char shifted[] = {
         [KEY_1] = '!', [KEY_2] = '@', [KEY_3] = '#', [KEY_4] = '$',
@@ -3461,13 +3520,87 @@ static char key_to_char(uint16_t key) {
         [KEY_9] = '(', [KEY_0] = ')', [KEY_MINUS] = '_', [KEY_EQUAL] = '+',
         [KEY_COMMA] = '<', [KEY_DOT] = '>', [KEY_SLASH] = '?',
         [KEY_SEMICOLON] = ':', [KEY_APOSTROPHE] = '"', [KEY_LEFTBRACE] = '{',
-        [KEY_RIGHTBRACE] = '}', [KEY_BACKSLASH] = '|', [KEY_GRAVE] = '~'
+        [KEY_RIGHTBRACE] = '}', [KEY_BACKSLASH] = '|', [KEY_GRAVE] = '~',
+        [KEY_102ND] = '|',
     };
     char c = 0;
     if (key < sizeof(normal)) c = normal[key];
-    if (shift_down && key < sizeof(shifted) && shifted[key]) c = shifted[key];
-    if (c >= 'a' && c <= 'z' && (shift_down ^ caps_on)) c -= 32;
+    if (shift && key < sizeof(shifted) && shifted[key]) c = shifted[key];
     return c;
+}
+
+/* Turkish Q: the keys that differ from US, as Unicode code points
+ * (normal, shifted, AltGr).  Letters follow Caps Lock; i/ı pair with İ/I. */
+static const struct { uint16_t key; unsigned n, s, g; } tr_keys[] = {
+    { KEY_1, '1', '!', '>' },        { KEY_2, '2', '\'', 0xA3 },
+    { KEY_3, '3', '^', '#' },        { KEY_4, '4', '+', '$' },
+    { KEY_5, '5', '%', 0xBD },       { KEY_6, '6', '&', 0 },
+    { KEY_7, '7', '/', '{' },        { KEY_8, '8', '(', '[' },
+    { KEY_9, '9', ')', ']' },        { KEY_0, '0', '=', '}' },
+    { KEY_MINUS, '*', '?', '\\' },   { KEY_EQUAL, '-', '_', '|' },
+    { KEY_Q, 'q', 'Q', '@' },        { KEY_E, 'e', 'E', 0x20AC },
+    { KEY_I, 0x131, 'I', 'i' },      { KEY_APOSTROPHE, 'i', 0x130, 0 },
+    { KEY_LEFTBRACE, 0x11F, 0x11E, 0 }, { KEY_RIGHTBRACE, 0xFC, 0xDC, '~' },
+    { KEY_SEMICOLON, 0x15F, 0x15E, 0 }, { KEY_COMMA, 0xF6, 0xD6, 0 },
+    { KEY_DOT, 0xE7, 0xC7, 0 },      { KEY_SLASH, '.', ':', 0 },
+    { KEY_BACKSLASH, ',', ';', '`' }, { KEY_GRAVE, '"', 0xE9, '<' },
+    { KEY_102ND, '<', '>', '|' },
+};
+
+/* Upper/lower case pairs the shifted column does not give by itself. */
+static unsigned tr_toggle_case(unsigned cp) {
+    switch (cp) {
+    case 0x131: return 'I';
+    case 'i':   return 0x130;
+    case 0x11F: return 0x11E;
+    case 0xFC:  return 0xDC;
+    case 0x15F: return 0x15E;
+    case 0xF6:  return 0xD6;
+    case 0xE7:  return 0xC7;
+    }
+    return cp;
+}
+
+/* The character a key types under the configured layout, as a Unicode code
+ * point (0 = none).  Clients get it in the "key" event; text widgets store it
+ * as UTF-8. */
+static unsigned key_to_cp(uint16_t key) {
+    if (conf_keymap == KEYMAP_TR) {
+        for (unsigned i = 0; i < sizeof(tr_keys) / sizeof(tr_keys[0]); i++) {
+            unsigned cp;
+            if (tr_keys[i].key != key) continue;
+            if (altgr_down) return tr_keys[i].g;
+            cp = shift_down ? tr_keys[i].s : tr_keys[i].n;
+            /* Caps Lock flips the case of letters (and only letters). */
+            if (caps_on && (tr_keys[i].n >= 0x80 || tr_keys[i].n == 'i' ||
+                            (tr_keys[i].n >= 'a' && tr_keys[i].n <= 'z'))) {
+                unsigned n = tr_keys[i].n;
+                unsigned up = n >= 'a' && n <= 'z' && n != 'i' ? n - 32
+                                                               : tr_toggle_case(n);
+                cp = shift_down ? n : up;
+            }
+            return cp;
+        }
+    }
+    {
+        char c = us_char(key, shift_down);
+        if (c >= 'a' && c <= 'z' && caps_on) c -= 32;
+        else if (c >= 'A' && c <= 'Z' && caps_on) c += 32;
+        return (unsigned char)c;
+    }
+}
+
+/* ASCII-only view for the desktop's own fields (search box, sticky note). */
+static char key_to_char(uint16_t key) {
+    unsigned cp = key_to_cp(key);
+    return cp < 0x80 ? (char)cp : 0;
+}
+
+/* Ctrl+letter by key position (the US letter), whatever the layout. */
+static char ctrl_char(uint16_t key) {
+    char c = us_char(key, 0);
+    if (c >= 'a' && c <= 'z') return (char)(c - 'a' + 1);
+    return 0;
 }
 
 /* Alt-Tab: focus the next visible, non-minimized window after the active. */
@@ -3506,6 +3639,12 @@ static int current_mods(void) {
            (super_down  ? WM_MOD_SUPER : 0);
 }
 
+static int active_grabs_esc(void) {
+    int idx = client_index_for_window(active_window);
+    return is_client_window(active_window) && idx >= 0 &&
+           idx < MAX_CLIENT_WINDOWS && client_grab_esc[idx];
+}
+
 static void handle_key(uint16_t code, int value) {
     char out;
 
@@ -3517,7 +3656,8 @@ static void handle_key(uint16_t code, int value) {
      * rule in emit_client_rawkey_event(), which is why the test is on the press
      * only.  A release always goes to whoever received its press. */
     if (!value ||
-        (!note_focus && !launcher_open && code != KEY_ESC &&
+        (!note_focus && !launcher_open &&
+         (code != KEY_ESC || active_grabs_esc()) &&
          !(alt_down && code == KEY_TAB)))
         emit_client_rawkey_event(code, value, current_mods());
 
@@ -3531,6 +3671,7 @@ static void handle_key(uint16_t code, int value) {
     }
     if (code == KEY_LEFTALT || code == KEY_RIGHTALT) {
         alt_down = value != 0;
+        if (code == KEY_RIGHTALT) altgr_down = value != 0;
         return;
     }
     if (code == KEY_LEFTMETA || code == KEY_RIGHTMETA) {
@@ -3603,7 +3744,7 @@ static void handle_key(uint16_t code, int value) {
         }
         return;
     }
-    if (code == KEY_ESC) {
+    if (code == KEY_ESC && !active_grabs_esc()) {
         if (is_client_window(active_window)) {
             int idx = client_index_for_window(active_window);
             hide_client_app(idx);
@@ -3611,13 +3752,10 @@ static void handle_key(uint16_t code, int value) {
         return;
     }
     if (is_client_window(active_window)) {
-        char ch = key_to_char(code);
+        unsigned cp = key_to_cp(code);
         /* Apply Ctrl here: clients receive ready-to-use control bytes. */
-        if (ctrl_down) {
-            if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 1);
-            else if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 1);
-        }
-        emit_client_key_event(code, value, ch);
+        if (ctrl_down && ctrl_char(code)) cp = (unsigned char)ctrl_char(code);
+        emit_client_key_event(code, value, cp);
         return;
     }
     if (active_window != WIN_TERMINAL) return;
@@ -3631,14 +3769,27 @@ static void handle_key(uint16_t code, int value) {
     if (code == KEY_ENTER)          out = '\n';
     else if (code == KEY_BACKSPACE) out = 127;
     else if (code == KEY_TAB)       out = '\t';
-    else {
-        out = key_to_char(code);
+    else if (ctrl_down) {
+        out = ctrl_char(code);
         if (!out) return;
-        if (ctrl_down) {
-            if (out >= 'a' && out <= 'z') out = (char)(out - 'a' + 1);
-            else if (out >= 'A' && out <= 'Z') out = (char)(out - 'A' + 1);
-            else return;
+    } else {
+        unsigned cp = key_to_cp(code);
+        char u[4];
+        int n = 0;
+        if (!cp) return;
+        /* UTF-8 for the layout's non-ASCII letters. */
+        if (cp < 0x80) u[n++] = (char)cp;
+        else if (cp < 0x800) {
+            u[n++] = (char)(0xC0 | (cp >> 6));
+            u[n++] = (char)(0x80 | (cp & 0x3F));
+        } else {
+            u[n++] = (char)(0xE0 | (cp >> 12));
+            u[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            u[n++] = (char)(0x80 | (cp & 0x3F));
         }
+        term_view = 0;
+        write(shell_fd, u, (size_t)n);
+        return;
     }
     term_view = 0;   /* typing snaps the scrollback to the bottom */
     write(shell_fd, &out, 1);
@@ -4169,7 +4320,7 @@ static void draw_gadgets_on_row(unsigned y) {
             /* hands from RTC time */
             {
                 struct timeval tv;
-                if (gettimeofday(&tv, 0) == 0) {
+                if (local_timeofday(&tv) == 0) {
                     int secs = (int)(tv.tv_sec % 86400);
                     int hh = (secs / 3600) % 12, mm = (secs / 60) % 60;
                     int hm = hh * 5 + mm / 12;        /* hour hand pos */
@@ -4229,7 +4380,7 @@ static void draw_gadgets_on_row(unsigned y) {
             {
                 struct timeval tv;
                 char buf[16];
-                if (gettimeofday(&tv, 0) == 0) {
+                if (local_timeofday(&tv) == 0) {
                     int yy;
                     unsigned mm, dd;
                     civil_from_days(tv.tv_sec / 86400, &yy, &mm, &dd);
@@ -4364,7 +4515,7 @@ static void draw_taskbar_on_row(unsigned y, const char *clock_text) {
         {
             char datebuf[20];
             struct timeval tv;
-            if (gettimeofday(&tv, 0) == 0) {
+            if (local_timeofday(&tv) == 0) {
                 int yy;
                 unsigned mm, dd;
                 civil_from_days(tv.tv_sec / 86400, &yy, &mm, &dd);
@@ -4522,6 +4673,9 @@ static void load_desktop_conf(void) {
     char buf[512];
     int n;
 
+    conf_keymap = KEYMAP_US;
+    conf_tz_min = 0;
+    conf_clock24 = 1;
     if (fd < 0) return;
     n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
@@ -4530,7 +4684,24 @@ static void load_desktop_conf(void) {
     for (char *line = buf; line && *line; ) {
         char *nl = strchr(line, '\n');
         if (nl) *nl = 0;
-        if (!strncmp(line, "wallpaper=", 10)) {
+        if (!strncmp(line, "keymap=", 7)) {
+            conf_keymap = !strcmp(line + 7, "tr") ? KEYMAP_TR : KEYMAP_US;
+        } else if (!strncmp(line, "tz=", 3)) {
+            /* tz=+03:00 / tz=-05:30 / tz=UTC: offset from UTC. */
+            const char *t = line + 3;
+            int sign = 1, hh = 0, mm = 0;
+            if (!strncmp(t, "UTC", 3)) t += 3;
+            if (*t == '-') { sign = -1; t++; }
+            else if (*t == '+') t++;
+            while (*t >= '0' && *t <= '9') hh = hh * 10 + (*t++ - '0');
+            if (*t == ':') {
+                t++;
+                while (*t >= '0' && *t <= '9') mm = mm * 10 + (*t++ - '0');
+            }
+            if (hh <= 14 && mm < 60) conf_tz_min = sign * (hh * 60 + mm);
+        } else if (!strncmp(line, "clock=", 6)) {
+            conf_clock24 = strcmp(line + 6, "12") != 0;
+        } else if (!strncmp(line, "wallpaper=", 10)) {
             strncpy(conf_wallpaper, line + 10, sizeof(conf_wallpaper) - 1);
             conf_wallpaper[sizeof(conf_wallpaper) - 1] = 0;
         } else if (!strncmp(line, "accent=#", 8)) {
@@ -4755,8 +4926,7 @@ static int render(void) {
 
     {
         /* Wall-clock time of day (gettimeofday is RTC-anchored now). */
-        int s = clock_secs < 0 ? 0 : clock_secs % 86400;
-        sprintf(clock_text, "%02d:%02d", s / 3600, (s / 60) % 60);
+        format_clock(clock_text);
     }
 
     update_cursor_shape();
