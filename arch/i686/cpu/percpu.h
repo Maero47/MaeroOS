@@ -34,8 +34,9 @@ struct cpu {
     uint64_t run_t0;
     /* A syscall on this CPU woke threads that no idle CPU took (sync wake):
      * wake_vr is the largest vruntime among them (0: none), and the syscall
-     * exit queues the waker behind them.  in_irq: nesting of hardware
-     * interrupt handlers, whose wakes are not the running thread's own. */
+     * exit queues the waker behind them.  in_irq: set while a hardware
+     * interrupt handler runs (its wakes are not the running thread's own);
+     * cleared before the IRQ's signal delivery and at every dispatch. */
     uint64_t wake_vr;
     int in_irq;
 };

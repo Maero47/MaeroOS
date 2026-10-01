@@ -212,6 +212,9 @@ void scheduler_init(void) {
 
 /* Time the CPUs spent halted with nothing to run, in us (/proc/cputime). */
 uint32_t sched_idle_us;
+/* Sync hand-offs taken at syscall exit (/proc/cputime "handoffs"): lets a
+ * test see that futex wakes still yield to the woken thread. */
+uint32_t sched_handoffs;
 static uint32_t sched_idle_ns_rem;
 
 /* Add an interval to a us counter, carrying the sub-us part.  32-bit only:
@@ -230,6 +233,7 @@ void scheduler_start(void) {
         uint64_t scan_t0 = kprof_probe_begin();
         me->need_resched = 0;
         me->wake_vr = 0;        /* a kthread's sync wake owes no one a yield */
+        me->in_irq = 0;         /* no handler is in progress between threads */
         struct proc *p = sched_pick();
 
         if (p) {
@@ -583,6 +587,7 @@ void resched_on_return(void) {
         if (d > SCHED_SLICE_NS) d = SCHED_SLICE_NS;   /* the skip does the rest */
         current_proc->vruntime += d;
         me->need_resched = 0;
+        sched_handoffs++;
         kprof_count(KPE_RESCHED);
         yield();
         return;

@@ -4,6 +4,8 @@
 Boots kernel.elf + initrd.tar (KVM when /dev/kvm is usable, else TCG), logs
 in on the serial console and runs testfiles/schedlat:
 
+  handoff        (one CPU) futex wakes still hand the CPU to the woken
+                 thread after a spinning thread is SIGKILLed
   pipe / futex   thread A wakes thread B (pipe write / FUTEX_WAKE) while
                  HOGS busy-looping processes run; rdtsc wake-to-run latency
   audio          a producer sends a buffer every 10 ms through a pipe to a
@@ -39,6 +41,7 @@ def commands(smp, iters):
         "/schedlat audio %d %d" % (hogs, iters),
         "/schedlat audio %d %d" % (hogs * 2, iters),
         "/schedlat nice",
+    ] + (["/schedlat handoff"] if smp == 1 else []) + [
     ] + ["/schedlat time " + w for w in ("shloop", "forks", "targz", "par4")
          for _ in range(3)]
 

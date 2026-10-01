@@ -5,6 +5,12 @@
  *   schedlat futex HOGS N   thread A FUTEX_WAKEs, thread B blocked in FUTEX_WAIT
  *   schedlat nice            two hogs, one at nice 10, for 2 s: their CPU
  *                           shares (1 CPU: ~9:1 under Linux's weights)
+ *   schedlat handoff         SIGKILL a thread spinning in user mode (it dies on
+ *                           an IRQ's way out), then check that futex wakes
+ *                           still hand the CPU to the woken thread: the
+ *                           "handoffs" count in /proc/cputime must keep rising
+ *                           (boot with one CPU: an idle CPU takes a wakee
+ *                           without a hand-off)
  *   schedlat time WORKLOAD   runs a busybox sh workload, prints its wall time:
  *                           shloop (arithmetic loop), forks (200 fork+exec),
  *                           targz (tar|gzip of /lib /bin /usr), par4 (4 shloops)
@@ -216,7 +222,62 @@ static int run_nice(void) {
     return 0;
 }
 
+static unsigned long read_handoffs(void) {
+    char buf[256];
+    FILE *f = fopen("/proc/cputime", "r");
+    unsigned long v = 0;
+    if (!f) return 0;
+    while (fgets(buf, sizeof(buf), f))
+        if (!strncmp(buf, "handoffs ", 9)) v = strtoul(buf + 9, NULL, 10);
+    fclose(f);
+    return v;
+}
+
+static volatile int ack_word;
+
+static void *handoff_waiter(void *arg) {
+    (void)arg;
+    for (int i = 0; i < iters; i++) {
+        while (futex_word == 0) futex(&futex_word, FUTEX_WAIT_PRIVATE, 0);
+        futex_word = 0;
+        ack_word = 1;
+        futex(&ack_word, FUTEX_WAKE_PRIVATE, 1);
+    }
+    return NULL;
+}
+
+static unsigned long handoff_round(void) {
+    unsigned long h0 = read_handoffs();
+    pthread_t th;
+    pthread_create(&th, NULL, handoff_waiter, NULL);
+    for (int i = 0; i < iters; i++) {
+        sleep_us(500);                    /* let the waiter block again */
+        futex_word = 1;
+        futex(&futex_word, FUTEX_WAKE_PRIVATE, 1);
+        while (ack_word == 0) futex(&ack_word, FUTEX_WAIT_PRIVATE, 0);
+        ack_word = 0;
+    }
+    pthread_join(th, NULL);
+    return read_handoffs() - h0;
+}
+
+static int run_handoff(void) {
+    iters = 50;
+    unsigned long before = handoff_round();
+    pid_t pid = fork();
+    if (pid == 0) { volatile uint32_t x = 0; for (;;) x++; }
+    sleep_us(100000);                     /* the spinner is mid-slice in user mode */
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+    unsigned long after = handoff_round();
+    int ok = before >= (unsigned long)iters / 2 && after >= (unsigned long)iters / 2;
+    printf("schedlat handoff: before-kill=%lu after-kill=%lu (of %d wakes) %s\n",
+           before, after, iters, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "handoff")) return run_handoff();
     if (argc > 2 && !strcmp(argv[1], "time")) return run_time(argv[2]);
     if (argc > 1 && !strcmp(argv[1], "nice")) return run_nice();
     if (argc < 2) {
