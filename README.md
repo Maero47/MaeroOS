@@ -16,12 +16,15 @@ desktop application and reporting `0 clients, DISPLAY=:0`.
 ## Why it is unusual
 
 - The kernel implements the **Linux i386 syscall table**, not a bespoke one.
-  `proc/syscall.c` dispatches 225 Linux syscall numbers, so software built with an
-  ordinary `i686-linux-musl` or `i686-linux-gnu` toolchain runs without patching.
+  `proc/syscall.c` dispatches 249 Linux syscall numbers (five more, inotify and `rseq`,
+  deliberately answer `ENOSYS`), so software built with an ordinary `i686-linux-musl` or
+  `i686-linux-gnu` toolchain runs without patching.
 - **Dynamic linking works.** The real musl `ld-musl-i386.so.1` loads PIEs and external
   shared objects, which is what makes prebuilt Linux packages usable at all.
 - **SMP.** Application processors are booted through a real-mode trampoline and run
   threads under a recursive Big Kernel Lock with IPI-based TLB shootdown.
+- **PAE paging with NX** on a 32-bit kernel: 64-bit page-table entries, execute
+  protection (W^X) for user and kernel pages, and user pages in RAM above 4 GiB.
 - **The X11 wire protocol.** `maeroX` is a native MaeroOS GUI application that acts as
   an X server on `/tmp/.X11-unix/X0`, including enough of the RENDER extension for Cairo
   to composite and for text to arrive as glyphs. The genuine libX11, libxcb, Cairo, Pango
@@ -33,15 +36,15 @@ What is proven by the automated QEMU tests in `tools/`:
 
 | Area | Proof | Target |
 |---|---|---|
-| Boot, shell, procfs, PTYs, threads, shm, AF_UNIX, RNG, bad user pointers | `ls`, `cat`, `sysprobe ok`, `shmprobe ok`, `unixprobe ok` (stream, datagram and seqpacket sockets), `threadprobe ok`, `ptytest ok`, `cttytest ok`, `memprobe ok`, `wxprobe ok` (read-only text/rodata/mprotect'ed pages refuse writes, also after fork), `/proc/self/status` | `make smoke` |
+| Boot, shell, procfs, PTYs, threads, shm, AF_UNIX, RNG, bad user pointers | `ls`, `cat`, `sysprobe ok`, `shmprobe ok`, `unixprobe ok` (stream, datagram and seqpacket sockets), `threadprobe ok`, `ptytest ok`, `cttytest ok`, `memprobe ok`, `wxprobe ok` (read-only text/rodata/mprotect'ed pages refuse writes, also after fork; with NX, code on the stack, the brk heap and an anonymous RW mapping dies of `SIGSEGV` until `mprotect(PROT_EXEC)`, and a JIT buffer flipped RW→RX runs), `/proc/self/status` | `make smoke` |
 | toybox 0.8.13, syscall edge cases, signals, timers, libc, job control, `pkg` archive checks | `TOYBOX_OK` plus about 90 applet checks, `sysmiscprobe ok`, `abi2probe ok` (open modes, `O_APPEND`, groups, `access`), `sigexecprobe ok`, `sigshareprobe ok` (process-wide pending signals, group stop), `timerprobe ok` (`alarm`, `setitimer`, `timer_*`), `LIBCTEST PASS`, `^Z`/`jobs`/`fg` on a pipeline, `pkg` refusing `../etc`, and the host-side `tools/test_pkg_tarx.py`, `tools/test_pkg_sign.py` and `tools/test_regex.py` | `make smoke-toybox` |
 | Native coreutils-style commands, user faults | `kwprobe ok` (a user write to kernel memory dies of SIGSEGV, a user `int3` of SIGTRAP), then `uname`, `whoami`, `hostname`, `free`, `df`, `uptime`, `which` | `make smoke-cmds` |
 | ext2 disk, symlinks, login/passwd/doas, permissions, init services, sessions | 169 checks including `passwd` keeping `/etc/shadow` root-only 0600, `login` dropping to `uid=1000`, `doas` ignoring a planted `./ls`, `credprobe ok`, `fsprobe ok`, `symprobe ok` (ext2 symlinks, checked on the image with `debugfs` too) and `svc` state transitions | `make smoke-disk` |
 | SATA AHCI disk (pc + `-device ahci`, then `-M q35`), no IDE disk | `/disk` mounted from `ahci0`, `diskprobe ok`, `fsprobe ok`, `symprobe ok`, a 3 MiB random file read and copied with matching md5 in the guest and on the host (`debugfs`), persistence across a reboot onto q35, `e2fsck -fn` showing no new damage, `reboot`/`poweroff` ending QEMU | `make smoke-ahci` |
 | NVMe disk (pc + `-device nvme`, then `-M q35` with MDTS=2 and two namespaces), no IDE/AHCI disk | `/disk` mounted from `nvme0`, both namespaces found, `diskprobe ok`, `fsprobe ok`, a 3 MiB random file read and copied with matching md5 in the guest and on the host, transfers using PRP lists and split at MDTS (driver counters at shutdown), persistence across a reboot, `e2fsck -fn` clean of new damage, `reboot`/`poweroff` ending QEMU | `make smoke-nvme` |
 | `mount`/`umount`, partitions, read-only ext4 | busybox `mount -t ext4 /dev/hdb2 /mnt` on a GPT disk (4 KiB blocks, `64bit`, `metadata_csum`, `huge_file`, `flex_bg`) and `/dev/hdc5` on an MBR logical partition (1 KiB blocks): md5 of every file equals the host's, including a 300 MiB sparse file and an unwritten extent; a 5020-entry and a 20000-entry (two-level) htree directory list and resolve completely; fast, slow, relative, absolute and directory symlinks; writes fail with `EROFS`; `umount` is refused while a cwd is inside; tmpfs `remount,ro`; non-root `mount` refused; afterwards both filesystems are byte-identical to their images and `e2fsck -fn` is clean; on q35 the same partitions are found and mounted from AHCI (`/dev/sdb2`) and NVMe (`/dev/nvme0n1p5`) | `make smoke-ext4` |
-| Read-write FAT12/16/32 (vfat), USB sticks | volumes made on the host with `mkfs.fat` and `mtools` (long and Turkish names, a 300-entry directory, a 5 MiB file): mounted read-write with busybox `mount -t vfat` from AHCI (`/dev/sdb1`, MBR), a QEMU `usb-storage` stick without a partition table (`/dev/sdd`, mounted without `-t`) and IDE (`/dev/hdb1`); every file's md5 matches; mkdir, create, a 5 MiB copy, a directory that grows to 150 long-name entries, append, write past the end, truncate, renames (across directories, a directory with contents, over an existing file, case-only), unlink, `rm -r`, rmdir; `df` accounting; a file unlinked while open; `ENOSPC` on a full FAT12 volume; `remount,ro`/`rw`; the stick unplugged while mounted and plugged back in; `poweroff` with the stick still mounted; afterwards `fsck.fat -n` is clean on every volume and `mtools` on the host sees exactly the guest's files and contents | `make smoke-vfat` |
-| Installing to a disk (`maeros-install`) | from the Limine live ISO on q35 with the live `disk.img` as `sda` and an empty 1 GiB `sdb`: `maeros-install -l` lists both and marks `sda` in use, installing over `sda` is refused, `maeros-install -y /dev/sdb` writes a GPT (BIOS boot, FAT32 ESP, ext2 root) and Limine; on the host `sgdisk -v`, `e2fsck -fn` and `fsck.fat -n` are clean; then the installed disk alone boots under SeaBIOS and OVMF x64: Limine passes `root=PARTUUID=...`, `/dev/sda3` is `/disk`, login and the desktop work, and a file written in the first boot is there in the second | `make smoke-install` |
+| Read-write FAT12/16/32 (vfat), USB sticks | volumes made on the host with `mkfs.fat` and `mtools` (long and Turkish names, a 300-entry directory, a 5 MiB file): mounted read-write with busybox `mount -t vfat` from AHCI (`/dev/sdb1`, MBR), a QEMU `usb-storage` stick without a partition table (`/dev/sdd`, mounted without `-t`) and IDE (`/dev/hdb1`); every file's md5 matches; mkdir, create, a 5 MiB copy, a directory that grows to 150 long-name entries, append, write past the end, truncate, renames (across directories, a directory with contents, over an existing file, case-only), unlink, `rm -r`, rmdir; `df` accounting; a file unlinked while open; `ENOSPC` on a full FAT12 volume; `remount,ro`/`rw`; the stick unplugged while mounted and plugged back in; raw writes to `/dev/sdd` and to `/dev/sdc` (whose partitions are mounted) refused with `EBUSY` and `maeros-install -l` marking the mounted stick in use; `poweroff` with the stick still mounted; afterwards `fsck.fat -n` is clean on every volume and `mtools` on the host sees exactly the guest's files and contents | `make smoke-vfat` |
+| Installing to a disk (`maeros-install`) | from the Limine live ISO on q35 with the live `disk.img` as `sda` and an empty 1 GiB `sdb`: `maeros-install -l` lists both and marks `sda` in use, installing over `sda` is refused, `maeros-install -y /dev/sdb` writes a GPT (BIOS boot, FAT32 ESP, ext2 root) and Limine; on the host `sgdisk -v`, `e2fsck -fn` and `fsck.fat -n` are clean; then the installed disk alone boots under SeaBIOS and OVMF x64: Limine passes `root=PARTUUID=...`, `/dev/sda3` is `/disk`, login and the desktop work, the ESP (`/dev/sda2`) mounts with the vfat driver and its `limine.conf` names the booted root, and a file written in the first boot is there in the second | `make smoke-install` |
 | `pkg` and the signed repo index | `tools/test_pkg_sign.py` runs the RFC 8032 vectors through the Python signer and the C verifier and rejects altered, unsigned and foreign-key indexes; in the guest, `pkg update` rejects unsigned, tampered and rolled-back indexes, installs and runs busybox, and `install` rejects a tarball whose SHA-256 does not match | `make smoke-pkg` |
 | TCP/IP over lwIP and RTL8139 | `MAEROS_HTTP_OK` fetched from a host HTTP server; `sockprobe` checks that `send` after `shutdown(SHUT_WR)` fails with `EPIPE`, a two-step shutdown ends in a FIN and no RST, closing TIME_WAIT sockets keeps TCP working, and a non-blocking client gets `EINPROGRESS`, `SO_ERROR`, `EAGAIN`, `ECONNREFUSED` and both socket names; `abi2probe net` checks `MSG_NOSIGNAL` and `EPIPE` after a reset | `make smoke-net` |
 | Intel e1000, DHCP DNS, name resolution | the same suite on an e1000; the DHCP lease's DNS server is in `/etc/resolv.conf`; against a DNS responder in the harness, `getent` resolves A, AAAA, a CNAME, a PTR and an NXDOMAIN, `/etc/hosts` wins over DNS, and `httpget`, `toybox wget` and `toybox nc` connect by name | `make smoke-net-e1000` |
@@ -56,6 +59,9 @@ What is proven by the automated QEMU tests in `tools/`:
 | Sound for Linux programs (ALSA ABI) | Alpine's unmodified `aplay` (alsa-utils 1.2.14) in the chroot plays a 44.1 kHz mono S16 WAV through alsa-lib's `default` device and 22.05 kHz U8 and 48 kHz float WAVs through `hw:0`, then `tone` plays through `/dev/dsp`; QEMU's wav capture holds each tone at its frequency (DFT peak and zero crossings), for its length, without dropouts; the same on AC'97 with `--ac97` (docs/audio.md; needs `disk-alpine.img`) | `make smoke-audio` |
 | ACPI (uACPI 6.1.0) | on QEMU's `pc` and `q35` machines the kernel finds the RSDP, loads the AML namespace (`[ACPI] ready`), `poweroff` ends QEMU through S5 (`\_PTS`, `\_S5`), `reboot` restarts it through the FADT reset register (q35) or 0xCF9 (pc, whose FADT has none), and the ACPI power button (`system_powerdown`) reaches init as SIGUSR2 and powers off | `make smoke-acpi` |
 | PC without legacy devices | `-M q35,i8042=off -smp 2` with an ICH9 HDA: no PS/2 controller (`[KBD]  no PS/2 controller`), `/disk` from `ahci0`, both CPUs from the MADT, the desktop's Terminal opened and typed into with a USB tablet and keyboard, and `doas poweroff` typed there makes QEMU exit through S5 | `make smoke-pc` |
+| USB input and storage (xHCI) | the desktop driven with only a `usb-kbd` and `usb-tablet` on a `qemu-xhci`: the Terminal opens and a `doas login root` typed on the USB keyboard reaches a root shell, tablet clicks land where sent, a held key repeats, a `usb-mouse` behind a `usb-hub` moves the pointer, and a `usb-storage` stick behind the hub is read and written through `/dev/usbdisk0` (checksummed against the image), unplugged and plugged back in | `make smoke-usb` |
+| UEFI and BIOS boot (Limine, Multiboot 2) | `maeros-limine.iso` under SeaBIOS, OVMF x64 and OVMF IA32: the kernel sees Multiboot 2 from Limine on the expected firmware with an ACPI RSDP tag, the framebuffer (VBE or GOP) comes from the boot info, login works, the desktop starts and a screendump is that size and not blank, and `poweroff` exits through S5 (a firmware that is not installed is reported as SKIP) | `make smoke-uefi` |
+| Linux ABI conformance | 44 musl-built probes (`ports/abiprobes/`), each printing the same `PASS` on Linux, covering findings of the Firefox audit plus later additions: `splice`, `flock`/`fcntl` record locks, `renameat2`, rtnetlink and `/proc/<pid>/fd` link permissions among them; any `FAIL`, missing verdict or wedge fails the run | `make smoke-abi` |
 | Firefox 115.15.0esr | `ff: Firefox painted` (the browser window, about 5 s after `firefox-bin` starts); with `--web`, a page served from the host (HTML, a CSS rule, a PNG) requested and its image on screen about 3 s after Enter (needs the Firefox tree, see `ports/firefox/`) | `make smoke-firefox`, `make smoke-firefox-web` |
 | Alpine Linux x86 userland (chroot) | Alpine 3.22 (apk-tools 2) and 3.24 (apk-tools 3) roots from pinned, signature-checked packages, run with `chroot /disk/alpine`: `bash -c 'echo ok'`, GNU `ls --version`, `python3 -c 'print(1+1)'`, `vim --version`, `git init/commit/log`, `ssh -V`, `less` on a pipe, `apk add tree` / `apk del tree` from an offline repo on the disk, `apk verify`, and no unimplemented syscall on the way; `--net` also installs from a host-served HTTP mirror (needs network on the build host the first time, see `ports/alpine/`) | `make smoke-alpine` |
 | Alpine networking and sshd (chroot) | In the Alpine chroot on an e1000: busybox `ip addr`/`ip route`/`ip link` (rtnetlink), `ifconfig` and `route -n` (SIOC* ioctls, `/proc/net/route`) show eth0's DHCP address and the default route; `udhcpc -i eth0 -n -q` gets a lease over `AF_PACKET` and its script reconfigures eth0 through rtnetlink; `ping` over a raw ICMP socket; `flock -n` fails while another process holds the lock and a blocking `flock` waits, and `apk` refuses to run while its database lock is held; `openssh-server` installed with `apk` from the offline repo, `ssh-keygen -A`, `sshd` on port 22, and the host logs in through hostfwd with a throwaway key (`ssh ... true`, a command, an interactive `ssh -tt` session on `/dev/pts/0`); no unimplemented syscall. Needs `ssh` on the host | `make smoke-alpine-net` |
@@ -72,17 +78,20 @@ What is proven by the automated QEMU tests in `tools/`:
   its own profile (`testfiles/ffprofile`) that turns off first-run dialogs, telemetry
   and add-on scans. `docs/audit/firefox-first-paint.md` and `docs/perf/firefox-startup.md` record how it
   got here.
-- **Firefox sound is choppy.** `<audio>` reaches the sound card through cubeb's
-  PulseAudio backend, apulse and the kernel's ALSA ABI, but Firefox's own
-  AudioSink receives decoded audio at about a third of real time. The clip plays
-  to its end with gaps of silence in between (`docs/audio.md`, `smoke_firefox.py --audio`).
-- **No execute protection (NX).** The kernel runs i686 page tables without PAE, which
-  have no no-execute bit, so every readable user page is also executable. Write
-  protection is enforced: `proc/elf.c` maps each `PT_LOAD` segment with its own
-  `p_flags` (`.text` and `.rodata` read-only, the in-tree programs are linked by
-  `userspace/user.ld` into separate R-X and RW segments), `ld.so` can `mprotect` a
-  `PT_GNU_RELRO` range read-only, and a write to a read-only page is `SIGSEGV`
-  (`SEGV_ACCERR`), in a forked child as well.
+- **Firefox sound is only checked by an opt-in run.** `<audio>` reaches the sound
+  card through cubeb's PulseAudio backend, apulse and the kernel's ALSA ABI
+  (`docs/audio.md`). On the current tree `smoke_firefox.py --audio` passes: in three
+  runs the 3 s, 440 Hz clip was captured for 2.99-3.00 s with 5 silent 10 ms blocks
+  inside. It is not part of `make check`, and only that one clip has been tried.
+- **Execute protection needs PAE and NX in the CPU.** With both (`-cpu qemu32,+nx`,
+  which every smoke suite uses, or any x86-64 CPU), user stacks, heaps, anonymous and
+  shm mappings are non-executable and `mprotect(PROT_EXEC)` toggles it. QEMU's default
+  `qemu32` model has PAE but no NX, so there the kernel runs PAE without execute
+  protection; a CPU without PAE (`-cpu qemu32,-pae`) gets the old 2-level page tables.
+  `nonx` on the kernel command line turns NX off. Write protection is enforced in
+  every mode: `proc/elf.c` maps each `PT_LOAD` segment with its own `p_flags`, `ld.so`
+  can `mprotect` a `PT_GNU_RELRO` range read-only, and a write to a read-only page is
+  `SIGSEGV` (`SEGV_ACCERR`), in a forked child as well.
 - **inotify is deliberately absent.** Numbers 291, 292, 293 and 332 return `-ENOSYS`
   on purpose so GLib falls back to its polling backend (see the comment on those
   cases in `proc/syscall.c`).
@@ -98,13 +107,18 @@ What is proven by the automated QEMU tests in `tools/`:
   owns.
 - **No SMP scaling.** One Big Kernel Lock serialises all kernel execution
   (`arch/i686/cpu/bkl.c`).
+- **Hardware coverage is what QEMU emulates.** Every driver is tested against QEMU's
+  device models only. There is no Wi-Fi, no Realtek r8169 or virtio device, no GPU
+  acceleration (the desktop draws into the boot framebuffer), no ACPI sleep states
+  (only S5 power-off), no USB 3 hubs, and xHCI is polled rather than interrupt-driven.
 - **ext4 is read-only.** `mount -t ext4` works, but the driver never writes: it
   cannot replay or write the journal, so a read-write mount is refused with `EROFS`
   and busybox `mount` falls back to read-only (`docs/ext4.md`). Writable: the boot
   disk (`/disk`, ext2) and FAT volumes (`mount -t vfat`, `docs/vfat.md`). There is no
   exFAT driver: an exFAT stick is recognised and refused.
 - **Missing Linux interfaces.** There is no SysV IPC and no utmp.
-  `/proc/<pid>/` has only `status` and `stat` (the full set is under `/proc/self`), and
+  `/proc/<pid>/` lists only `status` and `stat` and resolves `fd/N` links (the full
+  set is under `/proc/self`), and
   there is no `/proc/stat`, so toybox is built without `killall` (it matches names
   through other processes' `cmdline`), `vmstat` and `who`. There is no IPv6 stack:
   the resolver returns AAAA records, but only IPv4 sockets connect.
@@ -119,26 +133,31 @@ What is proven by the automated QEMU tests in `tools/`:
   `user`/`user` (PBKDF2 hashes), so every image built from the tree has them, and the
   desktop runs as `user` without asking. Change them with `passwd` on anything that
   is reachable from a network.
-- What is enforced: per-segment write protection (not NX, see above), file and
-  credential checks, guarded kernel stacks, a signed package index, and a maeroX that
-  validates every request length and has no key-injection channel in the desktop
-  build.
-- What is not: the Firefox content sandbox, execute protection, search permission on
-  path lookups, and repo-key rotation (all under "What does not work").
+- What is enforced: per-segment write protection, execute protection on CPUs with
+  PAE and NX (see above), file and credential checks, guarded kernel stacks, a signed
+  package index, raw writes to a disk with a mounted filesystem refused (`EBUSY`), and
+  a maeroX that validates every request length and has no key-injection channel in the
+  desktop build.
+- What is not: the Firefox content sandbox, execute protection on CPUs without NX,
+  search permission on path lookups, and repo-key rotation (all under "What does not
+  work").
 
 ## What is in the box
 
 ### Kernel
 
-- Multiboot 1 higher-half kernel: `arch/i686/boot/boot.asm` sets up paging before jumping
-  to `0xC0000000`, `linker.ld` links the image at `KERNEL_VMA + 0x00100000`.
+- Multiboot 1 and Multiboot 2 higher-half kernel: `arch/i686/boot/boot.asm` sets up
+  paging (PAE when CPUID reports it, else 2-level) before jumping to `0xC0000000`,
+  `linker.ld` links the image at `KERNEL_VMA + 0x00100000`.
 - Boot order lives in one readable function, `kernel_main` in `kernel/main.c`: serial,
   RTC, GDT/TSS/IDT/FPU, PIC, VGA, physical memory, RNG, paging, LAPIC, framebuffer,
-  heap, VFS, initrd, network, PCI and its drivers, ATA/ext2, tmpfs, devfs, procfs,
-  scheduler, input, PIT, TSC, kernel threads, application processors, then `/disk/init`
-  or `/init`.
-- About 31,600 lines of C, headers and assembly across the kernel directories, of which
-  `proc/syscall.c` is about 9,300.
+  heap, VFS, initrd, network, PCI and its drivers (NICs, AC'97, xHCI, HDA, ALSA), the
+  disks (ATA, AHCI, NVMe, the block-device table and partitions) and ext2, tmpfs,
+  devfs, procfs, scheduler, input, PIT, TSC, ACPI, application processors, kernel
+  threads, then `/disk/init` or `/init`.
+- About 49,600 lines of C, headers and assembly in `arch/`, `drivers/`, `fs/`,
+  `kernel/`, `lib/`, `mm/`, `net/`, `proc/` and `include/` (vendored code not counted),
+  of which `proc/syscall.c` is about 10,200.
 - Limits in `include/kernel/config.h`: `MAX_PROCS` 256, `MAX_FD` 512, 32 KiB kernel
   stacks, a 256 MiB kernel heap window at `0xD0000000`, 64-page user stacks below
   `0xC0000000`.
@@ -150,16 +169,22 @@ What is proven by the automated QEMU tests in `tools/`:
 ### Memory
 
 - `mm/pmm.c`: bitmap frame allocator with a per-frame `uint16_t` refcount array and a
-  use-after-free detector that reports frames handed out with a stale refcount.
-- `arch/i686/mm/paging.c`: recursive page-directory self-map at PDE 1023, copy-on-write
-  fork, demand-paged anonymous VMAs, and an exception table (`__start___ex_table`) so a
+  use-after-free detector that reports frames handed out with a stale refcount. It
+  sizes itself from the boot memory map, up to 16 GiB under PAE, in two zones: frames
+  the kernel holds a 32-bit address of (page tables, heap, DMA, page cache, shm, tmpfs)
+  stay below 4 GiB, and private user pages prefer frames above it. Booted by hand with
+  `-m 6G`, `/proc/meminfo` shows `HighTotal` 3 GiB, `HighFree` drops as programs run,
+  and `memprobe`, `threadprobe` and `wxprobe` pass; no suite runs with more than 2 GiB.
+- `arch/i686/mm/paging.c`: 64-bit page-table entries in either mode, PAE (3-level, NX
+  in bit 63) or legacy 2-level, chosen at boot; a recursive mapping (PAE: the four page
+  directories at `0xFFFFC000`, the tables from `0xFF800000`; legacy: PDE 1023),
+  copy-on-write fork, demand-paged anonymous VMAs, and an exception table (`__start___ex_table`) so a
   faulting `copy_from_user`/`copy_to_user` (`proc/syscall.c`) returns `-EFAULT` instead
   of panicking. The kernel touches user memory only through these copies; file and
   socket I/O is bounced through kernel buffers, and a user fault on a kernel page is a
   SIGSEGV rather than a retry loop.
-- RAM above 512 MiB boots: the higher-half direct map stops at 256 MiB (the heap window
-  at `0xD0000000`) and frames above it are reached through temporary maps, so the kernel
-  reaches the shell with `-m 1024M` and `-m 2048M` (`run-firefox` uses 2 GiB).
+- The higher-half direct map stops at 256 MiB (the heap window at `0xD0000000`), and
+  frames above it are reached through temporary maps.
 - `mm/heap.c`: TLSF-style segregated free lists over boundary-tagged blocks, with O(1)
   coalescing; a `0xDEADBEEF` magic and a used/free state word are checked on free,
   `realloc` and `heap_check`.
@@ -214,16 +239,22 @@ filesystems at any directory, crossed during the walk, listed in `/proc/mounts`)
 `fs/vfat.c` (read-write FAT12/16/32 with long names for `mount -t vfat`: UTF-8 names,
 8.3 aliases with `~N` tails, FSInfo, the dirty flag, `uid=`/`gid=`/`umask=`; see
 `docs/vfat.md`),
-`drivers/blkpart.c` (MBR, logical and GPT partitions of all four IDE disks as
-`/dev/hda`..`/dev/hdd5`, `/proc/partitions`), `fs/initrd.c` ustar archive read from
+`drivers/blkpart.c` (MBR, logical and GPT partitions, or a FAT filesystem on the
+whole disk, on every disk in `drivers/blkdev.c`'s table: IDE `/dev/hda`..`hdd`, AHCI
+and USB `/dev/sdX`, NVMe `/dev/nvme0nN`, with partitions as `hda1`, `sdb2`,
+`nvme0n1p5`; root can read and write the nodes, except a disk with a mounted
+filesystem, which is `EBUSY`; `BLKGETSIZE64`; `/proc/partitions`), `fs/initrd.c` ustar archive read from
 the Multiboot module, `fs/ext2.c` (read and write, mounted at `/disk` and overlaid on
 `/`, symlinks included), `fs/tmpfs.c` at `/tmp` (file bodies in page frames rather than
 the kernel heap, capped at 1 GiB per file, `EFBIG` beyond), `fs/devfs.c` at
 `/dev` (`null`, `zero`, `tty`,
 `ptmx`, `pts/`, `random`, `urandom`, `fb0`, `dsp`, `snd/controlC0`, `snd/pcmC0D0p`, `shm`, `input/event0`, `input/event1`,
-`stdin`/`stdout`/`stderr`), and `fs/procfs.c` at `/proc` (per-pid `status` and `stat`;
+`initrd` (the boot module, for the installer), `usbdisk0`, the disk and partition
+nodes, `stdin`/`stdout`/`stderr`), and `fs/procfs.c` at `/proc` (per-pid `status`,
+`stat` and `fd/N` links;
 `self` adds `statm`, `maps`, `fd`, `cmdline`, `environ`, `auxv`, `exe`; plus `meminfo`, `version`,
-`uptime`, `cpuinfo`, `kmsg`, `processes`, `pci`, `netif`, `firewall`, `sys/vm/`).
+`uptime`, `cpuinfo`, `kmsg`, `processes`, `pci`, `netif`, `firewall`, `mounts`,
+`partitions`, `filesystems`, `cputime`, `net/dev`, `net/route`, `sys/vm/`).
 
 ### Networking
 
@@ -234,7 +265,11 @@ found first. DHCP runs at boot, and the lease's DNS servers are written to
 BSD socket calls both through `socketcall` (102) and the direct i386 numbers 359 to 373;
 `net/firewall.c` is a rule-based packet filter configured by `fwctl` and readable at
 `/proc/firewall`; a kernel thread `knetd` (`net/net.c`) keeps timers and TCP alive
-without userspace polling.
+without userspace polling. For Linux network tools, `net/netlink.c` answers
+`AF_NETLINK`/`NETLINK_ROUTE` (link, address and route dumps; setting eth0's address,
+default route and `IFF_UP`) and the `SIOC*` interface and route ioctls, and
+`net/rawsock.c` provides `AF_PACKET` (with classic BPF filters) and raw `AF_INET`
+sockets, which is what busybox `ip`, `udhcpc` and `ping` in the Alpine chroot use.
 
 ### Drivers
 
@@ -314,8 +349,11 @@ a small `bbwrap` launcher.
 ### Desktop and window system
 
 `desktop` (`userspace/desktop/desktop.c`) opens `/dev/fb0`,
-`/dev/input/event0` and `/dev/input/event1`, and composites the whole screen into a back
-buffer that it presents once per frame. It draws a PPM wallpaper (kept in a blurred copy
+`/dev/input/event0` and `/dev/input/event1`, and composites into a back buffer with
+damage tracking: only the scanlines something changed are recomposited and only their
+changed spans written to the framebuffer, at most once per 16 ms; a client that commits
+a rectangle (`wm_commit_rect`) damages just that part of its window
+(`make bench-gfx` measures it). It draws a PPM wallpaper (kept in a blurred copy
 for the window backdrop), desktop icons that launch on double-click, and a taskbar with a
 start menu that has a search filter and a right-click context menu. Windows have title
 bars with minimize, maximize and close, plus drag, edge resize, half-screen snapping, a
@@ -428,6 +466,9 @@ libX11/libxcb client stack (`ports/x11/build-x11.sh`), the GLib/Cairo/Pango/GTK3
 (`ports/gtk/`), and a prebuilt Firefox 115 ESR (`ports/firefox/`). The extracted trees and
 the toolchain tarball are gitignored because they run to several gigabytes, so a fresh
 clone will not contain them; the `ports/build-*.sh` scripts refetch and rebuild.
+`ports/alpine/` builds a separate disk (`make disk-alpine`) with unmodified Alpine
+Linux x86 roots (3.22 and 3.24) from pinned, signature-checked packages, used with
+`chroot /disk/alpine` (details in `ports/alpine/README.md`).
 
 ## Building and running
 
@@ -603,6 +644,9 @@ make smoke-install  # maeros-install from the live ISO to an empty disk, then bo
 make smoke-abi      # Linux-ABI probes (ports/abiprobes/README.md), needs i686-linux-musl-gcc and disk.img
 make smoke-firefox  # does Firefox paint? (README-BROWSER.md)
 make smoke-firefox-web  # ...and load a page served from the host over the network
+make smoke-alpine   # Alpine 3.22/3.24 userland in a chroot, apk from an offline repo (opt-in)
+make smoke-alpine-net  # ip/udhcpc/ping, flock and sshd in that chroot (opt-in, needs ssh on the host)
+make bench-gfx      # compositor/maeroX cost of an animating region (a benchmark, judges nothing)
 ```
 
 `SMOKE_SMP=N make smoke-cmds` boots the same guest with `-smp N`. `make smoke-gtk` needs
@@ -627,7 +671,7 @@ Each script exits non-zero and prints the failing expectation, for example
 
 ### GUI smoke test
 
-`make smoke-gui` (`tools/smoke_gui.py`, about 30 s) boots `maeros.iso` with a copy of
+`make smoke-gui` (`tools/smoke_gui.py`, about 65 s under KVM) boots `maeros.iso` with a copy of
 `disk.img` (minus the `ffauto`/`gtkauto` autostart markers), `-vga std` and
 `-display none`, and drives the PS/2 mouse and keyboard with QMP `input-send-event`.
 The desktop and the apps print one line per state change to the serial console
@@ -654,7 +698,7 @@ about the same time.
 A new app becomes testable by calling `gui_trace("app", ...)` where its state changes,
 with click targets as window-relative points (surface point + `GUI_BODY_X`/`GUI_BODY_Y`).
 
-`make smoke-usb` (`tools/smoke_usb.py`, about 35 s) does the same with USB input only:
+`make smoke-usb` (`tools/smoke_usb.py`, about 40 s) does the same with USB input only:
 a `qemu-xhci` with a `usb-kbd` and `usb-tablet` bound to the VGA display (so QMP
 `input-send-event` reaches them and never the PS/2 devices), and a `usb-hub` with a
 `usb-mouse` and a `usb-storage` stick behind it. It opens the Terminal and logs in
@@ -662,7 +706,7 @@ a `qemu-xhci` with a `usb-kbd` and `usb-tablet` bound to the VGA display (so QMP
 land where sent and that the boot mouse moves the pointer, reads and writes the stick
 through `/dev/usbdisk0` (checksummed against the image file) and unplugs and replugs it.
 
-`make smoke-pc` (`tools/smoke_pc.py`, about 15 s) boots a PC with no legacy devices:
+`make smoke-pc` (`tools/smoke_pc.py`, about 20 s) boots a PC with no legacy devices:
 `-M q35,i8042=off -smp 2` with an ICH9 HDA codec, the disk on q35's AHCI controller, and a `usb-kbd` and
 `usb-tablet` on a `qemu-xhci` as the only input. It checks that the kernel skips the
 missing PS/2 controller, mounts `/disk` from `ahci0`, starts both CPUs from the MADT and
@@ -700,9 +744,10 @@ The built `~/opt/cross` toolchain is cached, keyed on the binutils/gcc versions,
 and configure flags in `tools/setup-linux.sh` and on the runner's Ubuntu release, so only
 the first run and version bumps pay for the gcc build. When `make check` fails, the
 `build/check/` logs, and the `smoke-gui` screendumps and serial log, are uploaded as a
-`smoke-logs-*` artifact of the run. The smoke suites do not use KVM (`make run` boots
-QEMU with its default TCG accelerator), except `smoke-gui`, which uses it when
-`/dev/kvm` is usable.
+`smoke-logs-*` artifact of the run. Most smoke suites run under TCG (`make run` boots QEMU
+with its default accelerator); `smoke-gui`, `smoke-usb`, `smoke-pc`, `smoke-ext4`,
+`smoke-vfat`, `smoke-install` and the BIOS case of `smoke-uefi` (plus the opt-in
+Firefox, Alpine and audio suites) use KVM when `/dev/kvm` is usable.
 
 ### Diagnosing a hang
 
@@ -739,29 +784,31 @@ A wedged boot prints nothing, so three things exist to make one visible.
 | Path | Contents |
 |---|---|
 | `arch/i686/` | boot and AP trampoline assembly, GDT/IDT/TSS/PIC/PIT, LAPIC, SMP, BKL, paging |
-| `drivers/` | ATA, AHCI, NVMe, PCI, RTL8139, e1000, AC'97, framebuffer, VGA, keyboard, mouse, RTC, serial, ACPI (uACPI glue) |
-| `fs/` | VFS, ustar initrd, ext2, tmpfs, devfs, procfs |
+| `drivers/` | ATA, AHCI, NVMe, block-device table and partitions, PCI, RTL8139, e1000, AC'97, HDA, ALSA, USB (xHCI, HID, mass storage), framebuffer, VGA, keyboard, mouse, RTC, serial, ACPI (uACPI glue) |
+| `fs/` | VFS and mounts, ustar initrd, ext2, read-only ext4, vfat, tmpfs, devfs, procfs |
 | `include/kernel/` | `config.h`, `types.h`, `multiboot.h`, `assert.h` |
 | `kernel/` | `main.c`, `printk`, ring-buffer `klog`, `panic`, RNG, stack protector |
 | `lib/` | freestanding `string` and `printf` |
 | `mm/` | physical allocator, kernel heap, VMM helpers |
-| `net/` | lwIP port and glue, sockets, firewall, `knetd` |
+| `net/` | lwIP port and glue, sockets, rtnetlink, packet and raw sockets, firewall, `knetd` |
 | `proc/` | scheduler, processes, ELF loader, syscalls, signals, pipes, AF_UNIX, shm |
 | `userspace/` | libc, init, shell, libdraw/libwm/libgui, desktop, maeroX, commands |
 | `ports/` | cross-build scripts, Dockerfiles and package recipes for imported software |
 | `testfiles/` | the root filesystem staged into `initrd.tar` and `disk.img` |
 | `third_party/` | vendored lwIP, toybox, TweetNaCl and uACPI |
 | `tools/` | smoke tests, QEMU launch script, icon/font/wallpaper/repo generators |
-| `docs/` | screenshots, the Firefox first-paint audit (`docs/audit/`) and startup profile (`docs/perf/`) |
+| `docs/` | subsystem notes (see [Documentation](#documentation)), screenshots, the Firefox first-paint audit and startup profile |
 
 ## Architecture notes
 
-- **Higher half at `0xC0000000`.** `boot.asm` identity-maps the first 12 MiB (PDE 0 to 2)
-  and mirrors them at PDE 768 to 770 before enabling paging, then jumps to the virtual
-  address and clears the identity entries for the first 8 MiB. User address space runs
-  from 0 to `0xC0000000`.
-- **Recursive page tables.** PDE 1023 points at the page directory itself, so any page
-  table is reachable at `0xFFC00000 + (pde << 12)` without a temporary mapping.
+- **Higher half at `0xC0000000`.** `boot.asm` identity-maps the first 12 MiB and
+  mirrors it at `0xC0000000` before enabling paging (PAE tables when CPUID reports PAE,
+  2-level ones otherwise), then jumps to the virtual address and drops the identity
+  entries. User address space runs from 0 to `0xC0000000`.
+- **Recursive page tables.** Under PAE the last page directory maps the four
+  directories (`PD3[508..511]`), so every page table is reachable from `0xFF800000` and
+  the directories at `0xFFFFC000`; with 2-level paging PDE 1023 points at the directory
+  itself (`0xFFC00000 + (pde << 12)`). Either way no temporary mapping is needed.
 - **Linux i386 ABI over `int 0x80`.** Arguments arrive in EBX, ECX, EDX, ESI, EDI, EBP,
   which is why `mmap2` reads its file offset from `regs->ebp`. The kernel adds seven
   numbers of its own outside the Linux table: 500 to 502 and 506 for shared memory
@@ -777,9 +824,21 @@ A wedged boot prints nothing, so three things exist to make one visible.
 - **maeroX speaks the X11 wire protocol** over AF_UNIX rather than emulating a toolkit,
   which is why the unmodified libX11 and libxcb from upstream work against it.
 
-For the longer story of how the browser stack was built up, phase by phase, see
-[README-BROWSER.md](README-BROWSER.md). For the planned direction, see
-[ROADMAP.md](ROADMAP.md).
+## Documentation
+
+| Document | Covers |
+|---|---|
+| [docs/boot.md](docs/boot.md) | Multiboot 1 and 2, BIOS and UEFI boot paths, `smoke-uefi` |
+| [docs/install.md](docs/install.md) | `maeros-install`: disk layout, Limine, `root=PARTUUID=` |
+| [docs/ext4.md](docs/ext4.md) | `mount(2)`, partitions, the read-only ext4 driver |
+| [docs/vfat.md](docs/vfat.md) | read-write FAT and USB sticks |
+| [docs/audio.md](docs/audio.md) | `/dev/dsp`, the ALSA kernel ABI, Firefox audio |
+| [docs/audit/firefox-first-paint.md](docs/audit/firefox-first-paint.md) | the kernel audit behind the ABI probes |
+| [docs/perf/firefox-startup.md](docs/perf/firefox-startup.md) | where Firefox's startup time goes |
+| [ports/alpine/README.md](ports/alpine/README.md) | the Alpine chroot, its networking and sshd |
+| [ports/abiprobes/README.md](ports/abiprobes/README.md) | the Linux ABI probes run by `smoke-abi` |
+| [README-BROWSER.md](README-BROWSER.md) | how the browser stack was built up, phase by phase |
+| [ROADMAP.md](ROADMAP.md) | what remains |
 
 ## Third-party code
 
@@ -795,6 +854,9 @@ For the longer story of how the browser stack was built up, phase by phase, see
 | zlib, libpng, libjpeg | 1.3.1, 1.6.43, 9f | upstream tarballs in `ports/` | zlib, libpng and IJG terms |
 | libX11 / libxcb, GLib, Cairo, Pango, GTK3 | built by `ports/x11` and `ports/gtk` | not vendored | upstream terms |
 | Firefox ESR | 115.15.0 | fetched by `ports/firefox` | upstream terms |
+| Debian i386 runtime for Firefox (glibc, GTK3, apulse, alsa-lib, ...) | Debian trixie | fetched by `ports/firefox/fetch-runtime.sh` | upstream terms |
+| Alpine Linux packages | 3.22 and 3.24 | fetched and signature-checked by `ports/alpine` | upstream terms |
+| Limine | 11.4.1 | fetched by `tools/fetch-limine.sh` (sha256-pinned) | BSD 2-clause |
 | Doom shareware WAD | `doom1.wad` | `ports/doom1.wad` | id Software shareware terms |
 
 Each of these keeps its own license. Nothing in this list has been relicensed.

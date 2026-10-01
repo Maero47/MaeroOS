@@ -116,7 +116,14 @@ Firefox: `python3 tools/smoke_firefox.py --audio` (see below).
 
 ## Firefox
 
-Firefox 115 ESR reaches the sound card, but the sound is choppy.
+Firefox 115 ESR reaches the sound card. Once this work was merged with the
+rest of the tree (PAE paging, the compositor's damage tracking and frame pacing,
+the `rep movs`/`stos` libc string functions, among others), three runs of
+`smoke_firefox.py --audio` passed: the 3 s, 440 Hz clip was captured for
+2.99-3.00 s with 5 silent 10 ms blocks inside. On the audio branch alone the
+same test showed the choppy playback described below. Which later change made
+the difference has not been isolated, so the analysis is kept as it was
+measured.
 
 **How the path works.** Mozilla's Linux builds do not compile cubeb's ALSA
 backend. `libxul.so` has no `snd_pcm_open_lconf`, no `snd_config_*` and no
@@ -138,7 +145,7 @@ Debian's own `aplay` from the same glibc and libasound plays a clean 440 Hz
 tone through this ABI. That run used the 108-byte `STATUS` and 132-byte
 `SYNC_PTR` layouts.
 
-**What `smoke_firefox.py --audio` shows.** The page opens from
+**What `smoke_firefox.py --audio` showed on the audio branch.** The page opens from
 `file:///disk/audio.html` with no network involved. The clip's `play`,
 `playing` and `ended` events fire, and `ended` comes at `currentTime` 3. The
 kernel takes about 44,100 frames/s from apulse, which is real time. For
@@ -146,7 +153,7 @@ roughly the first 1.3 s the capture holds a clean 440 Hz tone. After that it
 alternates tone and silence in 10 ms blocks, and the 3 s clip takes 10 to
 19 s to finish.
 
-**The remaining blocker is inside Firefox, not in the kernel.** Firefox
+**The blocker on that branch was inside Firefox, not in the kernel.** Firefox
 logs `W/AudioStream ... lost N frames` (MOZ_LOG `AudioStream:2`) on almost
 every cubeb callback. In each callback its AudioSink has only about one
 decoded packet (about 1000 frames) ready, whatever the period: with 25 ms
