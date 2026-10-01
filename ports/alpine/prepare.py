@@ -78,6 +78,9 @@ X_PACKAGES = ["xterm", "xeyes", "xclock", "xev", "xdpyinfo", "xwininfo",
               "font-dejavu", "adwaita-icon-theme", "hicolor-icon-theme"]
 X_LOCK = os.path.join(HERE, "alpine-x.lock")
 X_PREINSTALL = ["mousepad", "font-dejavu", "hicolor-icon-theme"]
+# ALPINE_X_EXTRA="feh mpv ...": also preinstall these (with ALPINE_IMG, a
+# development image for apps whose guest install takes too long).
+X_PREINSTALL += os.environ.get("ALPINE_X_EXTRA", "").split()
 
 IMG = os.environ.get("ALPINE_IMG", os.path.join(
     ROOT, "disk-alpinex.img" if X else "disk-alpine.img"))

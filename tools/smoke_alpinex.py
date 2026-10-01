@@ -20,6 +20,8 @@ smoke_gui.py:
   3. xterm: a command typed into it writes a file (keyboard path).
      mousepad: text typed into it, Ctrl+S, a file name typed into the GTK
      save dialog, Enter: the file must hold the text.
+     galculator (GTK 3, installed in the guest like xeyes): its window, and
+     7*6 Enter typed into it changes the display.
   4. Each app is closed with the maeroX title bar's close button
      (WM_DELETE_WINDOW) and must exit; maeroX must still be running.
 
@@ -156,6 +158,7 @@ class AlpineX:
             raise AssertionError("xapp list:\n" + out)
         step("install xterm (Linux Apps)", self.install_frontend, "xterm")
         step("install xeyes", self.install_cli, "xeyes")
+        step("install galculator", self.install_cli, "galculator")
         # The GTK 3 stack is preinstalled by prepare.py: apk in the guest
         # takes well over 15 minutes for its 67 packages.
         if not re.search(r"mousepad\s+installed", out):
@@ -191,13 +194,45 @@ class AlpineX:
         self.g.settle(4.0)
         self.g.shot("mousepad-save-dialog")
         self.inp.combo(["ctrl"], "a")
-        self.inp.type("maerox-note.txt\n")
-        self.g.settle(3.0)
+        self.inp.type("maerox-note.txt")
+        # GTK's file chooser ignores Enter while it is still loading the
+        # folder and completing the name: give it a moment, and a second
+        # Enter if the first one was swallowed.
+        self.g.settle(2.0)
+        saved = ""
+        for attempt in range(2):
+            self.inp.press("ret")
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                self.g.settle(1.0)
+                saved = self.sh("cat /disk/alpine/home/*/maerox-note.txt")
+                if "hello from maeroX" in saved:
+                    break
+            if "hello from maeroX" in saved:
+                break
         self.g.shot("mousepad-saved")
-        saved = self.sh("cat /disk/alpine/home/*/maerox-note.txt")
         if "hello from maeroX" not in saved:
             self.fail("mousepad: the typed text was not saved")
+        else:
+            self.notes.append("mousepad saved the typed text")
 
+        gc = step("galculator", self.launch, "galculator", "galculator")
+        self.click_in(gc, gc["w"] // 2, 55)        # the display, not the menu bar
+        before = self.g.shot("galculator-before")
+        self.inp.type("7")
+        self.inp.combo(["shift"], "8")
+        self.inp.type("6\n")
+        self.g.settle(1.5)
+        after = self.g.shot("galculator-42")
+        disp = (gc["rect"][0], gc["rect"][1] + 20, gc["w"], 60)
+        changed = smoke_gui.changed_fraction(before, after, disp)
+        print(f"\n[SMOKE-ALPINEX] galculator: {changed:.1%} of its display changed after 7*6=")
+        if changed < 0.005:
+            self.fail("galculator: typing 7*6 Enter did not change its display")
+        else:
+            self.notes.append(f"galculator display changed {changed:.1%} after 7*6=")
+
+        step("close galculator", self.close, "galculator", gc, "galculator")
         step("close mousepad", self.close, "mousepad", mp, "mousepad")
         step("close xeyes", self.close, "xeyes", xe, "xeyes")
         step("close xterm", self.close, "xterm", xt, "xterm")
@@ -249,7 +284,7 @@ def main():
         if ax is not None and proc.poll() is None:
             try:
                 for f in ("/tmp/maerox.log",) + tuple(
-                        f"/disk/alpine/tmp/xapp-{n}.log" for n in ("xterm", "xeyes", "mousepad")):
+                        f"/disk/alpine/tmp/xapp-{n}.log" for n in ("xterm", "xeyes", "mousepad", "galculator")):
                     with open(os.path.join(OUT, os.path.basename(f)), "w") as fh:
                         fh.write(con.run(f"cat {f}", 10))
             except Exception:

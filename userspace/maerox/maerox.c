@@ -392,6 +392,9 @@ static window_t *wm_frame_hit(int x, int y, int *part) {
 static void blit_rect(draw_surface_t *s, const uint32_t *src, int sw, int sh,
                       int ax, int ay, int cx0, int cy0, int cx1, int cy1) {
     int x0 = imax(ax, cx0), y0 = imax(ay, cy0), x1 = imin(ax + sw, cx1), y1 = imin(ay + sh, cy1);
+    /* A source wholly left or right of the clip: x1 < x0 would be a
+     * negative length (GIMP's many frames crashed maeroX here). */
+    if (x0 >= x1) return;
     for (int y = y0; y < y1; y++)
         memcpy(s->px + (size_t)y * s->w + x0, src + (size_t)(y - ay) * sw + (x0 - ax),
                (size_t)(x1 - x0) * 4);
@@ -400,6 +403,7 @@ static void blit_rect(draw_surface_t *s, const uint32_t *src, int sw, int sh,
 static void fill_clip(draw_surface_t *s, int x, int y, int w, int h, uint32_t col,
                       int cx0, int cy0, int cx1, int cy1) {
     int x0 = imax(x, cx0), y0 = imax(y, cy0), x1 = imin(x + w, cx1), y1 = imin(y + h, cy1);
+    if (x0 >= x1) return;
     for (int yy = y0; yy < y1; yy++) fill32(s->px + (size_t)yy * s->w + x0, col, x1 - x0);
 }
 

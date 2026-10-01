@@ -30,9 +30,10 @@ static const xapp_t xapps[] = {
       "ristretto /usr/share/icons/hicolor", "Image viewer (GTK 3)" },
     { "feh", "feh", "feh", "/usr/bin/feh",
       "feh -g 640x480 -. /usr/share/feh/images", "Lightweight image viewer" },
-    { "mpv", "mpv", "mpv font-dejavu", "/usr/bin/mpv",
-      "mpv --vo=x11 --player-operation-mode=pseudo-gui --force-window=yes --idle=yes",
-      "Media player (X11 output, ALSA sound)" },
+    { "mpv", "mpv", "mpv font-dejavu alsa-utils", "/usr/bin/mpv",
+      "mpv --vo=x11 --ao=alsa --force-window=yes --keep-open=yes --idle=yes "
+      "/usr/share/sounds/alsa/Front_Center.wav",
+      "Media player (X11 output, ALSA sound); plays a sample" },
     { "gimp", "GIMP", "gimp font-dejavu adwaita-icon-theme", "/usr/bin/gimp",
       "gimp --no-splash", "Image editor (large: about 230 MB)" },
 };

@@ -216,6 +216,14 @@ static void exec_app(const xapp_t *a, uid_t uid, gid_t gid, int wait_server) {
     snprintf(path, sizeof(path), ALPINE_ROOT "%s", home);
     mkdir(ALPINE_ROOT "/home", 0755);
     if (mkdir(path, 0700) == 0 || errno == EEXIST) chown(path, uid, gid);
+    /* XDG directories apps expect to exist (galculator does not create
+     * ~/.config itself and then cannot keep its settings). */
+    static const char *const xdg[] = { "/.config", "/.cache", "/.local", "/.local/share" };
+    for (unsigned i = 0; i < sizeof(xdg) / sizeof(xdg[0]); i++) {
+        char sub[160];
+        snprintf(sub, sizeof(sub), "%s%s", path, xdg[i]);
+        if (mkdir(sub, 0700) == 0) chown(sub, uid, gid);
+    }
     snprintf(rt, sizeof(rt), "/tmp/runtime-%u", (unsigned)uid);
     snprintf(path, sizeof(path), ALPINE_ROOT "%s", rt);
     if (mkdir(path, 0700) == 0 || errno == EEXIST) chown(path, uid, gid);
