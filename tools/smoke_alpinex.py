@@ -68,12 +68,13 @@ class AlpineX:
     def maerox_log(self):
         return self.sh("cat /tmp/maerox.log")
 
-    def wait_log(self, pattern, timeout=90.0):
+    def wait_log(self, pattern, timeout=90.0, skip=0):
+        """The (skip+1)-th match of pattern in maeroX's log."""
         deadline = time.time() + timeout
         while True:
-            m = re.search(pattern, self.maerox_log())
-            if m:
-                return m
+            ms = list(re.finditer(pattern, self.maerox_log()))
+            if len(ms) > skip:
+                return ms[skip]
             if time.time() >= deadline:
                 raise AssertionError(f"maeroX log never showed {pattern!r}")
             self.g.settle(1.0)
@@ -99,12 +100,13 @@ class AlpineX:
 
     def launch(self, name, title_re):
         """Launch through the desktop; returns the toplevel's screen rect."""
+        maps = len(re.findall(r"map toplevel", self.maerox_log())) if self.maerox else 0
         start = self.con.mark()
         self.sh(f"wmctl launch {name}")
         if self.maerox is None:
             self.maerox = self.g.wait_window("maeroX :0", timeout=60, start=start)
         m = self.wait_log(r"map toplevel 0x([0-9a-f]+) client=(\d+) (\d+)x(\d+) "
-                          r"@(-?\d+),(-?\d+) title='%s" % title_re)
+                          r"@(-?\d+),(-?\d+) title='%s" % title_re, timeout=120, skip=maps)
         w, h, x, y = (int(m.group(i)) for i in (3, 4, 5, 6))
         self.g.settle(3.0)
         mx = self.maerox["x"] + BODY_X
