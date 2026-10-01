@@ -7,8 +7,12 @@
  * SIGSEGV with si_code SEGV_ACCERR and si_addr the address written, as Linux
  * delivers it — not as a fault loop, a kernel panic or a silent success.
  *
- * i686 without PAE has no NX bit: execute permission is not checked here
- * because the hardware cannot refuse it.
+ * Execute permission (PAE + NX, "nx" in /proc/cpuinfo): code placed on the
+ * stack, the brk heap or an anonymous PROT_READ|PROT_WRITE mapping does not
+ * run (SIGSEGV, SEGV_ACCERR, si_addr the instruction); mprotect(PROT_EXEC)
+ * makes it run, and a JIT-style buffer flipped RW → RX → RW runs only while
+ * it is RX.  Without NX (legacy paging) these checks are skipped: the hardware
+ * cannot refuse execution.
  *
  * Prints "wxprobe: <case> ok" per case and "wxprobe ok" at the end;
  * tools/smoke.py waits for the latter.
@@ -21,6 +25,7 @@
 #include "../include/signal.h"
 #include "../include/sys/mman.h"
 #include "../include/sys/wait.h"
+#include "../include/fcntl.h"
 
 #define NR_READ         3
 #define NR_MMAP2        192
@@ -131,6 +136,96 @@ static int in_child(void (*fn)(void)) {
 }
 
 static void child_write(void) { *child_target = 'C'; }
+
+/* ── Execute permission ──────────────────────────────────────────────────── */
+static int nx_active(void) {
+    char buf[512];
+    int fd = open("/proc/cpuinfo", O_RDONLY);
+    if (fd < 0) return 0;
+    int n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    char *f = strstr(buf, "flags");
+    return f && (strstr(f, " nx\n") || strstr(f, " nx "));
+}
+
+/* `mov eax, 42; ret` at p. */
+static void put_code(volatile char *p) {
+    static const unsigned char code[] = { 0xB8, 42, 0, 0, 0, 0xC3 };
+    for (unsigned i = 0; i < sizeof(code); i++) p[i] = (char)code[i];
+}
+static int run_code(volatile char *p) { return ((int (*)(void))(unsigned)p)(); }
+
+/* Call code at p, expecting one SEGV_ACCERR at p; the handler then grants
+ * `restore` (which includes PROT_EXEC) and the call runs. */
+static void exec_then_fix(const char *name, volatile char *p, int restore) {
+    put_code(p);
+    fault_want = (unsigned)p;
+    fault_page = page_of(p);
+    fault_restore = restore;
+    fault_hits = 0; fault_code = 0; fault_addr = 0;
+    int v = run_code(p);
+    int ok = fault_hits == 1 && fault_code == SEGV_ACCERR &&
+             fault_addr == fault_want && v == 42;
+    if (!ok)
+        printf("wxprobe: %s: hits=%d code=%d addr=%08x want=%08x ret=%d\n", name,
+               fault_hits, fault_code, fault_addr, fault_want, v);
+    check(name, ok, fault_hits);
+}
+
+static volatile char *child_code;
+static void child_exec(void) { put_code(child_code); run_code(child_code); }
+static void child_exec_stack(void) {
+    volatile char buf[16];
+    put_code(buf);
+    run_code(buf);
+}
+
+static void nx_checks(void) {
+    if (!nx_active()) {
+        printf("wxprobe: no NX on this CPU/kernel, exec checks skipped\n");
+        return;
+    }
+    const int rwx = PROT_READ | PROT_WRITE | PROT_EXEC;
+
+    /* Stack: a child dies running its own frame's buffer; then here, the
+     * same fault is fixed by making the page executable (after the child,
+     * whose frame may share the page). */
+    int r = in_child(child_exec_stack);
+    check("fork child stack exec SIGSEGV", r == -SIGSEGV, r);
+    volatile char stack_code[64];
+    exec_then_fix("stack exec faults", stack_code, rwx);
+
+    /* brk heap */
+    volatile char *heap = brk_page();
+    exec_then_fix("heap exec faults", heap, rwx);
+
+    /* Anonymous PROT_READ|PROT_WRITE mapping */
+    volatile char *anon = map_anon();
+    exec_then_fix("anon RW exec faults", anon, rwx);
+
+    /* A JIT buffer: written RW, flipped RX (runs, no fault, not writable),
+     * flipped back RW (no longer runs). */
+    volatile char *jit = map_anon();
+    put_code(jit);
+    check("jit mprotect RX", protect(page_of(jit), PROT_READ | PROT_EXEC) == 0, 0);
+    fault_hits = 0;
+    int v = run_code(jit);
+    check("jit RX runs", v == 42 && fault_hits == 0, v);
+    child_target = jit;
+    r = in_child(child_write);
+    check("jit RX write SIGSEGV", r == -SIGSEGV, r);
+    check("jit mprotect RW", protect(page_of(jit), PROT_READ | PROT_WRITE) == 0, 0);
+    child_code = jit;
+    r = in_child(child_exec);
+    check("jit RW exec SIGSEGV", r == -SIGSEGV, r);
+
+    /* Read-only data is not code either. */
+    child_code = (volatile char *)(unsigned)&rw_word;
+    r = in_child(child_exec);
+    check("data exec SIGSEGV", r == -SIGSEGV, r);
+}
 static void child_write_data(void) { rw_word = 2; }
 
 int main(void) {
@@ -145,9 +240,11 @@ int main(void) {
     char text_byte = *text;
     fault_then_fix("text write faults", text, text_byte, PROT_READ | PROT_WRITE | PROT_EXEC);
     check("text re-protect", protect(page_of(text), PROT_READ | PROT_EXEC) == 0, 0);
-    fault_then_fix("rodata write faults", rodata, 'W', PROT_READ | PROT_WRITE);
+    /* .rodata shares the text segment (user.ld), and possibly a page with
+     * code: keep PROT_EXEC on it, as the segment's p_flags have it. */
+    fault_then_fix("rodata write faults", rodata, 'W', PROT_READ | PROT_WRITE | PROT_EXEC);
     *rodata = 'w';                              /* put the text back */
-    check("rodata re-protect", protect(page_of(rodata), PROT_READ) == 0, 0);
+    check("rodata re-protect", protect(page_of(rodata), PROT_READ | PROT_EXEC) == 0, 0);
     rw_word = 3;
     check("data write works", rw_word == 3, rw_word);
 
@@ -215,6 +312,8 @@ int main(void) {
     rw_word = 1;
     r = in_child(child_write_data);
     check("fork child data write private", r == 0 && rw_word == 1, r);
+
+    nx_checks();
 
     if (failures) {
         printf("wxprobe: %d FAILED\n", failures);

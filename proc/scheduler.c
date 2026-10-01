@@ -353,9 +353,9 @@ void io_wake(void) {
  * Note: a 4-byte read can straddle a page boundary, so check both ends. */
 static int user_word_present(uint32_t a) {
     if (a >= 0xC0000000U || (a + 3) >= 0xC0000000U) return 0;
-    if (!(*paging_get_pde(a) & 1) || !(*paging_get_pte(a) & 1)) return 0;
+    if (!(pte_read(a) & PAGE_PRESENT)) return 0;
     if (((a & 0xFFF) > 0xFFC) &&
-        (!(*paging_get_pde(a + 3) & 1) || !(*paging_get_pte(a + 3) & 1)))
+        !(pte_read(a + 3) & PAGE_PRESENT))
         return 0;
     return 1;
 }

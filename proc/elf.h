@@ -32,6 +32,7 @@ typedef struct {
 
 #define PT_LOAD   1
 #define PT_INTERP 3
+#define PT_GNU_STACK 0x6474e551
 
 /* p_flags */
 #define PF_X      0x1
@@ -51,6 +52,7 @@ typedef struct {
     uint16_t phent;
     uint16_t phnum;
     int      has_interp;    /* 1 if a PT_INTERP was present */
+    int      stack_flags;   /* PT_GNU_STACK p_flags, -1 if there is none */
     char     interp[80];    /* interpreter path ("" if none) */
 } elf_info_t;
 

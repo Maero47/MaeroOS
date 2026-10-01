@@ -90,7 +90,7 @@ void apic_init(void) {
          * there is no caller to return an error to, and the scheduler's timer
          * and IPIs are unreachable without the LAPIC window. */
         if (paging_map(LAPIC_PHYS_BASE, LAPIC_PHYS_BASE,
-                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_PCD) != 0)
+                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_PCD | PAGE_NX) != 0)
             panic("apic_init: cannot map the LAPIC MMIO page", 0);
         g_lapic = (volatile uint32_t *)LAPIC_PHYS_BASE;
     }

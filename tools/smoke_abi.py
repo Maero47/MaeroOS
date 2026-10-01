@@ -205,7 +205,7 @@ def boot(args):
         # free space; the probes that predate it ignore it.
         [args.qemu, "-kernel", "kernel.elf", "-initrd", "initrd.tar",
          "-drive", "file=disk.img,format=raw,index=0,media=disk",
-         "-serial", "stdio", "-display", "none", "-m", args.mem,
+         "-serial", "stdio", *smokelib.QEMU_DISPLAY, "-m", args.mem,
          "-no-reboot", "-no-shutdown"],
         cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, bufsize=0,

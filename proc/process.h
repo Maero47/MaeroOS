@@ -334,7 +334,27 @@ struct proc {
     uint32_t         last_fault_eip;
     uint32_t         last_fault_addr;
     uint32_t         fault_repeat;
+
+    /* Execute permission policy of the image, set at exec from its
+     * PT_GNU_STACK (Linux fs/binfmt_elf.c), inherited across fork and clone:
+     *   read_implies_exec — no PT_GNU_STACK at all: a legacy i386 binary that
+     *       may run code from anything readable (READ_IMPLIES_EXEC), so every
+     *       PROT_READ mapping, the heap and the stack are executable;
+     *   exec_stack — PT_GNU_STACK asks for PF_X: the stack is executable.
+     * Both 0 is the normal case: only PF_X segments and PROT_EXEC mappings
+     * run.  Without NX (legacy paging) the hardware ignores all of it. */
+    uint8_t          read_implies_exec;
+    uint8_t          exec_stack;
 };
+
+/* Is the main/grown stack of p executable? */
+static inline int proc_stack_exec(const struct proc *p) {
+    return p && (p->exec_stack || p->read_implies_exec);
+}
+/* mmap/mprotect prot as the image's policy widens it (PROT_READ → +EXEC). */
+static inline uint32_t proc_prot_adjust(const struct proc *p, uint32_t prot) {
+    return (p && p->read_implies_exec && (prot & 0x1U)) ? (prot | 0x4U) : prot;
+}
 
 /* Process table and current process */
 extern struct proc ptable[];

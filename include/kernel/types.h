@@ -15,5 +15,5 @@ typedef signed long long   i64;
 
 typedef uintptr_t physaddr_t;
 typedef uintptr_t virtaddr_t;
-typedef uint32_t  pte_t;
-typedef uint32_t  pde_t;
+typedef uint64_t  pte_t;   /* also arch/i686/mm/paging.h: PAE entries are 64-bit */
+typedef uint64_t  pde_t;

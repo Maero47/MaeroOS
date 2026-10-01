@@ -15,8 +15,14 @@ PROMPT = "MaeroOS$ "
 LOGIN_PROMPT = " login: "
 PASSWORD_PROMPT = "Password: "
 
-# Extra QEMU arguments for every suite; empty with SMOKE_DISPLAY set.
-QEMU_DISPLAY = [] if os.environ.get("SMOKE_DISPLAY") else ["-display", "none"]
+# Extra QEMU arguments for every suite: headless unless SMOKE_DISPLAY is set,
+# and a CPU with NX.  QEMU's default i386 model (qemu32) has PAE but no NX, so
+# without "+nx" the kernel would run PAE with execute protection off and no
+# suite would see it; SMOKE_CPU picks another model ("" = QEMU's default,
+# "pentium" = no PAE, the legacy 2-level paging path).
+_CPU = os.environ.get("SMOKE_CPU", "qemu32,+nx")
+QEMU_DISPLAY = ([] if os.environ.get("SMOKE_DISPLAY") else ["-display", "none"]) + \
+               (["-cpu", _CPU] if _CPU else [])
 # The same for suites that boot through a Makefile run target.
 MAKE_DISPLAY = [] if not QEMU_DISPLAY else ["QEMU_DISPLAY=" + " ".join(QEMU_DISPLAY)]
 

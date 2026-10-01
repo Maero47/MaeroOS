@@ -22,7 +22,7 @@ void *mmio_map(uint32_t phys, uint32_t size) {
         /* cannot fail: the tables were reserved above */
         if (paging_map(base + p, (phys & ~0xFFFU) + p,
                        PAGE_PRESENT | PAGE_WRITABLE | PAGE_NOCACHE |
-                       PAGE_WRITETHRU) != 0)
+                       PAGE_WRITETHRU | PAGE_NX) != 0)
             return 0;
     }
     /* one unmapped guard page between consecutive mappings */

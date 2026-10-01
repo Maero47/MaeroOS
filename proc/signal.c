@@ -545,21 +545,29 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
      *
      * Without SA_SIGINFO — C ABI: [esp+0]=retaddr, [esp+4]=signo
      *
-     *   [ trampoline (8 bytes) ]  ← tramp_addr
-     *   [ saved registers_t   ]  ← saved_addr
-     *   [ retaddr → tramp     ]
-     *   [ signo               ]  ← new useresp
+     *   [ mask to restore      ]
+     *   [ saved registers_t    ]  ← saved_addr
+     *   [ restore marker = 0   ]  [esp+20]
+     *   [ restore addr = saved ]  [esp+16]
+     *   [ 0, 0                 ]
+     *   [ signo                ]
+     *   [ retaddr = SIGPAGE_VA ]  ← new useresp
      *
      * With SA_SIGINFO — three-arg ABI: [esp+0]=retaddr, [esp+4]=signo,
-     *                                  [esp+8]=&siginfo, [esp+12]=NULL (ucontext)
+     *                                  [esp+8]=&siginfo, [esp+12]=&ucontext
      *
-     *   [ trampoline (8 bytes) ]  ← tramp_addr
-     *   [ saved registers_t   ]  ← saved_addr
-     *   [ siginfo_t (128 bytes) ] ← siginfo_addr
-     *   [ retaddr → tramp     ]
-     *   [ signo               ]
-     *   [ &siginfo            ]
-     *   [ NULL (ucontext)     ]  ← new useresp
+     *   [ mask, registers_t    ]  ← saved_addr
+     *   [ ucontext             ]  ← uctx_addr
+     *   [ siginfo_t            ]  ← siginfo_addr
+     *   [ restore marker = 1   ]  [esp+20]
+     *   [ restore addr = uctx  ]  [esp+16]
+     *   [ &ucontext, &siginfo  ]
+     *   [ signo                ]
+     *   [ retaddr = SIGPAGE_VA ]  ← new useresp
+     *
+     * The handler's `ret` leaves esp 4 higher, so the trampoline on the signal
+     * page finds the restore words at [esp+12] and [esp+16]: past every
+     * argument slot, which a handler may reuse but never anything above.
      */
     uint32_t sp = regs->useresp;
 
@@ -616,17 +624,16 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
         if (lo < (sp_floor & ~0xFFFU)) lo = sp_floor & ~0xFFFU;   /* never below
                                                 * the alternate stack */
         for (uint32_t a = lo; a <= hi && a >= 0x08000000U; a += 0x1000) {
-            if ((*paging_get_pde(a) & 1) && (*paging_get_pte(a) & 1)) continue;
+            if (pte_read(a) & PAGE_PRESENT) continue;
             if (!vma_handle_fault(a)) goto fatal;   /* unmappable → kill, not panic */
         }
     }
 
-    /* Reserve trampoline space; it's written below once the restore-frame
-     * address + type marker are known (20 bytes: mov eax,0x77; mov ecx,addr;
-     * mov edx,marker; int 0x80; pad). */
-    sp -= 20;
-    uint32_t tramp_addr = sp;
-    if (sp < sp_floor) goto fatal;
+    /* The handler returns into the sigreturn trampoline on the signal page
+     * (paging_map_sigpage), which picks the restore-frame address and its
+     * type marker up from the two words after the argument block.  It used
+     * to be code written onto this stack, which NX now refuses to run. */
+    const uint32_t tramp_addr = SIGPAGE_VA;
     uint32_t uctx_addr = 0;   /* set in the SA_SIGINFO branch below */
 
     /*
@@ -723,24 +730,32 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
          * entry esp (pointing at the return address) must be ≡ 12 (mod 16) —
          * GCC-compiled handlers emit aligned SSE (movaps) to the stack, which
          * #GPs on a misaligned frame.  Round the 4-dword arg block down to that. */
-        sp = ((sp - 16) & ~0xFU) - 4;
+        sp = ((sp - 24) & ~0xFU) - 4;
         if (sp < sp_floor) goto fatal;
-        uint32_t args[4] = { tramp_addr,               /* retaddr */
+        uint32_t args[6] = { tramp_addr,               /* retaddr */
                              (uint32_t)sig,            /* signo */
                              siginfo_addr,             /* &siginfo */
-                             uctx_addr };              /* &ucontext */
+                             uctx_addr,                /* &ucontext */
+                             uctx_addr, 1 };           /* for the trampoline:
+                                                        * restore from the
+                                                        * ucontext (marker 1) */
         if (copy_to_user((void *)(uintptr_t)sp, args, sizeof(args)) < 0) goto fatal;
     } else {
         /* Simple one-arg frame: retaddr, signo — same 16-byte alignment rule. */
-        sp = ((sp - 16) & ~0xFU) - 4;
+        sp = ((sp - 24) & ~0xFU) - 4;
         if (sp < sp_floor) goto fatal;
-        uint32_t args[2] = { tramp_addr,               /* retaddr */
-                             (uint32_t)sig };          /* signo */
+        uint32_t args[6] = { tramp_addr,               /* retaddr */
+                             (uint32_t)sig,            /* signo */
+                             0, 0,                     /* not arguments */
+                             saved_addr, 0 };          /* for the trampoline:
+                                                        * the plain frame
+                                                        * (marker 0) */
         if (copy_to_user((void *)(uintptr_t)sp, args, sizeof(args)) < 0) goto fatal;
     }
 
-    /* Write the sigreturn trampoline.  It loads the restore-frame ADDRESS into
-     * ecx and a TYPE marker into edx, then traps into sigreturn:
+    /* The trampoline loads the restore-frame ADDRESS into ecx and a TYPE
+     * marker into edx (the last two words of the argument block above), then
+     * traps into sigreturn:
      *   marker 1 → restore from the ucontext's mcontext (which the handler may
      *              have MODIFIED — WasmTrapHandler / the SpiderMonkey JIT redirect
      *              the PC past a WASM trap by writing uc_mcontext.gregs[REG_EIP];
@@ -749,19 +764,6 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
      *   marker 0 → restore from the plain saved registers_t (no ucontext).
      * Encoding the address per-frame (instead of one kernel field) also makes
      * sigreturn correct under NESTED signals (a fault inside a handler). */
-    {
-        uint32_t restore_addr, marker;
-        if (sflags & SA_SIGINFO) { restore_addr = uctx_addr; marker = 1; }
-        else                                           { restore_addr = saved_addr; marker = 0; }
-        uint8_t tr[20] = { 0xB8, 0x77,0,0,0,    /* mov  eax, 0x77 (sigreturn) */
-                           0xB9, 0,0,0,0,       /* mov  ecx, restore_addr     */
-                           0xBA, 0,0,0,0,       /* mov  edx, marker           */
-                           0xCD, 0x80,          /* int  0x80                  */
-                           0x90, 0x90 };        /* pad                        */
-        tr[6]=restore_addr; tr[7]=restore_addr>>8; tr[8]=restore_addr>>16; tr[9]=restore_addr>>24;
-        tr[11]=marker; tr[12]=marker>>8; tr[13]=marker>>16; tr[14]=marker>>24;
-        if (copy_to_user((void *)(uintptr_t)tramp_addr, tr, 20) < 0) goto fatal;
-    }
     current_proc->sigframe_addr = saved_addr;
 
     /* The frame now carries the mask to restore, so sigsuspend's stash has done

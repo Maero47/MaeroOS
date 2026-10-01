@@ -140,6 +140,16 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     random_init(mb_phys, initrd_phys_start ^ initrd_phys_end);
 
     /* ── M6: VMM ─────────────────────────────────────────────────────────── */
+    /* "nonx" on the command line: PAE paging without EFER.NXE, for telling
+     * an NX fault from anything else (tbl_set then never writes bit 63). */
+    {
+        const char *c = boot_info_cmdline();
+        for (; c && *c; c++)
+            if ((c == boot_info_cmdline() || c[-1] == ' ') &&
+                c[0] == 'n' && c[1] == 'o' && c[2] == 'n' && c[3] == 'x' &&
+                (c[4] == '\0' || c[4] == ' '))
+                paging_nx_disable();
+    }
     paging_init();
     paging_set_kernel_permissions();
 

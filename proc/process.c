@@ -334,8 +334,12 @@ struct proc *proc_create_userproc(const uint8_t *code, uint32_t code_len,
         return NULL;
     }
 
+    /* A raw code blob has no ELF headers to ask: it runs as a legacy image
+     * (its one page is code and data at once). */
+    p->read_implies_exec = 1;
+
     /* Allocate code page, map it in the process pgdir, copy bytecode */
-    uint32_t code_phys = pmm_alloc_frame();
+    uint32_t code_phys = paging_map_sigpage(p->pgdir_phys) == 0 ? pmm_alloc_frame() : 0;
     if (!code_phys) {
         pgdir_free_user(p->pgdir_phys);
         kstack_free(p->kstack);
@@ -423,13 +427,18 @@ struct proc *proc_create_from_elf(vfs_node_t *node, const char *name) {
     }
 
     uint32_t entry = 0, heap_end = 0;
-    if (elf_load(node, p->pgdir_phys, &entry, &heap_end) < 0) {
+    elf_info_t info;
+    if (elf_load_ex(node, p->pgdir_phys, &entry, &heap_end, &info) < 0 ||
+        paging_map_sigpage(p->pgdir_phys) != 0) {
         pgdir_free_user(p->pgdir_phys);
         kstack_free(p->kstack);
         p->state = PROC_UNUSED;
         return NULL;
     }
     p->heap_end = heap_end;
+    /* Execute policy from PT_GNU_STACK, as sys_execve sets it. */
+    p->read_implies_exec = info.stack_flags < 0;
+    p->exec_stack = info.stack_flags >= 0 && (info.stack_flags & PF_X);
 
     /* Allocate and map the user stack region. */
     uint32_t stack_top_phys = 0;
@@ -443,7 +452,8 @@ struct proc *proc_create_from_elf(vfs_node_t *node, const char *name) {
         }
         pmm_frame_incref(stack_phys);
         if (pgdir_map(p->pgdir_phys, va, stack_phys,
-                      PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
+                      PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER |
+                      page_nx_unless(proc_stack_exec(p))) != 0) {
             pmm_frame_decref(stack_phys);
             pgdir_free_user(p->pgdir_phys);
             kstack_free(p->kstack);

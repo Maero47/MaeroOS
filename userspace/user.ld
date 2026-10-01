@@ -7,6 +7,10 @@ OUTPUT_FORMAT(elf32-i386)
 PHDRS {
     text PT_LOAD FILEHDR PHDRS FLAGS(5);    /* PF_R | PF_X */
     data PT_LOAD FLAGS(6);                  /* PF_R | PF_W */
+    /* Non-executable stack.  Without a PT_GNU_STACK the kernel (like Linux)
+     * treats the program as a legacy one that may run code from anything
+     * readable (READ_IMPLIES_EXEC) and leaves its stack and heap executable. */
+    stack PT_GNU_STACK FLAGS(6);
 }
 
 SECTIONS {

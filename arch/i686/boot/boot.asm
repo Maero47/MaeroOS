@@ -102,7 +102,20 @@ boot_page_directory: resb 4096          ; 1024 PDEs
 boot_page_table1:    resb 4096          ; 1024 PTEs (first 4 MiB)
 boot_page_table2:    resb 4096          ; 1024 PTEs (4-8 MiB; kernel > 4 MiB now)
 boot_page_table3:    resb 4096          ; 1024 PTEs (8-12 MiB; headroom for big .bss)
-align 16
+; PAE boot (paging_pae = 1): 8-byte entries, so the 12 MiB take six 512-entry
+; page tables — boot_page_table1..3 hold the first three, these the rest.  They
+; must follow boot_page_table3 directly: the fill loop runs straight through.
+boot_pae_tables:     resb 3 * 4096
+; The four PAE page directories (PDPT order) and the PDPT itself.
+global boot_pae_pd
+boot_pae_pd:         resb 4 * 4096
+boot_pdpt:           resb 32
+; 1 when the boot tables (and so every page table the kernel builds) are PAE:
+; set below before paging is on, read by arch/i686/mm/paging.c.
+global paging_pae
+alignb 4
+paging_pae:          resd 1
+alignb 16
 stack_bottom: resb 16384               ; 16 KiB kernel stack
 stack_top:
 ; Multiboot 2 hands over its info block wherever the loader put it (under
@@ -156,6 +169,37 @@ _start:
     mov ebx, (mb2_info_copy - KERNEL_VMA)
     mov [ebx], edx
 .mb2_done:
+
+%ifndef NO_PAE
+    ; ── PAE?  CPUID.1:EDX bit 6.  (No CPUID — a 486 — means no PAE.) ─────────
+    ; EAX/EBX hold the boot magic and info pointer; park them in ESI/EBP while
+    ; CPUID clobbers EAX-EDX.
+    mov esi, eax
+    mov ebp, ebx
+    pushfd                              ; EFLAGS.ID toggles iff CPUID exists
+    pop ecx
+    mov edx, ecx
+    xor ecx, 0x00200000
+    push ecx
+    popfd
+    pushfd
+    pop ecx
+    push edx
+    popfd
+    xor ecx, edx
+    test ecx, 0x00200000
+    jz .no_pae
+    mov eax, 1
+    cpuid
+    test edx, 0x40                      ; PAE
+    jz .no_pae
+    mov eax, esi
+    mov ebx, ebp
+    jmp pae_boot
+.no_pae:
+    mov eax, esi
+    mov ebx, ebp
+%endif
 
     ; ── Zero boot_page_directory (physical address before paging) ────────────
     ; (label - KERNEL_VMA) converts virtual link address → physical load address
@@ -230,6 +274,7 @@ higher_half:
     ; reload CR3 so no stale identity translation survives in the TLB.
     mov dword [(boot_page_directory) + 0*4], 0
     mov dword [(boot_page_directory) + 1*4], 0
+higher_half_common:
     mov ecx, cr3
     mov cr3, ecx
 
@@ -247,3 +292,75 @@ higher_half:
 .hang:
     hlt
     jmp .hang
+
+%ifndef NO_PAE
+; ─── PAE boot tables ─────────────────────────────────────────────────────────
+; The same 12 MiB identity + higher-half map as above, in PAE form:
+;   PDPT[k]     = PD k                 (k = 0..3, one per GiB)
+;   PD0[0..5]   = the six page tables  (identity, removed after the jump)
+;   PD3[0..5]   = the six page tables  (0xC0000000 + 12 MiB)
+;   PD3[508+k]  = PD k                 (recursive: tables at 0xFF800000,
+;                                       directories at 0xFFFFC000)
+; .bss is already zero, so only the present entries are written; every high
+; dword stays 0.
+pae_boot:
+    mov dword [paging_pae - KERNEL_VMA], 1
+
+    ; 3072 PTEs, 8 bytes each, through boot_page_table1.. boot_pae_tables
+    mov edi, (boot_page_table1 - KERNEL_VMA)
+    mov esi, 0x003                      ; frame 0, Present + Read/Write
+    mov ecx, 6 * 512
+.pae_fill:
+    mov [edi], esi
+    add esi, 4096
+    add edi, 8
+    dec ecx
+    jnz .pae_fill
+
+    ; PD0[i] and PD3[i] = page table i, i = 0..5
+    mov edi, (boot_pae_pd - KERNEL_VMA)
+    mov esi, (boot_page_table1 - KERNEL_VMA) + 0x003
+    xor ecx, ecx
+.pae_pd:
+    mov [edi + ecx*8], esi
+    mov [edi + 3*4096 + ecx*8], esi
+    add esi, 4096
+    inc ecx
+    cmp ecx, 6
+    jne .pae_pd
+
+    ; PD3[508+k] = PD k (recursive), PDPT[k] = PD k
+    mov esi, (boot_pae_pd - KERNEL_VMA)
+    xor ecx, ecx
+.pae_rec:
+    lea edx, [esi + 0x003]
+    mov [(boot_pae_pd - KERNEL_VMA) + 3*4096 + (508*8) + ecx*8], edx
+    lea edx, [esi + 0x001]              ; a PDPTE takes Present only
+    mov [(boot_pdpt - KERNEL_VMA) + ecx*8], edx
+    add esi, 4096
+    inc ecx
+    cmp ecx, 4
+    jne .pae_rec
+
+    mov ecx, cr4
+    or  ecx, 0x20                       ; CR4.PAE
+    mov cr4, ecx
+    mov ecx, (boot_pdpt - KERNEL_VMA)
+    mov cr3, ecx
+    mov ecx, cr0
+    or  ecx, 0x80010000                 ; CR0.PG + CR0.WP
+    mov cr0, ecx
+    lea ecx, [pae_higher_half + KERNEL_VMA]
+    jmp ecx
+
+pae_higher_half:
+    ; drop the identity half: PD0[0..5]
+    mov edi, boot_pae_pd
+    xor ecx, ecx
+.pae_unid:
+    mov dword [edi + ecx*4], 0
+    inc ecx
+    cmp ecx, 12
+    jne .pae_unid
+    jmp higher_half_common              ; relative: stays on this alias
+%endif

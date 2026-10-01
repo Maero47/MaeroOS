@@ -103,7 +103,7 @@ void framebuffer_init(const multiboot_info_t *mbi) {
      * mapped tail on the first console scroll. */
     for (uint32_t off = 0; off < map_len; off += PAGE_SIZE) {
         if (paging_map(FB_VIRT_BASE + off, phys_page + off,
-                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_NOCACHE) != 0)
+                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_NOCACHE | PAGE_NX) != 0)
             panic("framebuffer_init: cannot map the framebuffer", NULL);
     }
     fb.virt = FB_VIRT_BASE + page_off;

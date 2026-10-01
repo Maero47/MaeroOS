@@ -300,7 +300,7 @@ static int heap_expand(size_t min_bytes) {
             kmem_oom_report("kernel heap address space", (unsigned)heap_end);
             return 0;
         }
-        if (vmm_alloc_page(heap_end, PAGE_WRITABLE) != 0) {
+        if (vmm_alloc_page(heap_end, PAGE_WRITABLE | PAGE_NX) != 0) {
             kmem_oom_report("physical memory for the kernel heap",
                             (unsigned)heap_end);
             return 0;
@@ -491,7 +491,7 @@ void heap_init(void) {
     /* Map the first heap page.  FATAL by design (audit category (c)): this runs
      * from kmain before there is a process, a scheduler or a caller to return
      * an error to, and a kernel with no heap at all cannot make progress. */
-    if (vmm_alloc_page(HEAP_START, PAGE_WRITABLE) != 0)
+    if (vmm_alloc_page(HEAP_START, PAGE_WRITABLE | PAGE_NX) != 0)
         panic("heap_init: no memory for the first heap page", NULL);
     heap_end = HEAP_START + PAGE_SIZE;
 

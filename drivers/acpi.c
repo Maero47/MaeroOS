@@ -169,7 +169,7 @@ void *uacpi_kernel_map(uacpi_phys_addr addr, uacpi_size len) {
     for (uint32_t i = 0; i < pages; i++) {
         /* Cannot fail: acpi_init reserved every page table of the window. */
         if (paging_map(virt + i * 4096, base + i * 4096,
-                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_NOCACHE) != 0)
+                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_NOCACHE | PAGE_NX) != 0)
             goto out;
     }
     map_next += pages * 4096;

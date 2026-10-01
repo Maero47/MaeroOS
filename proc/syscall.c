@@ -141,8 +141,7 @@ int access_ok(const void *ptr, size_t len) {
     uintptr_t last = (end - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
 
     for (;;) {
-        uint32_t *pde = paging_get_pde((uint32_t)page);
-        uint32_t pte = (*pde & PAGE_PRESENT) ? *paging_get_pte((uint32_t)page) : 0;
+        pte_t pte = pte_read((uint32_t)page);
         if (!(pte & PAGE_PRESENT) || !(pte & PAGE_USER)) {
             /* Not populated: fine if a VMA with access covers it — the copy
              * demand-faults it in (Linux access_ok only checks the range; the
@@ -1003,6 +1002,8 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
     child->root_node = parent->root_node;
     if (child->root_node) vfs_retain(child->root_node);
     child->heap_end  = fowner->heap_end;
+    child->read_implies_exec = parent->read_implies_exec;
+    child->exec_stack        = parent->exec_stack;
     child->umask     = parent->umask;
     child->uid = parent->uid; child->gid = parent->gid;
     child->euid = parent->euid; child->egid = parent->egid;
@@ -1054,16 +1055,14 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
      * Each parent page table is accessed via PAGE_TABLES_BASE + i*4096.
      * Each child page table is allocated and accessed via TEMP_MAP_VIRT.
      */
-    uint32_t *parent_pd = (uint32_t *)PAGE_DIR_VIRT;
-    uint32_t *child_pd  = (uint32_t *)paging_temp_map2(child->pgdir_phys);
+    volatile void *parent_pd = (volatile void *)(uintptr_t)PAGE_DIR_VIRT;
 
-    for (int pde_idx = 0; pde_idx < 768; pde_idx++) {
-        if (!(parent_pd[pde_idx] & PAGE_PRESENT)) continue;
+    for (uint32_t pde_idx = 0; pde_idx < USER_PT_COUNT; pde_idx++) {
+        if (!(tbl_get(parent_pd, pde_idx) & PAGE_PRESENT)) continue;
 
         /* Allocate a new page table for the child */
         uint32_t child_pt_phys = pmm_alloc_frame();
         if (!child_pt_phys) {
-            paging_temp_unmap2();
             pgdir_free_user(child->pgdir_phys);
             child->pgdir_phys = 0;
             fork_abort(child);
@@ -1071,23 +1070,19 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
         }
 
         /* Access the child's PT via TEMP_MAP_VIRT, zero it, then populate */
-        uint32_t *child_pt = (uint32_t *)paging_temp_map(child_pt_phys);
-        for (int k = 0; k < 1024; k++)
-            child_pt[k] = 0;
+        volatile void *child_pt = paging_temp_map(child_pt_phys);
+        __builtin_memset((void *)child_pt, 0, PAGE_SIZE);
 
         /* Access parent's PT via the recursive mapping */
-        uint32_t *parent_pt =
-            (uint32_t *)(PAGE_TABLES_BASE + (uint32_t)pde_idx * PAGE_SIZE);
+        volatile void *parent_pt = pt_window(pde_idx);
 
-        for (int pte_idx = 0; pte_idx < 1024; pte_idx++) {
-            uint32_t pte = parent_pt[pte_idx];
+        for (uint32_t pte_idx = 0; pte_idx < PT_ENTRIES; pte_idx++) {
+            pte_t pte = tbl_get(parent_pt, pte_idx);
             /* PAGE_PROTNONE entries own a frame too (mprotect(PROT_NONE)). */
-            if (!(pte & (PAGE_PRESENT | PAGE_PROTNONE))) {
-                child_pt[pte_idx] = 0;
+            if (!(pte & (PAGE_PRESENT | PAGE_PROTNONE)))
                 continue;
-            }
 
-            uint32_t frame_phys = pte & ~0xFFFU;
+            uint32_t frame_phys = pte_frame(pte);
 
             /* Every private page becomes COW, writable or not: a read-only
              * private page may be made writable later by mprotect(), and the
@@ -1101,25 +1096,24 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
                  * thread reaches WaitForProcessHandle before the launcher forks).
                  * A SINGLE local CR3 reload after the loop flushes the whole local
                  * TLB in O(1); the final tlb_shootdown handles the other CPUs. */
-                uint32_t cow_pte = (pte & ~(uint32_t)PAGE_WRITABLE) | PAGE_COW;
-                parent_pt[pte_idx] = cow_pte;
-                child_pt[pte_idx]  = cow_pte;
+                pte_t cow_pte = (pte & ~(pte_t)PAGE_WRITABLE) | PAGE_COW;
+                if (cow_pte != pte) tbl_set(parent_pt, pte_idx, cow_pte);
+                tbl_set(child_pt, pte_idx, cow_pte);
             } else {
                 /* Read-only or shared-memory page: share directly.  Shared
                  * pages must stay writable in both — COW would silently
                  * un-share them. */
-                child_pt[pte_idx] = pte;
+                tbl_set(child_pt, pte_idx, pte);
             }
             pmm_frame_incref(frame_phys);
         }
 
         paging_temp_unmap();   /* release child_pt (TEMP_MAP_VIRT) */
 
-        /* Install child's PT in child's PD (still mapped at TEMP_MAP_VIRT2) */
-        child_pd[pde_idx] = child_pt_phys | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+        /* Install child's PT in child's directory */
+        pgdir_install_pt(child->pgdir_phys, pde_idx,
+                         child_pt_phys | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
     }
-
-    paging_temp_unmap2();  /* release child_pd */
 
     /* Flush THIS CPU's TLB in one shot (reload CR3 with the parent's own pgdir,
      * still loaded) — drops every now-stale writable entry for the pages just
@@ -1649,15 +1643,16 @@ static int sys_brk(registers_t *regs) {
         }
         for (; va < end; va += PAGE_SIZE) {
             /* Skip pages already mapped (old_brk might not be page-aligned) */
-            if (va < old_brk && (*paging_get_pde(va) & PAGE_PRESENT) &&
-                (*paging_get_pte(va) & PAGE_PRESENT))
+            if (va < old_brk && pde_present(va) &&
+                (pte_get(va) & PAGE_PRESENT))
                 continue;
 
             uint32_t phys = pmm_alloc_frame();
             if (!phys) return -12;  /* -ENOMEM */
             pmm_frame_incref(phys);
             if (paging_map(va, phys,
-                           PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
+                           PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER |
+                           page_nx_unless(current_proc->read_implies_exec)) != 0) {
                 pmm_frame_decref(phys);
                 return -12;         /* -ENOMEM; heap_end unchanged, so the
                                      * pages mapped so far are simply spare */
@@ -2037,6 +2032,15 @@ static int sys_exec(registers_t *regs) {
         pgdir_free_user(new_pgdir);
         EXEC_FAIL(-8);  /* -ENOEXEC */
     }
+    /* Execute policy of the new image (Linux load_elf_binary): no
+     * PT_GNU_STACK → READ_IMPLIES_EXEC; PT_GNU_STACK with PF_X → an
+     * executable stack. */
+    int new_rie        = einfo.stack_flags < 0;
+    int new_stack_exec = new_rie || (einfo.stack_flags & PF_X);
+    if (paging_map_sigpage(new_pgdir) != 0) {
+        pgdir_free_user(new_pgdir);
+        EXEC_FAIL(-12);
+    }
     uint32_t prog_entry = einfo.entry;   /* main program entry (AT_ENTRY) */
     uint32_t entry      = einfo.entry;   /* address we actually iret to */
     uint32_t heap_end   = einfo.heap_end;
@@ -2267,7 +2271,8 @@ static int sys_exec(registers_t *regs) {
             paging_temp_unmap();
             preempt_enable();
             if (pgdir_map(new_pgdir, va, stack_phys,
-                          PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
+                          PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER |
+                          page_nx_unless(new_stack_exec)) != 0) {
                 pmm_frame_decref(stack_phys);
                 kfree(uargv_ptrs);
                 kfree(uenvp_ptrs);
@@ -2296,6 +2301,8 @@ static int sys_exec(registers_t *regs) {
     uint32_t old_pgdir = current_proc->pgdir_phys;
     current_proc->pgdir_phys = new_pgdir;
     current_proc->heap_end   = heap_end;
+    current_proc->read_implies_exec = (uint8_t)new_rie;
+    current_proc->exec_stack        = (uint8_t)(new_stack_exec && !new_rie);
     current_proc->mmap_next  = mmap_floor;
     /* Image span + heap base for a real /proc/self/maps. */
     current_proc->image_start = einfo.load_bias ? einfo.load_bias
@@ -3715,7 +3722,7 @@ struct vma {
  * growth window (Linux: mmap_base sits below the stack plus stack_guard_gap;
  * audit M14). */
 #define MMAP_FLOOR   0x40000000U
-#define MMAP_TOP     ((uint32_t)USER_STACK_TOP - (8U << 20))
+#define MMAP_TOP     SIGPAGE_VA      /* stack window minus the sigreturn page */
 
 /* Small mappings are populated at mmap time; large ones fault in lazily (8 MiB
  * thread stacks and multi-hundred-MiB libraries mostly go untouched). */
@@ -3732,15 +3739,16 @@ static inline void vma_irq_restore(uint32_t f) {
 /* A PTE that owns a frame: present, or PROT_NONE'd (not present, PAGE_PROTNONE
  * marker, frame kept so the data survives an mprotect(PROT_NONE)/mprotect(RW)
  * round trip exactly like Linux's _PAGE_PROTNONE). */
-static inline int pte_mapped(uint32_t pte) {
+static inline int pte_mapped(pte_t pte) {
     return (pte & (PAGE_PRESENT | PAGE_PROTNONE)) != 0;
 }
 
-/* PTE flag bits for a freshly populated page of a mapping with `prot`. */
-static uint32_t pte_flags_for(uint32_t prot, uint32_t shared) {
-    uint32_t f = PAGE_USER | (shared ? PAGE_SHARED : 0);
-    if (prot == 0) return f | PAGE_PROTNONE;          /* inaccessible, frame kept */
-    f |= PAGE_PRESENT;
+/* PTE flag bits for a freshly populated page of a mapping with `prot`
+ * (already widened by proc_prot_adjust where the image asks for it). */
+static pte_t pte_flags_for(uint32_t prot, uint32_t shared) {
+    pte_t f = PAGE_USER | (shared ? PAGE_SHARED : 0);
+    if (prot == 0) return f | PAGE_PROTNONE | PAGE_NX; /* inaccessible, frame kept */
+    f |= PAGE_PRESENT | page_nx_unless(prot & PROT_EXEC_K);
     if (prot & PROT_WRITE_K) f |= PAGE_WRITABLE;
     return f;
 }
@@ -3875,13 +3883,13 @@ static uint32_t first_mapped_page(uint32_t start, uint32_t end) {
 }
 static uint32_t first_mapped_page_inner(uint32_t start, uint32_t end) {
     for (uint32_t a = start; a < end; ) {
-        if (!(*paging_get_pde(a) & PAGE_PRESENT)) {
-            uint32_t n = (a & ~0x3FFFFFU) + 0x400000U;   /* next 4 MiB PDE */
+        if (!pde_present(a)) {
+            uint32_t n = pt_next(a);   /* next page table */
             if (n <= a) break;                            /* wrapped */
             a = n;
             continue;
         }
-        if (pte_mapped(*paging_get_pte(a))) return a ? a : 1;
+        if (pte_mapped(pte_get(a))) return a ? a : 1;
         a += PAGE_SIZE;
     }
     return 0;
@@ -4329,8 +4337,8 @@ static int shmem_truncate(vfs_node_t *node, uint32_t new_size) {
  * the shared temp-map slot ours across the BKL-held, non-sleeping vfs_read. */
 static int vma_populate_page(struct vma *v, uint32_t addr) {
     addr &= ~0xFFFU;
-    if ((*paging_get_pde(addr) & PAGE_PRESENT) &&
-        pte_mapped(*paging_get_pte(addr))) return 1;     /* already there */
+    if (pde_present(addr) &&
+        pte_mapped(pte_get(addr))) return 1;     /* already there */
     uint32_t phys = pmm_alloc_frame();
     if (!phys) return 0;
     pmm_frame_incref(phys);
@@ -4409,16 +4417,16 @@ static void unmap_pages(uint32_t start, uint32_t end) {
     uint32_t batch[256];
     int nb = 0;
     for (uint32_t va = start; va < end; ) {
-        if (!(*paging_get_pde(va) & PAGE_PRESENT)) {
-            uint32_t n = (va & ~0x3FFFFFU) + 0x400000U;
+        if (!pde_present(va)) {
+            uint32_t n = pt_next(va);
             if (n <= va) break;
             va = n;
             continue;
         }
-        uint32_t *pte = paging_get_pte(va);
-        if (pte_mapped(*pte)) {
-            batch[nb++] = *pte & ~0xFFFU;       /* remember frame; free AFTER flush */
-            *pte = 0;
+        pte_t pte = pte_get(va);
+        if (pte_mapped(pte)) {
+            batch[nb++] = pte_frame(pte);       /* remember frame; free AFTER flush */
+            pte_set(va, 0);
             tlb_flush_single(va);
             if (nb == 256) {
                 tlb_shootdown();                /* no CPU keeps a stale entry now */
@@ -4458,7 +4466,8 @@ uint32_t mm_shm_attach(const uint32_t *frames, uint32_t npages) {
     for (uint32_t i = 0; i < npages; i++) {
         pmm_frame_incref(frames[i]);        /* this PTE's reference */
         if (paging_map(base + i * PAGE_SIZE, frames[i],
-                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_SHARED) != 0)
+                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_SHARED |
+                       page_nx_unless(current_proc->read_implies_exec)) != 0)
             panic("shmat: reserved page table vanished", NULL);
     }
     return base;
@@ -4466,9 +4475,9 @@ uint32_t mm_shm_attach(const uint32_t *frames, uint32_t npages) {
 
 /* Is the page at va still mapping `frame` (present or PROT_NONE'd)? */
 static int pte_maps_frame(uint32_t va, uint32_t frame) {
-    if (!(*paging_get_pde(va) & PAGE_PRESENT)) return 0;
-    uint32_t pte = *paging_get_pte(va);
-    return pte_mapped(pte) && (pte & ~0xFFFU) == frame;
+    if (!pde_present(va)) return 0;
+    pte_t pte = pte_get(va);
+    return pte_mapped(pte) && pte_frame(pte) == frame;
 }
 
 uint32_t mm_shm_mapped(uint32_t base, const uint32_t *frames, uint32_t npages) {
@@ -4489,7 +4498,7 @@ void mm_shm_detach(uint32_t base, const uint32_t *frames, uint32_t npages) {
     for (uint32_t i = 0; i < npages; i++) {
         uint32_t va = base + i * PAGE_SIZE;
         if (pte_maps_frame(va, frames[i])) {
-            *paging_get_pte(va) = 0;
+            pte_set(va, 0);
             tlb_flush_single(va);
             cleared[i / 32] |= 1U << (i % 32);
             if (!run_len) run = va;
@@ -4510,7 +4519,8 @@ void mm_shm_detach(uint32_t base, const uint32_t *frames, uint32_t npages) {
 static int sys_mmap2(registers_t *regs) {
     uint32_t addr   = regs->ebx;
     uint32_t length = regs->ecx;
-    uint32_t prot   = regs->edx & 0x7;           /* PROT_SEM/GROWS* ignored */
+    uint32_t prot   = proc_prot_adjust(current_proc, regs->edx & 0x7);
+                                                 /* PROT_SEM/GROWS* ignored */
     int flags  = (int)regs->esi;
     int fd     = (int)regs->edi;
     /* mmap2's 6th arg (offset in PAGES) is passed in EBP on i386, which the
@@ -4599,7 +4609,7 @@ static int sys_mmap2(registers_t *regs) {
         if (!vma_add(va, end, prot, VMA_F_SHARED | nowrite, NULL, 0)) return -12;
         /* SHARED: no COW on fork; bit 4 is PCD.  A PROT_READ view of the
          * framebuffer is read-only like any other mapping. */
-        uint32_t fb_flags = PAGE_PRESENT | PAGE_USER | PAGE_SHARED | (1U << 4) |
+        pte_t fb_flags = PAGE_PRESENT | PAGE_USER | PAGE_SHARED | (1U << 4) | PAGE_NX |
                             ((prot & PROT_WRITE_K) ? PAGE_WRITABLE : 0);
         for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
             if (paging_map(va + i, fb_phys + i, fb_flags) != 0) {
@@ -4737,16 +4747,15 @@ static int sys_munmap(registers_t *regs) {
  * pages that are not copy-on-write — a COW page stays read-only and the write
  * fault copies it (or reuses it when it is the last reference). */
 static void pte_apply_prot(uint32_t va, uint32_t prot) {
-    if (!(*paging_get_pde(va) & PAGE_PRESENT)) return;      /* not populated */
-    uint32_t *pte = paging_get_pte(va);
-    uint32_t old = *pte;
+    if (!pde_present(va)) return;      /* not populated */
+    pte_t old = pte_get(va);
     if (!pte_mapped(old) || !(old & PAGE_USER)) return;
-    uint32_t nw = old & ~(uint32_t)(PAGE_PRESENT | PAGE_WRITABLE | PAGE_PROTNONE |
-                                    PAGE_WRPROT);
+    pte_t nw = old & ~(pte_t)(PAGE_PRESENT | PAGE_WRITABLE | PAGE_PROTNONE |
+                              PAGE_WRPROT | PAGE_NX);
     if (prot == 0) {
-        nw |= PAGE_PROTNONE;
+        nw |= PAGE_PROTNONE | PAGE_NX;
     } else {
-        nw |= PAGE_PRESENT;
+        nw |= PAGE_PRESENT | page_nx_unless(prot & PROT_EXEC_K);
         if (prot & PROT_WRITE_K) {
             if (!(old & PAGE_COW)) nw |= PAGE_WRITABLE;
         } else {
@@ -4761,7 +4770,7 @@ static void pte_apply_prot(uint32_t va, uint32_t prot) {
         }
     }
     if (nw != old) {
-        *pte = nw;
+        pte_set(va, nw);
         tlb_flush_single(va);
     }
 }
@@ -4775,7 +4784,7 @@ static int sys_mprotect(registers_t *regs) {
     if (addr & (PAGE_SIZE - 1)) return -22;
     if (len == 0) return 0;
     if (prot & ~(0x7U | 0x01000000U | 0x02000000U)) return -22;   /* GROWSDOWN/UP tolerated */
-    prot &= 0x7U;
+    prot = proc_prot_adjust(current_proc, prot & 0x7U);
     uint32_t end = addr + ((len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1));
     if (end < addr || end > 0xC0000000U) return -22;
 
@@ -4795,8 +4804,8 @@ static int sys_mprotect(registers_t *regs) {
     vma_protect_range(addr, end, prot);
 
     for (uint32_t va = addr; va < end; ) {
-        if (!(*paging_get_pde(va) & PAGE_PRESENT)) {
-            uint32_t n = (va & ~0x3FFFFFU) + 0x400000U;
+        if (!pde_present(va)) {
+            uint32_t n = pt_next(va);
             if (n <= va) break;
             va = n;
             continue;
@@ -4852,19 +4861,18 @@ static int sys_madvise(registers_t *regs) {
     uint32_t batch[256];
     int nb = 0;
     for (uint32_t va = addr; va < end; ) {
-        if (!(*paging_get_pde(va) & PAGE_PRESENT)) {
-            uint32_t n = (va & ~0x3FFFFFU) + 0x400000U;
+        if (!pde_present(va)) {
+            uint32_t n = pt_next(va);
             if (n <= va) break;
             va = n;
             continue;
         }
-        uint32_t *pte = paging_get_pte(va);
-        uint32_t old = *pte;
+        pte_t old = pte_get(va);
         if (pte_mapped(old) && (old & PAGE_USER) && !(old & PAGE_SHARED)) {
-            uint32_t frame = old & ~0xFFFU;
+            uint32_t frame = pte_frame(old);
             if (vma_find(va)) {
                 batch[nb++] = frame;             /* free AFTER the shootdown */
-                *pte = 0;
+                pte_set(va, 0);
                 tlb_flush_single(va);
                 if (nb == 256) {
                     tlb_shootdown();
@@ -4890,9 +4898,9 @@ static int sys_madvise(registers_t *regs) {
                          * would come back writable while still flagged
                          * write-protected, and the next store would succeed
                          * where Linux raises SIGSEGV. */
-                        uint32_t nflags = old & 0xFFFU & ~(uint32_t)PAGE_COW;
+                        pte_t nflags = old & (0xFFFU | PAGE_NX) & ~(pte_t)PAGE_COW;
                         if (!(old & PAGE_WRPROT)) nflags |= PAGE_WRITABLE;
-                        *pte = nf | nflags;
+                        pte_set(va, nf | nflags);
                         tlb_flush_single(va);
                         batch[nb++] = frame;
                         if (nb == 256) {
@@ -4933,8 +4941,8 @@ static int sys_mincore(registers_t *regs) {
         if (n > sizeof(buf)) n = sizeof(buf);
         for (uint32_t i = 0; i < n; i++) {
             uint32_t va = addr + (done + i) * PAGE_SIZE;
-            int mapped = (*paging_get_pde(va) & PAGE_PRESENT) &&
-                         pte_mapped(*paging_get_pte(va));
+            int mapped = pde_present(va) &&
+                         pte_mapped(pte_get(va));
             /* Linux: ENOMEM if a page is in no mapping at all. */
             if (!mapped && !vma_find(va)) return -12;
             buf[i] = mapped ? 1 : 0;              /* resident */
@@ -4995,14 +5003,13 @@ static int mremap_move(uint32_t old, uint32_t len, uint32_t new) {
     vma_remove_range(old, old + len);
     for (uint32_t off = 0; off < len; off += PAGE_SIZE) {
         uint32_t va = old + off;
-        if (!(*paging_get_pde(va) & PAGE_PRESENT)) continue;
-        uint32_t *pte = paging_get_pte(va);
-        uint32_t e = *pte;
+        if (!pde_present(va)) continue;
+        pte_t e = pte_get(va);
         if (!pte_mapped(e)) continue;
-        *pte = 0;
+        pte_set(va, 0);
         tlb_flush_single(va);
         /* Cannot fail: the table was reserved above. */
-        if (paging_map(new + off, e & ~0xFFFU, e & 0xFFFU) != 0)
+        if (paging_map(new + off, pte_frame(e), e & (0xFFFU | PAGE_NX)) != 0)
             panic("mremap: reserved page table vanished", NULL);
     }
     tlb_shootdown();
@@ -7371,8 +7378,8 @@ static int sys_sysinfo(registers_t *regs) {
 static uint32_t futex_resolve_phys(uint32_t uaddr) {
     uint32_t page = uaddr & ~0xFFFU;
     if (page >= 0xC0000000U) return 0;              /* kernel space — not a futex */
-    if (!(*paging_get_pde(page) & PAGE_PRESENT)) return 0;
-    uint32_t pte = *paging_get_pte(page);
+    if (!pde_present(page)) return 0;
+    pte_t pte = pte_get(page);
     if (!(pte & PAGE_PRESENT)) return 0;
     return (pte & ~0xFFFU) | (uaddr & 0xFFF);
 }
@@ -8224,6 +8231,8 @@ static int sys_clone(registers_t *regs) {
     if (child->ctty)
         vfs_retain(child->ctty);
 
+    child->read_implies_exec = parent->read_implies_exec;
+    child->exec_stack        = parent->exec_stack;
     child->pgdir_phys = parent->pgdir_phys;
     pgdir_retain(child->pgdir_phys);
 
