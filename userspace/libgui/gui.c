@@ -696,8 +696,11 @@ int gui_poll(gui_window_t *gui) {
             gui->width = event.w;
             gui->height = event.h;
             if (size_changed) {
-                /* New body size → new shared surface, then re-render. */
-                gui_make_surface(gui);
+                /* New body size → new shared surface, then re-render.  On
+                 * failure the old (smaller) surface stays in use. */
+                if (gui_make_surface(gui) < 0)
+                    gui_trace("gui", "surface %dx%d failed", gui->width,
+                              gui->height);
                 if (gui->layout)
                     gui->layout(gui);
                 gui_draw(gui);

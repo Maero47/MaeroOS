@@ -36,7 +36,7 @@ struct proc;
  */
 
 #define SHM_MAX_OBJECTS 32
-#define SHM_MAX_PAGES   768   /* 3 MiB — one 1024x768x32 surface */
+#define SHM_MAX_PAGES   2048  /* 8 MiB — one 1920x1080x32 surface (a maximized window) */
 #define SHM_MAX_ATTACH  256   /* attachments system-wide */
 
 int shm_sys_create(uint32_t npages);

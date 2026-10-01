@@ -489,6 +489,10 @@ class GuiSmoke:
         m = self.con.wait_re(r"\[term\] grid (\d+)x(\d+)", start=self.launched_at)
         self.con.at = at
         cols, rows = int(m.group(1)), int(m.group(2))
+        self.check_pty_size(win, cols, rows)
+        return win
+
+    def check_pty_size(self, win, cols, rows):
         self.type_in_terminal(win, "busybox stty size > /tmp/guismoke.size",
                               "/tmp/guismoke.term")
         out = self.con.run("cat /tmp/guismoke.size")
@@ -497,7 +501,28 @@ class GuiSmoke:
         if size != [str(rows), str(cols)]:
             raise AssertionError(f"pty size {size} != terminal grid "
                                  f"{rows}x{cols}")
-        return win
+
+    def term_maximize(self, win):
+        """The maximize button resizes the terminal: a bigger surface, a
+        bigger grid, and the pty reports it.  Updates win to the maximized
+        geometry (the desktop's maximize rule: 8px margins above the
+        taskbar), so the close button is found again."""
+        m = re.findall(r"\[term\] grid (\d+)x(\d+)",
+                       self.con.text()[self.launched_at:])
+        old = tuple(int(v) for v in m[-1])
+        maxbtn = (win["close"][0] - 21 - 14, win["close"][1])
+        start = self.con.mark()
+        self.click(*maxbtn)
+        m = self.con.wait_re(r"\[term\] grid (\d+)x(\d+)", start=start)
+        cols, rows = int(m.group(1)), int(m.group(2))
+        if cols <= old[0] or rows <= old[1]:
+            raise AssertionError(f"maximized grid {cols}x{rows} is not "
+                                 f"larger than {old[0]}x{old[1]}")
+        win.update(x=8, y=8, w=self.fb[0] - 16, h=self.fb[1] - 40 - 16)
+        win["close"] = (win["x"] + win["w"] - 8 - 21, win["y"] + 1 + 9)
+        self.settle()
+        self.shot("term-maximized")
+        self.check_pty_size(win, cols, rows)
 
     def term_vi(self, win):
         """A full-screen program: vi edits and writes a file, which needs
@@ -805,6 +830,7 @@ class GuiSmoke:
         view = step("viewer", self.viewer, term)
         step("close viewer (button)", self.close, view, "button", term)
         step("terminal vi", self.term_vi, term)
+        step("terminal maximize", self.term_maximize, term)
         step("close terminal (button)", self.close, term)
         files = step("files", self.files)
         step("close files (button)", self.close, files)
