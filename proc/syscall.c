@@ -17,6 +17,7 @@
 #include "../drivers/framebuffer.h"
 #include "../drivers/acpi.h"
 #include "../arch/i686/cpu/smp.h"
+#include "../arch/i686/cpu/bklstat.h"
 #include "../drivers/keyboard.h"
 #include "../drivers/nvme.h"
 #include "../kernel/random.h"
@@ -10609,6 +10610,16 @@ void syscall_dispatch(registers_t *regs) {
         kprof_reset();
         ret = 0;
         break;
+#ifdef BKLSTAT
+    case 507:  /* BKL contention statistics (make BKLSTAT=1): dump, reset */
+        bklstat_dump();
+        ret = 0;
+        break;
+    case 508:
+        bklstat_reset();
+        ret = 0;
+        break;
+#endif
     case 505:  /* register Ctrl+Alt+Backspace kill target (desktop only) */
         keyboard_set_kill_target((int)regs->ebx);
         ret = 0;

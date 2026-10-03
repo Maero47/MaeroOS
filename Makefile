@@ -47,10 +47,32 @@ endif
 # makes every sound cross their 32-bit wrap (drivers/hda.c, drivers/ac97.c).
 AUDIO_POS_START ?= 0U
 CFLAGS  += -DAUDIO_POS_START=$(AUDIO_POS_START)
+# Big Kernel Lock contention statistics (arch/i686/cpu/bklstat.h): `make
+# BKLSTAT=1`, or `make bench-bkl`, which builds kernel-bklstat.elf with it.
+# Off by default: a normal build compiles none of it.
+BKLSTAT ?= 0
+ifeq ($(BKLSTAT),1)
+CFLAGS  += -DBKLSTAT=1
+endif
+# Lock primitives (include/kernel/klock.h): `make KLOCKDEP=1` turns on the
+# lock-order checker; `make KLOCK_TEST=1` (implies it) adds the SMP lock
+# torture threads at boot (`make smoke-klock`).  Both off by default.
+KLOCKDEP ?= 0
+ifeq ($(KLOCKDEP),1)
+CFLAGS  += -DKLOCKDEP=1
+endif
+KLOCK_TEST ?= 0
+ifneq ($(KLOCK_TEST),0)
+CFLAGS  += -DKLOCK_TEST=$(KLOCK_TEST)
+endif
 KTRACE_STAMP := .ktrace-stamp
-$(shell [ "$$(cat $(KTRACE_STAMP) 2>/dev/null)" = "$(KTRACE) $(KSTACK_TEST) $(KHEAP_TEST) $(AUDIO_POS_START)" ] || echo "$(KTRACE) $(KSTACK_TEST) $(KHEAP_TEST) $(AUDIO_POS_START)" > $(KTRACE_STAMP))
+KSTAMP_VAL := $(KTRACE) $(KSTACK_TEST) $(KHEAP_TEST) $(AUDIO_POS_START) $(BKLSTAT) $(KLOCKDEP) $(KLOCK_TEST)
+$(shell [ "$$(cat $(KTRACE_STAMP) 2>/dev/null)" = "$(KSTAMP_VAL)" ] || echo "$(KSTAMP_VAL)" > $(KTRACE_STAMP))
 
 ASFLAGS := -f elf32 -g
+ifeq ($(BKLSTAT),1)
+ASFLAGS += -DBKLSTAT=1
+endif
 
 LDFLAGS := -ffreestanding -nostdlib -lgcc \
            -T./linker.ld \
@@ -149,7 +171,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-net-virtio smoke-tcpsrv smoke-net6 smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-gfxmode smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-largefile smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-alpinex disk-alpinex smoke-alpine-net smoke-audio disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-net-virtio smoke-tcpsrv smoke-net6 smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-gfxmode smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-largefile smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-alpinex disk-alpinex smoke-alpine-net smoke-audio disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched bench-bkl smoke-klock
 
 all: $(TARGET)
 
@@ -169,7 +191,7 @@ third_party/uacpi/%.o: third_party/uacpi/%.c
 	$(CC) $(UACPI_CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # NASM assembly
-%.o: %.asm
+%.o: %.asm $(KTRACE_STAMP)
 	$(AS) $(ASFLAGS) $< -o $@
 
 # Build userspace binaries (libc, init, shell)
@@ -479,6 +501,22 @@ bench-gfx: $(TARGET) iso disk
 # e.g. "--smp 4 --tag mychange".  Results go to build/bench-sched/results.txt.
 bench-sched: $(TARGET) initrd
 	python3 tools/bench_sched.py $(BENCH_SCHED_ARGS)
+
+# Big Kernel Lock contention (docs/smp-plan.md): rebuilds the kernel with
+# BKLSTAT=1 and runs syscall-scaling and busybox workloads under -smp 4,
+# printing where the lock is held and who spins for it.  BENCH_BKL_ARGS passes
+# e.g. "--smp 8 --tag mychange".  Results go to build/bench-bkl/.  The next
+# plain `make` rebuilds the kernel without the counters.
+bench-bkl:
+	$(MAKE) BKLSTAT=1 $(TARGET) initrd
+	python3 tools/bench_bkl.py $(BENCH_BKL_ARGS)
+
+# Lock primitives torture (kernel/klock.c): rebuilds the kernel with
+# KLOCK_TEST=1 (lock-order checker on), boots it with -smp 4 and expects
+# "[KLOCK-TEST] PASS" with the threads running on several CPUs at once.
+smoke-klock:
+	$(MAKE) KLOCK_TEST=1 $(TARGET) initrd
+	python3 tools/smoke_klock.py
 
 # The desktop driven with USB input only: qemu-xhci with usb-kbd, usb-tablet
 # and usb-mouse (drivers/usb/), including a login typed on the USB keyboard.

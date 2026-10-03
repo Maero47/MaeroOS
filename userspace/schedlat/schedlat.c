@@ -13,7 +13,11 @@
  *                           without a hand-off)
  *   schedlat time WORKLOAD   runs a busybox sh workload, prints its wall time:
  *                           shloop (arithmetic loop), forks (200 fork+exec),
- *                           targz (tar|gzip of /lib /bin /usr), par4 (4 shloops)
+ *                           targz (tar|gzip of /lib /bin /usr), par4 (4 shloops),
+ *                           forks4 / targz4 (four forks / targz at once)
+ *   schedlat scale KIND P MS P processes in a syscall loop (getpid, pipe,
+ *                           stat, mmap) for MS ms: total ops/s
+ *   schedlat bkl dump|reset  BKL statistics of a BKLSTAT=1 kernel
  *   schedlat audio HOGS N   a producer sends a buffer every 10 ms (absolute
  *                           clock_nanosleep) through a pipe; the consumer counts
  *                           late deliveries
@@ -36,6 +40,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -177,7 +182,73 @@ static const char *const workloads[][2] = {
     { "forks",  "i=0; while [ $i -lt 200 ]; do /true; i=$((i+1)); done" },
     { "targz",  "busybox tar cf - /lib /bin /usr | busybox gzip > /tmp/schedlat.gz; busybox rm -f /tmp/schedlat.gz" },
     { "par4",   "for j in 1 2 3 4; do (" SHLOOP ") & done; wait" },
+    { "forks4", "for j in 1 2 3 4; do (i=0; while [ $i -lt 100 ]; do /true; i=$((i+1)); done) & done; wait" },
+    { "targz4", "for j in 1 2 3 4; do (busybox tar cf - /lib /bin /usr | busybox gzip > /tmp/schedlat$j.gz) & done; wait; busybox rm -f /tmp/schedlat?.gz" },
 };
+
+/*
+ * schedlat scale KIND PROCS MS: PROCS processes each run one syscall-bound
+ * loop for MS milliseconds and the total operations per second is printed.
+ * With one Big Kernel Lock the total stops growing with PROCS as soon as the
+ * kernel half of the loop saturates the lock (docs/smp-plan.md).
+ *   getpid  the cheapest syscall: trap + lock + return
+ *   pipe    write 64 bytes into a private pipe and read them back
+ *   stat    stat("/bin/busybox"): path walk in the VFS
+ *   mmap    mmap + touch + munmap one anonymous page (PMM, page tables, TLB)
+ */
+static long scale_loop(const char *kind, uint64_t end_ns) {
+    long n = 0;
+    int p[2] = { -1, -1 };
+    char buf[64] = { 0 };
+    struct stat st;
+    if (!strcmp(kind, "pipe") && pipe(p) < 0) return -1;
+    while (mono_ns() < end_ns) {
+        for (int k = 0; k < 64; k++) {
+            if (!strcmp(kind, "getpid")) syscall(SYS_getpid);
+            else if (p[0] >= 0) {
+                if (write(p[1], buf, sizeof buf) != sizeof buf ||
+                    read(p[0], buf, sizeof buf) != sizeof buf) return -1;
+            } else if (!strcmp(kind, "stat")) {
+                if (stat("/bin/busybox", &st) < 0) return -1;
+            } else {
+                char *m = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (m == MAP_FAILED) return -1;
+                m[0] = 1;
+                munmap(m, 4096);
+            }
+        }
+        n += 64;
+    }
+    return n;
+}
+
+static int run_scale(const char *kind, int procs, int ms) {
+    int rp[2];
+    if (procs < 1) procs = 1;
+    if (procs > 32) procs = 32;
+    if (pipe(rp) < 0) { perror("pipe"); return 1; }
+    uint64_t start = mono_ns() + 50000000ULL;     /* everyone forked by then */
+    uint64_t end = start + (uint64_t)ms * 1000000ULL;
+    for (int i = 0; i < procs; i++) {
+        if (fork() == 0) {
+            while (mono_ns() < start) ;
+            long n = scale_loop(kind, end);
+            write(rp[1], &n, sizeof n);
+            _exit(0);
+        }
+    }
+    long total = 0, bad = 0;
+    for (int i = 0; i < procs; i++) {
+        long n = 0;
+        if (read(rp[0], &n, sizeof n) != sizeof n || n < 0) bad++;
+        else total += n;
+    }
+    while (wait(NULL) > 0) ;
+    printf("schedlat scale %s procs=%d ops=%ld ops_per_s=%ld%s\n", kind, procs, total,
+           (long)(total * 1000.0 / ms), bad ? " (errors)" : "");
+    return bad ? 1 : 0;
+}
 
 static int run_time(const char *name) {
     const char *script = NULL;
@@ -280,6 +351,17 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "handoff")) return run_handoff();
     if (argc > 2 && !strcmp(argv[1], "time")) return run_time(argv[2]);
     if (argc > 1 && !strcmp(argv[1], "nice")) return run_nice();
+    if (argc > 4 && !strcmp(argv[1], "scale"))
+        return run_scale(argv[2], atoi(argv[3]), atoi(argv[4]));
+    /* BKL statistics of a `make BKLSTAT=1` kernel: syscall 507 dumps them to
+     * the console, 508 resets them (ENOSYS in a normal build). */
+    if (argc > 2 && !strcmp(argv[1], "bkl")) {
+        if (syscall(!strcmp(argv[2], "reset") ? 508 : 507) < 0) {
+            perror("schedlat bkl");
+            return 1;
+        }
+        return 0;
+    }
     if (argc < 2) {
         fprintf(stderr, "usage: schedlat pipe|futex|audio [hogs] [iters]\n");
         return 2;
