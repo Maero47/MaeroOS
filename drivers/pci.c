@@ -205,20 +205,3 @@ uint32_t pci_bar_size(const pci_device_t *d, int i) {
     return mask ? ~mask + 1 : 0;
 }
 
-/* The ID of the capability at config offset `off` and the next one's offset,
- * for walking a list with several capabilities of one ID (virtio). */
-uint8_t pci_cap_next(const pci_device_t *d, uint8_t off, uint8_t *id) {
-    if (!off) {
-        if (!(pci_read_config16(d->bus, d->slot, d->func, 0x06) & 0x10))
-            return 0;
-        off = pci_read_config8(d->bus, d->slot, d->func, 0x34) & 0xFC;
-    } else {
-        off = pci_read_config8(d->bus, d->slot, d->func, (uint8_t)(off + 1)) & 0xFC;
-    }
-    if (off && id) *id = pci_read_config8(d->bus, d->slot, d->func, off);
-    return off;
-}
-
-uint8_t pci_read8(const pci_device_t *d, uint8_t off) {
-    return pci_read_config8(d->bus, d->slot, d->func, off);
-}

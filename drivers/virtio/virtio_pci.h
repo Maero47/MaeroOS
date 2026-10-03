@@ -169,6 +169,7 @@ uint8_t  virtio_pci_config8(struct virtio_pci *vp, uint32_t off);
 uint16_t virtio_pci_config16(struct virtio_pci *vp, uint32_t off);
 uint32_t virtio_pci_config32(struct virtio_pci *vp, uint32_t off);
 void virtio_pci_config_write8(struct virtio_pci *vp, uint32_t off, uint8_t v);
+void virtio_pci_config_write32(struct virtio_pci *vp, uint32_t off, uint32_t v);
 
 /* " irq=msix/0xe4" or " irq=intx/11" etc. for /proc; bytes written. */
 int virtio_pci_describe_irq(struct virtio_pci *vp, char *buf, uint32_t cap);

@@ -2,13 +2,14 @@
  * virtio-gpu, 2D only (QEMU -device virtio-gpu-pci or virtio-vga; PCI
  * 1af4:1050).
  *
- * Transport: virtio 1.x over PCI ("modern"): the common, notify and device
- * configuration structures are found through the vendor capabilities and
- * mapped with mmio_map().  One split virtqueue, the control queue, is driven
- * synchronously and polled: a command is a two-descriptor chain (request,
- * response), the driver notifies and spins on the used ring.  Interrupts are
- * off (INTx disabled, no MSI-X vectors, VIRTQ_AVAIL_F_NO_INTERRUPT); the
- * cursor queue is not used (the desktop draws its own pointer).
+ * Transport: the generic virtio PCI transport and split virtqueues
+ * (drivers/virtio/virtio_pci.h, virtqueue.h); virtio-gpu is a modern-only
+ * device.  One virtqueue, the control queue, is driven synchronously and
+ * polled: a command is a two-descriptor chain (request, response), the
+ * driver publishes, kicks and spins on the used ring.  Interrupts are off
+ * (VIRTIO_IRQ_POLL: no MSI vector from the shared pool, INTx disabled,
+ * VIRTQ_AVAIL_F_NO_INTERRUPT); the cursor queue is not used (the desktop
+ * draws its own pointer).
  *
  * Display: the framebuffer is guest RAM, enough frames for the largest mode,
  * allocated once and mapped cached at the framebuffer window.  A mode is a
@@ -33,57 +34,16 @@
 #include "virtio_gpu.h"
 #include "framebuffer.h"
 #include "pci.h"
+#include "virtio/virtio_pci.h"
 #include "../arch/i686/cpu/spinlock.h"
 #include "../kernel/printk.h"
 #include "../lib/string.h"
-#include "../mm/mmio.h"
 #include "../mm/pmm.h"
 #include <kernel/boot_info.h>
 #include <kernel/config.h>
 #include <stdint.h>
 
-/* ── virtio over PCI ─────────────────────────────────────────────────────── */
-
-#define VIRTIO_PCI_CAP_COMMON_CFG  1
-#define VIRTIO_PCI_CAP_NOTIFY_CFG  2
-#define VIRTIO_PCI_CAP_DEVICE_CFG  4
-
-/* struct virtio_pci_common_cfg */
-#define VC_DEVICE_FEATURE_SELECT 0x00
-#define VC_DEVICE_FEATURE        0x04
-#define VC_DRIVER_FEATURE_SELECT 0x08
-#define VC_DRIVER_FEATURE        0x0C
-#define VC_MSIX_CONFIG           0x10
-#define VC_NUM_QUEUES            0x12
-#define VC_DEVICE_STATUS         0x14
-#define VC_QUEUE_SELECT          0x16
-#define VC_QUEUE_SIZE            0x18
-#define VC_QUEUE_MSIX_VECTOR     0x1A
-#define VC_QUEUE_ENABLE          0x1C
-#define VC_QUEUE_NOTIFY_OFF      0x1E
-#define VC_QUEUE_DESC            0x20
-#define VC_QUEUE_DRIVER          0x28
-#define VC_QUEUE_DEVICE          0x30
-
-#define VS_ACKNOWLEDGE  1
-#define VS_DRIVER       2
-#define VS_DRIVER_OK    4
-#define VS_FEATURES_OK  8
-#define VS_FAILED       128
-
-#define VIRTIO_F_VERSION_1_HI  (1U << 0)   /* feature bit 32 */
-#define VIRTIO_MSI_NO_VECTOR   0xFFFF
-
-#define VIRTQ_DESC_F_NEXT      1
-#define VIRTQ_DESC_F_WRITE     2
-#define VIRTQ_AVAIL_F_NO_INTERRUPT 1
-
 #define QSIZE 16                /* plenty for two in-flight commands */
-
-struct virtq_desc { uint64_t addr; uint32_t len; uint16_t flags; uint16_t next; };
-struct virtq_avail { uint16_t flags; uint16_t idx; uint16_t ring[QSIZE]; uint16_t used_event; };
-struct virtq_used_elem { uint32_t id; uint32_t len; };
-struct virtq_used { uint16_t flags; uint16_t idx; struct virtq_used_elem ring[QSIZE]; uint16_t avail_event; };
 
 /* ── virtio-gpu ──────────────────────────────────────────────────────────── */
 
@@ -130,44 +90,20 @@ struct gpu_resource { struct gpu_hdr hdr; uint32_t resource_id, pad; };
  * area holds the request header and up to this many. */
 #define VG_MAX_ENTRIES ((4096 - sizeof(struct gpu_attach_backing)) / sizeof(struct gpu_mem_entry))
 
-/* DMA memory: in the kernel image, so physically contiguous and below 4 GiB
- * (phys = virt - KERNEL_VMA).  The queue in one page; two command slots, each
- * a request page and a response page. */
-static uint8_t vq_mem[4096] __attribute__((aligned(4096)));
+/* Command memory: in the kernel image, so each page is physically
+ * contiguous and below 4 GiB.  Two command slots, each a request page and a
+ * response page. */
 static uint8_t cmd_mem[2][4096] __attribute__((aligned(4096)));
 static uint8_t resp_mem[2][4096] __attribute__((aligned(4096)));
 
-static volatile struct virtq_desc  *vq_desc;
-static volatile struct virtq_avail *vq_avail;
-static volatile struct virtq_used  *vq_used;
-static uint16_t vq_used_seen;
-
-static volatile uint8_t *common;
-static volatile uint8_t *notify;      /* this queue's notify address */
-static volatile uint8_t *devcfg;
+static struct virtio_pci vp;
+static struct virtqueue ctrlq;
 static spinlock_t vg_lock;
 static int vg_dead;                   /* a command timed out: stop talking */
 
 static uint32_t fb_frames[VG_FB_PAGES];
 static uint32_t cur_res, cur_w, cur_h;
 static uint32_t next_res = 1;
-
-static uint32_t kphys(const void *p) {
-    return (uint32_t)(uintptr_t)p - (uint32_t)KERNEL_VMA;
-}
-
-static inline void mb(void) { __asm__ volatile("lock; addl $0,(%%esp)" ::: "memory"); }
-
-static inline uint8_t  c8(uint32_t o)  { return *(volatile uint8_t *)(common + o); }
-static inline uint16_t c16(uint32_t o) { return *(volatile uint16_t *)(common + o); }
-static inline uint32_t c32(uint32_t o) { return *(volatile uint32_t *)(common + o); }
-static inline void w8(uint32_t o, uint8_t v)   { *(volatile uint8_t *)(common + o) = v; }
-static inline void w16(uint32_t o, uint16_t v) { *(volatile uint16_t *)(common + o) = v; }
-static inline void w32(uint32_t o, uint32_t v) { *(volatile uint32_t *)(common + o) = v; }
-static inline void w64(uint32_t o, uint64_t v) {
-    w32(o, (uint32_t)v);
-    w32(o + 4, (uint32_t)(v >> 32));
-}
 
 /*
  * Submit `n` commands (1 or 2: slot i's request of req_len[i] bytes and
@@ -179,35 +115,31 @@ static int vg_submit(int n, const uint32_t *req_len, const uint32_t *resp_len,
                      const uint32_t *want) {
     if (vg_dead) return -5;
     for (int i = 0; i < n; i++) {
-        volatile struct virtq_desc *d = &vq_desc[2 * i];
-        d[0].addr = kphys(cmd_mem[i]);
-        d[0].len = req_len[i];
-        d[0].flags = VIRTQ_DESC_F_NEXT;
-        d[0].next = (uint16_t)(2 * i + 1);
-        d[1].addr = kphys(resp_mem[i]);
-        d[1].len = resp_len[i];
-        d[1].flags = VIRTQ_DESC_F_WRITE;
-        d[1].next = 0;
         memset(resp_mem[i], 0, sizeof(struct gpu_hdr));
-        vq_avail->ring[(vq_avail->idx + i) % QSIZE] = (uint16_t)(2 * i);
-    }
-    mb();
-    vq_avail->idx = (uint16_t)(vq_avail->idx + n);
-    mb();
-    *(volatile uint16_t *)notify = 0;           /* queue 0 */
-    uint16_t target = (uint16_t)(vq_used_seen + n);
-    /* QEMU answers within microseconds under KVM; TCG and a busy host
-     * get a generous budget before the device is given up on. */
-    for (uint32_t spin = 0; (uint16_t)(vq_used->idx - target) > 0x8000; spin++) {
-        if (spin > 400000000U) {
-            printk("[VGPU] control queue timeout; display driver stopped\n");
+        struct virtq_buf b[2] = {
+            { virtio_virt_to_phys(cmd_mem[i]), req_len[i] },
+            { virtio_virt_to_phys(resp_mem[i]), resp_len[i] },
+        };
+        if (virtq_add(&ctrlq, b, 1, 1, cmd_mem[i]) < 0) {
+            printk("[VGPU] control queue full; display driver stopped\n");
             vg_dead = 1;
             return -5;
         }
-        __asm__ volatile("pause" ::: "memory");
     }
-    vq_used_seen = target;
-    mb();
+    virtio_pci_publish(&vp, &ctrlq);
+    /* QEMU answers within microseconds under KVM; TCG and a busy host
+     * get a generous budget before the device is given up on. */
+    for (int done = 0; done < n;) {
+        for (uint32_t spin = 0; !virtq_has_used(&ctrlq); spin++) {
+            if (spin > 400000000U) {
+                printk("[VGPU] control queue timeout; display driver stopped\n");
+                vg_dead = 1;
+                return -5;
+            }
+            __asm__ volatile("pause" ::: "memory");
+        }
+        if (virtq_get_used(&ctrlq, 0)) done++;
+    }
     int rc = 0;
     for (int i = 0; i < n; i++) {
         const struct gpu_hdr *r = (const struct gpu_hdr *)resp_mem[i];
@@ -342,9 +274,9 @@ static void vg_refresh_preferred(void) {
  * preferred size again.  The desktop sees the new list (generation) and
  * decides; the scanout keeps its mode until then. */
 static void vg_poll(void) {
-    if (vg_dead || !devcfg) return;
-    if (!(*(volatile uint32_t *)devcfg & VIRTIO_GPU_EVENT_DISPLAY)) return;
-    *(volatile uint32_t *)(devcfg + 4) = VIRTIO_GPU_EVENT_DISPLAY;   /* events_clear */
+    if (vg_dead || !vp.device) return;
+    if (!(virtio_pci_config32(&vp, 0) & VIRTIO_GPU_EVENT_DISPLAY)) return;   /* events_read */
+    virtio_pci_config_write32(&vp, 4, VIRTIO_GPU_EVENT_DISPLAY);             /* events_clear */
     spin_lock(&vg_lock);
     vg_refresh_preferred();
     spin_unlock(&vg_lock);
@@ -358,23 +290,8 @@ static const fb_driver_t vg_driver = {
     .poll = vg_poll,
 };
 
-static volatile uint8_t *map_cap(const pci_device_t *d, uint8_t cap, uint32_t min_len) {
-    uint8_t bar = pci_read8(d, (uint8_t)(cap + 4));
-    uint32_t off = pci_read_config32(d->bus, d->slot, d->func, (uint8_t)(cap + 8));
-    uint32_t len = pci_read_config32(d->bus, d->slot, d->func, (uint8_t)(cap + 12));
-    if (bar > 5 || (d->bar[bar] & 1) || len < min_len) return 0;
-    if ((d->bar[bar] & 0x6) == 0x4 && (bar == 5 || d->bar[bar + 1])) {
-        printk("[VGPU] BAR%u is above 4 GiB\n", (unsigned)bar);
-        return 0;
-    }
-    uint32_t base = d->bar[bar] & ~0xFU;
-    if (!base) return 0;
-    if (len > 0x10000) len = 0x10000;
-    return (volatile uint8_t *)mmio_map(base + off, len);
-}
-
 int virtio_gpu_init(void) {
-    const pci_device_t *d = pci_find_device(0x1AF4, 0x1050);
+    const pci_device_t *d = virtio_pci_find(VIRTIO_ID_GPU, 0);
     if (!d) return 0;
     const char *c = boot_info_cmdline();
     for (const char *p = c; p && *p; p++)
@@ -396,81 +313,22 @@ int virtio_gpu_init(void) {
         }
     }
 
-    /* Find the common, notify and device configuration structures. */
-    uint8_t cap_common = 0, cap_notify = 0, cap_dev = 0, id = 0;
-    for (uint8_t off = pci_cap_next(d, 0, &id), guard = 0; off && guard < 48;
-         off = pci_cap_next(d, off, &id), guard++) {
-        if (id != 0x09) continue;
-        uint8_t type = pci_read8(d, (uint8_t)(off + 3));
-        if (type == VIRTIO_PCI_CAP_COMMON_CFG && !cap_common) cap_common = off;
-        if (type == VIRTIO_PCI_CAP_NOTIFY_CFG && !cap_notify) cap_notify = off;
-        if (type == VIRTIO_PCI_CAP_DEVICE_CFG && !cap_dev) cap_dev = off;
-    }
-    if (!cap_common || !cap_notify) {
-        printk("[VGPU] no virtio 1.0 PCI capabilities\n");
-        return 0;
-    }
-    /* memory decode and bus mastering on, INTx off (the queue is polled) */
+    /* 3.1.1 Driver Requirements: Device Initialization (no EDID, no virgl) */
+    if (virtio_pci_probe(&vp, d, "VGPU") < 0) return 0;
+    if (virtio_pci_set_features(&vp, VIRTIO_F_VERSION_1) < 0) return 0;
+    virtio_pci_irq_setup(&vp, VIRTIO_IRQ_POLL, 0, 0);
+    /* Polled: INTx off too, so a display event raises no interrupt. */
     uint32_t cmdreg = pci_read_config32(d->bus, d->slot, d->func, 0x04);
-    pci_write_config32(d->bus, d->slot, d->func, 0x04, (cmdreg & 0xFFFF) | 0x6 | 0x400);
-
-    common = map_cap(d, cap_common, 0x38);
-    volatile uint8_t *notify_base = map_cap(d, cap_notify, 2);
-    devcfg = cap_dev ? map_cap(d, cap_dev, 16) : 0;
-    uint32_t notify_mult = pci_read_config32(d->bus, d->slot, d->func,
-                                             (uint8_t)(cap_notify + 16));
-    if (!common || !notify_base) return 0;
-
-    /* 3.1.1 Driver Requirements: Device Initialization */
-    w8(VC_DEVICE_STATUS, 0);
-    for (int i = 0; i < 1000000 && c8(VC_DEVICE_STATUS); i++)
-        __asm__ volatile("pause");
-    w8(VC_DEVICE_STATUS, VS_ACKNOWLEDGE);
-    w8(VC_DEVICE_STATUS, VS_ACKNOWLEDGE | VS_DRIVER);
-    w32(VC_DEVICE_FEATURE_SELECT, 1);
-    uint32_t feat_hi = c32(VC_DEVICE_FEATURE);
-    if (!(feat_hi & VIRTIO_F_VERSION_1_HI)) {
-        printk("[VGPU] device lacks VIRTIO_F_VERSION_1\n");
-        w8(VC_DEVICE_STATUS, VS_FAILED);
-        return 0;
-    }
-    w32(VC_DRIVER_FEATURE_SELECT, 0);
-    w32(VC_DRIVER_FEATURE, 0);              /* no EDID, no virgl */
-    w32(VC_DRIVER_FEATURE_SELECT, 1);
-    w32(VC_DRIVER_FEATURE, VIRTIO_F_VERSION_1_HI);
-    w8(VC_DEVICE_STATUS, VS_ACKNOWLEDGE | VS_DRIVER | VS_FEATURES_OK);
-    if (!(c8(VC_DEVICE_STATUS) & VS_FEATURES_OK)) {
-        printk("[VGPU] features not accepted\n");
-        w8(VC_DEVICE_STATUS, VS_FAILED);
-        return 0;
-    }
-    w16(VC_MSIX_CONFIG, VIRTIO_MSI_NO_VECTOR);
+    pci_write_config32(d->bus, d->slot, d->func, 0x04, (cmdreg & 0xFFFF) | 0x400);
 
     /* control queue (0) */
-    w16(VC_QUEUE_SELECT, 0);
-    uint16_t qmax = c16(VC_QUEUE_SIZE);
-    if (qmax < 4) {
-        w8(VC_DEVICE_STATUS, VS_FAILED);
+    if (virtio_pci_queue_setup(&vp, &ctrlq, 0, QSIZE) < 0 || ctrlq.size < 4) {
+        printk("[VGPU] no usable control queue\n");
+        virtio_pci_fail(&vp);
         return 0;
     }
-    memset(vq_mem, 0, sizeof(vq_mem));
-    vq_desc  = (volatile struct virtq_desc *)vq_mem;
-    vq_avail = (volatile struct virtq_avail *)(vq_mem + 16 * QSIZE);
-    vq_used  = (volatile struct virtq_used *)(vq_mem + 2048);
-    w16(VC_QUEUE_SIZE, qmax < QSIZE ? qmax : QSIZE);
-    if (c16(VC_QUEUE_SIZE) != QSIZE) {
-        printk("[VGPU] queue size %u refused\n", (unsigned)QSIZE);
-        w8(VC_DEVICE_STATUS, VS_FAILED);
-        return 0;
-    }
-    vq_avail->flags = VIRTQ_AVAIL_F_NO_INTERRUPT;
-    w16(VC_QUEUE_MSIX_VECTOR, VIRTIO_MSI_NO_VECTOR);
-    w64(VC_QUEUE_DESC, kphys((const void *)vq_desc));
-    w64(VC_QUEUE_DRIVER, kphys((const void *)vq_avail));
-    w64(VC_QUEUE_DEVICE, kphys((const void *)vq_used));
-    notify = notify_base + (uint32_t)c16(VC_QUEUE_NOTIFY_OFF) * notify_mult;
-    w16(VC_QUEUE_ENABLE, 1);
-    w8(VC_DEVICE_STATUS, VS_ACKNOWLEDGE | VS_DRIVER | VS_FEATURES_OK | VS_DRIVER_OK);
+    virtq_disable_cb(&ctrlq);
+    virtio_pci_driver_ok(&vp);
     spin_init(&vg_lock);
 
     /* The framebuffer: RAM frames, each holding the driver's reference so
@@ -481,7 +339,7 @@ int virtio_gpu_init(void) {
         if (!fb_frames[i]) {
             printk("[VGPU] out of memory for the framebuffer\n");
             for (uint32_t j = 0; j < i; j++) pmm_free_frame(fb_frames[j]);
-            w8(VC_DEVICE_STATUS, VS_FAILED);
+            virtio_pci_fail(&vp);
             return 0;
         }
         pmm_frame_incref(fb_frames[i]);
@@ -511,7 +369,7 @@ int virtio_gpu_init(void) {
     if (have_boot && boot.xres <= VG_MAX_W && boot.yres <= VG_MAX_H)
         framebuffer_mode_add(boot.xres, boot.yres);
     printk("[VGPU] virtio-gpu%s: control queue %u, display %ux%u\n",
-           is_vga ? " (virtio-vga)" : "", (unsigned)QSIZE,
+           is_vga ? " (virtio-vga)" : "", (unsigned)ctrlq.size,
            (unsigned)pw, (unsigned)ph);
 
     /* Start in the display's own size (QEMU: the -device's xres/yres,

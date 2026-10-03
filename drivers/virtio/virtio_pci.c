@@ -641,3 +641,13 @@ void virtio_pci_config_write8(struct virtio_pci *vp, uint32_t off, uint8_t v) {
     else
         wr8(vp->device, off, v);
 }
+
+void virtio_pci_config_write32(struct virtio_pci *vp, uint32_t off, uint32_t v) {
+    if (!cfg_ok(vp, off, 4))
+        return;
+    uint32_t len;
+    if (vp->legacy)
+        outl((uint16_t)(legacy_cfg(vp, &len) + off), v);
+    else
+        wr32(vp->device, off, v);
+}

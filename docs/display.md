@@ -9,7 +9,7 @@ mode can then change at run time:
 |---|---|---|---|
 | Bochs / QEMU `-vga std` | 1234:1111 | `drivers/bochs_vga.c` | VBE DISPI registers (ports 0x1CE/0x1CF), linear framebuffer at BAR0 |
 | VirtualBox VGA | 80ee:beef | `drivers/bochs_vga.c` | the same DISPI ports |
-| virtio-gpu (`-device virtio-gpu-pci`, `virtio-vga`) | 1af4:1050 | `drivers/virtio_gpu.c` | virtio 1.x over PCI, control queue, 2D resources |
+| virtio-gpu (`-device virtio-gpu-pci`, `virtio-vga`) | 1af4:1050 | `drivers/virtio_gpu.c` | virtio 1.x over PCI (the shared transport, `drivers/virtio/`), polled control queue, 2D resources |
 
 Anything else (a real PC's GOP or VBE framebuffer, QEMU `ramfb`, Cirrus) keeps
 the boot loader's mode: the mode list holds that one mode and Settings says it

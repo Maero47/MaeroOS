@@ -10,7 +10,9 @@ default. MaeroOS drives it with three pieces in `drivers/virtio/`:
 | `virtio_net.[ch]` | the network device on top: MAC, link status, RX/TX rings, the control queue, the `netif` glue |
 
 The transport knows nothing of what the device is, so another virtio
-driver (block, GPU, input, ...) uses it unchanged. Its API, with the call
+driver (block, GPU, input, ...) uses it unchanged; the virtio-gpu display
+driver (`drivers/virtio_gpu.c`, [display.md](display.md)) is the second
+user, with its control queue polled (`VIRTIO_IRQ_POLL`, no MSI vector). Its API, with the call
 sequence a driver follows, is documented at the top of
 `drivers/virtio/virtio_pci.h`.
 
@@ -186,9 +188,6 @@ does not use.
   transitional.
 - lwIP runs on `eth0` only. A virtio-net that comes up as `eth1` (behind
   an e1000, say) is registered and counted but carries no traffic.
-- A virtio-gpu driver was being written in parallel from its own copy of
-  the transport idea. The two are to be unified on this
-  `virtio_pci.[ch]` + `virtqueue.[ch]`.
 
 ## References
 
