@@ -95,9 +95,10 @@ struct virtqueue {
 /* Full memory barrier: the device sees the ring entries before the index
  * that publishes them (and we see its used entry before reading the data).
  * x86 keeps stores in order, but the compiler must not reorder either, and
- * a locked op also orders loads after stores. */
+ * only a fenced or locked op orders a load after a store.  GCC emits
+ * "lock orl $0,(%esp)" here for i686 without SSE2, mfence on the host. */
 static inline void virtq_mb(void) {
-    __asm__ volatile("lock; addl $0, (%%esp)" ::: "memory", "cc");
+    __sync_synchronize();
 }
 
 /* Lay out an empty queue on areas the caller allocated and zeroed (sizes
