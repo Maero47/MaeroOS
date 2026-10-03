@@ -279,6 +279,21 @@ def build_images():
     run(MKE2FS, "-q", "-F", "-t", "ext4", "-N", "40000", "-L", "ext4g", g_img, "256M")
     journal_csum_v3(g_img)
     info["g_img"] = g_img
+    # An htree whose root claims 7 index levels: lookups must scan.
+    k_img = os.path.join(OUT, "k.img")
+    src = os.path.join(OUT, "src-k")
+    os.makedirs(os.path.join(src, "dir"))
+    for i in range(400):
+        with open(os.path.join(src, "dir", f"name-{i:04d}-padding-padding"), "wb") as f:
+            f.write(f"{i}\n".encode())
+    run(MKE2FS, "-q", "-F", "-t", "ext4", "-L", "ext4k", "-d", src, k_img, "32M")
+    subprocess.run([E2FSCK, "-fyD", k_img], capture_output=True)
+    info["k_htree"] = htree_levels(k_img, "/dir") == 0
+    kblk = int(debugfs(k_img, "bmap /dir 0").split()[0])
+    with open(k_img, "r+b") as f:
+        f.seek(kblk * 4096 + 0x1E)
+        f.write(bytes([7]))
+    info["k_img"] = k_img
     h_img = os.path.join(OUT, "h.img")
     run(MKE2FS, "-q", "-F", "-t", "ext4", "-O", "^dir_index", "-N", "40000", "-L", "ext4h", h_img, "256M")
     info["h_img"] = h_img
@@ -660,6 +675,7 @@ def second_boot(d2_img, e2_img, g2_img, info):
          "-drive", "file=disk.img,format=raw,index=0,media=disk,snapshot=on",
          "-drive", f"file={d2_img},format=raw,index=1,media=disk",
          "-drive", f"file={e2_img},format=raw,index=2,media=disk",
+         "-drive", f"file={info['k_img']},format=raw,index=3,media=disk",
          "-drive", f"file={g2_img},format=raw,if=none,id=nv",
          "-device", "nvme,serial=ext4g2,drive=nv",
          "-serial", "stdio", "-m", "256M", "-no-reboot"],
@@ -696,6 +712,13 @@ def second_boot(d2_img, e2_img, g2_img, info):
         check(rc == 0 and re.search(r"nvme0n1: orphans: 0 deleted, 1 truncated", text) is not None
               and " 10000 " in out and hashlib.md5(b" " * 10000).hexdigest() in out,
               f"second boot: nvme0n2's T cut to 10000 bytes at mount ({out.strip()[-300:]!r})")
+        g.sh("busybox mkdir -p /mnt/k")
+        rc, out = g.sh("busybox mount -t ext4 /dev/sdd /mnt/k && busybox cat /mnt/k/dir/name-0123-padding-padding; "
+                       "busybox ls /mnt/k/dir/missing 2>&1; busybox umount /mnt/k")
+        text = "".join(log)
+        check(re.search(r"^123\r?$", out, re.M) and "No such file" in out and
+              re.search(r"sdd: dir \d+: htree index unusable \(root\); scanned linearly", text),
+              f"second boot: a corrupt htree root is scanned linearly ({out.strip()[-200:]!r})")
         smokelib.send(proc, "poweroff\n")
         deadline = time.time() + 60
         while proc.poll() is None and time.time() < deadline:
@@ -716,6 +739,9 @@ def second_boot(d2_img, e2_img, g2_img, info):
     check("held.bin" not in " ".join(live_names(d2_img, "/")) and re.search(r"Links: 0", st) and
           re.search(r"dtime:", st) is not None, "second boot: sdd held.bin's inode is freed")
     check(htree_levels(g2_img, "/grow") == 0, "second boot: nvme0n2 /grow still indexed")
+    st = subprocess.run([DUMPE2FS, "-h", info["k_img"]], capture_output=True, text=True).stdout
+    check(re.search(r"Filesystem state:.*with errors", st) is not None,
+          "second boot: the corrupt htree marked the filesystem for fsck (state: with errors)")
     check(debugfs_cat(d2_img, "/crash.txt") == b"crash-test\nafter-crash\n",
           "second boot: debugfs sees crash.txt with the line added after the replay")
 
@@ -725,6 +751,7 @@ def main():
     check(info["a_htree"], "host: sdb /big is an htree directory (e2fsck -D)")
     check(info["b_levels"] == 0, "host: nvme0n1 /big2 is a one-level htree directory")
     check(info["c_dirty"], "host: sdc needs recovery (debugfs jw)")
+    check(info["k_htree"], "host: k.img /dir is an htree directory (e2fsck -D), its root then corrupted")
     accel = ["-accel", "kvm"] if os.access("/dev/kvm", os.R_OK | os.W_OK) else ["-accel", "tcg"]
     proc = subprocess.Popen(
         ["qemu-system-i386", *smokelib.QEMU_DISPLAY, *accel, "-M", "q35",
