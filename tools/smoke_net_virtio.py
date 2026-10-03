@@ -22,7 +22,10 @@ Two boots, one per interrupt mode:
     - throughput: 50 MB each way over TCP (sockprobe bulk rx/tx), checked
       for the byte count and reported in MB/s.
   INTx (-device virtio-net-pci,vectors=0: no MSI-X capability):
-    - /proc/netif irq=intx, DHCP lease, a wget, ping, 50 MB each way.
+    - /proc/netif irq=intx, DHCP lease, a wget, SLAAC, ping, 50 MB each way.
+  Legacy (disable-modern=on: only the virtio 0.9.5 I/O-port interface):
+    - the legacy transport with MSI-X, DHCP, a wget, SLAAC, link down/up,
+      50 MB each way.
 
     python3 tools/smoke_net_virtio.py                 both boots
     python3 tools/smoke_net_virtio.py --bench-only e1000
@@ -238,6 +241,53 @@ def pings(proc, sel, log):
     print("ping 127.0.0.1 and ::1 ok")
 
 
+def link_toggle(proc, sel, log, qmp):
+    """QMP set_link off, then on: each is a config-change interrupt, and
+    the driver reads the new status from the device configuration."""
+    qmp.cmd("set_link", name="vnet0", up=False)
+    wait_dmesg(proc, sel, log, "[VNET] link down")
+    if "link=down" not in netif_line(proc, sel, log):
+        raise AssertionError("/proc/netif still says link=up")
+    qmp.cmd("set_link", name="vnet0", up=True)
+    wait_dmesg(proc, sel, log, "[VNET] link up")
+    if "link=up" not in netif_line(proc, sel, log):
+        raise AssertionError("/proc/netif did not see the link come back")
+    print("link down/up ok (config-change interrupts)")
+
+
+def legacy_boot(v6port):
+    """disable-modern=on: no virtio 1.x capabilities, so the legacy I/O-port
+    interface, 256-entry rings in contiguous pages, a 10-byte header, the
+    device configuration at 0x18 with MSI-X on."""
+    qmp_dir = tempfile.TemporaryDirectory(dir=os.path.join(ROOT, "build"))
+    qmp_path = os.path.join(qmp_dir.name, "qmp.sock")
+    proc = qmp = None
+    try:
+        proc, sel, log = boot("virtio-net-pci,netdev=n0,id=vnet0,disable-modern=on", "", qmp_path)
+        qmp = Qmp(qmp_path)
+        line = netif_line(proc, sel, log)
+        print(line)
+        for want in ("virtio-legacy 1af4:1000", "irq=msix/", "rxmode=allmulti",
+                     "mac=52:54:00:12:34:56", "rxq=256"):
+            if want not in line:
+                raise AssertionError(f"legacy: /proc/netif lacks {want!r}")
+        out = run(proc, sel, log,
+                  f"toybox wget -O /tmp/big.bin http://10.0.2.2:{v6port}/big.bin"
+                  " && toybox md5sum /tmp/big.bin", timeout=60)
+        if BIG_MD5 not in out:
+            raise AssertionError("legacy: wget of a 1 MiB file failed")
+        print(f"legacy SLAAC ok: {slaac(proc, sel, log)}")
+        link_toggle(proc, sel, log, qmp)
+        rates = throughput(proc, sel, log, "virtio-net legacy msix")
+        print(netif_line(proc, sel, log))
+        return rates
+    finally:
+        if qmp:
+            qmp.close()
+        stop(proc)
+        qmp_dir.cleanup()
+
+
 def msix_boot(webdir, v6port):
     qmp_dir = tempfile.TemporaryDirectory(dir=os.path.join(ROOT, "build"))
     qmp_path = os.path.join(qmp_dir.name, "qmp.sock")
@@ -299,16 +349,7 @@ def msix_boot(webdir, v6port):
         print("wget over IPv6 ok")
         pings(proc, sel, log)
 
-        # Link state: a config-change interrupt each way.
-        qmp.cmd("set_link", name="vnet0", up=False)
-        wait_dmesg(proc, sel, log, "[VNET] link down")
-        if "link=down" not in netif_line(proc, sel, log):
-            raise AssertionError("/proc/netif still says link=up")
-        qmp.cmd("set_link", name="vnet0", up=True)
-        wait_dmesg(proc, sel, log, "[VNET] link up")
-        if "link=up" not in netif_line(proc, sel, log):
-            raise AssertionError("/proc/netif did not see the link come back")
-        print("link down/up ok (config-change interrupts)")
+        link_toggle(proc, sel, log, qmp)
 
         rates = throughput(proc, sel, log, "virtio-net msix")
         line = netif_line(proc, sel, log)
@@ -390,12 +431,13 @@ def main():
     try:
         msix = msix_boot(webdir.name, port)
         intx = intx_boot(port)
+        legacy = legacy_boot(port)
     finally:
         httpd6.shutdown()
         httpd4.shutdown()
         webdir.cleanup()
     print(f"smoke-net-virtio ok: MB/s rx/tx msix {msix[0]:.1f}/{msix[1]:.1f}, "
-          f"intx {intx[0]:.1f}/{intx[1]:.1f}")
+          f"intx {intx[0]:.1f}/{intx[1]:.1f}, legacy {legacy[0]:.1f}/{legacy[1]:.1f}")
     return 0
 
 

@@ -6,14 +6,18 @@
  * its device by virtio type, negotiates features, sets up its queues and
  * reads its own device-specific configuration through this API.
  *
- * Supported: the modern (virtio 1.x) interface, found through the vendor
- * PCI capabilities: common, notify, ISR and device configuration
- * structures in memory BARs, mapped uncached with mm/mmio.c.  Transitional
- * devices (QEMU's default, 1af4:1000-103f) and modern-only ones
- * (1af4:1040+type) both work through it.  Not supported: legacy-only
- * (virtio 0.9.5, I/O-port) devices, e.g. QEMU's "disable-modern=on" or
- * VirtualBox's virtio-net: probe fails with a message and the driver gives
- * up.  A memory BAR above 4 GiB is not usable (mmio_map is 32-bit).
+ * Interfaces: the modern (virtio 1.x) one, found through the vendor PCI
+ * capabilities: common, notify, ISR and device configuration structures in
+ * memory BARs, mapped uncached with mm/mmio.c.  Transitional devices
+ * (QEMU's default, 1af4:1000-103f) and modern-only ones (1af4:1040+type)
+ * both use it.  A transitional device without those capabilities (QEMU's
+ * "disable-modern=on", older hypervisors) falls back to the legacy 0.9.5
+ * interface in its I/O BAR 0: 32 feature bits, no FEATURES_OK, queues of
+ * the device's fixed size in one physically contiguous block from
+ * pmm_alloc_contig (inside the 256 MiB direct map).  vp->legacy says which;
+ * drivers see the same API either way, except that a legacy device never
+ * has VIRTIO_F_VERSION_1 (virtio-net's header is then 10 bytes, not 12).
+ * A memory BAR above 4 GiB is not usable (mmio_map is 32-bit).
  *
  * Interrupts: MSI-X when the function has it, with one vector (from the
  * MSI pool, arch/i686/cpu/irq.c, 0xE0-0xE7) shared by configuration changes
@@ -22,18 +26,18 @@
  * whose interrupt it is).  "virtio=intx" / "virtio=poll" on the kernel
  * command line force INTx or no interrupts at all.
  *
- * Memory: queues of up to VIRTQ_MAX_SIZE (256) entries, so each ring area
- * is at most one page and needs no physically contiguous memory.  Pages
- * come from the kernel heap, whose frames are all below 4 GiB, PAE or not
- * (pmm_alloc_frame), so every DMA address is 32-bit.
+ * Memory: queues of up to VIRTQ_MAX_SIZE (256) entries.  Modern: each ring
+ * area is at most one page, from the kernel heap, so needs no physically
+ * contiguous memory.  Heap frames are all below 4 GiB, PAE or not
+ * (pmm_alloc_frame), as is the direct map, so every DMA address is 32-bit.
  *
  * Driver sequence (3.1.1 "Driver Requirements: Device Initialization"):
  *
  *   const pci_device_t *d = virtio_pci_find(VIRTIO_ID_NET, 0);
  *   static struct virtio_pci vp;
  *   if (virtio_pci_probe(&vp, d, "VNET") < 0) return;  // reset, ACK, DRIVER
- *   uint64_t f = virtio_pci_device_features(&vp) & wanted;
- *   if (virtio_pci_set_features(&vp, f | VIRTIO_F_VERSION_1) < 0) return;
+ *   if (virtio_pci_set_features(&vp, wanted | VIRTIO_F_VERSION_1) < 0)
+ *       return;                                 // offered & wanted is kept
  *   virtio_pci_irq_setup(&vp, my_irq_cb, ctx);  // before the queues
  *   virtio_pci_queue_setup(&vp, &rxq, 0, 128);  // per queue
  *   ... read device config, post buffers ...
@@ -100,7 +104,10 @@ struct virtio_pci {
     uint32_t device_len;
     uint64_t device_features;        /* offered */
     uint64_t features;               /* negotiated */
-    uint16_t num_queues;
+    uint16_t num_queues;             /* modern only (legacy: 0xFFFF) */
+    int legacy;                      /* 1: legacy I/O-port interface */
+    uint16_t io;                     /* legacy: I/O BAR 0 base */
+    uint32_t io_size;                /* legacy: its size */
 
     int irq_mode;                    /* VIRTIO_IRQ_* */
     int vector;                      /* MSI-X: IDT vector, else -1 */
@@ -116,15 +123,16 @@ struct virtio_pci {
  * type.  NULL when there is none. */
 const pci_device_t *virtio_pci_find(uint16_t type, int nth);
 
-/* Map the modern capabilities, enable memory decode and bus mastering,
- * reset the device and set ACKNOWLEDGE|DRIVER.  `tag` prefixes log lines.
+/* Map the modern capabilities (or find the legacy I/O BAR), enable decode
+ * and bus mastering, reset the device and set ACKNOWLEDGE|DRIVER.  `tag` prefixes log lines.
  * 0, or -1 (message printed; the device is left reset). */
 int virtio_pci_probe(struct virtio_pci *vp, const pci_device_t *d, const char *tag);
 
 uint64_t virtio_pci_device_features(struct virtio_pci *vp);
 
-/* Write the driver's features (must include VIRTIO_F_VERSION_1), set
- * FEATURES_OK and check the device kept it.  0, or -1 (FAILED set). */
+/* Accept `features` & what the device offers (vp->features afterwards).
+ * Modern: must include VIRTIO_F_VERSION_1; sets FEATURES_OK and checks the
+ * device kept it.  Legacy: just written.  0, or -1 (FAILED set). */
 int virtio_pci_set_features(struct virtio_pci *vp, uint64_t features);
 
 /* MSI-X if possible, else INTx, else polling (see the top of the file);
@@ -134,8 +142,9 @@ int virtio_pci_set_features(struct virtio_pci *vp, uint64_t features);
 int virtio_pci_irq_setup(struct virtio_pci *vp, int want, virtio_irq_fn fn, void *ctx);
 
 /* Allocate and register queue `index` with min(device max, `max_size`)
- * entries, rounded down to a power of two, and enable it.  0, or -1 (the
- * queue does not exist, no memory, or its MSI-X vector was refused). */
+ * entries, rounded down to a power of two (legacy: the device's own size,
+ * at most VIRTQ_MAX_SIZE), and enable it.  0, or -1 (the queue does not
+ * exist, no memory, or its MSI-X vector was refused). */
 int virtio_pci_queue_setup(struct virtio_pci *vp, struct virtqueue *vq,
                            uint16_t index, uint16_t max_size);
 

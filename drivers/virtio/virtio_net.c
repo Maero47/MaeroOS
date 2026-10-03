@@ -10,10 +10,10 @@
  * frame never exceeds 1514 bytes and every receive buffer is a fixed 2 KiB
  * one, without MRG_RXBUF; MQ (one queue pair); EVENT_IDX.
  *
- * Every frame carries a 12-byte struct virtio_net_hdr in front (VERSION_1:
- * num_buffers is always there).  Transmit: header and frame in one 2 KiB
+ * Every frame carries a struct virtio_net_hdr in front: 12 bytes with
+ * VERSION_1 (num_buffers is always there), 10 on a legacy device.  Transmit: header and frame in one 2 KiB
  * buffer, one descriptor; completions are reaped on the next send (the
- * transmit queue's interrupts are switched off).  Receive: RX_BUFS buffers
+ * transmit queue's interrupts are switched off).  Receive: up to RX_BUFS buffers
  * of 2 KiB, one descriptor each; the interrupt only wakes knetd, and
  * net_poll_all() drains the used ring in process context, as for the other
  * NICs, because lwIP is not reentrant.
@@ -62,7 +62,7 @@
 #define Q_TX   1
 #define Q_CTRL 2
 
-#define NET_HDR_LEN 12           /* struct virtio_net_hdr, VERSION_1 */
+#define NET_HDR_MAX 12           /* struct virtio_net_hdr with num_buffers */
 #define BUF_SIZE    2048         /* two per page: never crosses one */
 #define RX_BUFS     128
 #define TX_BUFS     128
@@ -74,10 +74,12 @@ static netif_t *vnet_netif;
 static int present;
 static uint8_t mac[6];
 static int has_ctrl;
+static uint32_t hdr_len;              /* 12 with VERSION_1, 10 on a legacy device */
 
 static uint8_t *rx_mem, *tx_mem, *ctrl_mem;
 static uint16_t tx_free[TX_BUFS];     /* stack of free TX buffer indices */
 static uint16_t tx_nfree;
+static uint32_t nrx, ntx;              /* buffers: min(ring size, RX_BUFS/TX_BUFS) */
 
 static volatile int config_changed;
 static int link_up;
@@ -105,7 +107,7 @@ static void tx_reclaim(void) {
     void *c;
     while ((c = virtq_get_used(&txq, 0)) != 0) {
         uint32_t i = INDEX(c);
-        if (i < TX_BUFS && tx_nfree < TX_BUFS)
+        if (i < ntx && tx_nfree < ntx)
             tx_free[tx_nfree++] = (uint16_t)i;
     }
 }
@@ -136,9 +138,9 @@ static int vnet_send(netif_t *iface, const void *data, uint32_t len) {
     }
     uint32_t i = tx_free[--tx_nfree];
     uint8_t *b = tx_buf(i);
-    memset(b, 0, NET_HDR_LEN);          /* no offloads, no GSO */
-    memcpy(b + NET_HDR_LEN, data, len);
-    struct virtq_buf vb = { virtio_virt_to_phys(b), NET_HDR_LEN + len };
+    memset(b, 0, hdr_len);          /* no offloads, no GSO */
+    memcpy(b + hdr_len, data, len);
+    struct virtq_buf vb = { virtio_virt_to_phys(b), hdr_len + len };
     if (virtq_add(&txq, &vb, 1, 0, COOKIE(i)) < 0) {
         tx_free[tx_nfree++] = (uint16_t)i;
         tx_full++;
@@ -166,12 +168,12 @@ static int vnet_poll(netif_t *iface) {
     int packets = 0;
     void *c;
     uint32_t len;
-    while (packets < RX_BUFS && (c = virtq_get_used(&rxq, &len)) != 0) {
+    while (packets < (int)nrx && (c = virtq_get_used(&rxq, &len)) != 0) {
         uint32_t i = INDEX(c);
-        if (i >= RX_BUFS)
+        if (i >= nrx)
             continue;
-        if (len >= NET_HDR_LEN + 14 && len <= BUF_SIZE) {
-            net_receive_ethernet(vnet_netif, rx_buf(i) + NET_HDR_LEN, len - NET_HDR_LEN);
+        if (len >= hdr_len + 14 && len <= BUF_SIZE) {
+            net_receive_ethernet(vnet_netif, rx_buf(i) + hdr_len, len - hdr_len);
             packets++;
         } else {
             rx_errors++;
@@ -234,7 +236,8 @@ static int vnet_describe(netif_t *iface, char *buf, uint32_t cap) {
     char irq[24];
     virtio_pci_describe_irq(&vp, irq, sizeof(irq));
     return snprintf(buf, cap,
-                    "virtio %04x:%04x%s mac=%02x:%02x:%02x:%02x:%02x:%02x link=%s features=0x%08x rxq=%u txq=%u txfree=%u rxmode=%s irqs=%u kicks=%u/%u rxerr=%u txfull=%u",
+                    "virtio%s %04x:%04x%s mac=%02x:%02x:%02x:%02x:%02x:%02x link=%s features=0x%08x rxq=%u txq=%u txfree=%u rxmode=%s irqs=%u kicks=%u/%u rxerr=%u txfull=%u",
+                    vp.legacy ? "-legacy" : "",
                     (unsigned)vp.pci->vendor_id, (unsigned)vp.pci->device_id, irq,
                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
                     link_status() ? "up" : "down",
@@ -273,6 +276,8 @@ void virtio_net_init(void) {
     if (virtio_pci_set_features(&vp, want) < 0)
         return;
     has_ctrl = (vp.features & VIRTIO_NET_F_CTRL_VQ) != 0;
+    /* num_buffers is in the header with VERSION_1 or MRG_RXBUF (5.1.6). */
+    hdr_len = (vp.features & VIRTIO_F_VERSION_1) ? 12 : 10;
 
     virtio_pci_irq_setup(&vp, VIRTIO_IRQ_MSIX, vnet_irq, 0);
 
@@ -288,18 +293,21 @@ void virtio_net_init(void) {
         has_ctrl = 0;
     }
 
-    rx_mem = virtio_dma_alloc((uint32_t)rxq.size * BUF_SIZE);
-    tx_mem = virtio_dma_alloc((uint32_t)txq.size * BUF_SIZE);
+    /* A legacy device's rings may be larger than the buffers we give them. */
+    nrx = rxq.size < RX_BUFS ? rxq.size : RX_BUFS;
+    ntx = txq.size < TX_BUFS ? txq.size : TX_BUFS;
+    rx_mem = virtio_dma_alloc(nrx * BUF_SIZE);
+    tx_mem = virtio_dma_alloc(ntx * BUF_SIZE);
     ctrl_mem = has_ctrl ? virtio_dma_alloc(64) : 0;
     if (!rx_mem || !tx_mem || (has_ctrl && !ctrl_mem)) {
         printk("[VNET] out of memory for buffers\n");
         virtio_pci_fail(&vp);
         return;
     }
-    for (uint32_t i = 0; i < rxq.size; i++)
+    for (uint32_t i = 0; i < nrx; i++)
         rx_post(i);
     tx_nfree = 0;
-    for (uint32_t i = txq.size; i-- > 0;)
+    for (uint32_t i = ntx; i-- > 0;)
         tx_free[tx_nfree++] = (uint16_t)i;
     virtq_disable_cb(&txq);             /* reaped on send and poll */
 
@@ -329,8 +337,9 @@ void virtio_net_init(void) {
 
     char irq[24];
     virtio_pci_describe_irq(&vp, irq, sizeof(irq));
-    printk("[VNET] %04x:%04x virtio 1.x%s mac=%02x:%02x:%02x:%02x:%02x:%02x%s features=0x%08x%08x rxq=%u txq=%u ctrl=%s link=%s\n",
-           (unsigned)d->vendor_id, (unsigned)d->device_id, irq,
+    printk("[VNET] %04x:%04x virtio %s%s mac=%02x:%02x:%02x:%02x:%02x:%02x%s features=0x%08x%08x rxq=%u txq=%u ctrl=%s link=%s\n",
+           (unsigned)d->vendor_id, (unsigned)d->device_id,
+           vp.legacy ? "legacy" : "1.x", irq,
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
            (vp.features & VIRTIO_NET_F_MAC) ? "" : " (generated)",
            (unsigned)(vp.features >> 32), (unsigned)vp.features,

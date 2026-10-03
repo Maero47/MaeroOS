@@ -1,12 +1,16 @@
 /*
- * virtio PCI transport, modern (virtio 1.x) interface; see virtio_pci.h.
- * Written from the OASIS specification "Virtual I/O Device (VIRTIO)
- * Version 1.2" (sections 2, 3.1 and 4.1); no code was copied.
+ * virtio PCI transport: the modern (virtio 1.x) interface, and the legacy
+ * (0.9.5) I/O-port one for devices without the modern capabilities; see
+ * virtio_pci.h.  Written from the OASIS specification "Virtual I/O Device
+ * (VIRTIO) Version 1.2" (sections 2, 3.1 and 4.1, legacy layout in 4.1.4.8
+ * and 2.7.2 "Legacy Interfaces: A Note on Virtqueue Layout"); no code was
+ * copied.
  */
 #include "virtio_pci.h"
 #include "../../arch/i686/cpu/apic.h"
 #include "../../arch/i686/cpu/irq.h"
 #include "../../arch/i686/cpu/pic.h"
+#include "../../arch/i686/include/io.h"
 #include "../../arch/i686/mm/paging.h"
 #include "../../include/kernel/boot_info.h"
 #include "../../include/kernel/config.h"
@@ -15,6 +19,7 @@
 #include "../../lib/string.h"
 #include "../../mm/heap.h"
 #include "../../mm/mmio.h"
+#include "../../mm/pmm.h"
 #include <registers.h>
 
 /* struct virtio_pci_cap (4.1.4) fields, as config-space offsets from the
@@ -53,6 +58,26 @@
 #define COMMON_LEN           0x38
 
 #define VIRTIO_MSI_NO_VECTOR 0xFFFF
+
+/* Legacy I/O BAR 0 registers (4.1.4.8).  The device configuration follows
+ * at 0x14, or at 0x18 once MSI-X is on (the two vector registers sit
+ * between). */
+#define LEG_HOST_FEATURES   0x00
+#define LEG_GUEST_FEATURES  0x04
+#define LEG_QUEUE_PFN       0x08
+#define LEG_QUEUE_SIZE      0x0C
+#define LEG_QUEUE_SELECT    0x0E
+#define LEG_QUEUE_NOTIFY    0x10
+#define LEG_STATUS          0x12
+#define LEG_ISR             0x13
+#define LEG_CONFIG_VECTOR   0x14
+#define LEG_QUEUE_VECTOR    0x16
+#define LEG_CONFIG          0x14
+#define LEG_CONFIG_MSIX     0x18
+#define LEG_QUEUE_ALIGN     4096
+
+/* Legacy queues come from the 256 MiB direct map (KERNEL_VMA + phys). */
+#define DIRECT_MAP_FRAMES   ((uint32_t)((HEAP_START - KERNEL_VMA) / PAGE_SIZE))
 
 /* Every probed device, for the shared interrupt handler. */
 #define VIRTIO_MAX_DEVS 8
@@ -172,15 +197,27 @@ static int map_caps(struct virtio_pci *vp) {
 
 /* ── Status and features ─────────────────────────────────────────────────── */
 uint8_t virtio_pci_status(struct virtio_pci *vp) {
+    if (vp->legacy)
+        return inb((uint16_t)(vp->io + LEG_STATUS));
     return rd8(vp->common, COMMON_STATUS);
 }
 
 static void set_status(struct virtio_pci *vp, uint8_t bits) {
+    if (vp->legacy) {
+        uint16_t port = (uint16_t)(vp->io + LEG_STATUS);
+        outb(port, (uint8_t)(inb(port) | bits));
+        return;
+    }
     wr8(vp->common, COMMON_STATUS, (uint8_t)(rd8(vp->common, COMMON_STATUS) | bits));
 }
 
-/* Write 0 and wait for the device to read back 0 (4.1.4.3.2). */
+/* Write 0 and wait for the device to read back 0 (4.1.4.3.2; a legacy
+ * device resets at once). */
 static int reset(struct virtio_pci *vp) {
+    if (vp->legacy) {
+        outb((uint16_t)(vp->io + LEG_STATUS), 0);
+        return inb((uint16_t)(vp->io + LEG_STATUS)) == 0 ? 0 : -1;
+    }
     wr8(vp->common, COMMON_STATUS, 0);
     for (int i = 0; i < 1000000; i++) {
         if (rd8(vp->common, COMMON_STATUS) == 0)
@@ -191,8 +228,37 @@ static int reset(struct virtio_pci *vp) {
 }
 
 void virtio_pci_fail(struct virtio_pci *vp) {
-    if (vp->common)
+    if (vp->common || vp->legacy)
         set_status(vp, VIRTIO_STATUS_FAILED);
+}
+
+/* Size of I/O BAR `bar` (PCI 3.0, 6.2.5.1), with I/O decode off meanwhile. */
+static uint32_t io_bar_size(const pci_device_t *d, int bar) {
+    uint8_t off = (uint8_t)(0x10 + bar * 4);
+    uint32_t cmd = cfg32(d, 0x04);
+    pci_write_config32(d->bus, d->slot, d->func, 0x04, (cmd & 0xFFFFU) & ~1U);
+    uint32_t orig = cfg32(d, off);
+    pci_write_config32(d->bus, d->slot, d->func, off, 0xFFFFFFFFU);
+    uint32_t mask = cfg32(d, off) & ~3U;
+    pci_write_config32(d->bus, d->slot, d->func, off, orig);
+    pci_write_config32(d->bus, d->slot, d->func, 0x04, cmd & 0xFFFFU);
+    mask |= 0xFFFF0000U;                 /* I/O BARs may decode only 16 bits */
+    return mask ? (~mask + 1) & 0xFFFFU : 0;
+}
+
+/* A transitional device without (usable) modern capabilities: its I/O
+ * BAR 0 is the legacy register block. */
+static int legacy_attach(struct virtio_pci *vp) {
+    const pci_device_t *d = vp->pci;
+    if (d->device_id > 0x103F || !(d->bar[0] & 1U))
+        return -1;
+    uint32_t size = io_bar_size(d, 0);
+    if (size < LEG_CONFIG)
+        return -1;
+    vp->legacy = 1;
+    vp->io = (uint16_t)(d->bar[0] & ~3U);
+    vp->io_size = size;
+    return 0;
 }
 
 int virtio_pci_probe(struct virtio_pci *vp, const pci_device_t *d, const char *tag) {
@@ -203,22 +269,22 @@ int virtio_pci_probe(struct virtio_pci *vp, const pci_device_t *d, const char *t
     vp->type = (d->device_id >= 0x1040) ? (uint16_t)(d->device_id - 0x1040)
                                         : (uint16_t)(cfg32(d, 0x2C) >> 16);
 
-    /* Memory decode and bus mastering on (the queues are DMA). */
-    uint32_t cmd = cfg32(d, 0x04);
-    pci_write_config32(d->bus, d->slot, d->func, 0x04, (cmd & 0xFFFFU) | 0x6U);
-
-    if (map_caps(vp) < 0) {
-        printk("[%s] %04x:%04x has no usable virtio 1.x capabilities (legacy-only device?); not used\n",
+    if (map_caps(vp) < 0 && legacy_attach(vp) < 0) {
+        printk("[%s] %04x:%04x has neither usable virtio 1.x capabilities nor a legacy I/O BAR; not used\n",
                tag, (unsigned)d->vendor_id, (unsigned)d->device_id);
         return -1;
     }
+    /* Register decode and bus mastering on (the queues are DMA). */
+    uint32_t cmd = cfg32(d, 0x04);
+    pci_write_config32(d->bus, d->slot, d->func, 0x04,
+                       (cmd & 0xFFFFU) | 0x4U | (vp->legacy ? 0x1U : 0x2U));
     if (reset(vp) < 0) {
         printk("[%s] device did not reset\n", tag);
         return -1;
     }
     set_status(vp, VIRTIO_STATUS_ACKNOWLEDGE);
     set_status(vp, VIRTIO_STATUS_DRIVER);
-    vp->num_queues = rd16(vp->common, COMMON_NUMQ);
+    vp->num_queues = vp->legacy ? 0xFFFF : rd16(vp->common, COMMON_NUMQ);
     vp->device_features = virtio_pci_device_features(vp);
     if (ndevs < VIRTIO_MAX_DEVS)
         devs[ndevs++] = vp;
@@ -226,6 +292,8 @@ int virtio_pci_probe(struct virtio_pci *vp, const pci_device_t *d, const char *t
 }
 
 uint64_t virtio_pci_device_features(struct virtio_pci *vp) {
+    if (vp->legacy)
+        return inl((uint16_t)(vp->io + LEG_HOST_FEATURES));     /* 32 bits only */
     wr32(vp->common, COMMON_DFSELECT, 0);
     uint32_t lo = rd32(vp->common, COMMON_DF);
     wr32(vp->common, COMMON_DFSELECT, 1);
@@ -235,6 +303,12 @@ uint64_t virtio_pci_device_features(struct virtio_pci *vp) {
 
 int virtio_pci_set_features(struct virtio_pci *vp, uint64_t features) {
     features &= vp->device_features;
+    if (vp->legacy) {
+        /* No FEATURES_OK step for a legacy device (3.1.2). */
+        outl((uint16_t)(vp->io + LEG_GUEST_FEATURES), (uint32_t)features);
+        vp->features = features;
+        return 0;
+    }
     if (!(features & VIRTIO_F_VERSION_1)) {
         printk("[%s] device does not offer VIRTIO_F_VERSION_1\n", vp->tag);
         virtio_pci_fail(vp);
@@ -272,7 +346,7 @@ static void virtio_pci_irq(registers_t *regs) {
                 vp->irq_fn(vp, VIRTIO_ISR_QUEUE | VIRTIO_ISR_CONFIG, vp->irq_ctx);
         } else if (vp->irq_mode == VIRTIO_IRQ_INTX && vec == 32U + vp->irq_line) {
             /* Reading ISR status acknowledges it; 0 = not this device's. */
-            uint8_t isr = rd8(vp->isr, 0);
+            uint8_t isr = vp->legacy ? inb((uint16_t)(vp->io + LEG_ISR)) : rd8(vp->isr, 0);
             if (!isr)
                 continue;
             vp->irqs++;
@@ -319,8 +393,15 @@ static int msix_setup(struct virtio_pci *vp) {
     vp->vector = vec;
     vp->irq_mode = VIRTIO_IRQ_MSIX;
     pci_msix_enable(d, cap);
-    wr16(vp->common, COMMON_MSIX, 0);
-    if (rd16(vp->common, COMMON_MSIX) != 0) {
+    uint16_t cfg_vec;
+    if (vp->legacy) {
+        outw((uint16_t)(vp->io + LEG_CONFIG_VECTOR), 0);
+        cfg_vec = inw((uint16_t)(vp->io + LEG_CONFIG_VECTOR));
+    } else {
+        wr16(vp->common, COMMON_MSIX, 0);
+        cfg_vec = rd16(vp->common, COMMON_MSIX);
+    }
+    if (cfg_vec != 0) {
         printk("[%s] device refused MSI-X vector 0 for config changes\n", vp->tag);
         /* Back to INTx: MSI-X off again (enable bit 15). */
         uint32_t hdr = cfg32(d, cap);
@@ -372,8 +453,51 @@ int virtio_pci_describe_irq(struct virtio_pci *vp, char *buf, uint32_t cap) {
 }
 
 /* ── Queues ──────────────────────────────────────────────────────────────── */
+/* A legacy queue: the device fixes its size, and the descriptor table, the
+ * available ring and (at the next 4 KiB boundary) the used ring are one
+ * physically contiguous block whose page number the device is given. */
+static int legacy_queue_setup(struct virtio_pci *vp, struct virtqueue *vq, uint16_t index) {
+    uint16_t io = vp->io;
+    outw((uint16_t)(io + LEG_QUEUE_SELECT), index);
+    uint16_t size = inw((uint16_t)(io + LEG_QUEUE_SIZE));
+    if (size == 0 || inl((uint16_t)(io + LEG_QUEUE_PFN)) != 0)
+        return -1;
+    if (size > VIRTQ_MAX_SIZE || (size & (size - 1))) {
+        printk("[%s] queue %u: legacy size %u is not supported\n", vp->tag,
+               (unsigned)index, (unsigned)size);
+        return -1;
+    }
+    uint32_t avail_off = VIRTQ_DESC_BYTES(size);
+    uint32_t used_off = (avail_off + VIRTQ_AVAIL_BYTES(size) + LEG_QUEUE_ALIGN - 1) &
+                        ~(uint32_t)(LEG_QUEUE_ALIGN - 1);
+    uint32_t bytes = used_off + VIRTQ_USED_BYTES(size);
+    uint32_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint32_t phys = pmm_alloc_contig(pages, DIRECT_MAP_FRAMES);
+    if (!phys) {
+        printk("[%s] queue %u: no %u contiguous pages\n", vp->tag, (unsigned)index,
+               (unsigned)pages);
+        return -1;
+    }
+    uint8_t *mem = (uint8_t *)(uintptr_t)(phys + KERNEL_VMA);
+    memset(mem, 0, pages * PAGE_SIZE);
+    virtq_init(vq, index, size, mem, phys, mem + avail_off, phys + avail_off,
+               mem + used_off, phys + used_off);
+    if (vp->irq_mode == VIRTIO_IRQ_MSIX) {
+        outw((uint16_t)(io + LEG_QUEUE_VECTOR), 0);
+        if (inw((uint16_t)(io + LEG_QUEUE_VECTOR)) != 0) {
+            printk("[%s] queue %u: device refused MSI-X vector 0\n", vp->tag, (unsigned)index);
+            return -1;
+        }
+    }
+    outl((uint16_t)(io + LEG_QUEUE_PFN), phys / LEG_QUEUE_ALIGN);
+    vq->notify = 0;                     /* virtio_pci_kick writes the port */
+    return 0;
+}
+
 int virtio_pci_queue_setup(struct virtio_pci *vp, struct virtqueue *vq,
                            uint16_t index, uint16_t max_size) {
+    if (vp->legacy)
+        return legacy_queue_setup(vp, vq, index);
     volatile uint8_t *c = vp->common;
     if (index >= vp->num_queues)
         return -1;
@@ -426,8 +550,10 @@ int virtio_pci_queue_setup(struct virtio_pci *vp, struct virtqueue *vq,
 }
 
 void virtio_pci_kick(struct virtio_pci *vp, struct virtqueue *vq) {
-    (void)vp;
-    *vq->notify = vq->index;
+    if (vp->legacy)
+        outw((uint16_t)(vp->io + LEG_QUEUE_NOTIFY), vq->index);
+    else
+        *vq->notify = vq->index;
     vq->kicks++;
 }
 
@@ -437,10 +563,44 @@ void virtio_pci_publish(struct virtio_pci *vp, struct virtqueue *vq) {
 }
 
 /* ── Device configuration ────────────────────────────────────────────────── */
+/* Legacy: the configuration's port and how much of it the I/O BAR holds. */
+static uint16_t legacy_cfg(struct virtio_pci *vp, uint32_t *len) {
+    uint32_t base = vp->irq_mode == VIRTIO_IRQ_MSIX ? LEG_CONFIG_MSIX : LEG_CONFIG;
+    *len = vp->io_size > base ? vp->io_size - base : 0;
+    return (uint16_t)(vp->io + base);
+}
+
+static int cfg_ok(struct virtio_pci *vp, uint32_t off, uint32_t len) {
+    uint32_t have = vp->device_len;
+    if (vp->legacy)
+        legacy_cfg(vp, &have);
+    else if (!vp->device)
+        return 0;
+    return off <= have && len <= have - off;
+}
+
+static uint8_t cfg_rd8(struct virtio_pci *vp, uint32_t off) {
+    uint32_t len;
+    return vp->legacy ? inb((uint16_t)(legacy_cfg(vp, &len) + off)) : rd8(vp->device, off);
+}
+
 void virtio_pci_config_read(struct virtio_pci *vp, uint32_t off, void *buf, uint32_t len) {
     uint8_t *out = buf;
-    if (!vp->device || off > vp->device_len || len > vp->device_len - off) {
+    if (!cfg_ok(vp, off, len)) {
         memset(out, 0, len);
+        return;
+    }
+    if (vp->legacy) {                   /* no generation counter: read twice */
+        for (int tries = 0; tries < 100; tries++) {
+            int same = 1;
+            for (uint32_t i = 0; i < len; i++)
+                out[i] = cfg_rd8(vp, off + i);
+            for (uint32_t i = 0; i < len; i++)
+                if (cfg_rd8(vp, off + i) != out[i])
+                    same = 0;
+            if (same)
+                return;
+        }
         return;
     }
     for (int tries = 0; tries < 100; tries++) {
@@ -453,24 +613,29 @@ void virtio_pci_config_read(struct virtio_pci *vp, uint32_t off, void *buf, uint
 }
 
 uint8_t virtio_pci_config8(struct virtio_pci *vp, uint32_t off) {
-    if (!vp->device || off >= vp->device_len)
-        return 0;
-    return rd8(vp->device, off);
+    return cfg_ok(vp, off, 1) ? cfg_rd8(vp, off) : 0;
 }
 
 uint16_t virtio_pci_config16(struct virtio_pci *vp, uint32_t off) {
-    if (!vp->device || off + 2 > vp->device_len)
+    if (!cfg_ok(vp, off, 2))
         return 0;
-    return rd16(vp->device, off);
+    uint32_t len;
+    return vp->legacy ? inw((uint16_t)(legacy_cfg(vp, &len) + off)) : rd16(vp->device, off);
 }
 
 uint32_t virtio_pci_config32(struct virtio_pci *vp, uint32_t off) {
-    if (!vp->device || off + 4 > vp->device_len)
+    if (!cfg_ok(vp, off, 4))
         return 0;
-    return rd32(vp->device, off);
+    uint32_t len;
+    return vp->legacy ? inl((uint16_t)(legacy_cfg(vp, &len) + off)) : rd32(vp->device, off);
 }
 
 void virtio_pci_config_write8(struct virtio_pci *vp, uint32_t off, uint8_t v) {
-    if (vp->device && off < vp->device_len)
+    if (!cfg_ok(vp, off, 1))
+        return;
+    uint32_t len;
+    if (vp->legacy)
+        outb((uint16_t)(legacy_cfg(vp, &len) + off), v);
+    else
         wr8(vp->device, off, v);
 }

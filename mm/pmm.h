@@ -21,6 +21,10 @@ uint32_t pmm_alloc_frame(void);
 /* A frame for a private user page: above 4 GiB when there is RAM there (and
  * PAE to map it), else as pmm_alloc_frame.  0 on OOM. */
 phys_t   pmm_alloc_user_frame(void);
+/* `n` contiguous frames below frame index `limit` (pass 65536 for the
+ * kernel's 256 MiB direct map, so phys + KERNEL_VMA addresses them).
+ * Physical address of the first, 0 when there is no such run. */
+uint32_t pmm_alloc_contig(uint32_t n, uint32_t limit);
 void     pmm_free_frame(phys_t phys);
 uint32_t pmm_free_frames(void);    /* Number of free frames */
 uint32_t pmm_total_frames(void);   /* frame index span, holes included */
