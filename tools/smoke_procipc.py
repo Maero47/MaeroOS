@@ -227,10 +227,11 @@ def run_alpine(args):
               extra=["-netdev", "user,id=n0", "-device", "rtl8139,netdev=n0"])
     try:
         g.login()
-        a = "toybox chroot /disk/alpine /bin/sh -c "
+        a = ("toybox chroot /disk/alpine /usr/bin/env -i "
+             "PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=vt100 /bin/sh -c ")
         # Not in the image (its package set is locked): fetched from the
         # mirror through the host; the disk is a snapshot, nothing persists.
-        out = g.run(a + f"'apk add -X http://10.0.2.2:{port}/{branch}/main procps-ng htop; "
+        out = g.run(a + f"'apk add --repositories-file /dev/null -X http://10.0.2.2:{port}/{branch}/main procps-ng htop; "
                     "echo rc=$?'", timeout=900)
         expect(out, r"rc=0", "apk add procps-ng htop")
         out = g.run(a + "'ps -eo pid,user,stat,etime,rss,cmd; echo rc=$?'")
