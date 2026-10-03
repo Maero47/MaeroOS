@@ -318,6 +318,7 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
      * Always: lo needs lwIP's timers (retransmits, delayed ACKs, TIME_WAIT)
      * even on a machine with no NIC. */
     proc_create_kthread(knetd, "knetd");
+    ext2_start_flusher();
     ac97_start_thread();
     hda_start_thread();
     xhci_start_thread();

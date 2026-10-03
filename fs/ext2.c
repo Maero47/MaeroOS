@@ -4827,7 +4827,19 @@ static void ext2_jfs_add(ext2_fs_t *fs) {
     for (int i = 0; i < EXT2_JFS_MAX; i++)
         if (!g_jfs[i]) { g_jfs[i] = fs; break; }
     jfs_unlock();
-    if (!g_flusher_started) {
+    /* /disk is mounted before processes exist: ext2_start_flusher(). */
+    if (!g_flusher_started && !fs->boot) {
+        g_flusher_started = 1;
+        proc_create_kthread(ext2_flusher, "kjournald");
+    }
+}
+
+void ext2_start_flusher(void) {
+    int any = 0;
+    jfs_lock();
+    for (int i = 0; i < EXT2_JFS_MAX; i++) if (g_jfs[i]) any = 1;
+    jfs_unlock();
+    if (any && !g_flusher_started) {
         g_flusher_started = 1;
         proc_create_kthread(ext2_flusher, "kjournald");
     }

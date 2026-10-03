@@ -32,6 +32,8 @@ int ext2_mount_dev(blkpart_t *bp, int ro, vfs_node_t **root, ext2_fs_t **fs);
 
 /* /proc/mounts type of /disk: "ext2", "ext3" or "ext4". */
 const char *ext2_boot_fstype(void);
+/* Once processes exist: start kjournald if a journaled /disk needs it. */
+void ext2_start_flusher(void);
 /* reboot(2)/poweroff: an ext3/ext4 /disk committed and marked clean. */
 void ext2_shutdown(void);
 
