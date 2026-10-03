@@ -16,8 +16,8 @@ desktop application and reporting `0 clients, DISPLAY=:0`.
 ## Why it is unusual
 
 - The kernel implements the **Linux i386 syscall table**, not a bespoke one.
-  `proc/syscall.c` dispatches 249 Linux syscall numbers (five more, inotify and `rseq`,
-  deliberately answer `ENOSYS`), so software built with an ordinary `i686-linux-musl` or
+  `proc/syscall.c` dispatches the Linux syscall numbers software uses (`rseq` deliberately
+  answers `ENOSYS`), so software built with an ordinary `i686-linux-musl` or
   `i686-linux-gnu` toolchain runs without patching.
 - **Dynamic linking works.** The real musl `ld-musl-i386.so.1` loads PIEs and external
   shared objects, which is what makes prebuilt Linux packages usable at all.
@@ -65,7 +65,8 @@ What is proven by the automated QEMU tests in `tools/`:
 | PC without legacy devices | `-M q35,i8042=off -smp 2` with an ICH9 HDA: no PS/2 controller (`[KBD]  no PS/2 controller`), `/disk` from `ahci0`, both CPUs from the MADT, the desktop's Terminal opened and typed into with a USB tablet and keyboard, and `doas poweroff` typed there makes QEMU exit through S5 | `make smoke-pc` |
 | USB input and storage (xHCI) | the desktop driven with only a `usb-kbd` and `usb-tablet` on a `qemu-xhci`: the Terminal opens and a `doas login root` typed on the USB keyboard reaches a root shell, tablet clicks land where sent, a held key repeats, a `usb-mouse` behind a `usb-hub` moves the pointer, the xHCI on MSI-X interrupts; two FAT `usb-storage` sticks (one behind the hub at full speed, one on a root port at SuperSpeed) mounted at once with a file copied each way, the first also read and written raw through its `/dev/usbdiskN` (checksummed against the image); a two-LUN `usb-bot` as two disks; Caps Lock sets the keyboard's LED by SET_REPORT; Volume Up reaches the desktop; the SuperSpeed stick unplugged and plugged back in five times under a looping reader without errors or leaked devices; idle kusbd CPU reported (smoke-pc runs the xHCI on its INTx line) | `make smoke-usb` |
 | UEFI and BIOS boot (Limine, Multiboot 2) | `maeros-limine.iso` under SeaBIOS, OVMF x64 and OVMF IA32: the kernel sees Multiboot 2 from Limine on the expected firmware with an ACPI RSDP tag, the framebuffer (VBE or GOP) comes from the boot info, login works, the desktop starts and a screendump is that size and not blank, and `poweroff` exits through S5 (a firmware that is not installed is reported as SKIP) | `make smoke-uefi` |
-| Linux ABI conformance | 44 musl-built probes (`ports/abiprobes/`), each printing the same `PASS` on Linux, covering findings of the Firefox audit plus later additions: `splice`, `flock`/`fcntl` record locks, `renameat2`, rtnetlink and `/proc/<pid>/fd` link permissions among them; any `FAIL`, missing verdict or wedge fails the run | `make smoke-abi` |
+| /proc, System V IPC, utmp, inotify | busybox `ps`/`top`/`free`/`uptime` and toybox `ps`/`top`/`free`/`uptime`/`vmstat`/`pgrep`/`killall` read `/proc/stat`, `/proc/loadavg` and `/proc/<pid>`; toybox `who`/`w`/`last` show the console logins from utmp/wtmp; SysV shm/sem/msg between processes with permissions, `IPC_RMID` and `SEM_UNDO` (p45); inotify events on tmpfs and ext2 (p46); another user's `/proc/<pid>` `environ`, `fd/` and links are refused (p47). `SMOKE_PROCIPC_ARGS=--alpine` adds Alpine's procps-ng and htop | `make smoke-procipc` |
+| Linux ABI conformance | 47 musl-built probes (`ports/abiprobes/`), each printing the same `PASS` on Linux, covering findings of the Firefox audit plus later additions: `splice`, `flock`/`fcntl` record locks, `renameat2`, rtnetlink and `/proc/<pid>/fd` link permissions among them; any `FAIL`, missing verdict or wedge fails the run | `make smoke-abi` |
 | Firefox 115.15.0esr | `ff: Firefox painted` (the browser window, about 5 s after `firefox-bin` starts); with `--web`, a page served from the host (HTML, a CSS rule, a PNG) requested and its image on screen about 3 s after Enter (needs the Firefox tree, see `ports/firefox/`) | `make smoke-firefox`, `make smoke-firefox-web` |
 | Alpine Linux x86 userland (chroot) | Alpine 3.22 (apk-tools 2) and 3.24 (apk-tools 3) roots from pinned, signature-checked packages, run with `chroot /disk/alpine`: `bash -c 'echo ok'`, GNU `ls --version`, `python3 -c 'print(1+1)'`, `vim --version`, `git init/commit/log`, `ssh -V`, `less` on a pipe, `apk add tree` / `apk del tree` from an offline repo on the disk, `apk verify`, and no unimplemented syscall on the way; `--net` also installs from a host-served HTTP mirror (needs network on the build host the first time, see `ports/alpine/`) | `make smoke-alpine` |
 | Alpine networking and sshd (chroot) | In the Alpine chroot on an e1000: busybox `ip addr`/`ip route`/`ip link` (rtnetlink), `ifconfig` and `route -n` (SIOC* ioctls, `/proc/net/route`) show eth0's DHCP address and the default route; `udhcpc -i eth0 -n -q` gets a lease over `AF_PACKET` and its script reconfigures eth0 through rtnetlink; `ping` over a raw ICMP socket; `flock -n` fails while another process holds the lock and a blocking `flock` waits, and `apk` refuses to run while its database lock is held; `openssh-server` installed with `apk` from the offline repo, `ssh-keygen -A`, `sshd` on port 22, and the host logs in through hostfwd with a throwaway key (`ssh ... true`, a command, an interactive `ssh -tt` session on `/dev/pts/0`); no unimplemented syscall. Needs `ssh` on the host | `make smoke-alpine-net` |
@@ -96,9 +97,12 @@ What is proven by the automated QEMU tests in `tools/`:
   every mode: `proc/elf.c` maps each `PT_LOAD` segment with its own `p_flags`, `ld.so`
   can `mprotect` a `PT_GNU_RELRO` range read-only, and a write to a read-only page is
   `SIGSEGV` (`SEGV_ACCERR`), in a forked child as well.
-- **inotify is deliberately absent.** Numbers 291, 292, 293 and 332 return `-ENOSYS`
-  on purpose so GLib falls back to its polling backend (see the comment on those
-  cases in `proc/syscall.c`).
+- **inotify reports through the VFS, not per dentry.** `fs/inotify.c` sees
+  creates, unlinks, renames, attribute changes, writes and closes made through the
+  VFS and the syscalls; an event about a file reaches its directory's watches through
+  the directory its last path lookup went through, so an `fchmod` or a write on a
+  descriptor whose file was renamed away reaches only the file's own watches.
+  `IN_OPEN`, `IN_ACCESS` and `IN_UNMOUNT` are never generated (`docs/procipc.md`).
 - **Unfinished credential and socket semantics.** `setfsuid`/`setfsgid` just report
   the effective id; a path lookup does not check search permission on the directories
   it walks through. `SO_LINGER` only acts with a zero timeout (`close()` sends a
@@ -127,11 +131,10 @@ What is proven by the automated QEMU tests in `tools/`:
   (`mount -t vfat`, `docs/vfat.md`), and so are exFAT volumes (`mount -t exfat`,
   `docs/exfat.md`); through the 32-bit VFS a file of 4 GiB or more shows its
   first 4 GiB − 1 bytes.
-- **Missing Linux interfaces.** There is no SysV IPC and no utmp.
-  `/proc/<pid>/` lists only `status` and `stat` and resolves `fd/N` links (the full
-  set is under `/proc/self`), and
-  there is no `/proc/stat`, so toybox is built without `killall` (it matches names
-  through other processes' `cmdline`), `vmstat` and `who`. IPv6 is SLAAC only
+- **Process accounting is approximate.** `/proc/stat` splits each CPU's busy time
+  into user and system by timer-tick samples and has no iowait, irq or steal time;
+  page-fault counters and `pgpgin`/`pgpgout` are 0 (`docs/procipc.md`). busybox
+  `who` (musl) has no utmp support; toybox `who`, `w` and `last` read it. IPv6 is SLAAC only
   (no DHCPv6, no static IPv6 addresses), and the native resolver reads only IPv4
   `nameserver` lines (`docs/net.md`).
 - **Only Linux and macOS hosts are covered.** The Makefile looks up `mke2fs`, `debugfs`
@@ -286,11 +289,13 @@ the kernel heap, capped at 1 GiB per file, `EFBIG` beyond), `fs/devfs.c` at
 `ptmx`, `pts/`, `random`, `urandom`, `fb0`, `dsp`, `snd/controlC0`, `snd/pcmC0D0p`, `shm`, `input/event0`, `input/event1`,
 `initrd` (the boot module, for the installer), `usbdisk0`, `usbdisk1`, ... (one per
 USB disk), the disk and partition
-nodes, `stdin`/`stdout`/`stderr`), and `fs/procfs.c` at `/proc` (per-pid `status`,
-`stat` and `fd/N` links;
-`self` adds `statm`, `maps`, `fd`, `cmdline`, `environ`, `auxv`, `exe`; plus `meminfo`, `version`,
-`uptime`, `cpuinfo`, `kmsg`, `processes`, `pci`, `netif`, `firewall`, `mounts`,
-`partitions`, `filesystems`, `cputime`, `net/dev`, `net/route`, `sys/vm/`).
+nodes, `stdin`/`stdout`/`stderr`), and `fs/procfs.c` at `/proc` (`/proc/<pid>/` and
+`task/<tid>/` with `stat`, `statm`, `status`, `cmdline`, `comm`, `environ`, `auxv`,
+`maps`, `limits`, `io`, `mountinfo`, `mounts`, `fd/`, `fdinfo/` and the `exe`/`cwd`/`root`
+links, permission-checked like Linux; `self` and `thread-self` links; `stat`, `loadavg`,
+`vmstat`, `meminfo`, `version`, `uptime`, `cpuinfo`, `kmsg`, `processes`, `pci`, `netif`,
+`firewall`, `mounts`, `partitions`, `filesystems`, `cputime`, `net/`, `sysvipc/`, `sys/`;
+`docs/procipc.md`).
 
 ### Networking
 

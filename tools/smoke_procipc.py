@@ -26,6 +26,9 @@ import re
 import selectors
 import subprocess
 import sys
+import threading
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import smokelib
 
@@ -34,12 +37,13 @@ PROMPT = smokelib.PROMPT
 
 
 class Guest:
-    def __init__(self, disk, mem="512M"):
+    def __init__(self, disk, mem="512M", extra=()):
         smp = os.environ.get("SMOKE_SMP", "2")
         cmd = ["qemu-system-i386", *smokelib.QEMU_DISPLAY, "-kernel", "kernel.elf",
                "-initrd", "initrd.tar", "-serial", "stdio", "-m", mem,
                "-no-reboot", "-no-shutdown", "-smp", smp,
-               "-drive", f"file={disk},format=raw,index=0,media=disk,snapshot=on"]
+               "-drive", f"file={disk},format=raw,index=0,media=disk,snapshot=on",
+               *extra]
         self.proc = subprocess.Popen(cmd, cwd=ROOT, stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      bufsize=0)
@@ -189,15 +193,46 @@ def run_initrd(args):
         g.stop()
 
 
+class MirrorProxy(BaseHTTPRequestHandler):
+    """GET /<path> from the Alpine mirror (ALPINE_MIRROR, as prepare.py), so
+    the guest's apk reaches it over QEMU user networking without DNS or TLS.
+    apk still checks the signed index and every package against the keys in
+    the image."""
+    mirror = os.environ.get("ALPINE_MIRROR", "https://dl-cdn.alpinelinux.org/alpine")
+
+    def do_GET(self):
+        try:
+            with urllib.request.urlopen(self.mirror + self.path, timeout=60) as r:
+                body = r.read()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            self.send_error(404, str(e))
+
+    def log_message(self, fmt, *a):
+        sys.stderr.write("[mirror] " + (fmt % a) + "\n")
+
+
 def run_alpine(args):
-    img = os.path.join(ROOT, "disk-alpine.img")
+    img = os.environ.get("ALPINE_IMG", os.path.join(ROOT, "disk-alpine.img"))
     if not os.path.exists(img):
         raise AssertionError("disk-alpine.img missing: make disk-alpine")
-    g = Guest(img, mem="1024M")
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), MirrorProxy)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    branch = os.environ.get("ALPINE_BRANCH", "v3.22")
+    g = Guest(img, mem="1024M",
+              extra=["-netdev", "user,id=n0", "-device", "rtl8139,netdev=n0"])
     try:
         g.login()
-        a = "chroot /disk/alpine /bin/sh -c "
-        out = g.run(a + "'apk info -e procps-ng htop || apk add procps-ng htop'", timeout=600)
+        a = "toybox chroot /disk/alpine /bin/sh -c "
+        # Not in the image (its package set is locked): fetched from the
+        # mirror through the host; the disk is a snapshot, nothing persists.
+        out = g.run(a + f"'apk add -X http://10.0.2.2:{port}/{branch}/main procps-ng htop; "
+                    "echo rc=$?'", timeout=900)
+        expect(out, r"rc=0", "apk add procps-ng htop")
         out = g.run(a + "'ps -eo pid,user,stat,etime,rss,cmd; echo rc=$?'")
         expect(out, r"^\s*PID USER\s+STAT\s+ELAPSED\s+RSS CMD", "procps ps")
         expect(out, r"rc=0", "procps ps exit")
@@ -208,11 +243,12 @@ def run_alpine(args):
         expect(out, r"rc=0", "procps vmstat")
         out = g.run(a + "'top -b -n 1 | head -5; echo rc=$?'")
         expect(out, r"^top - .* load average", "procps top")
-        out = g.run(a + "'TERM=vt100 timeout 3 htop >/dev/null; echo rc=$?'", timeout=60)
+        out = g.run(a + "'TERM=vt100 timeout 5 htop; echo; echo rc=$?'", timeout=60)
         expect(out, r"rc=(0|124|143)", "htop starts and runs until killed")
         reject(out, r"killed by signal 11", "htop")
     finally:
         g.stop()
+        httpd.shutdown()
 
 
 def main():

@@ -825,7 +825,6 @@ static int do_msgsnd(int id, const void *umsg, uint32_t sz, int flag) {
 static int do_msgrcv(int id, void *umsg, uint32_t sz, int32_t type, int flag) {
     if ((int32_t)sz < 0) return -E_INVAL;
     if (flag & MSG_COPY) return -E_NOSYS;
-    if (!access_ok(umsg, 4 + sz)) return -E_FAULT;
     sysv_msq_t *q = msq_by_id(id);
     if (!q) return -E_INVAL;
     if (ipcperms(&q->perm, 0444)) return -E_ACCES;

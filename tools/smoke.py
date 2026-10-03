@@ -52,7 +52,7 @@ def main():
             ("randprobe\n", "randprobe urandom ok"),
             ("ptytest\n", "ptytest ok"),
             ("cttytest\n", "cttytest ok"),
-            ("cat /proc/self/status\n", "Pgid:"),
+            ("cat /proc/self/status\n", "NSpgid:"),   # Linux names: NSpgid/NSsid
             ("cat /proc/processes\n", "PID PPID PGRP SID STATE TTY TIME NAME"),
             ("cat /proc/1/status\n", "Pid:\t1"),
             ("cat /proc/1/stat\n", "1 ("),
