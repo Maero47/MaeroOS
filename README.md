@@ -701,6 +701,8 @@ make smoke-alpine   # Alpine 3.22/3.24 userland in a chroot, apk from an offline
 make smoke-alpine-net  # ip/udhcpc/ping, flock and sshd in that chroot (opt-in, needs ssh on the host)
 make bench-gfx      # compositor/maeroX cost of an animating region (a benchmark, judges nothing)
 make bench-sched    # wake latency and a 10 ms audio-like hand-off under CPU hogs
+make bench-bkl      # Big Kernel Lock hold/spin report under -smp 4 (docs/smp-plan.md)
+make smoke-klock    # SMP lock-primitive torture + lock-order checker (debug build)
 ```
 
 `SMOKE_SMP=N make smoke-cmds` boots the same guest with `-smp N`. `make smoke-gtk` needs
@@ -714,7 +716,10 @@ rebuilds the kernel objects. Two debug-only self-tests use the same stamp:
 show the double-fault or guard-page report, not a reset), and `make KHEAP_TEST=1` runs
 a randomised heap stress with poisoned free memory (`[HEAP-TEST] PASS`; `=2` adds a
 deliberate use-after-free that must end in a heap-corruption panic). Neither belongs
-in a normal build.
+in a normal build. The same stamp covers the SMP lock tooling (docs/smp-plan.md):
+`make KLOCKDEP=1` turns on the lock-order checker (`[lockdep]` lines), `make
+KLOCK_TEST=1` adds the lock torture threads that `make smoke-klock` checks, and `make
+BKLSTAT=1` the Big Kernel Lock hold/spin counters that `make bench-bkl` reports.
 
 `python3 tools/smoke_firefox.py --sites default` drives Firefox through a few live
 sites and reports load and scroll times without judging them; it is manual only
