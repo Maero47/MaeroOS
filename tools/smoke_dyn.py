@@ -51,13 +51,6 @@ def main():
         body = "".join(log)[before:]
         if "DYNPROBE_OK" not in body:
             raise AssertionError("dynprobe did not print DYNPROBE_OK (ld.so path broken)")
-        # The kernel's "[ELF] Loaded" lines go to the kernel log, not the
-        # console (proc/elf.c).  The bracketed patterns keep the echoed
-        # command line itself from matching.
-        before = len("".join(log))
-        send(proc, "dmesg | busybox grep -e 'needs l[d].so' -e 'ld-mus[l]-i386' | busybox tail -n 4\n")
-        wait_for(proc, sel, PROMPT, log, start=before)
-        body = "".join(log)[before:]
         if "needs ld.so" not in body:
             raise AssertionError("dynprobe was not recognized as needing the dynamic linker")
         if "ld-musl-i386.so.1" not in body:

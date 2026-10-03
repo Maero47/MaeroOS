@@ -316,8 +316,14 @@ static uint32_t tty_write(vfs_node_t *n, uint32_t off, uint32_t len,
     vfs_node_t *ctty = proc_ctty_node();
     if (ctty && ctty->write_fn)
         return ctty->write_fn(ctty, off, len, buf);
-    for (uint32_t i = 0; i < len; i++)
-        serial_putc((char)buf[i]);
+    /* In chunks through a kernel buffer: the user bytes are read before the
+     * UART's lock is taken (it runs with interrupts off). */
+    char chunk[64];
+    for (uint32_t i = 0; i < len; ) {
+        uint32_t k = 0;
+        while (k < sizeof(chunk) && i < len) chunk[k++] = (char)buf[i++];
+        serial_write(chunk, k);
+    }
     return len;
 }
 

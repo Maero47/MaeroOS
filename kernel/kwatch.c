@@ -1,3 +1,4 @@
+#include "../drivers/serial.h"
 #include <kernel/kwatch.h>
 #include <kernel/kprof.h>
 #include <kernel/config.h>
@@ -213,10 +214,14 @@ void kwatch_dump(const char *tag) {
  * against the very state being looked at.
  */
 void nmi_handler(registers_t *regs) {
+    /* Probably a wedged machine whose transmit interrupt will never run:
+     * write the dump straight out. */
+    serial_sync_begin();
     printk("[kwatch] NMI: cs=%x eip=%x eflags=%x (IF=%d)\n",
            (unsigned)regs->cs, (unsigned)regs->eip, (unsigned)regs->eflags,
            (regs->eflags & 0x200) ? 1 : 0);
     kwatch_dump("NMI");
+    serial_sync_end();
 }
 
 void kwatch_tick(void) {

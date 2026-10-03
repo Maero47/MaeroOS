@@ -20,6 +20,7 @@ extern void vma_clear(struct proc *p);   /* free demand-paged VMAs (syscall.c) *
 #include "../arch/i686/cpu/apic.h"
 #include "../arch/i686/cpu/smp.h"
 #include "../arch/i686/cpu/bklstat.h"
+#include "../drivers/serial.h"
 #include "../arch/i686/mm/paging.h"
 #include "../mm/heap.h"
 #include "../kernel/printk.h"
@@ -347,6 +348,7 @@ void scheduler_start(void) {
 void scheduler_tick(int user_mode) {
     uint32_t now = pit_ticks();
     kwatch_tick();
+    serial_tx_poll();
     struct proc *cur = current_proc;
     uint64_t min_runnable = ~0ULL;
     for (int i = 0; i < ptable_hwm; i++) {

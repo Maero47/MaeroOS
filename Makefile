@@ -171,7 +171,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-net6 smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-alpinex disk-alpinex smoke-alpine-net smoke-audio disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched bench-bkl smoke-klock
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-net6 smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-alpinex disk-alpinex smoke-alpine-net smoke-audio disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched bench-bkl smoke-klock stress-smp
 
 all: $(TARGET)
 
@@ -486,6 +486,14 @@ bench-sched: $(TARGET) initrd
 bench-bkl:
 	$(MAKE) BKLSTAT=1 $(TARGET) initrd
 	python3 tools/bench_bkl.py $(BENCH_BKL_ARGS)
+
+# SMP stress (tools/stress_smp.py): fork/exec, pipe, mmap and tar|gzip loops
+# on every CPU at once for STRESS_SECS seconds; fails on a hang, a panic, a
+# kwatch STALL or a lockdep report.  STRESS_SMP=4 by default.
+STRESS_SMP ?= 4
+STRESS_SECS ?= 180
+stress-smp: $(TARGET) initrd
+	python3 tools/stress_smp.py --smp $(STRESS_SMP) --secs $(STRESS_SECS)
 
 # Lock primitives torture (kernel/klock.c): rebuilds the kernel with
 # KLOCK_TEST=1 (lock-order checker on), boots it with -smp 4 and expects

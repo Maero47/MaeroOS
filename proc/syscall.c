@@ -2480,11 +2480,11 @@ static int sys_exec(registers_t *regs) {
     if (!pgdir_release(old_pgdir))
         pgdir_free_user(old_pgdir);
 
-    /* Kernel log only (dmesg), not the console: printk busy-waits on the
-     * 115200-baud UART, ~5 ms for this line, with the BKL held — that was
-     * 97% of every fork+exec (docs/smp-plan.md 3.3). */
-    printk_klog("[SYSCALL] exec '%s' pid=%d entry=0x%08x argc=%d\n",
-                path, current_proc->pid, (unsigned)entry, argc);
+    /* On the console (several smoke tests wait for it).  It no longer costs
+     * the ~5 ms UART busy-wait under the BKL it used to (docs/smp-plan.md
+     * 3.3): the transmit interrupt sends it (drivers/serial.c). */
+    printk("[SYSCALL] exec '%s' pid=%d entry=0x%08x argc=%d\n",
+           path, current_proc->pid, (unsigned)entry, argc);
     es_free(&av);
     es_free(&ev);
 #undef KARGV
@@ -5678,6 +5678,10 @@ static int sys_reboot(registers_t *regs) {
         vfs_mounts_shutdown();
     if (cmd == LINUX_REBOOT_CMD_POWER_OFF || cmd == LINUX_REBOOT_CMD_RESTART)
         nvme_shutdown();
+    /* Let the console's queued output out before the machine goes. */
+    if (cmd == LINUX_REBOOT_CMD_POWER_OFF || cmd == LINUX_REBOOT_CMD_RESTART ||
+        cmd == LINUX_REBOOT_CMD_HALT)
+        serial_sync_begin();
 
     switch (cmd) {
     case LINUX_REBOOT_CMD_POWER_OFF:

@@ -12,6 +12,7 @@ static void print_hex(uint32_t v) {
 
 void panic(const char *msg, registers_t *regs) {
     __asm__ volatile("cli");
+    serial_sync_begin();        /* flush queued output; write through from here */
 
     serial_puts("\r\n=== KERNEL PANIC ===\r\n");
     serial_puts(msg);
