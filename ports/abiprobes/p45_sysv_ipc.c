@@ -264,8 +264,9 @@ static void test_keys_perms(void)
 int main(void)
 {
     probe_watchdog(60);
-    if (shmget(IPC_PRIVATE, 4096, 0600) < 0 && errno == ENOSYS)
-        probe_fail("shmget: ENOSYS");
+    int first = shmget(IPC_PRIVATE, 4096, 0600);
+    if (first < 0 && errno == ENOSYS) probe_fail("shmget: ENOSYS");
+    if (first >= 0) shmctl(first, IPC_RMID, NULL);
     test_shm();
     test_sem();
     test_msg();

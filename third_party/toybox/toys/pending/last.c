@@ -181,10 +181,8 @@ void last_main(void)
       llist_add_node(&TT.list, memcpy(xmalloc(sizeof(ut)), &ut, sizeof(ut)));
     } else if (ut.ut_type == DEAD_PROCESS && *ut.ut_line)
       llist_add_node(&TT.list, memcpy(xmalloc(sizeof(ut)), &ut, sizeof(ut)));
-
-    loc -= sizeof(ut);
-    if(loc < 0) break;
-    xlseek(fd, loc, SEEK_SET);
+    // (MaeroOS: the loop's head already steps back one record; stepping
+    // here as well skipped every other record.)
   }
 
   if (CFG_TOYBOX_FREE) {

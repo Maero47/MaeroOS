@@ -7,6 +7,10 @@
 #include "../include/signal.h"
 #include "../include/poll.h"
 #include "../include/syscall.h"
+#include "../include/utmpx.h"
+#include "../include/sys/mount.h"
+#include "../include/sys/stat.h"
+#include "../include/sys/time.h"
 
 static char *initrd_shell_argv[] = { "/shell", (char *)0 };
 static char *initrd_desktop_argv[] = { "/desktop", (char *)0 };
@@ -689,7 +693,67 @@ static void start_sessions(char **envp) {
         start_session(&sessions[i], envp);
 }
 
+/* utmp/wtmp (include/utmpx.h).  At boot utmp starts empty and both files
+ * get a BOOT_TIME record; /var/run and /var/log get a tmpfs when the root
+ * cannot hold them (an initrd-only boot). */
+static int open_or_tmpfs(const char *dir, const char *file, int flags) {
+    mkdir(dir, 0755);
+    int fd = open(file, flags, 0644);
+    if (fd < 0 && mount("tmpfs", dir, "tmpfs", 0, "mode=0755") == 0)
+        fd = open(file, flags, 0644);
+    return fd;
+}
+
+static void utmp_record(struct utmpx *u, int type, int pid, const char *line) {
+    struct timeval tv;
+    memset(u, 0, sizeof(*u));
+    u->ut_type = (short)type;
+    u->ut_pid = pid;
+    if (line) {
+        strncpy(u->ut_line, line, sizeof(u->ut_line) - 1);
+        size_t l = strlen(line);
+        strncpy(u->ut_id, l > 4 ? line + l - 4 : line, sizeof(u->ut_id));
+    }
+    gettimeofday(&tv, 0);
+    u->ut_tv.tv_sec = (int)tv.tv_sec;
+    u->ut_tv.tv_usec = (int)tv.tv_usec;
+}
+
+static void utmp_boot(void) {
+    mkdir("/var", 0755);
+    int fd = open_or_tmpfs("/var/run", _PATH_UTMP, O_WRONLY | O_CREAT | O_TRUNC);
+    if (fd >= 0) close(fd);
+    fd = open_or_tmpfs("/var/log", _PATH_WTMP, O_WRONLY | O_CREAT | O_APPEND);
+    if (fd >= 0) close(fd);
+    chmod(_PATH_UTMP, 0644);
+    chmod(_PATH_WTMP, 0644);
+    struct utmpx u;
+    utmp_record(&u, BOOT_TIME, 0, "~");
+    strcpy(u.ut_user, "reboot");
+    strcpy(u.ut_id, "~~");
+    pututxline(&u);
+    updwtmpx(_PATH_WTMP, &u);
+}
+
+/* A login session's process ended: its utmp record becomes DEAD_PROCESS
+ * (login wrote it with the session's pid) and wtmp gets the logout. */
+static void utmp_session_end(int pid) {
+    struct utmpx *e, dead;
+    setutxent();
+    while ((e = getutxent())) {
+        if (e->ut_type != USER_PROCESS || e->ut_pid != pid) continue;
+        utmp_record(&dead, DEAD_PROCESS, pid, e->ut_line);
+        memcpy(dead.ut_id, e->ut_id, sizeof(dead.ut_id));
+        endutxent();
+        pututxline(&dead);
+        updwtmpx(_PATH_WTMP, &dead);
+        return;
+    }
+    endutxent();
+}
+
 static void monitor_children(char *command_shell_path, char **envp) {
+    utmp_boot();
     start_sessions(envp);
 
     while (1) {
@@ -721,6 +785,7 @@ static void monitor_children(char *command_shell_path, char **envp) {
             continue;
         }
 
+        utmp_session_end(pid);
         session_t *session = find_session_by_pid(pid);
         if (session) {
             session->pid = -1;
