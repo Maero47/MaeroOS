@@ -297,7 +297,8 @@ struct ext2_fs {
     uint32_t            dx_bad;      /* htree indexes found unusable (log limit) */
     uint32_t            orphan_ino;  /* the orphan file's inode, 0: none in use */
     uint32_t            orphans;     /* entries this mount put into it */
-    uint32_t            trunc_ino, trunc_size;   /* see ext2_write_inode_step */
+    uint32_t            trunc_ino;               /* see ext2_write_inode_step */
+    uint64_t            trunc_size;
 };
 
 static inline ext2_cache_entry_t *ext2_cache_set(ext2_fs_t *fs, uint32_t blk) {
@@ -3586,9 +3587,9 @@ static void x4_orphan_del(ext2_fs_t *fs, uint32_t ino, ext2_inode_t *inode) {
  * each step commit of its block freeing carries the new size, so a crash
  * between steps leaves an orphan whose i_size says where to cut. */
 static void ext2_write_inode_step(ext2_fs_t *fs, uint32_t ino, const ext2_inode_t *inode) {
-    if (fs->trunc_ino == ino && inode->i_size > fs->trunc_size) {
+    if (fs->trunc_ino == ino && ext2_isize(inode) > fs->trunc_size) {
         ext2_inode_t t = *inode;
-        t.i_size = fs->trunc_size;
+        ext2_set_isize(fs, &t, fs->trunc_size);
         ext2_write_inode(fs, ino, &t);
         return;
     }
@@ -3645,12 +3646,14 @@ static int x4_orphan_finish(ext2_fs_t *fs, uint32_t ino, uint32_t *next) {
     in.i_dtime = 0;
     if ((in.i_mode & EXT2_S_IFMT) == EXT2_S_IFREG) {
         uint32_t bs = fs->st.block_size;
-        uint32_t keep = in.i_size / bs + (in.i_size % bs != 0);
+        uint64_t isize = ext2_isize(&in);
+        uint32_t tail = (uint32_t)(isize % bs);
+        uint32_t keep = (uint32_t)(isize / bs) + (tail != 0);
         ext2_free_blocks_from(fs, ino, &in, keep);
-        uint32_t blk = (in.i_size % bs) ? ext2_file_blk(fs, &in, in.i_size / bs) : 0;
+        uint32_t blk = tail ? ext2_file_blk(fs, &in, (uint32_t)(isize / bs)) : 0;
         uint8_t *tb = blk ? (uint8_t *)kmalloc(bs) : (uint8_t *)0;
         if (tb && ext2_read_block(fs, blk, tb) == 0) {
-            memset(tb + in.i_size % bs, 0, bs - in.i_size % bs);
+            memset(tb + tail, 0, bs - tail);
             ext2_write_data(fs, blk, tb);
         }
         if (tb) kfree(tb);
@@ -5364,7 +5367,7 @@ static int ext2_truncate(vfs_node_t *node, uint64_t new_size) {
     int orph = 0;
     if (fs && fs->j && !fs->ro && ext2_read_inode(fs, ino, &in) == 0 &&
         (in.i_mode & EXT2_S_IFMT) == EXT2_S_IFREG && in.i_links_count && x4_is_ext(&in) &&
-        new_size / fs->st.block_size + 1 < in.i_size / fs->st.block_size) {
+        new_size / fs->st.block_size + 1 < ext2_isize(&in) / fs->st.block_size) {
         preempt_disable();
         ext2_open_t *e = ext2_open_find(fs, ino);
         orph = !(e && e->orphan);
