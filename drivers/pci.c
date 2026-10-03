@@ -187,3 +187,38 @@ void pci_msix_enable(const pci_device_t *d, uint8_t cap) {
     uint32_t cmd = pci_read_config32(b, s, f, 0x04);
     pci_write_config32(b, s, f, 0x04, (cmd & 0xFFFFU) | (1U << 10));
 }
+
+/* Size of memory BAR `i` (PCI Local Bus 3.0, 6.2.5.1): write all ones, read
+ * back the writable bits, restore.  Memory decode is off meanwhile so the
+ * device never answers at the all-ones address.  0 for an I/O or absent BAR. */
+uint32_t pci_bar_size(const pci_device_t *d, int i) {
+    if (i < 0 || i > 5) return 0;
+    uint8_t off = (uint8_t)(0x10 + i * 4);
+    uint32_t orig = pci_read_config32(d->bus, d->slot, d->func, off);
+    if (orig & 1) return 0;
+    uint32_t cmd = pci_read_config32(d->bus, d->slot, d->func, 0x04);
+    pci_write_config32(d->bus, d->slot, d->func, 0x04, cmd & ~0x3U);
+    pci_write_config32(d->bus, d->slot, d->func, off, 0xFFFFFFFFU);
+    uint32_t mask = pci_read_config32(d->bus, d->slot, d->func, off) & ~0xFU;
+    pci_write_config32(d->bus, d->slot, d->func, off, orig);
+    pci_write_config32(d->bus, d->slot, d->func, 0x04, cmd);
+    return mask ? ~mask + 1 : 0;
+}
+
+/* The ID of the capability at config offset `off` and the next one's offset,
+ * for walking a list with several capabilities of one ID (virtio). */
+uint8_t pci_cap_next(const pci_device_t *d, uint8_t off, uint8_t *id) {
+    if (!off) {
+        if (!(pci_read_config16(d->bus, d->slot, d->func, 0x06) & 0x10))
+            return 0;
+        off = pci_read_config8(d->bus, d->slot, d->func, 0x34) & 0xFC;
+    } else {
+        off = pci_read_config8(d->bus, d->slot, d->func, (uint8_t)(off + 1)) & 0xFC;
+    }
+    if (off && id) *id = pci_read_config8(d->bus, d->slot, d->func, off);
+    return off;
+}
+
+uint8_t pci_read8(const pci_device_t *d, uint8_t off) {
+    return pci_read_config8(d->bus, d->slot, d->func, off);
+}

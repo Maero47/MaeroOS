@@ -48,7 +48,11 @@
  *                          PTEs 1-2 are the temp-map slots (TEMP_MAP_VIRT*).
  *                          No-execute (PAE + NX) outside kernel .text
  *   0xD0000000-0xE0000000  kernel heap (HEAP_START..HEAP_MAX)
- *   0xE0000000-0xF0000000  framebuffer (drivers/framebuffer.c)
+ *   0xE0000000-0xF0000000  framebuffer (FB_WINDOW_*, drivers/framebuffer.c):
+ *                          the boot loader's framebuffer, or all of a mode-
+ *                          setting driver's memory (Bochs VRAM, the virtio-gpu
+ *                          backing frames) so the largest mode fits; mapped
+ *                          once at boot
  *   0xF0000000-0xF2000000  kernel stacks (KSTACK_REGION_*)
  *   0xF2000000-0xF8000000  free
  *   0xF8000000-0xFC000000  device registers (MMIO_WINDOW_*): mm/mmio.c hands
@@ -94,10 +98,17 @@
 #define ACPI_MAP_START      0xFD000000UL
 #define ACPI_MAP_END        0xFE000000UL
 
+/* Framebuffer window (drivers/framebuffer.c): 256 MiB, more than any mode's
+ * memory (the Bochs/QEMU std VGA tops out at 256 MiB of VRAM too). */
+#define FB_WINDOW_START     0xE0000000UL
+#define FB_WINDOW_END       0xF0000000UL
+
 /* Device register window (mm/mmio.c, mmio_map()). */
 #define MMIO_WINDOW_START   0xF8000000UL
 #define MMIO_WINDOW_END     0xFC000000UL
 
+_Static_assert(HEAP_MAX <= FB_WINDOW_START && FB_WINDOW_END <= KSTACK_REGION_START,
+               "framebuffer window overlaps the heap or the kernel stacks");
 _Static_assert(KSTACK_REGION_END <= MMIO_WINDOW_START,
                "kernel stacks overlap the MMIO window");
 _Static_assert(MMIO_WINDOW_END <= ACPI_MAP_START,

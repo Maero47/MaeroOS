@@ -1944,6 +1944,10 @@ void core_resize_root(int w, int h) {
     if (!root) return;
     resize_backing(root, w, h);
     fill_background(root, 0, 0, w, h);
+    /* As a RandR screen change does: clients that select StructureNotify
+     * on the root (window managers, GTK's screen size tracking) hear of the
+     * new size.  New connections get it in the setup reply's screen. */
+    send_configure_notify(root);
 }
 
 static void unselect_tree(window_t *w, int ci) {

@@ -1147,8 +1147,9 @@ static uint32_t fb0_write(vfs_node_t *n, uint32_t off, uint32_t len,
 }
 
 static int fb0_ioctl(vfs_node_t *n, uint32_t req, void *arg) {
-    (void)n;
-    return framebuffer_ioctl(req, arg);
+    int rc = framebuffer_ioctl(req, arg);
+    n->size = framebuffer_size();     /* FBIOPUT_VSCREENINFO changes it */
+    return rc;
 }
 
 static int tty_read_ready(vfs_node_t *n) {

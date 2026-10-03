@@ -43,6 +43,8 @@
 #include "../drivers/e1000.h"
 #include "../drivers/r8169.h"
 #include "../drivers/framebuffer.h"
+#include "../drivers/bochs_vga.h"
+#include "../drivers/virtio_gpu.h"
 #include "../drivers/keyboard.h"
 #include "../drivers/mouse.h"
 #include "../drivers/usb/xhci.h"
@@ -231,6 +233,11 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     /* ── ATA + ext2 disk ────────────────────────────────────────────────── */
     net_init();
     pci_init();
+    /* Mode-setting display drivers take over the boot framebuffer before
+     * devfs publishes /dev/fb0 (and before any process: they map the
+     * framebuffer window). */
+    bochs_vga_init();
+    virtio_gpu_init();
     rtl8139_init();
     e1000_init();
     r8169_init();
@@ -322,6 +329,7 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     ac97_start_thread();
     hda_start_thread();
     xhci_start_thread();
+    framebuffer_start_thread();
 
     printk("[BOOT] Jumping to scheduler.\n");
     /* The process table is now fully built — release the APs so they can scan
