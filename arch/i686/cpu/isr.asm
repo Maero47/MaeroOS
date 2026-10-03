@@ -236,6 +236,19 @@ nmi_isr:
 extern isr_handler
 extern bkl_enter
 extern bkl_leave
+%ifdef BKLSTAT
+extern bkl_enter_trap
+; BKLSTAT builds (Makefile): the lock is charged to the vector or syscall.
+%macro BKL_ENTER 0
+    push esp
+    call bkl_enter_trap
+    add esp, 4
+%endmacro
+%else
+%macro BKL_ENTER 0
+    call bkl_enter
+%endmacro
+%endif
 extern tlb_serve_pending
 
 isr_common_stub:
@@ -256,7 +269,7 @@ isr_common_stub:
 
     cld                 ; SysV ABI requires DF=0
 
-    call bkl_enter      ; SMP: acquire (or nest) the Big Kernel Lock
+    BKL_ENTER           ; SMP: acquire (or nest) the Big Kernel Lock
     call tlb_serve_pending ; SMP backstop: flush a missed TLB-shootdown request
 
     push esp            ; Argument: pointer to registers_t on the stack
@@ -293,7 +306,7 @@ irq_common_stub:
 
     cld
 
-    call bkl_enter      ; SMP: acquire (or nest) the Big Kernel Lock
+    BKL_ENTER           ; SMP: acquire (or nest) the Big Kernel Lock
     call tlb_serve_pending ; SMP backstop: flush a missed TLB-shootdown request
 
     push esp

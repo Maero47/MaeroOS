@@ -52,6 +52,7 @@
 #include "../lib/string.h"
 #include "../lib/printf.h"
 #include "../drivers/alsa.h"
+#include <kernel/klock.h>
 #include <stdint.h>
 
 void stack_chk_seed(void);   /* kernel/stack_chk.c */
@@ -318,6 +319,9 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
      * Always: lo needs lwIP's timers (retransmits, delayed ACKs, TIME_WAIT)
      * even on a machine with no NIC. */
     proc_create_kthread(knetd, "knetd");
+#if defined(KLOCK_TEST) && KLOCK_TEST
+    klock_test_start();
+#endif
     ac97_start_thread();
     hda_start_thread();
     xhci_start_thread();

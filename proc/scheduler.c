@@ -19,12 +19,14 @@ extern void vma_clear(struct proc *p);   /* free demand-paged VMAs (syscall.c) *
 #include "../arch/i686/cpu/percpu.h"
 #include "../arch/i686/cpu/apic.h"
 #include "../arch/i686/cpu/smp.h"
+#include "../arch/i686/cpu/bklstat.h"
 #include "../arch/i686/mm/paging.h"
 #include "../mm/heap.h"
 #include "../kernel/printk.h"
 #include <kernel/config.h>
 #include <kernel/kprof.h>
 #include <kernel/kwatch.h>
+#include <kernel/klock.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -265,7 +267,9 @@ void scheduler_start(void) {
             kprof_switch(p->kprof_bucket);   /* charge the dispatch to KPB_SCHED */
             uint64_t run_t0 = clock_mono_ns();
             me->run_t0 = run_t0;
+            bklstat_sched_in((int)(p - ptable), p->pgdir_phys == 0);
             swtch(&scheduler_ctx, p->context);
+            bklstat_sched_out((int)(p - ptable), me->bkl_depth == 1);
             uint64_t ran = clock_mono_ns() - run_t0;
             add_ns(&p->run_us, &p->run_ns_rem, ran);
             p->vruntime += vr_scale(p, ran);
@@ -431,6 +435,7 @@ static inline void kprof_park(void) {
 
 void yield(void) {
     if (!current_proc) return;
+    klock_might_sleep("yield");
     uint64_t yp = kprof_probe_begin();
     current_proc->state = PROC_RUNNABLE;
     current_proc->vr_skip = 1;
@@ -449,6 +454,7 @@ static uint32_t g_sleep_seq = 0;
 
 int sleep_on(void *chan) {
     if (!current_proc) return 0;
+    klock_might_sleep("sleep_on");
     current_proc->sleep_chan = chan;
     current_proc->sleep_tick = pit_ticks();
     current_proc->sleep_seq  = ++g_sleep_seq;
