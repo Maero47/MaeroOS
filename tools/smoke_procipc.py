@@ -144,6 +144,12 @@ def check_utmp(g):
 def check_ipc(g):
     out = g.run("/abiprobes/p45_sysv_ipc", timeout=90)
     expect(out, r"^PASS p45_sysv_ipc$", "SysV IPC probe")
+    # An unprivileged user cannot pin unbounded kernel memory (inotify
+    # queues, message queues, shm) and the system stays usable.
+    out = g.run("/abiprobes/p48_ipc_limits", timeout=300)
+    expect(out, r"^PASS p48_ipc_limits$", "IPC/inotify limits probe")
+    out = g.run("cat /proc/sys/fs/inotify/queued_bytes")
+    expect(out, r"^0$", "no inotify event memory left behind")
     out = g.run("cat /proc/sysvipc/shm | toybox wc -l")
     expect(out, r"^\s*1$", "no segment left behind by the probe")
     out = g.run("toybox ipcs -m")

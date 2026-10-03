@@ -112,6 +112,8 @@ PROBES = {
     "p45_sysv_ipc":            (60, ""),
     "p46_inotify":             (120, ""),
     "p47_proc_pid":            (60, ""),
+    # Unprivileged inotify queues, message queues and shm stay bounded.
+    "p48_ipc_limits":          (240, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

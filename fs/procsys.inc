@@ -175,7 +175,8 @@ typedef struct {
 enum { SC_OVERCOMMIT, SC_SHMMAX, SC_SHMALL, SC_SHMMNI, SC_SEM, SC_MSGMAX, SC_MSGMNB,
        SC_MSGMNI, SC_PIDMAX, SC_OSTYPE, SC_OSRELEASE, SC_HOSTNAME, SC_NGROUPS,
        SC_MAX_USER_WATCHES, SC_MAX_USER_INSTANCES, SC_MAX_QUEUED_EVENTS,
-       SC_FILE_MAX, SC_THREADS_MAX };
+       SC_FILE_MAX, SC_THREADS_MAX, SC_INO_USER_BYTES, SC_INO_TOTAL_BYTES,
+       SC_INO_QUEUED_BYTES, SC_SHM_USER, SC_MSG_PER_QUEUE };
 
 static const sysctl_ent_t sysctl_ents[] = {
     { "vm",     "overcommit_memory",    SC_OVERCOMMIT, 0644 },
@@ -196,6 +197,13 @@ static const sysctl_ent_t sysctl_ents[] = {
     { "fs/inotify", "max_user_watches",   SC_MAX_USER_WATCHES,   0444 },
     { "fs/inotify", "max_user_instances", SC_MAX_USER_INSTANCES, 0444 },
     { "fs/inotify", "max_queued_events",  SC_MAX_QUEUED_EVENTS,  0444 },
+    /* MaeroOS: the kernel-heap caps on queued events (fs/inotify.h). */
+    { "fs/inotify", "max_user_bytes",     SC_INO_USER_BYTES,     0444 },
+    { "fs/inotify", "max_total_bytes",    SC_INO_TOTAL_BYTES,    0444 },
+    { "fs/inotify", "queued_bytes",       SC_INO_QUEUED_BYTES,   0444 },
+    /* MaeroOS: shm bytes one non-root user may create, messages per queue. */
+    { "kernel", "shm_user_max",         SC_SHM_USER,   0444 },
+    { "kernel", "msg_per_queue_max",    SC_MSG_PER_QUEUE, 0444 },
 };
 #define N_SYSCTL (sizeof(sysctl_ents) / sizeof(sysctl_ents[0]))
 static const char *const sysctl_dirs[] = { "vm", "kernel", "fs", "fs/inotify" };
@@ -227,6 +235,11 @@ static uint32_t sysctl_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *
     case SC_MAX_USER_WATCHES: l = snprintf(t, sizeof(t), "%u\n", INOTIFY_MAX_WATCHES); break;
     case SC_MAX_USER_INSTANCES: l = snprintf(t, sizeof(t), "%u\n", INOTIFY_MAX_INSTANCES); break;
     case SC_MAX_QUEUED_EVENTS: l = snprintf(t, sizeof(t), "%u\n", INOTIFY_MAX_QUEUED); break;
+    case SC_INO_USER_BYTES: l = snprintf(t, sizeof(t), "%u\n", INOTIFY_USER_BYTES); break;
+    case SC_INO_TOTAL_BYTES: l = snprintf(t, sizeof(t), "%u\n", INOTIFY_TOTAL_BYTES); break;
+    case SC_INO_QUEUED_BYTES: l = snprintf(t, sizeof(t), "%u\n", inotify_heap_bytes); break;
+    case SC_SHM_USER: l = snprintf(t, sizeof(t), "%u\n", SYSV_SHM_USER_PAGES * 4096U); break;
+    case SC_MSG_PER_QUEUE: l = snprintf(t, sizeof(t), "%u\n", SYSV_MSG_PER_QUEUE); break;
     }
     return procfs_copy_blob((const uint8_t *)t, (uint32_t)l, off, len, buf);
 }

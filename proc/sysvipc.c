@@ -217,6 +217,13 @@ static int do_shmget(int key, uint32_t size, int flag) {
     if (size < 1 || size > SYSV_SHMMAX) return -E_INVAL;
     uint32_t np = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     if (shm_pages_total + np > SYSV_SHMALL) return -E_NOSPC;
+    if (current_proc->euid != 0) {
+        uint32_t mine = 0;
+        for (int i = 0; i < SYSV_SHMMNI; i++)
+            if (shms[i].used && shms[i].perm.cuid == current_proc->euid)
+                mine += shms[i].npages;
+        if (mine + np > SYSV_SHM_USER_PAGES) return -E_NOSPC;
+    }
     int slot = -1;
     for (int i = 0; i < SYSV_SHMMNI; i++)
         if (!shms[i].used) { slot = i; break; }
@@ -815,7 +822,7 @@ static int do_msgsnd(int id, const void *umsg, uint32_t sz, int flag) {
     uint16_t seq = q->perm.seq;
     /* Linux counts messages against qbytes too; and at most 1024 messages
      * per queue, so zero-length ones cannot pile up kernel headers. */
-    while (q->cbytes + sz > q->qbytes || q->qnum + 1 > q->qbytes || q->qnum >= 1024) {
+    while (q->cbytes + sz > q->qbytes || q->qnum + 1 > q->qbytes || q->qnum >= SYSV_MSG_PER_QUEUE) {
         if (flag & IPC_NOWAIT) { kfree(m); return -E_AGAIN; }
         int w = ipc_sleep(q, 0);
         q = &msqs[slot];

@@ -42,6 +42,10 @@ struct proc;
 #define SYSV_MSGMNI   64
 #define SYSV_MSGMAX   8192                       /* bytes per message */
 #define SYSV_MSGMNB   16384                      /* bytes per queue */
+#define SYSV_MSG_PER_QUEUE 1024                  /* messages per queue */
+/* Pages of segments one non-root user may have created (by cuid; segments
+ * outlive their creator, so this is what one user can pin). */
+#define SYSV_SHM_USER_PAGES 4096U                /* 16 MiB */
 
 /* ipc(2) and the direct syscalls; `num` is the syscall number. */
 int sys_ipc(registers_t *regs);

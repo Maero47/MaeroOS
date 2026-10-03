@@ -38,6 +38,7 @@ typedef struct inotify {
     uint32_t        bytes;         /* their size as read() returns them */
     int             next_wd;
     uint32_t        uid;
+    uint32_t        charged;       /* heap bytes its queue holds */
 } inotify_t;
 
 uint32_t inotify_nwatches;
@@ -61,6 +62,46 @@ static uint32_t name_len(const char *name) {
     return (l + EV_HDR - 1) & ~(EV_HDR - 1);
 }
 
+/* ── heap accounting: queued bytes per user and in all ── */
+uint32_t inotify_heap_bytes;
+#define ACCT_USERS 64
+static struct { uint32_t uid, bytes; } acct[ACCT_USERS];
+static uint32_t acct_spill;       /* users past ACCT_USERS share one budget */
+
+static uint32_t *acct_slot(uint32_t uid) {
+    int fr = -1;
+    for (int i = 0; i < ACCT_USERS; i++) {
+        if (acct[i].bytes && acct[i].uid == uid) return &acct[i].bytes;
+        if (!acct[i].bytes && fr < 0) fr = i;
+    }
+    if (fr < 0) return &acct_spill;
+    acct[fr].uid = uid;
+    return &acct[fr].bytes;
+}
+
+/* What one queued event costs the heap: the record, its name and the
+ * allocator's header. */
+static uint32_t ev_cost(uint32_t nl) { return (uint32_t)sizeof(ino_ev_t) + nl + 16; }
+
+static int charge(inotify_t *in, uint32_t cost, int force) {
+    uint32_t *u = acct_slot(in->uid);
+    if (!force) {
+        if (inotify_heap_bytes + cost > INOTIFY_TOTAL_BYTES) return 0;
+        if (in->uid != 0 && *u + cost > INOTIFY_USER_BYTES) return 0;
+    }
+    *u += cost;
+    inotify_heap_bytes += cost;
+    in->charged += cost;
+    return 1;
+}
+
+static void uncharge(inotify_t *in, uint32_t cost) {
+    uint32_t *u = acct_slot(in->uid);
+    *u = *u >= cost ? *u - cost : 0;
+    inotify_heap_bytes = inotify_heap_bytes >= cost ? inotify_heap_bytes - cost : 0;
+    in->charged = in->charged >= cost ? in->charged - cost : 0;
+}
+
 static void queue_event(inotify_t *in, int wd, uint32_t mask, uint32_t cookie,
                         const char *name) {
     uint32_t nl = name_len(name);
@@ -69,12 +110,16 @@ static void queue_event(inotify_t *in, int wd, uint32_t mask, uint32_t cookie,
     if (t && t->wd == wd && t->mask == mask && t->cookie == cookie && t->len == nl &&
         (!nl || !strcmp(t->name, name)) && !(mask & IN_Q_OVERFLOW))
         return;
-    if (in->nq >= INOTIFY_MAX_QUEUED) {
-        if (t && (t->mask & IN_Q_OVERFLOW)) return;
+    int over = in->nq >= INOTIFY_MAX_QUEUED || !charge(in, ev_cost(nl), 0);
+    if (over) {
+        if (t && (t->mask & IN_Q_OVERFLOW)) return;   /* already says so */
+        /* The one IN_Q_OVERFLOW a queue can hold is always let through
+         * (a bounded 16 + header bytes per instance). */
         wd = -1; mask = IN_Q_OVERFLOW; cookie = 0; nl = 0; name = NULL;
+        charge(in, ev_cost(0), 1);
     }
     ino_ev_t *e = (ino_ev_t *)kmalloc(sizeof(*e) + nl);
-    if (!e) return;
+    if (!e) { uncharge(in, ev_cost(nl)); return; }
     e->next = NULL;
     e->wd = wd;
     e->mask = mask;
@@ -188,6 +233,7 @@ static uint32_t ino_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf
         if (!in->head) in->tail = NULL;
         in->nq--;
         in->bytes -= sz;
+        uncharge(in, ev_cost(e->len));
         kfree(e);
     }
     ino_put(in);
@@ -216,6 +262,7 @@ static void ino_put(struct inotify *in) {
     while (in->head) {
         ino_ev_t *e = in->head;
         in->head = e->next;
+        uncharge(in, ev_cost(e->len));
         kfree(e);
     }
     if (ninstances) ninstances--;
@@ -279,7 +326,8 @@ int inotify_add(vfs_node_t *inst, vfs_node_t *target, uint32_t mask) {
     uint32_t mine = 0;
     for (ino_watch_t *w = watches; w; w = w->next)
         if (w->in->uid == in->uid) mine++;
-    if (mine >= INOTIFY_MAX_WATCHES) return -28;             /* -ENOSPC */
+    if (mine >= INOTIFY_MAX_WATCHES || inotify_nwatches >= INOTIFY_TOTAL_WATCHES)
+        return -28;                                          /* -ENOSPC */
     ino_watch_t *w = (ino_watch_t *)kmalloc(sizeof(*w));
     if (!w) return -12;
     w->in = in;

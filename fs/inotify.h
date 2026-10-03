@@ -50,8 +50,19 @@
 #define IN_ALL_EVENTS    0x00000FFF
 
 #define INOTIFY_MAX_WATCHES   8192     /* per user (fs.inotify.max_user_watches) */
-#define INOTIFY_MAX_INSTANCES 128
-#define INOTIFY_MAX_QUEUED    16384
+#define INOTIFY_MAX_INSTANCES 128      /* per user (fs.inotify.max_user_instances) */
+#define INOTIFY_MAX_QUEUED    16384    /* per instance (fs.inotify.max_queued_events) */
+/* Kernel heap held by queued events (the heap is one 256 MiB window).  A
+ * non-root user's instances together hold at most INOTIFY_USER_BYTES, all
+ * instances of everyone (root too) INOTIFY_TOTAL_BYTES; an event past
+ * either ends that queue in IN_Q_OVERFLOW, as max_queued_events does.
+ * Watches: at most INOTIFY_TOTAL_WATCHES in all.
+ * /proc/sys/fs/inotify/max_user_bytes and max_total_bytes show them. */
+#define INOTIFY_USER_BYTES    (2U << 20)
+#define INOTIFY_TOTAL_BYTES   (16U << 20)
+#define INOTIFY_TOTAL_WATCHES 65536
+/* Heap bytes queued now, by everyone (/proc/sys/fs/inotify/queued_bytes). */
+extern uint32_t inotify_heap_bytes;
 
 /* A new instance node (no references yet: the caller's descriptor takes the
  * first with vfs_retain), or NULL. */

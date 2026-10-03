@@ -81,7 +81,8 @@ are all as on Linux. Ids are `seq * slots + slot`.
   exit drop it, and `shm_nattch` counts address spaces. `IPC_RMID` on an
   attached segment marks it `SHM_DEST` and unfindable by key, and the last
   detach frees it.
-  Limits: 128 segments, 32 MiB each, 64 MiB in all.
+  Limits: 128 segments, 32 MiB each, 64 MiB in all, 16 MiB created by one
+  non-root user (`kernel.shm_user_max`); frames are physical pages, not heap.
 - **sem**: `semop` applies all of its operations or none. A blocked caller
   sleeps until the set changes, a signal arrives (`EINTR`) or the timeout runs
   out (`EAGAIN`). `IPC_NOWAIT`, `GETNCNT`/`GETZCNT`, `SETVAL`/`SETALL` (which
@@ -91,7 +92,9 @@ are all as on Linux. Ids are `seq * slots + slot`.
 - **msg**: messages are kept in FIFO order per queue, and `msgrcv` selects by
   exact type, by the lowest type up to `-type`, or with `MSG_EXCEPT`. A short
   buffer gets `E2BIG` unless `MSG_NOERROR` truncates. A full queue blocks the
-  sender. `MSG_COPY` returns `ENOSYS`.
+  sender, as do 1024 queued messages (so empty ones cannot pile up headers):
+  at most 64 queues x (16 KiB + 1024 headers), about 3 MiB of heap.
+  `MSG_COPY` returns `ENOSYS`.
 
 **MIT-SHM.** maeroX is unchanged. It could now offer the MIT-SHM extension
 (`shmget`/`shmat` by both the client and the server, with `IPC_RMID` after
@@ -136,7 +139,12 @@ its directory's. The directory is the one the caller's last path lookup of
 the file went through (`vfs_last_parent`); descriptor operations look the
 descriptor's path up again first. An event identical to the last one queued
 is merged. A user may hold 128 instances (root is not limited), and an
-instance cannot watch another instance. Past 16384 queued events the queue ends in one `IN_Q_OVERFLOW`
+instance cannot watch another instance. Queued events are charged to the
+kernel heap (record + name + allocator header): one non-root user's queues
+hold at most 2 MiB, everyone's together 16 MiB (`/proc/sys/fs/inotify/
+max_user_bytes`, `max_total_bytes`, and `queued_bytes` in use); an event
+past either cap, or past 16384 in one queue, ends that queue in one
+`IN_Q_OVERFLOW`. At most 8192 watches per user and 65536 in all. Past 16384 queued events the queue ends in one `IN_Q_OVERFLOW`
 (wd -1). `IN_MASK_ADD`, `IN_MASK_CREATE`, `IN_ONLYDIR`, `IN_DONT_FOLLOW` and
 `IN_ONESHOT` are supported.
 
