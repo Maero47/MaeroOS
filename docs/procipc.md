@@ -1,6 +1,7 @@
 # /proc, System V IPC, utmp and inotify
 
-    make smoke-procipc                               # in make check
+    make smoke-procipc                               # in make check (inotify on
+                                                     # tmpfs, ext2, vfat, exFAT, ext4)
     make smoke-procipc SMOKE_PROCIPC_ARGS=--alpine   # + Alpine procps-ng and htop
     make smoke-abi                                   # p45 (SysV), p46 (inotify), p47 (/proc)
 

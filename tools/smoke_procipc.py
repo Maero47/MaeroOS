@@ -9,7 +9,9 @@ back), logs in as root and checks:
   * utmp/wtmp: toybox who, w and last show the console login;
   * System V shm/sem/msg between processes, with permissions, IPC_RMID and
     SEM_UNDO on exit (abiprobe p45), and ipcs lists a live segment;
-  * inotify sees each directory operation on tmpfs and on ext2 (p46);
+  * inotify sees each directory operation on tmpfs and on ext2 (p46), and
+    on fresh vfat, exFAT and ext4 volumes (build/smoke-procipc/, made with the
+    host's mkfs tools when they are there);
   * /proc/<pid> files of another user's process are refused where Linux
     refuses them, and readable where it does not (p47, and by hand as
     "user").
@@ -151,10 +153,48 @@ def check_ipc(g):
     expect(out, r"^\d+\t\d+\t\d+\t\d+$", "sem limits")
 
 
-def check_inotify(g):
+# Scratch filesystems for the inotify probe beyond tmpfs and the ext2 disk:
+# (image, mkfs command, fstype), attached as hdb, hdc, hdd.
+EXTRA_FS = [("vfat.img", ["mkfs.vfat", "-F", "32"], "vfat"),
+            ("exfat.img", ["mkfs.exfat"], "exfat"),
+            ("ext4.img", ["mkfs.ext4", "-q", "-F"], "ext4")]
+WORK = os.path.join(ROOT, "build", "smoke-procipc")
+
+
+def find_tool(name):
+    for d in os.environ.get("PATH", "").split(os.pathsep) + ["/usr/sbin", "/sbin"]:
+        if d and os.access(os.path.join(d, name), os.X_OK):
+            return os.path.join(d, name)
+    return None
+
+
+def make_extra_fs():
+    """Fresh 64 MiB images; the filesystems whose mkfs is missing are left out."""
+    os.makedirs(WORK, exist_ok=True)
+    made = []
+    for img, mkfs, fstype in EXTRA_FS:
+        tool = find_tool(mkfs[0])
+        if not tool:
+            print(f"[SMOKE-PROCIPC] {mkfs[0]} not found: no {fstype} inotify run")
+            continue
+        path = os.path.join(WORK, img)
+        with open(path, "wb") as f:
+            f.truncate(64 << 20)
+        subprocess.run([tool, *mkfs[1:], path], check=True, stdout=subprocess.DEVNULL)
+        made.append((path, fstype))
+    return made
+
+
+def check_inotify(g, extra):
     for d in ("/tmp", "/disk"):
         out = g.run(f"/abiprobes/p46_inotify {d}", timeout=150)
         expect(out, r"^PASS p46_inotify$", f"inotify probe on {d}")
+    for i, (_, fstype) in enumerate(extra):
+        dev, mnt = "/dev/hd" + "bcd"[i], "/tmp/" + fstype
+        out = g.run(f"busybox mkdir -p {mnt} && busybox mount -t {fstype} {dev} {mnt}; echo rc=$?")
+        expect(out, r"rc=0", f"mount {fstype}")
+        out = g.run(f"/abiprobes/p46_inotify {mnt}", timeout=150)
+        expect(out, r"^PASS p46_inotify$", f"inotify probe on {fstype}")
 
 
 def check_proc_perms(g):
@@ -181,13 +221,15 @@ def check_proc_perms(g):
 
 
 def run_initrd(args):
-    g = Guest("disk.img")
+    extra = make_extra_fs()
+    g = Guest("disk.img", extra=[a for i, (path, _) in enumerate(extra) for a in
+                                 ("-drive", f"file={path},format=raw,index={i + 1},media=disk")])
     try:
         g.login()
         check_tools(g)
         check_utmp(g)
         check_ipc(g)
-        check_inotify(g)
+        check_inotify(g, extra)
         check_proc_perms(g)
     finally:
         g.stop()
