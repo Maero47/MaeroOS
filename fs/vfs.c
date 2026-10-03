@@ -689,6 +689,11 @@ int vfs_mount_add(const char *target, vfs_node_t *root, const vfs_mnt_t *tmpl) {
     if (mp->flags != VFS_FLAG_DIR) return -20;                /* -ENOTDIR */
     /* "/" itself is not a node any walk crosses from. */
     if (mp == vfs_root || mp == vfs_root_overlay) return -16; /* -EBUSY */
+    /* The table keeps raw pointers: neither end may be a node that goes
+     * once nothing holds it (per-process /proc nodes: -EINVAL). */
+    int pr = vfs_may_pin(mp, VFS_PIN_MOUNT);
+    if (!pr) pr = vfs_may_pin(root, VFS_PIN_MOUNT);
+    if (pr) return pr;
     preempt_disable();
     vfs_mnt_t *m = NULL;
     for (int i = 0; i < VFS_MNT_MAX; i++)

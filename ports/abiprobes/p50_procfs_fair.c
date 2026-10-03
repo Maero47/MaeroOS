@@ -13,6 +13,12 @@
  * /proc/sys/kernel/procfs_nodes_max throughout, and fall back near where it
  * started within a few seconds of the hammer stopping.
  *
+ * Also: nodes a user holds open or inotify-watches count against that
+ * user's share (it cannot hold more; the rest is refused with EMFILE,
+ * ENOSPC or, for its own lookups, ENOENT), and a per-process /proc
+ * directory cannot be a bind mount's source or target (MaeroOS: the mount
+ * table keeps no reference; EINVAL).
+ *
  * Linux: proc inodes and dentries are reclaimable cache, so the lookups just
  * work and there is no count to check.  Needs root (skipped otherwise).
  *
@@ -24,6 +30,8 @@
 #include "probe.h"
 #include <dirent.h>
 #include <sys/mman.h>
+#include <sys/inotify.h>
+#include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -179,13 +187,8 @@ static double now_s(void)
     return (double)ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-int main(void)
+static void part_hammer(void)
 {
-    probe_watchdog(150);
-    if (geteuid() != 0) probe_skip("needs root (two other users)");
-    sh = mmap(NULL, sizeof *sh, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (sh == MAP_FAILED) probe_fail("mmap");
-    memset((void *)sh, 0, sizeof *sh);
 
     long max = read_long("/proc/sys/kernel/procfs_nodes_max");
     long base = read_long("/proc/sys/kernel/procfs_nodes");
@@ -269,5 +272,136 @@ int main(void)
     if (base >= 0 && after > base + 64)
         probe_fail("%ld nodes still cached %s after the hammer stopped", after - base,
                    "10 s");
+}
+
+/* Part 2: holding nodes open or watched counts against the holder's share.
+ * Root looks up ~2800 nodes of 100 of its own processes (charged to root);
+ * a user then tries to open them (two processes) and to inotify-watch them
+ * (two more, no descriptor limit there) and keep them all.  It must end up
+ * holding at most procfs_user_nodes_max, the rest refused (EMFILE/ENOSPC/ENOENT),
+ * while another user's ps still works. */
+#define PIN_UID   65526
+#define NSLEEP    100
+#define NKINDS    14
+static const char *const pin_kinds[NKINDS] = {
+    "stat", "statm", "status", "cmdline", "comm", "limits", "mountinfo",
+    "mounts", "cgroup", "oom_score", "oom_score_adj", "wchan", "loginuid", "sched",
+};
+static pid_t sleepers[NSLEEP];
+
+static void pin_path(int i, char *path, size_t pl)
+{
+    int pid = sleepers[i / (2 * NKINDS)];
+    int k = i % NKINDS, task = (i / NKINDS) % 2;
+    if (task) snprintf(path, pl, "/proc/%d/task/%d/%s", pid, pid, pin_kinds[k]);
+    else snprintf(path, pl, "/proc/%d/%s", pid, pin_kinds[k]);
+}
+
+static void part_pin(void)
+{
+    long umax = read_long("/proc/sys/kernel/procfs_user_nodes_max");
+    for (int i = 0; i < NSLEEP; i++) {
+        sleepers[i] = fork();
+        if (sleepers[i] == 0) for (;;) sleep(60);
+        if (sleepers[i] < 0) probe_fail("fork sleeper %d", i);
+    }
+    const int total = NSLEEP * 2 * NKINDS;
+    char path[96];
+    struct stat st;
+    for (int i = 0; i < total; i++) {
+        pin_path(i, path, sizeof path);
+        if (stat(path, &st) != 0) probe_fail("root: stat %s: %s", path, strerror(errno));
+    }
+    memset((void *)sh, 0, sizeof *sh);
+    int go[2];
+    if (pipe(go) != 0) probe_fail("pipe");
+    pid_t w[4];
+    for (int j = 0; j < 4; j++) {
+        w[j] = fork();
+        if (w[j] != 0) continue;
+        close(go[1]);
+        if (setgid(PIN_UID) != 0 || setuid(PIN_UID) != 0) _exit(99);
+        int in = j >= 2 ? inotify_init1(0) : -1;
+        long held = 0, refused = 0;
+        for (int i = j; i < total; i += 4) {
+            pin_path(i, path, sizeof path);
+            int r = j < 2 ? open(path, O_RDONLY) : inotify_add_watch(in, path, IN_MODIFY);
+            if (r >= 0) held++;
+            /* ENOENT: its own lookup found no room for a node on the path
+             * (all of its share held). */
+            else if (errno == EMFILE || errno == ENOSPC || errno == ENOENT) refused++;
+        }
+        __sync_fetch_and_add(&sh->rounds[0], held);
+        __sync_fetch_and_add(&sh->misses[0], refused);
+        __sync_fetch_and_add(&sh->rounds[1], 1);
+        char x;
+        if (read(go[0], &x, 1) < 0) _exit(98);          /* hold until told */
+        _exit(0);
+    }
+    close(go[0]);
+    while (sh->rounds[1] < 4) usleep(20000);
+    long held = sh->rounds[0], refused = sh->misses[0];
+
+    /* Another user's ps while they are held. */
+    int bad = 0;
+    char what[128] = "";
+    pid_t o = fork();
+    if (o == 0) {
+        if (setgid(OTHER_UID) != 0 || setuid(OTHER_UID) != 0) _exit(99);
+        for (int r = 0; r < 20; r++)
+            if (ps_pass(what, sizeof what, NULL)) {
+                printf("info %s: other user: %s\n", PROBE_NAME, what);
+                _exit(1);
+            }
+        _exit(0);
+    }
+    int ost;
+    waitpid(o, &ost, 0);
+    if (!WIFEXITED(ost) || WEXITSTATUS(ost) != 0) bad = 1;
+    close(go[1]);
+    for (int j = 0; j < 4; j++) waitpid(w[j], NULL, 0);
+    for (int i = 0; i < NSLEEP; i++) kill(sleepers[i], SIGKILL);
+    for (int i = 0; i < NSLEEP; i++) waitpid(sleepers[i], NULL, 0);
+
+    probe_info("pins: %ld of %d nodes held open/watched by one user, %ld refused (share %ld)",
+               held, total, refused, umax);
+    if (bad) probe_fail("another user's lookups failed while one user held nodes");
+    if (umax > 0 && held > umax)
+        probe_fail("one user holds %ld nodes, over its share of %ld", held, umax);
+    if (umax > 0 && held + refused != total)
+        probe_fail("%ld of %d opens/watches failed some other way", total - held - refused, total);
+}
+
+/* Part 3 (MaeroOS): the mount table keeps no reference, so a per-process
+ * /proc directory is neither a bind source nor a mount point (Linux allows
+ * both; its dentries are pinned by the mount). */
+static void part_mount(void)
+{
+    if (read_long("/proc/sys/kernel/procfs_nodes_max") < 0) return;
+    char dir[64], pdir[64];
+    snprintf(dir, sizeof dir, "/tmp/p50m.%d", (int)getpid());
+    snprintf(pdir, sizeof pdir, "/proc/%d/task", (int)getpid());
+    if (mkdir(dir, 0755) != 0) probe_fail("mkdir %s", dir);
+    int r1 = mount(dir, pdir, NULL, MS_BIND, NULL), e1 = errno;
+    if (r1 == 0) umount(pdir);
+    int r2 = mount(pdir, dir, NULL, MS_BIND, NULL), e2 = errno;
+    if (r2 == 0) umount(dir);
+    rmdir(dir);
+    probe_info("bind onto %s: %s; bind of it: %s", pdir, r1 ? strerror(e1) : "mounted",
+               r2 ? strerror(e2) : "mounted");
+    if (r1 == 0 || e1 != EINVAL) probe_fail("bind mount onto %s not refused with EINVAL", pdir);
+    if (r2 == 0 || e2 != EINVAL) probe_fail("bind mount of %s not refused with EINVAL", pdir);
+}
+
+int main(void)
+{
+    probe_watchdog(150);
+    if (geteuid() != 0) probe_skip("needs root (two other users)");
+    sh = mmap(NULL, sizeof *sh, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (sh == MAP_FAILED) probe_fail("mmap");
+    memset((void *)sh, 0, sizeof *sh);
+    part_hammer();
+    part_pin();
+    part_mount();
     probe_pass();
 }

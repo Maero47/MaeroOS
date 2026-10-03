@@ -348,6 +348,10 @@ int inotify_add(vfs_node_t *inst, vfs_node_t *target, uint32_t mask) {
         if (w->in->uid == in->uid) mine++;
     if (mine >= INOTIFY_MAX_WATCHES || inotify_nwatches >= INOTIFY_TOTAL_WATCHES)
         return -28;                                          /* -ENOSPC */
+    /* A per-process /proc node is charged to the watcher (-ENOSPC once
+     * that user's share is all held). */
+    int pin = vfs_may_pin(target, VFS_PIN_WATCH);
+    if (pin) return pin;
     ino_watch_t *w = (ino_watch_t *)kmalloc(sizeof(*w));
     if (!w) return -12;
     w->in = in;

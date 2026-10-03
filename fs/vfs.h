@@ -72,6 +72,12 @@ typedef struct vfs_node {
      * exactly as a missing node would.  A finddir_fn that allocates per lookup
      * instead of setting this leaks on every stat(). */
     struct vfs_node * (*open_fn)   (struct vfs_node *);
+    /* About to be held for longer than the current syscall (how: VFS_PIN_*):
+     * 0, or a negative errno that refuses it.  Node caches whose entries go
+     * once nothing holds them (per-process /proc nodes) charge the holder
+     * here, and refuse what a raw pointer would outlive (mounts keep no
+     * reference).  NULL = always allowed.  See vfs_may_pin(). */
+    int               (*may_pin_fn)(struct vfs_node *, int how);
     /* Persist mode/uid/gid changes (chmod/chown); NULL = in-memory only. */
     int               (*setattr_fn)(struct vfs_node *, uint32_t mode,
                                     uint32_t uid, uint32_t gid);
@@ -180,6 +186,13 @@ void vfs_retain(vfs_node_t *node);
  * -13 (-EACCES).  euid 0 (root) bypasses, except X on a file still needs an
  * execute bit somewhere. */
 int vfs_access_check(vfs_node_t *node, uint32_t euid, uint32_t egid, int want);
+
+/* may_pin_fn: an open file, an inotify watch or a chroot root (references
+ * that vfs_retain counts), or a mount (which keeps a raw pointer). */
+enum { VFS_PIN_OPEN = 1, VFS_PIN_WATCH, VFS_PIN_ROOT, VFS_PIN_MOUNT };
+static inline int vfs_may_pin(vfs_node_t *node, int how) {
+    return node && node->may_pin_fn ? node->may_pin_fn(node, how) : 0;
+}
 /* The same, where the group class also applies when the file's group is any of
  * the `ngroups` supplementary gids in `groups` (Linux in_group_p). */
 int vfs_access_check_groups(vfs_node_t *node, uint32_t uid, uint32_t gid,

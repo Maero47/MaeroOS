@@ -75,13 +75,19 @@ count, without letting one user deny `/proc` to the others:
   neither open nor held by a running syscall; it never fails while one
   exists. Nothing is kept merely because it was used recently.
 - Each node is charged to one user: the last to look it up while it was not
-  open, or whoever opened it. A non-root user with 1024 nodes charged
-  (`/proc/sys/kernel/procfs_user_nodes_max`) frees one of its own first,
-  and fails only when all of its nodes are open or held by its own running
-  syscalls. So one user holds at most 1024, and the rest of the 8192 that
-  non-root lookups may fill stays available to everyone else. Root has no
-  per-user limit and may also use the last 1024 of the 9216 total
-  (`procfs_nodes_max`, about 4 MiB of heap at most).
+  open, or whoever first holds it (opens it, watches it with inotify, or
+  chroots to it). A non-root user with 1024 nodes charged
+  (`/proc/sys/kernel/procfs_user_nodes_max`) frees one of its own first.
+  When all of its nodes are open or held by its own running syscalls, its
+  new lookups fail (ENOENT) and its opens and watches of nodes charged to
+  others are refused (EMFILE, ENOSPC), so nodes held open count against the
+  holder's share. One user therefore holds at most 1024, and the rest of the
+  8192 that non-root lookups may fill stays available to everyone else.
+  Root has no per-user limit and may also use the last 1024 of the 9216
+  total (`procfs_nodes_max`, about 4 MiB of heap at most).
+- The mount table keeps raw node pointers, with no reference. A
+  per-process `/proc` directory therefore cannot be a bind mount's source or
+  mount point (EINVAL; Linux allows both).
 - Nodes unused for 3 s are freed by the sweep (every second, on a lookup),
   so `procfs_nodes` falls back once lookups stop. Nodes of exited processes
   and of closed descriptors age out the same way.

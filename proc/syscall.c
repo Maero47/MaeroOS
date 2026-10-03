@@ -1607,6 +1607,10 @@ static int sys_open_kernel_path(const char *path, int flags, uint32_t mode) {
              * only lookups that reserve a pty are the ones that become an open
              * — a stat(), an access() or a failed open() reserves nothing.
              * See the open_fn comment in fs/vfs.h. */
+            /* A per-process /proc node is charged to whoever holds it open
+             * (-EMFILE once that user's share is all held). */
+            int pin = vfs_may_pin(node, VFS_PIN_OPEN);
+            if (pin) return pin;
             if (node->open_fn) {
                 vfs_node_t *clone = node->open_fn(node);
                 if (!clone) return -2;   /* -ENOENT: no capacity left */
@@ -2757,6 +2761,8 @@ static int sys_chroot(registers_t *regs) {
     if (!n) return lerr;
     if (!(n->flags & VFS_FLAG_DIR)) return -20;        /* -ENOTDIR */
     if (n == current_proc->root_node) return 0;        /* chroot("/"), "." at / */
+    int pin = vfs_may_pin(n, VFS_PIN_ROOT);
+    if (pin) return pin;
     vfs_node_t *old = current_proc->root_node;
     if (n == vfs_root && !old) return 0;               /* the global root */
     vfs_retain(n);

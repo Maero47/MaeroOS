@@ -137,7 +137,9 @@ int procfs_may_read(struct proc *t) {
  *    to make room; a lookup that needs room never fails while such a node
  *    exists.
  *  - every node is charged to one user: the last to look it up while it was
- *    not open, or whoever opened it.  A non-root user with PNODE_USER_MAX
+ *    not open, or whoever first opened, watched or chroot'ed to it (refused
+ *    with EMFILE/ENOSPC when that user's share is all held; see
+ *    pnode_may_pin).  A non-root user with PNODE_USER_MAX
  *    nodes charged frees one of its own before it gets another (and its
  *    lookup fails only when all of them are open or in use by its own
  *    syscalls), so one user can hold at most that many and the rest of
@@ -240,13 +242,37 @@ static void pnode_sweep(uint32_t now) {
     }
 }
 
+/* may_pin_fn: before an open, a watch or a chroot takes the first
+ * reference, the node is charged to that user, who must have room for it
+ * like for a lookup: one of its own unheld nodes goes to make it, and with
+ * none left the pin is refused.  So the nodes held open count against the
+ * share of whoever holds them, and nobody can hold nodes in another user's
+ * share.  Mounts keep raw pointers, so a node that can be freed is never
+ * one of their ends. */
+static int pnode_may_pin(vfs_node_t *n, int how) {
+    pnode_t *pn = (pnode_t *)n;
+    if (how == VFS_PIN_MOUNT) return -22;                     /* -EINVAL */
+    if (pn->refs > 0) return 0;              /* already charged to a holder */
+    uint32_t uid = current_proc ? current_proc->euid : 0;
+    int b = pn_bucket_of(uid);
+    if (b == pn->bucket) return 0;
+    if (b != PN_ROOT) {
+        /* pn is in another bucket: making room in b cannot free it. */
+        while (pn_acct[b].n >= PNODE_USER_MAX && pn_evict(b)) {}
+        b = pn_bucket_of(uid);
+        if (b != pn->bucket && pn_acct[b].n >= PNODE_USER_MAX)
+            return how == VFS_PIN_WATCH ? -28 : -24;          /* ENOSPC, EMFILE */
+    }
+    pn_charge(pn, b, uid);
+    return 0;
+}
+
+/* The first reference takes it off the LRU lists; it stays charged where
+ * pnode_may_pin (or the last lookup) put it. */
 static void pnode_retain(vfs_node_t *n) {
     pnode_t *pn = (pnode_t *)n;
     if (pn->refs++ > 0) return;
-    /* Opened: off the LRU lists, and charged to the opener. */
     pn_lru_del(pn);
-    uint32_t uid = current_proc ? current_proc->euid : 0;
-    pn_charge(pn, pn_bucket_of(uid), uid);
 }
 
 static void pnode_close(vfs_node_t *n) {
@@ -363,6 +389,7 @@ static vfs_node_t *pnode_get(int pid, int kind, int arg, int thread,
         pn->v.inode = pp_inode(pid, kind, arg, thread);
         pn->v.retain_fn = pnode_retain;
         pn->v.close_fn = pnode_close;
+        pn->v.may_pin_fn = pnode_may_pin;
         pn->v.private = pn;
         switch (kind) {
         case PK_DIR:
