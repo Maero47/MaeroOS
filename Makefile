@@ -149,7 +149,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-tcpsrv smoke-net6 smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-gfxmode smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-alpinex disk-alpinex smoke-alpine-net smoke-audio disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-net-virtio smoke-tcpsrv smoke-net6 smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-gfxmode smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-alpinex disk-alpinex smoke-alpine-net smoke-audio disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched
 
 all: $(TARGET)
 
@@ -295,7 +295,8 @@ run: $(TARGET) initrd
 		-no-reboot \
 		-no-shutdown
 
-# NIC=e1000 for the Intel e1000 instead (drivers/e1000.c).
+# NIC=e1000 for the Intel e1000 instead (drivers/e1000.c), NIC=virtio-net-pci
+# for virtio-net (drivers/virtio/).
 NIC ?= rtl8139
 run-net: $(TARGET) initrd
 	qemu-system-i386 $(QEMU_DISPLAY) \
@@ -347,6 +348,14 @@ smoke-net: $(TARGET) initrd
 # DHCP's resolv.conf and DNS lookups against a responder in the harness.
 smoke-net-e1000: $(TARGET) initrd disk
 	python3 tools/smoke_net_e1000.py
+
+# virtio-net (drivers/virtio/) on QEMU's virtio-net-pci, booted with MSI-X
+# and again with INTx (vectors=0): DHCP, DNS, wget, hostfwd servers, SLAAC,
+# ping, link down/up over QMP, and 50 MB each way with the rate printed.
+# `python3 tools/smoke_net_virtio.py --bench-only e1000` runs only the
+# throughput part on another NIC, for comparison.
+smoke-net-virtio: $(TARGET) initrd disk
+	python3 tools/smoke_net_virtio.py
 
 # AF_INET listen/accept and blocking UDP, reached through QEMU hostfwd
 # (e1000; SMOKE_TCPSRV_ARGS="--nic rtl8139" for the other NIC).
@@ -484,7 +493,7 @@ smoke-pc: $(TARGET) iso disk
 # timeouts assume the guest has a host core to itself.  The suites start QEMU
 # with -display none (tools/smokelib.py), so no display is needed.
 # Pick a subset with CHECK_SUITES="smoke smoke-x".
-CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-net-e1000 smoke-net6 smoke-tcpsrv \
+CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-net-e1000 smoke-net-virtio smoke-net6 smoke-tcpsrv \
                  smoke-fw smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui smoke-gfxmode smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-uefi \
                  smoke-install smoke-hda smoke-acpi smoke-ahci smoke-nvme smoke-usb smoke-pc
 CHECK_LOG_DIR ?= build/check

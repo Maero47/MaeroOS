@@ -42,6 +42,7 @@
 #include "../drivers/rtl8139.h"
 #include "../drivers/e1000.h"
 #include "../drivers/r8169.h"
+#include "../drivers/virtio/virtio_net.h"
 #include "../drivers/framebuffer.h"
 #include "../drivers/bochs_vga.h"
 #include "../drivers/virtio_gpu.h"
@@ -241,6 +242,7 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     rtl8139_init();
     e1000_init();
     r8169_init();
+    virtio_net_init();
     ac97_init();
     xhci_init();
     hda_init();

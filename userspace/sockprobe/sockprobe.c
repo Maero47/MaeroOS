@@ -492,6 +492,50 @@ static int connintr(int port, int restart) {
     return 0;
 }
 
+/* sockprobe bulk tx|rx <port> <nbytes>: a throughput run against the host
+ * (10.0.2.2:port).  tx sends nbytes in 16 KiB writes then closes; rx reads
+ * until EOF.  Prints the byte count and the elapsed monotonic time. */
+static int bulk(const char *dir, int port, int nbytes) {
+    int tx = strcmp(dir, "tx") == 0;
+    int fd = http_connect(port);
+    if (fd < 0) {
+        printf("sockprobe: connect failed errno=%d\n", errno);
+        return 1;
+    }
+    static char buf[16384];
+    for (int i = 0; i < (int)sizeof(buf); i++)
+        buf[i] = (char)('a' + i % 26);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    long long done = 0;
+    for (;;) {
+        int r;
+        if (tx) {
+            if (done >= nbytes)
+                break;
+            int n = nbytes - done < (long long)sizeof(buf) ? (int)(nbytes - done) : (int)sizeof(buf);
+            r = (int)send(fd, buf, (size_t)n, 0);
+        } else {
+            r = (int)recv(fd, buf, sizeof(buf), 0);
+            if (r == 0)
+                break;
+        }
+        if (r < 0) {
+            printf("sockprobe: bulk %s failed at %lld errno=%d\n", dir, done, errno);
+            close(fd);
+            return 1;
+        }
+        done += r;
+    }
+    close(fd);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long long ms = (t1.tv_sec - t0.tv_sec) * 1000LL + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    if (ms <= 0)
+        ms = 1;
+    printf("sockprobe bulk %s %lld bytes %lld ms %lld KB/s\n", dir, done, ms, done * 1000 / ms / 1024);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "tcpshut") == 0)
         return tcpshut(atoi(argv[2]));
@@ -509,6 +553,8 @@ int main(int argc, char **argv) {
         return connintr(atoi(argv[2]), 0);
     if (argc == 4 && strcmp(argv[1], "conn") == 0 && strcmp(argv[3], "restart") == 0)
         return connintr(atoi(argv[2]), 1);
+    if (argc == 5 && strcmp(argv[1], "bulk") == 0)
+        return bulk(argv[2], atoi(argv[3]), atoi(argv[4]));
 
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {

@@ -247,6 +247,35 @@ uint32_t pmm_alloc_frame(void) {
     return idx == 0xFFFFFFFFU ? 0 : idx * PAGE_SIZE;   /* 0: out of memory */
 }
 
+/* `n` physically contiguous frames, all below frame index `limit` (and below
+ * 4 GiB), first fit.  For DMA structures a device needs in one piece (a
+ * legacy virtio queue: descriptor table, rings and the padding between
+ * them).  Returns the first frame's physical address, or 0. */
+uint32_t pmm_alloc_contig(uint32_t n, uint32_t limit) {
+    if (n == 0)
+        return 0;
+    uint32_t irq = pmm_irq_save();
+    uint32_t hi = limit < pmm_low_total ? limit : pmm_low_total;
+    uint32_t run = 0, found = 0xFFFFFFFFU;
+    for (uint32_t idx = 1; idx < hi; idx++) {         /* never frame 0 */
+        if (BIT_TEST(pmm_bitmap, idx)) {
+            run = 0;
+            continue;
+        }
+        if (++run == n) {
+            found = idx + 1 - n;
+            break;
+        }
+    }
+    if (found != 0xFFFFFFFFU)
+        for (uint32_t i = 0; i < n; i++) {
+            pmm_mark_used(found + i);
+            pmm_alloc_uaf_check(found + i);
+        }
+    pmm_irq_restore(irq);
+    return found == 0xFFFFFFFFU ? 0 : found * PAGE_SIZE;
+}
+
 phys_t pmm_alloc_user_frame(void) {
     if (pmm_total > pmm_low_total) {
         uint32_t irq = pmm_irq_save();

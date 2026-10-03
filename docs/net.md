@@ -9,7 +9,7 @@ mode, driven by `knetd` and by the socket calls themselves
 | ifindex | name | addresses | notes |
 |---|---|---|---|
 | 1 | `lo` | `127.0.0.1/8`, `::1/128` | lwIP's loop netif; no driver |
-| 2 | `eth0` | DHCPv4 lease; `fe80::/64` (EUI-64) and SLAAC `/64`s | e1000, RTL8139 or r8169 |
+| 2 | `eth0` | DHCPv4 lease; `fe80::/64` (EUI-64) and SLAAC `/64`s | RTL8139, e1000, r8169 or virtio-net (the first probed, in that order) |
 
 `lo` is registered first, so it is interface 1 and the NIC is 2, as on Linux.
 Traffic to `127.0.0.0/8`, `::1` and to eth0's own addresses goes through
@@ -26,8 +26,9 @@ advertisements. QEMU user networking advertises `fec0::/64` and answers at
 `fec0::2` (the host) and `fec0::3` (DNS); recent QEMU versions turn this on by
 default. Be careful with `-netdev user,ipv6=on` on its own: QEMU then turns
 IPv4 off, so pass `ipv4=on,ipv6=on`. The NIC drivers accept all multicast
-(e1000 `RCTL.MPE`, RTL8139 and r8169 `MAR` all ones), so neighbour discovery reaches
-lwIP. There is no DHCPv6. RDNSS is off, so the DHCPv4 lease still writes
+(e1000 `RCTL.MPE`, RTL8139 and r8169 `MAR` all ones, virtio-net
+`VIRTIO_NET_CTRL_RX_ALLMULTI` over its control queue, `docs/virtio.md`), so
+neighbour discovery reaches lwIP. There is no DHCPv6. RDNSS is off, so the DHCPv4 lease still writes
 `/etc/resolv.conf`.
 
 Where you can see it:
@@ -114,6 +115,10 @@ order it. The resolver only reads IPv4 `nameserver` lines.
   slirp hands to the host's `::1`;
 - `getaddrinfo` of a dual-stack name served by `tools/dns_responder.py`;
 - the firewall over IPv6.
+
+`make smoke-net-virtio` (`tools/smoke_net_virtio.py`) checks SLAAC, wget
+over IPv6 and ping to `::1` on virtio-net, with the device's receive filter
+read back over QMP (`docs/virtio.md`).
 
 `tools/smoke_alpine_net.py` also checks `ip -6 addr` and busybox
 `ping -6 ::1` in the Alpine chroot.

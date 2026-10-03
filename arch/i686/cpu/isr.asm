@@ -116,7 +116,7 @@ lapic_timer_isr:
     push dword 0xF0
     jmp irq_common_stub
 
-; ─── MSI stubs (vectors 0xE0-0xE3) ───────────────────────────────────────────
+; ─── MSI stubs (vectors 0xE0-0xE7) ───────────────────────────────────────────
 ; Message-signalled PCI interrupts (drivers/pci.c pci_enable_msi): delivered
 ; straight to the BSP's Local APIC, so irq_handler sends a LAPIC EOI, never a
 ; PIC one, and calls the handler registered with msi_install_handler().
@@ -131,6 +131,10 @@ MSI 0
 MSI 1
 MSI 2
 MSI 3
+MSI 4
+MSI 5
+MSI 6
+MSI 7
 
 ; ─── Reschedule IPI stub (vector 0xFC) ───────────────────────────────────────
 ; Sent by a CPU that woke a thread this CPU should run (proc/scheduler.c

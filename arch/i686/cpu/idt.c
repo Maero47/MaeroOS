@@ -1,5 +1,6 @@
 #include "idt.h"
 #include "isr.h"
+#include "irq.h"
 #include <stdint.h>
 
 /* IDT gate descriptor (8 bytes) */
@@ -111,12 +112,15 @@ void idt_init(void) {
     extern void lapic_timer_isr(void);
     idt_set_gate(0xF0, (uint32_t)lapic_timer_isr, 0x08, 0x8E);
 
-    /* MSI vectors 0xE0-0xE3 (arch/i686/cpu/irq.c msi_install_handler). */
-    extern void msi_isr0(void), msi_isr1(void), msi_isr2(void), msi_isr3(void);
-    idt_set_gate(0xE0, (uint32_t)msi_isr0, 0x08, 0x8E);
-    idt_set_gate(0xE1, (uint32_t)msi_isr1, 0x08, 0x8E);
-    idt_set_gate(0xE2, (uint32_t)msi_isr2, 0x08, 0x8E);
-    idt_set_gate(0xE3, (uint32_t)msi_isr3, 0x08, 0x8E);
+    /* MSI vectors 0xE0-0xE7 (arch/i686/cpu/irq.c msi_install_handler). */
+    extern void msi_isr0(void), msi_isr1(void), msi_isr2(void), msi_isr3(void),
+                msi_isr4(void), msi_isr5(void), msi_isr6(void), msi_isr7(void);
+    void (*const msi_stubs[MSI_VECTORS])(void) = {
+        msi_isr0, msi_isr1, msi_isr2, msi_isr3,
+        msi_isr4, msi_isr5, msi_isr6, msi_isr7,
+    };
+    for (unsigned i = 0; i < MSI_VECTORS; i++)
+        idt_set_gate((uint8_t)(MSI_VECTOR_BASE + i), (uint32_t)msi_stubs[i], 0x08, 0x8E);
 
     /* Reschedule IPI (vector 0xFC): wakeup preemption across CPUs. */
     extern void resched_ipi_isr(void);
