@@ -5,6 +5,7 @@
 #include "../proc/process.h"
 #include "../lib/printf.h"
 #include "../proc/scheduler.h"
+#include "inotify.h"
 #include <stddef.h>
 
 vfs_node_t *vfs_root = NULL;
@@ -68,17 +69,33 @@ uint32_t vfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
 
 int vfs_create(vfs_node_t *dir, const char *name, uint32_t flags) {
     if (!dir || !dir->create_fn) return -1;
-    return dir->create_fn(dir, name, flags);
+    int r = dir->create_fn(dir, name, flags);
+    if (r == 0)
+        inotify_dir_event(dir, IN_CREATE | (flags == VFS_FLAG_DIR ? IN_ISDIR : 0), 0, name);
+    return r;
 }
 
 int vfs_truncate(vfs_node_t *node, uint32_t new_size) {
     if (!node || !node->truncate_fn) return -1;
-    return node->truncate_fn(node, new_size);
+    int r = node->truncate_fn(node, new_size);
+    if (r == 0) inotify_child_event(node, NULL, IN_MODIFY);
+    return r;
 }
 
 int vfs_unlink(vfs_node_t *dir, const char *name) {
     if (!dir || !dir->unlink_fn) return -1;
-    return dir->unlink_fn(dir, name);
+    /* inotify: the entry being removed, looked up before it goes (the
+     * pointer is only compared afterwards; a watched node is kept alive by
+     * its watch's reference). */
+    vfs_node_t *child = inotify_nwatches ? vfs_finddir(dir, name) : NULL;
+    uint32_t isdir = child && child->flags == VFS_FLAG_DIR ? IN_ISDIR : 0;
+    int last = child && (isdir || child->nlink <= 1);
+    int r = dir->unlink_fn(dir, name);
+    if (r == 0 && inotify_nwatches) {
+        inotify_dir_event(dir, IN_DELETE | isdir, 0, name);
+        if (last) inotify_node_gone(child);
+    }
+    return r;
 }
 
 void vfs_close(vfs_node_t *node) {
@@ -131,21 +148,35 @@ int vfs_access_check_groups(vfs_node_t *node, uint32_t euid, uint32_t egid,
 
 int vfs_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid) {
     if (!node) return -2;
+    vfs_node_t *parent = NULL;
+    char name[256];
+    int haveparent = inotify_nwatches && vfs_last_parent(node, &parent, name);
     node->mask = mode & 07777;
     node->uid = uid;
     node->gid = gid;
-    if (node->setattr_fn)
-        return node->setattr_fn(node, node->mask, uid, gid);
-    return 0;
+    int r = node->setattr_fn ? node->setattr_fn(node, node->mask, uid, gid) : 0;
+    if (r == 0 && inotify_nwatches) {
+        uint32_t m = IN_ATTRIB | (node->flags == VFS_FLAG_DIR ? IN_ISDIR : 0);
+        inotify_self_event(node, m);
+        if (haveparent) inotify_dir_event(parent, m, 0, name);
+    }
+    return r;
 }
 
 int vfs_settimes(vfs_node_t *node, uint32_t atime, uint32_t mtime) {
     if (!node) return -2;
+    vfs_node_t *parent = NULL;
+    char name[256];
+    int haveparent = inotify_nwatches && vfs_last_parent(node, &parent, name);
     node->atime = atime;
     node->mtime = mtime;
-    if (node->settimes_fn)
-        return node->settimes_fn(node, atime, mtime);
-    return 0;
+    int r = node->settimes_fn ? node->settimes_fn(node, atime, mtime) : 0;
+    if (r == 0 && inotify_nwatches) {
+        uint32_t m = IN_ATTRIB | (node->flags == VFS_FLAG_DIR ? IN_ISDIR : 0);
+        inotify_self_event(node, m);
+        if (haveparent) inotify_dir_event(parent, m, 0, name);
+    }
+    return r;
 }
 
 /* ── Path resolution ──────────────────────────────────────────────────────── */
@@ -179,6 +210,25 @@ void vfs_set_root_overlay(vfs_node_t *fs_root) {
 
 vfs_node_t *vfs_get_root_overlay(void) {
     return vfs_root_overlay;
+}
+
+static vfs_node_t *mnt_resolve(vfs_node_t *dir);
+
+/* The last path walk's final component (inotify: a file's directory and
+ * name for the events on it).  Only kept while watches exist. */
+static struct {
+    struct proc *who;
+    vfs_node_t  *parent, *node;
+    char         name[256];
+} last_lookup;
+
+int vfs_last_parent(vfs_node_t *node, vfs_node_t **parent, char *name) {
+    if (!node || last_lookup.node != node || last_lookup.who != current_proc ||
+        !last_lookup.parent)
+        return 0;
+    *parent = last_lookup.parent;
+    memcpy(name, last_lookup.name, sizeof(last_lookup.name));
+    return 1;
 }
 
 /* Linux's MAXSYMLINKS: symlinks one lookup may follow before -ELOOP. */
@@ -296,10 +346,14 @@ static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
             char target[256];
             /* A target that does not fit would be followed truncated. */
             if (cur->size >= sizeof(target)) { *err = -36; return WALK_MISS; }
-            uint32_t tlen = vfs_read(cur, 0, sizeof(target) - 1,
-                                     (uint8_t *)target);
+            /* A procfs link may refuse the caller (-EACCES as a negative
+             * count: /proc/<pid>/cwd of another user's process). */
+            int32_t tl = (int32_t)vfs_read(cur, 0, sizeof(target) - 1,
+                                           (uint8_t *)target);
+            if (tl <= 0) { *err = tl < 0 ? tl : -2; return WALK_MISS; }
+            uint32_t tlen = (uint32_t)tl;
+            if (tlen > sizeof(target) - 1) tlen = sizeof(target) - 1;
             target[tlen] = '\0';
-            if (tlen == 0) { *err = -2; return WALK_MISS; }
             if (target[0] == '/') alen = 0;
             uint32_t rlen = (uint32_t)strlen(after_component);
             /* prefix + '/' + target + '/' + rest + NUL */
@@ -318,6 +372,13 @@ static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
             }
             alt[alen] = '\0';
             return WALK_RESTART;
+        }
+
+        if (is_final && inotify_nwatches) {
+            last_lookup.who = current_proc;
+            last_lookup.parent = mnt_resolve(parent);
+            last_lookup.node = cur;
+            memcpy(last_lookup.name, component, (uint32_t)len + 1);
         }
 
         if (depth < (sizeof(parents) / sizeof(parents[0]))) {
@@ -484,7 +545,23 @@ int vfs_rename(vfs_node_t *old_dir, const char *old_name,
     if (!old_dir || !new_dir) return -2;               /* -ENOENT */
     if (!old_dir->rename_fn) return -1;                /* -EPERM */
     if (new_dir->rename_fn != old_dir->rename_fn) return -18;   /* -EXDEV */
-    return old_dir->rename_fn(old_dir, old_name, new_dir, new_name);
+    vfs_node_t *moved = NULL, *victim = NULL;
+    if (inotify_nwatches) {
+        moved = vfs_finddir(old_dir, old_name);
+        victim = vfs_finddir(new_dir, new_name);
+        if (victim == moved) victim = NULL;
+    }
+    int r = old_dir->rename_fn(old_dir, old_name, new_dir, new_name);
+    if (r == 0 && inotify_nwatches) {
+        uint32_t isdir = moved && moved->flags == VFS_FLAG_DIR ? IN_ISDIR : 0;
+        uint32_t cookie = inotify_next_cookie();
+        inotify_dir_event(old_dir, IN_MOVED_FROM | isdir, cookie, old_name);
+        inotify_dir_event(new_dir, IN_MOVED_TO | isdir, cookie, new_name);
+        if (moved) inotify_self_event(moved, IN_MOVE_SELF);
+        if (victim && (victim->flags == VFS_FLAG_DIR || victim->nlink <= 1))
+            inotify_node_gone(victim);
+    }
+    return r;
 }
 
 int vfs_link(vfs_node_t *dir, const char *name, vfs_node_t *target) {
@@ -492,7 +569,16 @@ int vfs_link(vfs_node_t *dir, const char *name, vfs_node_t *target) {
     if (!dir || !target) return -2;                    /* -ENOENT */
     if (!dir->link_fn) return -1;                      /* -EPERM */
     if (target->link_fn != dir->link_fn) return -18;   /* -EXDEV */
-    return dir->link_fn(dir, name, target);
+    int r = dir->link_fn(dir, name, target);
+    if (r == 0) {
+        inotify_dir_event(dir, IN_CREATE, 0, name);
+        inotify_self_event(target, IN_ATTRIB);
+    }
+    return r;
+}
+
+vfs_node_t *vfs_resolve_mount(vfs_node_t *dir) {
+    return mnt_resolve(dir);
 }
 
 /* ── Symlink creation ─────────────────────────────────────────────────────── */
@@ -526,7 +612,9 @@ int vfs_symlink(const char *target, const char *path) {
     if (!dir) return -2;
     if (!dir->symlink_fn) return -38;
 
-    return dir->symlink_fn(dir, name, target);
+    int r = dir->symlink_fn(dir, name, target);
+    if (r == 0) inotify_dir_event(dir, IN_CREATE, 0, name);
+    return r;
 }
 
 /* ── No-follow path resolution ────────────────────────────────────────────── */
@@ -772,6 +860,32 @@ uint32_t vfs_mounts_format(char *buf, uint32_t size) {
                                   (m->flags & VFS_MS_NOSUID) ? ",nosuid" : "",
                                   (m->flags & VFS_MS_NODEV) ? ",nodev" : "",
                                   (m->flags & VFS_MS_NOEXEC) ? ",noexec" : "");
+        if (pos >= size) pos = size - 1;
+    }
+    return pos;
+}
+
+/* /proc/<pid>/mountinfo: "id parent major:minor root mountpoint options
+ * - fstype source superoptions", ids 20 + slot (1 for the boot root). */
+uint32_t vfs_mountinfo_format(char *buf, uint32_t size) {
+    uint32_t pos = 0;
+    if (!size) return 0;
+    buf[0] = '\0';
+    for (int i = 0; i < VFS_MNT_MAX; i++) {
+        vfs_mnt_t *m = &g_mnt[i];
+        if (!m->used) continue;
+        if (pos + 1 >= size) break;
+        int parent = m->parent ? 20 + (int)(m->parent - g_mnt) : 1;
+        if (!strcmp(m->target, "/")) parent = 1;
+        pos += (uint32_t)snprintf(buf + pos, size - pos,
+                                  "%d %d 0:%d / %s %s%s%s%s - %s %s %s\n",
+                                  20 + i, parent, 20 + i, m->target,
+                                  (m->flags & VFS_MS_RDONLY) ? "ro" : "rw",
+                                  (m->flags & VFS_MS_NOSUID) ? ",nosuid" : "",
+                                  (m->flags & VFS_MS_NODEV) ? ",nodev" : "",
+                                  (m->flags & VFS_MS_NOEXEC) ? ",noexec" : "",
+                                  m->fstype, m->source,
+                                  (m->flags & VFS_MS_RDONLY) ? "ro" : "rw");
         if (pos >= size) pos = size - 1;
     }
     return pos;

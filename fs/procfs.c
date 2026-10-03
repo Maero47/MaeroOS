@@ -13,6 +13,14 @@
 #include "../kernel/klog.h"
 #include "../arch/i686/cpu/pit.h"
 #include "../arch/i686/mm/paging.h"
+#include "../arch/i686/cpu/percpu.h"
+#include "../arch/i686/cpu/smp.h"
+#include "../drivers/rtc.h"
+#include "../lib/printf.h"
+#include "../proc/signal.h"
+#include "../proc/sysvipc.h"
+#include "inotify.h"
+#include <stdarg.h>
 #include <kernel/config.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -120,99 +128,6 @@ static int procfs_parse_pid(const char *name) {
     return pid;
 }
 
-static uint32_t procfs_build_status(struct proc *p, uint32_t off,
-                                    uint32_t len, uint8_t *buf) {
-    char content[512];
-    uint32_t pos = 0;
-
-    const char *pname = p ? p->name : "unknown";
-    int pid  = p ? p->pid : 0;
-    int ppid = (p && p->parent) ? p->parent->pid : 0;
-    int pgrp = p ? p->pgrp : 0;
-    int sid  = p ? p->sid : 0;
-
-    pappend(content, &pos, sizeof(content), "Name:\t");
-    pappend(content, &pos, sizeof(content), pname);
-    pappend(content, &pos, sizeof(content), "\nPid:\t");
-    pappend_int(content, &pos, sizeof(content), pid);
-    pappend(content, &pos, sizeof(content), "\nPPid:\t");
-    pappend_int(content, &pos, sizeof(content), ppid);
-    pappend(content, &pos, sizeof(content), "\nState:\t");
-    pappend(content, &pos, sizeof(content),
-            p ? proc_state_long(p->state) : "X (dead)");
-    pappend(content, &pos, sizeof(content), "\nPgid:\t");
-    pappend_int(content, &pos, sizeof(content), pgrp);
-    pappend(content, &pos, sizeof(content), "\nSid:\t");
-    pappend_int(content, &pos, sizeof(content), sid);
-    pappend(content, &pos, sizeof(content), "\nTty:\t");
-    pappend_tty(content, &pos, sizeof(content), p);
-    pappend(content, &pos, sizeof(content), "\nVmSize:\t4096 kB\n");
-    content[pos] = '\0';
-
-    if (off >= pos) return 0;
-    uint32_t avail = pos - off;
-    if (avail > len) avail = len;
-    __builtin_memcpy(buf, content + off, avail);
-    return avail;
-}
-
-static uint32_t procfs_build_stat(struct proc *p, uint32_t off,
-                                  uint32_t len, uint8_t *buf) {
-    char content[256];
-    uint32_t pos = 0;
-
-    int pid  = p ? p->pid : 0;
-    int ppid = (p && p->parent) ? p->parent->pid : 0;
-    int pgrp = p ? p->pgrp : 0;
-    int sid  = p ? p->sid : 0;
-    const char *pname = p ? p->name : "unknown";
-
-    pappend_int(content, &pos, sizeof(content), pid);
-    pappend(content, &pos, sizeof(content), " (");
-    pappend(content, &pos, sizeof(content), pname);
-    pappend(content, &pos, sizeof(content), ") ");
-    pappend(content, &pos, sizeof(content), p ? proc_state_short(p->state) : "X");
-    pappend(content, &pos, sizeof(content), " ");
-    pappend_int(content, &pos, sizeof(content), ppid);
-    pappend(content, &pos, sizeof(content), " ");
-    pappend_int(content, &pos, sizeof(content), pgrp);
-    pappend(content, &pos, sizeof(content), " ");
-    pappend_int(content, &pos, sizeof(content), sid);
-    /* Real-ish values: thread count and virtual size. */
-    int nthreads = 0;
-    uint32_t vsize = 0, rss = 0;
-    if (p) {
-        for (int i = 0; i < MAX_PROCS; i++)
-            if (ptable[i].state != PROC_UNUSED && ptable[i].tgid == p->tgid)
-                nthreads++;
-        if (nthreads < 1) nthreads = 1;
-        uint32_t img  = (p->image_end > p->image_start) ? p->image_end - p->image_start : 0;
-        uint32_t heap = (p->heap_end > p->brk_base) ? p->heap_end - p->brk_base : 0;
-        uint32_t stk  = (uint32_t)USER_STACK_PAGES * PAGE_SIZE;
-        vsize = img + heap + stk;
-        rss   = (img + stk) / PAGE_SIZE;   /* resident pages (coarse) */
-    }
-    /* tty_nr, tpgid, flags, minflt, cminflt, majflt, cmajflt */
-    pappend(content, &pos, sizeof(content),
-            " 0 0 0 0 0 0 0");
-    /* utime, stime, cutime, cstime, priority, nice */
-    pappend(content, &pos, sizeof(content), " 0 0 0 0 20 0 ");
-    pappend_int(content, &pos, sizeof(content), nthreads);   /* num_threads */
-    /* itrealvalue, starttime */
-    pappend(content, &pos, sizeof(content), " 0 0 ");
-    pappend_int(content, &pos, sizeof(content), (int)vsize);  /* vsize (bytes) */
-    pappend(content, &pos, sizeof(content), " ");
-    pappend_int(content, &pos, sizeof(content), (int)rss);    /* rss (pages) */
-    pappend(content, &pos, sizeof(content), "\n");
-    content[pos] = '\0';
-
-    if (off >= pos) return 0;
-    uint32_t avail = pos - off;
-    if (avail > len) avail = len;
-    __builtin_memcpy(buf, content + off, avail);
-    return avail;
-}
-
 /* ── /proc/version ────────────────────────────────────────────────────────── */
 
 static uint32_t procfs_version_read(vfs_node_t *n, uint32_t off, uint32_t len,
@@ -301,120 +216,7 @@ static uint32_t procfs_kmsg_read(vfs_node_t *n, uint32_t off, uint32_t len,
     return avail;
 }
 
-/* ── /proc/self/exe ───────────────────────────────────────────────────────── */
-
-static uint32_t procfs_exe_read(vfs_node_t *n, uint32_t off, uint32_t len,
-                                 uint8_t *buf) {
-    (void)n;
-    char content[260];
-    uint32_t pos = 0;
-    /* No trailing newline: as a symlink target this must be the exact path. */
-    if (current_proc && current_proc->exe[0])
-        pappend(content, &pos, sizeof(content), current_proc->exe);
-    else if (current_proc)
-        pappend(content, &pos, sizeof(content), current_proc->name);
-    content[pos] = '\0';
-
-    if (off >= pos) return 0;
-    uint32_t avail = pos - off;
-    if (avail > len) avail = len;
-    __builtin_memcpy(buf, content + off, avail);
-    return avail;
-}
-
-/* ── /proc/self/maps ──────────────────────────────────────────────────────── */
-
-/* Emit one Linux-format maps line: "start-end perms offset dev inode  path\n".
- * prot bits: 1=R 2=W 4=X (matches mmap PROT_*); always private ('p'). */
-static void maps_line(char *b, uint32_t *pos, uint32_t cap,
-                      uint32_t start, uint32_t end, uint32_t prot,
-                      const char *path) {
-    char perms[5];
-    perms[0] = (prot & 1) ? 'r' : '-';
-    perms[1] = (prot & 2) ? 'w' : '-';
-    perms[2] = (prot & 4) ? 'x' : '-';
-    perms[3] = (prot & 8) ? 's' : 'p';   /* bit 3: MAP_SHARED mapping */
-    perms[4] = '\0';
-    pappend_hex(b, pos, cap, start, 8);
-    pappend(b, pos, cap, "-");
-    pappend_hex(b, pos, cap, end, 8);
-    pappend(b, pos, cap, " ");
-    pappend(b, pos, cap, perms);
-    pappend(b, pos, cap, " 00000000 00:00 0 ");
-    if (path && path[0]) pappend(b, pos, cap, path);
-    pappend(b, pos, cap, "\n");
-}
-
-static uint32_t procfs_maps_read(vfs_node_t *n, uint32_t off, uint32_t len,
-                                  uint8_t *buf) {
-    (void)n;
-    /* The VMA registry lists every mapping, so this is big; it is built per
-     * read for the reading process.  A shared static buffer rebuilt only at
-     * off == 0 let a read at off > 0 return whichever process had read last. */
-    enum { MAPS_CAP = 32768 };
-    char *content = (char *)kmalloc(MAPS_CAP);
-    uint32_t content_len;
-    if (!content) return 0;
-
-    {
-        uint32_t pos = 0;
-        struct proc *p = current_proc;
-        if (p) {
-            /* Executable image (r-x). */
-            if (p->image_end > p->image_start)
-                maps_line(content, &pos, MAPS_CAP,
-                          p->image_start, p->image_end, 1 | 4, p->exe);
-            /* Heap (rw-), grows up from brk_base to heap_end. */
-            if (p->heap_end > p->brk_base)
-                maps_line(content, &pos, MAPS_CAP,
-                          p->brk_base, p->heap_end, 1 | 2, "[heap]");
-            /* Every mmap()ed region, in address order, from the VMA registry
-             * (anonymous, file-backed, shared); the backing file's name for
-             * file mappings, 's' for MAP_SHARED. */
-            uint32_t vs, ve, vp; int vsh; const char *vname;
-            for (int i = 0; proc_vma_iter_ex(p, i, &vs, &ve, &vp, &vsh, &vname) == 0; i++) {
-                if (pos > MAPS_CAP - 128) break;  /* leave room for [stack] */
-                maps_line(content, &pos, MAPS_CAP, vs, ve,
-                          vp | (vsh ? 8 : 0), vname);
-            }
-        }
-        /* The main-thread stack — the line glibc/SpiderMonkey read for stack
-         * bounds.  Report the REAL eagerly-mapped range, not a fake 8 KiB. */
-        maps_line(content, &pos, MAPS_CAP,
-                  (uint32_t)USER_STACK_BASE, (uint32_t)USER_STACK_TOP,
-                  1 | 2, "[stack]");
-        if (pos >= MAPS_CAP) pos = MAPS_CAP - 1;
-        content[pos] = '\0';
-        content_len = pos;
-    }
-
-    uint32_t avail = 0;
-    if (off < content_len) {
-        avail = content_len - off;
-        if (avail > len) avail = len;
-        __builtin_memcpy(buf, content + off, avail);
-    }
-    kfree(content);
-    return avail;
-}
-
-/* ── /proc/self/status ────────────────────────────────────────────────────── */
-
-static uint32_t procfs_status_read(vfs_node_t *n, uint32_t off, uint32_t len,
-                                    uint8_t *buf) {
-    (void)n;
-    return procfs_build_status(current_proc, off, len, buf);
-}
-
-/* ── /proc/self/stat ──────────────────────────────────────────────────────── */
-
-static uint32_t procfs_stat_read(vfs_node_t *n, uint32_t off, uint32_t len,
-                                  uint8_t *buf) {
-    (void)n;
-    return procfs_build_stat(current_proc, off, len, buf);
-}
-
-/* Copy a byte range out of a captured buffer (cmdline/environ/auxv). */
+/* Copy a byte range out of a captured buffer. */
 static uint32_t procfs_copy_blob(const uint8_t *blob, uint32_t blob_len,
                                  uint32_t off, uint32_t len, uint8_t *buf) {
     if (off >= blob_len) return 0;
@@ -424,298 +226,8 @@ static uint32_t procfs_copy_blob(const uint8_t *blob, uint32_t blob_len,
     return avail;
 }
 
-/* ── /proc/self/cmdline ───────────────────────────────────────────────────── */
-static uint32_t procfs_cmdline_read(vfs_node_t *n, uint32_t off, uint32_t len,
-                                    uint8_t *buf) {
-    (void)n;
-    if (!current_proc) return 0;
-    return procfs_copy_blob((const uint8_t *)current_proc->cmdline,
-                            current_proc->cmdline_len, off, len, buf);
-}
-
-/* ── /proc/self/environ ───────────────────────────────────────────────────── */
-static uint32_t procfs_environ_read(vfs_node_t *n, uint32_t off, uint32_t len,
-                                    uint8_t *buf) {
-    (void)n;
-    if (!current_proc) return 0;
-    return procfs_copy_blob((const uint8_t *)current_proc->environ,
-                            current_proc->environ_len, off, len, buf);
-}
-
-/* ── /proc/self/auxv (binary type/value pairs) ───────────────────────────── */
-static uint32_t procfs_auxv_read(vfs_node_t *n, uint32_t off, uint32_t len,
-                                 uint8_t *buf) {
-    (void)n;
-    if (!current_proc) return 0;
-    return procfs_copy_blob(current_proc->auxv_data,
-                            current_proc->auxv_bytes, off, len, buf);
-}
-
-/* ── /proc/self/statm (size resident shared text lib data dt, in pages) ───── */
-static uint32_t procfs_statm_read(vfs_node_t *n, uint32_t off, uint32_t len,
-                                  uint8_t *buf) {
-    (void)n;
-    /* Built on every read, for the reader: a static buffer filled at off == 0
-     * handed one process another's numbers when their reads interleaved. */
-    char content[128];
-    uint32_t content_len;
-    {
-        uint32_t pos = 0;
-        struct proc *p = current_proc;
-        uint32_t img = (p && p->image_end > p->image_start)
-                     ? (p->image_end - p->image_start) / PAGE_SIZE : 1;
-        uint32_t heap = (p && p->heap_end > p->brk_base)
-                      ? (p->heap_end - p->brk_base) / PAGE_SIZE : 0;
-        uint32_t stack = (USER_STACK_PAGES);
-        uint32_t total = img + heap + stack;
-        pappend_int(content, &pos, sizeof(content), (int)total);   /* size */
-        pappend(content, &pos, sizeof(content), " ");
-        pappend_int(content, &pos, sizeof(content), (int)total);   /* resident */
-        pappend(content, &pos, sizeof(content), " 0 ");            /* shared */
-        pappend_int(content, &pos, sizeof(content), (int)img);     /* text */
-        pappend(content, &pos, sizeof(content), " 0 ");            /* lib */
-        pappend_int(content, &pos, sizeof(content), (int)(heap + stack)); /* data */
-        pappend(content, &pos, sizeof(content), " 0\n");           /* dt */
-        content_len = pos;
-    }
-    return procfs_copy_blob((const uint8_t *)content, content_len, off, len, buf);
-}
-
-/* ── /proc/self/fd directory ─────────────────────────────────────────────── */
-
-/*
- * readdir: iterate over open file descriptors of current_proc.
- * idx maps to the Nth open fd slot (FD_NONE slots are skipped).
- */
-static int procfs_fd_readdir(vfs_node_t *node, uint32_t idx, vfs_dirent_t *out) {
-    (void)node;
-    if (!current_proc) return -1;
-
-    uint32_t found = 0;
-    for (int i = 0; i < MAX_FD; i++) {
-        if (current_proc->ofile[i].type == FD_NONE) continue;
-        if (found == idx) {
-            out->ino  = (uint32_t)i + 100u;
-            out->type = VFS_FLAG_FILE;
-            /* convert fd number to decimal string */
-            char tmp[12];
-            uint32_t pos = 0;
-            pappend_int(tmp, &pos, sizeof(tmp), i);
-            tmp[pos] = '\0';
-            strncpy(out->name, tmp, 255);
-            out->name[255] = '\0';
-            return 0;
-        }
-        found++;
-    }
-    return -1;
-}
-
-/*
- * finddir: look up a numeric fd name (e.g. "0", "1") in the fd directory.
- * Returns a pointer to a per-fd static node array entry if the fd is open.
- */
-
-/* Static nodes for individual fd entries — one per possible fd */
-static vfs_node_t fd_file_nodes[MAX_FD];
-
-static vfs_node_t *procfs_fd_finddir(vfs_node_t *node, const char *name) {
-    (void)node;
-    if (!current_proc) return NULL;
-
-    /* Parse name as a decimal integer */
-    int fd = 0;
-    const char *p = name;
-    if (*p == '\0') return NULL;
-    while (*p >= '0' && *p <= '9') {
-        if (fd >= MAX_FD) return NULL;   /* stop before the multiply can wrap */
-        fd = fd * 10 + (*p - '0');
-        p++;
-    }
-    if (*p != '\0') return NULL;  /* non-numeric suffix */
-    if (fd < 0 || fd >= MAX_FD)   return NULL;
-    if (current_proc->ofile[fd].type == FD_NONE) return NULL;
-
-    /* For a regular file (incl. memfd/tmpfs), return the REAL underlying node so
-     * that opening /proc/self/fd/N yields the SAME file object.  Firefox's
-     * shared-memory Freeze() reopens /proc/self/fd/N read-only (DupReadOnly) and
-     * maps it MAP_SHARED — it MUST share frames with the original fd, or the data
-     * written via the first mapping is invisible (SharedStringMap magic mismatch
-     * → MOZ_CRASH).  A synthetic empty node breaks that sharing. */
-    if (current_proc->ofile[fd].type == FD_FILE && current_proc->ofile[fd].node) {
-        /* A chrooted process gets no directory through here: /proc is passed
-         * through into the chroot, and a directory opened before chroot()
-         * would let a walk like /proc/self/fd/3/etc/shadow continue in the
-         * old tree (Linux allows that escape; MaeroOS does not). */
-        if (current_proc->root_node &&
-            current_proc->ofile[fd].node->flags == VFS_FLAG_DIR)
-            return NULL;
-        return current_proc->ofile[fd].node;
-    }
-
-    /* Non-file fds (pipes/sockets): a placeholder node (can't be reopened). */
-    vfs_node_t *fn = &fd_file_nodes[fd];
-    memset(fn, 0, sizeof(vfs_node_t));
-    strncpy(fn->name, name, 255);
-    fn->name[255] = '\0';
-    fn->flags  = VFS_FLAG_FILE;
-    fn->inode  = (uint32_t)fd + 100u;
-    fn->size   = 0;
-    return fn;
-}
-
-/* Static node for /proc/self/fd directory */
-static vfs_node_t proc_self_fd_node;
-
-/* ── /proc/self directory ─────────────────────────────────────────────────── */
-
-/*
- * Static file nodes for entries inside /proc/self.
- * These are re-used across calls; read_fn always consults current_proc at
- * call time so they are always fresh.
- */
-static vfs_node_t proc_self_exe_node;
-static vfs_node_t proc_self_maps_node;
-static vfs_node_t proc_self_status_node;
-static vfs_node_t proc_self_stat_node;
-static vfs_node_t proc_self_cmdline_node;
-static vfs_node_t proc_self_environ_node;
-static vfs_node_t proc_self_auxv_node;
-static vfs_node_t proc_self_statm_node;
-
-/* readdir for /proc/self: enumerate the fixed set of entries */
-static int procfs_self_readdir(vfs_node_t *node, uint32_t idx,
-                                vfs_dirent_t *out) {
-    (void)node;
-    static const struct { const char *name; uint32_t type; uint32_t ino; } entries[] = {
-        { "exe",     VFS_FLAG_FILE, 10 },
-        { "maps",    VFS_FLAG_FILE, 11 },
-        { "status",  VFS_FLAG_FILE, 12 },
-        { "stat",    VFS_FLAG_FILE, 13 },
-        { "fd",      VFS_FLAG_DIR,  14 },
-        { "cmdline", VFS_FLAG_FILE, 15 },
-        { "environ", VFS_FLAG_FILE, 16 },
-        { "auxv",    VFS_FLAG_FILE, 17 },
-        { "statm",   VFS_FLAG_FILE, 18 },
-    };
-    static const uint32_t nentries =
-        sizeof(entries) / sizeof(entries[0]);
-
-    if (idx >= nentries) return -1;
-    out->ino  = entries[idx].ino;
-    out->type = (uint8_t)entries[idx].type;
-    strncpy(out->name, entries[idx].name, 255);
-    out->name[255] = '\0';
-    return 0;
-}
-
-/* finddir for /proc/self: map name → static vfs_node_t */
-static vfs_node_t *procfs_self_finddir(vfs_node_t *node, const char *name) {
-    (void)node;
-    if (strcmp(name, "exe")    == 0) return &proc_self_exe_node;
-    if (strcmp(name, "maps")   == 0) return &proc_self_maps_node;
-    if (strcmp(name, "status") == 0) return &proc_self_status_node;
-    if (strcmp(name, "stat")   == 0) return &proc_self_stat_node;
-    if (strcmp(name, "fd")     == 0) return &proc_self_fd_node;
-    if (strcmp(name, "cmdline")== 0) return &proc_self_cmdline_node;
-    if (strcmp(name, "environ")== 0) return &proc_self_environ_node;
-    if (strcmp(name, "auxv")   == 0) return &proc_self_auxv_node;
-    if (strcmp(name, "statm")  == 0) return &proc_self_statm_node;
-    return NULL;
-}
-
-/* Static node for /proc/self directory */
-static vfs_node_t proc_self_node;
-
-/* ── /proc/<pid> directories ─────────────────────────────────────────────── */
-
-static vfs_node_t proc_pid_dir_nodes[MAX_PROCS];
-static vfs_node_t proc_pid_status_nodes[MAX_PROCS];
-static vfs_node_t proc_pid_stat_nodes[MAX_PROCS];
-
-static int procfs_slot_for_node(vfs_node_t *node) {
-    if (!node || !node->private) return -1;
-    struct proc *p = (struct proc *)node->private;
-    if (p->state == PROC_UNUSED) return -1;
-    return (int)(p - ptable);
-}
-
-static uint32_t procfs_pid_status_read(vfs_node_t *n, uint32_t off,
-                                       uint32_t len, uint8_t *buf) {
-    int slot = procfs_slot_for_node(n);
-    if (slot < 0) return 0;
-    return procfs_build_status(&ptable[slot], off, len, buf);
-}
-
-static uint32_t procfs_pid_stat_read(vfs_node_t *n, uint32_t off,
-                                     uint32_t len, uint8_t *buf) {
-    int slot = procfs_slot_for_node(n);
-    if (slot < 0) return 0;
-    return procfs_build_stat(&ptable[slot], off, len, buf);
-}
-
-static int procfs_pid_readdir(vfs_node_t *node, uint32_t idx,
-                              vfs_dirent_t *out) {
-    (void)node;
-    static const struct { const char *name; uint32_t type; uint32_t ino; } entries[] = {
-        { "status", VFS_FLAG_FILE, 1 },
-        { "stat",   VFS_FLAG_FILE, 2 },
-    };
-    static const uint32_t nentries = sizeof(entries) / sizeof(entries[0]);
-    if (idx >= nentries) return -1;
-
-    out->ino  = entries[idx].ino;
-    out->type = (uint8_t)entries[idx].type;
-    strncpy(out->name, entries[idx].name, 255);
-    out->name[255] = '\0';
-    return 0;
-}
-
-static vfs_node_t *procfs_pid_finddir(vfs_node_t *node, const char *name) {
-    int slot = procfs_slot_for_node(node);
-    if (slot < 0) return NULL;
-    struct proc *p = &ptable[slot];
-
-    if (strcmp(name, "status") == 0) {
-        vfs_node_t *n = &proc_pid_status_nodes[slot];
-        memset(n, 0, sizeof(*n));
-        strncpy(n->name, "status", 255);
-        n->flags = VFS_FLAG_FILE;
-        n->inode = (uint32_t)p->pid * 100u + 1u;
-        n->read_fn = procfs_pid_status_read;
-        n->private = p;
-        return n;
-    }
-    if (strcmp(name, "stat") == 0) {
-        vfs_node_t *n = &proc_pid_stat_nodes[slot];
-        memset(n, 0, sizeof(*n));
-        strncpy(n->name, "stat", 255);
-        n->flags = VFS_FLAG_FILE;
-        n->inode = (uint32_t)p->pid * 100u + 2u;
-        n->read_fn = procfs_pid_stat_read;
-        n->private = p;
-        return n;
-    }
-    return NULL;
-}
-
-static vfs_node_t *procfs_pid_node(struct proc *p) {
-    if (!p || p->state == PROC_UNUSED) return NULL;
-    int slot = (int)(p - ptable);
-    if (slot < 0 || slot >= MAX_PROCS) return NULL;
-
-    vfs_node_t *n = &proc_pid_dir_nodes[slot];
-    memset(n, 0, sizeof(*n));
-    uint32_t pos = 0;
-    pappend_int(n->name, &pos, sizeof(n->name), p->pid);
-    n->name[pos] = '\0';
-    n->flags = VFS_FLAG_DIR;
-    n->inode = (uint32_t)p->pid * 100u;
-    n->readdir_fn = procfs_pid_readdir;
-    n->finddir_fn = procfs_pid_finddir;
-    n->private = p;
-    return n;
-}
+#include "procpid.inc"
+#include "procsys.inc"
 
 /* ── /proc root directory ─────────────────────────────────────────────────── */
 
@@ -735,70 +247,10 @@ static vfs_node_t proc_kmsg_node;
 static vfs_node_t proc_mounts_node;
 static vfs_node_t proc_partitions_node;
 static vfs_node_t proc_filesystems_node;
+static vfs_node_t proc_stat_node;
+static vfs_node_t proc_loadavg_node;
+static vfs_node_t proc_vmstat_node;
 static vfs_node_t proc_root_node;
-
-/* ── /proc/meminfo ────────────────────────────────────────────────────────── */
-
-static uint32_t procfs_meminfo_read(vfs_node_t *n, uint32_t off, uint32_t len,
-                                     uint8_t *buf) {
-    (void)n;
-    char content[256];
-    uint32_t pos = 0;
-    uint32_t total_kb = pmm_ram_frames() * 4;
-    uint32_t free_kb  = pmm_free_frames()  * 4;
-
-    pappend(content, &pos, sizeof(content), "MemTotal:     ");
-    pappend_int(content, &pos, sizeof(content), total_kb);
-    pappend(content, &pos, sizeof(content), " kB\n");
-    pappend(content, &pos, sizeof(content), "MemFree:      ");
-    pappend_int(content, &pos, sizeof(content), free_kb);
-    pappend(content, &pos, sizeof(content), " kB\n");
-    /* RAM above 4 GiB (PAE): only user pages go there. */
-    pappend(content, &pos, sizeof(content), "HighTotal:    ");
-    pappend_int(content, &pos, sizeof(content), (int)(pmm_high_frames() * 4));
-    pappend(content, &pos, sizeof(content), " kB\n");
-    pappend(content, &pos, sizeof(content), "HighFree:     ");
-    pappend_int(content, &pos, sizeof(content), (int)(pmm_high_free_frames() * 4));
-    pappend(content, &pos, sizeof(content), " kB\n");
-    content[pos] = '\0';
-
-    if (off >= pos) return 0;
-    uint32_t avail = pos - off;
-    if (avail > len) avail = len;
-    __builtin_memcpy(buf, content + off, avail);
-    return avail;
-}
-
-/* ── /proc/uptime ─────────────────────────────────────────────────────────── */
-
-static uint32_t procfs_uptime_read(vfs_node_t *n, uint32_t off, uint32_t len,
-                                    uint8_t *buf) {
-    (void)n;
-    char content[64];
-    uint32_t pos = 0;
-    uint32_t t   = pit_ticks();          /* 100 Hz since boot */
-    uint32_t secs = t / 100;
-    uint32_t cs   = t % 100;             /* centiseconds */
-
-    /* "<secs>.<cs> <idle>.<cs>\n" — second field is idle time (reuse secs). */
-    pappend_int(content, &pos, sizeof(content), (int)secs);
-    pappend(content, &pos, sizeof(content), ".");
-    if (cs < 10) pappend(content, &pos, sizeof(content), "0");
-    pappend_int(content, &pos, sizeof(content), (int)cs);
-    pappend(content, &pos, sizeof(content), " ");
-    pappend_int(content, &pos, sizeof(content), (int)secs);
-    pappend(content, &pos, sizeof(content), ".");
-    if (cs < 10) pappend(content, &pos, sizeof(content), "0");
-    pappend_int(content, &pos, sizeof(content), (int)cs);
-    pappend(content, &pos, sizeof(content), "\n");
-    content[pos] = '\0';
-
-    if (off >= pos) return 0;
-    uint32_t avail = pos - off;
-    if (avail > len) avail = len;
-    __builtin_memcpy(buf, content + off, avail);
-    return avail;
-}
 
 /* ── /proc/cpuinfo ────────────────────────────────────────────────────────── */
 
@@ -1086,50 +538,6 @@ static uint32_t procfs_cputime_read(vfs_node_t *n, uint32_t off,
 }
 
 /* readdir for /proc: enumerate fixed pseudo-files */
-/* ── /proc/sys/vm/overcommit_memory ──────────────────────────────────────────
- * glibc's malloc and some allocators read this; "0" = heuristic overcommit
- * (the default, allocator-friendly).  We accept writes and ignore them. */
-static vfs_node_t proc_sys_node;       /* /proc/sys */
-static vfs_node_t proc_sys_vm_node;    /* /proc/sys/vm */
-static vfs_node_t proc_overcommit_node;/* /proc/sys/vm/overcommit_memory */
-
-static uint32_t procfs_overcommit_read(vfs_node_t *n, uint32_t off,
-                                       uint32_t len, uint8_t *buf) {
-    (void)n;
-    static const char s[] = "0\n";
-    return procfs_copy_blob((const uint8_t *)s, 2, off, len, buf);
-}
-static uint32_t procfs_overcommit_write(vfs_node_t *n, uint32_t off,
-                                        uint32_t len, const uint8_t *buf) {
-    (void)n; (void)off; (void)buf;
-    return len;   /* accept + ignore */
-}
-
-static int procfs_sys_vm_readdir(vfs_node_t *node, uint32_t idx, vfs_dirent_t *out) {
-    (void)node;
-    if (idx != 0) return -1;
-    out->ino = 81; out->type = VFS_FLAG_FILE;
-    strncpy(out->name, "overcommit_memory", 255); out->name[255] = '\0';
-    return 0;
-}
-static vfs_node_t *procfs_sys_vm_finddir(vfs_node_t *node, const char *name) {
-    (void)node;
-    if (strcmp(name, "overcommit_memory") == 0) return &proc_overcommit_node;
-    return NULL;
-}
-static int procfs_sys_readdir(vfs_node_t *node, uint32_t idx, vfs_dirent_t *out) {
-    (void)node;
-    if (idx != 0) return -1;
-    out->ino = 80; out->type = VFS_FLAG_DIR;
-    strncpy(out->name, "vm", 255); out->name[255] = '\0';
-    return 0;
-}
-static vfs_node_t *procfs_sys_finddir(vfs_node_t *node, const char *name) {
-    (void)node;
-    if (strcmp(name, "vm") == 0) return &proc_sys_vm_node;
-    return NULL;
-}
-
 /* ── /proc/net: dev and route, the files busybox ifconfig and route read ─── */
 static vfs_node_t proc_net_node;
 static vfs_node_t proc_net_dev_node;
@@ -1179,8 +587,13 @@ static int procfs_root_readdir(vfs_node_t *node, uint32_t idx,
     (void)node;
     static const struct { const char *name; uint32_t type; uint32_t ino; } entries[] = {
         { "version", VFS_FLAG_FILE, 1 },
-        { "self",    VFS_FLAG_DIR,  2 },
+        { "self",    VFS_FLAG_SYMLINK, 2 },
+        { "thread-self", VFS_FLAG_SYMLINK, 20 },
         { "sys",     VFS_FLAG_DIR,  79 },
+        { "stat",    VFS_FLAG_FILE, 21 },
+        { "loadavg", VFS_FLAG_FILE, 22 },
+        { "vmstat",  VFS_FLAG_FILE, 23 },
+        { "sysvipc", VFS_FLAG_DIR,  24 },
         { "meminfo", VFS_FLAG_FILE, 3 },
         { "cpuinfo", VFS_FLAG_FILE, 4 },
         { "pci",     VFS_FLAG_FILE, 5 },
@@ -1210,11 +623,13 @@ static int procfs_root_readdir(vfs_node_t *node, uint32_t idx,
     uint32_t found = 0;
     for (int i = 0; i < MAX_PROCS; i++) {
         struct proc *p = &ptable[i];
-        if (p->state == PROC_UNUSED) continue;
+        /* One directory per process (thread-group leader); threads are
+         * reachable by tid but listed only under task/ (Linux). */
+        if (p->state == PROC_UNUSED || p->pid != p->tgid) continue;
         if (found++ != want) continue;
 
         uint32_t pos = 0;
-        out->ino = (uint32_t)p->pid * 100u;
+        out->ino = pp_inode(p->pid, PK_DIR, 0, 0);
         out->type = VFS_FLAG_DIR;
         pappend_int(out->name, &pos, sizeof(out->name), p->pid);
         out->name[pos] = '\0';
@@ -1227,8 +642,13 @@ static int procfs_root_readdir(vfs_node_t *node, uint32_t idx,
 static vfs_node_t *procfs_root_finddir(vfs_node_t *node, const char *name) {
     (void)node;
     if (strcmp(name, "version") == 0) return &proc_version_node;
-    if (strcmp(name, "self")    == 0) return &proc_self_node;
+    if (strcmp(name, "self")    == 0) return &proc_selflink_node;
+    if (strcmp(name, "thread-self") == 0) return &proc_threadself_node;
     if (strcmp(name, "sys")     == 0) return &proc_sys_node;
+    if (strcmp(name, "stat")    == 0) return &proc_stat_node;
+    if (strcmp(name, "loadavg") == 0) return &proc_loadavg_node;
+    if (strcmp(name, "vmstat")  == 0) return &proc_vmstat_node;
+    if (strcmp(name, "sysvipc") == 0) return &proc_sysvipc_node;
     if (strcmp(name, "meminfo") == 0) return &proc_meminfo_node;
     if (strcmp(name, "cpuinfo") == 0) return &proc_cpuinfo_node;
     if (strcmp(name, "uptime")  == 0) return &proc_uptime_node;
@@ -1246,7 +666,7 @@ static vfs_node_t *procfs_root_finddir(vfs_node_t *node, const char *name) {
     int pid = procfs_parse_pid(name);
     if (pid > 0) {
         struct proc *p = procfs_find_pid(pid);
-        if (p) return procfs_pid_node(p);
+        if (p) return procfs_pid_node(pid, 0);
     }
     return NULL;
 }
@@ -1282,77 +702,41 @@ vfs_node_t *procfs_mount(void) {
     proc_version_node.inode   = 1;
     proc_version_node.read_fn = procfs_version_read;
 
-    /* /proc/self/exe — a SYMLINK to the running binary.  glibc/Firefox locate
-     * their install directory via readlink("/proc/self/exe"); a plain file node
-     * makes readlink() return -EINVAL and Firefox aborts with "Couldn't find
-     * the application directory". */
-    memset(&proc_self_exe_node, 0, sizeof(proc_self_exe_node));
-    strncpy(proc_self_exe_node.name, "exe", 255);
-    proc_self_exe_node.flags   = VFS_FLAG_SYMLINK;
-    proc_self_exe_node.inode   = 10;
-    proc_self_exe_node.read_fn = procfs_exe_read;
+    /* /proc/self and /proc/thread-self: links into /proc/<pid>. */
+    memset(&proc_selflink_node, 0, sizeof(proc_selflink_node));
+    strncpy(proc_selflink_node.name, "self", 255);
+    proc_selflink_node.flags   = VFS_FLAG_SYMLINK;
+    proc_selflink_node.inode   = 2;
+    proc_selflink_node.mask    = 0777;
+    proc_selflink_node.read_fn = procfs_selflink_read;
+    memset(&proc_threadself_node, 0, sizeof(proc_threadself_node));
+    strncpy(proc_threadself_node.name, "thread-self", 255);
+    proc_threadself_node.flags   = VFS_FLAG_SYMLINK;
+    proc_threadself_node.inode   = 20;
+    proc_threadself_node.mask    = 0777;
+    proc_threadself_node.read_fn = procfs_selflink_read;
 
-    /* /proc/self/maps */
-    memset(&proc_self_maps_node, 0, sizeof(proc_self_maps_node));
-    strncpy(proc_self_maps_node.name, "maps", 255);
-    proc_self_maps_node.flags   = VFS_FLAG_FILE;
-    proc_self_maps_node.inode   = 11;
-    proc_self_maps_node.read_fn = procfs_maps_read;
-
-    /* /proc/self/status */
-    memset(&proc_self_status_node, 0, sizeof(proc_self_status_node));
-    strncpy(proc_self_status_node.name, "status", 255);
-    proc_self_status_node.flags   = VFS_FLAG_FILE;
-    proc_self_status_node.inode   = 12;
-    proc_self_status_node.read_fn = procfs_status_read;
-
-    /* /proc/self/stat */
-    memset(&proc_self_stat_node, 0, sizeof(proc_self_stat_node));
-    strncpy(proc_self_stat_node.name, "stat", 255);
-    proc_self_stat_node.flags   = VFS_FLAG_FILE;
-    proc_self_stat_node.inode   = 13;
-    proc_self_stat_node.read_fn = procfs_stat_read;
-
-    /* /proc/self/fd directory */
-    memset(&proc_self_fd_node, 0, sizeof(proc_self_fd_node));
-    strncpy(proc_self_fd_node.name, "fd", 255);
-    proc_self_fd_node.flags       = VFS_FLAG_DIR;
-    proc_self_fd_node.inode       = 14;
-    proc_self_fd_node.readdir_fn  = procfs_fd_readdir;
-    proc_self_fd_node.finddir_fn  = procfs_fd_finddir;
-
-    /* /proc/self/{cmdline,environ,auxv,statm} */
-    memset(&proc_self_cmdline_node, 0, sizeof(proc_self_cmdline_node));
-    strncpy(proc_self_cmdline_node.name, "cmdline", 255);
-    proc_self_cmdline_node.flags   = VFS_FLAG_FILE;
-    proc_self_cmdline_node.inode   = 15;
-    proc_self_cmdline_node.read_fn = procfs_cmdline_read;
-
-    memset(&proc_self_environ_node, 0, sizeof(proc_self_environ_node));
-    strncpy(proc_self_environ_node.name, "environ", 255);
-    proc_self_environ_node.flags   = VFS_FLAG_FILE;
-    proc_self_environ_node.inode   = 16;
-    proc_self_environ_node.read_fn = procfs_environ_read;
-
-    memset(&proc_self_auxv_node, 0, sizeof(proc_self_auxv_node));
-    strncpy(proc_self_auxv_node.name, "auxv", 255);
-    proc_self_auxv_node.flags   = VFS_FLAG_FILE;
-    proc_self_auxv_node.inode   = 17;
-    proc_self_auxv_node.read_fn = procfs_auxv_read;
-
-    memset(&proc_self_statm_node, 0, sizeof(proc_self_statm_node));
-    strncpy(proc_self_statm_node.name, "statm", 255);
-    proc_self_statm_node.flags   = VFS_FLAG_FILE;
-    proc_self_statm_node.inode   = 18;
-    proc_self_statm_node.read_fn = procfs_statm_read;
-
-    /* /proc/self directory */
-    memset(&proc_self_node, 0, sizeof(proc_self_node));
-    strncpy(proc_self_node.name, "self", 255);
-    proc_self_node.flags       = VFS_FLAG_DIR;
-    proc_self_node.inode       = 2;
-    proc_self_node.readdir_fn  = procfs_self_readdir;
-    proc_self_node.finddir_fn  = procfs_self_finddir;
+    /* /proc/stat, /proc/loadavg, /proc/vmstat */
+    memset(&proc_stat_node, 0, sizeof(proc_stat_node));
+    strncpy(proc_stat_node.name, "stat", 255);
+    proc_stat_node.flags   = VFS_FLAG_FILE;
+    proc_stat_node.inode   = 21;
+    proc_stat_node.mask    = 0444;
+    proc_stat_node.read_fn = procfs_stat_sys_read;
+    memset(&proc_loadavg_node, 0, sizeof(proc_loadavg_node));
+    strncpy(proc_loadavg_node.name, "loadavg", 255);
+    proc_loadavg_node.flags   = VFS_FLAG_FILE;
+    proc_loadavg_node.inode   = 22;
+    proc_loadavg_node.mask    = 0444;
+    proc_loadavg_node.read_fn = procfs_loadavg_read;
+    memset(&proc_vmstat_node, 0, sizeof(proc_vmstat_node));
+    strncpy(proc_vmstat_node.name, "vmstat", 255);
+    proc_vmstat_node.flags   = VFS_FLAG_FILE;
+    proc_vmstat_node.inode   = 23;
+    proc_vmstat_node.mask    = 0444;
+    proc_vmstat_node.read_fn = procfs_vmstat_read;
+    sysctl_init();
+    sysvipc_dir_init();
 
     /* /proc/meminfo */
     memset(&proc_meminfo_node, 0, sizeof(proc_meminfo_node));
@@ -1453,27 +837,6 @@ vfs_node_t *procfs_mount(void) {
     proc_net_if_inet6_node.inode   = 86;
     proc_net_if_inet6_node.mask    = 0444;
     proc_net_if_inet6_node.read_fn = procfs_net_text_read;
-
-    memset(&proc_sys_node, 0, sizeof(proc_sys_node));
-    strncpy(proc_sys_node.name, "sys", 255);
-    proc_sys_node.flags      = VFS_FLAG_DIR;
-    proc_sys_node.inode      = 79;
-    proc_sys_node.readdir_fn = procfs_sys_readdir;
-    proc_sys_node.finddir_fn = procfs_sys_finddir;
-
-    memset(&proc_sys_vm_node, 0, sizeof(proc_sys_vm_node));
-    strncpy(proc_sys_vm_node.name, "vm", 255);
-    proc_sys_vm_node.flags      = VFS_FLAG_DIR;
-    proc_sys_vm_node.inode      = 80;
-    proc_sys_vm_node.readdir_fn = procfs_sys_vm_readdir;
-    proc_sys_vm_node.finddir_fn = procfs_sys_vm_finddir;
-
-    memset(&proc_overcommit_node, 0, sizeof(proc_overcommit_node));
-    strncpy(proc_overcommit_node.name, "overcommit_memory", 255);
-    proc_overcommit_node.flags    = VFS_FLAG_FILE;
-    proc_overcommit_node.inode    = 81;
-    proc_overcommit_node.read_fn  = procfs_overcommit_read;
-    proc_overcommit_node.write_fn = procfs_overcommit_write;
 
     return &proc_root_node;
 }

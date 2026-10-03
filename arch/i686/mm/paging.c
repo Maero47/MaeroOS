@@ -970,3 +970,31 @@ int pgdir_release(uint32_t pgdir_phys) {
     }
     return 0;           /* unshared: caller frees */
 }
+
+/* Resident user pages of the address space pgdir_phys (present PTEs below
+ * the kernel), and how many of them are shared (PAGE_SHARED) - for
+ * /proc/<pid>/statm and status.  Walks through the recursive mapping with
+ * that directory loaded, interrupts off, like pgdir_virt_to_pte. */
+void pgdir_count_resident(uint32_t pgdir_phys, uint32_t *resident, uint32_t *shared) {
+    uint32_t res = 0, sh = 0, fl, prev_cr3;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+    __asm__ volatile("mov %%cr3, %0" : "=r"(prev_cr3));
+    if (prev_cr3 != pgdir_phys)
+        __asm__ volatile("mov %0, %%cr3" :: "r"(pgdir_phys) : "memory");
+    for (uint32_t t = 0; t < USER_PT_COUNT; t++) {
+        uint32_t va = t << PT_SHIFT;
+        if (!pde_present(va)) continue;
+        volatile void *pt = pt_window(t);
+        for (uint32_t i = 0; i < PT_ENTRIES; i++) {
+            pte_t e = tbl_get(pt, i);
+            if (!(e & PAGE_PRESENT) || !(e & PAGE_USER)) continue;
+            res++;
+            if (e & PAGE_SHARED) sh++;
+        }
+    }
+    if (prev_cr3 != pgdir_phys)
+        __asm__ volatile("mov %0, %%cr3" :: "r"(prev_cr3) : "memory");
+    if (fl & 0x200) __asm__ volatile("sti");
+    *resident = res;
+    *shared = sh;
+}

@@ -188,6 +188,8 @@ void pgdir_install_pt(uint32_t pgdir_phys, uint32_t idx, pte_t pde);
 
 /* The whole PTE of `virt` in pgdir_phys (0 if there is none).  IF=0. */
 pte_t pgdir_virt_to_pte(uint32_t pgdir_phys, uint32_t virt);
+/* Present user pages of an address space, and the PAGE_SHARED ones among them. */
+void pgdir_count_resident(uint32_t pgdir_phys, uint32_t *resident, uint32_t *shared);
 
 /*
  * The signal-return page: one read-only, executable user page at SIGPAGE_VA in

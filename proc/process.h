@@ -251,6 +251,17 @@ struct proc {
     uint32_t         run_us;
     uint32_t         run_ns_rem;
     uint32_t         run_us_mark;   /* run_us at the last KTRACE cpu dump */
+    uint64_t         run_ns_total;  /* the same, in ns, without wrapping */
+    uint32_t         stime_ticks;   /* the utime_ticks that found it in the kernel */
+    uint32_t         start_tick;    /* PIT tick of creation (/proc/<pid>/stat) */
+    /* Not dumpable (Linux mm->dumpable == 0): set by an exec that changed
+     * credentials (set-uid/set-gid image) or prctl(PR_SET_DUMPABLE, 0); its
+     * /proc/<pid> files that need ptrace read access then belong to root
+     * and refuse everyone else, even the same user. */
+    uint8_t          nondumpable;
+    /* /proc/<pid>/io: bytes and calls through read/write-family syscalls. */
+    uint64_t         io_rchar, io_wchar;
+    uint32_t         io_syscr, io_syscw;
     uint32_t         sched_count;   /* times scheduled */
 
     /* Fair scheduling (proc/scheduler.c): on-CPU time in ns, weighted by
@@ -376,6 +387,9 @@ static inline int proc_stack_exec(const struct proc *p) {
 static inline uint32_t proc_prot_adjust(const struct proc *p, uint32_t prot) {
     return (p && p->read_implies_exec && (prot & 0x1U)) ? (prot | 0x4U) : prot;
 }
+
+/* Processes created since boot (/proc/stat "processes"). */
+extern uint32_t proc_forks_total;
 
 /* Process table and current process */
 extern struct proc ptable[];

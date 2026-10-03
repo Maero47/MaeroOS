@@ -39,6 +39,12 @@ struct cpu {
      * cleared before the IRQ's signal delivery and at every dispatch. */
     uint64_t wake_vr;
     int in_irq;
+    /* /proc/stat accounting: time this CPU ran threads (busy_ns) and sat in
+     * the idle wait (idle_ns), from the scheduler's dispatch timestamps; and
+     * the timer ticks that found it in user mode, in the kernel, or idle,
+     * which split busy_ns into user and system time. */
+    uint64_t busy_ns, idle_ns;
+    uint32_t tick_user, tick_sys, tick_idle;
 };
 
 extern struct cpu cpus[MAX_CPUS];

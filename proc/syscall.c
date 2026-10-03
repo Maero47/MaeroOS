@@ -30,6 +30,9 @@
 #include "../arch/i686/include/io.h"
 #include "../kernel/printk.h"
 #include "../fs/vfs.h"
+#include "../fs/procfs.h"
+#include "sysvipc.h"
+#include "../fs/inotify.h"
 #include "../fs/mount.h"
 #include "../fs/devfs.h"
 #include "../fs/ext2.h"
@@ -865,6 +868,12 @@ void fd_retain(proc_file_t *f) {
 
 void fd_release(proc_file_t *f) {
     flock_fd_closed(f);        /* before the node and fid are gone */
+    /* inotify: IN_CLOSE_WRITE (the file's directory found again from the
+     * descriptor's path) or IN_CLOSE_NOWRITE. */
+    if (f->type == FD_FILE && inotify_nwatches && f->node && !inotify_is(f->node)) {
+        if (fd_writable(f)) inotify_child_event(f->node, f->path, IN_CLOSE_WRITE);
+        else inotify_child_event(f->node, NULL, IN_CLOSE_NOWRITE);
+    }
     if (f->type == FD_FILE)    vfs_close(f->node);
     if (f->type == FD_PIPE_R)  { pipe_close_read(f->pipe);  vfs_close(f->node); }
     if (f->type == FD_PIPE_W)  { pipe_close_write(f->pipe); vfs_close(f->node); }
@@ -1042,6 +1051,7 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
     child->nice      = parent->nice;
     child->uid = parent->uid; child->gid = parent->gid;
     child->euid = parent->euid; child->egid = parent->egid;
+    child->nondumpable = parent->nondumpable;
     child->suid = parent->suid; child->sgid = parent->sgid;
     child->ngroups = parent->ngroups;
     __builtin_memcpy(child->groups, parent->groups, sizeof(child->groups));
@@ -2372,6 +2382,10 @@ static int sys_exec(registers_t *regs) {
     current_proc->suid       = new_euid;
     current_proc->sgid       = new_egid;
     current_proc->did_exec   = 1;
+    /* Linux setup_new_exec(): an image that runs with ids other than the
+     * caller's real ones is not dumpable (its /proc files need root). */
+    current_proc->nondumpable = (new_euid != current_proc->uid ||
+                                 new_egid != current_proc->gid);
     current_proc->tgid       = current_proc->pid;  /* exec → new thread-group leader */
     current_proc->vm_owner   = NULL;               /* own address space from here */
     /* Linux begin_new_exec(): the new image inherits none of the old thread's
@@ -3051,6 +3065,7 @@ static int ioctl_arg_shape(uint32_t req, uint32_t *len) {
     case 0x1260:              *len = 4;             return IOA_OUT;   /* BLKGETSIZE */
     case 0x80041272U:         *len = 8;             return IOA_OUT;   /* BLKGETSIZE64 (u64) */
     case 0x540F:              *len = sizeof(int);   return IOA_OUT;   /* TIOCGPGRP */
+    case 0x541B:              *len = sizeof(int);   return IOA_OUT;   /* FIONREAD (inotify) */
     case 0x80044D00U:         *len = sizeof(int);   return IOA_OUT;   /* SOUND_MIXER_READ_VOLUME */
     case 0xC0044D00U:         *len = sizeof(int);   return IOA_INOUT; /* SOUND_MIXER_WRITE_VOLUME */
     case 0x5410:              *len = sizeof(int);   return IOA_IN;    /* TIOCSPGRP */
@@ -4508,20 +4523,41 @@ static void unmap_range(uint32_t start, uint32_t end) {
  * free-range search, so it is right for every thread of the process and never
  * lands on a live mapping. */
 uint32_t mm_shm_attach(const uint32_t *frames, uint32_t npages) {
+    return mm_shm_attach_at(frames, npages, 0, 0);
+}
+
+/* SysV shmat(): at `addr` when non-zero (page-aligned; the range must hold no
+ * mapping: -EINVAL like Linux without SHM_REMAP, reported here as 0), and
+ * read-only when `rdonly` (SHM_RDONLY). */
+uint32_t mm_shm_attach_at(const uint32_t *frames, uint32_t npages, uint32_t addr,
+                          int rdonly) {
     uint32_t len = npages * PAGE_SIZE;
-    uint32_t base = vma_gap_find(len, PAGE_SIZE);
+    uint32_t base;
+    if (addr) {
+        if ((addr & (PAGE_SIZE - 1)) || addr < MMAP_FLOOR || addr + len < addr ||
+            addr + len > MMAP_TOP)
+            return 0;
+        struct proc *o = mmap_owner();
+        if (!o) return 0;
+        for (struct vma *v = o->vmas; v; v = v->next)
+            if (v->start < addr + len && v->end > addr) return 0;
+        if (first_mapped_page(addr, addr + len)) return 0;
+        base = addr;
+    } else {
+        base = vma_gap_find(len, PAGE_SIZE);
+    }
     if (!base) return 0;
     /* Reserve the page tables before taking any reference, so the attach
      * either happens whole or leaves the address space as it was (Linux
      * shmat() returns ENOMEM here too). */
     if (paging_reserve_range(base, base + len, 1) != 0) return 0;
-    if (!vma_add(base, base + len, PROT_READ_K | PROT_WRITE_K,
+    if (!vma_add(base, base + len, rdonly ? PROT_READ_K : PROT_READ_K | PROT_WRITE_K,
                  VMA_F_SHARED | VMA_F_SHM, NULL, 0))
         return 0;
     for (uint32_t i = 0; i < npages; i++) {
         pmm_frame_incref(frames[i]);        /* this PTE's reference */
         if (paging_map(base + i * PAGE_SIZE, frames[i],
-                       PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_SHARED |
+                       PAGE_PRESENT | (rdonly ? 0 : PAGE_WRITABLE) | PAGE_USER | PAGE_SHARED |
                        page_nx_unless(current_proc->read_implies_exec)) != 0)
             panic("shmat: reserved page table vanished", NULL);
     }
@@ -4546,9 +4582,9 @@ uint32_t mm_shm_mapped(uint32_t base, const uint32_t *frames, uint32_t npages) {
  * a MAP_FIXED overlay already released the others (and whatever lives there
  * now is not ours to touch).  Flush before free, as unmap_pages does. */
 void mm_shm_detach(uint32_t base, const uint32_t *frames, uint32_t npages) {
-    uint32_t cleared[(SHM_MAX_PAGES + 31) / 32];
+    uint32_t cleared[(MM_SHM_MAX_PAGES + 31) / 32];
     uint32_t run = 0, run_len = 0;
-    if (npages > SHM_MAX_PAGES) npages = SHM_MAX_PAGES;
+    if (npages > MM_SHM_MAX_PAGES) npages = MM_SHM_MAX_PAGES;
     __builtin_memset(cleared, 0, sizeof(cleared));
     for (uint32_t i = 0; i < npages; i++) {
         uint32_t va = base + i * PAGE_SIZE;
@@ -5791,6 +5827,7 @@ static int proc_fd_readlink(const char *abs, char *out, uint32_t cap) {
     } else if (path_has_prefix(p, "thread-self/")) {
         who = current_proc;
         p += 12;
+        /* thread-self names "<tgid>/task/<tid>": the same descriptors. */
     } else {
         int pid = 0;
         if (*p < '0' || *p > '9') return 1;
@@ -5802,12 +5839,29 @@ static int proc_fd_readlink(const char *abs, char *out, uint32_t cap) {
                 break;
             }
         if (!who) return 1;
+        /* /proc/<pid>/task/<tid>/fd/N: the thread's (shared) table. */
+        if (path_has_prefix(p, "task/")) {
+            int tid = 0;
+            p += 5;
+            if (*p < '0' || *p > '9') return 1;
+            while (*p >= '0' && *p <= '9') tid = tid * 10 + (*p++ - '0');
+            if (*p++ != '/') return 1;
+            struct proc *t = NULL;
+            for (int i = 0; i < MAX_PROCS; i++)
+                if (ptable[i].state != PROC_UNUSED && ptable[i].pid == tid &&
+                    ptable[i].tgid == who->tgid) {
+                    t = &ptable[i];
+                    break;
+                }
+            if (!t) return 1;
+            who = t;
+        }
     }
     if (!path_has_prefix(p, "fd/")) return 1;
-    /* Another process's descriptors are its business: root or the same
-     * user only (Linux: PTRACE_MODE_READ on proc_fd_link). */
-    if (who != current_proc && who->tgid != current_proc->tgid &&
-        current_proc->euid != 0 && current_proc->euid != who->uid)
+    /* Another process's descriptors are its business: root, or the same
+     * user while the process is dumpable (Linux: PTRACE_MODE_READ on
+     * proc_fd_link). */
+    if (!procfs_may_read(who))
         return -13;                                         /* -EACCES */
     p += 3;
     int fd = 0;
@@ -5864,7 +5918,10 @@ static int sys_readlink(registers_t *regs) {
 
     /* Read target from the symlink node */
     char target[512];
-    uint32_t tlen = vfs_read(n, 0, sizeof(target), (uint8_t *)target);
+    int32_t tl = (int32_t)vfs_read(n, 0, sizeof(target), (uint8_t *)target);
+    if (tl < 0) return tl;                /* a procfs link refused the caller */
+    uint32_t tlen = (uint32_t)tl;
+    if (tlen > sizeof(target)) tlen = sizeof(target);
     if (tlen == 0) return -22;
     int copylen = (int)tlen < bufsiz ? (int)tlen : bufsiz;
     int cr = copy_to_user(ubuf, target, (uint32_t)copylen);
@@ -6652,10 +6709,35 @@ static int sys_ugetrlimit(registers_t *regs) {
     return 0;
 }
 
-/* ── sys_prctl(option, arg2…) — EAX=172 (stub) ──────────────────────────── */
+/* ── sys_prctl(option, arg2…) — EAX=172 ─────────────────────────────────────
+ * PR_{GET,SET}_DUMPABLE and PR_{SET,GET}_NAME are real; every other option
+ * is accepted and ignored, as before. */
 static int sys_prctl(registers_t *regs) {
-    (void)regs;
-    return 0;
+    switch (regs->ebx) {
+    case 3:                                   /* PR_GET_DUMPABLE */
+        return current_proc->nondumpable ? 0 : 1;
+    case 4:                                   /* PR_SET_DUMPABLE */
+        if (regs->ecx > 1) return -22;
+        current_proc->nondumpable = regs->ecx ? 0 : 1;
+        return 0;
+    case 15: {                                /* PR_SET_NAME: the thread's comm */
+        char name[16];
+        int i;
+        for (i = 0; i < 15; i++) {
+            if (copy_from_user(&name[i], (const char *)(uintptr_t)regs->ecx + i, 1) < 0)
+                return -14;
+            if (!name[i]) break;
+        }
+        name[i] = '\0';
+        __builtin_memcpy(current_proc->name, name, 16);
+        return 0;
+    }
+    case 16:                                  /* PR_GET_NAME */
+        return copy_to_user((void *)(uintptr_t)regs->ecx, current_proc->name, 16) < 0
+               ? -14 : 0;
+    default:
+        return 0;
+    }
 }
 
 /* ── sys_sigaltstack(ss, oss) — EAX=186 ─────────────────────────────────────
@@ -6970,7 +7052,10 @@ static int sys_readlinkat(registers_t *regs) {
     if (!n) return lerr;
     if (n->flags != VFS_FLAG_SYMLINK) return -22;
     char target[512];
-    uint32_t len = vfs_read(n, 0, sizeof(target), (uint8_t *)target);
+    int32_t tl = (int32_t)vfs_read(n, 0, sizeof(target), (uint8_t *)target);
+    if (tl < 0) return tl;                /* a procfs link refused the caller */
+    uint32_t len = (uint32_t)tl;
+    if (len > sizeof(target)) len = sizeof(target);
     if ((int)len > bufsiz) len = (uint32_t)bufsiz;
     int cr = copy_to_user(ubuf, target, len);
     return cr < 0 ? cr : (int)len;
@@ -8521,6 +8606,7 @@ static int sys_clone(registers_t *regs) {
     child->nice      = parent->nice;
     child->uid = parent->uid; child->gid = parent->gid;
     child->euid = parent->euid; child->egid = parent->egid;
+    child->nondumpable = parent->nondumpable;
     child->suid = parent->suid; child->sgid = parent->sgid;
     child->ngroups = parent->ngroups;
     __builtin_memcpy(child->groups, parent->groups, sizeof(child->groups));
@@ -10006,6 +10092,58 @@ static int sys_membarrier(registers_t *regs) {
     return 0;
 }
 
+/* ── inotify(7) (fs/inotify.c) ───────────────────────────────────────────── */
+static int sys_inotify_init1(int flags) {
+    if (flags & ~(O_NONBLOCK | O_CLOEXEC)) return -22;
+    int fd = -1;
+    for (int i = 0; i < MAX_FD; i++)
+        if (current_proc->ofile[i].type == FD_NONE) { fd = i; break; }
+    if (fd < 0) return -24;                            /* -EMFILE */
+    vfs_node_t *n = inotify_new();
+    if (!n) return -24;
+    proc_file_t *f = &current_proc->ofile[fd];
+    __builtin_memset(f, 0, sizeof(*f));
+    f->type = FD_FILE;
+    f->node = n;
+    vfs_retain(n);                                     /* the descriptor's */
+    f->flags = O_RDONLY | (flags & O_NONBLOCK);
+    f->cloexec = (flags & O_CLOEXEC) ? 1 : 0;
+    __builtin_memcpy(f->path, "anon_inode:inotify", 19);
+    return fd;
+}
+
+static int inotify_fd(int fd, vfs_node_t **out) {
+    if (fd < 0 || fd >= MAX_FD) return -9;
+    proc_file_t *f = &current_proc->ofile[fd];
+    if (f->type == FD_NONE) return -9;                 /* -EBADF */
+    if (f->type != FD_FILE || !inotify_is(f->node)) return -22;
+    *out = f->node;
+    return 0;
+}
+
+static int sys_inotify_add_watch(registers_t *regs) {
+    vfs_node_t *in;
+    int r = inotify_fd((int)regs->ebx, &in);
+    if (r < 0) return r;
+    char path[256];
+    r = copy_user_str((const char *)(uintptr_t)regs->ecx, path, sizeof(path));
+    if (r < 0) return r;
+    uint32_t mask = regs->edx;
+    int err;
+    vfs_node_t *n = vfs_lookup_at(path, !(mask & IN_DONT_FOLLOW), &err);
+    if (!n) return err;
+    if ((mask & IN_ONLYDIR) && n->flags != VFS_FLAG_DIR) return -20;   /* -ENOTDIR */
+    if (proc_access_check(n, VFS_WANT_R) < 0) return -13;             /* -EACCES */
+    return inotify_add(in, n, mask);
+}
+
+static int sys_inotify_rm_watch(registers_t *regs) {
+    vfs_node_t *in;
+    int r = inotify_fd((int)regs->ebx, &in);
+    if (r < 0) return r;
+    return inotify_rm(in, (int)regs->ecx);
+}
+
 /* ── Dispatch table ───────────────────────────────────────────────────────── */
 
 void syscall_dispatch(registers_t *regs) {
@@ -10248,14 +10386,21 @@ void syscall_dispatch(registers_t *regs) {
     /* eventfd */
     case 323: ret = sys_eventfd(regs->ebx, 0);          break;  /* eventfd(initval) */
     case 328: ret = sys_eventfd(regs->ebx, regs->ecx);  break;  /* eventfd2(initval,flags) */
-    /* inotify (i386: init=291, add_watch=292, rm_watch=293, init1=332).  We do
-     * NOT implement file-change notification.  CRITICAL: these MUST return
-     * -ENOSYS so GLib's inotify backend detects "unsupported" and falls back to
-     * its polling backend.  Previously 291 was WRONGLY routed to epoll_create1,
-     * so GLib got a working-looking fd, polled it, then read() it → EBADF →
-     * GLib's FATAL "GLib-GIO-ERROR: inotify read(): Bad file descriptor" aborted
-     * the process (killed Firefox content children during startup). */
-    case 291: case 292: case 293: case 332: ret = -38; break;  /* -ENOSYS */
+    /* inotify (i386: init=291, add_watch=292, rm_watch=293, init1=332), real
+     * since fs/inotify.c: GLib's inotify backend reads its descriptor and
+     * aborts on a read error ("inotify read(): Bad file descriptor" killed
+     * Firefox content children when 291 was once routed to epoll_create1), so
+     * the descriptor must read events, block, and poll like Linux's. */
+    case 291: ret = sys_inotify_init1(0);                 break;
+    case 332: ret = sys_inotify_init1((int)regs->ebx);    break;
+    case 292: ret = sys_inotify_add_watch(regs);          break;
+    case 293: ret = sys_inotify_rm_watch(regs);           break;
+    /* System V IPC (proc/sysvipc.c): the ipc(2) multiplexer musl uses and
+     * the direct calls glibc uses. */
+    case 117: ret = sys_ipc(regs);             break;
+    case 393: case 394: case 395: case 396: case 397: case 398:
+    case 399: case 400: case 401: case 402: case 420:
+        ret = sysv_direct(regs, (int)num);     break;
     /* AT family syscalls */
     /* MaeroOS shared memory (custom numbers, outside the Linux table) */
     case 500: ret = shm_sys_create(regs->ebx); break;
@@ -10327,6 +10472,29 @@ void syscall_dispatch(registers_t *regs) {
 
     kprof_probe_end(KPP_SYS_BODY, kp_body);
     regs->eax = (uint32_t)(int32_t)ret;
+
+    /* inotify IN_MODIFY for a write that changed a file (write, writev,
+     * pwrite64). */
+    if (inotify_nwatches && ret > 0 && current_proc && (num == 4 || num == 146 || num == 181)) {
+        int wfd = (int)regs->ebx;
+        if (wfd >= 0 && wfd < MAX_FD && current_proc->ofile[wfd].type == FD_FILE &&
+            current_proc->ofile[wfd].node &&
+            current_proc->ofile[wfd].node->flags == VFS_FLAG_FILE)
+            inotify_child_event(current_proc->ofile[wfd].node,
+                                current_proc->ofile[wfd].path, IN_MODIFY);
+    }
+
+    /* /proc/<pid>/io: read and write family (read, readv, pread64, recv on
+     * a descriptor through read, and the matching writes). */
+    if (current_proc) {
+        if (num == 3 || num == 145 || num == 180) {
+            current_proc->io_syscr++;
+            if (ret > 0) current_proc->io_rchar += (uint32_t)ret;
+        } else if (num == 4 || num == 146 || num == 181) {
+            current_proc->io_syscw++;
+            if (ret > 0) current_proc->io_wchar += (uint32_t)ret;
+        }
+    }
 
     uint64_t kp_epi = kprof_probe_begin();
 

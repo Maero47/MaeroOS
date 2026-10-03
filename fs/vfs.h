@@ -345,3 +345,15 @@ int vfs_path_rdonly(const char *path, int parent);
  * instance still has open files (used to refuse a second mount of a device,
  * and raw writes to it).  Releases detached instances that have gone idle. */
 int vfs_mount_has_fs_source(const char *source);
+
+/* The filesystem root a boot-time mount shim stands for (the node itself
+ * when it is not one): what inotify watches and reports on. */
+vfs_node_t *vfs_resolve_mount(vfs_node_t *dir);
+
+/* The directory and name through which the calling process's last path
+ * lookup reached `node` (its final component), for inotify's events on a
+ * directory's entries.  1 and *parent / name (256 bytes) set, or 0. */
+int vfs_last_parent(vfs_node_t *node, vfs_node_t **parent, char *name);
+
+/* /proc/<pid>/mountinfo text; returns its length. */
+uint32_t vfs_mountinfo_format(char *buf, uint32_t size);
