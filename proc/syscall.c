@@ -3040,7 +3040,9 @@ static int ioctl_arg_shape(uint32_t req, uint32_t *len) {
     switch (req) {
     case FBIOGET_FSCREENINFO: *len = sizeof(fb_fix_screeninfo_t); return IOA_OUT;
     case FBIOGET_VSCREENINFO: *len = sizeof(fb_var_screeninfo_t); return IOA_OUT;
-    case 0x4601:              *len = sizeof(fb_var_screeninfo_t); return IOA_IN;  /* FBIOPUT_VSCREENINFO */
+    case FBIOPUT_VSCREENINFO: *len = sizeof(fb_var_screeninfo_t); return IOA_INOUT;
+    case FBIO_MAEROS_MODES:   *len = sizeof(fb_modelist_t);       return IOA_OUT;
+    case FBIO_MAEROS_FLUSH:   *len = sizeof(fb_flush_t);          return IOA_IN;
     case 0x80045430U:         *len = sizeof(int);   return IOA_OUT;   /* TIOCGPTN */
     case 0x40045431U:         *len = sizeof(int);   return IOA_IN;    /* TIOCSPTLCK */
     case 0x5401:              *len = 36;            return IOA_OUT;   /* TCGETS: i386 struct termios */
@@ -3108,9 +3110,11 @@ static int sys_ioctl(registers_t *regs) {
         if (dir == IOA_VAL)
             return f->node->ioctl_fn(f->node, (uint32_t)req, uarg);
         if (!uarg) return -14;
-        uint8_t kbuf[sizeof(fb_var_screeninfo_t) > 64 ? sizeof(fb_var_screeninfo_t) : 64];
-        _Static_assert(sizeof(fb_fix_screeninfo_t) <= sizeof(kbuf),
-                       "ioctl bounce buffer too small for fb_fix_screeninfo");
+        uint8_t kbuf[sizeof(fb_flush_t)] __attribute__((aligned(4)));
+        _Static_assert(sizeof(fb_fix_screeninfo_t) <= sizeof(kbuf) &&
+                       sizeof(fb_var_screeninfo_t) <= sizeof(kbuf) &&
+                       sizeof(fb_modelist_t) <= sizeof(kbuf) && 64 <= sizeof(kbuf),
+                       "ioctl bounce buffer too small");
         __builtin_memset(kbuf, 0, sizeof(kbuf));
         if (dir != IOA_OUT && copy_from_user(kbuf, uarg, len) < 0) return -14;
         int rc = f->node->ioctl_fn(f->node, (uint32_t)req, kbuf);
@@ -4656,21 +4660,29 @@ static int sys_mmap2(registers_t *regs) {
     }
     uint32_t end = va + length;
 
-    /* ── /dev/fb0: map the real framebuffer (DOOM, links -g) ── */
+    /* ── /dev/fb0: map the real framebuffer (DOOM, links -g) ──
+     * Page by page: a virtio-gpu framebuffer is scattered guest RAM (and
+     * mapped cached), a VGA one is contiguous device memory. */
     if (fnode && __builtin_strcmp(fnode->name, "fb0") == 0) {
-        uint32_t fb_phys = framebuffer_phys();
         uint32_t fb_len = framebuffer_size();
-        if (!fb_phys) return -19;
+        if (!framebuffer_phys()) return -19;
         if (length > ((fb_len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1)))
             length = (fb_len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
         end = va + length;
         if (!vma_add(va, end, prot, VMA_F_SHARED | nowrite, NULL, 0)) return -12;
         /* SHARED: no COW on fork; bit 4 is PCD.  A PROT_READ view of the
          * framebuffer is read-only like any other mapping. */
-        pte_t fb_flags = PAGE_PRESENT | PAGE_USER | PAGE_SHARED | (1U << 4) | PAGE_NX |
+        pte_t fb_flags = PAGE_PRESENT | PAGE_USER | PAGE_SHARED | PAGE_NX |
+                            (framebuffer_cached() ? 0 : (1U << 4)) |
                             ((prot & PROT_WRITE_K) ? PAGE_WRITABLE : 0);
         for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
-            if (paging_map(va + i, fb_phys + i, fb_flags) != 0) {
+            uint32_t fb_page = framebuffer_page_phys(i);
+            /* RAM frames (virtio-gpu) carry a reference per PTE like any
+             * shared page, which munmap and exit drop again; device frames
+             * have no refcount and pmm ignores them. */
+            if (fb_page && framebuffer_cached()) pmm_frame_incref(fb_page);
+            if (!fb_page || paging_map(va + i, fb_page, fb_flags) != 0) {
+                if (fb_page && framebuffer_cached()) pmm_frame_decref(fb_page);
                 /* Device frames are not refcounted, so unmap_range drops the
                  * PTEs and the VMA without touching the physical allocator —
                  * the same path munmap of an fb0 mapping already takes. */
@@ -4678,6 +4690,7 @@ static int sys_mmap2(registers_t *regs) {
                 return -12;
             }
         }
+        framebuffer_note_mmap();
         return (int)va;
     }
 

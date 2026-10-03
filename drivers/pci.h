@@ -43,3 +43,10 @@ int pci_enable_msi(const pci_device_t *d, uint8_t vector, uint8_t apic_id);
  * (address 0xFEE00000 | apic << 12, data = vector, control 0). */
 uint8_t pci_msix_table(const pci_device_t *d, uint8_t *bir, uint32_t *offset);
 void    pci_msix_enable(const pci_device_t *d, uint8_t cap);
+
+/* Size in bytes of memory BAR i (0 for an I/O BAR or none). */
+uint32_t pci_bar_size(const pci_device_t *d, int i);
+/* Capability walk: off 0 starts the list; returns the next capability's
+ * config offset (0 at the end) and its ID in *id. */
+uint8_t pci_cap_next(const pci_device_t *d, uint8_t off, uint8_t *id);
+uint8_t pci_read8(const pci_device_t *d, uint8_t off);
