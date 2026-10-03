@@ -197,7 +197,7 @@ static int node_is_regular(vfs_node_t *n) {
  * negative errno if none were.  A fault copying out after a device read
  * loses that data, as on Linux; for a regular file nothing is lost — the
  * caller advances the offset only by what was delivered. */
-static int vfs_read_user(vfs_node_t *n, uint32_t off, char *ubuf, uint32_t len) {
+static int vfs_read_user(vfs_node_t *n, uint64_t off, char *ubuf, uint32_t len) {
     if (len == 0) return 0;
     uint32_t bsz;
     uint8_t *kbuf = bounce_alloc(len, &bsz);
@@ -221,12 +221,13 @@ static int vfs_read_user(vfs_node_t *n, uint32_t off, char *ubuf, uint32_t len) 
 
 /* vfs_write() of user `ubuf` at `off`, chunk by chunk, stopping at the first
  * short write.  Returns bytes written, or a negative errno if none were. */
-static int vfs_write_user(vfs_node_t *n, uint32_t off, const char *ubuf, uint32_t len) {
+static int vfs_write_user(vfs_node_t *n, uint64_t off, const char *ubuf, uint32_t len) {
     if (len == 0) return 0;
-    /* File offsets are 32-bit: nothing can be written at or past 4 GiB, and a
-     * write straddling it is shortened rather than wrapping to offset 0. */
-    if (off == 0xFFFFFFFFU) return -27;                    /* -EFBIG */
-    if (len > 0xFFFFFFFFU - off) len = 0xFFFFFFFFU - off;
+    /* A loff_t is signed: nothing is written at or past 2^63 - 1, and a write
+     * straddling it is shortened.  Each filesystem refuses (-EFBIG) from its
+     * own largest file size on, as at Linux's s_maxbytes. */
+    if (off >= VFS_OFF_MAX) return -27;                    /* -EFBIG */
+    if (len > VFS_OFF_MAX - off) len = (uint32_t)(VFS_OFF_MAX - off);
     uint32_t bsz;
     uint8_t *kbuf = bounce_alloc(len, &bsz);
     if (!kbuf) return -12;
@@ -634,8 +635,13 @@ static uint8_t vfs_type_to_dt(uint8_t t) {
     }
 }
 
-static void fill_kstat(struct kstat *st, vfs_node_t *n) {
+/* The largest size and offset a 32-bit off_t caller sees (Linux MAX_NON_LFS). */
+#define MAX_NON_LFS 0x7FFFFFFFU
+
+/* -EOVERFLOW (Linux cp_new_stat) when the size does not fit the 32-bit field. */
+static int fill_kstat(struct kstat *st, vfs_node_t *n) {
     __builtin_memset(st, 0, sizeof(*st));
+    if (n->size > MAX_NON_LFS) return -75;          /* -EOVERFLOW */
     st->st_dev     = (uint16_t)n->dev;
     st->st_rdev    = (uint16_t)n->rdev;
     st->st_ino     = n->inode;
@@ -644,12 +650,13 @@ static void fill_kstat(struct kstat *st, vfs_node_t *n) {
     /* Legacy 16-bit ids: anything wider reads as overflowuid (65534). */
     st->st_uid     = n->uid > 0xFFFFU ? 65534U : (uint16_t)n->uid;
     st->st_gid     = n->gid > 0xFFFFU ? 65534U : (uint16_t)n->gid;
-    st->st_size    = n->size;
+    st->st_size    = (uint32_t)n->size;
     st->st_blksize = 4096;
-    st->st_blocks  = (n->size + 511) / 512;
+    st->st_blocks  = (uint32_t)((n->size + 511) / 512);
     st->st_atime   = n->atime;
     st->st_mtime   = n->mtime;
     st->st_ctime   = n->ctime;
+    return 0;
 }
 
 static void fill_kstat64(struct kstat64 *st, vfs_node_t *n) {
@@ -1301,6 +1308,13 @@ static int sys_write(registers_t *regs) {
         if ((f->flags & O_NONBLOCK) && f->node->write_ready_fn &&
             !f->node->write_ready_fn(f->node))
             return -11;                        /* -EAGAIN */
+        /* A 32-bit off_t writer stops at 2 GiB - 1 (Linux
+         * generic_write_check_limits without O_LARGEFILE). */
+        if (!(f->flags & O_LARGEFILE) && node_is_regular(f->node)) {
+            if (f->offset >= MAX_NON_LFS) return len ? -27 : 0;   /* -EFBIG */
+            if ((uint64_t)len > MAX_NON_LFS - f->offset)
+                len = (int)(MAX_NON_LFS - f->offset);
+        }
         int written = vfs_write_user(f->node, f->offset, buf, (uint32_t)len);
         if (written > 0) f->offset += (uint32_t)written;
         return written;
@@ -1579,6 +1593,12 @@ static int sys_open_kernel_path(const char *path, int flags, uint32_t mode) {
         return -24;
     }
 
+    /* A caller with a 32-bit off_t (no O_LARGEFILE) cannot open a regular
+     * file whose size it could not represent (Linux generic_file_open). */
+    if (node->flags == VFS_FLAG_FILE && !(flags & O_LARGEFILE) &&
+        node->size > MAX_NON_LFS)
+        return -75;                                           /* -EOVERFLOW */
+
     /* O_TRUNC: discard existing content */
     if ((flags & O_TRUNC) && node->truncate_fn)
         node->truncate_fn(node, 0);
@@ -1609,7 +1629,8 @@ static int sys_open_kernel_path(const char *path, int flags, uint32_t mode) {
             current_proc->ofile[i].offset  = (flags & O_APPEND) ? node->size : 0;
             /* Access mode plus the status flags F_GETFL reports and write()
              * honours (O_APPEND re-seeks to EOF before every write). */
-            current_proc->ofile[i].flags   = flags & (O_ACCMODE | O_APPEND | O_NONBLOCK);
+            current_proc->ofile[i].flags   = flags & (O_ACCMODE | O_APPEND | O_NONBLOCK |
+                                                      O_LARGEFILE);
             current_proc->ofile[i].cloexec = (flags & O_CLOEXEC) ? 1 : 0;
             __builtin_memcpy(current_proc->ofile[i].path, path,
                              __builtin_strlen(path) + 1);
@@ -2762,20 +2783,37 @@ static int sys_fchdir(registers_t *regs) {
 }
 
 /* ── sys_lseek(fd, offset, whence) — EAX=19 ─────────────────────────────── */
-/* The offset lseek/_llseek would move `f` to, computed in 64 bits: Linux
- * vfs_setpos() refuses a negative result or one past the largest file (here
- * 4 GiB - 1) with -EINVAL, leaving the position unchanged. */
-static int seek_target(proc_file_t *f, int64_t off, int whence, uint32_t *out) {
+/* The offset lseek/_llseek would move `f` to: Linux vfs_setpos() refuses a
+ * negative result or one past the largest offset (loff_t's 2^63 - 1) with
+ * -EINVAL, leaving the position unchanged.  SEEK_DATA and SEEK_HOLE treat the
+ * whole file as data (Linux generic_file_llseek_size without hole tracking):
+ * -ENXIO at or past the end. */
+static int seek_target(proc_file_t *f, int64_t off, int whence, uint64_t *out) {
     int64_t base;
+    int64_t size = f->node ? (int64_t)f->node->size : 0;
     switch (whence) {
     case 0: base = 0; break;                                   /* SEEK_SET */
     case 1: base = (int64_t)f->offset; break;                  /* SEEK_CUR */
-    case 2: base = f->node ? (int64_t)f->node->size : 0; break; /* SEEK_END */
+    case 2: base = size; break;                                /* SEEK_END */
+    case 3: case 4:                                            /* SEEK_DATA/HOLE */
+        if (!f->node || !node_is_regular(f->node)) return -22;
+        if (off < 0 || off >= size) return -6;                 /* -ENXIO */
+        *out = (uint64_t)(whence == 3 ? off : size);
+        return 0;
     default: return -22;
     }
+    if (off > 0 && base > (int64_t)VFS_OFF_MAX - off) return -22;
     int64_t pos = base + off;
-    if (pos < 0 || pos > 0xFFFFFFFFLL) return -22;             /* -EINVAL */
-    *out = (uint32_t)pos;
+    if (pos < 0) return -22;                                   /* -EINVAL */
+    *out = (uint64_t)pos;
+    return 0;
+}
+
+/* Only descriptors with a node behind them seek: pipes, sockets, epoll and
+ * eventfd are -ESPIPE (Linux no_llseek). */
+static int fd_seekable(const proc_file_t *f) {
+    if (f->type == FD_NONE) return -9;
+    if (f->type != FD_FILE || !f->node) return -29;            /* -ESPIPE */
     return 0;
 }
 
@@ -2786,14 +2824,15 @@ static int sys_lseek(registers_t *regs) {
 
     if (fd < 0 || fd >= MAX_FD) return -9;
     proc_file_t *f = &current_proc->ofile[fd];
-    if (f->type == FD_NONE) return -9;
-    if (f->type == FD_PIPE_R || f->type == FD_PIPE_W) return -29;  /* ESPIPE */
-
-    uint32_t new_off;
-    int r = seek_target(f, off, whence, &new_off);
+    int r = fd_seekable(f);
     if (r < 0) return r;
-    /* A 32-bit off_t cannot carry the result (Linux: -EOVERFLOW). */
-    if (new_off > 0x7FFFFFFFU) return -75;
+
+    uint64_t new_off;
+    r = seek_target(f, off, whence, &new_off);
+    if (r < 0) return r;
+    /* A 32-bit off_t cannot carry the result (Linux ksys_lseek: -EOVERFLOW).
+     * The position stays where it was. */
+    if (new_off > MAX_NON_LFS) return -75;
     f->offset = new_off;
     return (int)new_off;
 }
@@ -3224,7 +3263,8 @@ static int sys_fcntl(registers_t *regs) {
         if (f->type == FD_NONE) return -9;
         return f->flags;
     case 4:  /* F_SETFL */
-        f->flags = (f->flags & O_ACCMODE) | (arg & (O_APPEND | O_NONBLOCK));
+        f->flags = (f->flags & (O_ACCMODE | O_LARGEFILE)) |
+                   (arg & (O_APPEND | O_NONBLOCK));
         return 0;
     case 5:  case 6:  case 7:   /* F_GETLK / F_SETLK / F_SETLKW */
     case 12: case 13: case 14:  /* their flock64 forms (musl, glibc LFS) */
@@ -3512,7 +3552,8 @@ static int sys_stat(registers_t *regs) {
     vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
     if (!n) return lerr;
     struct kstat kst;
-    fill_kstat(&kst, n);
+    int r = fill_kstat(&kst, n);
+    if (r < 0) return r;
     return copy_to_user(st, &kst, sizeof(kst));
 }
 
@@ -3543,7 +3584,8 @@ static int sys_fstat(registers_t *regs) {
         return copy_to_user(st, &kst, sizeof(kst));
     }
     struct kstat kst;
-    fill_kstat(&kst, f->node);
+    int r = fill_kstat(&kst, f->node);
+    if (r < 0) return r;
     return copy_to_user(st, &kst, sizeof(kst));
 }
 
@@ -3745,8 +3787,8 @@ struct vma {
     uint32_t prot;        /* raw mmap PROT bits: 1=R 2=W 4=X; 0 = PROT_NONE */
     uint32_t flags;       /* VMA_F_* */
     vfs_node_t *file;     /* NULL = anonymous (zero-fill); else file-backed   */
-    uint32_t file_off;    /* byte offset in `file` corresponding to `start`   */
-    uint32_t file_size;   /* file size snapshot (bytes past it are BSS-zero)  */
+    uint64_t file_off;    /* byte offset in `file` corresponding to `start`   */
+    uint64_t file_size;   /* file size snapshot (bytes past it are BSS-zero)  */
     struct vma *next;     /* next by ascending start */
 };
 
@@ -3809,7 +3851,7 @@ static pte_t pte_flags_for(uint32_t prot, uint32_t shared) {
 }
 
 static struct vma *vma_alloc(uint32_t start, uint32_t end, uint32_t prot,
-                             uint32_t flags, vfs_node_t *file, uint32_t file_off) {
+                             uint32_t flags, vfs_node_t *file, uint64_t file_off) {
     struct vma *v = (struct vma *)kmalloc(sizeof(struct vma));
     if (!v) return NULL;
     v->start = start; v->end = end; v->prot = prot; v->flags = flags;
@@ -3870,7 +3912,7 @@ static void vma_merge_all(struct proc *o) {
 /* Record a VMA for [start,end).  Returns the VMA covering it (possibly a
  * merged neighbour spanning more than [start,end)) or NULL. */
 static struct vma *vma_add(uint32_t start, uint32_t end, uint32_t prot,
-                           uint32_t flags, vfs_node_t *file, uint32_t file_off) {
+                           uint32_t flags, vfs_node_t *file, uint64_t file_off) {
     struct proc *o = mmap_owner();
     if (!o || end <= start) return NULL;
     struct vma *v = vma_alloc(start, end, prot, flags, file, file_off);
@@ -4240,7 +4282,7 @@ static struct shmap_entry *shmap_get(vfs_node_t *node) {
 
 /* memfd nodes store their data IN this registry (see shmem_read below), so
  * there is no separate file body to seed a fresh frame from. */
-static uint32_t shmem_read(vfs_node_t *, uint32_t, uint32_t, uint8_t *);
+static uint32_t shmem_read(vfs_node_t *, uint64_t, uint32_t, uint8_t *);
 static int node_is_shmem(vfs_node_t *n) { return n && n->read_fn == shmem_read; }
 
 /* Get (allocating + initialising from file content on first touch) the shared
@@ -4268,7 +4310,7 @@ static uint32_t shmap_frame(struct shmap_entry *e, vfs_node_t *node, uint32_t pg
     uint8_t *kp = (uint8_t *)paging_temp_map(phys);
     __builtin_memset(kp, 0, PAGE_SIZE);
     if (node->read_fn && !node_is_shmem(node))  /* preserve any pre-written content */
-        vfs_read(node, pg * PAGE_SIZE, PAGE_SIZE, kp);
+        vfs_read(node, (uint64_t)pg * PAGE_SIZE, PAGE_SIZE, kp);
     paging_temp_unmap();
     e->frames[pg] = phys;
     return phys;
@@ -4309,10 +4351,13 @@ static void shmem_bounce(uint32_t phys, uint32_t in, uint8_t *buf, uint32_t n,
     }
 }
 
-static uint32_t shmem_read(vfs_node_t *node, uint32_t off, uint32_t len,
+/* A memfd is at most 4 GiB - 1 bytes (shmem_write/shmem_truncate refuse
+ * more), so past the size check its offsets fit 32 bits. */
+static uint32_t shmem_read(vfs_node_t *node, uint64_t off64, uint32_t len,
                            uint8_t *buf) {
-    if (off >= node->size) return 0;
-    if (len > node->size - off) len = node->size - off;
+    if (off64 >= node->size) return 0;
+    uint32_t off = (uint32_t)off64;
+    if (len > node->size - off) len = (uint32_t)(node->size - off);
     struct shmap_entry *e = shmap_lookup(node);
     uint32_t done = 0;
     while (done < len) {
@@ -4328,10 +4373,11 @@ static uint32_t shmem_read(vfs_node_t *node, uint32_t off, uint32_t len,
     return done;
 }
 
-static uint32_t shmem_write(vfs_node_t *node, uint32_t off, uint32_t len,
+static uint32_t shmem_write(vfs_node_t *node, uint64_t off64, uint32_t len,
                             const uint8_t *buf) {
-    /* off + len must not wrap past 4 GiB onto page 0. */
-    if (off == 0xFFFFFFFFU) return VFS_WRITE_EFBIG;
+    /* A memfd ends below 4 GiB (its frame table is indexed densely). */
+    if (off64 >= 0xFFFFFFFFU) return VFS_WRITE_EFBIG;
+    uint32_t off = (uint32_t)off64;
     if (len > 0xFFFFFFFFU - off) len = 0xFFFFFFFFU - off;
     struct shmap_entry *e = shmap_get(node);
     if (!e) return VFS_WRITE_ENOMEM;
@@ -4354,7 +4400,9 @@ static uint32_t shmem_write(vfs_node_t *node, uint32_t off, uint32_t len,
 /* Linux shmem_setattr/shmem_truncate_range: growing is lazy (the new pages are
  * holes that read as zero), shrinking drops the pages past the new end and
  * zeroes the tail of the last partial one. */
-static int shmem_truncate(vfs_node_t *node, uint32_t new_size) {
+static int shmem_truncate(vfs_node_t *node, uint64_t new_size64) {
+    if (new_size64 > 0xFFFFFFFFU) return -27;           /* -EFBIG */
+    uint32_t new_size = (uint32_t)new_size64;
     struct shmap_entry *e = shmap_lookup(node);
     if (e && e->frames && new_size < node->size) {
         uint32_t tail = new_size & (PAGE_SIZE - 1);
@@ -4408,7 +4456,7 @@ static int vma_populate_page(struct vma *v, uint32_t addr) {
     __builtin_memset(kva, 0, PAGE_SIZE);
     kprof_probe_end(KPP_FAULT_ZERO, kp_z);
     if (v->file) {
-        uint32_t foff = v->file_off + (addr - v->start);
+        uint64_t foff = v->file_off + (addr - v->start);
         uint32_t sf = se ? shmap_peek(se, foff / PAGE_SIZE) : 0;
         if (sf) {
             /* copy from the shared frame (temp slot 2), not the stale tmpfs buffer */
@@ -4417,7 +4465,7 @@ static int vma_populate_page(struct vma *v, uint32_t addr) {
             paging_temp_unmap2();
         } else if (foff < v->file_size) {
             uint32_t want = PAGE_SIZE;
-            if (want > v->file_size - foff) want = v->file_size - foff;
+            if (want > v->file_size - foff) want = (uint32_t)(v->file_size - foff);
             uint64_t kp_r = kprof_probe_begin();
             vfs_read(v->file, foff, want, kva);
             kprof_probe_end(KPP_FAULT_READ, kp_r);
@@ -4755,7 +4803,7 @@ static int sys_mmap2(registers_t *regs) {
      * is ~175 MiB) would read the whole file through the slow ATA-PIO path even
      * though startup touches a fraction of it, so large mappings are lazy. */
     {
-        struct vma *v = vma_add(va, end, prot, 0, fnode, pgoff * PAGE_SIZE);
+        struct vma *v = vma_add(va, end, prot, 0, fnode, (uint64_t)pgoff * PAGE_SIZE);
         if (!v) return -12;
         if (length < VMA_FILE_DEMAND_MIN) {
             uint64_t kp = kprof_probe_begin();
@@ -5022,7 +5070,7 @@ static int sys_mincore(registers_t *regs) {
 
 /* Attributes of the last VMA piece of the old range, captured before any list
  * surgery (the extension of a grown mapping continues them). */
-struct mremap_tail { uint32_t prot, flags, off, fsize; vfs_node_t *file; };
+struct mremap_tail { uint32_t prot, flags; uint64_t off, fsize; vfs_node_t *file; };
 
 /* Move the page table entries of [old,old+len) to new (both page aligned,
  * non-overlapping) and the VMA coverage with them.  The pieces are snapshotted
@@ -5032,7 +5080,7 @@ struct mremap_tail { uint32_t prot, flags, off, fsize; vfs_node_t *file; };
 static int mremap_move(uint32_t old, uint32_t len, uint32_t new) {
     struct proc *o = mmap_owner();
     if (!o) return -12;
-    struct { uint32_t s, e, prot, flags, off, fsize; vfs_node_t *file; } pcs[MREMAP_MAX_PIECES];
+    struct { uint32_t s, e, prot, flags; uint64_t off, fsize; vfs_node_t *file; } pcs[MREMAP_MAX_PIECES];
     int np = 0;
     for (struct vma *v = o->vmas; v && v->start < old + len; v = v->next) {
         if (v->end <= old) continue;
@@ -5706,7 +5754,8 @@ static int sys_lstat(registers_t *regs) {
     vfs_node_t *n = vfs_lookup_at(path, 0, &err);
     if (!n) return err;
     struct kstat kst;
-    fill_kstat(&kst, n);
+    int r = fill_kstat(&kst, n);
+    if (r < 0) return r;
     /* For symlinks, st_mode should be S_IFLNK */
     if (n->flags == VFS_FLAG_SYMLINK)
         kst.st_mode = (kst.st_mode & ~0xF000) | 0xA000;  /* S_IFLNK */
@@ -5873,12 +5922,11 @@ static int sys_readlink(registers_t *regs) {
 }
 
 /* ── sys_truncate(path, length) — EAX=92 ────────────────────────────────── */
-static int sys_truncate(registers_t *regs) {
+/* truncate(2) of `upath` to `len` bytes (already known non-negative). */
+static int do_truncate_path(const char *upath, uint64_t len) {
     char path[256];
-    if (copy_user_str((const char *)(uintptr_t)regs->ebx, path, 256) < 0)
+    if (copy_user_str(upath, path, 256) < 0)
         return -14;
-    uint32_t len = (uint32_t)regs->ecx;
-    if ((int32_t)len < 0 && regs->eax == 92) return -22;   /* -EINVAL */
     int lerr;
     vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
     if (!n) return lerr;
@@ -5895,12 +5943,12 @@ static int sys_truncate(registers_t *regs) {
             vfs_path_rdonly(abs, 0))
             return -30;                                    /* -EROFS */
     }
+    /* Past the filesystem's largest file the driver answers -EFBIG. */
     return vfs_truncate(n, len);
 }
 
-/* ── sys_ftruncate(fd, length) — EAX=93 ─────────────────────────────────── */
-static int sys_ftruncate(registers_t *regs) {
-    int fd = (int)regs->ebx;
+/* ftruncate(2) of descriptor `fd` to `len` bytes (non-negative). */
+static int do_ftruncate(int fd, uint64_t len) {
     if (fd < 0 || fd >= MAX_FD) return -9;
     proc_file_t *f = &current_proc->ofile[fd];
     if (f->type != FD_FILE || !f->node) return -9;
@@ -5908,48 +5956,64 @@ static int sys_ftruncate(registers_t *regs) {
      * writing (the permission was checked when it was opened). */
     if (!fd_writable(f)) return -22;
     if (fd_rofs(f)) return -30;                    /* -EROFS */
-    /* A negative length is -EINVAL (93 takes a signed 32-bit off_t; 194
-     * reaches here with the non-negative low word of a 64-bit one). */
-    if ((int32_t)regs->ecx < 0 && regs->eax == 93) return -22;
-    return vfs_truncate(f->node, (uint32_t)regs->ecx);
+    return vfs_truncate(f->node, len);
+}
+
+/* ── sys_truncate(path, length) — EAX=92, sys_ftruncate(fd, length) — 93 ──
+ * The legacy forms take a signed 32-bit off_t: negative is -EINVAL. */
+static int sys_truncate(registers_t *regs) {
+    if ((int32_t)regs->ecx < 0) return -22;        /* -EINVAL */
+    return do_truncate_path((const char *)(uintptr_t)regs->ebx, regs->ecx);
+}
+
+static int sys_ftruncate(registers_t *regs) {
+    if ((int32_t)regs->ecx < 0) return -22;        /* -EINVAL */
+    return do_ftruncate((int)regs->ebx, regs->ecx);
 }
 
 /* ── sys_truncate64(path, length_lo, length_hi) — EAX=193 ───────────────────
  * ── sys_ftruncate64(fd,  length_lo, length_hi) — EAX=194 ───────────────────
  * Linux i386 carries a 64-bit-offset (f)truncate pair alongside the legacy
  * 92/93; musl always issues these (src/unistd/{f,}truncate.c pass the length
- * as the __SYSCALL_LL_O register pair ECX:EDX).  Our files are below 4 GiB, so
- * a nonzero high word is -EFBIG, exactly what Linux reports past s_maxbytes. */
+ * as the __SYSCALL_LL_O register pair ECX:EDX, low word first). */
 static int sys_truncate64(registers_t *regs) {
     if ((int32_t)regs->edx < 0) return -22;        /* -EINVAL: negative */
-    if (regs->edx) return -27;                     /* -EFBIG */
-    return sys_truncate(regs);                     /* ECX already holds the low word */
+    return do_truncate_path((const char *)(uintptr_t)regs->ebx,
+                            ((uint64_t)regs->edx << 32) | regs->ecx);
 }
 
 static int sys_ftruncate64(registers_t *regs) {
     if ((int32_t)regs->edx < 0) return -22;        /* -EINVAL: negative */
-    if (regs->edx) return -27;                     /* -EFBIG */
-    return sys_ftruncate(regs);
+    return do_ftruncate((int)regs->ebx, ((uint64_t)regs->edx << 32) | regs->ecx);
 }
 
 /* ── sys_fallocate(fd, mode, offset, len) — EAX=324 ─────────────────────────
  * Firefox sizes its memfd-backed shared memory with fallocate(fd, 0, 0, size);
  * returning -ENOSYS made it log "fallocate failed to set shm size".  On i386
- * the 64-bit offset/len are register pairs (offset=edx:esi, len=edi:ebp); shm
- * segments are well under 4 GiB so we use the low words.  mode 0 = allocate:
- * ensure the file is at least offset+len bytes (grow a tmpfs/memfd file). */
+ * the 64-bit offset/len are register pairs (offset = esi:edx, len = ebp:edi,
+ * high:low).  Mode 0 makes the file at least offset+len bytes long (the new
+ * range reads as zeroes; no blocks are reserved ahead of time);
+ * FALLOC_FL_KEEP_SIZE alone has nothing to do; the other modes are
+ * -EOPNOTSUPP.  Linux vfs_fallocate: offset < 0 or len <= 0 is -EINVAL, a sum
+ * past the largest offset -EFBIG. */
 static int sys_fallocate(registers_t *regs) {
     int fd = (int)regs->ebx;
-    uint32_t offset = regs->edx;
-    uint32_t len    = regs->edi;
+    uint32_t mode = regs->ecx;
+    int64_t offset = (int64_t)(((uint64_t)regs->esi << 32) | regs->edx);
+    int64_t len    = (int64_t)(((uint64_t)regs->ebp << 32) | regs->edi);
     if (fd < 0 || fd >= MAX_FD) return -9;
     proc_file_t *f = &current_proc->ofile[fd];
+    if (offset < 0 || len <= 0) return -22;        /* -EINVAL */
+    if (f->type == FD_PIPE_R || f->type == FD_PIPE_W) return -29;  /* -ESPIPE */
     if (f->type != FD_FILE || !f->node) return -9;
     if (!fd_writable(f)) return -9;                /* Linux vfs_fallocate: -EBADF */
+    if (mode & ~1U) return -95;                    /* -EOPNOTSUPP */
+    if (f->node->flags == VFS_FLAG_DIR) return -21;           /* -EISDIR */
+    if (f->node->flags != VFS_FLAG_FILE) return -19;          /* -ENODEV */
     if (fd_rofs(f)) return -30;                    /* -EROFS */
-    uint32_t want = offset + len;
-    if (want < offset) return -22;                 /* -EINVAL: overflow */
-    if (want > f->node->size)
+    if (offset > (int64_t)VFS_OFF_MAX - len) return -27;      /* -EFBIG */
+    uint64_t want = (uint64_t)offset + (uint64_t)len;
+    if (!(mode & 1) && want > f->node->size)
         return vfs_truncate(f->node, want);        /* grow to size */
     return 0;
 }
@@ -6699,77 +6763,192 @@ static int sys_sigaltstack(registers_t *regs) {
     return 0;
 }
 
-/* pread64/pwrite64 on a disk or partition node: the full 64-bit offset (the
- * descriptor's own offset is 32-bit), so an installer can reach the backup GPT
- * at the end of a disk past 4 GiB. */
-static int blkdev_rw_user(blkpart_t *bp, uint64_t off, char *ubuf, uint32_t len,
-                          int write) {
-    if (len == 0) return 0;
+/* ── sys_pread64(fd, buf, count, offset_lo, offset_hi) — EAX=180 ───────────
+ * ── sys_pwrite64(fd, buf, count, offset_lo, offset_hi) — EAX=181 ───────────
+ * The offset is the 64-bit pair edi:esi (high:low); the descriptor's own
+ * position is left alone.  A negative offset is -EINVAL, a pipe or socket
+ * -ESPIPE (Linux ksys_pread64). */
+static int sys_pread64(registers_t *regs) {
+    int      fd  = (int)regs->ebx;
+    char    *buf = (char *)(uintptr_t)regs->ecx;
+    int      len = (int)(uint32_t)regs->edx;
+    int64_t  off = (int64_t)(((uint64_t)regs->edi << 32) | regs->esi);
+
+    if (len < 0 || !access_ok(buf, (size_t)len)) return -14;
+    if (fd < 0 || fd >= MAX_FD) return -9;
+
+    proc_file_t *f = &current_proc->ofile[fd];
+    if (f->type == FD_NONE) return -9;
+    if (!fd_readable(f)) return -9;
+    int r = fd_seekable(f);
+    if (r < 0) return r;
+    if (off < 0) return -22;                               /* -EINVAL */
+    return vfs_read_user(f->node, (uint64_t)off, buf, (uint32_t)len);
+}
+
+static int sys_pwrite64(registers_t *regs) {
+    int         fd  = (int)regs->ebx;
+    const char *buf = (const char *)(uintptr_t)regs->ecx;
+    int         len = (int)(uint32_t)regs->edx;
+    int64_t     off = (int64_t)(((uint64_t)regs->edi << 32) | regs->esi);
+
+    if (len < 0 || !access_ok(buf, (size_t)len)) return -14;
+    if (fd < 0 || fd >= MAX_FD) return -9;
+
+    proc_file_t *f = &current_proc->ofile[fd];
+    if (f->type == FD_NONE) return -9;
+    if (!fd_writable(f)) return -9;
+    int r = fd_seekable(f);
+    if (r < 0) return r;
+    if (!f->node->write_fn) return -9;
+    if (off < 0) return -22;                               /* -EINVAL */
+    return vfs_write_user(f->node, (uint64_t)off, buf, (uint32_t)len);
+}
+
+/* Copy up to `count` bytes from regular file `in` at *in_off to regular file
+ * `out` at *out_off through a kernel buffer, advancing both offsets by what
+ * was written.  Returns the bytes copied, or a negative errno if none were.
+ * The kernel half of sendfile(2) and copy_file_range(2). */
+static int file_copy_range(proc_file_t *in, uint64_t *in_off,
+                           proc_file_t *out, uint64_t *out_off, uint32_t count) {
+    if (count > 0x7FFFF000U) count = 0x7FFFF000U;        /* Linux MAX_RW_COUNT */
+    if (count == 0) return 0;
     uint32_t bsz;
-    uint8_t *kbuf = bounce_alloc(len, &bsz);
+    uint8_t *kbuf = bounce_alloc(count, &bsz);
     if (!kbuf) return -12;
     uint32_t done = 0;
     int err = 0;
-    while (done < len) {
-        uint32_t want = len - done < bsz ? len - done : bsz;
-        if (write && copy_from_user(kbuf, ubuf + done, want) < 0) { err = -14; break; }
-        int r = blkpart_rw(bp, off + done, kbuf, want, write);
-        if (r < 0) { err = r; break; }
-        if (!write && r && copy_to_user(ubuf + done, kbuf, (uint32_t)r) < 0) {
-            err = -14; break;
-        }
-        done += (uint32_t)r;
-        if ((uint32_t)r < want) break;
+    while (done < count) {
+        uint32_t want = count - done < bsz ? count - done : bsz;
+        uint32_t got = vfs_read(in->node, *in_off, want, kbuf);
+        if ((int32_t)got < 0) { err = (int32_t)got; break; }
+        if (got == 0) break;
+        if (got > want) got = want;
+        if (*out_off >= VFS_OFF_MAX) { err = -27; break; }
+        uint32_t w = vfs_write(out->node, *out_off, got, kbuf);
+        if (w == VFS_WRITE_ENOMEM) { err = -12; break; }
+        if (w == VFS_WRITE_EFBIG)  { err = -27; break; }
+        if ((int32_t)w < 0)        { err = (int32_t)w; break; }
+        if (w > got) w = got;
+        *in_off += w;
+        *out_off += w;
+        done += w;
+        if (w < got || got < want) break;
     }
     kfree(kbuf);
     return done ? (int)done : err;
 }
 
-/* ── sys_pread64(fd, buf, count, offset_lo, offset_hi) — EAX=180 ─────────── */
-static int sys_pread64(registers_t *regs) {
-    int      fd  = (int)regs->ebx;
-    char    *buf = (char *)(uintptr_t)regs->ecx;
-    int      len = (int)(uint32_t)regs->edx;
-    uint32_t off = regs->esi;  /* offset low 32 bits (high 32 bits in edi) */
-
-    if (len < 0 || !access_ok(buf, (size_t)len)) return -14;
-    if (fd < 0 || fd >= MAX_FD) return -9;
-
-    proc_file_t *f = &current_proc->ofile[fd];
-    if (f->type != FD_FILE || !f->node) return -9;
-    if (!fd_readable(f)) return -9;
-    if ((int32_t)regs->edi < 0) return -22;                /* -EINVAL */
-    blkpart_t *bp = blkpart_from_node(f->node);
-    if (bp)
-        return blkdev_rw_user(bp, ((uint64_t)regs->edi << 32) | off, buf,
-                              (uint32_t)len, 0);
-    if (regs->edi) return 0;                /* past the largest file: EOF */
-
-    return vfs_read_user(f->node, off, buf, (uint32_t)len);
+/* Both descriptors are files that can take part in a copy: `in` a regular
+ * file open for reading, `out` a regular file open for writing.  Anything
+ * else is -EINVAL, on which callers (coreutils, busybox) fall back to
+ * read/write. */
+static int copy_fds_ok(proc_file_t *in, proc_file_t *out) {
+    if (in->type == FD_NONE || out->type == FD_NONE) return -9;
+    if (!fd_readable(in) || !fd_writable(out)) return -9;      /* -EBADF */
+    if (in->type != FD_FILE || out->type != FD_FILE || !in->node || !out->node)
+        return -22;
+    if (!node_is_regular(in->node) || !node_is_regular(out->node) ||
+        !out->node->write_fn)
+        return -22;
+    if (fd_rofs(out)) return -30;                              /* -EROFS */
+    return 0;
 }
 
-/* ── sys_pwrite64(fd, buf, count, offset) — EAX=181 ─────────────────────── */
-static int sys_pwrite64(registers_t *regs) {
-    int         fd  = (int)regs->ebx;
-    const char *buf = (const char *)(uintptr_t)regs->ecx;
-    int         len = (int)(uint32_t)regs->edx;
-    uint32_t    off = regs->esi;
+/* ── sys_sendfile(out_fd, in_fd, off_t *offset, count) — EAX=187 ────────────
+ * ── sys_sendfile64(out_fd, in_fd, loff_t *offset, count) — EAX=239 ────────
+ * With `offset` the input is read from *offset (updated afterwards) and the
+ * input descriptor's position is left alone; without it the position is used
+ * and advanced.  The output is written at its own position.  sendfile's
+ * 32-bit offset stops at 2 GiB - 1 (-EOVERFLOW past it, Linux do_sendfile).
+ * Output to a pipe or socket is not supported here (-EINVAL). */
+static int do_sendfile(registers_t *regs, int wide) {
+    int out_fd = (int)regs->ebx, in_fd = (int)regs->ecx;
+    void *uoff = (void *)(uintptr_t)regs->edx;
+    uint32_t count = regs->esi;
+    if (out_fd < 0 || out_fd >= MAX_FD || in_fd < 0 || in_fd >= MAX_FD) return -9;
+    proc_file_t *in = &current_proc->ofile[in_fd];
+    proc_file_t *out = &current_proc->ofile[out_fd];
+    int r = copy_fds_ok(in, out);
+    if (r < 0) return r;
+    if (out->flags & O_APPEND) return -22;                     /* Linux: -EINVAL */
+    uint64_t pos;
+    if (uoff) {
+        if (wide) {
+            int64_t v;
+            if (copy_from_user(&v, uoff, sizeof(v)) < 0) return -14;
+            if (v < 0) return -22;
+            pos = (uint64_t)v;
+        } else {
+            int32_t v;
+            if (copy_from_user(&v, uoff, sizeof(v)) < 0) return -14;
+            if (v < 0) return -22;
+            pos = (uint32_t)v;
+        }
+    } else {
+        pos = in->offset;
+    }
+    uint64_t max = wide ? VFS_OFF_MAX : MAX_NON_LFS;
+    if (pos >= max) return count ? -75 : 0;                    /* -EOVERFLOW */
+    if (count > max - pos) count = (uint32_t)(max - pos);
+    uint64_t opos = out->offset;
+    int n = file_copy_range(in, &pos, out, &opos, count);
+    if (n <= 0) return n;
+    out->offset = opos;
+    if (uoff) {
+        int cr;
+        if (wide) { int64_t v = (int64_t)pos; cr = copy_to_user(uoff, &v, sizeof(v)); }
+        else      { int32_t v = (int32_t)pos; cr = copy_to_user(uoff, &v, sizeof(v)); }
+        if (cr < 0) return -14;
+    } else {
+        in->offset = pos;
+    }
+    return n;
+}
 
-    if (len < 0 || !access_ok(buf, (size_t)len)) return -14;
-    if (fd < 0 || fd >= MAX_FD) return -9;
+static int sys_sendfile(registers_t *regs)   { return do_sendfile(regs, 0); }
+static int sys_sendfile64(registers_t *regs) { return do_sendfile(regs, 1); }
 
-    proc_file_t *f = &current_proc->ofile[fd];
-    if (f->type != FD_FILE || !f->node) return -9;
-    if (!fd_writable(f) || !f->node->write_fn) return -9;
-    /* The offset is 64-bit (esi:edi); files here are at most 4 GiB. */
-    if ((int32_t)regs->edi < 0) return -22;                /* -EINVAL */
-    blkpart_t *bp = blkpart_from_node(f->node);
-    if (bp)
-        return blkdev_rw_user(bp, ((uint64_t)regs->edi << 32) | off, (char *)buf,
-                              (uint32_t)len, 1);
-    if (regs->edi) return len ? -27 : 0;                   /* -EFBIG */
-
-    return vfs_write_user(f->node, off, buf, (uint32_t)len);
+/* ── sys_copy_file_range(fd_in, loff_t *off_in, fd_out, loff_t *off_out,
+ *                        len, flags) — EAX=377 ──────────────────────────────
+ * Between two regular files; an offset pointer given is used and updated
+ * instead of that descriptor's position.  flags must be 0; an overlapping
+ * range within one file is -EINVAL; an O_APPEND output -EBADF (Linux
+ * generic_copy_file_checks). */
+static int sys_copy_file_range(registers_t *regs) {
+    int in_fd = (int)regs->ebx, out_fd = (int)regs->edx;
+    int64_t *uin = (int64_t *)(uintptr_t)regs->ecx;
+    int64_t *uout = (int64_t *)(uintptr_t)regs->esi;
+    uint32_t len = regs->edi, flags = regs->ebp;
+    if (flags) return -22;
+    if (out_fd < 0 || out_fd >= MAX_FD || in_fd < 0 || in_fd >= MAX_FD) return -9;
+    proc_file_t *in = &current_proc->ofile[in_fd];
+    proc_file_t *out = &current_proc->ofile[out_fd];
+    int r = copy_fds_ok(in, out);
+    if (r < 0) return r;
+    if (out->flags & O_APPEND) return -9;
+    int64_t v;
+    uint64_t ipos = in->offset, opos = out->offset;
+    if (uin) {
+        if (copy_from_user(&v, uin, sizeof(v)) < 0) return -14;
+        if (v < 0) return -22;
+        ipos = (uint64_t)v;
+    }
+    if (uout) {
+        if (copy_from_user(&v, uout, sizeof(v)) < 0) return -14;
+        if (v < 0) return -22;
+        opos = (uint64_t)v;
+    }
+    if (ipos >= VFS_OFF_MAX - len || opos >= VFS_OFF_MAX - len) return -27;  /* -EFBIG */
+    if (in->node == out->node && ipos < opos + len && opos < ipos + len)
+        return -22;                                            /* overlap */
+    int n = file_copy_range(in, &ipos, out, &opos, len);
+    if (n <= 0) return n;
+    if (uin) { v = (int64_t)ipos; if (copy_to_user(uin, &v, sizeof(v)) < 0) return -14; }
+    else in->offset = ipos;
+    if (uout) { v = (int64_t)opos; if (copy_to_user(uout, &v, sizeof(v)) < 0) return -14; }
+    else out->offset = opos;
+    return n;
 }
 
 /* ── sys_openat(dirfd, path, flags, mode) — EAX=295 ─────────────────────── */
@@ -7374,7 +7553,7 @@ static int sys_memfd_create(registers_t *regs) {
     while (seq) { num[n++] = '0' + (seq % 10); seq /= 10; }
     while (n) path[p++] = num[--n];
     path[p] = '\0';
-    int fd = sys_open_kernel_path(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    int fd = sys_open_kernel_path(path, O_RDWR | O_CREAT | O_TRUNC | O_LARGEFILE, 0600);
     if (fd < 0) return fd;
     /* MFD_CLOEXEC = 0x0001 (Linux mm/memfd.c hands O_CLOEXEC to get_unused_fd). */
     current_proc->ofile[fd].cloexec = (regs->ecx & 0x1) ? 1 : 0;
@@ -7612,16 +7791,15 @@ static int sys_llseek(registers_t *regs) {
 
     if (fd < 0 || fd >= MAX_FD) return -9;
     proc_file_t *f = &current_proc->ofile[fd];
-    if (f->type == FD_NONE) return -9;
-    if (f->type == FD_PIPE_R || f->type == FD_PIPE_W) return -29;
+    int r = fd_seekable(f);
+    if (r < 0) return r;
 
-    uint32_t new_off;
-    int r = seek_target(f, off, whence, &new_off);
+    uint64_t new_off;
+    r = seek_target(f, off, whence, &new_off);
     if (r < 0) return r;
     f->offset = new_off;
     if (result) {
-        uint64_t kres = (uint64_t)new_off;
-        int cr = copy_to_user(result, &kres, sizeof(kres));
+        int cr = copy_to_user(result, &new_off, sizeof(new_off));
         if (cr < 0) return cr;
     }
     return 0;
@@ -10143,6 +10321,9 @@ void syscall_dispatch(registers_t *regs) {
     case 272: ret = 0;                         break;  /* fadvise64_64 */
     case 179: ret = sys_rt_sigsuspend(regs);   break;
     case 180: ret = sys_pread64(regs);         break;
+    case 187: ret = sys_sendfile(regs);        break;
+    case 239: ret = sys_sendfile64(regs);      break;
+    case 377: ret = sys_copy_file_range(regs); break;
     case 181: ret = sys_pwrite64(regs);        break;
     case 183: ret = sys_getcwd(regs);          break;
     case 186: ret = sys_sigaltstack(regs);     break;

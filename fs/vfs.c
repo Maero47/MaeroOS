@@ -16,7 +16,7 @@ void vfs_init(void) {
 
 /* ── Low-level node operations ────────────────────────────────────────────── */
 
-uint32_t vfs_read(vfs_node_t *node, uint32_t offset, uint32_t size,
+uint32_t vfs_read(vfs_node_t *node, uint64_t offset, uint32_t size,
                   uint8_t *buf) {
     if (!node) return 0;
     if (node->read_fn)
@@ -24,8 +24,8 @@ uint32_t vfs_read(vfs_node_t *node, uint32_t offset, uint32_t size,
     /* Default: initrd in-memory data */
     if (!(node->flags & VFS_FLAG_FILE) || !node->data) return 0;
     if (offset >= node->size) return 0;
-    if (offset + size > node->size) size = node->size - offset;
-    memcpy(buf, node->data + offset, size);
+    if (size > node->size - offset) size = (uint32_t)(node->size - offset);
+    memcpy(buf, node->data + (uint32_t)offset, size);
     return size;
 }
 
@@ -60,7 +60,7 @@ vfs_node_t *vfs_finddir(vfs_node_t *dir, const char *name) {
     return NULL;
 }
 
-uint32_t vfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
+uint32_t vfs_write(vfs_node_t *node, uint64_t offset, uint32_t size,
                    const uint8_t *buf) {
     if (!node || !node->write_fn) return 0;
     return node->write_fn(node, offset, size, buf);
@@ -71,7 +71,7 @@ int vfs_create(vfs_node_t *dir, const char *name, uint32_t flags) {
     return dir->create_fn(dir, name, flags);
 }
 
-int vfs_truncate(vfs_node_t *node, uint32_t new_size) {
+int vfs_truncate(vfs_node_t *node, uint64_t new_size) {
     if (!node || !node->truncate_fn) return -1;
     return node->truncate_fn(node, new_size);
 }

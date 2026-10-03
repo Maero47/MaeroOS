@@ -32,6 +32,7 @@ typedef enum {
 #define O_TRUNC    0x200
 #define O_APPEND   0x400
 #define O_NONBLOCK 0x800
+#define O_LARGEFILE 0x8000  /* i386 value: the caller's off_t is 64-bit */
 #define O_CLOEXEC  0x80000
 
 /* FD flags (separate from open flags — set via fcntl F_SETFD) */
@@ -40,7 +41,7 @@ typedef enum {
 typedef struct {
     fd_type_t        type;
     struct vfs_node *node;    /* FD_FILE: vfs node */
-    uint32_t         offset;  /* FD_FILE: current read/write position */
+    uint64_t         offset;  /* FD_FILE: current read/write position */
     struct pipe_buf *pipe;    /* FD_PIPE_R/FD_PIPE_W: the pipe buffer */
     struct net_socket *socket;/* FD_SOCKET: network socket object */
     struct usocket   *usock;  /* FD_USOCKET: AF_UNIX socket object */

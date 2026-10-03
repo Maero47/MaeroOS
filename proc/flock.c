@@ -236,10 +236,16 @@ int flock_fcntl(proc_file_t *f, int cmd, void *uarg) {
     case 2: base = (int64_t)f->node->size; break;
     default: return -22;
     }
+    /* Linux flock64_to_posix_lock: past OFFSET_MAX is -EOVERFLOW, before
+     * offset 0 is -EINVAL.  Checked before adding: int64_t must not wrap. */
+    if (fl.start > 0 && base > OFF_MAX - fl.start) return -75;   /* -EOVERFLOW */
     int64_t start = base + fl.start, end;
+    if (start < 0) return -22;
     if (fl.len > 0) {
+        if (fl.len - 1 > OFF_MAX - start) return -75;           /* -EOVERFLOW */
         end = start + fl.len - 1;
     } else if (fl.len < 0) {
+        if (fl.len < -start) return -22;      /* would start before 0 */
         end = start - 1;
         start += fl.len;
     } else {

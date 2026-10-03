@@ -1185,12 +1185,12 @@ int alsa_ioctl(vfs_node_t *n, uint32_t req, void *uarg, int nonblock) {
     return rc;
 }
 
-static uint32_t nodata_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+static uint32_t nodata_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf) {
     (void)n; (void)off; (void)len; (void)buf;
     return 0;
 }
 
-static uint32_t nodata_write(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t nodata_write(vfs_node_t *n, uint64_t off, uint32_t len,
                              const uint8_t *buf) {
     (void)n; (void)off; (void)len; (void)buf;
     return 0;

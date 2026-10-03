@@ -34,7 +34,7 @@ typedef struct vfs_node {
     char     name[256];
     uint32_t flags;    /* VFS_FLAG_* */
     uint32_t inode;    /* filesystem inode number */
-    uint32_t size;     /* file size in bytes */
+    uint64_t size;     /* file size in bytes (64-bit: files past 4 GiB) */
     uint32_t mask;     /* Unix permission bits */
     uint32_t uid, gid;
     uint32_t atime, mtime, ctime;
@@ -43,13 +43,14 @@ typedef struct vfs_node {
     uint32_t rdev;     /* st_rdev: the device a BLKDEV/CHARDEV node stands for */
 
     /* ── Operations (NULL = use built-in defaults) ──────────────────── */
-    uint32_t          (*read_fn)   (struct vfs_node *, uint32_t off,
+    /* Offsets are 64-bit; one call moves at most 4 GiB - 1 bytes. */
+    uint32_t          (*read_fn)   (struct vfs_node *, uint64_t off,
                                     uint32_t len, uint8_t *buf);
-    uint32_t          (*write_fn)  (struct vfs_node *, uint32_t off,
+    uint32_t          (*write_fn)  (struct vfs_node *, uint64_t off,
                                     uint32_t len, const uint8_t *buf);
     int               (*create_fn) (struct vfs_node *dir, const char *name,
                                     uint32_t flags);
-    int               (*truncate_fn)(struct vfs_node *, uint32_t new_size);
+    int               (*truncate_fn)(struct vfs_node *, uint64_t new_size);
     int               (*unlink_fn) (struct vfs_node *dir, const char *name);
     int               (*symlink_fn)(struct vfs_node *dir, const char *name,
                                     const char *target);
@@ -123,7 +124,7 @@ vfs_node_t *vfs_open(const char *path);
 vfs_node_t *vfs_lookup(const char *path, int follow_final, int *err);
 
 /* Read up to `size` bytes at `offset` from a file node */
-uint32_t vfs_read(vfs_node_t *node, uint32_t offset, uint32_t size,
+uint32_t vfs_read(vfs_node_t *node, uint64_t offset, uint32_t size,
                   uint8_t *buf);
 
 /*
@@ -142,16 +143,19 @@ uint32_t vfs_read(vfs_node_t *node, uint32_t offset, uint32_t size,
  * filesystem can hold" (write(2) gets -EFBIG, as at Linux's s_maxbytes). */
 #define VFS_WRITE_EFBIG   0xFFFFFFFEU
 
+/* The largest file offset (Linux loff_t is signed 64-bit). */
+#define VFS_OFF_MAX       0x7FFFFFFFFFFFFFFFULL
+
 /* Write up to `size` bytes at `offset` to a file node; returns bytes written,
  * VFS_WRITE_ENOMEM or VFS_WRITE_EFBIG. */
-uint32_t vfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
+uint32_t vfs_write(vfs_node_t *node, uint64_t offset, uint32_t size,
                    const uint8_t *buf);
 
 /* Create a file or directory named `name` inside `dir`; returns 0 or -1 */
 int vfs_create(vfs_node_t *dir, const char *name, uint32_t flags);
 
 /* Truncate (or extend with zeros) a file to `new_size`; returns 0 or -1 */
-int vfs_truncate(vfs_node_t *node, uint32_t new_size);
+int vfs_truncate(vfs_node_t *node, uint64_t new_size);
 
 /* Remove file named `name` from directory `dir`; returns 0 or -errno */
 int vfs_unlink(vfs_node_t *dir, const char *name);

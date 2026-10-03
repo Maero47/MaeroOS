@@ -135,6 +135,7 @@ typedef struct {
     uint32_t inodes_count;
     uint32_t blocks_count;
     uint32_t first_ino;
+    uint32_t block_shift;        /* log2(block_size) */
 } ext2_state_t;
 
 
@@ -327,7 +328,7 @@ static vfs_node_t *ext2_finddir(vfs_node_t *dir, const char *name);
 static int ext2_readdir(vfs_node_t *dir, uint32_t req_idx,
                          vfs_dirent_t *out);
 static int ext2_create(vfs_node_t *dir, const char *name, uint32_t flags);
-static int ext2_truncate(vfs_node_t *node, uint32_t new_size);
+static int ext2_truncate(vfs_node_t *node, uint64_t new_size);
 static int ext2_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid,
                         uint32_t gid);
 static int ext2_settimes(vfs_node_t *node, uint32_t atime, uint32_t mtime);
@@ -337,7 +338,7 @@ static int ext2_symlink(vfs_node_t *dir, const char *name, const char *target);
 static int ext2_rename(vfs_node_t *old_dir, const char *old_name,
                        vfs_node_t *new_dir, const char *new_name);
 static int ext2_free_block(ext2_fs_t *fs, uint32_t blk);
-static uint32_t ext2_write_node(vfs_node_t *node, uint32_t offset,
+static uint32_t ext2_write_node(vfs_node_t *node, uint64_t offset,
                                 uint32_t size, const uint8_t *buf);
 static const uint8_t *ext2_jt_find(ext2_fs_t *fs, uint32_t blk);
 static void ext2_op_end(ext2_fs_t *fs);
@@ -1347,6 +1348,73 @@ static int x4_is_ext(const ext2_inode_t *ino) {
     return (ino->i_flags & EXT4_EXTENTS_FL) != 0;
 }
 
+/* ── 64-bit file sizes ───────────────────────────────────────────────────────
+ * A regular file's size is i_size | i_size_high << 32 (the LARGE_FILE
+ * read-only-compatible feature; on ext2 revision 0 directories the high word
+ * was i_dir_acl, so it only counts for regular files here, and directories
+ * stay below 4 GiB). */
+static uint64_t ext2_isize(const ext2_inode_t *ino) {
+    uint64_t sz = ino->i_size;
+    if ((ino->i_mode & EXT2_S_IFMT) == EXT2_S_IFREG)
+        sz |= (uint64_t)ino->i_size_high << 32;
+    return sz;
+}
+
+/* Set the size; a file past 2 GiB - 1 marks the filesystem LARGE_FILE (as
+ * Linux ext2_update_dynamic_rev/ext4_update_inode_size do), so that e2fsck
+ * and older drivers know i_size_high carries size. */
+static void ext2_set_large_file(ext2_fs_t *fs);
+static void ext2_set_isize(ext2_fs_t *fs, ext2_inode_t *ino, uint64_t sz) {
+    ino->i_size = (uint32_t)sz;
+    if ((ino->i_mode & EXT2_S_IFMT) == EXT2_S_IFREG) {
+        ino->i_size_high = (uint32_t)(sz >> 32);
+        if (sz > 0x7FFFFFFFu) ext2_set_large_file(fs);
+    }
+}
+
+#define EXT2_RO_COMPAT_LARGE_FILE_BIT 0x0002u
+static void ext2_set_large_file(ext2_fs_t *fs) {
+    if (fs->ro_compat & EXT2_RO_COMPAT_LARGE_FILE_BIT) return;
+    if (fs->x4) {
+        /* In memory; the end of the operation writes (or journals) it. */
+        x4_wr32(fs->sb + 0x64, x4_rd32(fs->sb + 0x64) | EXT2_RO_COMPAT_LARGE_FILE_BIT);
+        fs->sb_dirty = 1;
+        fs->ro_compat |= EXT2_RO_COMPAT_LARGE_FILE_BIT;
+        return;
+    }
+    uint8_t sb_buf[1024];
+    if (ext2_dev_read(fs, fs->st.lba_offset + 2, 2, sb_buf) < 0) return;
+    uint32_t ro;
+    memcpy(&ro, sb_buf + 0x64, 4);
+    ro |= EXT2_RO_COMPAT_LARGE_FILE_BIT;
+    memcpy(sb_buf + 0x64, &ro, 4);
+    if (ext2_dev_write(fs, fs->st.lba_offset + 2, 2, sb_buf) == 0)
+        fs->ro_compat |= EXT2_RO_COMPAT_LARGE_FILE_BIT;
+}
+
+/* The largest file the inode's mapping can address (Linux ext4_max_size and
+ * ext4_max_bitmap_size).  i_blocks is kept as a 32-bit count of 512-byte
+ * sectors (no huge_file high word is written), so allocation must stay
+ * below 2^32 sectors too: 2 TiB with 4 KiB blocks.  Extent-mapped files
+ * address 2^32 - 1 logical blocks; block-mapped ones 12 direct, one
+ * singly, one doubly and one triply indirect tree, whose own blocks also
+ * count in i_blocks. */
+static uint64_t ext2_max_file(ext2_fs_t *fs, const ext2_inode_t *ino) {
+    uint32_t shift = fs->st.block_shift;
+    uint64_t sect_blocks = 0xFFFFFFFFull >> (shift - 9);
+    uint64_t blocks;
+    if (x4_is_ext(ino)) {
+        blocks = 0xFFFFFFFFull;
+        if (blocks > sect_blocks) blocks = sect_blocks;
+    } else {
+        uint64_t p = fs->st.block_size / 4;
+        uint64_t meta = 1 + (1 + p) + (1 + p + p * p);
+        blocks = 12 + p + p * p + p * p * p;
+        if (blocks > sect_blocks - meta) blocks = sect_blocks - meta;
+    }
+    return blocks << shift;
+}
+
 static void x4_ext_get(const uint8_t *e, x4_ext_t *x) {
     uint32_t len = x4_rd16(e + 4);
     x->lblk = x4_rd32(e);
@@ -1830,10 +1898,71 @@ static uint32_t ext2_file_blk(ext2_fs_t *fs, ext2_inode_t *ino, uint32_t idx) {
     return 0;
 }
 
+/* The pointer block an inode slot (i_block[12..14]) names, allocated and
+ * zeroed when missing.  `tbl` is a block-sized scratch buffer.  0 on failure. */
+static uint32_t ext2_tbl_root(ext2_fs_t *fs, ext2_inode_t *ino, uint32_t *slot,
+                              uint32_t *tbl) {
+    if (*slot) return *slot;
+    uint32_t nb = ext2_alloc_block(fs);
+    if (!nb) return 0;
+    memset(tbl, 0, fs->st.block_size);
+    if (ext2_write_block(fs, nb, tbl) < 0) {
+        ext2_free_block(fs, nb);
+        return 0;
+    }
+    *slot = nb;
+    ino->i_blocks += fs->st.sectors_per_block;
+    return nb;
+}
+
+/* Entry `i` of pointer block `tblk`, allocated when missing: a zeroed
+ * pointer block when `table`, else a (zeroed) data block.  0 on failure. */
+static uint32_t ext2_tbl_entry(ext2_fs_t *fs, ext2_inode_t *ino, uint32_t tblk,
+                               uint32_t i, int table, uint32_t *tbl) {
+    if (ext2_read_block(fs, tblk, tbl) < 0) return 0;
+    if (tbl[i]) return tbl[i];
+    uint32_t nb = ext2_alloc_block(fs);           /* comes back zeroed */
+    if (!nb) return 0;
+    if (table) {
+        uint32_t *z = (uint32_t *)kmalloc(fs->st.block_size);
+        if (!z) { ext2_free_block(fs, nb); return 0; }
+        memset(z, 0, fs->st.block_size);
+        int w = ext2_write_block(fs, nb, z);
+        kfree(z);
+        if (w < 0) { ext2_free_block(fs, nb); return 0; }
+    }
+    tbl[i] = nb;
+    ino->i_blocks += fs->st.sectors_per_block;
+    if (ext2_write_block(fs, tblk, tbl) < 0) {
+        ext2_free_block(fs, nb);
+        if (ino->i_blocks >= fs->st.sectors_per_block)
+            ino->i_blocks -= fs->st.sectors_per_block;
+        return 0;
+    }
+    return nb;
+}
+
 static uint32_t ext2_file_blk_alloc(ext2_fs_t *fs, uint32_t ino_num, ext2_inode_t *ino,
                                     uint32_t idx) {
     if (x4_is_ext(ino)) return x4_ext_alloc(fs, ino_num, ino, idx);
     uint32_t ptrs_per_blk = fs->st.block_size / 4;
+    /* ── Triply indirect range (past ~4 GiB with 4 KiB blocks, ~64 MiB with
+     * 1 KiB ones): i_block[14] → doubly → singly → data. */
+    if (idx >= 12 + ptrs_per_blk + ptrs_per_blk * ptrs_per_blk) {
+        uint32_t per2 = ptrs_per_blk * ptrs_per_blk;
+        uint32_t t = idx - 12 - ptrs_per_blk - per2;
+        if (t / per2 >= ptrs_per_blk) return 0;
+        uint32_t *tbl = (uint32_t *)kmalloc(fs->st.block_size);
+        if (!tbl) return 0;
+        uint32_t root = ino->i_block[14];       /* packed: no pointer into it */
+        uint32_t blk = ext2_tbl_root(fs, ino, &root, tbl);
+        ino->i_block[14] = root;
+        if (blk) blk = ext2_tbl_entry(fs, ino, blk, t / per2, 1, tbl);
+        if (blk) blk = ext2_tbl_entry(fs, ino, blk, (t % per2) / ptrs_per_blk, 1, tbl);
+        if (blk) blk = ext2_tbl_entry(fs, ino, blk, t % ptrs_per_blk, 0, tbl);
+        kfree(tbl);
+        return blk;
+    }
     if (idx < 12) {
         if (!ino->i_block[idx]) {
             uint32_t blk = ext2_alloc_block(fs);
@@ -1854,7 +1983,7 @@ static uint32_t ext2_file_blk_alloc(ext2_fs_t *fs, uint32_t ino_num, ext2_inode_
         uint32_t *tbl;
 
         idx -= ptrs_per_blk;
-        if (idx >= ptrs_per_blk * ptrs_per_blk) return 0;  /* > ~256MB: no */
+        if (idx >= ptrs_per_blk * ptrs_per_blk) return 0;  /* triply: above */
         d_idx = idx / ptrs_per_blk;
         i_idx = idx % ptrs_per_blk;
 
@@ -1985,7 +2114,7 @@ static uint32_t ext2_file_blk_alloc(ext2_fs_t *fs, uint32_t ino_num, ext2_inode_
 
 /* ── VFS read_fn for ext2 file nodes ─────────────────────────────────────── */
 
-static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
+static uint32_t ext2_read_node(vfs_node_t *node, uint64_t offset,
                                 uint32_t size, uint8_t *buf) {
     if (!node->private) return 0;
     ext2_priv_t *priv = (ext2_priv_t *)node->private;
@@ -1997,16 +2126,18 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
     kprof_probe_end(KPP_E2_INODE, kp_i);
     if (inode_err) return 0;
 
-    if (offset >= inode.i_size) return 0;
-    if (size > inode.i_size - offset) size = inode.i_size - offset;
+    uint64_t isize = ext2_isize(&inode);
+    if (offset >= isize) return 0;
+    if (size > isize - offset) size = (uint32_t)(isize - offset);
 
     if (ext2_is_fast_symlink(fs, &inode)) {
-        if (inode.i_size > EXT2_FAST_LINK_MAX) return 0;
-        memcpy(buf, (const uint8_t *)inode.i_block + offset, size);
+        if (isize > EXT2_FAST_LINK_MAX) return 0;
+        memcpy(buf, (const uint8_t *)inode.i_block + (uint32_t)offset, size);
         return size;
     }
 
     uint32_t blk_size = fs->st.block_size;
+    uint32_t bshift = fs->st.block_shift;
     uint32_t done = 0;
     /* The bounce buffer is only needed for a partial block; a page fault, which
      * is nearly every read here, is whole-block aligned and never touches it.
@@ -2014,9 +2145,10 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
     uint8_t *blk_buf = (uint8_t *)0;
 
     while (done < size) {
-        uint32_t file_off   = offset + done;
-        uint32_t blk_idx    = file_off / blk_size;
-        uint32_t blk_off    = file_off % blk_size;
+        uint64_t file_off   = offset + done;
+        /* File block numbers are 32-bit (both mappings stop below 2^32). */
+        uint32_t blk_idx    = (uint32_t)(file_off >> bshift);
+        uint32_t blk_off    = (uint32_t)file_off & (blk_size - 1);
         uint32_t to_copy    = blk_size - blk_off;
         if (to_copy > size - done) to_copy = size - done;
 
@@ -2056,7 +2188,7 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
                  * blocks of the file while they are consecutive on disk and
                  * not cached, into fs->ra_buf, and they go to the cache only. */
                 uint32_t total = run;
-                uint32_t nblk = (inode.i_size + blk_size - 1) / blk_size;
+                uint64_t nblk = (isize + blk_size - 1) >> bshift;
                 if ((uintptr_t)(buf + done) >= KERNEL_VMA && fs->ra_buf &&
                     run < EXT2_READAHEAD) {
                     while (total < EXT2_READAHEAD && blk_idx + total < nblk &&
@@ -2148,7 +2280,7 @@ static uint32_t ext2_read_node(vfs_node_t *node, uint32_t offset,
 
 /* ── VFS write_fn for ext2 file nodes ────────────────────────────────────── */
 
-static uint32_t ext2_write_node_do(vfs_node_t *node, uint32_t offset,
+static uint32_t ext2_write_node_do(vfs_node_t *node, uint64_t offset,
                                  uint32_t size, const uint8_t *buf) {
     if (!node->private) return 0;
     ext2_priv_t *priv = (ext2_priv_t *)node->private;
@@ -2158,10 +2290,15 @@ static uint32_t ext2_write_node_do(vfs_node_t *node, uint32_t offset,
     if (ext2_read_inode(fs, priv->ino, &inode) < 0) return 0;
     if ((inode.i_mode & EXT2_S_IFMT) != EXT2_S_IFREG) return 0;
 
-    uint32_t end = offset + size;
-    if (end < offset) return 0;
+    /* Past the largest file the mapping can reach: -EFBIG, and a write
+     * straddling it is shortened (Linux generic_write_check_limits). */
+    uint64_t maxsz = ext2_max_file(fs, &inode);
+    if (offset >= maxsz) return size ? VFS_WRITE_EFBIG : 0;
+    if (size > maxsz - offset) size = (uint32_t)(maxsz - offset);
+    uint64_t isize = ext2_isize(&inode);
 
     uint32_t blk_size = fs->st.block_size;
+    uint32_t bshift = fs->st.block_shift;
     uint32_t done = 0;
     uint8_t *blk_buf = (uint8_t *)kmalloc(blk_size);
     /* Out of kernel memory, not out of disk: say so.  A plain 0 here means
@@ -2172,9 +2309,9 @@ static uint32_t ext2_write_node_do(vfs_node_t *node, uint32_t offset,
     if (!blk_buf) return VFS_WRITE_ENOMEM;
 
     while (done < size) {
-        uint32_t file_off = offset + done;
-        uint32_t blk_idx = file_off / blk_size;
-        uint32_t blk_off = file_off % blk_size;
+        uint64_t file_off = offset + done;
+        uint32_t blk_idx = (uint32_t)(file_off >> bshift);
+        uint32_t blk_off = (uint32_t)file_off & (blk_size - 1);
         uint32_t to_copy = blk_size - blk_off;
         if (to_copy > size - done) to_copy = size - done;
 
@@ -2191,9 +2328,10 @@ static uint32_t ext2_write_node_do(vfs_node_t *node, uint32_t offset,
         /* A large write commits in steps, each a complete shorter write:
          * the inode says what has been written so far, then the commit. */
         if (done < size && ext2_jnl_due(fs)) {
-            if (offset + done > inode.i_size) {
-                inode.i_size = offset + done;
-                node->size = inode.i_size;
+            if (offset + done > isize) {
+                isize = offset + done;
+                ext2_set_isize(fs, &inode, isize);
+                node->size = isize;
             }
             if (ext2_write_inode(fs, priv->ino, &inode) < 0) break;
             ext2_jnl_step(fs);
@@ -2201,9 +2339,10 @@ static uint32_t ext2_write_node_do(vfs_node_t *node, uint32_t offset,
     }
 
     kfree(blk_buf);
-    if (done && offset + done > inode.i_size) {
-        inode.i_size = offset + done;
-        node->size = inode.i_size;
+    if (done && offset + done > isize) {
+        isize = offset + done;
+        ext2_set_isize(fs, &inode, isize);
+        node->size = isize;
     }
     if (done) {
         inode.i_mtime = ext2_now();
@@ -2931,9 +3070,9 @@ static int ext2_free_subtree(ext2_fs_t *fs, uint32_t blk, int level, uint32_t ba
  * Release every block of `inode` from file-block index `from` onward, including
  * the indirect blocks that stop being needed.  from == 0 empties the file.
  *
- * The driver reads all three indirect levels (ext2_file_blk) and allocates two
- * of them (ext2_file_blk_alloc stops at doubly indirect, ~256 MiB with 1 KiB
- * blocks), but the free path used to stop after the singly-indirect chain.
+ * The driver reads and allocates all three indirect levels (ext2_file_blk,
+ * ext2_file_blk_alloc), but the free path used to stop after the
+ * singly-indirect chain.
  * Everything a file held beyond ~268 KiB was therefore lost on unlink: the
  * bitmap bits stayed set with nothing referencing them, so the space could
  * never be reused and only fsck could recover it.  Walk all three levels, so
@@ -3067,7 +3206,7 @@ static void ext2_release_orphan(ext2_fs_t *fs, uint32_t ino) {
     if (ext2_read_inode(fs, ino, &victim) == 0) {
         if ((victim.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR) ext2_count_dir(fs, ino, -1);
         ext2_free_inode_blocks(fs, ino, &victim);
-        victim.i_size = 0;
+        victim.i_size = victim.i_size_high = 0;
         victim.i_dtime = ext2_now();
         ext2_write_inode(fs, ino, &victim);
     }
@@ -3163,7 +3302,7 @@ typedef struct {
 /* Copy the on-disk state into `node` and install the operations that fit the
  * inode's type. */
 static void ext2_fill_node(vfs_node_t *node, const ext2_inode_t *inode) {
-    node->size  = inode->i_size;
+    node->size  = ext2_isize(inode);
     node->mask  = inode->i_mode & 0xFFF;
     node->uid   = inode->i_uid;
     node->gid   = inode->i_gid;
@@ -3324,7 +3463,7 @@ static int ext2_create_do(vfs_node_t *dir, const char *name, uint32_t flags) {
         inode.i_links_count = 2;
     } else {
         inode.i_mode = (flags == VFS_FLAG_SOCK ? EXT2_S_IFSOCK : EXT2_S_IFREG) | 0644;
-        inode.i_size = 0;
+        inode.i_size = inode.i_size_high = 0;
         inode.i_links_count = 1;
         inode.i_blocks = 0;
     }
@@ -3439,7 +3578,7 @@ static void ext2_put_unlinked(ext2_fs_t *fs, uint32_t ino, ext2_inode_t *victim,
         if ((victim->i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR) ext2_count_dir(fs, ino, -1);
         ext2_free_inode_blocks(fs, ino, victim);
         victim->i_dtime = now;
-        victim->i_size = 0;
+        victim->i_size = victim->i_size_high = 0;
         ext2_write_inode(fs, ino, victim);
         ext2_free_inode(fs, ino);
     }
@@ -3739,7 +3878,7 @@ static int ext2_link_do(vfs_node_t *dir, const char *name, vfs_node_t *target) {
     return 0;
 }
 
-static int ext2_truncate_do(vfs_node_t *node, uint32_t new_size) {
+static int ext2_truncate_do(vfs_node_t *node, uint64_t new_size) {
     if (!node || !node->private) return -1;
     ext2_priv_t *priv = (ext2_priv_t *)node->private;
     ext2_fs_t *fs = priv->fs;
@@ -3748,48 +3887,38 @@ static int ext2_truncate_do(vfs_node_t *node, uint32_t new_size) {
     if (ext2_read_inode(fs, priv->ino, &inode) < 0) return -1;
     if ((inode.i_mode & EXT2_S_IFMT) != EXT2_S_IFREG) return -1;
 
-    /* Rounded up without forming size + bs - 1, which wraps for sizes near
-     * 4 GiB: ftruncate(fd, -1) used to compute new_blocks = 0, free every
-     * block and leave i_size at 0xFFFFFFFF. */
-    uint32_t bs = fs->st.block_size;
-    uint32_t old_blocks = inode.i_size / bs + (inode.i_size % bs != 0);
-    uint32_t new_blocks = new_size / bs + (new_size % bs != 0);
-    /* The limit belongs to GROWING only, and it is what ext2_file_blk_alloc can
-     * actually reach (direct + singly + doubly indirect).  Applying it to every
-     * call also refused to SHRINK a file bigger than that - ftruncate() on a
-     * multi-megabyte file returned -1 instead of releasing the tail. */
-    uint32_t ppb = fs->st.block_size / 4;
-    uint32_t max_blocks = 12 + ppb + ppb * ppb;
-    if (!x4_is_ext(&inode) && new_blocks > old_blocks && new_blocks > max_blocks) return -1;
+    uint64_t isize = ext2_isize(&inode);
+    /* Growing is limited to what the mapping can reach (-EFBIG, Linux
+     * inode_newsize_ok); shrinking never is. */
+    if (new_size > isize && new_size > ext2_max_file(fs, &inode)) return -27;
 
-    /* Growing an extent-mapped file leaves a hole, as Linux does. */
-    if (new_blocks > old_blocks && !x4_is_ext(&inode)) {
-        uint32_t i;
-        for (i = old_blocks; i < new_blocks; i++) {
-            if (!ext2_file_blk_alloc(fs, priv->ino, &inode, i)) {
-                ext2_free_blocks_from(fs, priv->ino, &inode, old_blocks);   /* undo this call */
-                return -1;
-            }
-        }
-    } else if (new_blocks < old_blocks) {
-        /* Free the tail, including any indirect blocks it leaves empty.  This
-         * used to go through a per-index helper that silently did nothing
-         * beyond the singly-indirect range, so shrinking a large file leaked
-         * exactly like unlink did. */
+    /* Rounded up without forming size + bs - 1.  Block counts fit 32 bits
+     * below the largest file; a corrupt size past it is cut to it. */
+    uint32_t bs = fs->st.block_size, bshift = fs->st.block_shift;
+    uint64_t ob = (isize >> bshift) + ((isize & (bs - 1)) != 0);
+    uint32_t old_blocks = ob > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)ob;
+    uint32_t new_blocks = (uint32_t)((new_size >> bshift) + ((new_size & (bs - 1)) != 0));
+
+    /* Growing leaves a hole that reads as zeroes, for both mappings, as
+     * Linux does.  (Block-mapped files used to get every new block allocated
+     * and zeroed, which made a large ftruncate cost its full size.) */
+    if (new_blocks < old_blocks) {
+        /* Free the tail, including any indirect blocks it leaves empty. */
         ext2_free_blocks_from(fs, priv->ino, &inode, new_blocks);
     }
     /* The rest of a block cut in the middle reads as zeroes if the file
      * grows over it again (and holds nothing of the old contents). */
-    if (new_size < inode.i_size && (new_size % bs) && !ext2_is_fast_symlink(fs, &inode)) {
-        uint32_t blk = ext2_file_blk(fs, &inode, new_size / bs);
+    if (new_size < isize && (new_size & (bs - 1)) && !ext2_is_fast_symlink(fs, &inode)) {
+        uint32_t blk = ext2_file_blk(fs, &inode, (uint32_t)(new_size >> bshift));
         uint8_t *tb = blk ? (uint8_t *)kmalloc(bs) : (uint8_t *)0;
+        uint32_t cut = (uint32_t)new_size & (bs - 1);
         if (tb && ext2_read_block(fs, blk, tb) == 0) {
-            memset(tb + new_size % bs, 0, bs - new_size % bs);
+            memset(tb + cut, 0, bs - cut);
             ext2_write_data(fs, blk, tb);
         }
         if (tb) kfree(tb);
     }
-    inode.i_size = new_size;
+    ext2_set_isize(fs, &inode, new_size);
     inode.i_mtime = ext2_now();
     inode.i_ctime = inode.i_mtime;
     node->size = new_size;
@@ -4698,7 +4827,7 @@ static int ext2_link(vfs_node_t *dir, const char *name, vfs_node_t *target) {
     return r;
 }
 
-static int ext2_truncate(vfs_node_t *node, uint32_t new_size) {
+static int ext2_truncate(vfs_node_t *node, uint64_t new_size) {
     ext2_fs_t *fs = (node && node->private) ? ((ext2_priv_t *)node->private)->fs
                                         : (ext2_fs_t *)0;
     if (fs) ext2_lock(fs);
@@ -4710,7 +4839,7 @@ static int ext2_truncate(vfs_node_t *node, uint32_t new_size) {
     return r;
 }
 
-static uint32_t ext2_write_node(vfs_node_t *node, uint32_t offset,
+static uint32_t ext2_write_node(vfs_node_t *node, uint64_t offset,
                                 uint32_t size, const uint8_t *buf) {
     ext2_fs_t *fs = (node && node->private) ? ((ext2_priv_t *)node->private)->fs
                                              : (ext2_fs_t *)0;
@@ -4725,7 +4854,7 @@ static uint32_t ext2_write_node(vfs_node_t *node, uint32_t offset,
         fs->want_reclaim = 0;
         ext2_sync_fs(fs);
         uint32_t r2 = ext2_write_node_do(node, offset + r, size - r, buf + r);
-        if (r2 != VFS_WRITE_ENOMEM) r += r2;
+        if (r2 != VFS_WRITE_ENOMEM && r2 != VFS_WRITE_EFBIG) r += r2;
     }
     if (fs) {
         if (fs->crash_test == 1 && r) fs->crash_test = 2;
@@ -4991,6 +5120,7 @@ static int ext2_load_super(ext2_fs_t *fs, const uint8_t *sb_buf, uint32_t lba_of
 
     fs->st.lba_offset      = lba_offset;
     fs->st.block_size      = 1024U << sb->s_log_block_size;
+    fs->st.block_shift     = 10U + sb->s_log_block_size;
     fs->st.sectors_per_block = fs->st.block_size / 512;
     fs->st.inodes_per_group  = sb->s_inodes_per_group;
     fs->st.blocks_per_group  = sb->s_blocks_per_group;

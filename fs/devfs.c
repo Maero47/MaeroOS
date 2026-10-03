@@ -23,7 +23,7 @@
 
 /* ── /dev/null ─────────────────────────────────────────────────────────────── */
 
-static uint32_t null_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+static uint32_t null_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf) {
     (void)n; (void)off; (void)len; (void)buf;
     return 0;   /* EOF immediately */
 }
@@ -33,7 +33,7 @@ static int always_ready(vfs_node_t *n) {
     return 1;
 }
 
-static uint32_t null_write(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t null_write(vfs_node_t *n, uint64_t off, uint32_t len,
                             const uint8_t *buf) {
     (void)n; (void)off; (void)buf;
     return len; /* discard, pretend all bytes consumed */
@@ -42,17 +42,17 @@ static uint32_t null_write(vfs_node_t *n, uint32_t off, uint32_t len,
 /* ── /dev/zero ─────────────────────────────────────────────────────────────── */
 
 /* /dev/initrd: the boot module the root filesystem was unpacked from. */
-static uint32_t initrd_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+static uint32_t initrd_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf) {
     (void)n;
     uint32_t size;
     const uint8_t *img = initrd_image(&size);
     if (!img || off >= size) return 0;
-    if (len > size - off) len = size - off;
-    memcpy(buf, img + off, len);
+    if (len > size - off) len = (uint32_t)(size - off);
+    memcpy(buf, img + (uint32_t)off, len);
     return len;
 }
 
-static uint32_t zero_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+static uint32_t zero_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf) {
     (void)n; (void)off;
     for (uint32_t i = 0; i < len; i++) buf[i] = 0;
     return len;
@@ -243,7 +243,7 @@ static void console_isig(int sig) {
         signal_send_group(current_proc, sig);
 }
 
-static uint32_t tty_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+static uint32_t tty_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf) {
     (void)n; (void)off;
     vfs_node_t *ctty = proc_ctty_node();
     if (ctty && ctty->read_fn)
@@ -310,7 +310,7 @@ static uint32_t tty_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf
     return i;
 }
 
-static uint32_t tty_write(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t tty_write(vfs_node_t *n, uint64_t off, uint32_t len,
                            const uint8_t *buf) {
     (void)n; (void)off;
     vfs_node_t *ctty = proc_ctty_node();
@@ -440,7 +440,7 @@ static int tty_ioctl(vfs_node_t *n, uint32_t req, void *arg) {
 
 /* ── /dev/dsp — AC97 or HDA PCM out (48kHz S16LE stereo), blocking writes ── */
 
-static uint32_t dsp_write(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t dsp_write(vfs_node_t *n, uint64_t off, uint32_t len,
                           const uint8_t *buf) {
     (void)n;
     (void)off;
@@ -467,7 +467,7 @@ static int dsp_ioctl(vfs_node_t *n, uint32_t req, void *arg) {
     return -25;
 }
 
-static uint32_t dsp_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t dsp_read(vfs_node_t *n, uint64_t off, uint32_t len,
                          uint8_t *buf) {
     (void)n; (void)off; (void)len; (void)buf;
     return 0;   /* no capture */
@@ -477,7 +477,7 @@ static vfs_node_t dev_dsp;
 
 /* ── /dev/urandom — kernel best-effort pseudo-random bytes ────────────────── */
 
-static uint32_t urandom_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+static uint32_t urandom_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf) {
     (void)n; (void)off;
     random_get_bytes(buf, len);
     return len;
@@ -706,13 +706,13 @@ static uint32_t pty_slave_write_output(pty_pair_t *p,
     return len;
 }
 
-static uint32_t pty_master_read(vfs_node_t *n, uint32_t off,
+static uint32_t pty_master_read(vfs_node_t *n, uint64_t off,
                                 uint32_t len, uint8_t *buf) {
     (void)off;
     return pty_buf_read((pty_pair_t *)n->private, 1, len, buf);
 }
 
-static uint32_t pty_master_write(vfs_node_t *n, uint32_t off,
+static uint32_t pty_master_write(vfs_node_t *n, uint64_t off,
                                  uint32_t len, const uint8_t *buf) {
     (void)off;
     return pty_master_write_input((pty_pair_t *)n->private, len, buf);
@@ -758,7 +758,7 @@ static int pty_bg_check(int sig) {
     return -4;                                    /* restarted after SIGCONT */
 }
 
-static uint32_t pty_slave_read(vfs_node_t *n, uint32_t off,
+static uint32_t pty_slave_read(vfs_node_t *n, uint64_t off,
                                uint32_t len, uint8_t *buf) {
     (void)off;
     pty_pair_t *p = (pty_pair_t *)n->private;
@@ -769,7 +769,7 @@ static uint32_t pty_slave_read(vfs_node_t *n, uint32_t off,
     return pty_buf_read(p, 0, len, buf);
 }
 
-static uint32_t pty_slave_write(vfs_node_t *n, uint32_t off,
+static uint32_t pty_slave_write(vfs_node_t *n, uint64_t off,
                                 uint32_t len, const uint8_t *buf) {
     (void)off;
     pty_pair_t *p = (pty_pair_t *)n->private;
@@ -1135,15 +1135,17 @@ static int ptsdir_readdir(vfs_node_t *node, uint32_t idx, vfs_dirent_t *out) {
     return -1;
 }
 
-static uint32_t fb0_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+static uint32_t fb0_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf) {
     (void)n;
-    return framebuffer_read(off, len, buf);
+    if (off > 0xFFFFFFFFu) return 0;
+    return framebuffer_read((uint32_t)off, len, buf);
 }
 
-static uint32_t fb0_write(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t fb0_write(vfs_node_t *n, uint64_t off, uint32_t len,
                           const uint8_t *buf) {
     (void)n;
-    return framebuffer_write(off, len, buf);
+    if (off > 0xFFFFFFFFu) return 0;
+    return framebuffer_write((uint32_t)off, len, buf);
 }
 
 static int fb0_ioctl(vfs_node_t *n, uint32_t req, void *arg) {
@@ -1177,13 +1179,13 @@ static int mouse_ready(vfs_node_t *n) {
     return mouse_has_events();
 }
 
-static uint32_t input_event_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t input_event_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                  uint8_t *buf) {
     (void)n; (void)off;
     return keyboard_read_events(len, buf);
 }
 
-static uint32_t input_mouse_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t input_mouse_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                  uint8_t *buf) {
     (void)n; (void)off;
     return mouse_read_events(len, buf);
@@ -1233,7 +1235,11 @@ vfs_node_t *devfs_mount(void) {
     dev_initrd.rdev    = (1u << 8) | 250u;
     dev_initrd.read_fn = initrd_read;
     dev_initrd.read_ready_fn = always_ready;
-    initrd_image(&dev_initrd.size);
+    {
+        uint32_t isz = 0;
+        initrd_image(&isz);
+        dev_initrd.size = isz;
+    }
 
     /* /dev/zero */
     memset(&dev_zero, 0, sizeof(dev_zero));

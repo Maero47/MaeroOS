@@ -804,8 +804,14 @@ static uint32_t ino_of(uint64_t key) {
     return key ? (uint32_t)(key / 32) + 2 : 1;
 }
 
-static uint32_t vsize(const xf_vnode_t *vn) {
-    return vn->size > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)vn->size;
+static uint64_t vsize(const xf_vnode_t *vn) {
+    return vn->size;
+}
+
+/* The largest file whose cluster count fits the 32-bit cluster numbers
+ * (anything near it runs out of clusters first: -ENOSPC). */
+static uint64_t xf_max_file(const exfat_fs_t *fs) {
+    return (uint64_t)0xFFFFFFFFu << fs->cshift;
 }
 
 static void node_from_set(xf_vnode_t *vn, const uint8_t *set) {
@@ -1205,7 +1211,7 @@ static int file_zero(exfat_fs_t *fs, xf_vnode_t *vn, uint64_t from, uint64_t to)
     return 0;
 }
 
-static uint32_t xf_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+static uint32_t xf_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf) {
     xf_vnode_t *vn = (xf_vnode_t *)n;
     exfat_fs_t *fs = vn->fs;
     fs_lock(fs);
@@ -1224,12 +1230,13 @@ static uint32_t xf_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf)
     return got;
 }
 
-static uint32_t xf_write(vfs_node_t *n, uint32_t off, uint32_t len, const uint8_t *buf) {
+static uint32_t xf_write(vfs_node_t *n, uint64_t off, uint32_t len, const uint8_t *buf) {
     xf_vnode_t *vn = (xf_vnode_t *)n;
     exfat_fs_t *fs = vn->fs;
     if (len == 0) return 0;
-    if (off == 0xFFFFFFFFu) return VFS_WRITE_EFBIG;
-    if (len > 0xFFFFFFFFu - off) len = 0xFFFFFFFFu - off;
+    uint64_t max = xf_max_file(fs);
+    if (off >= max) return VFS_WRITE_EFBIG;
+    if (len > max - off) len = (uint32_t)(max - off);
     fs_lock(fs);
     int r = 0;
     uint64_t end = (uint64_t)off + len;
@@ -1257,10 +1264,11 @@ static uint32_t xf_write(vfs_node_t *n, uint32_t off, uint32_t len, const uint8_
     return r < 0 ? (uint32_t)r : len;
 }
 
-static int xf_truncate(vfs_node_t *n, uint32_t size) {
+static int xf_truncate(vfs_node_t *n, uint64_t size) {
     xf_vnode_t *vn = (xf_vnode_t *)n;
     exfat_fs_t *fs = vn->fs;
     if (vn->is_dir) return E_ISDIR;
+    if (size > xf_max_file(fs)) return -27;            /* -EFBIG */
     fs_lock(fs);
     int r = 0;
     if (fs->ro) r = E_ROFS;

@@ -102,13 +102,13 @@ int blkpart_rw(blkpart_t *bp, uint64_t off, uint8_t *buf, uint32_t len, int writ
 
 /* ── /dev node: raw access (root only: mode 0660, root:root) ─────────────── */
 
-static uint32_t blkpart_node_read(vfs_node_t *node, uint32_t off, uint32_t len,
+static uint32_t blkpart_node_read(vfs_node_t *node, uint64_t off, uint32_t len,
                                   uint8_t *buf) {
-    int r = blkpart_rw((blkpart_t *)node->private, off, buf, len, 0);
-    return r < 0 ? 0 : (uint32_t)r;
+    /* A negative errno passes through (vfs_read_user returns it). */
+    return (uint32_t)blkpart_rw((blkpart_t *)node->private, off, buf, len, 0);
 }
 
-static uint32_t blkpart_node_write(vfs_node_t *node, uint32_t off, uint32_t len,
+static uint32_t blkpart_node_write(vfs_node_t *node, uint64_t off, uint32_t len,
                                    const uint8_t *buf) {
     return (uint32_t)blkpart_rw((blkpart_t *)node->private, off, (uint8_t *)buf,
                                 len, 1);
@@ -163,7 +163,7 @@ static blkpart_t *blkpart_add(int dev, int partno, uint32_t start, uint32_t nsec
     bp->node.flags   = VFS_FLAG_BLKDEV;
     bp->node.inode   = 0x30000000u + bp->rdev;
     bp->node.mask    = 0660;
-    bp->node.size    = nsect >= 0x800000u ? 0xFFFFFFFFu : nsect * 512u;
+    bp->node.size    = (uint64_t)nsect * 512u;
     bp->node.rdev    = bp->rdev;
     bp->node.read_fn = blkpart_node_read;
     bp->node.write_fn = blkpart_node_write;

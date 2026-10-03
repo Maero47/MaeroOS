@@ -16,7 +16,7 @@ on a qemu-xhci usb-storage device (sdd).  In the guest, with busybox:
     directory with contents, over an existing file, case only), unlink,
     rm -r, rmdir; a directory that grows past its cluster
   * statfs, a file unlinked while open, umount + mount, ro / remount,rw, EBUSY
-  * the 5 GiB file: its first 4 GiB - 1 bytes read and written at the right
+  * the 5 GiB file: its exact size, markers on both sides of 4 GiB read and written at the right
     places (64-bit cluster arithmetic), its length kept
   * the stick and the big volume are left mounted: `poweroff` must flush them
     and clear VolumeDirty
@@ -338,15 +338,19 @@ def big_session(g, man):
     check(f and f[1] == 128 * 1024 and f[2] > 500000,
           f"statfs: 128 KiB clusters, {f[2] if f else '?'} clusters on the 64 GiB volume")
     rc, out = g.sh("busybox stat -c %s /big/huge.bin")
-    check(out.strip().endswith("4294967295"),
-          f"the 5 GiB file shows its first 4 GiB - 1 bytes through the 32-bit VFS ({out.strip()!r})")
-    # Markers at 0 and 4 GiB - 8 KiB (block 1048574 of 4096 bytes).
+    check(out.strip().endswith(str(b["huge"])),
+          f"the 5 GiB file shows its exact 64-bit size ({out.strip()!r})")
+    # Markers at 0, 4 GiB - 8 KiB (block 1048574 of 4096 bytes), 4.5 GiB
+    # (block 1179648) and the last 123 bytes.
     rc, out = g.sh("busybox dd if=/big/huge.bin bs=4096 count=1 2>/dev/null | busybox md5sum; "
-                   "busybox dd if=/big/huge.bin bs=4096 skip=1048574 count=1 2>/dev/null | busybox md5sum",
+                   "busybox dd if=/big/huge.bin bs=4096 skip=1048574 count=1 2>/dev/null | busybox md5sum; "
+                   "busybox dd if=/big/huge.bin bs=4096 skip=1179648 count=1 2>/dev/null | busybox md5sum; "
+                   "busybox tail -c 123 /big/huge.bin | busybox md5sum",
                    timeout=180.0)
     sums = re.findall(r"([0-9a-f]{32})", out)
-    check(sums == [b["marks"]["0"], b["marks"][str(4 * GiB - 8192)]],
-          f"markers at 0 and 4 GiB - 8 KiB read back ({sums})")
+    check(sums == [b["marks"]["0"], b["marks"][str(4 * GiB - 8192)],
+                   b["marks"][str(4 * GiB + GiB // 2)], b["marks"][str(b["huge"] - 123)]],
+          f"markers at 0, 4 GiB - 8 KiB, 4.5 GiB and the end read back ({sums})")
     rc, out = g.sh("busybox dd if=/dev/urandom of=/tmp/mark bs=4096 count=1 2>/dev/null && "
                    "busybox dd if=/tmp/mark of=/big/huge.bin bs=4096 seek=1048574 conv=notrunc "
                    "2>/dev/null && busybox md5sum /tmp/mark", timeout=180.0)
