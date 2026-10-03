@@ -52,6 +52,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | TCP/IP over lwIP and RTL8139 | `MAEROS_HTTP_OK` fetched from a host HTTP server; `sockprobe` checks that `send` after `shutdown(SHUT_WR)` fails with `EPIPE`, a two-step shutdown ends in a FIN and no RST, closing TIME_WAIT sockets keeps TCP working, and a non-blocking client gets `EINPROGRESS`, `SO_ERROR`, `EAGAIN`, `ECONNREFUSED` and both socket names; `abi2probe net` checks `MSG_NOSIGNAL` and `EPIPE` after a reset | `make smoke-net` |
 | Loopback and IPv6 | SLAAC on eth0 (QEMU user-net `fec0::/64`) in `/proc/net/if_inet6`. A guest TCP server on `127.0.0.1` and `[::1]` is reached by a guest client, an `AF_INET6` listener on `[::]` accepts an IPv4 client as `::ffff:127.0.0.1`, an `IPV6_V6ONLY` one refuses it, UDP runs over `::1`, and ICMP echo to `127.0.0.1` and `::1` works over ping sockets. `toybox wget` fetches from a host server at `http://[fec0::2]:port/`, `getaddrinfo` of a dual-stack name returns A and AAAA in RFC 6724 order, and an any-address firewall rule blocks an IPv6 connect | `make smoke-net6` |
 | Intel e1000, DHCP DNS, name resolution | the same suite on an e1000; the DHCP lease's DNS server is in `/etc/resolv.conf`; against a DNS responder in the harness, `getent` resolves A, AAAA, a CNAME, a PTR and an NXDOMAIN, `/etc/hosts` wins over DNS, and `httpget`, `toybox wget` and `toybox nc` connect by name | `make smoke-net-e1000` |
+| virtio-net | QEMU `virtio-net-pci` booted three times: MSI-X, INTx (`vectors=0`) and the legacy interface (`disable-modern=on`); DHCP and `/etc/resolv.conf`, DNS lookups and `wget`/`httpget`/`nc` by name, a 1 MiB `wget` checked by md5, guest TCP and UDP servers reached through `hostfwd`, SLAAC and `wget` over IPv6, `ping` to `127.0.0.1` and `::1`, eth0 as ifindex 2; QEMU's `query-rx-filter` shows all-multicast and no promiscuous mode, `set_link` off/on reaches the guest as configuration interrupts; 50 MiB each way over TCP with the rate printed | `make smoke-net-virtio` |
 | AF_INET server sockets | through QEMU `hostfwd`: `toybox nc -l -p 8080` exchanges a line each way with a host client; `srvprobe tcp` checks non-blocking `accept` (`EAGAIN`), `SO_RCVTIMEO` on `accept`, `poll` and `epoll` on a listener, three host clients queued in the backlog at once and taken with `accept4(SOCK_NONBLOCK\|SOCK_CLOEXEC)`, both socket names of an accepted connection, `EADDRINUSE` and then a `SO_REUSEADDR` rebind over TIME_WAIT, and `shutdown` of a listener; `srvprobe udp` checks a blocking `recvfrom` that `SO_RCVTIMEO` ends with `EAGAIN` and one that waits for the host's datagram | `make smoke-tcpsrv` |
 | Kernel firewall | after `fwctl enable` plus a drop rule the same fetch fails, `fwctl list` reports the firewall `enabled` with the `drop out tcp` rule, malformed rules (`/33`, an overflowing prefix, port 70000, `tcpp`) are rejected under `policy out drop`, and `fwctl flush` restores the fetch | `make smoke-fw` |
 | Dynamic linker | `DYNPROBE_OK` from a PIE loaded through musl `ld.so`; `WXPIE_OK` (the PIE's text and RELRO, libc's text and a `PROT_READ\|PROT_EXEC` library mapping are read-only) | `make smoke-dyn` |
@@ -114,7 +115,7 @@ What is proven by the automated QEMU tests in `tools/`:
 - **Hardware coverage is what QEMU emulates.** Every driver is tested against QEMU's
   device models only (the Realtek r8169 driver, which QEMU cannot emulate, is
   tested on the host against a simulated chip: `docs/r8169.md`). There is no
-  Wi-Fi, no virtio device, no GPU
+  Wi-Fi, no virtio device other than virtio-net (`docs/virtio.md`), no GPU
   acceleration (the desktop draws into the boot framebuffer), no ACPI sleep states
   (only S5 power-off), and USB 3 hubs are untested (QEMU has none).
 - **ext4 writes cover what `mkfs.ext4` makes, not every feature.** The ext2 driver
@@ -295,8 +296,9 @@ nodes, `stdin`/`stdout`/`stderr`), and `fs/procfs.c` at `/proc` (per-pid `status
 ### Networking
 
 lwIP 2.2.1 is vendored at `third_party/lwip` and driven by `net/lwip_glue.c` over the
-RTL8139 (`drivers/rtl8139.c`) or Intel e1000 (`drivers/e1000.c`) driver, whichever is
-found first. DHCP runs at boot, and the lease's DNS servers are written to
+RTL8139 (`drivers/rtl8139.c`), Intel e1000 (`drivers/e1000.c`), Realtek r8169
+(`drivers/r8169.c`) or virtio-net (`drivers/virtio/`, [docs/virtio.md](docs/virtio.md))
+driver, whichever is found first. DHCP runs at boot, and the lease's DNS servers are written to
 `/etc/resolv.conf` when `/etc` is writable (a disk is attached); `net/socket.c` implements the
 BSD socket calls both through `socketcall` (102) and the direct i386 numbers 359 to 373;
 `net/firewall.c` is a rule-based packet filter configured by `fwctl` and readable at
@@ -319,7 +321,9 @@ and the firewall cover IPv6, and `getaddrinfo` orders its results by RFC 6724
 ATA with bus-master DMA reads and PIO writes (`ata.c`), SATA AHCI with DMA reads and writes on every
 controller and port (`ahci.c`), NVMe with one polled I/O queue pair per controller and every 512-byte
 namespace as a disk (`nvme.c`; `/disk` mounts from the IDE master if there is one, else the first AHCI
-disk, else the first NVMe namespace, via `blkdev.c`), PCI enumeration (`pci.c`), RTL8139 (`rtl8139.c`), Intel 8254x e1000 (`e1000.c`), Intel 82801AA AC'97
+disk, else the first NVMe namespace, via `blkdev.c`), PCI enumeration (`pci.c`), RTL8139 (`rtl8139.c`), Intel 8254x e1000 (`e1000.c`), virtio-net on a
+generic virtio PCI transport, modern with a legacy fallback, MSI-X or INTx (`virtio/`,
+[docs/virtio.md](docs/virtio.md)), Intel 82801AA AC'97
 audio (`ac97.c`), Intel High Definition Audio (`hda.c`: CORB/RIRB, codec widget walk, cyclic BDL
 playback; `/dev/dsp` uses whichever of the two is present, and so does the ALSA
 playback ABI in `alsa.c`, see [docs/audio.md](docs/audio.md)), Multiboot VBE framebuffer (`framebuffer.c`), VGA text (`vga.c`), PS/2
@@ -616,7 +620,7 @@ the guest from the Finder desktop bounds and uses the `cocoa` display with `core
 make                # build kernel.elf
 make initrd         # build userspace + toybox, pack testfiles/ into initrd.tar
 make run            # QEMU -kernel boot, serial on stdio, 512 MiB
-make run-net        # -kernel boot with an RTL8139 on QEMU user networking (NIC=e1000 for an e1000)
+make run-net        # -kernel boot with an RTL8139 on QEMU user networking (NIC=e1000, NIC=virtio-net-pci)
 make run-disk       # -kernel boot with the ext2 disk.img attached
 make iso            # GRUB ISO (maeros.iso)
 make limine-iso     # hybrid BIOS + UEFI ISO via Limine/Multiboot 2 (maeros-limine.iso)
@@ -678,6 +682,7 @@ make smoke-ext2rw   # two more ext2/ext3 mounted read-write at once, then host e
 make smoke-ext4rw   # mkfs.ext4 images read-write (extents, csums, jbd2), then host e2fsck/debugfs
 make smoke-net      # DHCP, TCP, HTTP GET from the host
 make smoke-net-e1000  # the same on an e1000, plus resolv.conf from DHCP and DNS lookups
+make smoke-net-virtio # virtio-net with MSI-X, INTx and legacy: DHCP, DNS, hostfwd, IPv6, 50 MiB each way
 make smoke-tcpsrv   # listen/accept and blocking UDP, from the host through hostfwd
 make smoke-net6     # lo and IPv6: SLAAC, TCP/UDP over 127.0.0.1 and [::1], ping, wget over v6
 make smoke-pkg      # pkg against a host repo: signed index, install, rollback
@@ -775,7 +780,7 @@ there: QEMU, started without `-no-shutdown`, must exit through ACPI S5.
 ### Continuous integration
 
 `make check` runs the suites that need nothing beyond a fresh clone: `smoke`,
-`smoke-cmds`, `smoke-toybox`, `smoke-disk`, `smoke-net`, `smoke-net-e1000`, `smoke-tcpsrv`, `smoke-fw`,
+`smoke-cmds`, `smoke-toybox`, `smoke-disk`, `smoke-net`, `smoke-net-e1000`, `smoke-net-virtio`, `smoke-tcpsrv`, `smoke-fw`,
 `smoke-dyn`, `smoke-dynlib`, `smoke-x`, `smoke-pkg` (which first builds `repo/` and, on a
 host without one, a repo signing key), `smoke-gui` (which needs the ISO, so `check`
 builds it), `smoke-ext4`, `smoke-ext2rw`, `smoke-ext4rw`, `smoke-vfat` (needs `mkfs.fat`, `fsck.fat` and mtools on
@@ -844,7 +849,7 @@ A wedged boot prints nothing, so three things exist to make one visible.
 | Path | Contents |
 |---|---|
 | `arch/i686/` | boot and AP trampoline assembly, GDT/IDT/TSS/PIC/PIT, LAPIC, SMP, BKL, paging |
-| `drivers/` | ATA, AHCI, NVMe, block-device table and partitions, PCI, RTL8139, e1000, AC'97, HDA, ALSA, USB (xHCI, HID, mass storage), framebuffer, VGA, keyboard, mouse, RTC, serial, ACPI (uACPI glue) |
+| `drivers/` | ATA, AHCI, NVMe, block-device table and partitions, PCI, RTL8139, e1000, r8169, virtio (PCI transport, virtqueues, virtio-net), AC'97, HDA, ALSA, USB (xHCI, HID, mass storage), framebuffer, VGA, keyboard, mouse, RTC, serial, ACPI (uACPI glue) |
 | `fs/` | VFS and mounts, ustar initrd, ext2, read-only ext4, vfat, tmpfs, devfs, procfs |
 | `include/kernel/` | `config.h`, `types.h`, `multiboot.h`, `assert.h` |
 | `kernel/` | `main.c`, `printk`, ring-buffer `klog`, `panic`, RNG, stack protector |

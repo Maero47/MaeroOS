@@ -274,10 +274,12 @@ int virtio_pci_probe(struct virtio_pci *vp, const pci_device_t *d, const char *t
                tag, (unsigned)d->vendor_id, (unsigned)d->device_id);
         return -1;
     }
-    /* Register decode and bus mastering on (the queues are DMA). */
+    /* Memory decode (the modern structures, the MSI-X table), I/O decode
+     * for a legacy device's registers, and bus mastering (the queues are
+     * DMA). */
     uint32_t cmd = cfg32(d, 0x04);
     pci_write_config32(d->bus, d->slot, d->func, 0x04,
-                       (cmd & 0xFFFFU) | 0x4U | (vp->legacy ? 0x1U : 0x2U));
+                       (cmd & 0xFFFFU) | 0x6U | (vp->legacy ? 0x1U : 0x0U));
     if (reset(vp) < 0) {
         printk("[%s] device did not reset\n", tag);
         return -1;
