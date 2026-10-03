@@ -514,11 +514,13 @@ int virtio_gpu_init(void) {
            is_vga ? " (virtio-vga)" : "", (unsigned)QSIZE,
            (unsigned)pw, (unsigned)ph);
 
-    /* Start in the boot loader's mode (the desktop sized for it), else the
-     * display's own, else 1024x768. */
+    /* Start in the display's own size (QEMU: the -device's xres/yres,
+     * 1280x800 by default, or the window's); the boot loader's mode was for
+     * the VGA side (often 640x480: the virtio VGA BIOS has few VBE modes)
+     * and is only the fallback, then 1024x768. */
     int rc = -1;
-    if (have_boot) rc = framebuffer_set_mode(boot.xres, boot.yres);
-    if (rc != 0 && have_pref) rc = framebuffer_set_mode(pw, ph);
+    if (have_pref) rc = framebuffer_set_mode(pw, ph);
+    if (rc != 0 && have_boot) rc = framebuffer_set_mode(boot.xres, boot.yres);
     if (rc != 0) rc = framebuffer_set_mode(1024, 768);
     if (rc != 0) printk("[VGPU] cannot set a mode\n");
     else vg_flush(0, 0, cur_w, cur_h);

@@ -145,6 +145,12 @@ typedef struct {
 
 static unsigned fb_w, fb_h, fb_pitch;
 static int fb_fd = -1;
+/* The display needs its changes flushed (virtio-gpu): present() collects the
+ * rectangles it wrote and hands them to the kernel (FBIO_MAEROS_FLUSH). */
+static int fb_needs_flush;
+static struct fb_flush fb_fl;
+static unsigned st_flushes, st_flush_rects;   /* FBIO_MAEROS_FLUSH calls */
+static unsigned long long st_flush_px;        /* pixels in their rectangles */
 /*
  * Double buffering: all drawing targets `row`, which points either into the
  * full-screen `backbuf` (one scanline at a time) or, if the back buffer could
@@ -342,6 +348,13 @@ static void copy_text(char *dst, unsigned size, const char *src);
 static void focus_client_app(int idx);
 static void load_desktop_conf(void);
 static void load_wallpaper(void);
+/* Display mode switching (see set_display_mode). */
+#define MODE_CONFIRM_S 15
+static unsigned mode_prev_w, mode_prev_h;   /* to go back to */
+static int      mode_pending;               /* waiting for modekeep */
+static long     mode_deadline;              /* monotonic seconds */
+static void request_display_mode(const char *arg);
+static void revert_display_mode(const char *why);
 /* Wall-clock time in the configured zone (desktop.conf tz=). */
 static int local_timeofday(struct timeval *tv) {
     if (gettimeofday(tv, 0) != 0) return -1;
@@ -2228,10 +2241,12 @@ static int gfx_stats;   /* /disk/gfxstats exists: trace the counters */
 static unsigned long long st_present_bytes, st_render_us;
 
 static void trace_stats(void) {
-    trace("stats frames=%u rows=%u commits=%u present_kb=%u render_ms=%u fast_rows=%u",
+    trace("stats frames=%u rows=%u commits=%u present_kb=%u render_ms=%u fast_rows=%u "
+          "flushes=%u flush_rects=%u flush_kpx=%u",
           st_frames, st_rows, st_commits,
           (unsigned)(st_present_bytes / 1024), (unsigned)(st_render_us / 1000),
-          st_fast_rows);
+          st_fast_rows, st_flushes, st_flush_rects,
+          (unsigned)(st_flush_px / 1024));
 }
 
 /* commit SLOT [X Y W H] — the client's surface changed (in that rectangle of
@@ -2298,6 +2313,20 @@ static void handle_wmctl_line(char *line) {
     arg = command_arg(line, "log");
     if (arg) {
         add_log(arg);
+        return;
+    }
+    arg = command_arg(line, "setmode");      /* setmode <w> <h> (Settings) */
+    if (arg) {
+        request_display_mode(arg);
+        return;
+    }
+    if (!strcmp(line, "modekeep")) {
+        if (mode_pending) trace("mode kept %ux%u", fb_w, fb_h);
+        mode_pending = 0;
+        return;
+    }
+    if (!strcmp(line, "moderevert")) {
+        revert_display_mode("asked");
         return;
     }
     arg = command_arg(line, "launch");
@@ -5097,7 +5126,46 @@ static void blank_framebuffer(void) {
 /* Write columns [x0, x1) of scanlines [y0, y0 + rows) from the back buffer to
  * the screen.  Full-width runs on a packed framebuffer are one write; anything
  * narrower is one pwrite per scanline of just that span. */
+/* Add a written rectangle to the pending flush.  Rows written one at a time
+ * with the same span merge into one rectangle; past FB_FLUSH_MAX the last
+ * rectangle grows to cover the rest. */
+static void flush_add(unsigned x0, unsigned y0, unsigned x1, unsigned y1) {
+    struct fb_rect *r;
+
+    if (!fb_needs_flush || x0 >= x1 || y0 >= y1) return;
+    if (fb_fl.count) {
+        r = &fb_fl.rects[fb_fl.count - 1];
+        if (r->x == x0 && r->w == x1 - x0 && r->y + r->h == y0) {
+            r->h = y1 - r->y;
+            return;
+        }
+        if (fb_fl.count == FB_FLUSH_MAX) {
+            unsigned rx1 = r->x + r->w, ry1 = r->y + r->h;
+            if (x0 < r->x) r->x = x0;
+            if (y0 < r->y) r->y = y0;
+            if (x1 > rx1) rx1 = x1;
+            if (y1 > ry1) ry1 = y1;
+            r->w = rx1 - r->x;
+            r->h = ry1 - r->y;
+            return;
+        }
+    }
+    r = &fb_fl.rects[fb_fl.count++];
+    r->x = x0; r->y = y0; r->w = x1 - x0; r->h = y1 - y0;
+}
+
+static void flush_commit(void) {
+    if (!fb_needs_flush || !fb_fl.count) return;
+    ioctl(fb_fd, FBIO_MAEROS_FLUSH, &fb_fl);
+    st_flushes++;
+    st_flush_rects += fb_fl.count;
+    for (unsigned i = 0; i < fb_fl.count; i++)
+        st_flush_px += (unsigned long long)fb_fl.rects[i].w * fb_fl.rects[i].h;
+    fb_fl.count = 0;
+}
+
 static int present_span(unsigned y0, unsigned rows, unsigned x0, unsigned x1) {
+    flush_add(x0, y0, x1, y0 + rows);
     if (x0 == 0 && x1 == fb_w && fb_pitch == fb_w * 4) {
         st_present_bytes += (unsigned long long)rows * fb_w * 4;
         return pwrite(fb_fd, backbuf + (size_t)y0 * fb_w, (size_t)rows * fb_w * 4,
@@ -5129,7 +5197,15 @@ static int present_span(unsigned y0, unsigned rows, unsigned x0, unsigned x1) {
  * and the app's exit both invalidate it and the next present is a full blit.
  * If the shadow cannot be allocated, every damaged span is written.
  */
+static int present_frame(void);
+
 static int present(void) {
+    int rc = present_frame();
+    flush_commit();
+    return rc;
+}
+
+static int present_frame(void) {
     if (!backbuf) return 0;
     const unsigned rowpx = fb_w;
 
@@ -5308,12 +5384,218 @@ static int render(void) {
         }
     }
     tick_win_anim();
+    if (!backbuf) {
+        flush_add(0, 0, fb_w, fb_h);
+        flush_commit();
+    }
     int rc = backbuf ? present() : 0;
     if (dmg_lo)
         for (unsigned y = 0; y < fb_h; y++) dmg_lo[y] = dmg_hi[y] = 0;
     dmg_pending = 0;
     st_render_us += now_us() - t_render0;
     return rc;
+}
+
+/*
+ * Display modes.
+ *
+ * The Settings app lists the modes from FBIO_MAEROS_MODES itself and asks for
+ * one with "setmode W H".  The desktop switches (FBIOPUT_VSCREENINFO),
+ * re-creates everything sized by the screen - back buffer, shadow, damage
+ * spans, the scaled wallpaper and its blur - and re-lays the windows out:
+ * maximized and snapped windows take the new full or half screen, the rest
+ * are kept inside it, and clients whose window changed get a geom event
+ * (maeroX resizes its root window from it).  The new mode stays only if
+ * Settings says "modekeep" within MODE_CONFIRM_S seconds; otherwise, or on
+ * "moderevert", the old one comes back.  desktop.conf's mode= (written by
+ * Settings on Keep) is applied when the desktop starts, i.e. at login.
+ */
+
+static long mono_secs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec;
+}
+
+/* Read the current mode back from the kernel. */
+static int fb_query(void) {
+    struct fb_var_screeninfo var;
+    struct fb_fix_screeninfo fix;
+    struct fb_modelist ml;
+
+    if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &var) < 0 ||
+        ioctl(fb_fd, FBIOGET_FSCREENINFO, &fix) < 0 ||
+        var.bits_per_pixel != 32 || var.xres == 0 || var.yres == 0)
+        return -1;
+    fb_w = var.xres;
+    fb_h = var.yres;
+    fb_pitch = fix.line_length;
+    memset(&ml, 0, sizeof(ml));
+    fb_needs_flush = ioctl(fb_fd, FBIO_MAEROS_MODES, &ml) == 0 &&
+                     (ml.flags & FB_MODES_FLUSH);
+    fb_fl.count = 0;
+    return 0;
+}
+
+/* Program w x h; 0, or -1 with the old mode still up. */
+static int fb_put_mode(unsigned w, unsigned h) {
+    struct fb_var_screeninfo var;
+
+    if (w > MAX_W || w < 640 || h < 480) return -1;
+    if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &var) < 0) return -1;
+    var.xres = var.xres_virtual = w;
+    var.yres = var.yres_virtual = h;
+    var.xoffset = var.yoffset = 0;
+    var.bits_per_pixel = 32;
+    var.activate = 0;
+    if (ioctl(fb_fd, FBIOPUT_VSCREENINFO, &var) < 0) return -1;
+    return fb_query();
+}
+
+/* Back buffer, shadow and damage spans for the current fb_w x fb_h. */
+static void alloc_screen_buffers(void) {
+    free(backbuf);
+    free(shadow);
+    free(dmg_lo);
+    free(dmg_hi);
+    backbuf = shadow = 0;
+    dmg_lo = dmg_hi = 0;
+    /* Allocate the full-screen back buffer; fall back to direct writes if the
+     * heap can't satisfy it so the desktop still boots on tight memory. */
+    backbuf = (uint32_t *)malloc((size_t)fb_w * fb_h * 4);
+    shadow  = backbuf ? (uint32_t *)malloc((size_t)fb_w * fb_h * 4) : 0;
+    if (backbuf) {
+        dmg_lo = (int *)malloc(fb_h * sizeof(int));
+        dmg_hi = (int *)malloc(fb_h * sizeof(int));
+        if (!dmg_lo || !dmg_hi) {         /* always full frames */
+            free(dmg_lo);
+            free(dmg_hi);
+            dmg_lo = dmg_hi = 0;
+        } else {
+            for (unsigned y = 0; y < fb_h; y++) dmg_lo[y] = dmg_hi[y] = 0;
+        }
+    }
+    row = backbuf ? backbuf : fallback_row;
+    shadow_valid = 0;
+}
+
+/* Fit every window to the new screen. */
+static void relayout_windows(void) {
+    for (int i = 0; i < window_count; i++) {
+        desktop_window_t *win = &windows[i];
+        int ox = win->x, oy = win->y, ow = win->w, oh = win->h;
+        if (win->maximized) {
+            win->x = 8;
+            win->y = 8;
+            win->w = (int)fb_w - 16;
+            win->h = (int)fb_h - TASKBAR_H - 16;
+        } else if (win->snapped) {
+            int left = win->x <= 4;
+            win->x = left ? 4 : (int)fb_w / 2 + 2;
+            win->y = 6;
+            win->w = (int)fb_w / 2 - 6;
+            win->h = (int)fb_h - TASKBAR_H - 12;
+        }
+        /* the size a maximized/snapped window goes back to must fit too */
+        if (win->sw > (int)fb_w - 16) win->sw = (int)fb_w - 16;
+        if (win->sh > (int)fb_h - TASKBAR_H - 16) win->sh = (int)fb_h - TASKBAR_H - 16;
+        if (win->sx + win->sw > (int)fb_w - 8) win->sx = (int)fb_w - 8 - win->sw;
+        if (win->sy + win->sh > (int)fb_h - TASKBAR_H - 8)
+            win->sy = (int)fb_h - TASKBAR_H - 8 - win->sh;
+        if (win->sx < 8) win->sx = 8;
+        if (win->sy < 8) win->sy = 8;
+        clamp_window(win);
+        if (win->visible && (win->x != ox || win->y != oy ||
+                             win->w != ow || win->h != oh)) {
+            emit_client_geom_event(win);
+            trace("relayout %s slot=%d x=%d y=%d w=%d h=%d", win->title,
+                  client_index_for_window(win->id) + 1, win->x, win->y,
+                  win->w, win->h);
+        }
+    }
+}
+
+/* Switch to w x h and rebuild everything sized by the screen. */
+static int set_display_mode(unsigned w, unsigned h) {
+    unsigned ow = fb_w, oh = fb_h;
+
+    if (w == fb_w && h == fb_h) return 0;
+    if (fb_put_mode(w, h) < 0) {
+        trace("mode %ux%u refused", w, h);
+        return -1;
+    }
+    alloc_screen_buffers();
+    if (wallpaper) { free(wallpaper); wallpaper = 0; }
+    if (wallpaper_blur) { free(wallpaper_blur); wallpaper_blur = 0; }
+    load_wallpaper();
+    make_wallpaper_blur();
+    relayout_windows();
+    if (mouse_x >= (int)fb_w) mouse_x = (int)fb_w - 1;
+    if (mouse_y >= (int)fb_h) mouse_y = (int)fb_h - 1;
+    launcher_open = 0;
+    ctx_open = 0;
+    cal_open = 0;
+    thumb_win_id = -1;
+    present_invalidate();
+    {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "DISPLAY %ux%u", fb_w, fb_h);
+        add_log(msg);
+    }
+    trace("mode %ux%u was=%ux%u orb=%d,%d", fb_w, fb_h, ow, oh,
+          ORB_X + ORB_SIZE / 2, (int)fb_h - TASKBAR_H - 4 + ORB_SIZE / 2);
+    return 0;
+}
+
+/* "setmode W H": switch, and go back in MODE_CONFIRM_S seconds unless kept. */
+static void request_display_mode(const char *arg) {
+    unsigned w = 0, h = 0, pw = fb_w, ph = fb_h;
+    char *end;
+
+    w = (unsigned)strtoul(arg, &end, 10);
+    if (*end == 'x' || *end == ' ') h = (unsigned)strtoul(end + 1, 0, 10);
+    if (set_display_mode(w, h) < 0) return;
+    if (!mode_pending) {                 /* a second switch keeps the first undo */
+        mode_prev_w = pw;
+        mode_prev_h = ph;
+    }
+    mode_pending = 1;
+    mode_deadline = mono_secs() + MODE_CONFIRM_S;
+    trace("mode pending %ux%u revert=%ux%u in %ds", fb_w, fb_h, mode_prev_w,
+          mode_prev_h, MODE_CONFIRM_S);
+}
+
+static void revert_display_mode(const char *why) {
+    if (!mode_pending) return;
+    mode_pending = 0;
+    set_display_mode(mode_prev_w, mode_prev_h);
+    trace("mode reverted to %ux%u (%s)", fb_w, fb_h, why);
+}
+
+/* desktop.conf mode=WxH, applied once at start (login). */
+static void apply_conf_mode(void) {
+    const char *cp = access("/disk/etc/desktop.conf", 0) == 0 ?
+                     "/disk/etc/desktop.conf" : "/etc/desktop.conf";
+    char buf[512];
+    int fd = open(cp, O_RDONLY), n;
+
+    if (fd < 0) return;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return;
+    buf[n] = 0;
+    for (char *line = buf; line && *line; ) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        if (!strncmp(line, "mode=", 5)) {
+            char *end;
+            unsigned w = (unsigned)strtoul(line + 5, &end, 10);
+            unsigned h = *end == 'x' ? (unsigned)strtoul(end + 1, 0, 10) : 0;
+            if ((w != fb_w || h != fb_h) && fb_put_mode(w, h) < 0)
+                printf("desktop: mode=%ux%u from %s not available\n", w, h, cp);
+        }
+        line = nl ? nl + 1 : 0;
+    }
 }
 
 int main(void) {
@@ -5329,22 +5611,13 @@ int main(void) {
         return 1;
     }
 
-    struct fb_var_screeninfo var;
-    int vr;
-    struct fb_fix_screeninfo fix;
-    vr = ioctl(fb_fd, FBIOGET_VSCREENINFO, &var);
-    if (vr < 0 ||
-        ioctl(fb_fd, FBIOGET_FSCREENINFO, &fix) < 0 ||
-        var.bits_per_pixel != 32 || var.xres == 0 || var.yres == 0) {
-        printf("desktop: unsupported framebuffer (r=%d xres=%u yres=%u bpp=%u)\n",
-               vr, var.xres, var.yres, var.bits_per_pixel);
+    if (fb_query() < 0) {
+        printf("desktop: unsupported framebuffer (need 32 bpp)\n");
         close(ev_fd);
         close(fb_fd);
         return 1;
     }
-    fb_w = var.xres;
-    fb_h = var.yres;
-    fb_pitch = fix.line_length;
+    apply_conf_mode();
     mouse_x = (int)fb_w / 2;
     mouse_y = (int)fb_h / 2;
     if (fb_w > MAX_W) {
@@ -5354,18 +5627,7 @@ int main(void) {
         return 1;
     }
     init_windows();
-
-    /* Allocate the full-screen back buffer; fall back to direct writes if the
-     * heap can't satisfy it so the desktop still boots on tight memory. */
-    backbuf = (uint32_t *)malloc((size_t)fb_w * fb_h * 4);
-    shadow  = backbuf ? (uint32_t *)malloc((size_t)fb_w * fb_h * 4) : 0;
-    if (backbuf) {
-        dmg_lo = (int *)malloc(fb_h * sizeof(int));
-        dmg_hi = (int *)malloc(fb_h * sizeof(int));
-        if (!dmg_lo || !dmg_hi) dmg_lo = dmg_hi = 0;   /* always full frames */
-        else for (unsigned y = 0; y < fb_h; y++) dmg_lo[y] = dmg_hi[y] = 0;
-    }
-    shadow_valid = 0;
+    alloc_screen_buffers();
     load_desktop_conf();
     load_wallpaper();
     make_wallpaper_blur();
@@ -5410,6 +5672,9 @@ int main(void) {
         struct input_event ev;
         int n;
         int dirty = 0;      /* something changed the whole screen */
+
+        if (mode_pending && mono_secs() >= mode_deadline)
+            revert_display_mode("timeout");
 
         if (ff_auto > 0 && ++ff_tick == 120) {   /* ~a few seconds in, once */
             int which = ff_auto; ff_auto = 0;

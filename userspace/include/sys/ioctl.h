@@ -5,7 +5,40 @@
 #define BLKGETSIZE64 0x80081272
 
 #define FBIOGET_VSCREENINFO 0x4600
+#define FBIOPUT_VSCREENINFO 0x4601
 #define FBIOGET_FSCREENINFO 0x4602
+#define FB_ACTIVATE_TEST    2
+
+/* MaeroOS fbdev extensions (drivers/framebuffer.h): the modes
+ * FBIOPUT_VSCREENINFO accepts, and flushing changed rectangles to a display
+ * that needs it (virtio-gpu: modes.flags & FB_MODES_FLUSH). */
+#define FBIO_MAEROS_MODES   0x46E0
+#define FBIO_MAEROS_FLUSH   0x46E1
+#define FB_MAX_MODES        32
+#define FB_FLUSH_MAX        16
+#define FB_MODES_SETTABLE   1
+#define FB_MODES_FLUSH      2
+
+struct fb_mode { unsigned short w, h; };
+
+struct fb_modelist {
+    unsigned int count;
+    unsigned int current;           /* index into modes; count if none */
+    unsigned int flags;             /* FB_MODES_* */
+    unsigned int generation;        /* changes with the list (hotplug) */
+    char driver[16];                /* "boot", "bochs", "virtio-gpu" */
+    unsigned short preferred_w, preferred_h;
+    struct fb_mode modes[FB_MAX_MODES];
+};
+
+struct fb_rect { unsigned int x, y, w, h; };
+
+struct fb_flush {
+    unsigned int count;
+    struct fb_rect rects[FB_FLUSH_MAX];
+};
+_Static_assert(sizeof(struct fb_modelist) == 164 && sizeof(struct fb_flush) == 260,
+               "fb ioctl layouts must match drivers/framebuffer.h");
 
 /* EXACT Linux UAPI layouts */
 struct fb_fix_screeninfo {

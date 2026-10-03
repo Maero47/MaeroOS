@@ -140,3 +140,6 @@ void framebuffer_start_thread(void);
 /* Common resolutions up to (max_w, max_h) and max_bytes at 32 bpp. */
 void framebuffer_add_standard_modes(uint32_t max_w, uint32_t max_h,
                                     uint32_t max_bytes);
+
+_Static_assert(sizeof(fb_modelist_t) == 164 && sizeof(fb_flush_t) == 260,
+               "fb ioctl layouts are user ABI (userspace/include/sys/ioctl.h)");
