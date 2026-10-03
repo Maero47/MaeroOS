@@ -883,9 +883,24 @@ static int find_hids(const uint8_t *cfg, uint32_t len, hid_intf_t *out) {
 
 static volatile int usb_locked;
 
+/* Waiters sleep a tick at a time, so a thread that unlocks and locks again
+ * at once (a reader looping over a stick that keeps timing out) could keep
+ * the lock from them for good -- kusbd then never scans the hub that would
+ * tell it the stick is gone.  A newcomer that finds anyone waiting queues
+ * behind them instead of taking the lock straight away. */
+static volatile int usb_waiters;
+
 void usb_lock(void) {
-    while (__sync_lock_test_and_set(&usb_locked, 1))
+    if (!usb_waiters && !__sync_lock_test_and_set(&usb_locked, 1))
+        return;
+    __sync_add_and_fetch(&usb_waiters, 1);
+    int first = 1;
+    for (;;) {
+        if (!first && !__sync_lock_test_and_set(&usb_locked, 1)) break;
+        first = 0;
         sleep_ticks(1);
+    }
+    __sync_sub_and_fetch(&usb_waiters, 1);
 }
 
 void usb_unlock(void) {

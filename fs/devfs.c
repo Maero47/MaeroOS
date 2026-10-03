@@ -316,8 +316,14 @@ static uint32_t tty_write(vfs_node_t *n, uint64_t off, uint32_t len,
     vfs_node_t *ctty = proc_ctty_node();
     if (ctty && ctty->write_fn)
         return ctty->write_fn(ctty, off, len, buf);
-    for (uint32_t i = 0; i < len; i++)
-        serial_putc((char)buf[i]);
+    /* In chunks through a kernel buffer: the user bytes are read before the
+     * UART's lock is taken (it runs with interrupts off). */
+    char chunk[64];
+    for (uint32_t i = 0; i < len; ) {
+        uint32_t k = 0;
+        while (k < sizeof(chunk) && i < len) chunk[k++] = (char)buf[i++];
+        serial_write(chunk, k);
+    }
     return len;
 }
 
@@ -561,7 +567,7 @@ static uint32_t pty_buf_read(pty_pair_t *p, int from_slave,
     }
     *count -= take;
     wake_up(p);
-    io_wake();
+    io_wake_poll();
     return n;
 }
 
@@ -587,8 +593,12 @@ static uint32_t pty_buf_write(pty_pair_t *p, int to_slave,
         uint32_t tail = (*head + *count) % PTY_BUF_SIZE;
         ring[tail] = buf[n++];
         (*count)++;
-        wake_up(p);
-        io_wake();
+        /* Wake the reader once the ring is full or the write is done, not
+         * per byte: each wake is a scan of the whole ptable. */
+        if (*count == PTY_BUF_SIZE || n == len) {
+            wake_up(p);
+            io_wake_poll();
+        }
     }
     return n;
 }

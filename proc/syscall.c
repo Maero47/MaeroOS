@@ -759,7 +759,7 @@ static int eventfd_read(struct eventfd_obj *e, char *buf, int len, int nonblock)
     if (copy_to_user(buf, &out, 8) < 0) return -14;
     e->count -= out;
     wake_up(e);                                    /* wake blocked writers */
-    io_wake();                                     /* wake pollers (space avail) */
+    io_wake_poll();                                /* wake pollers (space avail) */
     return 8;
 }
 
@@ -777,7 +777,7 @@ static int eventfd_write(struct eventfd_obj *e, const char *buf, int len, int no
     }
     e->count += add;
     wake_up(e);                                     /* wake blocked readers */
-    io_wake();                                      /* wake pollers (now readable) */
+    io_wake_poll();                                 /* wake pollers (now readable) */
     return 8;
 }
 
@@ -1186,7 +1186,7 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
      * the parent's and the child's copy.  Force the flush now.  (Firefox forks
      * subprocesses from its ~20-thread parent constantly, so this is the
      * dominant corruption source under -smp 2.) */
-    tlb_shootdown();
+    tlb_shootdown_user();
 
     /* Copy open file descriptors; bump pipe refcounts */
     for (int i = 0; i < MAX_FD; i++) {
@@ -1203,6 +1203,7 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
         child->tf->useresp = child_stack;
 
     child->state = PROC_RUNNABLE;
+    sched_kick_idle();
 
     return child->pid;  /* parent gets child's PID */
 }
@@ -2515,6 +2516,9 @@ static int sys_exec(registers_t *regs) {
     if (!pgdir_release(old_pgdir))
         pgdir_free_user(old_pgdir);
 
+    /* On the console (several smoke tests wait for it).  It no longer costs
+     * the ~5 ms UART busy-wait under the BKL it used to (docs/smp-plan.md
+     * 3.3): the transmit interrupt sends it (drivers/serial.c). */
     printk("[SYSCALL] exec '%s' pid=%d entry=0x%08x argc=%d\n",
            path, current_proc->pid, (unsigned)entry, argc);
     es_free(&av);
@@ -4564,14 +4568,14 @@ static void unmap_pages(uint32_t start, uint32_t end) {
             pte_set(va, 0);
             tlb_flush_single(va);
             if (nb == 256) {
-                tlb_shootdown();                /* no CPU keeps a stale entry now */
+                tlb_shootdown_user();                /* no CPU keeps a stale entry now */
                 for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
                 nb = 0;
             }
         }
         va += PAGE_SIZE;
     }
-    tlb_shootdown();                            /* flush the remainder before freeing */
+    tlb_shootdown_user();                            /* flush the remainder before freeing */
     for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
 }
 
@@ -4644,7 +4648,7 @@ void mm_shm_detach(uint32_t base, const uint32_t *frames, uint32_t npages) {
         run_len = 0;
     }
     if (run_len) vma_remove_range(run, run + run_len);
-    tlb_shootdown();                    /* no CPU keeps a stale entry now */
+    tlb_shootdown_user();                    /* no CPU keeps a stale entry now */
     for (uint32_t i = 0; i < npages; i++)
         if (cleared[i / 32] & (1U << (i % 32)))
             pmm_frame_decref(frames[i]);
@@ -4973,7 +4977,7 @@ static int sys_mprotect(registers_t *regs) {
     }
     /* SMP: permission reductions must be seen by sibling threads on other CPUs
      * before they next touch the page (W^X / JIT correctness). */
-    tlb_shootdown();
+    tlb_shootdown_user();
 
     /* A SIGSEGV handler that changes protections is making progress, not
      * looping: write barriers (GCs, JITs, this kernel's wxprobe) fault the
@@ -5033,7 +5037,7 @@ static int sys_madvise(registers_t *regs) {
                 pte_set(va, 0);
                 tlb_flush_single(va);
                 if (nb == 256) {
-                    tlb_shootdown();
+                    tlb_shootdown_user();
                     for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
                     nb = 0;
                 }
@@ -5062,7 +5066,7 @@ static int sys_madvise(registers_t *regs) {
                         tlb_flush_single(va);
                         batch[nb++] = frame;
                         if (nb == 256) {
-                            tlb_shootdown();
+                            tlb_shootdown_user();
                             for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
                             nb = 0;
                         }
@@ -5077,7 +5081,7 @@ static int sys_madvise(registers_t *regs) {
         }
         va += PAGE_SIZE;
     }
-    tlb_shootdown();
+    tlb_shootdown_user();
     for (int i = 0; i < nb; i++) pmm_frame_decref(batch[i]);
     return 0;
 }
@@ -5170,7 +5174,7 @@ static int mremap_move(uint32_t old, uint32_t len, uint32_t new) {
         if (paging_map(new + off, pte_frame(e), e & (0xFFFU | PAGE_NX)) != 0)
             panic("mremap: reserved page table vanished", NULL);
     }
-    tlb_shootdown();
+    tlb_shootdown_user();
     for (int i = 0; i < np; i++) {
         struct vma *nv = vma_alloc(pcs[i].s, pcs[i].e, pcs[i].prot, pcs[i].flags,
                                    pcs[i].file, pcs[i].off);
@@ -5776,6 +5780,10 @@ static int sys_reboot(registers_t *regs) {
     }
     if (cmd == LINUX_REBOOT_CMD_POWER_OFF || cmd == LINUX_REBOOT_CMD_RESTART)
         nvme_shutdown();
+    /* Let the console's queued output out before the machine goes. */
+    if (cmd == LINUX_REBOOT_CMD_POWER_OFF || cmd == LINUX_REBOOT_CMD_RESTART ||
+        cmd == LINUX_REBOOT_CMD_HALT)
+        serial_sync_begin();
 
     switch (cmd) {
     case LINUX_REBOOT_CMD_POWER_OFF:
@@ -6241,7 +6249,7 @@ static int sys_pselect6(registers_t *regs) {
  */
 static void io_wait_sleep(uint32_t max_ticks) {
     current_proc->wake_tick = pit_ticks() + max_ticks;
-    sleep_on(&io_activity);
+    io_poll_sleep();
 }
 
 
@@ -8933,6 +8941,7 @@ static int sys_clone(registers_t *regs) {
         child->vfork_parent = parent;
         parent->vfork_waiting = 1;
         child->state = PROC_RUNNABLE;
+        sched_kick_idle();
         while (parent->vfork_waiting) {
             if (parent->pending_sigs & (1u << SIGKILL)) break;
             sleep_on((void *)&parent->vfork_waiting);
@@ -8941,6 +8950,7 @@ static int sys_clone(registers_t *regs) {
     }
 
     child->state = PROC_RUNNABLE;
+    sched_kick_idle();
     return child->pid;
 }
 

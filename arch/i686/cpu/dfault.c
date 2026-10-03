@@ -77,6 +77,7 @@ void kstack_overflow_panic(const char *why, registers_t *regs, uint32_t addr) {
  * The task switch saved the interrupted context in this CPU's main TSS.
  */
 void double_fault_report(void) {
+    serial_sync_begin();        /* nothing will drain a queue after this */
     uint32_t cpu = this_cpu_id();
     const tss_entry_t *t = tss_saved_state((int)cpu);
     uint32_t cr2;

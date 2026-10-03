@@ -80,6 +80,15 @@ void bkl_state(int *locked, int *depth);  /* diagnostic: lock word + depth */
  */
 void tlb_shootdown(void);
 
+/* The same, for a change to the USER half of one address space: only CPUs
+ * running a thread on page directory `pgdir_phys` are flushed (CPUs idle or
+ * in another address space hold none of its user entries).
+ * tlb_shootdown_user() names the directory in this CPU's CR3, which is the
+ * one every pte_set()/recursive-mapping change modifies.  Kernel-half
+ * changes (kernel stacks, kmaps) still need tlb_shootdown(). */
+void tlb_shootdown_mm(uint32_t pgdir_phys);
+void tlb_shootdown_user(void);
+
 /* Service a pending flush request on the calling CPU (flush + ack).
  * Called at every trap entry and from spin loops (bkl wait, AP idle) so a CPU
  * that can't take the shootdown IPI (interrupts off) still flushes. */

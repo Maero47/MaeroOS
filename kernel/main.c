@@ -295,6 +295,10 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     acpi_init();
 
     __asm__ volatile("sti");
+    /* Console output through the UART's transmit interrupt from here on: no
+     * printk or console write busy-waits on the 115200-baud line any more
+     * (with the BKL held, that stalled every CPU; docs/smp-plan.md 1e). */
+    serial_enable_async();
 
     /* ── SMP S2: bring up application processors (needs heap, LAPIC, PIT for
      * timed delays + interrupts on).  APs park (hlt) until the per-CPU scheduler

@@ -16,3 +16,9 @@ void gdt_init_ap(void);  /* AP:  build + load this CPU's GDT (per-CPU TSS/TLS) *
 /* Re-base the user TLS segment (GDT entry 6, selector 0x33) */
 void gdt_set_tls(uint32_t base);
 uint32_t gdt_get_tls(void);   /* DEBUG: read back GDT entry 6 base */
+
+/* Each CPU's GDT is GDT_PERCPU_BYTES long and CPU n's starts at
+ * gdt_percpu_base + n * GDT_PERCPU_BYTES, so `sgdt` names the CPU
+ * (this_cpu_id, bkl.c). */
+#define GDT_PERCPU_BYTES 64U
+extern const uint32_t gdt_percpu_base;

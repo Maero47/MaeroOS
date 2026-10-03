@@ -722,6 +722,7 @@ make bench-gfx      # compositor/maeroX cost of an animating region (a benchmark
 make bench-sched    # wake latency and a 10 ms audio-like hand-off under CPU hogs
 make bench-bkl      # Big Kernel Lock hold/spin report under -smp 4 (docs/smp-plan.md)
 make smoke-klock    # SMP lock-primitive torture + lock-order checker (debug build)
+make stress-smp     # SMP4 fork/exec/pipe/mmap/tar|gzip loops for 3 minutes; no hang, panic or STALL
 ```
 
 `SMOKE_SMP=N make smoke-cmds` boots the same guest with `-smp N`. `make smoke-gtk` needs

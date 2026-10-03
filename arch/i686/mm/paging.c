@@ -703,7 +703,7 @@ static void page_fault_handler(registers_t *regs) {
                  * this line too. */
                 pte_set(cr2, (pte & ~(pte_t)PAGE_COW) | PAGE_WRITABLE);
                 tlb_flush_single(cr2 & ~0xFFFU);
-                tlb_shootdown();
+                tlb_shootdown_user();
                 return;
             }
 
@@ -751,7 +751,7 @@ static void page_fault_handler(registers_t *regs) {
             /* SMP: a sibling thread (shared pgdir) may have the old read-only
              * COW entry cached and would keep reading the pre-break frame —
              * force it to flush before we proceed. */
-            tlb_shootdown();
+            tlb_shootdown_user();
 
             /* Release our share of the old frame */
             pmm_frame_decref(old_phys);

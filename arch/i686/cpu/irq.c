@@ -82,6 +82,28 @@ int msi_install_handler(isr_handler_t handler) {
  */
 static void irq_handler_body(registers_t *regs);
 
+/*
+ * Called from irq_common_stub BEFORE it takes the Big Kernel Lock.  An idle
+ * CPU (scheduler_start's halt loop: idle set, lock not held) acknowledges its
+ * own LAPIC tick and the reschedule IPI here and returns 1, and the stub irets
+ * straight back into the halt loop without the lock.  Nothing in either
+ * handler is needed on an idle CPU: the tick's bookkeeping (sleep timeouts,
+ * timers, vruntime floor) is global and the BSP's PIT tick does it, there is
+ * no thread to charge or preempt, and the waker that sent the IPI already set
+ * need_resched, which the halt loop tests.  Before this, every idle AP spun
+ * with interrupts off for the lock 100 times a second, for as long as another
+ * CPU stayed in the kernel (docs/smp-plan.md 3.3: 70-80% of wall time).
+ */
+int irq_idle_fast(registers_t *regs) {
+    if (regs->int_no != LAPIC_TIMER_VECTOR && regs->int_no != RESCHED_IPI_VECTOR)
+        return 0;
+    if (!apic_available() || (regs->cs & 3) != 0) return 0;
+    struct cpu *c = &cpus[this_cpu_id()];
+    if (!c->idle || c->bkl_depth != 0) return 0;
+    apic_eoi();
+    return 1;
+}
+
 void irq_handler(registers_t *regs) {
     int kp_old = kprof_switch(KPB_IRQ);
     /* A flag, not a nesting count: IRQ gates run with interrupts off, and

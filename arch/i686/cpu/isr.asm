@@ -294,6 +294,7 @@ isr_common_stub:
 
 ; ─── Common IRQ stub ─────────────────────────────────────────────────────────
 extern irq_handler
+extern irq_idle_fast
 
 irq_common_stub:
     pusha
@@ -310,6 +311,14 @@ irq_common_stub:
 
     cld
 
+    ; An idle CPU acknowledges its LAPIC tick and the reschedule IPI without
+    ; the lock and goes straight back to its halt loop (irq.c irq_idle_fast).
+    push esp
+    call irq_idle_fast
+    add esp, 4
+    test eax, eax
+    jnz .irq_out
+
     BKL_ENTER           ; SMP: acquire (or nest) the Big Kernel Lock
     call tlb_serve_pending ; SMP backstop: flush a missed TLB-shootdown request
 
@@ -319,6 +328,7 @@ irq_common_stub:
 
     call bkl_leave      ; SMP: release (or un-nest) the Big Kernel Lock
 
+.irq_out:
     pop gs
     pop fs
     pop es
