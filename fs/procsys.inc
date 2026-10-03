@@ -176,7 +176,8 @@ enum { SC_OVERCOMMIT, SC_SHMMAX, SC_SHMALL, SC_SHMMNI, SC_SEM, SC_MSGMAX, SC_MSG
        SC_MSGMNI, SC_PIDMAX, SC_OSTYPE, SC_OSRELEASE, SC_HOSTNAME, SC_NGROUPS,
        SC_MAX_USER_WATCHES, SC_MAX_USER_INSTANCES, SC_MAX_QUEUED_EVENTS,
        SC_FILE_MAX, SC_THREADS_MAX, SC_INO_USER_BYTES, SC_INO_TOTAL_BYTES,
-       SC_INO_QUEUED_BYTES, SC_SHM_USER, SC_MSG_PER_QUEUE };
+       SC_INO_QUEUED_BYTES, SC_SHM_USER, SC_MSG_PER_QUEUE, SC_INO_ACCT_SLOTS,
+       SC_INO_SPILL_BYTES, SC_PROCFS_NODES };
 
 static const sysctl_ent_t sysctl_ents[] = {
     { "vm",     "overcommit_memory",    SC_OVERCOMMIT, 0644 },
@@ -201,6 +202,11 @@ static const sysctl_ent_t sysctl_ents[] = {
     { "fs/inotify", "max_user_bytes",     SC_INO_USER_BYTES,     0444 },
     { "fs/inotify", "max_total_bytes",    SC_INO_TOTAL_BYTES,    0444 },
     { "fs/inotify", "queued_bytes",       SC_INO_QUEUED_BYTES,   0444 },
+    /* MaeroOS test knobs for the per-user accounting (fs/inotify.c). */
+    { "fs/inotify", "acct_slots",         SC_INO_ACCT_SLOTS,     0644 },
+    { "fs/inotify", "spill_bytes",        SC_INO_SPILL_BYTES,    0444 },
+    /* MaeroOS: per-process /proc nodes cached now (fs/procpid.inc). */
+    { "kernel", "procfs_nodes",         SC_PROCFS_NODES, 0444 },
     /* MaeroOS: shm bytes one non-root user may create, messages per queue. */
     { "kernel", "shm_user_max",         SC_SHM_USER,   0444 },
     { "kernel", "msg_per_queue_max",    SC_MSG_PER_QUEUE, 0444 },
@@ -238,6 +244,9 @@ static uint32_t sysctl_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *
     case SC_INO_USER_BYTES: l = snprintf(t, sizeof(t), "%u\n", INOTIFY_USER_BYTES); break;
     case SC_INO_TOTAL_BYTES: l = snprintf(t, sizeof(t), "%u\n", INOTIFY_TOTAL_BYTES); break;
     case SC_INO_QUEUED_BYTES: l = snprintf(t, sizeof(t), "%u\n", inotify_heap_bytes); break;
+    case SC_INO_ACCT_SLOTS: l = snprintf(t, sizeof(t), "%u\n", inotify_acct_slots); break;
+    case SC_INO_SPILL_BYTES: l = snprintf(t, sizeof(t), "%u\n", inotify_spill_bytes()); break;
+    case SC_PROCFS_NODES: l = snprintf(t, sizeof(t), "%u\n", pnode_count); break;
     case SC_SHM_USER: l = snprintf(t, sizeof(t), "%u\n", SYSV_SHM_USER_PAGES * 4096U); break;
     case SC_MSG_PER_QUEUE: l = snprintf(t, sizeof(t), "%u\n", SYSV_MSG_PER_QUEUE); break;
     }
@@ -245,7 +254,19 @@ static uint32_t sysctl_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *
 }
 
 static uint32_t sysctl_write(vfs_node_t *n, uint32_t off, uint32_t len, const uint8_t *buf) {
-    (void)n; (void)off; (void)buf;
+    (void)off;
+    const sysctl_ent_t *e = &sysctl_ents[(int)(uintptr_t)n->private];
+    if (e->which == SC_INO_ACCT_SLOTS) {
+        /* 1..64; the node is 0644 root's, so only root gets here.  Slots
+         * already bound keep their instances; the new count applies to
+         * instances created from now on. */
+        uint32_t v = 0, i = 0;
+        while (i < len && buf[i] >= '0' && buf[i] <= '9' && v < 1000)
+            v = v * 10 + (uint32_t)(buf[i++] - '0');
+        if (!i || v < 1 || v > 64) return (uint32_t)-22;
+        inotify_acct_slots = v;
+        return len;
+    }
     return len;   /* overcommit_memory: accepted and ignored */
 }
 

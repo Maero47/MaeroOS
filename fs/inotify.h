@@ -63,6 +63,10 @@
 #define INOTIFY_TOTAL_WATCHES 65536
 /* Heap bytes queued now, by everyone (/proc/sys/fs/inotify/queued_bytes). */
 extern uint32_t inotify_heap_bytes;
+/* Accounting slots in use (root may lower it, 1..64, to test the shared
+ * spill bucket) and the spill bucket's bytes. */
+extern uint32_t inotify_acct_slots;
+uint32_t inotify_spill_bytes(void);
 
 /* A new instance node (no references yet: the caller's descriptor takes the
  * first with vfs_retain), or NULL. */

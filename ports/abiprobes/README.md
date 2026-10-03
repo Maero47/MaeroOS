@@ -1,7 +1,7 @@
 # Linux-ABI probes
 
-Forty-eight small C programs.  P1-P20 are the probes of
-`docs/audit/firefox-first-paint.md` section 8; P21-P48 were added with later
+Forty-nine small C programs.  P1-P20 are the probes of
+`docs/audit/firefox-first-paint.md` section 8; P21-P49 were added with later
 kernel fixes.  Each proves or disproves one kernel-semantics gap and prints
 exactly one final line:
 
@@ -66,6 +66,7 @@ regression tests for the fixes in audit section 5.
 | P46 | `p46_inotify.c`             | inotify events of each directory operation, poll/epoll/FIONREAD, blocking read, IN_Q_OVERFLOW | — |
 | P47 | `p47_proc_pid.c`            | `/proc/self` link, `/proc/<pid>` files, `/proc/stat`/`loadavg`; another user's `environ`/`fd`/links are `EACCES` | — |
 | P48 | `p48_ipc_limits.c`          | an unprivileged user's inotify queues end in `IN_Q_OVERFLOW`, a full message queue is `EAGAIN`, shm stops at `ENOSPC`; fork and allocation still work | — |
+| P49 | `p49_accounting.c`          | `/proc/self/fd`/`fdinfo` nodes are dropped once the fds close (`procfs_nodes`); inotify's spill bucket returns to 0 after a spilled user gets a slot | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the

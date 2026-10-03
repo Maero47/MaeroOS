@@ -114,6 +114,8 @@ PROBES = {
     "p47_proc_pid":            (60, ""),
     # Unprivileged inotify queues, message queues and shm stay bounded.
     "p48_ipc_limits":          (240, ""),
+    # /proc node cache and inotify accounting buckets do not drift.
+    "p49_accounting":          (120, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

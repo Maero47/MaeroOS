@@ -62,7 +62,11 @@ must outlive the walk that found them. Each (pid, file, fd, thread view)
 gets one heap node, reused by later lookups and counted by open references.
 Its contents are built at read time from whichever process holds that pid,
 and pids are never reused. A node is freed once its process has been gone for
-3 s and nothing holds it open.
+3 s and nothing holds it open; an `fd/N` or `fdinfo/N` node once its
+descriptor is closed (and it has not been looked up for a second). At most
+4096 nodes are cached (`/proc/sys/kernel/procfs_nodes` counts them): past
+that a lookup evicts nodes nobody holds open that have been idle for 3 s, and
+fails if there are none.
 
 ## System V IPC
 
@@ -144,7 +148,13 @@ kernel heap (record + name + allocator header): one non-root user's queues
 hold at most 2 MiB, everyone's together 16 MiB (`/proc/sys/fs/inotify/
 max_user_bytes`, `max_total_bytes`, and `queued_bytes` in use); an event
 past either cap, or past 16384 in one queue, ends that queue in one
-`IN_Q_OVERFLOW`. At most 8192 watches per user and 65536 in all. Past 16384 queued events the queue ends in one `IN_Q_OVERFLOW`
+`IN_Q_OVERFLOW`. At most 8192 watches per user and 65536 in all. Each instance is
+bound to its user's accounting bucket for its whole life (64 buckets; past
+them users share a spill bucket with one 2 MiB budget), and a bucket passes
+to another user only when no instance is bound to it, so bytes are always
+returned to the bucket they were charged to. `acct_slots` (root, 1-64)
+lowers the bucket count for tests and `spill_bytes` shows the spill bucket
+(p49). Past 16384 queued events the queue ends in one `IN_Q_OVERFLOW`
 (wd -1). `IN_MASK_ADD`, `IN_MASK_CREATE`, `IN_ONLYDIR`, `IN_DONT_FOLLOW` and
 `IN_ONESHOT` are supported.
 

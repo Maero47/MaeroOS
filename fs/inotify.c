@@ -39,6 +39,7 @@ typedef struct inotify {
     int             next_wd;
     uint32_t        uid;
     uint32_t        charged;       /* heap bytes its queue holds */
+    int             bucket;        /* accounting bucket (-1: spill) */
 } inotify_t;
 
 uint32_t inotify_nwatches;
@@ -65,26 +66,43 @@ static uint32_t name_len(const char *name) {
 /* ── heap accounting: queued bytes per user and in all ── */
 uint32_t inotify_heap_bytes;
 #define ACCT_USERS 64
-static struct { uint32_t uid, bytes; } acct[ACCT_USERS];
-static uint32_t acct_spill;       /* users past ACCT_USERS share one budget */
+/* One bucket per user with instances; past the slots in use (acct_slots,
+ * 64, lowered by root through /proc/sys/fs/inotify/acct_slots for tests)
+ * users share the spill bucket.  An instance is bound to its bucket for
+ * life, and a bucket is only given to another user once no instance is bound
+ * to it, so every byte is uncharged from the bucket it was charged to. */
+static struct { uint32_t uid, bytes, ninst; } acct[ACCT_USERS];
+static uint32_t acct_spill, acct_spill_ninst;
+uint32_t inotify_acct_slots = ACCT_USERS;
+uint32_t inotify_spill_bytes(void) { return acct_spill; }
 
-static uint32_t *acct_slot(uint32_t uid) {
+static int acct_bind(uint32_t uid) {
     int fr = -1;
-    for (int i = 0; i < ACCT_USERS; i++) {
-        if (acct[i].bytes && acct[i].uid == uid) return &acct[i].bytes;
-        if (!acct[i].bytes && fr < 0) fr = i;
+    uint32_t n = inotify_acct_slots <= ACCT_USERS ? inotify_acct_slots : ACCT_USERS;
+    for (uint32_t i = 0; i < n; i++) {
+        if (acct[i].ninst && acct[i].uid == uid) { acct[i].ninst++; return (int)i; }
+        if (!acct[i].ninst && fr < 0) fr = (int)i;
     }
-    if (fr < 0) return &acct_spill;
+    if (fr < 0) { acct_spill_ninst++; return -1; }
     acct[fr].uid = uid;
-    return &acct[fr].bytes;
+    acct[fr].bytes = 0;
+    acct[fr].ninst = 1;
+    return fr;
 }
+
+static void acct_unbind(int b) {
+    if (b < 0) { if (acct_spill_ninst) acct_spill_ninst--; return; }
+    if (acct[b].ninst) acct[b].ninst--;
+}
+
+static uint32_t *acct_bytes(int b) { return b < 0 ? &acct_spill : &acct[b].bytes; }
 
 /* What one queued event costs the heap: the record, its name and the
  * allocator's header. */
 static uint32_t ev_cost(uint32_t nl) { return (uint32_t)sizeof(ino_ev_t) + nl + 16; }
 
 static int charge(inotify_t *in, uint32_t cost, int force) {
-    uint32_t *u = acct_slot(in->uid);
+    uint32_t *u = acct_bytes(in->bucket);
     if (!force) {
         if (inotify_heap_bytes + cost > INOTIFY_TOTAL_BYTES) return 0;
         if (in->uid != 0 && *u + cost > INOTIFY_USER_BYTES) return 0;
@@ -96,7 +114,7 @@ static int charge(inotify_t *in, uint32_t cost, int force) {
 }
 
 static void uncharge(inotify_t *in, uint32_t cost) {
-    uint32_t *u = acct_slot(in->uid);
+    uint32_t *u = acct_bytes(in->bucket);
     *u = *u >= cost ? *u - cost : 0;
     inotify_heap_bytes = inotify_heap_bytes >= cost ? inotify_heap_bytes - cost : 0;
     in->charged = in->charged >= cost ? in->charged - cost : 0;
@@ -265,6 +283,7 @@ static void ino_put(struct inotify *in) {
         uncharge(in, ev_cost(e->len));
         kfree(e);
     }
+    acct_unbind(in->bucket);
     if (ninstances) ninstances--;
     for (int i = 0; i < INOTIFY_MAX_INSTANCES * 8; i++)
         if (instances[i] == in) instances[i] = NULL;
@@ -302,6 +321,7 @@ vfs_node_t *inotify_new(void) {
     in->v.private = in;
     in->next_wd = 1;
     in->uid = in->v.uid;
+    in->bucket = acct_bind(in->uid);
     instances[slot] = in;
     ninstances++;
     return &in->v;

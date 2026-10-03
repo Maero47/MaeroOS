@@ -37,10 +37,18 @@ typedef struct pnode {
     uint8_t        thread;     /* under task/<tid>: the thread's own view */
     int            refs;       /* open references (retain/close) */
     uint32_t       dead_tick;  /* PIT tick its process was first seen gone */
+    uint32_t       used_tick;  /* PIT tick of its last lookup */
     struct pnode  *next;
 } pnode_t;
 
 static pnode_t *pnodes;
+/* Nodes cached now (/proc/sys/kernel/procfs_nodes).  At most PNODE_MAX
+ * (about 1.7 MiB of heap): a lookup past it first evicts nodes nobody holds
+ * open and nobody has looked up for PNODE_IDLE ticks, and fails if none
+ * can go. */
+static uint32_t pnode_count;
+#define PNODE_MAX  4096
+#define PNODE_IDLE 300
 
 /* Entries of a /proc/<pid> (and task/<tid>) directory. */
 static const struct pent {
@@ -121,22 +129,37 @@ static void pnode_close(vfs_node_t *n) {
     if (pn->refs > 0) pn->refs--;
 }
 
-/* Free nodes whose process has been gone a while and that nobody holds. */
-static void pnode_sweep(void) {
+/* Free the nodes nobody holds open that are no longer needed: those of a
+ * process gone for 3 s; fd/N and fdinfo/N nodes whose descriptor has been
+ * closed (not looked up for a second); and, with `evict`, any node idle for
+ * PNODE_IDLE ticks (a later lookup makes it again).  A node looked up in the
+ * last second is never freed: a path walk may still be using it. */
+static void pnode_sweep(int evict) {
     uint32_t now = pit_ticks();
     pnode_t **pp = &pnodes;
     while (*pp) {
         pnode_t *pn = *pp;
-        if (pp_task(pn->pid)) {
+        struct proc *t = pp_task(pn->pid);
+        int drop = 0;
+        if (t) {
             pn->dead_tick = 0;
-            pp = &pn->next;
-            continue;
+            if (pn->refs <= 0 && now - pn->used_tick > 100) {
+                if (pn->kind == PK_FD || pn->kind == PK_FDINFO) {
+                    struct proc *o = pn->thread ? t : pp_leader(t);
+                    drop = !o->ofile || pn->arg < 0 || pn->arg >= MAX_FD ||
+                           o->ofile[pn->arg].type == FD_NONE;
+                }
+                if (evict && now - pn->used_tick > PNODE_IDLE) drop = 1;
+            }
+        } else {
+            if (!pn->dead_tick) pn->dead_tick = now ? now : 1;
+            drop = pn->refs <= 0 && now - pn->dead_tick > 300;
         }
-        if (!pn->dead_tick) pn->dead_tick = now ? now : 1;
-        if (pn->refs <= 0 && now - pn->dead_tick > 300) {
+        if (drop) {
             *pp = pn->next;
             vfs_forget_last_lookup();         /* it may name this node */
             kfree(pn);
+            pnode_count--;
             continue;
         }
         pp = &pn->next;
@@ -170,7 +193,7 @@ static vfs_node_t *pnode_get(int pid, int kind, int arg, int thread,
                              const char *name, uint32_t type, uint32_t mode) {
     static uint32_t sweep_tick;
     uint32_t now = pit_ticks();
-    if (now - sweep_tick > 100) { sweep_tick = now; pnode_sweep(); }
+    if (now - sweep_tick > 100) { sweep_tick = now; pnode_sweep(0); }
 
     struct proc *t = pp_task(pid);
     if (!t) return NULL;
@@ -180,8 +203,11 @@ static vfs_node_t *pnode_get(int pid, int kind, int arg, int thread,
             pn->thread == thread)
             break;
     if (!pn) {
+        if (pnode_count >= PNODE_MAX) pnode_sweep(1);
+        if (pnode_count >= PNODE_MAX) return NULL;   /* all in use */
         pn = (pnode_t *)kmalloc(sizeof(*pn));
         if (!pn) return NULL;
+        pnode_count++;
         memset(pn, 0, sizeof(*pn));
         pn->pid = pid;
         pn->kind = (uint8_t)kind;
@@ -216,6 +242,7 @@ static vfs_node_t *pnode_get(int pid, int kind, int arg, int thread,
         pn->next = pnodes;
         pnodes = pn;
     }
+    pn->used_tick = now;
     /* Ownership follows the task's credentials as they are now. */
     uint32_t uid, gid;
     pp_owner(thread ? t : pp_leader(t), &uid, &gid);

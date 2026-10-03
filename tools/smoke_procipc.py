@@ -148,6 +148,10 @@ def check_ipc(g):
     # queues, message queues, shm) and the system stays usable.
     out = g.run("/abiprobes/p48_ipc_limits", timeout=300)
     expect(out, r"^PASS p48_ipc_limits$", "IPC/inotify limits probe")
+    # /proc fd/fdinfo nodes go once the fds close; inotify accounting buckets
+    # do not drift when a spilled user later gets a slot.
+    out = g.run("/abiprobes/p49_accounting", timeout=150)
+    expect(out, r"^PASS p49_accounting$", "accounting probe")
     out = g.run("cat /proc/sys/fs/inotify/queued_bytes")
     expect(out, r"^0$", "no inotify event memory left behind")
     out = g.run("cat /proc/sysvipc/shm | toybox wc -l")
