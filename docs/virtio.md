@@ -151,11 +151,21 @@ IRQ 11 (the e1000 is eth0, virtio-net eth1).
 ### Throughput
 
 50 MiB over TCP between the guest (`sockprobe bulk`) and a host socket
-through QEMU user networking, under TCG (`make check`'s QEMU settings,
-`-m 128M`, one CPU), timed by the guest's monotonic clock. Each is the
-median of five interleaved runs on the same host:
+through QEMU user networking, under TCG (`make check`'s QEMU settings, no
+KVM, `-m 128M`, one CPU), timed by the guest's monotonic clock. Five
+interleaved rounds (`--bench-only` for each model in turn), QEMU 10.2:
 
-THROUGHPUT_TABLE
+| NIC | receive MB/s, median (range) | send MB/s, median (range) |
+|---|---|---|
+| virtio-net, MSI-X | 40.9 (24-55) | 44.0 (35-51) |
+| virtio-net, INTx | 49.2 (32-59) | 46.0 (39-63) |
+| virtio-net, legacy, MSI-X | 44.4 (20-58) | 39.4 (30-55) |
+| e1000 | 49.7 (24-53) | 47.2 (37-56) |
+| RTL8139 | 45.8 (21-49) | 50.4 (47-61) |
+
+(MB = 10^6 bytes. The host was shared with other QEMU jobs, hence the wide
+ranges; a quiet run of `make smoke-net-virtio` typically prints 54-62 MB/s
+both ways for virtio-net, and `--bench-only e1000` about 52/58.)
 
 All four NICs land at about the same rate. Under TCG through slirp the
 bottleneck is the guest's TCP/IP stack and the copies, not the device
@@ -168,7 +178,9 @@ does not use.
 - One queue pair. No offloads, so no TSO/GSO and no checksum offload.
   No EVENT_IDX, so notification suppression is the flag kind only.
 - One MSI-X vector per device, to the BSP. Interrupts are not spread over
-  CPUs.
+  CPUs. The vector cannot tell a queue interrupt from a configuration
+  change, so after each one the next poll re-reads the link status (one
+  device-configuration read; cheap under TCG, a VM exit under KVM).
 - A memory BAR above 4 GiB cannot be mapped (`mmio_map` takes 32-bit
   addresses). Such a modern device is then tried as legacy, if it is
   transitional.
