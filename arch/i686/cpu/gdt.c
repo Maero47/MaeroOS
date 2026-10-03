@@ -29,6 +29,8 @@ typedef struct {
  */
 static gdt_entry_t gdt[MAX_CPUS][8];
 static gdt_ptr_t   gdt_ptr[MAX_CPUS];
+_Static_assert(sizeof(gdt[0]) == GDT_PERCPU_BYTES, "gdt.h GDT_PERCPU_BYTES");
+const uint32_t gdt_percpu_base = (uint32_t)&gdt[0][0];
 
 /* Defined in gdt_flush.asm */
 extern void gdt_flush(gdt_ptr_t *ptr);

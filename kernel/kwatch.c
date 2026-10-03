@@ -94,7 +94,8 @@ static const char *sys_name(int nr) {
  */
 static void describe_chan(void *chan, struct proc *waiter) {
     if (!chan) return;
-    if (chan == (void *)&io_activity) { printk(" poll/io"); return; }
+    if (chan == (void *)&io_activity) { printk(" io"); return; }
+    if (chan == (void *)&io_poll_chan) { printk(" poll"); return; }
     if (waiter->futex_wait) {
         printk(" futex%s", waiter->futex_shared ? "(shared)" : "");
         return;

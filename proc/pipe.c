@@ -53,7 +53,7 @@ int pipe_read(pipe_buf_t *p, char *buf, int len, int nonblock) {
     p->head   = (p->head + (uint32_t)take) % PIPE_BUF_SIZE;
     p->count -= (uint32_t)take;
     wake_up(p);   /* wake any blocked writers */
-    io_wake();
+    io_wake_poll();
     return take;
 }
 
@@ -90,7 +90,7 @@ int pipe_write(pipe_buf_t *p, const char *buf, int len, int nonblock) {
         n        += put;
         p->count += (uint32_t)put;
         wake_up(p);   /* wake any blocked readers */
-        io_wake();
+        io_wake_poll();
     }
     return n;
 }
@@ -112,17 +112,17 @@ static void pipe_try_free(pipe_buf_t *p) {
 void pipe_close_read(pipe_buf_t *p) {
     p->nreaders--;
     wake_up(p);       /* wake writers — they'll get EPIPE */
-    io_wake();        /* wake pollers/select waiting on POLLERR (nreaders==0) */
+    io_wake_poll();        /* wake pollers/select waiting on POLLERR (nreaders==0) */
     pipe_try_free(p);
 }
 
 void pipe_close_write(pipe_buf_t *p) {
     p->nwriters--;
     wake_up(p);       /* wake readers — they'll get EOF */
-    io_wake();        /* wake pollers/select: nwriters==0 → POLLHUP/EOF readable.
-                       * Pollers sleep on the global io_activity channel, not on
-                       * this pipe, so wake_up(p) alone would not rouse them until
-                       * their poll-timeout re-check. */
+    io_wake_poll();   /* wake pollers/select: nwriters==0 → POLLHUP/EOF readable.
+                       * Pollers sleep on the poll channel, not on this pipe,
+                       * so wake_up(p) alone would not rouse them until their
+                       * poll-timeout re-check. */
     pipe_try_free(p);
 }
 

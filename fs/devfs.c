@@ -561,7 +561,7 @@ static uint32_t pty_buf_read(pty_pair_t *p, int from_slave,
     }
     *count -= take;
     wake_up(p);
-    io_wake();
+    io_wake_poll();
     return n;
 }
 
@@ -587,8 +587,12 @@ static uint32_t pty_buf_write(pty_pair_t *p, int to_slave,
         uint32_t tail = (*head + *count) % PTY_BUF_SIZE;
         ring[tail] = buf[n++];
         (*count)++;
-        wake_up(p);
-        io_wake();
+        /* Wake the reader once the ring is full or the write is done, not
+         * per byte: each wake is a scan of the whole ptable. */
+        if (*count == PTY_BUF_SIZE || n == len) {
+            wake_up(p);
+            io_wake_poll();
+        }
     }
     return n;
 }

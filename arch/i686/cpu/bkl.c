@@ -1,6 +1,7 @@
 #include "percpu.h"
 #include "apic.h"
 #include "spinlock.h"
+#include "gdt.h"
 #include <stdint.h>
 
 struct cpu cpus[MAX_CPUS];
@@ -45,6 +46,23 @@ static inline uint32_t apic_to_cpu(uint32_t apicid) {
     return idx < MAX_CPUS ? idx : 0;
 }
 
+/*
+ * Once several CPUs run, the LAPIC read is cheap on average under KVM's APIC
+ * virtualisation but costs 100-150 ns as soon as CPUs contend (docs/smp-plan.md
+ * 3.4), and a stat touches current_proc dozens of times.  Every CPU loads its
+ * own GDT (gdt.c, gdt[cpu]), so the base `sgdt` reports names the CPU without
+ * leaving the guest.  An AP still on the trampoline GDT (before gdt_init_ap)
+ * falls back to the LAPIC.
+ */
+static inline int cpu_from_gdt(void) {
+    struct { uint16_t limit; uint32_t base; } __attribute__((packed)) d;
+    __asm__ volatile("sgdt %0" : "=m"(d));
+    uint32_t off = d.base - gdt_percpu_base;
+    if (off < MAX_CPUS * GDT_PERCPU_BYTES && off % GDT_PERCPU_BYTES == 0)
+        return (int)(off / GDT_PERCPU_BYTES);
+    return -1;
+}
+
 uint32_t this_cpu_id(void) {
     if (!apic_available()) return 0;
     if (!g_multi_cpu) {
@@ -54,6 +72,8 @@ uint32_t this_cpu_id(void) {
         }
         return g_solo_id;
     }
+    int c = cpu_from_gdt();
+    if (c >= 0) return (uint32_t)c;
     return apic_to_cpu(apic_id());
 }
 
@@ -161,6 +181,17 @@ static int bst_reason(const registers_t *r) {
  * Saving and restoring the caller's IF (rather than a bare cli/sti) keeps the
  * exception path's interrupts-enabled behaviour intact everywhere else.
  */
+/* Test-and-test-and-set: wait on a plain read until the lock looks free and
+ * only then retry the locked exchange.  Spinning on xchg itself pulls the
+ * lock's cache line exclusive on every iteration, which bounces it between
+ * all waiters and slows the holder down (docs/smp-plan.md 3.4: 2-3x on SMP4). */
+static inline void bkl_spin_wait(void) {
+    do {
+        tlb_serve_pending();
+        __asm__ volatile("pause");
+    } while (g_bkl.locked);
+}
+
 static void bkl_enter_reason(int reason) {
     if (!apic_available()) return;
     uint32_t fl;
@@ -173,10 +204,8 @@ static void bkl_enter_reason(int reason) {
         if (!spin_trylock(&g_bkl)) {
             uint64_t t = bst_rdtsc();
             int holder = g_holder_reason;
-            while (!spin_trylock(&g_bkl)) {
-                tlb_serve_pending();
-                __asm__ volatile("pause");
-            }
+            while (!spin_trylock(&g_bkl))
+                bkl_spin_wait();
             uint64_t dt = bst_rdtsc() - t;
             struct bkl_cnt *k = &g_cnt[id];
             k->contended++;
@@ -196,10 +225,8 @@ static void bkl_enter_reason(int reason) {
          * wait: a CPU spinning here has interrupts off, so it can't take the
          * shootdown IPI — without this it could never flush and the sender
          * would wait forever (deadlock). */
-        while (!spin_trylock(&g_bkl)) {
-            tlb_serve_pending();
-            __asm__ volatile("pause");
-        }
+        while (!spin_trylock(&g_bkl))
+            bkl_spin_wait();
 #endif
     }
 #ifdef BKLSTAT

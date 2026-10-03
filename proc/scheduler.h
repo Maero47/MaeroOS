@@ -23,6 +23,9 @@ void sched_make_runnable(struct proc *p);
 /* ... and, called from a syscall, have the caller yield to it at the syscall's
  * exit (futex wake, wake_up_n: a targeted hand-off). */
 void sched_make_runnable_sync(struct proc *p);
+/* Wake an idle CPU for a thread just made RUNNABLE directly (fork, clone,
+ * kthread creation). */
+void sched_kick_idle(void);
 
 /* Return-to-user point of an IRQ or exception: switch away if this CPU's
  * need_resched is set and the trap came from ring 3 (from_user). */
@@ -59,12 +62,18 @@ int wake_up_n(void *chan, int n);
 int wake_up_n_tgid(void *chan, int n, int tgid);
 
 /*
- * Global I/O-activity channel: producers (pipes, PTYs, input drivers, NIC
- * RX) call io_wake() so blocked poll/select sleepers re-check readiness
- * immediately instead of tick-polling.
+ * Global I/O-activity channel: producers (input drivers, NIC RX, sockets,
+ * audio) call io_wake() so knetd, socket waits and blocked poll/select
+ * sleepers re-check readiness immediately instead of tick-polling.
+ * Producers whose only other waiters sleep on the object itself (pipes,
+ * eventfds, ptys) call io_wake_poll(), which wakes poll/select/epoll alone.
+ * io_poll_sleep() is the poll/select/epoll sleep (returns sleep_on's value).
  */
 void io_wake(void);
+void io_wake_poll(void);
+int  io_poll_sleep(void);
 extern int io_activity;   /* sleep channel: sleep_on(&io_activity) */
+extern int io_poll_chan;  /* where io_poll_sleep() sleeps (kwatch names it) */
 
 /*
  * Suppress/allow PIT preemption of the current process (nests).  Hold around

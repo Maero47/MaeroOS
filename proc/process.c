@@ -331,6 +331,7 @@ struct proc *proc_create_kthread(void (*fn)(void), const char *name) {
     p->sleep_chan = NULL;
     p->wake_tick  = 0;
     p->state      = PROC_RUNNABLE;
+    sched_kick_idle();
     return p;
 }
 

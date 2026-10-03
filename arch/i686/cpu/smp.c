@@ -10,6 +10,7 @@
 #include "../../../mm/kstack.h"
 #include <kernel/config.h>
 #include "../../../proc/scheduler.h"
+#include "../../../proc/process.h"
 #include "pit.h"
 #include "../../../drivers/acpi.h"
 #include <stddef.h>
@@ -97,22 +98,20 @@ static void tlb_ipi_to(uint32_t apicid) {
  * idling, and both loops call tlb_serve_pending(); every trap entry serves as
  * well.  The LAPIC coalesces a same-vector edge IPI that arrives while one is
  * still pending, so a slow target is re-sent the IPI periodically instead. */
-void tlb_shootdown(void) {
-    if (!apic_available() || g_cpu_count < 2) return;
-    uint32_t self = this_cpu_id();
+static void tlb_shootdown_targets(const int *target) {
     uint32_t want[MAX_CPUS];
-    int      target[MAX_CPUS];
+    int any = 0;
     g_tlb_sends++;
 
-    for (uint32_t id = 0; id < MAX_CPUS; id++) {
-        target[id] = id != self && cpus[id].online;
-        if (target[id])
+    for (uint32_t id = 0; id < MAX_CPUS; id++)
+        if (target[id]) {
             want[id] = __sync_add_and_fetch(&cpus[id].tlb_req_gen, 1);
-    }
+            any = 1;
+        }
+    if (!any) return;
 
-    /* IPI all-excluding-self, fixed delivery, edge, vector TLB_IPI_VECTOR. */
-    apic_write(LAPIC_REG_ICR_HI, 0);
-    apic_write(LAPIC_REG_ICR_LO, TLB_IPI_VECTOR | (1U << 14) | (3U << 18));
+    for (uint32_t id = 0; id < MAX_CPUS; id++)
+        if (target[id]) tlb_ipi_to(cpus[id].apicid);
 
     for (uint32_t id = 0; id < MAX_CPUS; id++) {
         if (!target[id]) continue;
@@ -136,6 +135,53 @@ void tlb_shootdown(void) {
         }
         g_tlb_acks++;
     }
+}
+
+void tlb_shootdown(void) {
+    if (!apic_available() || g_cpu_count < 2) return;
+    uint32_t self = this_cpu_id();
+    int target[MAX_CPUS];
+    for (uint32_t id = 0; id < MAX_CPUS; id++)
+        target[id] = id != self && cpus[id].online;
+    tlb_shootdown_targets(target);
+}
+
+/*
+ * The same for a change to the user half of ONE address space, the page
+ * directory at physical `pgdir_phys` (docs/smp-plan.md stage 1f).  Only CPUs
+ * whose current thread runs on that directory can cache its user entries:
+ *
+ *  - user pages are never global, and the scheduler loads the kernel pgdir
+ *    every time a thread switches out (scheduler_start), so a CPU that is
+ *    idle, in its scheduler loop, or running another address space has none;
+ *  - cpus[c].proc stays set while that thread is in the kernel (spinning for
+ *    the BKL in a trap, say), so such a CPU is still a target;
+ *  - every write of cpus[c].proc and the CR3 load that goes with it happens
+ *    under the BKL, which the caller holds, so the set cannot change while we
+ *    look at it.  A CPU that dispatches a thread of this address space after
+ *    we release the lock loads CR3 and starts with a clean TLB.
+ *
+ * Before this, each munmap of a single-threaded process interrupted every
+ * other CPU and waited for all of them (mmap+munmap holds grew 8x on SMP4).
+ */
+void tlb_shootdown_mm(uint32_t pgdir_phys) {
+    if (!apic_available() || g_cpu_count < 2) return;
+    if (!pgdir_phys || pgdir_phys == kernel_pgdir_phys) { tlb_shootdown(); return; }
+    uint32_t self = this_cpu_id();
+    int target[MAX_CPUS];
+    for (uint32_t id = 0; id < MAX_CPUS; id++) {
+        struct proc *p = cpus[id].proc;
+        target[id] = id != self && cpus[id].online && p && p->pgdir_phys == pgdir_phys;
+    }
+    tlb_shootdown_targets(target);
+}
+
+/* The active address space: every caller changed it through the recursive
+ * page-table mapping, which only reaches the directory in CR3. */
+void tlb_shootdown_user(void) {
+    uint32_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    tlb_shootdown_mm(cr3);
 }
 
 /* ── timing ─────────────────────────────────────────────────────────────── */

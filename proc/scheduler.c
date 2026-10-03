@@ -68,6 +68,7 @@ extern void swtch(struct context **old, struct context *new_ctx);
 #define SCHED_SLICE_NS      4000000ULL   /* 4 ms; the 100 Hz tick rounds up   */
 #define SCHED_SLEEP_CREDIT  3000000ULL   /* sleeper bonus (CFS: latency / 2)  */
 #define SCHED_WAKEUP_GRAN    500000ULL   /* lead needed to preempt on wakeup  */
+#define SCHED_IDLE_RESCAN   10U          /* PIT ticks between idle rescans    */
 #define RESCHED_IPI_VECTOR  0xFCU
 
 /* Linux sched_prio_to_weight: nice 0 = 1024, each step ~1.25x. */
@@ -123,8 +124,22 @@ static void resched_ipi(uint32_t c) {
 static void resched_cpu(uint32_t c) {
     if (cpus[c].need_resched) return;
     cpus[c].need_resched = 1;
-    if (c != this_cpu_id() && !(cpus[c].idle && c != 0))
+    if (c != this_cpu_id())
         resched_ipi(c);
+}
+
+/* A thread was made RUNNABLE outside sched_make_runnable (fork, clone, a new
+ * kernel thread): wake one idle CPU to take it.  Idle CPUs halt until kicked
+ * (scheduler_start), so without this the child would wait for the idle
+ * rescan.  Nothing is preempted; the caller holds the BKL. */
+void sched_kick_idle(void) {
+    uint32_t ncpu = smp_cpu_count();
+    if (ncpu > MAX_CPUS) ncpu = MAX_CPUS;
+    for (uint32_t c = 0; c < ncpu; c++)
+        if ((cpus[c].online || c == 0) && cpus[c].idle && !cpus[c].need_resched) {
+            resched_cpu(c);
+            return;
+        }
 }
 
 /* p was just made RUNNABLE (caller holds the BKL).  Place it and preempt
@@ -297,36 +312,31 @@ void scheduler_start(void) {
         /* Nothing runnable: halt until the next interrupt (PIT tick, key,
          * IRQ, reschedule IPI) instead of spinning — drops host CPU to ~0 when
          * idle.  RELEASE the Big Kernel Lock first so the other CPU(s) and the
-         * waking IRQ can run kernel code; re-acquire on wake before re-scanning
-         * the shared ptable.  `idle` is published under the lock, so a waker
-         * (which holds it) either sees it and kicks us, or ran before our scan
-         * and we found its thread. */
+         * waking IRQ can run kernel code; re-acquire only once there is work.
+         * `idle` is published under the lock, so a waker (which holds it)
+         * either sees it and kicks us (need_resched + a reschedule IPI, also
+         * to an idle AP), or ran before our scan and we found its thread.
+         *
+         * The halt loop stays off the lock (docs/smp-plan.md stage 1c): while
+         * `idle` is set, this CPU's LAPIC tick and the reschedule IPI are
+         * acknowledged without the BKL (irq_idle_fast), so an idle CPU no
+         * longer spins with interrupts off behind whoever is in the kernel.
+         * Device IRQs and the BSP's PIT tick still take the lock and run
+         * their handlers; their wakes set need_resched.  Interrupts stay off
+         * from the need_resched test to the hlt (sti's one-instruction
+         * shadow), so a kick cannot slip in between and leave us halted.
+         * Every SCHED_IDLE_RESCAN ticks the loop rescans anyway, so a thread
+         * made runnable without a kick costs latency, never a hang. */
         int kp_old = kprof_switch(KPB_IDLE);
         uint64_t idle_t0 = clock_mono_ns();
         __asm__ volatile("cli");
         me->idle = 1;
         bkl_release();
-        if (this_cpu_id() == 0) {
-            /* BSP: woken by the PIT/keyboard/IRQ (all routed here via the
-             * PIC→LINT0) or a reschedule IPI.  Interrupts stay off from the
-             * need_resched test to the hlt (sti's one-instruction shadow), so
-             * a kick cannot slip in between and leave us halted until the
-             * next tick. */
-            if (!me->need_resched)
-                __asm__ volatile("sti; hlt");
-            __asm__ volatile("sti");
-        } else {
-            /* AP: the PIC delivers only to the BSP, but the AP DOES have
-             * its own LAPIC timer (S6) and takes IPIs, so service any TLB
-             * shootdown while idling and spin-back-off before re-scanning
-             * the shared ptable for newly-runnable work — at once when a
-             * waker kicks us through need_resched. */
-            __asm__ volatile("sti");
-            for (volatile int i = 0; i < 200000 && !me->need_resched; i++) {
-                tlb_serve_pending();
-                __asm__ volatile("pause");
-            }
-        }
+        uint32_t idle_tick0 = pit_ticks();
+        while (!me->need_resched &&
+               (uint32_t)(pit_ticks() - idle_tick0) < SCHED_IDLE_RESCAN)
+            __asm__ volatile("sti; hlt; cli" ::: "memory");
+        __asm__ volatile("sti");
         bkl_acquire();
         me->idle = 0;
         add_ns(&sched_idle_us, &sched_idle_ns_rem, clock_mono_ns() - idle_t0);
@@ -603,8 +613,30 @@ void resched_on_return(void) {
 
 int io_activity;
 
+/* poll/select/epoll sleep here, not on io_activity (docs/smp-plan.md stage
+ * 1d).  Pipes, eventfds and ptys wake their own blocked readers and writers
+ * on the object itself; the only other party that cares about them is a
+ * poller, so their producers call io_wake_poll(), which leaves knetd, the
+ * audio threads and the socket waits on io_activity alone, and costs nothing
+ * while no one polls.  Before, every pipe read and write woke knetd, which
+ * then ran net_poll_all under the BKL on an idle CPU. */
+int io_poll_chan;
+static int io_pollers;
+
 void io_wake(void) {
     wake_up(&io_activity);
+    io_wake_poll();
+}
+
+void io_wake_poll(void) {
+    if (io_pollers) wake_up(&io_poll_chan);
+}
+
+int io_poll_sleep(void) {
+    io_pollers++;
+    int r = sleep_on(&io_poll_chan);
+    io_pollers--;
+    return r;
 }
 
 /* True iff the 4 bytes at user vaddr `a` are backed by a present page in the
