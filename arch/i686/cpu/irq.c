@@ -122,7 +122,7 @@ static void irq_handler_body(registers_t *regs) {
         return;
     }
 
-    /* ── MSI (vectors 0xE0-0xE3): edge-triggered messages to the LAPIC. */
+    /* ── MSI (vectors 0xE0-0xE7): edge-triggered messages to the LAPIC. */
     if (regs->int_no >= MSI_VECTOR_BASE &&
         regs->int_no < MSI_VECTOR_BASE + MSI_VECTORS) {
         isr_handler_t h = msi_handlers[regs->int_no - MSI_VECTOR_BASE];

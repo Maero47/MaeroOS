@@ -329,7 +329,7 @@ keyboard and mouse (`keyboard.c`, `mouse.c`), CMOS RTC (`rtc.c`) and 16550 seria
 USB (`drivers/usb/`): an xHCI host controller driver (`xhci.c`) whose kernel thread
 `kusbd` enumerates root-hub ports, USB 2.0 hubs and USB 3 hubs (hot-plug included,
 hub ports looked at when the hub's status-change endpoint reports) and sleeps until
-the controller interrupts: MSI-X or MSI to the BSP's Local APIC (vectors 0xE0-0xE3,
+the controller interrupts: MSI-X or MSI to the BSP's Local APIC (vectors 0xE0-0xE7,
 `arch/i686/cpu/irq.c`), else the PCI INTx line through the PIC, shared, with
 interrupter moderation (at most one interrupt per 250 us) and a 500 ms fallback poll;
 `xhci=poll` / `xhci=intx` on the command line force the older modes. HID (`usb_hid.c`)
