@@ -16,6 +16,11 @@
  *
  * `fsprobe rename OLD NEW` instead makes one raw rename(2) and prints
  * "rename: 0" or "rename: -ERRNO" (mv would hide EXDEV by copying).
+ *
+ * `fsprobe mkfiles DIR N` creates DIR/f1 .. DIR/fN (empty) and `fsprobe
+ * lookups DIR N` stat()s each of them and as many names that do not exist;
+ * both print how long that took ("lookups: 20000 in 812 ms, 40 us each"),
+ * for smoke-ext4rw's directory index timings.
  */
 #include "../include/errno.h"
 #include "../include/fcntl.h"
@@ -24,6 +29,8 @@
 #include "../include/syscall.h"
 #include "../include/sys/mman.h"
 #include "../include/sys/stat.h"
+#include "../include/stdlib.h"
+#include "../include/time.h"
 #include "../include/unistd.h"
 
 static int fails;
@@ -243,7 +250,40 @@ static void check_mmap_after_write(const char *path) {
     unlink(path);
 }
 
+static unsigned now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned)ts.tv_sec * 1000u + (unsigned)(ts.tv_nsec / 1000000);
+}
+
+/* mkfiles / lookups (see the top): 0, or 1 when a step failed. */
+static int dir_timing(const char *op, const char *dir, int n) {
+    char path[256];
+    struct stat st;
+    int bad = 0, ops = 0;
+    unsigned t0 = now_ms();
+    for (int i = 1; i <= n; i++) {
+        snprintf(path, sizeof(path), "%s/f%d", dir, i);
+        if (strcmp(op, "mkfiles") == 0) {
+            int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+            if (fd < 0) bad++; else close(fd);
+            ops++;
+        } else {
+            if (stat(path, &st) != 0) bad++;
+            snprintf(path, sizeof(path), "%s/missing%d", dir, i);
+            if (stat(path, &st) == 0) bad++;
+            ops += 2;
+        }
+    }
+    unsigned ms = now_ms() - t0;
+    printf("%s: %d in %u ms, %u us each, %d failed\n", op, ops, ms,
+           ops ? ms * 1000u / (unsigned)ops : 0u, bad);
+    return bad != 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 4 && (strcmp(argv[1], "mkfiles") == 0 || strcmp(argv[1], "lookups") == 0))
+        return dir_timing(argv[1], argv[2], atoi(argv[3]));
     if (argc == 4 && strcmp(argv[1], "rename") == 0) {
         int r = syscall2(38, (int)argv[2], (int)argv[3]);
         printf("rename: %d\n", r);

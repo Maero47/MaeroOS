@@ -30,6 +30,11 @@ vfs_node_t *ext2_mount(uint32_t lba_offset, uint32_t nsect);
  */
 int ext2_mount_dev(blkpart_t *bp, int ro, vfs_node_t **root, ext2_fs_t **fs);
 
+/* /proc/mounts type of /disk: "ext2", "ext3" or "ext4". */
+const char *ext2_boot_fstype(void);
+/* reboot(2)/poweroff: an ext3/ext4 /disk committed and marked clean. */
+void ext2_shutdown(void);
+
 /* sync(2)/fsync(2): commit the journal of every ext3/ext4 instance. */
 void ext2_sync_all(void);
 

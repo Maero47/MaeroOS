@@ -32,6 +32,24 @@ see the data, the superblocks are clean without needs_recovery; sdd's
 journal holds the guest's transaction and e2fsck replays it (e2fsprogs
 accepts the descriptor, tag and commit checksums written here); a copy of it
 is booted again and this driver replays its own log at mount.
+
+Directory index and orphans:
+
+  nvme0n2  mkfs.ext4 defaults, 40000 inodes: a new directory grows to 5000
+           names and becomes indexed (debugfs htree, e2fsck -fn); a 10000-name
+           one is created and looked up with `fsprobe mkfiles/lookups`
+           (timings printed); then a truncate of a fragmented file loses
+           power between two of its commits (-o x4crashtrunc)
+  nvme0n3  the same without dir_index: the 10000-name directory stays linear,
+           for comparison
+  sdd      a file held open and unlinked before the power loss: an orphan in
+           the orphan file
+  sde      made without orphan_file, so the half-freed file of the
+           x4crashunlink case is on the old s_last_orphan list
+
+A second boot mounts copies of sdd, sde and nvme0n2 read-write: the driver
+replays each journal and then finishes the orphans (deletes the unlinked
+files, cuts the truncated one to its new size); e2fsck -fn is clean after.
 """
 import hashlib
 import os
@@ -246,13 +264,24 @@ def build_images():
     os.makedirs(src)
     with open(os.path.join(src, "keep.txt"), "wb") as f:
         f.write(b"kept\n")
+    with open(os.path.join(src, "held.bin"), "wb") as f:
+        f.write(bytes((i * 13) & 0xFF for i in range(256 * 1024)))
     run(MKE2FS, "-q", "-F", "-t", "ext4", "-L", "ext4d", "-d", src, d_img, "64M")
     journal_csum_v3(d_img)
+    info["d_held_ino"] = int(re.search(r"Inode:\s*(\d+)", debugfs(d_img, "stat /held.bin")).group(1))
 
     e_img = os.path.join(OUT, "e.img")
-    run(MKE2FS, "-q", "-F", "-t", "ext4", "-L", "ext4e", e_img, "64M")
+    run(MKE2FS, "-q", "-F", "-t", "ext4", "-O", "^orphan_file", "-L", "ext4e", e_img, "64M")
     journal_csum_v3(e_img)
     info["e_img"] = e_img
+
+    g_img = os.path.join(OUT, "g.img")
+    run(MKE2FS, "-q", "-F", "-t", "ext4", "-N", "40000", "-L", "ext4g", g_img, "256M")
+    journal_csum_v3(g_img)
+    info["g_img"] = g_img
+    h_img = os.path.join(OUT, "h.img")
+    run(MKE2FS, "-q", "-F", "-t", "ext4", "-O", "^dir_index", "-N", "40000", "-L", "ext4h", h_img, "256M")
+    info["h_img"] = h_img
 
     # 128-byte group descriptors: readable, never written by fs/ext2.c.
     f_img = os.path.join(OUT, "f.img")
@@ -456,14 +485,66 @@ def guest_tests(g, info):
           f"sde: power lost at the first commit inside unlink ({out.strip()[-200:]!r})")
 
     # simulated power loss after one commit
-    rc, out = g.sh("busybox mount -t ext4 -o x4crash /dev/sdd /mnt/d && "
-                   "echo crash-test > /mnt/d/crash.txt; busybox cat /mnt/d/crash.txt")
-    check("crash-test" in out, f"sdd: mounted with x4crash, file written ({out.strip()!r})")
+    # held.bin is open and unlinked when the power goes: an orphan.
+    rc, out = g.sh("busybox mount -t ext4 -o x4crash /dev/sdd /mnt/d && exec 3</mnt/d/held.bin && "
+                   "busybox rm /mnt/d/held.bin && echo crash-test > /mnt/d/crash.txt; "
+                   "busybox cat /mnt/d/crash.txt; busybox ls /mnt/d")
+    check("crash-test" in out and "held.bin" not in out,
+          f"sdd: mounted with x4crash, held.bin open and unlinked, file written ({out.strip()!r})")
+
+    dir_index_tests(g, info)
 
     rc, out = g.sh("echo at-poweroff > /mnt/a/at-poweroff.txt && echo at-poweroff > /mnt/b/at-poweroff.txt && "
                    "busybox grep -E \" /mnt/(a|b) \" /proc/mounts")
     check(rc == 0 and "/mnt/a ext4 rw" in out and "/mnt/b ext4 rw" in out,
           "sdb and nvme0n1 left mounted read-write for poweroff")
+
+
+def timing(out, op):
+    m = re.search(op + r": (\d+) in (\d+) ms, (\d+) us each, (\d+) failed", out)
+    return (int(m.group(2)), int(m.group(3)), int(m.group(4))) if m else None
+
+
+def dir_index_tests(g, info):
+    """nvme0n2: directories becoming indexed, lookup timings, a truncate cut
+    short by a power loss; nvme0n3 (no dir_index): the same timings."""
+    g.sh("busybox mkdir -p /mnt/g /mnt/h")
+    rc, out = g.sh("busybox mount -t ext4 /dev/nvme0n2 /mnt/g && busybox mount -t ext4 /dev/nvme0n3 /mnt/h")
+    check(rc == 0, f"mount nvme0n2 and nvme0n3 ({out.strip()!r})")
+    rc, out = g.sh("busybox mkdir /mnt/g/grow && fsprobe mkfiles /mnt/g/grow 5000 && "
+                   "busybox ls /mnt/g/grow | busybox wc -l", timeout=600.0)
+    check(rc == 0 and out.strip().endswith("5000"), f"nvme0n2: a new directory grows to 5000 names ({out.strip()[-200:]!r})")
+    rc, out = g.sh("cd /mnt/g/grow && busybox rm f17 f4000 && busybox mv f18 renamed-18 && "
+                   "busybox mv f19 /mnt/g/moved-19 && echo hi > f17 && busybox cat f17 renamed-18 /mnt/g/moved-19 && "
+                   "busybox ls | busybox wc -l && busybox ls -d f4000 2>&1")
+    check(rc != 0 and "hi" in out and "4998" in out.split() and "No such file" in out,
+          f"nvme0n2: unlink, rename, create in the indexed directory ({out.strip()[-200:]!r})")
+    res = {}
+    for m, name in (("/mnt/g", "indexed"), ("/mnt/h", "linear")):
+        rc, out = g.sh(f"busybox mkdir {m}/ten && fsprobe mkfiles {m}/ten 10000 && "
+                       f"fsprobe lookups {m}/ten 10000", timeout=1200.0)
+        mk, lk = timing(out, "mkfiles"), timing(out, "lookups")
+        check(rc == 0 and mk and lk and mk[2] == 0 and lk[2] == 0,
+              f"10000-name directory, {name}: created and looked up ({out.strip()[-300:]!r})")
+        res[name] = (mk, lk)
+        print(f"\n[SMOKE-EXT4RW] timing {name}: create 10000: {mk and mk[0]} ms; "
+              f"20000 lookups (10000 hits, 10000 misses): {lk and lk[0]} ms, {lk and lk[1]} us each")
+    info["timings"] = res
+    if res.get("indexed") and res.get("linear") and res["indexed"][1] and res["linear"][1]:
+        check(res["indexed"][1][0] * 3 < res["linear"][1][0],
+              f"lookups in the indexed directory are at least 3x faster ({res['indexed'][1][0]} vs "
+              f"{res['linear'][1][0]} ms)")
+    # Fragmented T (interleaved with U), then a truncate that loses power at
+    # its first step commit: an orphan with the new size.
+    rc, out = g.sh("cd /mnt/g && for i in $(busybox seq 1 200); do busybox cat /tmp/4k >> T; "
+                   "busybox cat /tmp/4k >> U; done && busybox sync && cd / && busybox umount /mnt/g && "
+                   "busybox umount /mnt/h", timeout=300.0)
+    check(rc == 0, f"nvme0n2: fragmented T written, both unmounted ({out.strip()[-200:]!r})")
+    at = smokelib.mark(g.log)
+    rc, out = g.sh("busybox mount -t ext4 -o x4smalltxn,x4crashtrunc /dev/nvme0n2 /mnt/g && "
+                   "busybox truncate -s 10000 /mnt/g/T; busybox ls -l /mnt/g/T")
+    check(re.search(r"nvme0n2: x4crash: stopped after committing transaction", "".join(g.log)[at:]) is not None,
+          f"nvme0n2: power lost at the first commit inside truncate ({out.strip()[-200:]!r})")
 
 
 def host_checks(a_img, b_img, c_img, d_img, info):
@@ -487,6 +568,7 @@ def host_checks(a_img, b_img, c_img, d_img, info):
         many = live_names(img, "/d1/many")
         check(len([n for n in many if re.fullmatch(r"f\d+", n)]) == 997 and "first" in many,
               f"debugfs: {name} /d1/many has 998 entries")
+        check(htree_levels(img, "/d1/many") == 0, f"debugfs: {name} /d1/many became an htree directory")
         check(debugfs_cat(img, "/victim.txt") == b"replacement\n", f"debugfs: {name} rename over existing")
         check(debugfs_cat(img, "/trunc.txt") == trunc_bytes(), f"debugfs: {name} truncated file")
         check(debugfs_cat(img, "/at-poweroff.txt") == b"at-poweroff\n",
@@ -520,8 +602,11 @@ def host_checks(a_img, b_img, c_img, d_img, info):
     e_img = info["e_img"]
     st = subprocess.run([DUMPE2FS, "-h", e_img], capture_output=True, text=True).stdout
     check("needs_recovery" in st, "sde: needs_recovery after the power loss inside unlink")
+    st = subprocess.run([DUMPE2FS, "-h", e_img], capture_output=True, text=True).stdout
+    check("orphan_file" not in st, "sde: made without orphan_file (the old orphan list)")
     r = subprocess.run([E2FSCK, "-fy", e_img], capture_output=True, text=True)
     bad = "Multiply-claimed" in r.stdout or re.search(r"Block bitmap differences:[^\n]*\+", r.stdout)
+    check("orphan" in r.stdout.lower(), f"sde: e2fsck finds the half-freed file on the orphan list\n{r.stdout[-800:]}")
     check("recovering journal" in r.stdout and not bad and r.returncode in (0, 1),
           f"sde: e2fsck replays; no block both free and in use, none claimed twice (rc={r.returncode})\n"
           f"{r.stdout[-1500:]}")
@@ -540,18 +625,43 @@ def host_checks(a_img, b_img, c_img, d_img, info):
     check(r.returncode in (0, 1) and "recovering journal" in r.stdout and "checksum" not in r.stdout.lower(),
           f"sdd: e2fsck replays the guest's journal (rc={r.returncode})\n{r.stdout[-1500:]}")
     check(debugfs_cat(d_img, "/crash.txt") == b"crash-test\n", "sdd: crash.txt there after the replay")
+    check("orphan" in r.stdout.lower(), f"sdd: e2fsck finds held.bin in the orphan file\n{r.stdout[-800:]}")
     r = subprocess.run([E2FSCK, "-fn", d_img], capture_output=True, text=True)
     check(r.returncode == 0, f"sdd: e2fsck -fn clean after the replay (rc={r.returncode})\n{r.stdout[-1500:]}")
 
 
-def second_boot(d2_img):
-    """Mount the power-lost sdd read-write: this driver replays its own log."""
+def host_checks_index(info):
+    g_img, h_img = info["g_img"], info["h_img"]
+    r = subprocess.run([E2FSCK, "-fy", g_img], capture_output=True, text=True)
+    check(r.returncode in (0, 1) and "recovering journal" in r.stdout,
+          f"nvme0n2: e2fsck replays the truncate's first commit (rc={r.returncode})\n{r.stdout[-1200:]}")
+    r = subprocess.run([E2FSCK, "-fn", g_img], capture_output=True, text=True)
+    check(r.returncode == 0, f"nvme0n2: e2fsck -fn clean (htree checked) (rc={r.returncode})\n{r.stdout[-1500:]}")
+    for d, n in (("/grow", 4998), ("/ten", 10000)):
+        check(htree_levels(g_img, d) == 0, f"debugfs: nvme0n2 {d} is an htree directory")
+        names = live_names(g_img, d)
+        check(len(names) == n + 2, f"debugfs: nvme0n2 {d} has {n} names ({len(names) - 2})")
+    grow = live_names(g_img, "/grow")
+    check("renamed-18" in grow and "f17" in grow and "f4000" not in grow and "f19" not in grow,
+          "debugfs: nvme0n2 /grow has the guest's unlink/rename/create")
+    r = subprocess.run([E2FSCK, "-fn", h_img], capture_output=True, text=True)
+    check(r.returncode == 0, f"nvme0n3: e2fsck -fn clean (rc={r.returncode})\n{r.stdout[-1500:]}")
+    check(htree_levels(h_img, "/ten") is None and len(live_names(h_img, "/ten")) == 10002,
+          "debugfs: nvme0n3 /ten (no dir_index) is linear with 10000 names")
+
+
+def second_boot(d2_img, e2_img, g2_img, info):
+    """Mount the power-lost sdd, sde and nvme0n2 read-write: this driver
+    replays its own log and finishes the orphans."""
     accel = ["-accel", "kvm"] if os.access("/dev/kvm", os.R_OK | os.W_OK) else ["-accel", "tcg"]
     proc = subprocess.Popen(
         ["qemu-system-i386", *smokelib.QEMU_DISPLAY, *accel, "-M", "q35",
          "-kernel", "kernel.elf", "-initrd", "initrd.tar",
          "-drive", "file=disk.img,format=raw,index=0,media=disk,snapshot=on",
          "-drive", f"file={d2_img},format=raw,index=1,media=disk",
+         "-drive", f"file={e2_img},format=raw,index=2,media=disk",
+         "-drive", f"file={g2_img},format=raw,if=none,id=nv",
+         "-device", "nvme,serial=ext4g2,drive=nv",
          "-serial", "stdio", "-m", "256M", "-no-reboot"],
         cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, bufsize=0)
@@ -568,8 +678,24 @@ def second_boot(d2_img):
         m = re.search(r"sdb: journal replayed: transactions (\d+)\.\.(\d+), (\d+) blocks", "".join(log))
         check(m is not None and int(m.group(3)) > 0,
               f"second boot: the driver replayed its own log ({m.group(0) if m else None})")
+        text = "".join(log)
+        check(re.search(r"sdb: orphans: 1 deleted, 0 truncated", text) is not None,
+              "second boot: sdd's unlinked-open held.bin deleted from the orphan file at mount")
         rc, out = g.sh("echo after-crash >> /mnt/d/crash.txt && busybox umount /mnt/d")
         check(rc == 0, "second boot: written and unmounted")
+        g.sh("busybox mkdir -p /mnt/e /mnt/g")
+        rc, out = g.sh("busybox mount -t ext4 /dev/sdc /mnt/e && busybox md5sum /mnt/e/B && busybox ls /mnt/e && "
+                       "busybox umount /mnt/e")
+        text = "".join(log)
+        check(rc == 0 and "A" not in out.split() and
+              re.search(r"sdc: orphans: 1 deleted, 0 truncated", text) is not None,
+              f"second boot: sde's half-freed A deleted from the old orphan list at mount ({out.strip()[-200:]!r})")
+        rc, out = g.sh("busybox mount -t ext4 /dev/nvme0n1 /mnt/g && busybox ls -l /mnt/g/T && "
+                       "busybox md5sum /mnt/g/T && busybox umount /mnt/g")
+        text = "".join(log)
+        check(rc == 0 and re.search(r"nvme0n1: orphans: 0 deleted, 1 truncated", text) is not None
+              and " 10000 " in out and hashlib.md5(b" " * 10000).hexdigest() in out,
+              f"second boot: nvme0n2's T cut to 10000 bytes at mount ({out.strip()[-300:]!r})")
         smokelib.send(proc, "poweroff\n")
         deadline = time.time() + 60
         while proc.poll() is None and time.time() < deadline:
@@ -583,8 +709,13 @@ def second_boot(d2_img):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
-    r = subprocess.run([E2FSCK, "-fn", d2_img], capture_output=True, text=True)
-    check(r.returncode == 0, f"second boot: e2fsck -fn sdd clean (rc={r.returncode})\n{r.stdout[-1500:]}")
+    for name, img in (("sdd", d2_img), ("sde", e2_img), ("nvme0n2", g2_img)):
+        r = subprocess.run([E2FSCK, "-fn", img], capture_output=True, text=True)
+        check(r.returncode == 0, f"second boot: e2fsck -fn {name} clean (rc={r.returncode})\n{r.stdout[-1500:]}")
+    st = debugfs(d2_img, f"stat <{info['d_held_ino']}>")
+    check("held.bin" not in " ".join(live_names(d2_img, "/")) and re.search(r"Links: 0", st) and
+          re.search(r"dtime:", st) is not None, "second boot: sdd held.bin's inode is freed")
+    check(htree_levels(g2_img, "/grow") == 0, "second boot: nvme0n2 /grow still indexed")
     check(debugfs_cat(d2_img, "/crash.txt") == b"crash-test\nafter-crash\n",
           "second boot: debugfs sees crash.txt with the line added after the replay")
 
@@ -606,6 +737,10 @@ def main():
          "-drive", f"file={info['f_img']},format=raw,index=5,media=disk",
          "-drive", f"file={b_img},format=raw,if=none,id=nv",
          "-device", "nvme,serial=ext4rw,drive=nv",
+         "-drive", f"file={info['g_img']},format=raw,if=none,id=nvg",
+         "-device", "nvme,serial=ext4g,drive=nvg",
+         "-drive", f"file={info['h_img']},format=raw,if=none,id=nvh",
+         "-device", "nvme,serial=ext4h,drive=nvh",
          "-serial", "stdio", "-m", "512M", "-no-reboot"],
         cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, bufsize=0)
@@ -647,8 +782,16 @@ def main():
     # (host_checks), this driver the other (a second boot).
     d2_img = os.path.join(OUT, "d-guest.img")
     shutil.copyfile(d_img, d2_img)
+    e2_img = os.path.join(OUT, "e-guest.img")
+    shutil.copyfile(info["e_img"], e2_img)
+    g2_img = os.path.join(OUT, "g-guest.img")
+    shutil.copyfile(info["g_img"], g2_img)
     host_checks(a_img, b_img, c_img, d_img, info)
-    second_boot(d2_img)
+    host_checks_index(info)
+    second_boot(d2_img, e2_img, g2_img, info)
+    for name, (mk, lk) in info.get("timings", {}).items():
+        print(f"[SMOKE-EXT4RW] {name}: create 10000 names {mk and mk[0]} ms, "
+              f"20000 lookups {lk and lk[0]} ms ({lk and lk[1]} us each)")
 
     if failures:
         print(f"\n[SMOKE-EXT4RW] {len(failures)} check(s) failed:")

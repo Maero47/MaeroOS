@@ -287,11 +287,16 @@ struct ext2_fs {
     struct ext2_jnl    *j;           /* the journal, when one is written */
     int                 crash_test;  /* mount -o x4crash, see ext2_test_crash */
     int                 crash_unlink; /* mount -o x4crashunlink */
+    int                 crash_trunc;  /* mount -o x4crashtrunc */
     volatile int        lock;        /* ext2_lock: one changing operation at a time */
     int                 want_reclaim; /* ENOSPC with freed blocks awaiting commit */
     int                 no_step;     /* undoing: no step commits (ext2_jnl_due) */
     int                 nozero;      /* the block being allocated is about to be
                                       * written whole: no need to clear it */
+    uint32_t            dx_bad;      /* htree indexes found unusable (log limit) */
+    uint32_t            orphan_ino;  /* the orphan file's inode, 0: none in use */
+    uint32_t            orphans;     /* entries this mount put into it */
+    uint32_t            trunc_ino, trunc_size;   /* see ext2_write_inode_step */
 };
 
 static inline ext2_cache_entry_t *ext2_cache_set(ext2_fs_t *fs, uint32_t blk) {
@@ -347,6 +352,8 @@ static int ext2_jnl_due(ext2_fs_t *fs);
 static void ext2_free_blocks_from(ext2_fs_t *fs, uint32_t ino, ext2_inode_t *inode,
                                   uint32_t from);
 static void ext2_jnl_step(ext2_fs_t *fs);
+static void ext2_write_inode_step(ext2_fs_t *fs, uint32_t ino, const ext2_inode_t *inode);
+static void ext2_sync_fs(ext2_fs_t *fs);
 
 /* Operations that change an ext3/ext4 instance run one at a time, and the
  * journal flusher runs between them: the running transaction is shared
@@ -1779,7 +1786,7 @@ static int x4_ext_free_from(ext2_fs_t *fs, uint32_t ino, ext2_inode_t *inode, ui
         x4_rebuild(fs, ino, inode, &l, 0);
         x4_list_free(&l);
         if (!stepped) break;
-        if (ext2_write_inode(fs, ino, inode) < 0) break;
+        ext2_write_inode_step(fs, ino, inode);
         ext2_jnl_step(fs);
         if (fs->ro) break;
     }
@@ -2496,6 +2503,165 @@ static uint32_t x4_dx_find(const uint8_t *buf, uint32_t count_off, uint32_t hash
     return at;
 }
 
+/* ── htree lookup ─────────────────────────────────────────────────────────────
+ * A name's hash picks one entry per index level (binary search for the last
+ * entry whose hash is <= it) down to a leaf; when the name is not there and
+ * the next index entry starts at the same hash (a collision run split across
+ * leaves; the low bit of that hash marks it), the next leaf is searched too,
+ * stepping up the path as far as needed (Linux's htree_next_block).  Up to
+ * two interior levels with largedir, one without.  An index that does not
+ * hold together (bad root info, counts, block numbers past the directory, an
+ * interior block that is not one) is not trusted: the caller scans the
+ * directory linearly, and the filesystem is marked as having errors so the
+ * next fsck looks at it, as Linux does. */
+#define EXT2_COMPAT_DIR_INDEX 0x0020u
+#define EXT2_ERROR_FS         0x0002u   /* s_state: errors detected */
+
+static int x4_dx_usable(ext2_fs_t *fs, const ext2_inode_t *d) {
+    return (d->i_flags & EXT2_INDEX_FL) && (fs->compat & EXT2_COMPAT_DIR_INDEX) &&
+           d->i_size >= 2 * fs->st.block_size;
+}
+
+static void x4_dx_bad(ext2_fs_t *fs, uint32_t dir_ino, const char *why) {
+    if (fs->dx_bad++ < 4)
+        printk("[EXT2]  %s: dir %u: htree index unusable (%s); scanned linearly, "
+               "run e2fsck\n", fs->name, (unsigned)dir_ino, why);
+    if (fs->x4 && !fs->ro && !(x4_rd16(fs->sb + 0x3A) & EXT2_ERROR_FS)) {
+        x4_wr16(fs->sb + 0x3A, (uint16_t)(x4_rd16(fs->sb + 0x3A) | EXT2_ERROR_FS));
+        fs->sb_dirty = 1;
+    }
+}
+
+/* Offset of `name` in a leaf block, or -1. */
+static int ext2_leaf_find(ext2_fs_t *fs, const uint8_t *b, const char *name, uint32_t nlen) {
+    uint32_t bs = fs->st.block_size;
+    for (uint32_t off = 0; off < bs; ) {
+        if (!ext2_de_ok(b, off, bs)) return -1;
+        const ext2_dirent_t *de = (const ext2_dirent_t *)(b + off);
+        if (de->inode && de->name_len == nlen && memcmp(de->name, name, nlen) == 0)
+            return (int)off;
+        off += de->rec_len;
+    }
+    return -1;
+}
+
+#define X4_DX_MAXLVL 3
+typedef struct {
+    uint8_t *buf[X4_DX_MAXLVL];
+    uint32_t eoff[X4_DX_MAXLVL], at[X4_DX_MAXLVL], count[X4_DX_MAXLVL];
+} x4_dxpath_t;
+
+/* Index level `lvl` of the path is in buf[lvl] with its entries at `eoff`:
+ * check count and limit and pick the entry for `hash`. */
+static int x4_dx_level(ext2_fs_t *fs, x4_dxpath_t *p, int lvl, uint32_t eoff, uint32_t hash) {
+    const uint8_t *b = p->buf[lvl];
+    uint32_t limit = x4_rd16(b + eoff), count = x4_rd16(b + eoff + 2);
+    if (!count || count > limit || eoff + limit * 8u > fs->st.block_size) return -1;
+    uint32_t lo = 1, hi = count;                  /* first entry > hash, in [1,count] */
+    while (lo < hi) {
+        uint32_t mid = (lo + hi) / 2;
+        if (x4_rd32(b + eoff + 8 * mid) > hash) hi = mid; else lo = mid + 1;
+    }
+    p->eoff[lvl] = eoff;
+    p->at[lvl] = lo - 1;
+    p->count[lvl] = count;
+    return 0;
+}
+
+static uint32_t x4_dx_child(const x4_dxpath_t *p, int lvl) {
+    return x4_rd32(p->buf[lvl] + p->eoff[lvl] + 8 * p->at[lvl] + 4) & 0x0FFFFFFFu;
+}
+
+/* Read interior block `lblk` into level `lvl`; -1 if it is not one. */
+static int x4_dx_read_node(ext2_fs_t *fs, const ext2_inode_t *d, x4_dxpath_t *p, int lvl,
+                           uint32_t lblk) {
+    uint32_t pb = ext2_file_blk(fs, (ext2_inode_t *)d, lblk);
+    if (!pb || ext2_read_block(fs, pb, p->buf[lvl]) < 0) return -1;
+    const ext2_dirent_t *de = (const ext2_dirent_t *)p->buf[lvl];
+    if (de->inode != 0 || de->rec_len != fs->st.block_size) return -1;
+    return 0;
+}
+
+/* 1: found (*ino, *ftype, *lblk_out set), 0: not in the directory,
+ * -1: the index cannot be used (the caller scans linearly), -2: no memory. */
+static int x4_dx_lookup(ext2_fs_t *fs, uint32_t dir_ino, const ext2_inode_t *d,
+                        const char *name, uint32_t nlen, uint32_t *ino, uint8_t *ftype,
+                        uint32_t *lblk_out) {
+    uint32_t bs = fs->st.block_size, nblk = d->i_size / bs;
+    x4_dxpath_t p;
+    memset(&p, 0, sizeof(p));
+    uint8_t *leaf = (uint8_t *)kmalloc(bs);
+    int rc = -2;
+    const char *why = "root";
+    for (int i = 0; i < X4_DX_MAXLVL; i++)
+        if (!(p.buf[i] = (uint8_t *)kmalloc(bs))) goto out;
+    if (!leaf) goto out;
+    rc = -1;
+    uint32_t rb = ext2_file_blk(fs, (ext2_inode_t *)d, 0);
+    if (!rb || ext2_read_block(fs, rb, p.buf[0]) < 0) goto out;
+    uint8_t *r = p.buf[0];
+    uint32_t version = r[0x1C], info_len = r[0x1D], levels = r[0x1E];
+    uint32_t maxlvl = (fs->incompat & 0x4000u) ? 2u : 1u;          /* largedir */
+    if (x4_rd32(r + 0x18) != 0 || info_len != 8 || levels > maxlvl || version > DX_HASH_TEA)
+        goto out;
+    uint32_t hash;
+    if (dx_hash(fs, version, name, nlen, &hash) < 0) goto out;
+    why = "index block";
+    if (x4_dx_level(fs, &p, 0, 0x18 + info_len, hash) < 0) goto out;
+    for (uint32_t lvl = 1; lvl <= levels; lvl++) {
+        uint32_t c = x4_dx_child(&p, (int)lvl - 1);
+        if (c == 0 || c >= nblk || x4_dx_read_node(fs, d, &p, (int)lvl, c) < 0 ||
+            x4_dx_level(fs, &p, (int)lvl, 8, hash) < 0)
+            goto out;
+    }
+    why = "leaf";
+    for (int hops = 0; hops < 64; hops++) {
+        uint32_t lb = x4_dx_child(&p, (int)levels);
+        uint32_t pb = (lb && lb < nblk) ? ext2_file_blk(fs, (ext2_inode_t *)d, lb) : 0;
+        if (!pb || ext2_read_block(fs, pb, leaf) < 0) goto out;
+        int off = ext2_leaf_find(fs, leaf, name, nlen);
+        if (off >= 0) {
+            const ext2_dirent_t *de = (const ext2_dirent_t *)(leaf + off);
+            *ino = de->inode;
+            if (ftype) *ftype = de->file_type;
+            if (lblk_out) *lblk_out = lb;
+            rc = 1;
+            goto out;
+        }
+        /* The next leaf in hash order, if the run of this hash goes on. */
+        int up = (int)levels;
+        while (up >= 0 && p.at[up] + 1 >= p.count[up]) up--;
+        if (up < 0) { rc = 0; goto out; }
+        p.at[up]++;
+        uint32_t nh = x4_rd32(p.buf[up] + p.eoff[up] + 8 * p.at[up]);
+        if ((nh & ~1u) != hash) { rc = 0; goto out; }
+        for (int lvl = up + 1; lvl <= (int)levels; lvl++) {
+            uint32_t c = x4_dx_child(&p, lvl - 1);
+            if (c == 0 || c >= nblk || x4_dx_read_node(fs, d, &p, lvl, c) < 0) goto out;
+            uint32_t limit = x4_rd16(p.buf[lvl] + 8), count = x4_rd16(p.buf[lvl] + 10);
+            if (!count || count > limit || 8 + limit * 8u > bs) goto out;
+            p.eoff[lvl] = 8; p.at[lvl] = 0; p.count[lvl] = count;
+        }
+    }
+out:
+    if (rc == -1) x4_dx_bad(fs, dir_ino, why);
+    for (int i = 0; i < X4_DX_MAXLVL; i++) if (p.buf[i]) kfree(p.buf[i]);
+    if (leaf) kfree(leaf);
+    return rc;
+}
+
+/* Through the index, when the directory has a usable one: 1 found, 0 not
+ * there; -1: scan linearly (not indexed, "." or "..", which live in the root
+ * block, or an index that failed). */
+static int ext2_dx_find(ext2_fs_t *fs, uint32_t dir_ino, const ext2_inode_t *d,
+                        const char *name, uint32_t *ino, uint8_t *ftype, uint32_t *lblk) {
+    uint32_t nlen = strlen(name);
+    if (!x4_dx_usable(fs, d) || nlen == 0 || nlen > 255) return -1;
+    if (name[0] == '.' && (nlen == 1 || (nlen == 2 && name[1] == '.'))) return -1;
+    int r = x4_dx_lookup(fs, dir_ino, d, name, nlen, ino, ftype, lblk);
+    return r >= 0 ? r : -1;
+}
+
 /* A new block at the end of the directory: its logical number, 0 on failure
  * (block 0 is the root, never new). */
 static uint32_t x4_dir_grow(ext2_fs_t *fs, uint32_t dir_ino, ext2_inode_t *d, uint32_t *pblk) {
@@ -2690,11 +2856,113 @@ out:
     return rc;
 }
 
+/* A linear directory whose one block is full becomes indexed (Linux's
+ * make_indexed_dir): every entry but "." and ".." moves into a new block 1,
+ * and block 0 becomes the htree root with one index entry pointing at it,
+ * hashed with the superblock's default hash.  The caller then adds the name
+ * through the index, which splits the leaf when it has no room.  New block
+ * first, then the root, then (the caller) the inode with the index flag; with
+ * a journal they are one transaction.  1: indexed, 0: left linear (block 0
+ * not laid out as expected), -1: an I/O or allocation failure. */
+static int x4_make_indexed(ext2_fs_t *fs, uint32_t dir_ino, ext2_inode_t *d) {
+    uint32_t bs = fs->st.block_size, end = ext2_dir_end(fs);
+    uint32_t version = fs->sb[0xFC];                    /* s_def_hash_version */
+    if (version > DX_HASH_TEA) version = DX_HASH_HALF_MD4;
+    if (d->i_size != bs || dx_root_limit(fs) < 2) return 0;
+    uint8_t *root = (uint8_t *)kmalloc(bs), *leaf = (uint8_t *)kmalloc(bs);
+    int rc = -1;
+    uint32_t rblk, newpb = 0;
+    if (!root || !leaf) goto out;
+    if (!(rblk = ext2_file_blk(fs, d, 0)) || ext2_read_block(fs, rblk, root) < 0) goto out;
+    rc = 0;
+    const ext2_dirent_t *dot = (const ext2_dirent_t *)root;
+    const ext2_dirent_t *dd = (const ext2_dirent_t *)(root + 12);
+    if (!ext2_de_ok(root, 0, end) || dot->rec_len != 12 || dot->name_len != 1 ||
+        dot->name[0] != '.' || !ext2_de_ok(root, 12, end) || dd->name_len != 2 ||
+        dd->name[0] != '.' || dd->name[1] != '.')
+        goto out;
+    /* The other entries, packed into the new leaf. */
+    memset(leaf, 0, bs);
+    uint32_t woff = 0, last = 0;
+    int any = 0;
+    for (uint32_t off = 12 + dd->rec_len; off < end; ) {
+        if (!ext2_de_ok(root, off, end)) goto out;
+        const ext2_dirent_t *src = (const ext2_dirent_t *)(root + off);
+        if (src->inode) {
+            uint32_t len = ext2_dir_rec_len(src->name_len);
+            if (woff + len > end) goto out;
+            ext2_dirent_t *dst = (ext2_dirent_t *)(leaf + woff);
+            dst->inode = src->inode;
+            dst->name_len = src->name_len;
+            dst->file_type = src->file_type;
+            memcpy(dst->name, src->name, src->name_len);
+            dst->rec_len = (uint16_t)len;
+            last = woff;
+            woff += len;
+            any = 1;
+        }
+        off += src->rec_len;
+    }
+    if (any) ((ext2_dirent_t *)(leaf + last))->rec_len = (uint16_t)(end - last);
+    else ((ext2_dirent_t *)leaf)->rec_len = (uint16_t)end;
+
+    rc = -1;
+    if (x4_dir_grow(fs, dir_ino, d, &newpb) != 1) goto undo;
+    /* The root: ".", ".." covering the rest, dx_root_info, one entry. */
+    ((ext2_dirent_t *)(root + 12))->rec_len = (uint16_t)(bs - 12);
+    memset(root + 0x18, 0, bs - 0x18);
+    root[0x1C] = (uint8_t)version;
+    root[0x1D] = 8;                                     /* info_length */
+    root[0x1E] = 0;                                     /* indirect_levels */
+    x4_wr16(root + 0x20, (uint16_t)dx_root_limit(fs));
+    x4_wr16(root + 0x22, 1);
+    x4_wr32(root + 0x24, 1);
+    d->i_flags |= EXT2_INDEX_FL;
+    if (ext2_write_dirblk(fs, dir_ino, d, newpb, leaf) < 0 ||
+        ext2_write_dirblk(fs, dir_ino, d, rblk, root) < 0) {
+        d->i_flags &= ~EXT2_INDEX_FL;
+        goto out;
+    }
+    rc = 1;
+    goto out;
+undo:
+    if (d->i_size > bs) {
+        d->i_size = bs;
+        fs->no_step = 1;
+        ext2_free_blocks_from(fs, dir_ino, d, 1);
+        fs->no_step = 0;
+    }
+out:
+    if (root) kfree(root);
+    if (leaf) kfree(leaf);
+    return rc;
+}
+
 static int ext2_add_dirent(ext2_fs_t *fs, uint32_t dir_ino, ext2_inode_t *dir_inode,
                             uint32_t child_ino, const char *name,
                             uint8_t file_type) {
     uint32_t name_len = strlen(name);
     if (name_len == 0 || name_len > 255) return -1;
+    if (fs->x4 && (fs->compat & EXT2_COMPAT_DIR_INDEX) &&
+        !(dir_inode->i_flags & EXT2_INDEX_FL) && dir_inode->i_size == fs->st.block_size) {
+        /* One block: index it if the name does not fit there any more. */
+        uint8_t *b = (uint8_t *)kmalloc(fs->st.block_size);
+        uint32_t pb = ext2_file_blk(fs, dir_inode, 0);
+        int full = 0;
+        if (b && pb && ext2_read_block(fs, pb, b) == 0) {
+            uint32_t end = ext2_dir_end(fs), need = ext2_dir_rec_len((uint8_t)name_len);
+            full = 1;
+            for (uint32_t off = 0; off < end; ) {
+                if (!ext2_de_ok(b, off, end)) { full = 0; break; }
+                ext2_dirent_t *de = (ext2_dirent_t *)(b + off);
+                uint32_t actual = de->inode ? ext2_dir_rec_len(de->name_len) : 0;
+                if (de->rec_len >= actual + need) { full = 0; break; }
+                off += de->rec_len;
+            }
+        }
+        if (b) kfree(b);
+        if (full && x4_make_indexed(fs, dir_ino, dir_inode) < 0) return -1;
+    }
     if (fs->x4 && (dir_inode->i_flags & EXT2_INDEX_FL)) {
         int r = x4_dx_add(fs, dir_ino, dir_inode, child_ino, name, name_len, file_type);
         if (r == 1) return ext2_write_inode(fs, dir_ino, dir_inode);
@@ -2775,13 +3043,18 @@ static int ext2_remove_dirent(ext2_fs_t *fs, uint32_t dir_ino, ext2_inode_t *dir
     /* Taking a name out of a leaf leaves an htree index valid. */
     if (!fs->x4) ext2_dir_unindex(fs, dir_ino, dir_inode);
     uint32_t end = ext2_dir_end(fs);
+    /* An indexed directory: only the leaf the index names. */
+    uint32_t first = 0, dx_ino = 0, dx_lblk = 0;
+    uint32_t max_blocks = dir_inode->i_size / fs->st.block_size +
+                          (dir_inode->i_size % fs->st.block_size != 0);
+    int dx = ext2_dx_find(fs, dir_ino, dir_inode, name, &dx_ino, (uint8_t *)0, &dx_lblk);
+    if (dx == 0) return -1;
+    if (dx == 1) { first = dx_lblk; max_blocks = dx_lblk + 1; }
 
     uint8_t *blk_buf = (uint8_t *)kmalloc(fs->st.block_size);
     if (!blk_buf) return -1;
 
-    uint32_t max_blocks = dir_inode->i_size / fs->st.block_size +
-                          (dir_inode->i_size % fs->st.block_size != 0);
-    for (uint32_t blk_idx = 0; blk_idx < max_blocks; blk_idx++) {
+    for (uint32_t blk_idx = first; blk_idx < max_blocks; blk_idx++) {
         uint32_t blk_num = ext2_file_blk(fs, dir_inode, blk_idx);
         if (!blk_num) continue;
         if (ext2_read_block(fs, blk_num, blk_buf) < 0) break;
@@ -3037,9 +3310,10 @@ static void ext2_free_inode_blocks(ext2_fs_t *fs, uint32_t ino, ext2_inode_t *in
  * descriptors, inherited fd tables, file-backed VMAs and the shared-mapping
  * registry.
  *
- * An orphan whose last reference is dropped by a reboot rather than a close
- * still leaks, exactly as it would on any filesystem without an on-disk orphan
- * list; recovering that needs fsck.  Table exhaustion degrades to the old
+ * On ext3/ext4 (x4) such an orphan is also recorded on disk (below), so one
+ * whose last reference is dropped by a crash rather than a close is deleted
+ * at the next read-write mount; plain ext2 keeps no orphan list (as Linux's
+ * ext2 driver) and leaks it until fsck.  Table exhaustion degrades to the old
  * behaviour (immediate release) rather than to a dangling inode. */
 
 
@@ -3061,17 +3335,239 @@ static void ext2_count_dir(ext2_fs_t *fs, uint32_t ino, int delta) {
     ext2_write_bgd(fs, grp, &bgd);
 }
 
+/* ── Orphans on disk ──────────────────────────────────────────────────────────
+ * An inode whose last name is gone while it is still open, one being deleted
+ * over several journal transactions, and a file being cut short over several
+ * of them are recorded on disk until that is finished, so a crash in between
+ * neither leaks nor half-frees them: in the orphan file (orphan_file: per
+ * block, an array of inode numbers closed by a magic and a crc32c of the
+ * block's number and contents seeded like the orphan file's inode), or, on a
+ * filesystem without one (or when it is full), in the old list that starts
+ * at s_last_orphan and goes on through each inode's i_dtime.  A read-write
+ * mount finishes whatever it finds there: an inode with no links left is
+ * deleted, one with links is cut to its i_size.  Layout from the kernel's
+ * Documentation/filesystems/ext4 (orphan file, "Orphan File"); the checksum
+ * was checked against what mke2fs 1.47 writes.  Every entry change goes into
+ * the running transaction with the rest of the operation. */
+#define SB_LAST_ORPHAN  0xE8
+#define SB_ORPHAN_INUM  0x280
+#define X4_SB_RO_COMPAT 0x64
+#define EXT2_COMPAT_ORPHAN_FILE       0x1000u
+#define EXT2_RO_COMPAT_ORPHAN_PRESENT 0x10000u
+#define X4_ORPHAN_MAGIC 0x0B10CA04u
+
+static void x4_orphan_csum(ext2_fs_t *fs, uint32_t gen, uint32_t pblk, uint8_t *b) {
+    uint32_t bs = fs->st.block_size;
+    x4_wr32(b + bs - 8, X4_ORPHAN_MAGIC);
+    if (!fs->csum) return;
+    uint8_t le[8];
+    x4_wr32(le, pblk);
+    x4_wr32(le + 4, 0);
+    uint32_t c = crc32c(x4_iseed(fs, fs->orphan_ino, gen), le, 8);
+    x4_wr32(b + bs - 4, crc32c(c, b, bs - 8));
+}
+
+static void x4_orphan_present(ext2_fs_t *fs, int on) {
+    uint32_t ro = x4_rd32(fs->sb + X4_SB_RO_COMPAT);
+    uint32_t want = on ? (ro | EXT2_RO_COMPAT_ORPHAN_PRESENT) : (ro & ~EXT2_RO_COMPAT_ORPHAN_PRESENT);
+    if (want == ro) return;
+    x4_wr32(fs->sb + X4_SB_RO_COMPAT, want);
+    fs->ro_compat = want;
+    fs->sb_dirty = 1;
+}
+
+/* The first orphan-file slot holding `find`, set to `repl`: 1, or 0 when
+ * there is none, -1 on an I/O error. */
+static int x4_orphan_slot(ext2_fs_t *fs, uint32_t find, uint32_t repl) {
+    ext2_inode_t oi;
+    if (ext2_read_inode(fs, fs->orphan_ino, &oi) < 0) return -1;
+    uint32_t bs = fs->st.block_size, nblk = oi.i_size / bs, per = (bs - 8) / 4;
+    uint8_t *b = (uint8_t *)kmalloc(bs);
+    if (!b) return -1;
+    int rc = 0;
+    for (uint32_t l = 0; l < nblk && !rc; l++) {
+        uint32_t pb = ext2_file_blk(fs, &oi, l);
+        if (!pb || ext2_read_block(fs, pb, b) < 0) { rc = -1; break; }
+        if (x4_rd32(b + bs - 8) != X4_ORPHAN_MAGIC) continue;   /* not ours to touch */
+        for (uint32_t i = 0; i < per; i++) {
+            if (x4_rd32(b + 4 * i) != find) continue;
+            x4_wr32(b + 4 * i, repl);
+            x4_orphan_csum(fs, oi.i_generation, pb, b);
+            rc = ext2_write_block(fs, pb, b) < 0 ? -1 : 1;
+            break;
+        }
+    }
+    kfree(b);
+    return rc;
+}
+
+/* Record `ino` as an orphan.  With the old list *inode's i_dtime becomes the
+ * link, so the caller writes the inode afterwards. */
+static void x4_orphan_add(ext2_fs_t *fs, uint32_t ino, ext2_inode_t *inode) {
+    if (!fs->x4 || fs->ro) return;
+    if (fs->orphan_ino && x4_orphan_slot(fs, 0, ino) == 1) {
+        fs->orphans++;
+        x4_orphan_present(fs, 1);
+        return;
+    }
+    inode->i_dtime = x4_rd32(fs->sb + SB_LAST_ORPHAN);
+    x4_wr32(fs->sb + SB_LAST_ORPHAN, ino);
+    fs->sb_dirty = 1;
+}
+
+/* Take `ino` off whichever record holds it; the caller writes *inode. */
+static void x4_orphan_del(ext2_fs_t *fs, uint32_t ino, ext2_inode_t *inode) {
+    if (!fs->x4 || fs->ro) return;
+    if (fs->orphan_ino && x4_orphan_slot(fs, ino, 0) == 1) {
+        if (fs->orphans) fs->orphans--;
+        if (!fs->orphans) x4_orphan_present(fs, 0);
+        return;
+    }
+    uint32_t next = inode->i_dtime, cur = x4_rd32(fs->sb + SB_LAST_ORPHAN);
+    if (cur == ino) {
+        x4_wr32(fs->sb + SB_LAST_ORPHAN, next);
+        fs->sb_dirty = 1;
+        inode->i_dtime = 0;
+        return;
+    }
+    for (uint32_t steps = 0; cur && cur <= fs->st.inodes_count && steps < 4096; steps++) {
+        ext2_inode_t ci;
+        if (ext2_read_inode(fs, cur, &ci) < 0) return;
+        if (ci.i_dtime == ino) {
+            ci.i_dtime = next;
+            ext2_write_inode(fs, cur, &ci);
+            inode->i_dtime = 0;
+            return;
+        }
+        cur = ci.i_dtime;
+    }
+}
+
+/* A shrinking truncate in progress (ext2_truncate): the inode written at
+ * each step commit of its block freeing carries the new size, so a crash
+ * between steps leaves an orphan whose i_size says where to cut. */
+static void ext2_write_inode_step(ext2_fs_t *fs, uint32_t ino, const ext2_inode_t *inode) {
+    if (fs->trunc_ino == ino && inode->i_size > fs->trunc_size) {
+        ext2_inode_t t = *inode;
+        t.i_size = fs->trunc_size;
+        ext2_write_inode(fs, ino, &t);
+        return;
+    }
+    ext2_write_inode(fs, ino, inode);
+}
+
+/* Delete an inode with no links: its blocks, then (off the orphan record
+ * when `unorphan`, in the same transaction) the inode itself. */
+static void ext2_delete_inode(ext2_fs_t *fs, uint32_t ino, ext2_inode_t *victim, int unorphan) {
+    if ((victim->i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR) ext2_count_dir(fs, ino, -1);
+    ext2_free_inode_blocks(fs, ino, victim);
+    if (unorphan) x4_orphan_del(fs, ino, victim);
+    victim->i_size = 0;
+    victim->i_dtime = ext2_now();
+    ext2_write_inode(fs, ino, victim);
+    ext2_free_inode(fs, ino);
+}
+
 /* Drop an orphaned inode for good: its blocks, then the inode itself. */
 static void ext2_release_orphan(ext2_fs_t *fs, uint32_t ino) {
     ext2_inode_t victim;
     if (ext2_read_inode(fs, ino, &victim) == 0) {
-        if ((victim.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR) ext2_count_dir(fs, ino, -1);
-        ext2_free_inode_blocks(fs, ino, &victim);
-        victim.i_size = 0;
-        victim.i_dtime = ext2_now();
-        ext2_write_inode(fs, ino, &victim);
+        ext2_delete_inode(fs, ino, &victim, 1);
+        return;
     }
     ext2_free_inode(fs, ino);
+}
+
+static int ext2_inode_in_use(ext2_fs_t *fs, uint32_t ino) {
+    uint32_t grp = (ino - 1) / fs->st.inodes_per_group, idx = (ino - 1) % fs->st.inodes_per_group;
+    ext2_bgd_t bgd;
+    if (ext2_read_bgd(fs, grp, &bgd) < 0) return 0;
+    uint8_t *bm = (uint8_t *)kmalloc(fs->st.block_size);
+    if (!bm) return 0;
+    int r = ext2_get_bitmap(fs, grp, &bgd, 1, bm) == 0 && ext2_bitmap_test(bm, idx);
+    kfree(bm);
+    return r;
+}
+
+/* One orphan found at mount: 1 deleted, 2 cut to its size, 0 left alone.
+ * With the old list, *next gets the link to the following one. */
+static int x4_orphan_finish(ext2_fs_t *fs, uint32_t ino, uint32_t *next) {
+    ext2_inode_t in;
+    if (next) *next = 0;
+    if (ino < fs->st.first_ino || ino > fs->st.inodes_count ||
+        ext2_read_inode(fs, ino, &in) < 0)
+        return 0;
+    if (next) *next = in.i_dtime;
+    if (!in.i_mode || !ext2_inode_in_use(fs, ino)) return 0;
+    if (in.i_links_count == 0) {
+        ext2_delete_inode(fs, ino, &in, 0);
+        return 1;
+    }
+    in.i_dtime = 0;
+    if ((in.i_mode & EXT2_S_IFMT) == EXT2_S_IFREG) {
+        uint32_t bs = fs->st.block_size;
+        uint32_t keep = in.i_size / bs + (in.i_size % bs != 0);
+        ext2_free_blocks_from(fs, ino, &in, keep);
+        uint32_t blk = (in.i_size % bs) ? ext2_file_blk(fs, &in, in.i_size / bs) : 0;
+        uint8_t *tb = blk ? (uint8_t *)kmalloc(bs) : (uint8_t *)0;
+        if (tb && ext2_read_block(fs, blk, tb) == 0) {
+            memset(tb + in.i_size % bs, 0, bs - in.i_size % bs);
+            ext2_write_data(fs, blk, tb);
+        }
+        if (tb) kfree(tb);
+    }
+    ext2_write_inode(fs, ino, &in);
+    return 2;
+}
+
+/* At a read-write mount: finish every orphan, empty both records. */
+static void x4_orphan_cleanup(ext2_fs_t *fs) {
+    if (!fs->x4 || fs->ro) return;
+    uint32_t done[3] = { 0, 0, 0 };
+    uint32_t bs = fs->st.block_size;
+    if (fs->compat & EXT2_COMPAT_ORPHAN_FILE) {
+        ext2_inode_t oi;
+        fs->orphan_ino = x4_rd32(fs->sb + SB_ORPHAN_INUM);
+        if (!fs->orphan_ino || fs->orphan_ino > fs->st.inodes_count ||
+            ext2_read_inode(fs, fs->orphan_ino, &oi) < 0 ||
+            (oi.i_mode & EXT2_S_IFMT) != EXT2_S_IFREG || !oi.i_size || oi.i_size % bs) {
+            printk("[EXT2]  %s: orphan file unusable; orphans go to the old list\n", fs->name);
+            fs->orphan_ino = 0;
+        }
+        uint8_t *b = fs->orphan_ino ? (uint8_t *)kmalloc(bs) : (uint8_t *)0;
+        for (uint32_t l = 0; b && l < oi.i_size / bs; l++) {
+            uint32_t pb = ext2_file_blk(fs, &oi, l);
+            if (!pb || ext2_read_block(fs, pb, b) < 0) continue;
+            if (x4_rd32(b + bs - 8) != X4_ORPHAN_MAGIC) continue;
+            for (uint32_t i = 0; i < (bs - 8) / 4; i++) {
+                uint32_t ino = x4_rd32(b + 4 * i);
+                if (!ino) continue;
+                done[x4_orphan_finish(fs, ino, (uint32_t *)0)]++;
+                x4_wr32(b + 4 * i, 0);
+                x4_orphan_csum(fs, oi.i_generation, pb, b);
+                ext2_write_block(fs, pb, b);
+            }
+        }
+        if (b) kfree(b);
+        x4_orphan_present(fs, 0);
+    }
+    uint32_t ino = x4_rd32(fs->sb + SB_LAST_ORPHAN);
+    for (uint32_t steps = 0; ino && steps < fs->st.inodes_count; steps++) {
+        uint32_t next = 0;
+        done[x4_orphan_finish(fs, ino, &next)]++;
+        x4_wr32(fs->sb + SB_LAST_ORPHAN, next);
+        fs->sb_dirty = 1;
+        ino = next;
+    }
+    if (x4_rd32(fs->sb + SB_LAST_ORPHAN)) {
+        x4_wr32(fs->sb + SB_LAST_ORPHAN, 0);
+        fs->sb_dirty = 1;
+    }
+    fs->orphans = 0;
+    if (done[0] + done[1] + done[2])
+        printk("[EXT2]  %s: orphans: %u deleted, %u truncated, %u skipped\n", fs->name,
+               (unsigned)done[1], (unsigned)done[2], (unsigned)done[0]);
+    ext2_sync_fs(fs);
 }
 
 static void ext2_retain_node(vfs_node_t *node) {
@@ -3433,15 +3929,20 @@ static void ext2_put_unlinked(ext2_fs_t *fs, uint32_t ino, ext2_inode_t *victim,
     preempt_enable();
 
     if (in_use) {
-        /* Name gone, data still reachable through the open descriptors. */
+        /* Name gone, data still reachable through the open descriptors;
+         * on disk an orphan until the last one closes. */
+        x4_orphan_add(fs, ino, victim);
         ext2_write_inode(fs, ino, victim);
     } else {
-        if ((victim->i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR) ext2_count_dir(fs, ino, -1);
-        ext2_free_inode_blocks(fs, ino, victim);
-        victim->i_dtime = now;
-        victim->i_size = 0;
-        ext2_write_inode(fs, ino, victim);
-        ext2_free_inode(fs, ino);
+        /* With a journal the blocks may be freed over several
+         * transactions: an orphan until the inode itself is gone. */
+        int orph = fs->j != 0;
+        if (orph) {
+            x4_orphan_add(fs, ino, victim);
+            ext2_write_inode(fs, ino, victim);
+        }
+        ext2_delete_inode(fs, ino, victim, orph);
+        (void)now;
     }
 }
 
@@ -3504,28 +4005,25 @@ static int ext2_unlink_do(vfs_node_t *dir, const char *name) {
 
 /* Look `name` up in a directory inode: its inode number (0 if absent) and,
  * through *ftype, the entry's file-type byte. */
-static uint32_t ext2_dir_lookup(ext2_fs_t *fs, ext2_inode_t *dir_inode, const char *name,
-                                uint8_t *ftype) {
+static uint32_t ext2_dir_lookup(ext2_fs_t *fs, uint32_t dir_ino, ext2_inode_t *dir_inode,
+                                const char *name, uint8_t *ftype) {
     uint32_t name_len = strlen(name);
     if (name_len == 0 || name_len > 255) return 0;
+    uint32_t found = 0;
+    int r = ext2_dx_find(fs, dir_ino, dir_inode, name, &found, ftype, (uint32_t *)0);
+    if (r >= 0) return r ? found : 0;
     uint8_t *blk_buf = (uint8_t *)kmalloc(fs->st.block_size);
     if (!blk_buf) return 0;
-    uint32_t found = 0;
     for (uint32_t pos = 0; pos < dir_inode->i_size && !found;
          pos += fs->st.block_size) {
         uint32_t blk_num = ext2_file_blk(fs, dir_inode, pos / fs->st.block_size);
         if (!blk_num) continue;
         if (ext2_read_block(fs, blk_num, blk_buf) < 0) break;
-        for (uint32_t off = 0; off < fs->st.block_size; ) {
+        int off = ext2_leaf_find(fs, blk_buf, name, name_len);
+        if (off >= 0) {
             ext2_dirent_t *de = (ext2_dirent_t *)(blk_buf + off);
-            if (!ext2_de_ok(blk_buf, off, fs->st.block_size)) break;
-            if (de->inode && de->name_len == (uint8_t)name_len &&
-                memcmp(de->name, name, name_len) == 0) {
-                found = de->inode;
-                if (ftype) *ftype = de->file_type;
-                break;
-            }
-            off += de->rec_len;
+            found = de->inode;
+            if (ftype) *ftype = de->file_type;
         }
     }
     kfree(blk_buf);
@@ -3542,9 +4040,13 @@ static int ext2_set_dirent(ext2_fs_t *fs, uint32_t dir_ino, ext2_inode_t *dir_in
     if (name_len == 0 || name_len > 255) return -1;
     /* Rewriting an entry in place leaves an htree index valid. */
     if (!fs->x4) ext2_dir_unindex(fs, dir_ino, dir_inode);
+    uint32_t start = 0, dx_ino = 0, dx_lblk = 0, stop = dir_inode->i_size;
+    int dx = ext2_dx_find(fs, dir_ino, dir_inode, name, &dx_ino, (uint8_t *)0, &dx_lblk);
+    if (dx == 0) return -1;
+    if (dx == 1) { start = dx_lblk * fs->st.block_size; stop = start + fs->st.block_size; }
     uint8_t *blk_buf = (uint8_t *)kmalloc(fs->st.block_size);
     if (!blk_buf) return -1;
-    for (uint32_t pos = 0; pos < dir_inode->i_size; pos += fs->st.block_size) {
+    for (uint32_t pos = start; pos < stop; pos += fs->st.block_size) {
         uint32_t blk_num = ext2_file_blk(fs, dir_inode, pos / fs->st.block_size);
         if (!blk_num) continue;
         if (ext2_read_block(fs, blk_num, blk_buf) < 0) break;
@@ -3598,9 +4100,9 @@ static int ext2_rename_do(vfs_node_t *old_dir, const char *old_name,
         return -20;                                          /* -ENOTDIR */
 
     uint8_t src_ft = 0, dst_ft = 0;
-    uint32_t src_ino = ext2_dir_lookup(fs, &odir, old_name, &src_ft);
+    uint32_t src_ino = ext2_dir_lookup(fs, o_ino, &odir, old_name, &src_ft);
     if (!src_ino) return -2;                                 /* -ENOENT */
-    uint32_t dst_ino = ext2_dir_lookup(fs, ndir, new_name, &dst_ft);
+    uint32_t dst_ino = ext2_dir_lookup(fs, n_ino, ndir, new_name, &dst_ft);
     if (dst_ino == src_ino) return 0;        /* same object: nothing to do */
 
     ext2_inode_t src, dst;
@@ -3622,7 +4124,7 @@ static int ext2_rename_do(vfs_node_t *old_dir, const char *old_name,
             if (cur == src_ino) return -22;                  /* -EINVAL */
             ext2_inode_t ci;
             if (ext2_read_inode(fs, cur, &ci) < 0) return -5;
-            uint32_t up = ext2_dir_lookup(fs, &ci, "..", (uint8_t *)0);
+            uint32_t up = ext2_dir_lookup(fs, cur, &ci, "..", (uint8_t *)0);
             if (!up || up == cur) break;
             cur = up;
         }
@@ -3811,6 +4313,13 @@ static vfs_node_t *ext2_finddir(vfs_node_t *dir, const char *name) {
 
     uint32_t blk_size = fs->st.block_size;
     uint32_t name_len = strlen(name);
+    {
+        uint32_t ino = 0;
+        uint8_t ft = 0;
+        int r = ext2_dx_find(fs, priv->ino, &inode, name, &ino, &ft, (uint32_t *)0);
+        if (r == 0) return NULL;
+        if (r == 1) return ext2_make_node(fs, ino, name, ft);
+    }
     uint8_t *blk_buf  = (uint8_t *)kmalloc(blk_size);
     if (!blk_buf) return NULL;
 
@@ -4702,7 +5211,38 @@ static int ext2_truncate(vfs_node_t *node, uint32_t new_size) {
     ext2_fs_t *fs = (node && node->private) ? ((ext2_priv_t *)node->private)->fs
                                         : (ext2_fs_t *)0;
     if (fs) ext2_lock(fs);
+    if (fs && fs->crash_trunc) {
+        fs->crash_trunc = 0;
+        fs->crash_test = 2;
+    }
+    /* A shrink that frees blocks over several journal transactions is an
+     * orphan until it is done (see "Orphans on disk"), unless the inode is
+     * one already (unlinked while open). */
+    uint32_t ino = fs ? ((ext2_priv_t *)node->private)->ino : 0;
+    ext2_inode_t in;
+    int orph = 0;
+    if (fs && fs->j && !fs->ro && ext2_read_inode(fs, ino, &in) == 0 &&
+        (in.i_mode & EXT2_S_IFMT) == EXT2_S_IFREG && in.i_links_count && x4_is_ext(&in) &&
+        new_size / fs->st.block_size + 1 < in.i_size / fs->st.block_size) {
+        preempt_disable();
+        ext2_open_t *e = ext2_open_find(fs, ino);
+        orph = !(e && e->orphan);
+        preempt_enable();
+        if (orph) {
+            x4_orphan_add(fs, ino, &in);
+            ext2_write_inode(fs, ino, &in);
+            fs->trunc_ino = ino;
+            fs->trunc_size = new_size;
+        }
+    }
     int r = ext2_truncate_do(node, new_size);
+    if (orph) {
+        fs->trunc_ino = 0;
+        if (ext2_read_inode(fs, ino, &in) == 0) {
+            x4_orphan_del(fs, ino, &in);
+            ext2_write_inode(fs, ino, &in);
+        }
+    }
     if (fs) {
         ext2_op_end(fs);
         ext2_unlock(fs);
@@ -4778,14 +5318,43 @@ static uint32_t ext2_write_node(vfs_node_t *node, uint32_t offset,
 #define EXT2_RO_COMPAT_METADATA_CSUM 0x0400u
 /* Read-only-compatible features kept up to date when writing.  Not here,
  * so read-only: quota and project (their inodes would go stale), bigalloc,
- * orphan_present (orphans waiting in the orphan file), verity, ... */
+ * verity, ...  orphan_present (orphans waiting in the orphan file) is fine:
+ * a read-write mount finishes them (x4_orphan_cleanup). */
 #define X4_RO_COMPAT_RW (EXT2_RO_COMPAT_RW | EXT2_RO_COMPAT_HUGE_FILE | EXT2_RO_COMPAT_GDT_CSUM | \
-                         EXT2_RO_COMPAT_EXTRA_ISIZE | EXT2_RO_COMPAT_METADATA_CSUM)
+                         EXT2_RO_COMPAT_EXTRA_ISIZE | EXT2_RO_COMPAT_METADATA_CSUM | \
+                         EXT2_RO_COMPAT_ORPHAN_PRESENT)
 /* Compatible features that still change where things are: sparse_super2
  * (backup groups), exclude_bitmap. */
 #define X4_COMPAT_NOT_RW 0x0300u
 #define SB_JNL_DEV_INCOMPAT 0x0008u
 #define EXT2_COMPAT_HAS_JOURNAL 0x0004u
+
+/* Can this driver read the filesystem, and write it?  0, or -EOPNOTSUPP /
+ * -EUCLEAN (not a layout read here; the read-only ext4 driver may serve it),
+ * or -EROFS for a read-write request when only reading is possible. */
+static int ext2_features(ext2_fs_t *fs, const uint8_t *sb_buf, int ro) {
+    uint32_t bad = fs->incompat & ~X4_INCOMPAT_OK;
+    if (x4_rd32(sb_buf + SB_BLOCKS_HI)) bad |= EXT2_INCOMPAT_64BIT;   /* > 2^32 blocks */
+    if (bad) {
+        /* Not a layout this driver reads; the ext4 driver may (read-only). */
+        printk("[EXT2]  %s: incompatible features 0x%x%s; not for the ext2 driver\n",
+               fs->name, (unsigned)bad,
+               (bad & EXT2_INCOMPAT_RECOVER) ? " (journal needs recovery)" : "");
+        return (bad & EXT2_INCOMPAT_RECOVER) ? -117 : -95;   /* -EUCLEAN / -EOPNOTSUPP */
+    }
+    fs->rw_ok = !(fs->ro_compat & ~X4_RO_COMPAT_RW) &&
+                !(fs->compat & X4_COMPAT_NOT_RW) &&
+                /* gdt_csum's crc16 descriptors are not written here */
+                !((fs->ro_compat & EXT2_RO_COMPAT_GDT_CSUM) &&
+                  !(fs->ro_compat & EXT2_RO_COMPAT_METADATA_CSUM));
+    if (!ro && !fs->rw_ok) {
+        printk("[EXT2]  %s: features 0x%x/0x%x; read-only only\n",
+               fs->name, (unsigned)(fs->compat & X4_COMPAT_NOT_RW),
+               (unsigned)(fs->ro_compat & ~X4_RO_COMPAT_RW));
+        return -30;                                          /* -EROFS */
+    }
+    return 0;
+}
 
 /* ext3/ext4 state of a mount(2) instance from its superblock: checksum
  * seed, descriptor size, the journal (replayed here when a read-write mount
@@ -5042,21 +5611,66 @@ vfs_node_t *ext2_mount(uint32_t lba_offset, uint32_t nsect) {
         kfree(fs);
         return NULL;
     }
+    /* An ext3/ext4 root (maeros-install writes ext4) gets what a read-write
+     * mount(2) gets: the feature checks, the journal (replayed if needed),
+     * needs_recovery while mounted, the orphans finished, the flusher; it
+     * is marked clean again by ext2_shutdown() at reboot/poweroff.  A
+     * feature only readable here leaves /disk read-only. */
+    int rc = ext2_features(fs, sb_buf, 0), want_ro = 0;
+    if (rc == -30) {
+        want_ro = 1;
+        rc = 0;
+    }
+    fs->ro = 1;                       /* until the checks below pass */
+    if (rc == 0) rc = x4_setup(fs, sb_buf, want_ro);
+    if (rc < 0) {
+        printk("[EXT2]  disk: not mounted (%d)\n", rc);
+        ext2_free_fs(fs);
+        return NULL;
+    }
 
     ext2_cache_init(fs);
     ext2_seen_init(fs);
 
-    printk("[EXT2]  Mounted: block_size=%u  inodes=%u  inode_size=%u cache=%s\n",
+    printk("[EXT2]  Mounted: block_size=%u  inodes=%u  inode_size=%u cache=%s%s%s%s%s\n",
            (unsigned)fs->st.block_size,
            (unsigned)fs->st.inodes_count,
            (unsigned)fs->st.inode_size,
-           fs->cache_ready ? "on" : "off");
+           fs->cache_ready ? "on" : "off",
+           fs->j ? ", journal" : "", fs->extents ? ", extents" : "",
+           fs->csum ? ", metadata_csum" : "", want_ro ? ", read-only" : "");
 
     /* Build VFS node for root (inode 2) */
     vfs_node_t *root = ext2_root(fs);
     if (!root) { ext2_free_fs(fs); return NULL; }
+    fs->ro = want_ro;
+    if (fs->x4 && !fs->ro) {
+        if (ext2_sb_mark(fs, 1) < 0) { ext2_free_fs(fs); return NULL; }
+        x4_orphan_cleanup(fs);
+    }
+    ext2_jfs_add(fs);
     g_boot_fs = fs;
     return root;
+}
+
+const char *ext2_boot_fstype(void) {
+    ext2_fs_t *fs = g_boot_fs;
+    if (!fs || !fs->x4) return "ext2";
+    return (fs->extents || !fs->j) ? "ext4" : "ext3";
+}
+
+/* reboot(2): /disk's journal committed and checkpointed, its superblock
+ * clean, as umount would leave it; nothing is written after this. */
+void ext2_shutdown(void) {
+    ext2_fs_t *fs = g_boot_fs;
+    if (!fs || !fs->x4 || fs->ro) return;
+    ext2_lock(fs);
+    ext2_sb_mark(fs, 0);
+    fs->ro = 1;
+    ext2_unlock(fs);
+    if (fs->j) printk("[EXT2]  disk: clean at shutdown (%u journal commits)\n",
+                      (unsigned)fs->j->commits);
+    else printk("[EXT2]  disk: clean at shutdown\n");
 }
 
 int ext2_mount_dev(blkpart_t *bp, int ro, vfs_node_t **root_out, ext2_fs_t **fs_out) {
@@ -5079,28 +5693,8 @@ int ext2_mount_dev(blkpart_t *bp, int ro, vfs_node_t **root_out, ext2_fs_t **fs_
     if (((ext2_sb_t *)sb_buf)->s_magic != 0xEF53) goto fail;  /* quietly: not ours */
     if (ext2_load_super(fs, sb_buf, bp->start, bp->nsect) < 0) goto fail;
 
-    uint32_t bad = fs->incompat & ~X4_INCOMPAT_OK;
-    if (x4_rd32(sb_buf + SB_BLOCKS_HI)) bad |= EXT2_INCOMPAT_64BIT;   /* > 2^32 blocks */
-    if (bad) {
-        /* Not a layout this driver reads; the ext4 driver may (read-only). */
-        printk("[EXT2]  %s: incompatible features 0x%x%s; not for the ext2 driver\n",
-               fs->name, (unsigned)bad,
-               (bad & EXT2_INCOMPAT_RECOVER) ? " (journal needs recovery)" : "");
-        rc = (bad & EXT2_INCOMPAT_RECOVER) ? -117 : -95;   /* -EUCLEAN / -EOPNOTSUPP */
-        goto fail;
-    }
-    fs->rw_ok = !(fs->ro_compat & ~X4_RO_COMPAT_RW) &&
-                !(fs->compat & X4_COMPAT_NOT_RW) &&
-                /* gdt_csum's crc16 descriptors are not written here */
-                !((fs->ro_compat & EXT2_RO_COMPAT_GDT_CSUM) &&
-                  !(fs->ro_compat & EXT2_RO_COMPAT_METADATA_CSUM));
-    if (!ro && !fs->rw_ok) {
-        printk("[EXT2]  %s: features 0x%x/0x%x; read-only only\n",
-               fs->name, (unsigned)(fs->compat & X4_COMPAT_NOT_RW),
-               (unsigned)(fs->ro_compat & ~X4_RO_COMPAT_RW));
-        rc = -30;                                           /* -EROFS */
-        goto fail;
-    }
+    rc = ext2_features(fs, sb_buf, ro);
+    if (rc < 0) goto fail;
     rc = x4_setup(fs, sb_buf, ro);
     if (rc < 0) goto fail;
     rc = -22;
@@ -5116,6 +5710,7 @@ int ext2_mount_dev(blkpart_t *bp, int ro, vfs_node_t **root_out, ext2_fs_t **fs_
     if (!ro) {
         fs->ro = 0;
         if (ext2_sb_mark(fs, 1) < 0) { rc = -5; goto fail; }
+        x4_orphan_cleanup(fs);
     }
     printk("[EXT2]  %s: mounted %s (block %u, %u inodes%s%s%s%s)\n", fs->name,
            ro ? "read-only" : "read-write", (unsigned)fs->st.block_size,
@@ -5147,7 +5742,8 @@ void ext2_test_crash(ext2_fs_t *fs) {
 /* More test hooks (smoke-ext4rw): x4smalltxn makes every transaction past
  * two blocks due at the next safe point, so writes and frees commit in many
  * steps; x4crashunlink loses power at the first commit inside the next
- * unlink(2), i.e. between two steps of freeing a file. */
+ * unlink(2), i.e. between two steps of freeing a file; x4crashtrunc the same
+ * inside the next truncate. */
 void ext2_test_opt(ext2_fs_t *fs, const char *opt) {
     if (!fs->j) return;
     if (strcmp(opt, "x4smalltxn") == 0) {
@@ -5156,6 +5752,9 @@ void ext2_test_opt(ext2_fs_t *fs, const char *opt) {
     } else if (strcmp(opt, "x4crashunlink") == 0) {
         fs->crash_unlink = 1;
         printk("[EXT2]  %s: x4crashunlink armed\n", fs->name);
+    } else if (strcmp(opt, "x4crashtrunc") == 0) {
+        fs->crash_trunc = 1;
+        printk("[EXT2]  %s: x4crashtrunc armed\n", fs->name);
     }
 }
 
@@ -5188,6 +5787,7 @@ static int ext2_set_ro_locked(ext2_fs_t *fs, int ro) {
     if (!fs->rw_ok) return -30;                             /* -EROFS */
     fs->ro = 0;
     if (ext2_sb_mark(fs, 1) < 0) { fs->ro = 1; return -5; }
+    x4_orphan_cleanup(fs);
     printk("[EXT2]  %s: now read-write\n", fs->name);
     return 0;
 }

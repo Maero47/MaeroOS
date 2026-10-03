@@ -125,13 +125,13 @@ static void mount_disk_root(void) {
     /* ext2 checks the superblock's size against the device's. */
     vfs_node_t *disk_root = ext2_mount(start, bp ? bp->nsect : 0);
     if (!disk_root) {
-        if (arg) printk("[BOOT] root=%s: no ext2 filesystem on %s\n", want, devpath);
+        if (arg) printk("[BOOT] root=%s: no ext2/ext4 filesystem on %s\n", want, devpath);
         return;
     }
     if (bp) blk_set_busy(bp->dev);
     vfs_mount("/disk", disk_root);
     vfs_set_root_overlay(disk_root);
-    vfs_mount_note(devpath, "/disk", "ext2", 0);
+    vfs_mount_note(devpath, "/disk", ext2_boot_fstype(), 0);
 }
 
 void kernel_main(u32 mb_magic, u32 mb_phys) {
