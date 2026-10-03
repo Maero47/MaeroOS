@@ -12,7 +12,7 @@
 | 6 | **Firefox 115.15.0esr** (official i686 build) | ✅ Paints its window about 5 s after `firefox-bin` starts and loads pages over HTTP and HTTPS (`make smoke-firefox`, `make smoke-firefox-web`, `--sites` for live sites) |
 
 What is still missing on rung 6 is listed under "What does not work" in
-[README.md](README.md): the content sandbox is off, scripts DejaVu does not
+[README.md](README.md): the content sandbox has no namespaces ([docs/sandbox.md](docs/sandbox.md)), scripts DejaVu does not
 cover (CJK, Indic) come out as missing-glyph boxes, and `ff` brings its own
 profile. The sections below record how each rung was cleared, oldest first.
 

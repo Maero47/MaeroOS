@@ -664,6 +664,16 @@ if [ ! -f "$FONTDIR/DejaVuSans.ttf" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 10b. Autoconfig: maeros.cfg prints about:support's sandbox section on stderr
+#      (docs/sandbox.md)
+# ---------------------------------------------------------------------------
+mkdir -p "$FFDIR/defaults/pref"
+cp "$HERE/autoconfig/autoconfig.js" "$FFDIR/defaults/pref/autoconfig.js"
+cp "$HERE/autoconfig/maeros.cfg" "$FFDIR/maeros.cfg"
+printf '%s\n' "defaults/pref/autoconfig.js" "maeros.cfg" >> "$MANIFEST"
+log "autoconfig (maeros.cfg) installed in ${FFDIR#"$ROOT"/}"
+
+# ---------------------------------------------------------------------------
 # 11. Verify
 # ---------------------------------------------------------------------------
 if [ "${SKIP_CHECK:-0}" != 1 ]; then

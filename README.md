@@ -77,8 +77,8 @@ What is proven by the automated QEMU tests in `tools/`:
   through QEMU's user network, DNS and TLS included), but: text in scripts the disk has
   no font for (it ships DejaVu Sans, Serif and Sans Mono, which cover Latin, Greek and
   Cyrillic, and Twemoji; not CJK or Indic) is drawn as missing-glyph boxes; the
-  content sandbox is off (`MOZ_DISABLE_CONTENT_SANDBOX`, `security.sandbox.content.level
-  0`); startup still takes about 5 s after `firefox-bin` starts; and `ff` has to bring
+  content sandbox runs at level 4 but without user namespaces, so Firefox skips
+  its chroot and network/PID namespaces (`docs/sandbox.md`); startup still takes about 5 s after `firefox-bin` starts; and `ff` has to bring
   its own profile (`testfiles/ffprofile`) that turns off first-run dialogs, telemetry
   and add-on scans. `docs/audit/firefox-first-paint.md` and `docs/perf/firefox-startup.md` record how it
   got here.
@@ -150,7 +150,8 @@ What is proven by the automated QEMU tests in `tools/`:
   package index, raw writes to a disk with a mounted filesystem refused (`EBUSY`), and
   a maeroX that validates every request length and has no key-injection channel in the
   desktop build.
-- What is not: the Firefox content sandbox, execute protection on CPUs without NX,
+- What is not: the namespace part of the Firefox content sandbox (seccomp-bpf
+  filtering and the file broker are on, `docs/sandbox.md`), execute protection on CPUs without NX,
   search permission on path lookups, and repo-key rotation (all under "What does not
   work").
 

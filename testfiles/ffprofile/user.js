@@ -7,7 +7,9 @@ user_pref("webgl.disabled", true);
 user_pref("gfx.x11-glx.disabled", true);
 user_pref("dom.ipc.processCount", 1);
 user_pref("browser.tabs.remote.autostart", false);
-user_pref("security.sandbox.content.level", 0);
+/* Content sandbox on (docs/sandbox.md): seccomp-bpf + the SandboxBroker. */
+user_pref("security.sandbox.content.level", 4);
+user_pref("security.sandbox.logging.enabled", true);
 user_pref("media.rdd-process.enabled", false);
 user_pref("network.process.enabled", false);
 /* NB (2026-07-03): dom.ipc.processPrelaunch.enabled=true was TESTED to try to
@@ -23,7 +25,15 @@ user_pref("network.process.enabled", false);
  * With prelaunch ON, a preallocated process launches early and (now that launches
  * complete) may be READY when the tab asks → no synchronous second wait. */
 user_pref("dom.ipc.processPrelaunch.enabled", true);
-user_pref("media.cubeb.sandbox", false);
+/* Audio is remoted: cubeb runs in the parent and the sandboxed content process
+ * feeds it over audioipc (Firefox keeps the content sandbox at level 3 unless
+ * this is on, and a level-3 content process cannot reach /dev/snd at all).
+ * The extra hop needs more buffering on one CPU: with the defaults the 3 s
+ * smoke-firefox --audio tone had 37-118 silent 10 ms blocks, with these 9-17
+ * (docs/sandbox.md). */
+user_pref("media.cubeb.sandbox", true);
+user_pref("media.cubeb_latency_playback_ms", 250);
+user_pref("media.audio.audiosink.threshold_ms", 500);
 user_pref("accessibility.force_disabled", 1);
 user_pref("toolkit.telemetry.enabled", false);
 user_pref("browser.shell.checkDefaultBrowser", false);

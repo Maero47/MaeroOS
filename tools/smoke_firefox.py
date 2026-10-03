@@ -471,6 +471,30 @@ def red_pixels(frame):
                if rgb[i] == 255 and rgb[i + 1] == 0 and rgb[i + 2] == 0)
 
 
+SANDBOX_REPORT = "maeros-sandbox: "
+SANDBOX_WAIT = 45          # s after the verdict to wait for the sandbox report
+
+
+def check_sandbox(run):
+    """FAIL a PASS whose Firefox reports the content sandbox off or a syscall
+    the filter refused (docs/sandbox.md).  No report at all is only noted:
+    a runtime tree without ports/firefox/autoconfig cannot print one."""
+    sb = run.sandbox
+    if sb is None or run.result != "PASS":
+        return
+    bad = []
+    if not sb.get("hasSeccompBPF") or not sb.get("hasSeccompTSync"):
+        bad.append("seccomp-bpf/TSYNC not detected")
+    if not sb.get("canSandboxContent"):
+        bad.append("canSandboxContent false")
+    if not sb.get("effectiveContentSandboxLevel"):
+        bad.append("effective content sandbox level %r" % sb.get("effectiveContentSandboxLevel"))
+    if sb.get("syscallLog"):
+        bad.append("%d rejected syscall(s) in the sandbox log" % len(sb["syscallLog"]))
+    if bad:
+        run.result, run.reason = "FAIL", "content sandbox: " + "; ".join(bad)
+
+
 def kvm_usable():
     return os.access("/dev/kvm", os.R_OK | os.W_OK)
 
@@ -769,6 +793,7 @@ class Run:
         self.site_rows = []
         self.key_notes = None
         self.key_ok = None
+        self.sandbox = None        # about:support's sandbox section (maeros.cfg)
 
     # ── serial intake ────────────────────────────────────────────────────
     def feed(self, chunk):
@@ -839,6 +864,12 @@ class Run:
             interesting = True
         elif self.panic_lines and len(self.panic_lines) < 30:
             self.panic_lines.append(line)
+        elif SANDBOX_REPORT in line:
+            try:
+                self.sandbox = json.loads(line.split(SANDBOX_REPORT, 1)[1])
+            except ValueError:
+                self.sandbox = {"unparsed": line.split(SANDBOX_REPORT, 1)[1].strip()}
+            interesting = True
         elif line.startswith("XT hist"):
             self.xt_last = (t, line.strip())
         elif line.startswith("ff:") or line.startswith("[init]") or line.startswith("maerox:"):
@@ -884,6 +915,13 @@ class Run:
         L.append("  first Firefox X window    : %s" % fmt_t(self.t_xwindow))
         if self.desktop_ended is not None:
             L.append("  desktop session ended     : %s" % fmt_t(self.desktop_ended))
+        L.append("")
+        L.append("content sandbox (about:support, from maeros.cfg)")
+        if self.sandbox is None:
+            L.append("  (not reported: is ports/firefox/autoconfig installed in testfiles/firefox?)")
+        else:
+            for k in sorted(self.sandbox):
+                L.append("  %-30s %s" % (k, json.dumps(self.sandbox[k])))
         L.append("")
         L.append("maeroX last trace line (putimg= is the PutImage count; 0 = nothing drawn)")
         L.append("  %s  %s" % (fmt_t(self.xt_last[0]), self.xt_last[1]) if self.xt_last else "  (none)")
@@ -1752,6 +1790,13 @@ def main():
                     audio_load(qmp, args, run, pump, audio_web)
                 finally:
                     audio_web.close()
+            # about:support's sandbox section, printed by maeros.cfg a few
+            # seconds after start (ports/firefox/autoconfig).
+            waited = 0.0
+            while run.sandbox is None and waited < SANDBOX_WAIT:
+                pump(1.0)
+                waited += 1.0
+            check_sandbox(run)
         elif run.panic_lines:
             pump(2.0)         # collect the register dump / stack trace
         else:
