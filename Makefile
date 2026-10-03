@@ -295,7 +295,8 @@ run: $(TARGET) initrd
 		-no-reboot \
 		-no-shutdown
 
-# NIC=e1000 for the Intel e1000 instead (drivers/e1000.c).
+# NIC=e1000 for the Intel e1000 instead (drivers/e1000.c), NIC=virtio-net-pci
+# for virtio-net (drivers/virtio/).
 NIC ?= rtl8139
 run-net: $(TARGET) initrd
 	qemu-system-i386 $(QEMU_DISPLAY) \
