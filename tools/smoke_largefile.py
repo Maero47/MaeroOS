@@ -19,7 +19,9 @@ binary) on ext4, exFAT and ext2: a file written across 4 GiB and past
 sizes, the 32-bit off_t ABI (lseek(2), open without O_LARGEFILE,
 stat/fstat, sendfile(187), a 32-bit F_GETLK) answering EOVERFLOW,
 F_SETLK64 record locks past 4 GiB against a child, copy_file_range and
-sendfile64 past 4 GiB, ftruncate64 down below 4 GiB and up to 9 GiB.  On
+sendfile64 past 4 GiB, ftruncate64 down below 4 GiB and up to 9 GiB, mmap2
+at page 0x3FFFFFF8 and an offset+length wrap refused.  1 MiB pread64/read
+and busybox dd bs=1M of /dev/sdb at 5 GiB come back whole.  On
 vfat: writes and truncates at and past 4 GiB - 1 are EFBIG.  busybox dd and
 cmp write and compare markers at 4 GiB + 4 KiB and 8 GiB + 4 KiB on ext4,
 and busybox truncate cuts the file to 6 GiB.  Then `poweroff` with ext4,
@@ -150,6 +152,10 @@ def guest_tests(g, info):
     probe(g, "big", "/mnt/e2", "ext2 (block-mapped, triply indirect)", 300.0)
     probe(g, "big", "/mnt/xf", "exFAT", 900.0)
     probe(g, "efbig", "/mnt/vf", "vfat", 60.0)
+    probe(g, "blkdev", "/dev/sdb", "/dev/sdb (1 MiB reads at 5 GiB)", 60.0)
+    rc, out = g.sh("busybox dd if=/dev/sdb of=/dev/null bs=1M skip=5120 count=4 2>&1")
+    check(rc == 0 and "4+0 records in" in out,
+          f"busybox dd bs=1M from /dev/sdb at 5 GiB reads whole records ({out.strip()[-80:]!r})")
 
     # busybox dd/cmp on ext4: 8 KiB markers at 4 GiB + 4 KiB and 8 GiB + 4 KiB.
     rc, out = g.sh("busybox dd if=/dev/urandom of=/tmp/m bs=4096 count=2 2>/dev/null && "

@@ -193,6 +193,13 @@ static int node_is_regular(vfs_node_t *n) {
     return (n->flags & 0x7U) == VFS_FLAG_FILE;
 }
 
+/* A block device reads like a regular file too: nothing is consumed, and a
+ * short count mid-device is an error to its callers (e2fsprogs unix_io:
+ * EXT2_ET_SHORT_READ), so a large read is not cut at one bounce buffer. */
+static int node_reads_whole(vfs_node_t *n) {
+    return node_is_regular(n) || n->flags == VFS_FLAG_BLKDEV;
+}
+
 /* vfs_read() at `off` into user `ubuf`.  Returns bytes delivered, or a
  * negative errno if none were.  A fault copying out after a device read
  * loses that data, as on Linux; for a regular file nothing is lost — the
@@ -202,7 +209,7 @@ static int vfs_read_user(vfs_node_t *n, uint64_t off, char *ubuf, uint32_t len) 
     uint32_t bsz;
     uint8_t *kbuf = bounce_alloc(len, &bsz);
     if (!kbuf) return -12;                                 /* -ENOMEM */
-    int regular = node_is_regular(n);
+    int regular = node_reads_whole(n);
     uint32_t done = 0;
     int err = 0;
     while (done < len) {
@@ -4286,14 +4293,24 @@ static struct shmap_entry *shmap_get(vfs_node_t *node) {
 static uint32_t shmem_read(vfs_node_t *, uint64_t, uint32_t, uint8_t *);
 static int node_is_shmem(vfs_node_t *n) { return n && n->read_fn == shmem_read; }
 
+/* The shared-frame table is indexed densely by page, so it covers the first
+ * 4 GiB of a file (a memfd's whole size): 2^20 entries, a 4 MiB table at most.
+ * Shared mappings past that are refused (sys_mmap2: -ENOMEM), and no index
+ * at or past it may reach the table-size arithmetic below, where
+ * `newn * sizeof(uint32_t)` would wrap and the table come out short. */
+#define SHMAP_MAX_PAGES 0x100000U
+
 /* Get (allocating + initialising from file content on first touch) the shared
- * physical frame backing page `pg` of the file. */
+ * physical frame backing page `pg` of the file.  0 when out of memory or `pg`
+ * is past SHMAP_MAX_PAGES. */
 static uint32_t shmap_frame(struct shmap_entry *e, vfs_node_t *node, uint32_t pg) {
+    if (pg >= SHMAP_MAX_PAGES) return 0;
     if (pg >= e->npages) {
         /* Double, never grow by a constant: a 64 MiB memfd is 16384 pages and
          * a +16 step would recopy the table on every page (O(n^2)). */
         uint32_t newn = e->npages ? e->npages * 2 : 16;
         if (newn < pg + 16) newn = pg + 16;
+        if (newn > SHMAP_MAX_PAGES) newn = SHMAP_MAX_PAGES;
         uint32_t *nf = (uint32_t *)kmalloc(newn * sizeof(uint32_t));
         if (!nf) return 0;
         __builtin_memset(nf, 0, newn * sizeof(uint32_t));
@@ -4458,7 +4475,8 @@ static int vma_populate_page(struct vma *v, uint32_t addr) {
     kprof_probe_end(KPP_FAULT_ZERO, kp_z);
     if (v->file) {
         uint64_t foff = v->file_off + (addr - v->start);
-        uint32_t sf = se ? shmap_peek(se, foff / PAGE_SIZE) : 0;
+        uint64_t fpg = foff / PAGE_SIZE;
+        uint32_t sf = (se && fpg < SHMAP_MAX_PAGES) ? shmap_peek(se, (uint32_t)fpg) : 0;
         if (sf) {
             /* copy from the shared frame (temp slot 2), not the stale tmpfs buffer */
             const uint8_t *src = (const uint8_t *)paging_temp_map2(sf);
@@ -4660,6 +4678,17 @@ static int sys_mmap2(registers_t *regs) {
         if (shared && (prot & PROT_WRITE_K) &&
             (mf->flags & O_ACCMODE) != O_RDWR)
             return -13;                                           /* -EACCES */
+    }
+    /* Page offsets are 32-bit: an offset plus length past 2^32 pages is
+     * -EOVERFLOW (Linux do_mmap), and a shared file mapping must stay inside
+     * the shared-frame table (the first 4 GiB, SHMAP_MAX_PAGES).  Both are
+     * refused before MAP_FIXED unmaps anything. */
+    if (fnode) {
+        uint64_t last = (uint64_t)pgoff + length / PAGE_SIZE;
+        if (last > 0xFFFFFFFFULL) return -75;                     /* -EOVERFLOW */
+        if (shared && __builtin_strcmp(fnode->name, "fb0") != 0 &&
+            last > SHMAP_MAX_PAGES)
+            return -12;                                           /* -ENOMEM */
     }
     /* Shared file mappings the descriptor cannot write through stay so. */
     uint32_t nowrite = (fnode && shared &&

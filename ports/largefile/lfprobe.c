@@ -3,6 +3,7 @@
  *
  *   lfprobe big  DIR   a file past 4 GiB and 8 GiB on DIR (ext4, exFAT)
  *   lfprobe efbig DIR  a filesystem whose files stop at 4 GiB - 1 (vfat)
+ *   lfprobe blkdev DEV 1 MiB reads of a disk at 5 GiB are whole
  *
  * Static musl binary: off_t is 64-bit, open() passes O_LARGEFILE, lseek()
  * is _llseek, pread/pwrite are pread64/pwrite64, ftruncate is ftruncate64,
@@ -72,6 +73,8 @@ static void info(const char *fmt, ...) {
     fflush(stdout);
 }
 
+static int compat_kernel(void);
+
 static void marker(int k, unsigned char *b, int n) {
     for (int i = 0; i < n; i++) b[i] = (unsigned char)((i * 31 + k * 17 + (i >> 8)) & 0xFF);
 }
@@ -100,8 +103,7 @@ static void check_off32(int fd, const char *path) {
     /* An x86_64 kernel running this i386 binary returns the truncated
      * offset from compat lseek (its off_t is 64-bit); an i386 kernel
      * checks it (Linux ksys_lseek). */
-    struct utsname u;
-    int compat = uname(&u) == 0 && strcmp(u.machine, "x86_64") == 0;
+    int compat = compat_kernel();
     long r;
     if (compat) {
         info("x86_64 kernel: compat lseek(2) does not report EOVERFLOW; not checked");
@@ -178,6 +180,45 @@ static void check_mmap(int fd) {
     if (memcmp(p + (M2_OFF - off), m, M2_LEN)) fail("mmap at 8 GiB: wrong bytes");
     munmap(p, 8192);
     info("mmap2 with a page offset past 8 GiB reads marker 2");
+}
+
+static int compat_kernel(void) {
+    struct utsname u;
+    return uname(&u) == 0 && strcmp(u.machine, "x86_64") == 0;
+}
+
+/* mmap2 page offsets at the edges: a huge shared offset must neither crash
+ * nor map anything but the file (MaeroOS refuses shared mappings past the
+ * first 4 GiB with ENOMEM; Linux maps them), and an offset + length past
+ * 2^32 pages is EOVERFLOW on an i386 kernel. */
+static void check_mmap_bounds(int fd) {
+    errno = 0;
+    void *p = (void *)syscall(SYS_mmap2, 0L, 4096L, PROT_READ, MAP_SHARED, fd, 0x3FFFFFF8L);
+    if (p == MAP_FAILED) {
+        if (errno != ENOMEM) fail("shared mmap2 at page 0x3FFFFFF8: want ENOMEM or a mapping");
+    } else {
+        munmap(p, 4096);                       /* past EOF: never touched */
+    }
+    long long off = M2_OFF & ~4095LL;          /* 8 GiB: past 4 GiB */
+    p = mmap(NULL, 8192, PROT_READ, MAP_SHARED, fd, off);
+    if (p == MAP_FAILED) {
+        if (errno != ENOMEM) fail("shared mmap at 8 GiB: want ENOMEM or a mapping");
+    } else {
+        unsigned char m[M2_LEN];
+        marker(2, m, M2_LEN);
+        if (memcmp((unsigned char *)p + (M2_OFF - off), m, M2_LEN)) fail("shared mmap at 8 GiB: wrong bytes");
+        munmap(p, 8192);
+    }
+    unsigned char *q = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+    if (q == MAP_FAILED) fail("shared mmap at 0 after the refused ones");
+    for (int i = 0; i < 4096; i++) if (q[i]) fail("shared mmap at 0: not zero");
+    munmap(q, 4096);
+    if (!compat_kernel()) {
+        errno = 0;
+        p = (void *)syscall(SYS_mmap2, 0L, 8192L, PROT_READ, MAP_PRIVATE, fd, 0xFFFFFFFFL);
+        if (p != MAP_FAILED || errno != EOVERFLOW) fail("mmap2 page offset + length past 2^32: want EOVERFLOW");
+    }
+    info("mmap2 at page 0x3FFFFFF8 and shared at 8 GiB: refused or correct; offset wrap EOVERFLOW");
 }
 
 static void check_copy(const char *dir, int fd) {
@@ -259,6 +300,7 @@ static void big(const char *dir) {
     check_off32(fd, path);
     check_locks(fd);
     check_mmap(fd);
+    check_mmap_bounds(fd);
     check_copy(dir, fd);
 
     /* Truncate down across 4 GiB, then up past 8 GiB. */
@@ -311,14 +353,36 @@ static void efbig(const char *dir) {
     info("writes at and past 4 GiB - 1 and truncates past it: EFBIG; the file is untouched");
 }
 
+/* One 1 MiB pread64/read of a disk past 4 GiB returns all of it, and the
+ * same bytes as sixteen 64 KiB reads (e2fsprogs treats a short count as an
+ * error). */
+static void blkdev(const char *dev) {
+    static unsigned char a[1 << 20], b[1 << 20];
+    int fd = open(dev, O_RDONLY);
+    if (fd < 0) fail("open %s", dev);
+    long long off = 5 * GiB + 4096;
+    ssize_t r = pread(fd, a, sizeof a, off);
+    if (r != (ssize_t)sizeof a) fail("pread64 1 MiB at 5 GiB of %s = %zd", dev, r);
+    for (int i = 0; i < 16; i++)
+        if (pread(fd, b + i * 65536, 65536, off + i * 65536) != 65536) fail("pread64 64 KiB");
+    if (memcmp(a, b, sizeof a)) fail("1 MiB pread64 differs from 16 x 64 KiB");
+    if (lseek(fd, off, SEEK_SET) != off) fail("lseek on %s", dev);
+    r = read(fd, b, sizeof b);
+    if (r != (ssize_t)sizeof b || memcmp(a, b, sizeof a)) fail("read 1 MiB at 5 GiB = %zd", r);
+    if (lseek(fd, 0, SEEK_CUR) != off + (1 << 20)) fail("offset after the read");
+    close(fd);
+    info("1 MiB pread64 and read of %s at 5 GiB are whole", dev);
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc != 3) {
-        fprintf(stderr, "usage: lfprobe big|efbig DIR\n");
+        fprintf(stderr, "usage: lfprobe big|efbig DIR | blkdev DEV\n");
         return 2;
     }
     if (!strcmp(argv[1], "big")) big(argv[2]);
     else if (!strcmp(argv[1], "efbig")) efbig(argv[2]);
+    else if (!strcmp(argv[1], "blkdev")) blkdev(argv[2]);
     else fail("unknown mode %s", argv[1]);
     printf("PASS lfprobe\n");
     return 0;
