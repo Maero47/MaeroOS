@@ -262,6 +262,11 @@ struct proc {
     /* /proc/<pid>/io: bytes and calls through read/write-family syscalls. */
     uint64_t         io_rchar, io_wchar;
     uint32_t         io_syscr, io_syscw;
+    /* /proc nodes this thread's current syscall has looked up: a path walk
+     * keeps no reference to what it finds, so these are held against
+     * eviction until the syscall returns (fs/procpid.inc). */
+    struct vfs_node *pn_walk[16];
+    uint8_t          pn_nwalk;
     uint32_t         sched_count;   /* times scheduled */
 
     /* Fair scheduling (proc/scheduler.c): on-CPU time in ns, weighted by

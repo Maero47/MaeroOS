@@ -11,6 +11,7 @@ extern void vma_clear(struct proc *p);   /* free demand-paged VMAs (syscall.c) *
 #include "syscall.h"       /* copy_to_user / copy_from_user */
 #include "../fs/devfs.h"
 #include "../fs/vfs.h"
+#include "../fs/procfs.h"
 #include "../net/socket.h"
 #include "../arch/i686/cpu/tss.h"
 #include "../arch/i686/cpu/gdt.h"
@@ -774,6 +775,8 @@ void proc_exit(int status) {
         vfs_close(current_proc->ctty);
         current_proc->ctty = (void *)0;
     }
+    /* /proc nodes held by a syscall that is not coming back. */
+    if (current_proc->pn_nwalk) procfs_walk_done(current_proc);
     if (current_proc->root_node) {           /* chroot(2)'s pinned root */
         vfs_close(current_proc->root_node);
         current_proc->root_node = (void *)0;

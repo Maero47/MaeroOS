@@ -11,9 +11,11 @@
  * one per (pid, kind, fd, thread view), made on first lookup and reused by
  * later ones.  Its contents are computed at read time from whatever process
  * holds that pid then; a pid is never reused, so a node never shows another
- * process.  Once its process is gone a node is freed when it is no longer
- * open and has been dead for a few seconds (a lookup in progress on another
- * CPU still holding it has long finished by then).
+ * process.  A node cannot be freed while it is open (refs) or while a
+ * syscall that looked it up is still running (walks: the thread records it
+ * and lets go at the syscall's return, procfs_walk_done); any other node is
+ * only a cache entry, made again by the next lookup.  See "node cache" below
+ * for how many are kept and who pays for them.
  *
  * Permissions follow Linux's: a process's directory and most files belong
  * to its effective uid/gid (root when it is not dumpable); environ, auxv, io,
@@ -35,20 +37,22 @@ typedef struct pnode {
     int            arg;        /* fd number (PK_FD, PK_FDINFO) */
     uint8_t        kind;
     uint8_t        thread;     /* under task/<tid>: the thread's own view */
+    uint8_t        bucket;     /* accounting bucket it is charged to */
+    uint16_t       walks;      /* running syscalls that looked it up */
     int            refs;       /* open references (retain/close) */
-    uint32_t       dead_tick;  /* PIT tick its process was first seen gone */
-    uint32_t       used_tick;  /* PIT tick of its last lookup */
-    struct pnode  *next;
+    uint32_t       used_tick;  /* PIT tick of its last lookup or close */
+    struct pnode  *hnext;      /* hash chain */
+    /* With refs == 0 a node is on two LRU lists, most recent first: all such
+     * nodes, and those of its bucket. */
+    struct pnode  *gprev, *gnext, *bprev, *bnext;
 } pnode_t;
 
-static pnode_t *pnodes;
-/* Nodes cached now (/proc/sys/kernel/procfs_nodes).  At most PNODE_MAX
- * (about 1.7 MiB of heap): a lookup past it first evicts nodes nobody holds
- * open and nobody has looked up for PNODE_IDLE ticks, and fails if none
- * can go. */
+/* Nodes cached now (/proc/sys/kernel/procfs_nodes).  Limits: */
 static uint32_t pnode_count;
-#define PNODE_MAX  4096
-#define PNODE_IDLE 300
+#define PNODE_USER_MAX 1024   /* charged to one non-root user */
+#define PNODE_MAX      8192   /* in all, for lookups by non-root users */
+#define PNODE_ROOT_MAX 9216   /* in all, for root's (the last 1024 are its); ~4 MiB */
+#define PNODE_IDLE     300    /* ticks unused before the sweep frees a node */
 
 /* Entries of a /proc/<pid> (and task/<tid>) directory. */
 static const struct pent {
@@ -121,49 +125,171 @@ int procfs_may_read(struct proc *t) {
            g == t->gid && g == t->egid && g == t->sgid;
 }
 
-/* ── node cache ── */
+/* ── node cache ──
+ *
+ * Linux keeps no count: proc inodes and dentries are reclaimable cache that
+ * the shrinkers free under memory pressure.  Here the heap is bounded by
+ * count instead, and that bound must not let one user deny /proc to the
+ * others.  So:
+ *
+ *  - nothing is kept for its recency alone.  A node nobody holds open and no
+ *    running syscall has looked up can be freed at any time, oldest first,
+ *    to make room; a lookup that needs room never fails while such a node
+ *    exists.
+ *  - every node is charged to one user: the last to look it up while it was
+ *    not open, or whoever opened it.  A non-root user with PNODE_USER_MAX
+ *    nodes charged frees one of its own before it gets another (and its
+ *    lookup fails only when all of them are open or in use by its own
+ *    syscalls), so one user can hold at most that many and the rest of
+ *    PNODE_MAX is always there for the others.  Root is not limited per
+ *    user and has PNODE_ROOT_MAX - PNODE_MAX to itself.
+ *  - the sweep frees nodes unused for PNODE_IDLE ticks, so the count falls
+ *    back once the lookups stop (dead processes' nodes and closed fd/N go
+ *    the same way).
+ *
+ * Buckets: one per user with nodes charged, up to PN_USERS of them; users
+ * past that share the spill bucket (and its limit), and root has its own,
+ * unlimited.  A node's bucket is the one it is uncharged from, and a bucket
+ * is given to another user only once nothing is charged to it. */
+#define PN_USERS 64
+#define PN_SPILL PN_USERS
+#define PN_ROOT  (PN_USERS + 1)
+static struct { uint32_t uid, n; pnode_t *head, *tail; } pn_acct[PN_USERS + 2];
+static pnode_t *pn_ghead, *pn_gtail;
+#define PN_HASH 512
+static pnode_t *pn_hash[PN_HASH];
 
-static void pnode_retain(vfs_node_t *n) { ((pnode_t *)n)->refs++; }
-static void pnode_close(vfs_node_t *n) {
-    pnode_t *pn = (pnode_t *)n;
-    if (pn->refs > 0) pn->refs--;
+static uint32_t pn_hashof(int pid, int kind, int arg, int thread) {
+    uint32_t h = (uint32_t)pid * 2654435761U ^ (uint32_t)arg * 40503U ^
+                 (uint32_t)kind << 3 ^ (uint32_t)thread;
+    return (h ^ h >> 15) % PN_HASH;
 }
 
-/* Free the nodes nobody holds open that are no longer needed: those of a
- * process gone for 3 s; fd/N and fdinfo/N nodes whose descriptor has been
- * closed (not looked up for a second); and, with `evict`, any node idle for
- * PNODE_IDLE ticks (a later lookup makes it again).  A node looked up in the
- * last second is never freed: a path walk may still be using it. */
-static void pnode_sweep(int evict) {
-    uint32_t now = pit_ticks();
-    pnode_t **pp = &pnodes;
-    while (*pp) {
-        pnode_t *pn = *pp;
-        struct proc *t = pp_task(pn->pid);
-        int drop = 0;
-        if (t) {
-            pn->dead_tick = 0;
-            if (pn->refs <= 0 && now - pn->used_tick > 100) {
-                if (pn->kind == PK_FD || pn->kind == PK_FDINFO) {
-                    struct proc *o = pn->thread ? t : pp_leader(t);
-                    drop = !o->ofile || pn->arg < 0 || pn->arg >= MAX_FD ||
-                           o->ofile[pn->arg].type == FD_NONE;
-                }
-                if (evict && now - pn->used_tick > PNODE_IDLE) drop = 1;
-            }
-        } else {
-            if (!pn->dead_tick) pn->dead_tick = now ? now : 1;
-            drop = pn->refs <= 0 && now - pn->dead_tick > 300;
-        }
-        if (drop) {
-            *pp = pn->next;
-            vfs_forget_last_lookup();         /* it may name this node */
-            kfree(pn);
-            pnode_count--;
-            continue;
-        }
-        pp = &pn->next;
+static void pn_lru_add(pnode_t *pn) {
+    pn->gprev = NULL;
+    pn->gnext = pn_ghead;
+    if (pn_ghead) pn_ghead->gprev = pn; else pn_gtail = pn;
+    pn_ghead = pn;
+    __typeof__(pn_acct[0]) *a = &pn_acct[pn->bucket];
+    pn->bprev = NULL;
+    pn->bnext = a->head;
+    if (a->head) a->head->bprev = pn; else a->tail = pn;
+    a->head = pn;
+}
+
+static void pn_lru_del(pnode_t *pn) {
+    if (pn->gprev) pn->gprev->gnext = pn->gnext; else pn_ghead = pn->gnext;
+    if (pn->gnext) pn->gnext->gprev = pn->gprev; else pn_gtail = pn->gprev;
+    __typeof__(pn_acct[0]) *a = &pn_acct[pn->bucket];
+    if (pn->bprev) pn->bprev->bnext = pn->bnext; else a->head = pn->bnext;
+    if (pn->bnext) pn->bnext->bprev = pn->bprev; else a->tail = pn->bprev;
+    pn->gprev = pn->gnext = pn->bprev = pn->bnext = NULL;
+}
+
+/* The bucket uid's nodes are charged to. */
+static int pn_bucket_of(uint32_t uid) {
+    if (uid == 0) return PN_ROOT;
+    int fr = -1;
+    for (int i = 0; i < PN_USERS; i++) {
+        if (pn_acct[i].n && pn_acct[i].uid == uid) return i;
+        if (!pn_acct[i].n && fr < 0) fr = i;
     }
+    return fr >= 0 ? fr : PN_SPILL;
+}
+
+/* Charge pn to bucket b (for uid), uncharging it from its old one; while it
+ * is not open it moves to the head of b's list. */
+static void pn_charge(pnode_t *pn, int b, uint32_t uid) {
+    if (pn->bucket == b) return;
+    int listed = pn->refs <= 0;
+    if (listed) pn_lru_del(pn);
+    if (pn_acct[pn->bucket].n) pn_acct[pn->bucket].n--;
+    pn->bucket = (uint8_t)b;
+    if (!pn_acct[b].n++) pn_acct[b].uid = uid;
+    if (listed) pn_lru_add(pn);
+}
+
+static void pn_free(pnode_t *pn) {
+    pnode_t **pp = &pn_hash[pn_hashof(pn->pid, pn->kind, pn->arg, pn->thread)];
+    while (*pp && *pp != pn) pp = &(*pp)->hnext;
+    if (*pp) *pp = pn->hnext;
+    pn_lru_del(pn);
+    if (pn_acct[pn->bucket].n) pn_acct[pn->bucket].n--;
+    vfs_forget_last_lookup();             /* it may name this node */
+    kfree(pn);
+    pnode_count--;
+}
+
+/* Free the least recently used node of bucket b (b < 0: of all) that no
+ * running syscall holds.  0 if there is none. */
+static int pn_evict(int b) {
+    pnode_t *pn = b < 0 ? pn_gtail : pn_acct[b].tail;
+    while (pn && pn->walks) pn = b < 0 ? pn->gprev : pn->bprev;
+    if (!pn) return 0;
+    pn_free(pn);
+    return 1;
+}
+
+/* Free the nodes unused for PNODE_IDLE ticks. */
+static void pnode_sweep(uint32_t now) {
+    pnode_t *pn = pn_gtail;
+    while (pn && now - pn->used_tick > PNODE_IDLE) {
+        pnode_t *prev = pn->gprev;
+        if (!pn->walks) pn_free(pn);
+        pn = prev;
+    }
+}
+
+static void pnode_retain(vfs_node_t *n) {
+    pnode_t *pn = (pnode_t *)n;
+    if (pn->refs++ > 0) return;
+    /* Opened: off the LRU lists, and charged to the opener. */
+    pn_lru_del(pn);
+    uint32_t uid = current_proc ? current_proc->euid : 0;
+    pn_charge(pn, pn_bucket_of(uid), uid);
+}
+
+static void pnode_close(vfs_node_t *n) {
+    pnode_t *pn = (pnode_t *)n;
+    if (pn->refs <= 0 || --pn->refs > 0) return;
+    pn->used_tick = pit_ticks();
+    pn_lru_add(pn);
+}
+
+/* Hold pn until the caller's syscall returns.  0 if the caller already
+ * holds as many nodes as it can (a path that crosses that many per-process
+ * nodes then fails). */
+static int pn_walk_hold(pnode_t *pn) {
+    struct proc *c = current_proc;
+    if (!c) return 1;
+    for (uint32_t i = 0; i < c->pn_nwalk; i++)
+        if (c->pn_walk[i] == &pn->v) return 1;
+    if (c->pn_nwalk >= sizeof(c->pn_walk) / sizeof(c->pn_walk[0])) return 0;
+    c->pn_walk[c->pn_nwalk++] = &pn->v;
+    pn->walks++;
+    return 1;
+}
+
+void procfs_walk_done(struct proc *p) {
+    for (uint32_t i = 0; i < p->pn_nwalk; i++) {
+        pnode_t *pn = (pnode_t *)p->pn_walk[i];
+        if (pn->walks) pn->walks--;
+        p->pn_walk[i] = NULL;
+    }
+    p->pn_nwalk = 0;
+}
+
+/* Room for one more node looked up by uid: 0 if there is none. */
+static int pn_make_room(uint32_t uid) {
+    if (uid != 0) {
+        int b = pn_bucket_of(uid);
+        while (pn_acct[b].n >= PNODE_USER_MAX)
+            if (!pn_evict(b)) return 0;
+    }
+    uint32_t max = uid ? PNODE_MAX : PNODE_ROOT_MAX;
+    while (pnode_count >= max)
+        if (!pn_evict(-1)) return 0;
+    return 1;
 }
 
 static uint32_t pp_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf);
@@ -193,18 +319,37 @@ static vfs_node_t *pnode_get(int pid, int kind, int arg, int thread,
                              const char *name, uint32_t type, uint32_t mode) {
     static uint32_t sweep_tick;
     uint32_t now = pit_ticks();
-    if (now - sweep_tick > 100) { sweep_tick = now; pnode_sweep(0); }
+    if (now - sweep_tick > 100) { sweep_tick = now; pnode_sweep(now); }
 
     struct proc *t = pp_task(pid);
     if (!t) return NULL;
+    uint32_t uid = current_proc ? current_proc->euid : 0;
+    uint32_t h = pn_hashof(pid, kind, arg, thread);
     pnode_t *pn;
-    for (pn = pnodes; pn; pn = pn->next)
+    for (pn = pn_hash[h]; pn; pn = pn->hnext)
         if (pn->pid == pid && pn->kind == kind && pn->arg == arg &&
             pn->thread == thread)
             break;
-    if (!pn) {
-        if (pnode_count >= PNODE_MAX) pnode_sweep(1);
-        if (pnode_count >= PNODE_MAX) return NULL;   /* all in use */
+    if (pn) {
+        if (!pn_walk_hold(pn)) return NULL;
+        if (pn->refs <= 0) {
+            /* Charged to this user if it has room (pn is in another
+             * bucket, so making room cannot free it), and to the front. */
+            int b = pn_bucket_of(uid);
+            if (b != pn->bucket) {
+                while (b != PN_ROOT && pn_acct[b].n >= PNODE_USER_MAX && pn_evict(b)) {}
+                b = pn_bucket_of(uid);
+                if (b != pn->bucket && (b == PN_ROOT || pn_acct[b].n < PNODE_USER_MAX))
+                    pn_charge(pn, b, uid);
+            }
+            pn_lru_del(pn);
+            pn_lru_add(pn);
+        }
+    } else {
+        struct proc *c = current_proc;
+        if (c && c->pn_nwalk >= sizeof(c->pn_walk) / sizeof(c->pn_walk[0]))
+            return NULL;
+        if (!pn_make_room(uid)) return NULL;
         pn = (pnode_t *)kmalloc(sizeof(*pn));
         if (!pn) return NULL;
         pnode_count++;
@@ -239,15 +384,20 @@ static vfs_node_t *pnode_get(int pid, int kind, int arg, int thread,
                 pn->v.write_fn = pp_write;
             break;
         }
-        pn->next = pnodes;
-        pnodes = pn;
+        int b = pn_bucket_of(uid);
+        pn->bucket = (uint8_t)b;
+        if (!pn_acct[b].n++) pn_acct[b].uid = uid;
+        pn->hnext = pn_hash[h];
+        pn_hash[h] = pn;
+        pn_lru_add(pn);
+        pn_walk_hold(pn);
     }
     pn->used_tick = now;
     /* Ownership follows the task's credentials as they are now. */
-    uint32_t uid, gid;
-    pp_owner(thread ? t : pp_leader(t), &uid, &gid);
-    pn->v.uid = uid;
-    pn->v.gid = gid;
+    uint32_t ouid, ogid;
+    pp_owner(thread ? t : pp_leader(t), &ouid, &ogid);
+    pn->v.uid = ouid;
+    pn->v.gid = ogid;
     pn->v.mask = mode;
     pn->v.nlink = type == VFS_FLAG_DIR ? 2 : 1;
     pn->v.mtime = pn->v.ctime = pn->v.atime = rtc_boot_epoch() + t->start_tick / 100;

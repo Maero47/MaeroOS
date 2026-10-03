@@ -13,3 +13,7 @@ vfs_node_t *procfs_mount(void);
  * files (environ, auxv, maps, io, fd/, fdinfo/, exe, cwd, root) answer
  * -EACCES without it. */
 int procfs_may_read(struct proc *target);
+
+/* Let go of the /proc nodes p's syscall looked up (at its return, and at
+ * exit); until then the node cache cannot free them. */
+void procfs_walk_done(struct proc *p);

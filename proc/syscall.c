@@ -10498,6 +10498,7 @@ void syscall_dispatch(registers_t *regs) {
     if (current_proc && num != 11 &&
         (current_proc->euid != cred_euid || current_proc->egid != cred_egid))
         proc_set_dumpable(current_proc, 0);
+    if (current_proc && current_proc->pn_nwalk) procfs_walk_done(current_proc);
 
     /* inotify IN_MODIFY for a write that changed a file (write, writev,
      * pwrite64). */

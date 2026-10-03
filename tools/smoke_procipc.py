@@ -152,6 +152,10 @@ def check_ipc(g):
     # do not drift when a spilled user later gets a slot.
     out = g.run("/abiprobes/p49_accounting", timeout=150)
     expect(out, r"^PASS p49_accounting$", "accounting probe")
+    # One user hammering /proc lookups cannot make them fail for root or
+    # another user, and the node cache stays bounded.
+    out = g.run("/abiprobes/p50_procfs_fair", timeout=180)
+    expect(out, r"^PASS p50_procfs_fair$", "/proc fairness probe")
     out = g.run("cat /proc/sys/fs/inotify/queued_bytes")
     expect(out, r"^0$", "no inotify event memory left behind")
     out = g.run("cat /proc/sysvipc/shm | toybox wc -l")

@@ -116,6 +116,8 @@ PROBES = {
     "p48_ipc_limits":          (240, ""),
     # /proc node cache and inotify accounting buckets do not drift.
     "p49_accounting":          (120, ""),
+    # One user hammering /proc lookups cannot make them fail for others.
+    "p50_procfs_fair":         (150, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

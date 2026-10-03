@@ -177,7 +177,8 @@ enum { SC_OVERCOMMIT, SC_SHMMAX, SC_SHMALL, SC_SHMMNI, SC_SEM, SC_MSGMAX, SC_MSG
        SC_MAX_USER_WATCHES, SC_MAX_USER_INSTANCES, SC_MAX_QUEUED_EVENTS,
        SC_FILE_MAX, SC_THREADS_MAX, SC_INO_USER_BYTES, SC_INO_TOTAL_BYTES,
        SC_INO_QUEUED_BYTES, SC_SHM_USER, SC_MSG_PER_QUEUE, SC_INO_ACCT_SLOTS,
-       SC_INO_SPILL_BYTES, SC_PROCFS_NODES };
+       SC_INO_SPILL_BYTES, SC_PROCFS_NODES, SC_PROCFS_NODES_MAX,
+       SC_PROCFS_USER_NODES };
 
 static const sysctl_ent_t sysctl_ents[] = {
     { "vm",     "overcommit_memory",    SC_OVERCOMMIT, 0644 },
@@ -207,6 +208,8 @@ static const sysctl_ent_t sysctl_ents[] = {
     { "fs/inotify", "spill_bytes",        SC_INO_SPILL_BYTES,    0444 },
     /* MaeroOS: per-process /proc nodes cached now (fs/procpid.inc). */
     { "kernel", "procfs_nodes",         SC_PROCFS_NODES, 0444 },
+    { "kernel", "procfs_nodes_max",     SC_PROCFS_NODES_MAX, 0444 },
+    { "kernel", "procfs_user_nodes_max", SC_PROCFS_USER_NODES, 0444 },
     /* MaeroOS: shm bytes one non-root user may create, messages per queue. */
     { "kernel", "shm_user_max",         SC_SHM_USER,   0444 },
     { "kernel", "msg_per_queue_max",    SC_MSG_PER_QUEUE, 0444 },
@@ -247,6 +250,8 @@ static uint32_t sysctl_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *
     case SC_INO_ACCT_SLOTS: l = snprintf(t, sizeof(t), "%u\n", inotify_acct_slots); break;
     case SC_INO_SPILL_BYTES: l = snprintf(t, sizeof(t), "%u\n", inotify_spill_bytes()); break;
     case SC_PROCFS_NODES: l = snprintf(t, sizeof(t), "%u\n", pnode_count); break;
+    case SC_PROCFS_NODES_MAX: l = snprintf(t, sizeof(t), "%u\n", PNODE_ROOT_MAX); break;
+    case SC_PROCFS_USER_NODES: l = snprintf(t, sizeof(t), "%u\n", PNODE_USER_MAX); break;
     case SC_SHM_USER: l = snprintf(t, sizeof(t), "%u\n", SYSV_SHM_USER_PAGES * 4096U); break;
     case SC_MSG_PER_QUEUE: l = snprintf(t, sizeof(t), "%u\n", SYSV_MSG_PER_QUEUE); break;
     }

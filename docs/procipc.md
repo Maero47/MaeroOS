@@ -59,14 +59,40 @@ Firefox's reopen of a memfd shares its frames.
 
 **Node lifetime.** Lookups do not close what they return, so procfs nodes
 must outlive the walk that found them. Each (pid, file, fd, thread view)
-gets one heap node, reused by later lookups and counted by open references.
-Its contents are built at read time from whichever process holds that pid,
-and pids are never reused. A node is freed once its process has been gone for
-3 s and nothing holds it open; an `fd/N` or `fdinfo/N` node once its
-descriptor is closed (and it has not been looked up for a second). At most
-4096 nodes are cached (`/proc/sys/kernel/procfs_nodes` counts them): past
-that a lookup evicts nodes nobody holds open that have been idle for 3 s, and
-fails if there are none.
+gets one heap node, reused by later lookups. Its contents are built at read
+time from whichever process holds that pid, and pids are never reused. A
+node cannot be freed while it is open (counted by the open references) or
+while a syscall that looked it up is still running: the thread records each
+node it looks up (up to 16 per syscall; a path crossing more fails with
+ENOENT) and lets go of them when the syscall returns or the thread exits.
+Every other node is only a cache entry that the next lookup makes again.
+
+**Node cache limits.** Linux has no count here: proc inodes and dentries are
+reclaimable cache freed under memory pressure. MaeroOS bounds the heap by
+count, without letting one user deny `/proc` to the others:
+
+- A lookup that needs room frees the least recently used node that is
+  neither open nor held by a running syscall; it never fails while one
+  exists. Nothing is kept merely because it was used recently.
+- Each node is charged to one user: the last to look it up while it was not
+  open, or whoever opened it. A non-root user with 1024 nodes charged
+  (`/proc/sys/kernel/procfs_user_nodes_max`) frees one of its own first,
+  and fails only when all of its nodes are open or held by its own running
+  syscalls. So one user holds at most 1024, and the rest of the 8192 that
+  non-root lookups may fill stays available to everyone else. Root has no
+  per-user limit and may also use the last 1024 of the 9216 total
+  (`procfs_nodes_max`, about 4 MiB of heap at most).
+- Nodes unused for 3 s are freed by the sweep (every second, on a lookup),
+  so `procfs_nodes` falls back once lookups stop. Nodes of exited processes
+  and of closed descriptors age out the same way.
+- Users are tracked in 64 buckets. Users beyond that share a spill bucket
+  and its 1024 limit, and root has a bucket of its own.
+
+p50 has one user look up about 6000 distinct nodes in tight loops while
+root and a second user run `ps` and read every `/proc/<pid>/stat` and
+`status`. Before this change, past 4096 nodes only nodes idle for 3 s could
+be evicted, so the hammer kept the whole cache busy and every new lookup
+failed for everyone, `/proc/<pid>` and `/proc/self` included.
 
 ## System V IPC
 

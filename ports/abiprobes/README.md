@@ -67,6 +67,7 @@ regression tests for the fixes in audit section 5.
 | P47 | `p47_proc_pid.c`            | `/proc/self` link, `/proc/<pid>` files, `/proc/stat`/`loadavg`; another user's `environ`/`fd`/links are `EACCES` | — |
 | P48 | `p48_ipc_limits.c`          | an unprivileged user's inotify queues end in `IN_Q_OVERFLOW`, a full message queue is `EAGAIN`, shm stops at `ENOSPC`; fork and allocation still work | — |
 | P49 | `p49_accounting.c`          | `/proc/self/fd`/`fdinfo` nodes are dropped once the fds close (`procfs_nodes`); inotify's spill bucket returns to 0 after a spilled user gets a slot | — |
+| P50 | `p50_procfs_fair.c`         | an unprivileged user looking up ~6000 distinct `/proc/<pid>/fd`/`fdinfo` nodes in tight loops cannot make root's or another user's `/proc` lookups (or `ps`) fail; `procfs_nodes` stays within `procfs_nodes_max` and falls back once it stops | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the
