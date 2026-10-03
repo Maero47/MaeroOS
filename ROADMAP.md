@@ -27,8 +27,8 @@ Each is covered by the test named, which README.md's status table describes.
 - **Filesystems from USB sticks.** USB disks join the block-device table as
   `sdX`, and FAT12/16/32 and exFAT mount read-write (`make smoke-vfat`,
   `make smoke-exfat`).
-- **Installing to a disk.** `maeros-install` writes a GPT disk that boots
-  under BIOS and UEFI (`make smoke-install`).
+- **Installing to a disk.** `maeros-install` writes a GPT disk with an ext4
+  root that boots under BIOS and UEFI (`make smoke-install`).
 - **Sound for Linux programs.** The ALSA PCM/control ABI on HDA and AC'97
   (`make smoke-audio`).
 
@@ -37,10 +37,10 @@ Each is covered by the test named, which README.md's status table describes.
 What still stands between MaeroOS and daily use on real hardware:
 
 - **ext4 writes, the rest.** A default `mkfs.ext4` filesystem mounts read-write
-  with jbd2 journaling (`make smoke-ext4rw`, `docs/ext4.md`); still missing are
-  indexing new directories (they stay linear), htree lookups, the orphan file, `meta_bg`,
-  `inline_data`, `bigalloc`, quotas and filesystems past 2^32 blocks. The
-  installed root is ext2.
+  with jbd2 journaling, htree directories and the orphan file (`make smoke-ext4rw`,
+  `docs/ext4.md`), and the installed root is ext4; still missing are `meta_bg`,
+  `inline_data`, `bigalloc`, quotas, filesystems past 2^32 blocks, an htree deeper
+  than one interior level for inserts (`largedir`), and per-file `fsync`.
 - **SMP scaling.** Replace the single Big Kernel Lock with finer locking.
 - **Networking hardware.** Wi-Fi (an 802.11 stack and a driver), Realtek
   r8169 and virtio-net; today only RTL8139 and e1000 are supported.

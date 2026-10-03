@@ -117,15 +117,15 @@ ext2, ext3 and a typical ext4 as `mke2fs -t ext4` makes it today:
 | `metadata_csum`, `metadata_csum_seed` | crc32c of the superblock, group descriptors, block and inode bitmaps (in the descriptors), inodes, extent blocks and directory leaf blocks (the 12-byte tail), recomputed on every write |
 | `64bit` | 64-byte group descriptors; filesystems of 2^32 blocks or more are refused (i686: block numbers are 32-bit here) |
 | `flex_bg`, `uninit_bg` semantics | allocation follows the descriptors' bitmap and table locations; `BLOCK_UNINIT` bitmaps are built from the layout (and checked against the free count) on first use, `INODE_UNINIT` ones start empty, `bg_itable_unused` moves past each inode handed out |
-| `dir_index` | an htree directory keeps its index: a new name goes into the leaf its hash (legacy, half-MD4 or TEA, signed or unsigned, with the superblock's seed) selects; a full leaf splits at the median hash into a new block and the index gains an entry; a full root moves its entries into a new interior block (one more level), a full interior block splits; root and interior blocks get their dx tail checksum. Deeper than one interior level, the index is dropped instead (turning the index blocks into plain checksummed leaves). Lookups are linear; directories created here are linear |
-| `huge_file`, `extra_isize`, `dir_nlink`, `large_file`, `sparse_super`, `orphan_file` (empty), `resize_inode` | kept intact; new inodes get `i_extra_isize` and a creation time |
+| `dir_index` | lookups go through the index: the name's hash (legacy, half-MD4 or TEA, signed or unsigned, with the superblock's seed) is binary-searched in the root and up to two interior levels (`largedir`) down to a leaf, and on into the following leaves while the next index entry continues the same hash (a collision run); `.` and `..` come from the root block. An index that does not hold together (root info, counts or limits, a block past the directory, an interior block that is not one) is not trusted: the directory is scanned linearly, the error logged, and the superblock marked as having errors so the next `e2fsck` checks it, as Linux does. Inserts: a new name goes into the leaf its hash selects; a full leaf splits at the median hash into a new block and the index gains an entry; a full root moves its entries into a new interior block (one more level), a full interior block splits; root and interior blocks get their dx tail checksum. Deeper than one interior level, the index is dropped instead (turning the index blocks into plain checksummed leaves). Unlink and rename find the entry's leaf through the index too. A linear directory whose one block is full becomes indexed when the next name arrives (Linux's `make_indexed_dir`): its entries move into a new block 1, block 0 becomes the root with the default hash, all in one transaction |
+| `orphan_file` | see "Orphans" below |
+| `huge_file`, `extra_isize`, `dir_nlink`, `large_file`, `sparse_super`, `resize_inode` | kept intact; new inodes get `i_extra_isize` and a creation time |
 | `has_journal` | jbd2, below |
 
 Refused for writing (`EROFS`, busybox retries read-only and `fs/ext4.c`
 serves it): `meta_bg`, `inline_data`, `encrypt`, `casefold`, `bigalloc`,
 `quota`, `project`, `sparse_super2`, `gdt_csum` without `metadata_csum`, an
-orphan file with entries (`orphan_present`), an external journal, a journal
-with v1 checksums. `mount -t ext2 -o ro` stays with the ext2 driver when it
+external journal, a journal with v1 checksums. `mount -t ext2 -o ro` stays with the ext2 driver when it
 can read the filesystem, so `remount,rw` works there.
 
 **The journal.** Every metadata block an operation changes goes into the
@@ -158,9 +158,39 @@ extended-attribute block, `mkdir`/`rmdir` keep the group's directory count.
 writes through `/dev/<name>` to a mounted device, or to a disk or partition
 overlapping one, are `EBUSY`, as they are for `/disk`'s disk.
 
+**Orphans.** An inode whose last name goes while a descriptor or mapping
+still holds it, an inode being deleted with a journal (its blocks may be
+freed over several transactions), and a regular file being cut short over
+several transactions are recorded on disk until that is finished: in the
+orphan file (`orphan_file`: per block an array of inode numbers, then the
+magic `0x0B10CA04` and a crc32c of the block number and contents seeded like
+the orphan file's inode; adding the first entry sets `orphan_present`, taking
+the last one out clears it), or, without one or when it is full, in the old
+list that starts at `s_last_orphan` and continues through each inode's
+`i_dtime`. Each change goes into the transaction of the operation that makes
+it. While a truncate frees blocks in steps, the inode each step commits
+already carries the new size. A read-write mount (and `remount,rw`) finishes
+what it finds after the journal replay: an inode without links is deleted
+(its entry cleared in the same transaction as the inode is freed), one with
+links is cut to its `i_size` (the tail of the last block zeroed); it logs
+`orphans: N deleted, M truncated`. Plain ext2 keeps no orphan record (as
+Linux's ext2 driver), so there a file unlinked while open and lost to a crash
+stays allocated until `e2fsck`.
+
+**`/disk`.** An ext3/ext4 filesystem at `/disk` (the root `maeros-install`
+writes, or `root=` naming one) is mounted like a read-write `mount(2)`: the
+same feature checks (a feature that cannot be written leaves `/disk`
+read-only), the journal replayed if needed, `needs_recovery` while mounted,
+the orphans finished, the flusher started once processes exist; `reboot(2)`
+(power-off, restart, halt) commits it and marks it clean
+(`ext2_shutdown()`), and `/proc/mounts` lists it as `ext4` (`ext3`). A plain
+ext2 `/disk` is handled as before.
+
 `mount -o x4crash` is a test hook: the commit that ends the next `write(2)`
 stops before writing anything in place and the instance then refuses all
 writes, as if the power had gone; `smoke-ext4rw` has `e2fsck` replay the log.
+`x4crashunlink` and `x4crashtrunc` do the same at the first commit inside the
+next `unlink(2)` or truncate.
 
 `make smoke-ext2rw` (`tools/smoke_ext2rw.py`, images in `build/ext2rw/`)
 mounts an ext2 on AHCI and an ext3 on NVMe read-write together;
@@ -169,10 +199,25 @@ for `mkfs.ext4` filesystems with and without a journal, a dirty journal and
 the simulated power loss. Both check the result on the host with
 `e2fsck -fn` and `debugfs`.
 
-Not done: making a directory indexed (directories made here stay linear,
-which Linux and e2fsck accept), htree lookups (linear), the orphan file (a file unlinked while open is released
-when it is closed; after a crash in between it is lost space until `e2fsck`),
-fast commits, and per-file `fsync` (it commits everything).
+`make smoke-ext4rw` also grows a new directory to 5000 names (it becomes
+indexed; `debugfs htree`, `e2fsck -fn`), times 10000 creates and 20000
+lookups (half of them misses) with `fsprobe mkfiles`/`lookups` in an indexed
+and a `^dir_index` directory, and loses power with a file open and
+unlinked, in the middle of freeing a file (old orphan list) and in the middle
+of a truncate; a second boot finishes all three.
+
+Lookups in a 10000-name directory (4 KiB blocks, KVM, `fsprobe lookups`:
+10000 hits and 10000 misses):
+
+| kernel | create 10000 | 20000 lookups | per lookup |
+|---|---|---|---|
+| before (linear lookups, main `a593519`) | 13.8 s | 4.33 s | 216 us |
+| after, indexed directory | 3.9-5.1 s | 0.50-0.62 s | 24-30 us |
+| after, `^dir_index` filesystem (linear) | 10.2 s | 3.34 s | 167 us |
+
+Not done: inserting into an htree deeper than one interior level (the index
+is dropped instead), fast commits, and per-file `fsync` (it commits
+everything).
 
 ### The read-only driver
 
@@ -189,7 +234,10 @@ Written from the on-disk format as documented by the Linux kernel's
 Algorithms"; documentation, not code), the UEFI specification (GPT) and RFC
 1320 (MD4, which the half-MD4 directory hash shortens to three rounds over
 eight words), and for the journal `Documentation/filesystems/ext4/journal.rst`
-("Journal (jbd2)"). FreeBSD `sys/fs/ext2fs` (BSD-2-Clause) and HelenOS
+("Journal (jbd2)"), and for the orphan file and orphan list
+`Documentation/filesystems/ext4/` ("Orphan File", "Super Block": `s_last_orphan`,
+`s_orphan_file_inum`); the orphan-file block checksum was checked against what
+mke2fs 1.47 writes. FreeBSD `sys/fs/ext2fs` (BSD-2-Clause) and HelenOS
 `uspace/lib/ext4` (BSD-3-Clause) were read for layout details only. No code
 was copied from any source; in particular nothing from Linux or lwext4 (GPL).
 The crc32c table is generated at run time from the Castagnoli polynomial.

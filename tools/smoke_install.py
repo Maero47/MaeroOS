@@ -10,8 +10,8 @@
              the serial console (with a sparse 3 TiB sdc attached too):
              `maeros-install -y /dev/sdc` is refused (the block layer's
              32-bit sector count saturates, so its end is unknown),
-             `maeros-install -n /dev/sdb` prints the layout and writes
-             nothing, `-n` on a 1 GiB + 1 sector sdd puts the backup GPT in
+             `maeros-install -n /dev/sdb` prints the layout (ext4) and writes
+             nothing, as does `-n --ext2` (ext2), `-n` on a 1 GiB + 1 sector sdd puts the backup GPT in
              its exact last sector (BLKGETSIZE64, not /proc/partitions' KiB), `maeros-install -l` lists the disks and marks sda in use,
              `maeros-install -y /dev/sda` is refused, `maeros-install -y
              /dev/sdb` installs; then poweroff.
@@ -22,14 +22,18 @@
              the kernel refuses to mount it at /disk (superblock larger than
              the device) and boots from the initrd.
    host      the target's GPT verifies (sgdisk -v), its root partition is
-             clean under `e2fsck -fn`, its ESP under `fsck.fat -n` (each when
-             the tool is installed).
+             an ext4 (extent, flex_bg, metadata_csum, has_journal, dir_index,
+             orphan_file) clean under `e2fsck -fn`, its ESP under
+             `fsck.fat -n` (each when the tool is installed).
 2. bios      qemu-system-i386 -M q35, SeaBIOS, ONLY the installed disk: Limine
              (BIOS) boots it, the kernel takes root=PARTUUID=... as /dev/sda3,
              /proc/mounts has it at /disk, login works, the desktop comes up;
              a file is written to /disk; poweroff.
 3. uefi-x64  qemu-system-x86_64 -M q35, OVMF x64, ONLY the installed disk: the
              same checks, and the file from boot 2 is there.
+4. host      after both boots (the kernel mounted the root read-write with its
+             journal and marked it clean at poweroff): e2fsck -fn clean, no
+             needs_recovery, persist.txt there (debugfs).
 
 Output: build/smoke-install/ (serial logs, desktop screenshots, target.img).
 OVMF missing: the uefi-x64 boot is SKIP (SMOKE_UEFI_REQUIRE=1 makes it fail).
@@ -167,8 +171,11 @@ def live_install(accel):
         if "2 TiB or larger" not in big or "rc=1" not in big:
             raise AssertionError(f"a 3 TiB disk (saturated size) was not refused:\n{big}")
         dry = con.run("maeros-install -n /dev/sdb; echo rc=$?", timeout=60)
-        if "Dry run: nothing written." not in dry or "rc=0" not in dry:
+        if "Dry run: nothing written." not in dry or "rc=0" not in dry or "\next4: " not in dry.replace("\r", ""):
             raise AssertionError(f"maeros-install -n failed:\n{dry}")
+        dry = con.run("maeros-install -n --ext2 /dev/sdb; echo rc=$?", timeout=60)
+        if "Dry run: nothing written." not in dry or "rc=0" not in dry or "\next2: " not in dry.replace("\r", ""):
+            raise AssertionError(f"maeros-install -n --ext2 failed:\n{dry}")
         dry = con.run("maeros-install -n /dev/sdd; echo rc=$?", timeout=60)
         if f"backup GPT at LBA {ODD_SECTORS - 1}\n" not in dry.replace("\r", ""):
             raise AssertionError(f"odd-sized disk: backup GPT not at its last LBA "
@@ -287,7 +294,18 @@ def host_checks(uuid):
                 left -= len(buf)
         return path
 
-    for tool, n, args, label in (("e2fsck", 3, ["-fn"], "ext2"), ("fsck.fat", 2, ["-n"], "FAT32")):
+    dumpe2fs = shutil.which("dumpe2fs") or (os.path.exists("/usr/sbin/dumpe2fs") and "/usr/sbin/dumpe2fs")
+    if dumpe2fs:
+        img = extract(3, "part3.img")
+        st = subprocess.run([dumpe2fs, "-h", img], capture_output=True, text=True).stdout
+        os.remove(img)
+        feats = re.search(r"Filesystem features:\s*(.*)", st)
+        feats = feats.group(1).split() if feats else []
+        want = ("has_journal", "dir_index", "orphan_file", "extent", "flex_bg", "metadata_csum")
+        if any(f not in feats for f in want):
+            raise AssertionError(f"root is not the expected ext4: {feats}")
+        notes.append("root is ext4 (" + " ".join(want) + ")")
+    for tool, n, args, label in (("e2fsck", 3, ["-fn"], "ext4"), ("fsck.fat", 2, ["-n"], "FAT32")):
         exe = shutil.which(tool) or (os.path.exists("/usr/sbin/" + tool) and "/usr/sbin/" + tool)
         if not exe:
             notes.append(f"{tool} missing, {label} unchecked")
@@ -299,6 +317,44 @@ def host_checks(uuid):
             raise AssertionError(f"{tool} on partition {n}: rc={r.returncode}\n{r.stdout}{r.stderr}")
         notes.append(f"{label} clean")
     return notes
+
+
+def root_after_boots(token):
+    """The installed root after the kernel has run on it: clean, journal
+    empty, the file written in the BIOS boot there."""
+    e2fsck = shutil.which("e2fsck") or (os.path.exists("/usr/sbin/e2fsck") and "/usr/sbin/e2fsck")
+    sgdisk = shutil.which("sgdisk")
+    if not e2fsck or not sgdisk:
+        return "SKIP (no e2fsck or sgdisk)"
+    r = subprocess.run([sgdisk, "-i", "3", TARGET], capture_output=True, text=True)
+    first = int(re.search(r"First sector: (\d+)", r.stdout).group(1))
+    last = int(re.search(r"Last sector: (\d+)", r.stdout).group(1))
+    img = os.path.join(OUT, "root-after.img")
+    with open(TARGET, "rb") as src, open(img, "wb") as dst:
+        src.seek(first * 512)
+        left = (last - first + 1) * 512
+        while left:
+            buf = src.read(min(left, 1 << 22))
+            dst.write(buf)
+            left -= len(buf)
+    try:
+        r = subprocess.run([e2fsck, "-fn", img], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise AssertionError(f"e2fsck -fn after the boots: rc={r.returncode}\n{r.stdout[-2000:]}")
+        dumpe2fs = shutil.which("dumpe2fs") or "/usr/sbin/dumpe2fs"
+        st = subprocess.run([dumpe2fs, "-h", img], capture_output=True, text=True).stdout
+        if "needs_recovery" in st or not re.search(r"Filesystem state:\s+clean", st):
+            raise AssertionError(f"root not clean after poweroff:\n{st[:1500]}")
+        notes = "e2fsck -fn clean, state clean, no needs_recovery"
+        if token:
+            debugfs = shutil.which("debugfs") or "/usr/sbin/debugfs"
+            got = subprocess.run([debugfs, "-R", "cat /persist.txt", img], capture_output=True).stdout
+            if token.encode() not in got:
+                raise AssertionError(f"debugfs: /persist.txt is {got!r}")
+            notes += ", debugfs sees persist.txt"
+        return notes
+    finally:
+        os.remove(img)
 
 
 def boot_installed(name, qemu, firmware, accel, code=None, vars_src=None,
@@ -329,8 +385,10 @@ def boot_installed(name, qemu, firmware, accel, code=None, vars_src=None,
         fb = (int(m.group(1)), int(m.group(2)))
         smokelib.login(con.proc, con.sel, con.log, timeout=180, start=0)
         con.wait_re(r"\[desktop\] ready fb=(\d+)x(\d+)", timeout=120, start=0)
+        if not re.search(r"\[EXT2\]  Mounted: .*journal, extents, metadata_csum", con.text()):
+            raise AssertionError("the kernel did not mount the root as a journaled ext4")
         mounts = con.run("cat /proc/mounts", timeout=20)
-        if not re.search(r"^/dev/sda3 /disk ext2 ", mounts, re.M):
+        if not re.search(r"^/dev/sda3 /disk ext4 ", mounts, re.M):
             raise AssertionError(f"/disk is not /dev/sda3:\n{mounts}")
         # The ESP (FAT32 from maeros-install's own FAT writer) through the
         # kernel's vfat driver: limine.conf must name this root.
@@ -360,8 +418,11 @@ def boot_installed(name, qemu, firmware, accel, code=None, vars_src=None,
         colors = distinct_colors(img, (0, 0, img.w, img.h))
         if colors < 50:
             raise AssertionError(f"desktop screen has only {colors} colours")
+        at = con.mark()
         poweroff(con)
-        return (f"Limine ({firmware}) -> root {root_dev}, ESP mounted as vfat, "
+        if not re.search(r"\[EXT2\]  disk: clean at shutdown", con.text()[at:]):
+            raise AssertionError("poweroff did not mark the ext4 root clean")
+        return (f"Limine ({firmware}) -> root {root_dev} (ext4, journal), ESP mounted as vfat, "
                 f"login, desktop {fb[0]}x{fb[1]} "
                 f"({colors} colours), {time.time() - t0:.1f}s")
     except Exception:
@@ -417,6 +478,12 @@ def main():
         except Exception as exc:
             results.append(("uefi-x64", f"FAIL: {exc}"))
             failed.append("uefi-x64")
+
+    try:
+        results.append(("host-after", "PASS: " + root_after_boots(None if "bios" in failed else token)))
+    except Exception as exc:
+        results.append(("host-after", f"FAIL: {exc}"))
+        failed.append("host-after")
 
     print()
     for name, msg in results:

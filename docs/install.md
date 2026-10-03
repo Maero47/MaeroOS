@@ -10,6 +10,7 @@ maeros-install            # lists the disks, asks which one, asks you to type "y
 maeros-install -l         # just list the disks
 maeros-install -n /dev/sdb    # dry run: the layout, nothing written
 maeros-install -y /dev/sdb    # no questions (scripts, tools/smoke_install.py)
+maeros-install --ext2 /dev/sdb   # an ext2 root instead of ext4
 ```
 
 On the desktop, the launcher's **Install MaeroOS** entry and the **Install**
@@ -24,8 +25,9 @@ afterwards and boot from the disk. It boots under legacy BIOS (Limine's BIOS
 stages) and UEFI (x86_64 `BOOTX64.EFI` and IA32 `BOOTIA32.EFI`). Secure Boot must
 be off, because Limine is not signed.
 
-Options: `-n` (dry run), `--source DIR` (default `/disk`), `--boot-dir DIR` (default `/boot`),
-`--initrd FILE` (default `/dev/initrd`), `--esp-mib N`.
+Options: `-n` (dry run), `--ext2` (an ext2 root; ext4 is the default), `--source DIR`
+(default `/disk`), `--boot-dir DIR` (default `/boot`), `--initrd FILE` (default
+`/dev/initrd`), `--esp-mib N`.
 
 ## What it writes
 
@@ -33,7 +35,7 @@ Options: `-n` (dry run), `--source DIR` (default `/disk`), `--boot-dir DIR` (def
 |---|---|---|
 | 1 BIOS boot (`21686148-...`) | 1 MiB at 1 MiB | Limine BIOS stage 2 |
 | 2 EFI System (`C12A7328-...`) | 2 x (kernel + initrd + Limine) + 64 MiB, at least 128 MiB | FAT32: `/EFI/BOOT/BOOTX64.EFI`, `/EFI/BOOT/BOOTIA32.EFI`, `/boot/limine/{limine.conf,limine-bios.sys,LICENSE}`, `/boot/kernel.elf`, `/boot/initrd.tar` |
-| 3 MaeroOS root (Linux filesystem `0FC63DAF-...`) | the rest | ext2: a copy of `/disk` |
+| 3 MaeroOS root (Linux filesystem `0FC63DAF-...`) | the rest | ext4 (or ext2 with `--ext2`): a copy of `/disk` |
 
 The protective MBR carries Limine's BIOS stage 1. The installer writes
 `limine.conf` with `cmdline: root=PARTUUID=<partition 3's unique GUID>`.
@@ -60,27 +62,28 @@ Where the files come from:
 |---|---|
 | `userspace/install/install.c` | disk list (`/proc/partitions`, `/proc/mounts`), layout, GPT (both headers, CRC32), `limine.conf`, the Limine BIOS stage install, the interactive front end |
 | `userspace/install/fat.c` | FAT32 formatter: BPB, FSInfo, backup boot sector, two FATs, one contiguous cluster run per file, VFAT long names |
-| `userspace/install/ext2.c` | a populated ext2 in one pass, as `mke2fs -d` builds one: revision 1, 1 KiB blocks, 128-byte inodes, `sparse_super`, `filetype`, `large_file`, direct/indirect block maps up to triple, lost+found with 12 blocks |
+| `userspace/install/ext2.c` | a populated filesystem in one pass, as `mke2fs -d` builds one: revision 1, 1 KiB blocks, `sparse_super`, `filetype`, `large_file`, lost+found with 12 blocks. ext4 (default): 256-byte inodes (`extra_isize`, creation times), extent trees of depth 0 to 2, `flex_bg` (16 groups' bitmaps and inode tables in the first), `metadata_csum` (superblock, descriptors, bitmaps, inodes, extent blocks, directory leaves and htree blocks), an empty internal jbd2 journal (inode 8, 1024 to 16384 blocks by size, backed up in `s_jnl_blocks`), every directory of more than one block written as an htree (half-MD4 with a random seed, names sorted by hash into leaves, one or two index levels), the orphan file (inode 12, 16 blocks), `huge_file`, `dir_nlink`. ext2 (`--ext2`): 128-byte inodes, direct/indirect block maps up to triple |
 | `drivers/blkpart.c` | `/dev/<disk>` nodes are writable (root only, mode 0660), with partial sectors read-modify-written; writes to the disk mounted at `/disk` are `EBUSY`; GPT unique GUIDs are kept for `root=PARTUUID=` |
 | `drivers/ata.c`, `drivers/blkdev.c` | the drive's real size (LBA48 IDENTIFY words) next to the LBA28 part used for I/O; `BLKGETSIZE`/`BLKGETSIZE64` on `/dev` nodes report the exact size |
 | `proc/syscall.c` | `pread64`/`pwrite64` on a disk node take the full 64-bit offset (descriptor offsets are 32-bit), so the backup GPT at the end of a disk larger than 4 GiB can be reached |
 | `fs/devfs.c`, `fs/initrd.c` | `/dev/initrd` (read-only, root only; Linux's block device 1,250) |
 | `userspace/desktop/desktop.c`, `userspace/term/term.c` | the Install launcher entry and desktop icon; `term <slot> <command>` runs `shell -c <command>` instead of an interactive shell |
 | `fs/ext2.c`, `drivers/ata.c` | `ext2_mount()` refuses a superblock with more blocks than its device or partition has; the IDE master's `ata_read`/`ata_write` reject sectors at or past the drive's end or 2^28 (as the other IDE positions already did), so nothing wraps onto LBA 0 |
-| `kernel/main.c` | `root=/dev/<name>` or `root=PARTUUID=<guid>` picks the partition ext2 mounts at `/disk`. Without `root=`, the boot disk's whole device is used, as before. If `root=` names no device or the device holds no ext2, `/disk` stays unmounted rather than falling back to some other disk |
+| `kernel/main.c` | `root=/dev/<name>` or `root=PARTUUID=<guid>` picks the partition `fs/ext2.c` mounts at `/disk`. Without `root=`, the boot disk's whole device is used, as before. If `root=` names no device or the device holds no ext2/ext4, `/disk` stays unmounted rather than falling back to some other disk |
+| `fs/ext2.c` | an ext4 `/disk` is mounted read-write with its journal (replayed if needed), `needs_recovery` while up, orphans finished at mount, `kjournald` started once processes exist (`ext2_start_flusher`); `reboot(2)` commits it and marks it clean (`ext2_shutdown`, from `proc/syscall.c`) |
 
 The installer is plain POSIX C. Built on a Linux host (`cc -O2
 userspace/install/[a-z]*.c`), it writes an image file. This is how the formats
 were checked against `e2fsck -fn`, `fsck.fat -n` and `sgdisk -v`.
 
-### Why ext2 written in userland
+### Why the filesystem is written in userland
 
-The kernel's ext2 driver serves one filesystem, the one at `/disk`, and the ext4
-driver is read-only. That leaves no writable mount for a second disk. Writing
-the filesystem image directly needs neither of them, and it does not depend on
-an Alpine root being present (e2fsprogs' `mke2fs -d` in the chroot would). The
-result is the same format `make disk` produces with mke2fs, so `fs/ext2.c` reads
-and writes it with no changes.
+Writing the filesystem image directly needs no mounted target, and it does not
+depend on an Alpine root being present (e2fsprogs' `mke2fs -d` in the chroot
+would). The ext4 it writes is what `mke2fs -t ext4 -b 1024` makes (without
+`64bit`, `resize_inode` and `ext_attr`), so `fs/ext2.c` mounts it read-write
+with its journal at boot, and e2fsprogs accept it (`e2fsck -fn` clean, checked
+by `smoke-install` before and after the installed system has run on it).
 
 ### Limits
 
@@ -98,8 +101,14 @@ and writes it with no changes.
   group descriptor table takes 4096 of group 0's 8192 blocks; much past 1.9 TiB
   it would no longer fit, and data and group 1's backup superblock would land
   on group 0's metadata. The rest of a bigger disk is left unpartitioned (the
-  installer says how much). `maeros-install -n` prints the layout and the ext2
-  geometry and writes nothing.
+  installer says how much). With ext4, group 0 also holds the first flex
+  group's bitmaps and inode tables (2080 blocks at one inode per 16 KiB). `maeros-install -n` prints the
+  layout and the filesystem geometry and writes nothing.
+* ext4 blocks are 1 KiB, as in the ext2 layout (an extent covers at most 32 MiB).
+  A file of more than 28224 extents (`4 * 84 * 84`, two tree levels) is refused;
+  sequential allocation makes one extent per run between group metadata, so
+  this is far beyond any real file. A directory of more than 123 * 126 leaves
+  (some 400000 names) is written linearly instead of as an htree.
 * The copy keeps no block or inode bitmap in memory: allocation is
   sequential, so a block is in use when it is metadata or lies below the
   cursor. Its memory use does not grow with the disk size. There is one

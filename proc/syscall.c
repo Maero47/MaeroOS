@@ -5670,7 +5670,10 @@ static int sys_reboot(registers_t *regs) {
      * NVMe asks for an orderly shutdown notification before power goes. */
     if (cmd == LINUX_REBOOT_CMD_POWER_OFF || cmd == LINUX_REBOOT_CMD_RESTART ||
         cmd == LINUX_REBOOT_CMD_HALT)
+    {
         vfs_mounts_shutdown();
+        ext2_shutdown();
+    }
     if (cmd == LINUX_REBOOT_CMD_POWER_OFF || cmd == LINUX_REBOOT_CMD_RESTART)
         nvme_shutdown();
 

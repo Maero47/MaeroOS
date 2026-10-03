@@ -48,6 +48,8 @@ void fat32_build(uint64_t start, uint64_t nsect, const char *label,
 
 /* ── ext2 (ext2.c) ───────────────────────────────────────────────────────── */
 
+/* Format ext4 (on, the default) or ext2 (off); call before ext2_scan(). */
+void ext2_set_ext4(int on);
 /* Walk `srcdir` and report how many 1 KiB blocks and inodes a copy needs. */
 void ext2_scan(const char *srcdir, const char **skip, int nskip,
                uint64_t *blocks, uint32_t *inodes);
@@ -59,7 +61,8 @@ uint64_t ext2_max_sectors(void);
 /* The layout ext2_build() would use on `nsect` sectors (for --dry-run). */
 void ext2_geometry(uint64_t nsect, uint64_t *blocks, uint32_t *groups,
                    uint32_t *inodes, uint32_t *meta0);
-/* Make an ext2 filesystem (1 KiB blocks, sparse_super, filetype) on
- * [start, start + nsect) holding a copy of the tree ext2_scan() walked. */
+/* Make an ext4 (extents, flex_bg, metadata_csum, journal, dir_index,
+ * orphan_file) or ext2 filesystem, 1 KiB blocks, on [start, start + nsect)
+ * holding a copy of the tree ext2_scan() walked. */
 void ext2_build(uint64_t start, uint64_t nsect, const char *label,
                 const uint8_t uuid[16]);
