@@ -107,6 +107,8 @@ PROBES = {
     "p42_netlink":             (60, ""),
     "p43_lock_close_race":     (60, ""),
     "p44_proc_fd_link":        (60, ""),
+    # seccomp filters and no_new_privs (the Firefox content sandbox).
+    "p45_seccomp":             (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

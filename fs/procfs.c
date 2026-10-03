@@ -2,6 +2,7 @@
 #include "../drivers/blkpart.h"
 #include "vfs.h"
 #include "../proc/process.h"
+#include "../proc/seccomp.h"
 #include "../drivers/pci.h"
 #include "../net/net.h"
 #include "../net/lwip_glue.h"
@@ -146,7 +147,14 @@ static uint32_t procfs_build_status(struct proc *p, uint32_t off,
     pappend_int(content, &pos, sizeof(content), sid);
     pappend(content, &pos, sizeof(content), "\nTty:\t");
     pappend_tty(content, &pos, sizeof(content), p);
-    pappend(content, &pos, sizeof(content), "\nVmSize:\t4096 kB\n");
+    pappend(content, &pos, sizeof(content), "\nVmSize:\t4096 kB");
+    pappend(content, &pos, sizeof(content), "\nNoNewPrivs:\t");
+    pappend_int(content, &pos, sizeof(content), p ? p->no_new_privs : 0);
+    pappend(content, &pos, sizeof(content), "\nSeccomp:\t");
+    pappend_int(content, &pos, sizeof(content), p ? p->seccomp_mode : 0);
+    pappend(content, &pos, sizeof(content), "\nSeccomp_filters:\t");
+    pappend_int(content, &pos, sizeof(content), p ? seccomp_filter_count(p) : 0);
+    pappend(content, &pos, sizeof(content), "\n");
     content[pos] = '\0';
 
     if (off >= pos) return 0;

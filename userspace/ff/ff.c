@@ -72,10 +72,13 @@ static char *const ff_envp[] = {
      * during show).  Standard fix for GTK apps on minimal/headless systems. */
     "NO_AT_BRIDGE=1",
     "GTK_A11Y=none",
-    /* Firefox's child processes try to install a seccomp-bpf + namespace sandbox
-     * that this kernel doesn't provide; without disabling it the content/RDD/GMP
-     * children bail immediately and the parent stalls waiting for them. */
-    "MOZ_DISABLE_CONTENT_SANDBOX=1",
+    /* The content process sandbox is ON (docs/sandbox.md): the kernel has
+     * seccomp-bpf with TSYNC and no_new_privs, so each child filters its own
+     * system calls and reaches files only through the parent's SandboxBroker.
+     * MOZ_SANDBOX_LOGGING makes a child report every syscall its filter
+     * refuses or traps for the broker ("Sandbox: ..." on stderr), and the
+     * parent log the sandbox features it found at start. */
+    "MOZ_SANDBOX_LOGGING=1",
     /* alsa-lib (under apulse) reads its configuration from here instead of
      * its compiled-in /usr/share/alsa; ports/firefox/fetch-runtime.sh
      * installs it from libasound2-data. */
@@ -85,10 +88,6 @@ static char *const ff_envp[] = {
      * Breakpad contains it and the PARENT keeps running — that's how the early
      * run reached paint (putimg=24).  MOZ_CRASHREPORTER_DISABLE=1 made every
      * crash fatal (status 139) and dropped the paint rate to ~0, so it's OUT. */
-    "MOZ_DISABLE_GMP_SANDBOX=1",
-    "MOZ_DISABLE_RDD_SANDBOX=1",
-    "MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1",
-    "MOZ_DISABLE_UTILITY_SANDBOX=1",
     /* NB (2026-07-03): MOZ_FORCE_DISABLE_E10S=1 RE-TESTED with all the new fixes
      * (profile/inotify/EEXIST) — does NOT help.  FF115 STILL launches a content
      * process for the tab even with e10s "disabled" (main thread still parks in

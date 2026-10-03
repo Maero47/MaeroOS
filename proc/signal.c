@@ -283,6 +283,22 @@ void signal_send_fault(struct proc *p, int sig, int code, uint32_t addr) {
         p->fault_sig = 0;
 }
 
+void signal_force_sigsys(struct proc *p, int nr, uint32_t call_addr, int data) {
+    const int sig = 31;                                   /* SIGSYS */
+    struct sighand *sh = p->sighand;
+    int blocked = (p->blocked_sigs & (1u << sig)) != 0;
+    if (sh && (blocked || sh->handlers[sig] == SIG_IGN))
+        sh->handlers[sig] = SIG_DFL;
+    if (blocked) p->blocked_sigs &= ~(1u << sig);
+    p->fault_sig     = sig;
+    p->fault_code    = 1;                                 /* SYS_SECCOMP */
+    p->fault_addr    = call_addr;
+    p->fault_errno   = data;
+    p->fault_syscall = nr;
+    p->fault_arch    = 0x40000003U;                       /* AUDIT_ARCH_I386 */
+    p->pending_sigs |= 1u << sig;
+}
+
 void signal_send_group(struct proc *p, int sig) {
     if (!p || sig < 1 || sig >= NSIGS) return;
     int tg = p->tgid;
@@ -466,9 +482,15 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
         return;
     }
 
-    /* Find lowest-numbered pending signal */
+    /* A synchronous fault of this thread first (Linux dequeue_synchronous_
+     * signal): its frame must describe the instruction that raised it, which
+     * a handler for an unrelated signal running first would not.  Then the
+     * lowest-numbered pending signal. */
     int sig = 0;
-    for (int i = 1; i < NSIGS; i++) {
+    if (current_proc->fault_sig > 0 && current_proc->fault_sig < NSIGS &&
+        (own & (1u << current_proc->fault_sig)))
+        sig = current_proc->fault_sig;
+    for (int i = 1; !sig && i < NSIGS; i++) {
         if (pending & (1u << i)) { sig = i; break; }
     }
     if (!sig) { restore_saved_sigmask(); return; }
@@ -492,9 +514,16 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
      * faulting address).  Taken now so it is consumed by exactly one delivery. */
     int      si_code = SI_USER;
     uint32_t si_addr = 0;
+    int      si_errno = 0, si_syscall = 0;
+    uint32_t si_arch = 0;
     if (current_proc->fault_sig == sig) {
         si_code = current_proc->fault_code;
         si_addr = current_proc->fault_addr;
+        if (sig == 31 && si_code == 1) {                 /* SIGSYS, SYS_SECCOMP */
+            si_errno   = current_proc->fault_errno;
+            si_syscall = current_proc->fault_syscall;
+            si_arch    = current_proc->fault_arch;
+        }
         current_proc->fault_sig = 0;
     }
 
@@ -723,6 +752,11 @@ void signal_return_to_user(registers_t *regs, int syscall_nr) {
         si.si_signo = sig;
         si.si_code  = si_code;
         si._u._sigfault.si_addr = si_addr;
+        if (si_arch) {               /* seccomp SIGSYS: call_addr is si_addr */
+            si.si_errno            = si_errno;
+            si._u._sigsys.syscall  = si_syscall;
+            si._u._sigsys.arch     = si_arch;
+        }
         if (copy_to_user((void *)(uintptr_t)sp, &si, sizeof(si)) < 0) goto fatal;
 
         /* Push frame: retaddr, signo, &siginfo, &ucontext.  The i386 SysV ABI

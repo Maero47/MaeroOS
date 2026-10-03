@@ -66,6 +66,8 @@ typedef struct {
         char _pad[116];
         struct { uint32_t si_addr; } _sigfault;   /* SIGSEGV/BUS/ILL/FPE */
         struct { int32_t si_pid; uint32_t si_uid; } _kill;
+        /* SIGSYS from seccomp: where, which call, which ABI. */
+        struct { uint32_t call_addr; int32_t syscall; uint32_t arch; } _sigsys;
     } _u;
 } siginfo_t;
 
@@ -136,6 +138,13 @@ void signal_send_fault(struct proc *p, int sig, int code, uint32_t addr);
  * the sigaction sa_mask and the signal frame's uc_sigmask included. */
 static inline uint32_t sigset_from_user(uint32_t uset) { return uset << 1; }
 static inline uint32_t sigset_to_user(uint32_t kset)   { return kset >> 1; }
+
+/* Linux force_sig_seccomp(): a SECCOMP_RET_TRAP.  SIGSYS for thread p with
+ * si_code SYS_SECCOMP, si_errno = the filter's data, and the call's address,
+ * number and arch.  Like every forced signal it cannot be dodged: if p blocks
+ * or ignores SIGSYS, the block is lifted and the disposition reset to the
+ * default (which kills).  It is delivered before any other pending signal. */
+void signal_force_sigsys(struct proc *p, int nr, uint32_t call_addr, int data);
 
 /* Process-directed signal (kill, SIGCHLD, tty signals): queue sig on the
  * process-wide pending set of p's thread group and wake ONE thread that does not
