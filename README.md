@@ -65,6 +65,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | PC without legacy devices | `-M q35,i8042=off -smp 2` with an ICH9 HDA: no PS/2 controller (`[KBD]  no PS/2 controller`), `/disk` from `ahci0`, both CPUs from the MADT, the desktop's Terminal opened and typed into with a USB tablet and keyboard, and `doas poweroff` typed there makes QEMU exit through S5 | `make smoke-pc` |
 | USB input and storage (xHCI) | the desktop driven with only a `usb-kbd` and `usb-tablet` on a `qemu-xhci`: the Terminal opens and a `doas login root` typed on the USB keyboard reaches a root shell, tablet clicks land where sent, a held key repeats, a `usb-mouse` behind a `usb-hub` moves the pointer, the xHCI on MSI-X interrupts; two FAT `usb-storage` sticks (one behind the hub at full speed, one on a root port at SuperSpeed) mounted at once with a file copied each way, the first also read and written raw through its `/dev/usbdiskN` (checksummed against the image); a two-LUN `usb-bot` as two disks; Caps Lock sets the keyboard's LED by SET_REPORT; Volume Up reaches the desktop; the SuperSpeed stick unplugged and plugged back in five times under a looping reader without errors or leaked devices; idle kusbd CPU reported (smoke-pc runs the xHCI on its INTx line) | `make smoke-usb` |
 | UEFI and BIOS boot (Limine, Multiboot 2) | `maeros-limine.iso` under SeaBIOS, OVMF x64 and OVMF IA32: the kernel sees Multiboot 2 from Limine on the expected firmware with an ACPI RSDP tag, the framebuffer (VBE or GOP) comes from the boot info, login works, the desktop starts and a screendump is that size and not blank, and `poweroff` exits through S5 (a firmware that is not installed is reported as SKIP) | `make smoke-uefi` |
+| Display modes (Bochs DISPI, virtio-gpu) | Settings -> Display driven with QMP clicks on `-vga std` and on `virtio-vga`: the mode list comes from the expected driver and holds 1024x768, 1280x800 and 1920x1080; Apply switches (screendump size, colour count, the orb at the new bottom opens the launcher), Revert and the 15 s timeout go back, Keep stays and writes `mode=` to `desktop.conf`, which the next login applies; on virtio the desktop's flushes cover only its damage; the Limine ISO on OVMF with `ramfb` keeps its one fixed GOP mode | `make smoke-gfxmode` |
 | Linux ABI conformance | 44 musl-built probes (`ports/abiprobes/`), each printing the same `PASS` on Linux, covering findings of the Firefox audit plus later additions: `splice`, `flock`/`fcntl` record locks, `renameat2`, rtnetlink and `/proc/<pid>/fd` link permissions among them; any `FAIL`, missing verdict or wedge fails the run | `make smoke-abi` |
 | Firefox 115.15.0esr | `ff: Firefox painted` (the browser window, about 5 s after `firefox-bin` starts); with `--web`, a page served from the host (HTML, a CSS rule, a PNG) requested and its image on screen about 3 s after Enter (needs the Firefox tree, see `ports/firefox/`) | `make smoke-firefox`, `make smoke-firefox-web` |
 | Alpine Linux x86 userland (chroot) | Alpine 3.22 (apk-tools 2) and 3.24 (apk-tools 3) roots from pinned, signature-checked packages, run with `chroot /disk/alpine`: `bash -c 'echo ok'`, GNU `ls --version`, `python3 -c 'print(1+1)'`, `vim --version`, `git init/commit/log`, `ssh -V`, `less` on a pipe, `apk add tree` / `apk del tree` from an offline repo on the disk, `apk verify`, and no unimplemented syscall on the way; `--net` also installs from a host-served HTTP mirror (needs network on the build host the first time, see `ports/alpine/`) | `make smoke-alpine` |
@@ -114,8 +115,9 @@ What is proven by the automated QEMU tests in `tools/`:
 - **Hardware coverage is what QEMU emulates.** Every driver is tested against QEMU's
   device models only (the Realtek r8169 driver, which QEMU cannot emulate, is
   tested on the host against a simulated chip: `docs/r8169.md`). There is no
-  Wi-Fi, no virtio device, no GPU
-  acceleration (the desktop draws into the boot framebuffer), no ACPI sleep states
+  Wi-Fi, no virtio device other than virtio-gpu (2D), no GPU acceleration (the
+  desktop composites in software; mode setting exists for the Bochs/QEMU std VGA,
+  VirtualBox VGA and virtio-gpu, other cards keep the boot loader's mode), no ACPI sleep states
   (only S5 power-off), and USB 3 hubs are untested (QEMU has none).
 - **ext4 writes cover what `mkfs.ext4` makes, not every feature.** The ext2 driver
   mounts ext2, ext3 and a default ext4 (extents, `64bit`, `flex_bg`, `metadata_csum`)
@@ -322,7 +324,10 @@ namespace as a disk (`nvme.c`; `/disk` mounts from the IDE master if there is on
 disk, else the first NVMe namespace, via `blkdev.c`), PCI enumeration (`pci.c`), RTL8139 (`rtl8139.c`), Intel 8254x e1000 (`e1000.c`), Intel 82801AA AC'97
 audio (`ac97.c`), Intel High Definition Audio (`hda.c`: CORB/RIRB, codec widget walk, cyclic BDL
 playback; `/dev/dsp` uses whichever of the two is present, and so does the ALSA
-playback ABI in `alsa.c`, see [docs/audio.md](docs/audio.md)), Multiboot VBE framebuffer (`framebuffer.c`), VGA text (`vga.c`), PS/2
+playback ABI in `alsa.c`, see [docs/audio.md](docs/audio.md)), the framebuffer (`framebuffer.c`: the boot loader's VBE/GOP mode, or a mode-setting
+driver's — Bochs/QEMU std VGA and VirtualBox VGA through VBE DISPI (`bochs_vga.c`),
+virtio-gpu 2D over virtio-pci with damage flushes (`virtio_gpu.c`); see
+[docs/display.md](docs/display.md)), VGA text (`vga.c`), PS/2
 keyboard and mouse (`keyboard.c`, `mouse.c`), CMOS RTC (`rtc.c`) and 16550 serial
 (`serial.c`).
 
@@ -418,9 +423,12 @@ with AltGr on the right Alt, Caps Lock pairing i/İ and ı/I, and the ISO `<>` k
 sends it with the modifier mask in the client's `key` event; text widgets, the editor
 and the terminal store it as UTF-8. `libdraw` decodes UTF-8 and draws Latin-1 and
 Turkish letters as the ASCII glyph plus a painted diacritic (the font atlases hold ASCII
-only); other code points show `?`. The display resolution is the framebuffer mode the
-boot loader sets (`gfxpayload` in GRUB's config, `make start RES=WxH`), so Settings does
-not offer it.
+only); other code points show `?`. The display resolution starts as the framebuffer
+mode the boot loader sets (`gfxpayload` in GRUB's config, `make start RES=WxH`); on a
+Bochs/QEMU std VGA, VirtualBox VGA or virtio-gpu, Settings -> Display switches it at run
+time (15 s to Keep, else it reverts; a kept mode is `mode=WxH` in `desktop.conf`, applied
+at login), and the desktop, its windows and maeroX's root re-layout without a restart.
+See [docs/display.md](docs/display.md).
 
 The clipboard is shared by all of a user's apps: `gui_clipboard_set()` writes `clip`
 in a directory only that user can enter (`$HOME/.clipboard`, else

@@ -388,8 +388,13 @@ int framebuffer_ioctl(uint32_t req, void *arg) {
         fb_var_screeninfo_t *var = (fb_var_screeninfo_t *)arg;
         uint32_t w = var->xres, h = var->yres;
         int same = w == fb.width && h == fb.height;
-        if (var->bits_per_pixel && var->bits_per_pixel != fb.bpp &&
-            !(fb.drv && var->bits_per_pixel == 32))
+        /* Asking for the mode that is up (whatever virtual size or depth
+         * it names) answers with the real var, as this ioctl always did
+         * before modes could change; programs that set what they got keep
+         * working. */
+        if (same && !(var->activate & FB_ACTIVATE_TEST))
+            return framebuffer_ioctl(FBIOGET_VSCREENINFO, arg);
+        if (var->bits_per_pixel && var->bits_per_pixel != 32)
             return -22;
         if ((var->xres_virtual && var->xres_virtual != w) ||
             (var->yres_virtual && var->yres_virtual != h) ||
