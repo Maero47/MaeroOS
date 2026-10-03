@@ -22,6 +22,7 @@ import re
 import selectors
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 import smokelib  # noqa: E402
@@ -71,8 +72,12 @@ def main():
         smokelib.send(proc, "echo BBSH-$((1+1))\n")
         smokelib.wait_for(proc, sel, "BBSH-2", log, timeout=30, start=at)
         at = smokelib.mark(log)
-        script = " ".join(worker(n, b, a.secs) for n, b in workers) + " wait; echo STRESS-ALL-DONE-$((40+2))\n"
-        smokelib.send(proc, script)
+        # One worker per line: the console's line buffer would cut one long
+        # command line short.
+        for n, b in workers:
+            smokelib.send(proc, worker(n, b, a.secs) + "\n")
+            time.sleep(0.3)
+        smokelib.send(proc, "wait; echo STRESS-ALL-DONE-$((40+2))\n")
         # (The echoed command line carries the $((...)), not the value.)
         smokelib.wait_for(proc, sel, "STRESS-ALL-DONE-42", log, timeout=a.secs + 600, start=at)
         # The machine still answers afterwards.

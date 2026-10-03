@@ -41,8 +41,9 @@
  * again: before serial_enable_async() (early boot, interrupts off), and while
  * serial_sync_begin() is in force (panic, double fault, the NMI dump of a
  * wedged machine).  Those first drain whatever is queued, so nothing is lost
- * or reordered.  A full ring also drains synchronously: back-pressure, never
- * loss.  The PIT tick (serial_tx_poll) backs the interrupt up should an edge
+ * or reordered.  A writer that finds the ring full waits for room, feeding
+ * the UART itself between short holds of the lock: back-pressure, never loss
+ * (under such overload two writers' bytes may interleave).  The PIT tick (serial_tx_poll) backs the interrupt up should an edge
  * ever be missed.
  *
  * tx_lock is taken with interrupts off.  Nothing is called under it, so it
@@ -97,7 +98,9 @@ static int tx_lock_enter(uint32_t *fl) {
     int32_t me = (int32_t)this_cpu_id();
     if (tx_owner == me) return -1;              /* nested on this CPU (NMI) */
     for (uint32_t n = 0; !spin_trylock(&tx_lock); n++) {
-        if (n > 20000000U) return -1;           /* holder is gone (panic) */
+        /* Every hold is short (one FIFO load at most), so only a panic or
+         * a double fault, whose holder may have been stopped, gives up. */
+        if (tx_sync && n > 20000000U) return -1;
         tlb_serve_pending();
         __asm__ volatile("pause");
     }
@@ -114,31 +117,32 @@ static void tx_lock_leave(uint32_t fl, int locked) {
 }
 
 void serial_write(const char *s, uint32_t len) {
-    uint32_t fl;
-    int locked = tx_lock_enter(&fl);
-    if (locked < 0) {                           /* cannot touch the ring */
-        for (uint32_t i = 0; i < len; i++) tx_raw(s[i]);
-    } else if (!tx_async || tx_sync) {
-        tx_drain_sync();
-        for (uint32_t i = 0; i < len; i++) tx_raw(s[i]);
-    } else {
-        for (uint32_t i = 0; i < len; i++) {
-            if (tx_head - tx_tail == TX_RING) {
-                /* Full: give the UART a FIFO load each time it empties. */
-                while (!tx_thr_empty())
-                    ;
-                tx_fill_fifo();
+    uint32_t i = 0;
+    for (;;) {
+        uint32_t fl;
+        int locked = tx_lock_enter(&fl);
+        if (locked < 0) {                       /* cannot touch the ring */
+            for (; i < len; i++) tx_raw(s[i]);
+        } else if (!tx_async || tx_sync) {
+            tx_drain_sync();
+            for (; i < len; i++) tx_raw(s[i]);
+        } else {
+            while (i < len && tx_head - tx_tail < TX_RING)
+                tx_ring[tx_head++ % TX_RING] = s[i++];
+            /* Full: feed the UART ourselves when it has room (IRQ4 may be
+             * held off on this CPU), but never wait with the lock held. */
+            if (i < len && tx_thr_empty()) tx_fill_fifo();
+            if (!tx_thri && tx_tail != tx_head) {
+                /* Enabling THRI with the transmitter empty raises IRQ4 at
+                 * once; with it busy, the interrupt comes when it empties. */
+                tx_thri = 1;
+                outb(COM1 + UART_IER, UART_IER_THRI);
             }
-            tx_ring[tx_head++ % TX_RING] = s[i];
         }
-        if (!tx_thri && tx_tail != tx_head) {
-            /* Enabling THRI with the transmitter empty raises IRQ4 at once;
-             * with it busy, the interrupt comes when it empties. */
-            tx_thri = 1;
-            outb(COM1 + UART_IER, UART_IER_THRI);
-        }
+        tx_lock_leave(fl, locked);
+        if (i >= len) return;
+        __asm__ volatile("pause");
     }
-    tx_lock_leave(fl, locked);
 }
 
 /* IRQ4: the transmitter has room (or the line is shared and it is not ours). */
