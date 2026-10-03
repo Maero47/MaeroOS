@@ -48,8 +48,10 @@ effective and saved ids while the target is dumpable. `environ`, `auxv`,
 `maps`, `io`, `fd/`, `fdinfo/` and the `exe`/`cwd`/`root` links refuse others
 with `EACCES`. `stat`, `status`, `cmdline` and the rest stay readable.
 Directories and files belong to the process's effective ids, or to root when
-it is not dumpable. An exec that changes the effective ids (a set-uid image)
-and `prctl(PR_SET_DUMPABLE, 0)` make a process non-dumpable. The
+it is not dumpable. An exec that changes the effective ids (a set-uid image),
+a `set*id` call that changes the effective uid or gid (Linux `commit_creds`),
+and `prctl(PR_SET_DUMPABLE, 0)` make the whole process non-dumpable. The next
+exec of an ordinary image, or `PR_SET_DUMPABLE` 1, undoes it. The
 `/proc/<pid>/fd/N` readlink rule from the alpinenet review (`proc_fd_readlink`
 in `proc/syscall.c`) uses the same check, now also for `task/<tid>/fd/N`.
 `/proc/self/fd/N` of a regular file still hands back the file's real node, so
@@ -133,7 +135,8 @@ An event about a file goes to the file's own watches and, with its name, to
 its directory's. The directory is the one the caller's last path lookup of
 the file went through (`vfs_last_parent`); descriptor operations look the
 descriptor's path up again first. An event identical to the last one queued
-is merged. Past 16384 queued events the queue ends in one `IN_Q_OVERFLOW`
+is merged. A user may hold 128 instances (root is not limited), and an
+instance cannot watch another instance. Past 16384 queued events the queue ends in one `IN_Q_OVERFLOW`
 (wd -1). `IN_MASK_ADD`, `IN_MASK_CREATE`, `IN_ONLYDIR`, `IN_DONT_FOLLOW` and
 `IN_ONESHOT` are supported.
 
