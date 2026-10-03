@@ -10,7 +10,8 @@ Lock (BKL). This document covers four things:
 - a staged, testable plan to replace it.
 
 Stage 0 (lock primitives, a lock-order checker and a torture test) is implemented and
-changes no behaviour. Every later stage is a proposal.
+changes no behaviour. Stage 1 (cheap wins that keep the BKL) is implemented; section 11
+has what changed and the before/after numbers. Every later stage is a proposal.
 
 Numbers come from `make bench-bkl` (below) under KVM, on a 16-thread host that was also
 running other QEMU guests (load average about 10). Expect ±30% run-to-run noise. Every
@@ -88,6 +89,7 @@ table gives the median and the individual runs.
 | Recursion: per **CPU**, `cpus[].bkl_depth` | `arch/i686/cpu/percpu.h` |
 | Taken at every exception, syscall (`int 0x80`) and hardware interrupt | `isr_common_stub`, `irq_common_stub` in `arch/i686/cpu/isr.asm` |
 | Not taken by the TLB-shootdown IPI and the NMI | `tlb_ipi_isr`, `nmi_isr` (isr.asm) |
+| Not taken (stage 1) by an idle CPU's LAPIC tick and the reschedule IPI | `irq_idle_fast` (`arch/i686/cpu/irq.c`), called by `irq_common_stub` |
 | Held across `swtch()`; the scheduler loop runs holding it | `scheduler_start` in `proc/scheduler.c` |
 | Released only at iret-to-user, around the idle wait, and in `forkret` | `scheduler_start` (idle path), `forkret` in `proc/process.c` |
 | Kernel threads run holding it the whole time | `proc_create_kthread` (process.c) |
@@ -577,14 +579,14 @@ focused engineer-days.
 | # | Stage | Scope (files) | Test | Risk | Effort |
 |---|---|---|---|---|---|
 | **0** ✅ | Primitives, lockdep-lite, torture | `include/kernel/klock.h`, `kernel/klock.c`, `tools/smoke_klock.py`, `BKLSTAT` + `tools/bench_bkl.py` | `make smoke-klock` (4 CPUs in parallel; a broken lock must FAIL: verified) | none (unused by the kernel) | done |
-| **1** | **Cheap wins, still one BKL** | | | | |
-| 1a | TTAS spin in `bkl_enter` | `arch/i686/cpu/bkl.c` | bench-bkl getpid ×4 / pipe ×4 | very low | 0.5 |
-| 1b | Cheap per-CPU id: `sgdt` (each CPU has its own GDT) or a `%fs` per-CPU segment, instead of the LAPIC MMIO read | `bkl.c` `this_cpu_id`, `gdt.c` | bench-bkl; all smokes | low | 1 |
-| 1c | Idle APs stay off the lock. (i) The idle poll checks `need_resched` and a lock-free "runnable count" before re-taking the BKL. (ii) The LAPIC tick on an idle CPU does `scheduler_tick` bookkeeping without the BKL, or is stopped while idle (tickless idle) and the resched IPI is relied on. | `proc/scheduler.c`, `arch/i686/cpu/irq.c`, `isr.asm` (a lock-free path for vectors 0xF0/0xFC when the CPU is idle) | bench-bkl `forks`: idle spin should fall from ~75% to ~0 | medium (wake races) | 3 |
-| 1d | Replace `io_activity` with per-object wait channels: pipe, pty, eventfd, socket, input, audio, knetd's own NIC channel. poll/select sleeps on the channels of the fds it watches. | `proc/pipe.c`, `fs/devfs.c`, `proc/syscall.c` (poll), `net/*`, drivers' `io_wake` | bench-bkl pipe ×1 (expect close to SMP1); smoke-net, smoke-x, smoke-hda | medium | 3 |
-| 1e | **No serial busy-wait under the lock.** (i) Demote the per-exec `[SYSCALL] exec` and `[ELF] Loaded` lines to `ktrace()`: measured 28-37× on fork+exec (section 3.3). Check every smoke script that waits for them first. (ii) Make printk append to klog and leave the UART drain to the THRE interrupt or a kthread, keeping synchronous output for panic only. (iii) Batch the per-page CR3 reloads in ELF load; map the user stack lazily. | `proc/syscall.c` `sys_exec`, `proc/elf.c`, `kernel/printk.c`, `drivers/serial.c`, `arch/i686/mm/paging.c` | bench-bkl forks/forks4; smoke-dyn, smoke-abi, every suite that greps the console | low (i), medium (ii) | 0.5 + 3 + 2 |
-| 1f | Targeted TLB shootdown: a per-mm cpumask of CPUs that ran it; skip CPUs that are idle or in another mm (they reload CR3 on the next dispatch) | `arch/i686/cpu/smp.c`, `proc/scheduler.c` | bench-bkl mmap ×1/×4; threadprobe/mtmalloc smokes | medium | 2 |
-| 1g | Locked printk/klog (irqsave `log_lock`; a lockless path for panic and NMI) | `kernel/printk.c`, `kernel/klog.c` | boot logs stop interleaving; smoke-klock FAIL lines are readable | low | 1 |
+| **1** ✅ | **Cheap wins, still one BKL** (section 11; 1h not done) | | | | |
+| 1a ✅ | TTAS spin in `bkl_enter` | `arch/i686/cpu/bkl.c` | bench-bkl getpid ×4 / pipe ×4 | very low | 0.5 |
+| 1b ✅ | Cheap per-CPU id: `sgdt` (each CPU has its own GDT) or a `%fs` per-CPU segment, instead of the LAPIC MMIO read | `bkl.c` `this_cpu_id`, `gdt.c` | bench-bkl; all smokes | low | 1 |
+| 1c ✅ | Idle APs stay off the lock. (i) The idle poll checks `need_resched` and a lock-free "runnable count" before re-taking the BKL. (ii) The LAPIC tick on an idle CPU does `scheduler_tick` bookkeeping without the BKL, or is stopped while idle (tickless idle) and the resched IPI is relied on. | `proc/scheduler.c`, `arch/i686/cpu/irq.c`, `isr.asm` (a lock-free path for vectors 0xF0/0xFC when the CPU is idle) | bench-bkl `forks`: idle spin should fall from ~75% to ~0 | medium (wake races) | 3 |
+| 1d ✅ | Replace `io_activity` with per-object wait channels: pipe, pty, eventfd, socket, input, audio, knetd's own NIC channel. poll/select sleeps on the channels of the fds it watches. | `proc/pipe.c`, `fs/devfs.c`, `proc/syscall.c` (poll), `net/*`, drivers' `io_wake` | bench-bkl pipe ×1 (expect close to SMP1); smoke-net, smoke-x, smoke-hda | medium | 3 |
+| 1e ✅ | **No serial busy-wait under the lock.** (i) Demote the per-exec `[SYSCALL] exec` and `[ELF] Loaded` lines to `ktrace()`: measured 28-37× on fork+exec (section 3.3). Check every smoke script that waits for them first. (ii) Make printk append to klog and leave the UART drain to the THRE interrupt or a kthread, keeping synchronous output for panic only. (iii) Batch the per-page CR3 reloads in ELF load; map the user stack lazily. | `proc/syscall.c` `sys_exec`, `proc/elf.c`, `kernel/printk.c`, `drivers/serial.c`, `arch/i686/mm/paging.c` | bench-bkl forks/forks4; smoke-dyn, smoke-abi, every suite that greps the console | low (i), medium (ii) | 0.5 + 3 + 2 |
+| 1f ✅ | Targeted TLB shootdown: a per-mm cpumask of CPUs that ran it; skip CPUs that are idle or in another mm (they reload CR3 on the next dispatch) | `arch/i686/cpu/smp.c`, `proc/scheduler.c` | bench-bkl mmap ×1/×4; threadprobe/mtmalloc smokes | medium | 2 |
+| 1g ✅ | Locked printk/klog (irqsave `log_lock`; a lockless path for panic and NMI) | `kernel/printk.c`, `kernel/klog.c` | boot logs stop interleaving; smoke-klock FAIL lines are readable | low | 1 |
 | 1h | ATA: poll with interrupts on and the BKL dropped between status reads, or use the IRQ | `drivers/ata.c` | smoke-disk, smoke-ext2rw/ext4rw | medium | 2 |
 | **2** | **Foundations** | | | | |
 | 2a | Wait queues + `sleep_locked(chan, kspinlock)` (xv6 `sleep(chan, lk)`). Convert every check-then-sleep site in section 5, item 1 to check under the object lock. Under the BKL this is behaviour-preserving. | `proc/scheduler.c`, `proc/pipe.c`, futex/wait/flock/usocket, `fs/devfs.c` ptys | smoke-cmds, unixprobe, threadprobe; a new `schedlat torture` (N processes: pipes, futexes, fork/exit, signals, checksummed) | medium | 5 |
@@ -623,7 +625,7 @@ focused engineer-days.
 
 | After | Effect |
 |---|---|
-| Stage 1 | Idle CPUs and timer ticks stop paying for the lock, pipes stop dragging knetd in, and exec is short. Expect SMP4 to stop being slower than SMP1 for single-process loads. |
+| Stage 1 | Idle CPUs and timer ticks stop paying for the lock, pipes stop dragging knetd in, and exec is short. Measured (section 11): SMP4 single-process loads now run at the SMP1 rate (pipe 0.11 → 1.38 M ops/s), fork+exec is 17× faster on SMP4. |
 | Stage 3 + 4 | Scheduling and interrupts scale. |
 | Stage 7 + 5 + 8 | The common syscalls of a desktop and Firefox scale (`mmap`/`brk`/`futex`/`read`/`write` on pipes and eventfd). |
 | Stage 9-12 | File and network I/O scale, as far as one lwIP lock allows. |
@@ -679,7 +681,85 @@ Both `smoke-klock` and `bench-bkl` leave an instrumented `kernel.elf`; the next 
 
 ---
 
-## 11. References
+## 11. Stage 1, as implemented
+
+Still one BKL, taken at every trap; what changed is how long it is held, who has to
+take it, and how waiting CPUs behave.
+
+| Item | Change | Where |
+|---|---|---|
+| 1a | `bkl_enter` spins test-and-test-and-set: `pause` on a plain read until the word looks free, then one `xchg`. It still serves TLB shootdowns while spinning. | `arch/i686/cpu/bkl.c` (`bkl_spin_wait`) |
+| 1b | `this_cpu_id()` once several CPUs run: `sgdt`, and the GDT base names the CPU (each CPU loads `gdt[cpu]`). An AP still on the trampoline GDT falls back to the LAPIC read. | `bkl.c` (`cpu_from_gdt`), `gdt.c`/`gdt.h` (`gdt_percpu_base`) |
+| 1c | The idle loop `hlt`s on every CPU (APs used to spin and re-take the lock every 200k `pause`s). While a CPU is idle (`idle` set, lock not held) `irq_common_stub` acknowledges its LAPIC tick and the reschedule IPI in `irq_idle_fast`, before and without the BKL. Device IRQs and the BSP's PIT tick still take the lock and run their handlers. Wakers now IPI idle APs too; threads made RUNNABLE outside `sched_make_runnable` (fork, clone, vfork, kthread creation) kick an idle CPU (`sched_kick_idle`). The idle loop also rescans every 10 ticks as a backstop. | `proc/scheduler.c`, `arch/i686/cpu/irq.c`, `isr.asm`, `proc/syscall.c`, `proc/process.c` |
+| 1d | poll/select/epoll sleep on their own channel (`io_poll_sleep`). Pipes, eventfds and ptys wake their blocked readers/writers on the object as before, plus `io_wake_poll()`, which wakes only pollers, and only when there are any. knetd, socket waits, audio and the console input wait stay on `io_activity`; `io_wake()` (NIC, input, sockets, audio) wakes both. A pty write wakes its reader once per write instead of once per byte. Wait queues with an object lock (xv6 `sleep(chan, lk)`) are still stage 2a. | `proc/scheduler.c`, `proc/pipe.c`, `proc/syscall.c` (eventfd, `io_wait_sleep`), `fs/devfs.c`, `kernel/kwatch.c` |
+| 1e | No console output busy-waits any more. COM1 transmits from a 64 KiB ring, fed by the transmitter-empty interrupt (IRQ4), one FIFO load per interrupt, with a PIT-tick backstop. Writers only copy bytes. A full ring is back-pressure: the writer feeds the UART itself between short lock holds, nothing is dropped. Synchronous output stays for early boot, panic, double fault, the NMI dump and reboot (`serial_sync_begin` first drains the ring, so order holds). The VGA text console scrolls by moving the CRTC start address over the 32 KiB of text memory, with a RAM copy for the wrap, instead of reading and rewriting 2000 cells per line (each access is an exit under KVM). The cursor is set once per string. The `[SYSCALL] exec` and `[ELF] Loaded` lines stay on the console, because smoke-disk, smoke-toybox and smoke-install wait for them. Not done: (iii) batched CR3 reloads in ELF load and a lazy user stack. | `drivers/serial.c`, `drivers/vga.c`, `kernel/main.c`, `kernel/panic.c`, `arch/i686/cpu/dfault.c`, `fs/devfs.c` (`tty_write` in 64-byte chunks) |
+| 1f | `tlb_shootdown_user()` / `tlb_shootdown_mm(pgdir)` for user-half changes: only CPUs whose current thread runs on that page directory get the IPI. CPUs that are idle, in the scheduler, or in another address space cannot hold its user entries: user pages are not global, and switching out loads the kernel pgdir. `cpus[c].proc` and the CR3 load change only under the BKL, which the caller holds. Kernel-half shootdowns (`kstack`) still go to every CPU. munmap already batched 256 frames per shootdown. | `arch/i686/cpu/smp.c`, `percpu.h`, `proc/syscall.c` (9 sites), `arch/i686/mm/paging.c` (COW) |
+| 1g | printk takes a console spinlock (interrupts off) around klog, serial and VGA, so messages from different CPUs no longer interleave and the klog index update is serialised. `printk_klog` takes it too. A CPU that already holds it (an NMI) writes through; a waiter gives up after ~1 s (a stopped holder during panic). | `kernel/printk.c` |
+| 1h | Not done. ATA PIO is not on any measured path (`make check` disks use it, the benches do not). | – |
+
+New tooling: `tools/stress_smp.py` / `make stress-smp`. It runs two fork+exec loops, a pipe loop
+(shell pipelines plus `schedlat scale pipe`), an mmap/stat loop and `tar | gzip` at once
+for `STRESS_SECS` (180) on `-smp 4`. It fails on a hang, a panic, a kwatch STALL, a
+lockdep report or a worker that made no progress. `tools/bench_bkl_table.py` builds the
+table below from `results.txt`.
+
+### 11.1 Before and after
+
+`make bench-bkl` (BKLSTAT build, KVM, same host, which was also running other guests).
+`base` is the parent commit (`987fdc8`); `s1` is stage 1. Each cell is the median
+[individual runs]. Lower is better for times, higher for ops (k ops/s). "Idle-CPU spin"
+is the largest share of wall time any CPU that held the lock less than 5% of the run
+spent spinning for it.
+
+| Workload | base:1 | s1-:1 | base:4 | s1-:4 | base:8 | s1-:8 |
+|---|---|---|---|---|---|---|
+| time forks (ms) | 2005 [2110,1899] | 189 [125,254] | 2610 [2650,2570] | 149 [157,140] | 5410 | 152 |
+| time forks4 (ms) | 4515 [5440,3590] | 268 [259,277] | 9330 [10360,8300] | 414 [381,447] | 7810 | 437 |
+| time targz4 (ms) | 4115 [4310,3920] | 3729 [3597,3862] | 1420 [1650,1190] | 1502 [1190,1814] | 1740 | 1398 |
+| time par4 (ms) | 762 [956,567] | 552 [529,575] | 270 [284,256] | 194 [185,203] | 620 | 217 |
+| getpid x1 (k ops/s) | 3040 [2873,3208] | 3043 [3115,2971] | 1298 [1745,850] | 2817 [2952,2682] | 1493 | 2853 |
+| getpid x4 | 2986 [2751,3221] | 3112 [3204,3020] | 611 [625,596] | 1699 [1717,1681] | 428 | 1441 |
+| pipe x1 | 1413 [1326,1499] | 1481 [1545,1416] | 109 [102,116] | 1379 [1443,1315] | 90 | 1051 |
+| pipe x4 | 1418 [1334,1502] | 1257 [1511,1004] | 273 [291,255] | 816 [819,814] | 135 | 812 |
+| stat x1 | 1333 [1281,1384] | 1236 [1402,1070] | 448 [474,422] | 1423 [1488,1358] | 380 | 1327 |
+| stat x4 | 1280 [1246,1314] | 1410 [1492,1327] | 400 [404,396] | 963 [959,968] | 373 | 892 |
+| mmap x1 | 569 [533,604] | 611 [640,583] | 97 [94,100] | 584 [610,557] | 94 | 578 |
+| mmap x4 | 600 [587,613] | 633 [649,617] | 118 [127,110] | 406 [431,382] | 100 | 406 |
+| idle-CPU spin, stat x1 (%) | – | – | 9.3 [9.4,9.2] | 0.1 [0.0,0.1] | 5.0 | 0.2 |
+| idle-CPU spin, forks (%) | – | – | 67.6 [67.2,68.0] | 9.5 [17.6,1.3] | 85.3 | 4.9 |
+
+Results:
+
+- **Single-process kernel loads no longer lose anything on SMP.** On `-smp 4`, pipe,
+  stat, mmap and getpid ×1 run at the `-smp 1` rate (before: 0.08-0.44×).
+- **fork+exec is 17× faster on SMP4** (2610 → 149 ms for 200 execs) and 11× on SMP1.
+  On SMP4 the exec line now costs the COM1 interrupt ~0.3 ms instead of a 5 ms
+  busy-wait under the lock. `forks4` is 9330 → 414 ms.
+- **Idle CPUs stopped paying.** The idle-CPU spin in a single-process `stat` loop fell
+  from 9% to 0.1%, and in `forks` from 68% to 1-18%. What remains in `forks` is CPUs
+  kicked awake by fork, and the BSP's COM1 interrupt queueing for the lock (`com1` is
+  34% of hold time in that run).
+- **Four processes contending still serialise on the lock,** as expected with one BKL.
+  getpid ×4 is 0.61 → 1.70 M ops/s, pipe ×4 0.27 → 0.82 M, stat ×4 0.40 → 0.96 M,
+  mmap ×4 0.12 → 0.41 M. Every CPU still spends 55-80% of the run spinning. Only
+  stages 3-8 can move these rows to the `-smp 1` value and beyond.
+- **SMP8 matches SMP4** (single-process loads at the SMP1 rate, forks 5410 → 152 ms),
+  so adding CPUs no longer slows the kernel down.
+- `targz4` (gzip is user time) and `par4` are unchanged within noise.
+
+Verification (stage 1 commit, merged with `yonet/bklplan` 053c2fe):
+
+- `make check`: all 27 suites pass.
+- `SMOKE_SMP=4 smoke_cmds`, `make smoke-abi` (44 pass) and `make smoke-klock` (PASS)
+  pass.
+- `make smoke-firefox` and `smoke-firefox-web` pass with `--smp 2`.
+- `make stress-smp` (180 s, `-smp 4`; about 8400 rounds of 20 fork+execs,
+  618 pipe rounds, 334 mmap/stat rounds and 56 tar|gzip rounds) passes, with no
+  STALL, panic or lockdep line.
+
+---
+
+## 12. References
 
 - Linux: BKL removed in 2.6.39 (kernelnewbies.org/Linux_2_6_39: "the BKL has been
   removed completely from the kernel sources, including the functions lock_kernel()
@@ -701,3 +781,9 @@ Both `smoke-klock` and `bench-bkl` leave an instrumented `kernel.elf`; the next 
 - S. Peters, A. Danis, K. Elphinstone, G. Heiser, "For a Microkernel, a Big Lock Is
   Fine", APSys 2015.
 - DragonFly BSD LWKT serializing tokens (dragonflybsd.org, "LWKT tokens" documentation).
+- Stage 1: the 16550 UART's IER/IIR/LSR transmitter-empty interrupt (TI/National
+  PC16550D datasheet; OSDev wiki "Serial Ports"). The VGA CRTC start address
+  (0x0C/0x0D) and cursor location (0x0E/0x0F) registers (OSDev wiki "VGA Hardware",
+  FreeVGA CRTC register reference). Test-and-test-and-set spinning (Anderson, "The
+  Performance of Spin Lock Alternatives for Shared-Memory Multiprocessors", IEEE TPDS
+  1990). No code was copied.
