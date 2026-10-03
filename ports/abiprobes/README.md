@@ -62,6 +62,7 @@ regression tests for the fixes in audit section 5.
 | P42 | `p42_netlink.c`             | rtnetlink `RTM_GETLINK` dump and error ack, `SIOCGIFINDEX`/`SIOCGIFNAME`/`SIOCGIFCONF` agree (busybox `ip`, `ifconfig`, udhcpc) | — |
 | P43 | `p43_lock_close_race.c`     | a descriptor closed while `F_SETLKW`/`flock` waits leaves no lock behind (`F_SETLKW`: `EBADF`) | — |
 | P44 | `p44_proc_fd_link.c`        | `/proc/<pid>/fd/N` links name the open file (`ttyname`); another user's are `EACCES` | — |
+| P45 | `p45_seccomp.c`             | seccomp filters: validation, ALLOW/ERRNO/TRAP (SIGSYS siginfo + ucontext)/KILL_THREAD/KILL_PROCESS/LOG, STRICT, TSYNC, fork/exec inheritance; `no_new_privs` ignores set-uid on exec | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the

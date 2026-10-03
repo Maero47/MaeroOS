@@ -37,6 +37,7 @@
 #include "../net/socket.h"
 #include "../net/xsock.h"
 #include "flock.h"
+#include "seccomp.h"
 #include "../lib/printf.h"
 #include <registers.h>
 #include <kernel/config.h>
@@ -974,6 +975,7 @@ static void proc_copy_image_ids(struct proc *child, struct proc *parent) {
  * per failed fork, which made the next fork under pressure likelier to fail. */
 static void fork_abort(struct proc *child) {
     vma_clear(child);
+    seccomp_release(child);
     fdtable_put(child);
     if (child->sighand) { sighand_put(child->sighand); child->sighand = NULL; }
     sigshared_put(child->sigshared);
@@ -1044,6 +1046,7 @@ static int do_fork(registers_t *regs, uint32_t child_stack, uint32_t clone_flags
     child->euid = parent->euid; child->egid = parent->egid;
     child->suid = parent->suid; child->sgid = parent->sgid;
     child->ngroups = parent->ngroups;
+    seccomp_fork(child, parent);
     __builtin_memcpy(child->groups, parent->groups, sizeof(child->groups));
     child->mmap_next = fowner->mmap_next;
     child->pgrp      = parent->pgrp;
@@ -2070,8 +2073,12 @@ static int sys_exec(registers_t *regs) {
      * effective id below, as Linux commit_creds() leaves it after exec. */
     uint32_t new_euid = current_proc->euid;
     uint32_t new_egid = current_proc->egid;
-    if (node->mask & 04000) new_euid = node->uid;
-    if (node->mask & 02000) new_egid = node->gid;
+    /* Under no_new_privs (prctl, inherited by every filtered sandbox) the
+     * bits are ignored: execve can never grant what the caller lacks. */
+    if (!current_proc->no_new_privs) {
+        if (node->mask & 04000) new_euid = node->uid;
+        if (node->mask & 02000) new_egid = node->gid;
+    }
 
     /* Create new address space */
     uint32_t new_pgdir = pgdir_create();
@@ -2455,6 +2462,7 @@ static int sys_exec(registers_t *regs) {
     current_proc->sigframe_addr  = 0;
     current_proc->restore_sigmask = 0;   /* no sigsuspend mask survives exec */
     current_proc->fault_sig      = 0;
+    current_proc->not_dumpable   = 0;
     /* The alternate signal stack belonged to the old image (fs/exec.c
      * begin_new_exec: sas_ss_sp = sas_ss_size = 0). */
     current_proc->sas_sp         = 0;
@@ -6653,9 +6661,102 @@ static int sys_ugetrlimit(registers_t *regs) {
 }
 
 /* ── sys_prctl(option, arg2…) — EAX=172 (stub) ──────────────────────────── */
+/* ── sys_prctl(option, arg2, arg3, arg4, arg5) — EAX=172 ───────────────────
+ * The options programs here use.  Unknown ones are -EINVAL as on Linux (glibc
+ * and Firefox probe for features that way); a handful that only tune what
+ * this kernel does not have are accepted as no-ops. */
+#define PR_SET_PDEATHSIG      1
+#define PR_GET_PDEATHSIG      2
+#define PR_GET_DUMPABLE       3
+#define PR_SET_DUMPABLE       4
+#define PR_GET_KEEPCAPS       7
+#define PR_SET_KEEPCAPS       8
+#define PR_SET_NAME          15
+#define PR_GET_NAME          16
+#define PR_GET_SECCOMP       21
+#define PR_SET_SECCOMP       22
+#define PR_CAPBSET_READ      23
+#define PR_CAPBSET_DROP      24
+#define PR_SET_TIMERSLACK    29
+#define PR_GET_TIMERSLACK    30
+#define PR_SET_MM            35
+#define PR_SET_CHILD_SUBREAPER 36
+#define PR_GET_CHILD_SUBREAPER 37
+#define PR_SET_NO_NEW_PRIVS  38
+#define PR_GET_NO_NEW_PRIVS  39
+#define PR_SET_THP_DISABLE   41
+#define PR_GET_THP_DISABLE   42
+#define PR_CAP_AMBIENT       47
+#define PR_SET_VMA           0x53564d41
+#define PR_SET_PTRACER       0x59616d61
 static int sys_prctl(registers_t *regs) {
-    (void)regs;
-    return 0;
+    struct proc *p = current_proc;
+    uint32_t opt = regs->ebx, a2 = regs->ecx, a3 = regs->edx,
+             a4 = regs->esi, a5 = regs->edi;
+    switch (opt) {
+    case PR_SET_PDEATHSIG:
+        if (a2 >= NSIGS) return -22;
+        p->pdeathsig = (uint8_t)a2;
+        return 0;
+    case PR_GET_PDEATHSIG: {
+        int v = p->pdeathsig;
+        return copy_to_user((void *)(uintptr_t)a2, &v, sizeof(v)) < 0 ? -14 : 0;
+    }
+    case PR_GET_DUMPABLE:
+        return p->not_dumpable ? 0 : 1;
+    case PR_SET_DUMPABLE:
+        if (a2 > 1) return -22;
+        p->not_dumpable = a2 ? 0 : 1;
+        return 0;
+    case PR_GET_KEEPCAPS:
+        return 0;
+    case PR_SET_KEEPCAPS:
+        return a2 > 1 ? -22 : 0;
+    case PR_SET_NAME: {
+        char name[16];
+        int i;
+        for (i = 0; i < 15; i++) {
+            if (copy_from_user(&name[i], (const char *)(uintptr_t)(a2 + i), 1) < 0)
+                return -14;
+            if (!name[i]) break;
+        }
+        name[i < 15 ? i : 15] = '\0';
+        __builtin_memcpy(p->name, name, sizeof(name));
+        return 0;
+    }
+    case PR_GET_NAME: {
+        char name[16];
+        __builtin_memcpy(name, p->name, sizeof(name));
+        name[15] = '\0';
+        return copy_to_user((void *)(uintptr_t)a2, name, sizeof(name)) < 0 ? -14 : 0;
+    }
+    case PR_GET_SECCOMP:
+        return p->seccomp_mode;
+    case PR_SET_SECCOMP:
+        return seccomp_prctl_set(a2, a3);
+    case PR_SET_NO_NEW_PRIVS:
+        if (a2 != 1 || a3 || a4 || a5) return -22;
+        p->no_new_privs = 1;                 /* one way: never cleared */
+        return 0;
+    case PR_GET_NO_NEW_PRIVS:
+        if (a2 || a3 || a4 || a5) return -22;
+        return p->no_new_privs;
+    case PR_CAPBSET_READ:
+        return a2 < 41 ? 1 : -22;
+    case PR_CAPBSET_DROP:
+        return p->euid == 0 ? 0 : -1;        /* -EPERM without CAP_SETPCAP */
+    case PR_SET_TIMERSLACK: case PR_GET_TIMERSLACK:
+    case PR_SET_CHILD_SUBREAPER: case PR_GET_CHILD_SUBREAPER:
+    case PR_SET_THP_DISABLE: case PR_GET_THP_DISABLE:
+    case PR_SET_VMA: case PR_SET_PTRACER:
+        return 0;
+    case PR_SET_MM:
+        return -1;                           /* -EPERM: needs CAP_SYS_RESOURCE */
+    case PR_CAP_AMBIENT:
+        return a2 == 1 ? 0 : -22;            /* IS_SET: nothing is raised */
+    default:
+        return -22;
+    }
 }
 
 /* ── sys_sigaltstack(ss, oss) — EAX=186 ─────────────────────────────────────
@@ -8523,6 +8624,7 @@ static int sys_clone(registers_t *regs) {
     child->euid = parent->euid; child->egid = parent->egid;
     child->suid = parent->suid; child->sgid = parent->sgid;
     child->ngroups = parent->ngroups;
+    seccomp_fork(child, parent);
     __builtin_memcpy(child->groups, parent->groups, sizeof(child->groups));
     child->mmap_next = parent->mmap_next;
     child->pgrp      = parent->pgrp;
@@ -10019,6 +10121,15 @@ void syscall_dispatch(registers_t *regs) {
     kprof_tick();
     kprof_probe_end(KPP_SYS_PRO, kp_pro);
 
+    /* seccomp: the thread's filters decide before the call runs.  A skipped
+     * call (ERRNO, TRAP, …) has its result in eax already. */
+    if (current_proc && current_proc->seccomp_mode &&
+        seccomp_syscall_enter(regs, num)) {
+        signal_return_to_user(regs, -1);
+        resched_on_return();
+        return;
+    }
+
     uint64_t kp_body = kprof_probe_begin();
     switch (num) {
     case 1:   sys_exit(regs);                  break;  /* noreturn */
@@ -10115,6 +10226,7 @@ void syscall_dispatch(registers_t *regs) {
     case 309: ret = sys_ppoll(regs, 0);        break;  /* ppoll */
     case 414: ret = sys_ppoll(regs, 1);        break;  /* ppoll_time64 */
     case 172: ret = sys_prctl(regs);           break;
+    case 354: ret = sys_seccomp(regs->ebx, regs->ecx, regs->edx); break;
     case 174: ret = sys_rt_sigaction(regs);    break;
     case 175: ret = sys_rt_sigprocmask(regs);  break;
     case 176: ret = sys_rt_sigpending(regs);   break;

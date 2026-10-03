@@ -1,4 +1,5 @@
 #include "process.h"
+#include "seccomp.h"
 #include "scheduler.h"
 #include "elf.h"
 #include "../mm/heap.h"
@@ -254,6 +255,7 @@ void proc_release(struct proc *p) {
     if (!p || p->state != PROC_ZOMBIE) return;
     if (p->pgdir_phys && !pgdir_release(p->pgdir_phys))
         pgdir_free_user(p->pgdir_phys);
+    seccomp_release(p);
     kstack_free(p->kstack);
     p->kstack     = NULL;
     p->pgdir_phys = 0;

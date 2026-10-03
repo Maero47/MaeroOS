@@ -181,6 +181,11 @@ struct proc {
     int              fault_sig;
     int              fault_code;
     uint32_t         fault_addr;
+    /* SIGSYS from a seccomp SECCOMP_RET_TRAP (fault_code SYS_SECCOMP): the
+     * filter's data (si_errno), the trapped syscall and its arch. */
+    int              fault_errno;
+    int              fault_syscall;
+    uint32_t         fault_arch;
 
     /* sigaltstack (Linux task->sas_ss_sp / sas_ss_size): the stack SA_ONSTACK
      * handlers run on.  Size 0 means none is installed.  Inherited by fork,
@@ -325,6 +330,16 @@ struct proc {
     /* Set by execve, clear in a fresh fork (Linux !PF_FORKNOEXEC): a parent
      * may no longer setpgid() a child that has exec'd (-EACCES). */
     int              did_exec;
+
+    /* prctl(PR_SET_NO_NEW_PRIVS) and seccomp (proc/seccomp.c), per thread like
+     * Linux task->seccomp: kept by fork, clone and execve, never cleared. */
+    uint8_t          no_new_privs;
+    uint8_t          seccomp_mode;
+    struct seccomp_filter *seccomp_filter;
+    /* prctl(PR_SET_DUMPABLE, 0) (reset by exec) and PR_SET_PDEATHSIG
+     * (recorded, cleared by fork). */
+    uint8_t          not_dumpable;
+    uint8_t          pdeathsig;
 
     /* Process group and session IDs */
     int              pgrp;   /* process group ID */

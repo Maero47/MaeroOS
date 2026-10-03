@@ -1,6 +1,7 @@
 #include "scheduler.h"
 #include "process.h"
 #include "signal.h"
+#include "seccomp.h"
 #include "ktimer.h"
 
 extern void vma_clear(struct proc *p);   /* free demand-paged VMAs (syscall.c) */
@@ -728,6 +729,7 @@ void proc_exit(int status) {
         vfs_close(current_proc->root_node);
         current_proc->root_node = (void *)0;
     }
+    seccomp_release(current_proc);
     /* Likewise the shared handler table. */
     sighand_put(current_proc->sighand);
     current_proc->sighand = (struct sighand *)0;
