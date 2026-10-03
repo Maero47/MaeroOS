@@ -47,6 +47,21 @@ static inline void raw_acquire(spinlock_t *r) {
 #define F_IRQ_ON    2           /* taken with interrupts enabled            */
 
 static spinlock_t  g_kld;                       /* the checker's own state */
+
+/* g_kld is taken from any context, interrupt handlers included (a handler's
+ * first kspin_lock_irqsave registers its class), so every holder keeps
+ * interrupts off: an interrupt on the holding CPU would otherwise spin on it
+ * forever.  The spin serves TLB shootdowns like every IF=0 spin. */
+static inline uint32_t kld_lock(void) {
+    uint32_t fl = irq_save();
+    raw_acquire(&g_kld);
+    return fl;
+}
+
+static inline void kld_unlock(uint32_t fl) {
+    spin_unlock(&g_kld);
+    irq_restore(fl);
+}
 static const char *g_cls_name[KLD_CLASSES];
 static unsigned    g_ncls;
 static uint64_t    g_after[KLD_CLASSES];        /* bit b: b taken under this */
@@ -69,14 +84,14 @@ static int name_eq(const char *a, const char *b) {
 static int kld_class(uint16_t *slot, const char *name) {
     if (*slot) return *slot - 1;
     int c = -1;
-    spin_lock(&g_kld);
+    uint32_t fl = kld_lock();
     for (unsigned i = 0; i < g_ncls; i++)
         if (name_eq(g_cls_name[i], name)) { c = (int)i; break; }
     if (c < 0 && g_ncls < KLD_CLASSES) {
         c = (int)g_ncls;
         g_cls_name[g_ncls++] = name;
     }
-    spin_unlock(&g_kld);
+    kld_unlock(fl);
     if (c >= 0) *slot = (uint16_t)(c + 1);
     return c;
 }
@@ -116,7 +131,7 @@ static void kld_edge(int a, int b) {
         return;
     }
     int inverted = 0;
-    spin_lock(&g_kld);
+    uint32_t fl = kld_lock();
     if (!((g_after[a] >> b) & 1)) {
         if (kld_reaches(b, a) && !((g_reported[a] >> b) & 1)) {
             g_reported[a] |= 1ULL << b;
@@ -124,16 +139,24 @@ static void kld_edge(int a, int b) {
         }
         g_after[a] |= 1ULL << b;
     }
-    spin_unlock(&g_kld);
+    kld_unlock(fl);
     if (inverted)
         kld_report("lock order inversion (taken in both orders)", g_cls_name[a], g_cls_name[b]);
 }
 
+/* The flags are shared by all CPUs: update them under g_kld so two CPUs
+ * setting different bits cannot lose one, and report outside it. */
 static void kld_flag(int c, uint8_t f) {
+    int report = 0;
+    uint32_t fl = kld_lock();
     uint8_t nf = (uint8_t)(g_flags[c] | f);
     g_flags[c] = nf;
     if ((nf & (F_IN_IRQ | F_IRQ_ON)) == (F_IN_IRQ | F_IRQ_ON) && !g_flag_reported[c]) {
         g_flag_reported[c] = 1;
+        report = 1;
+    }
+    kld_unlock(fl);
+    if (report) {
         kld_report("lock taken in an interrupt handler and with interrupts enabled",
                    g_cls_name[c], 0);
     }
