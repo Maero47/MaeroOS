@@ -11,7 +11,7 @@
  *   2  EFI System (FAT32)      /EFI/BOOT/BOOTX64.EFI, BOOTIA32.EFI,
  *                              /boot/limine/{limine.conf,limine-bios.sys},
  *                              /boot/kernel.elf, /boot/initrd.tar
- *   3  MaeroOS root (ext2)     a copy of /disk
+ *   3  MaeroOS root (ext4)     a copy of /disk (ext2 with --ext2)
  *
  * and Limine's BIOS stage 1 in the protective MBR, so it boots under legacy
  * BIOS and UEFI (x86_64 and IA32) alike.  limine.conf passes
@@ -339,12 +339,13 @@ static void limine_bios_install(const char *hdd_bin, uint64_t stage2_sector) {
 /* ── Main ────────────────────────────────────────────────────────────────── */
 
 static void usage(void) {
-    printf("usage: maeros-install [-y] [-l] [-n] [--source DIR] [--boot-dir DIR]\n"
+    printf("usage: maeros-install [-y] [-l] [-n] [--ext2] [--source DIR] [--boot-dir DIR]\n"
            "                      [--initrd FILE] [--esp-mib N] [/dev/DISK]\n"
            "  Installs the running system onto DISK (GPT: BIOS boot, EFI system,\n"
-           "  ext2 root), bootable under BIOS and UEFI.  Everything on DISK is lost.\n"
+           "  ext4 root), bootable under BIOS and UEFI.  Everything on DISK is lost.\n"
            "  -y  do not ask for confirmation    -l  list the disks and exit\n"
-           "  -n  dry run: print the layout, write nothing\n");
+           "  -n  dry run: print the layout, write nothing\n"
+           "  --ext2  format the root as ext2 (no journal) instead of ext4\n");
 }
 
 static int ask(const char *q, char *buf, int len) {
@@ -358,7 +359,7 @@ static int ask(const char *q, char *buf, int len) {
 int main(int argc, char **argv) {
     const char *source = "/disk", *boot = "/boot", *initrd = "/dev/initrd";
     const char *target = NULL;
-    int yes = 0, list = 0, dry = 0;
+    int yes = 0, list = 0, dry = 0, ext4 = 1;
     uint64_t esp_mib = 0;
     g_tty = isatty(1);
     for (int i = 1; i < argc; i++) {
@@ -369,6 +370,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--boot-dir") == 0 && i + 1 < argc) boot = argv[++i];
         else if (strcmp(argv[i], "--initrd") == 0 && i + 1 < argc) initrd = argv[++i];
         else if (strcmp(argv[i], "--esp-mib") == 0 && i + 1 < argc) esp_mib = strtoull(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--ext2") == 0) ext4 = 0;
+        else if (strcmp(argv[i], "--ext4") == 0) ext4 = 1;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) { usage(); return 0; }
         else if (argv[i][0] != '-' && !target) target = argv[i];
         else { usage(); return 2; }
@@ -484,6 +487,7 @@ int main(int argc, char **argv) {
     }
     uint64_t need_blocks;
     uint32_t need_inodes;
+    ext2_set_ext4(ext4);
     ext2_scan(source, skip, nskip, &need_blocks, &need_inodes);
 
     gpart_t parts[3] = {
@@ -518,9 +522,9 @@ int main(int argc, char **argv) {
     if (dry) {
         uint64_t b; uint32_t g, in, m0;
         ext2_geometry(parts[2].last - parts[2].first + 1, &b, &g, &in, &m0);
-        printf("ext2: %llu blocks, %u groups, %u inodes, group 0 metadata %u of 8192 blocks\n"
+        printf("%s: %llu blocks, %u groups, %u inodes, group 0 metadata %u of 8192 blocks\n"
                "backup GPT at LBA %llu\nDry run: nothing written.\n",
-               (unsigned long long)b, (unsigned)g, (unsigned)in, (unsigned)m0,
+               ext4 ? "ext4" : "ext2", (unsigned long long)b, (unsigned)g, (unsigned)in, (unsigned)m0,
                (unsigned long long)(g_disk_sect - 1));
         return 0;
     }
@@ -538,7 +542,7 @@ int main(int argc, char **argv) {
     printf("[2/4] EFI system partition (FAT32)\n");
     snprintf(conf, sizeof(conf),
              "# Written by maeros-install.  Limine boots the kernel through\n"
-             "# Multiboot 2 from BIOS and UEFI alike; root= is the ext2 root.\n"
+             "# Multiboot 2 from BIOS and UEFI alike; root= is the %s root.\n"
              "timeout: 3\n"
              "serial: yes\n"
              "\n"
@@ -548,11 +552,11 @@ int main(int argc, char **argv) {
              "    cmdline: root=PARTUUID=%s\n"
              "    module_path: boot():/boot/initrd.tar\n"
              "    module_string: initrd\n"
-             "    resolution: 1920x1080x32\n", root_uuid);
+             "    resolution: 1920x1080x32\n", ext4 ? "ext4" : "ext2", root_uuid);
     files[2].len = strlen(conf);
     fat32_build(parts[1].first, parts[1].last - parts[1].first + 1, "MAEROS ESP", files, nfiles);
 
-    printf("[3/4] Root filesystem (ext2), copying %s\n", source);
+    printf("[3/4] Root filesystem (%s), copying %s\n", ext4 ? "ext4" : "ext2", source);
     uint8_t fsuuid[16];
     guid_random(fsuuid);
     ext2_build(parts[2].first, parts[2].last - parts[2].first + 1, "maeros-root", fsuuid);
