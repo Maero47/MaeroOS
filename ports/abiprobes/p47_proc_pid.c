@@ -134,10 +134,15 @@ int main(int argc, char **argv)
             if (!WIFEXITED(st)) probe_fail("child died");
             if (WEXITSTATUS(st) == 0) probe_pass();
             if (WEXITSTATUS(st) == 99) probe_fail("setuid(65534) failed");
+            if (WEXITSTATUS(st) == 98) probe_fail("still dumpable after setuid");
             probe_fail("as another user, check %d failed (see the list in the source)",
                        WEXITSTATUS(st));
         }
         if (setgid(65534) != 0 || setuid(65534) != 0) _exit(99);
+        /* Changing ids made it non-dumpable: its own /proc files now belong
+         * to root.  Real daemons that drop privileges turn that back on. */
+        if (prctl(PR_GET_DUMPABLE) != 0) _exit(98);
+        prctl(PR_SET_DUMPABLE, 1);
         in_child = 1;
     }
     int step = 0;

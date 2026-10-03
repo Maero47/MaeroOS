@@ -357,6 +357,8 @@ vfs_node_t *vfs_resolve_mount(vfs_node_t *dir);
  * lookup reached `node` (its final component), for inotify's events on a
  * directory's entries.  1 and *parent / name (256 bytes) set, or 0. */
 int vfs_last_parent(vfs_node_t *node, vfs_node_t **parent, char *name);
+/* Drop that record (the nodes it names may be about to go). */
+void vfs_forget_last_lookup(void);
 
 /* /proc/<pid>/mountinfo text; returns its length. */
 uint32_t vfs_mountinfo_format(char *buf, uint32_t size);

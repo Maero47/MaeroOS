@@ -44,6 +44,7 @@ uint32_t inotify_nwatches;
 static ino_watch_t *watches;
 static uint32_t cookie_next = 1;
 static uint32_t ninstances;
+static struct inotify *instances[INOTIFY_MAX_INSTANCES * 8];
 
 #define EV_HDR 16u
 
@@ -98,6 +99,8 @@ static void watch_free(ino_watch_t *w) {
     vfs_close(w->node);
     kfree(w);
     if (inotify_nwatches) inotify_nwatches--;
+    /* Unrecorded from here on, so the record must not go stale. */
+    if (!inotify_nwatches) vfs_forget_last_lookup();
 }
 
 /* Deliver `mask` (with IN_ISDIR etc. already in it) to the watches on node. */
@@ -120,6 +123,11 @@ static void deliver(vfs_node_t *node, uint32_t mask, uint32_t cookie, const char
 void inotify_dir_event(vfs_node_t *dir, uint32_t mask, uint32_t cookie, const char *name) {
     if (!inotify_nwatches || !dir) return;
     deliver(vfs_resolve_mount(dir), mask, cookie, name);
+}
+
+void inotify_parent_event(vfs_node_t *dir, uint32_t mask, const char *name) {
+    if (!inotify_nwatches || !dir) return;
+    deliver(dir, mask, 0, name);
 }
 
 void inotify_self_event(vfs_node_t *node, uint32_t mask) {
@@ -211,13 +219,23 @@ static void ino_put(struct inotify *in) {
         kfree(e);
     }
     if (ninstances) ninstances--;
+    for (int i = 0; i < INOTIFY_MAX_INSTANCES * 8; i++)
+        if (instances[i] == in) instances[i] = NULL;
     kfree(in);
 }
 
 static void ino_close(vfs_node_t *n) { ino_put((inotify_t *)n); }
 
 vfs_node_t *inotify_new(void) {
-    if (ninstances >= INOTIFY_MAX_INSTANCES * 8) return NULL;
+    /* fs.inotify.max_user_instances: per user, so no one user can take
+     * every instance (root is not limited). */
+    uint32_t uid = current_proc ? current_proc->euid : 0, mine = 0;
+    int slot = -1;
+    for (int i = 0; i < INOTIFY_MAX_INSTANCES * 8; i++) {
+        if (!instances[i]) { if (slot < 0) slot = i; continue; }
+        if (instances[i]->uid == uid) mine++;
+    }
+    if (slot < 0 || (uid != 0 && mine >= INOTIFY_MAX_INSTANCES)) return NULL;
     inotify_t *in = (inotify_t *)kmalloc(sizeof(*in));
     if (!in) return NULL;
     memset(in, 0, sizeof(*in));
@@ -237,6 +255,7 @@ vfs_node_t *inotify_new(void) {
     in->v.private = in;
     in->next_wd = 1;
     in->uid = in->v.uid;
+    instances[slot] = in;
     ninstances++;
     return &in->v;
 }

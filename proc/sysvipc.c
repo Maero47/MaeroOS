@@ -524,6 +524,8 @@ static int undo_add(int tgid, int slot, uint16_t seq, uint16_t num, int delta) {
     for (int i = 0; i < SEM_UNDO_MAX; i++) {
         sysv_undo_t *u = &undos[i];
         if (u->tgid == tgid && u->slot == slot && u->seq == seq && u->num == num) {
+            if (u->adj + delta > SYSV_SEMVMX || u->adj + delta < -SYSV_SEMVMX)
+                return -E_RANGE;              /* Linux: the adjustment is bounded */
             u->adj += delta;
             if (!u->adj) u->tgid = 0;
             return 0;
@@ -567,12 +569,15 @@ static int do_semtimedop(int id, const k_sembuf *uops, uint32_t nops,
             int tgid = current_proc->tgid;
             for (uint32_t i = 0; i < nops; i++) {
                 if (ops[i].flg & SEM_UNDO)
-                    if (undo_add(tgid, slot, seq, ops[i].num, -ops[i].op) < 0) {
-                        /* Roll back the undo entries made so far. */
-                        for (uint32_t j = 0; j < i; j++)
-                            if (ops[j].flg & SEM_UNDO)
-                                undo_add(tgid, slot, seq, ops[j].num, ops[j].op);
-                        return -E_NOSPC;
+                    {
+                        int ur = undo_add(tgid, slot, seq, ops[i].num, -ops[i].op);
+                        if (ur < 0) {
+                            /* Roll back the undo entries made so far. */
+                            for (uint32_t j = 0; j < i; j++)
+                                if (ops[j].flg & SEM_UNDO)
+                                    undo_add(tgid, slot, seq, ops[j].num, ops[j].op);
+                            return ur;
+                        }
                     }
             }
             for (uint32_t i = 0; i < nops; i++) {
@@ -686,10 +691,11 @@ static int do_semctl(int id, int num, int cmd, uint32_t arg) {
              : cmd == GETNCNT ? s->sems[num].ncnt : s->sems[num].zcnt;
     case GETALL: {
         if (ipcperms(&s->perm, 0444)) return -E_ACCES;
-        for (int i = 0; i < s->nsems; i++) {
-            uint16_t v = s->sems[i].val;
-            if (copy_to_user((uint16_t *)ubuf + i, &v, 2) < 0) return -E_FAULT;
-        }
+        /* Snapshot first: the set is not touched again after the copy. */
+        uint16_t vals[SYSV_SEMMSL];
+        int n = s->nsems;
+        for (int i = 0; i < n; i++) vals[i] = s->sems[i].val;
+        if (copy_to_user(ubuf, vals, (uint32_t)n * 2) < 0) return -E_FAULT;
         return 0;
     }
     case SETVAL: {
@@ -707,7 +713,9 @@ static int do_semctl(int id, int num, int cmd, uint32_t arg) {
     case SETALL: {
         if (ipcperms(&s->perm, 0222)) return -E_ACCES;
         uint16_t vals[SYSV_SEMMSL];
+        uint16_t seq = s->perm.seq;
         if (copy_from_user(vals, ubuf, (uint32_t)s->nsems * 2) < 0) return -E_FAULT;
+        if (!semsets[slot].used || semsets[slot].perm.seq != seq) return -E_IDRM;
         for (int i = 0; i < s->nsems; i++)
             if (vals[i] > SYSV_SEMVMX) return -E_RANGE;
         for (int i = 0; i < s->nsems; i++) {
@@ -805,7 +813,9 @@ static int do_msgsnd(int id, const void *umsg, uint32_t sz, int flag) {
     if (ipcperms(&q->perm, 0222)) { kfree(m); return -E_ACCES; }
     int slot = (int)(q - msqs);
     uint16_t seq = q->perm.seq;
-    while (q->cbytes + sz > q->qbytes || q->qnum + 1 > q->qbytes) {
+    /* Linux counts messages against qbytes too; and at most 1024 messages
+     * per queue, so zero-length ones cannot pile up kernel headers. */
+    while (q->cbytes + sz > q->qbytes || q->qnum + 1 > q->qbytes || q->qnum >= 1024) {
         if (flag & IPC_NOWAIT) { kfree(m); return -E_AGAIN; }
         int w = ipc_sleep(q, 0);
         q = &msqs[slot];
@@ -836,7 +846,7 @@ static int do_msgrcv(int id, void *umsg, uint32_t sz, int32_t type, int flag) {
             int ok;
             if (type == 0) ok = 1;
             else if (type > 0) ok = (flag & MSG_EXCEPT) ? it->type != type : it->type == type;
-            else ok = it->type <= -type && (!m || it->type < m->type);
+            else ok = (int64_t)it->type <= -(int64_t)type && (!m || it->type < m->type);
             if (!ok) continue;
             m = it;
             mprev = prev;

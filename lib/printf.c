@@ -128,12 +128,14 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list args) {
                        16, 0, width, zero_pad, left_align);
             break;
         case 'X':
-            write_uint(buf, &pos, n, va_arg(args, uint32_t), 16, 1,
-                       width, zero_pad, left_align);
+            write_uint(buf, &pos, n, lng >= 2 ? va_arg(args, uint64_t)
+                                              : (uint64_t)va_arg(args, uint32_t),
+                       16, 1, width, zero_pad, left_align);
             break;
         case 'o':
-            write_uint(buf, &pos, n, va_arg(args, uint32_t), 8, 0,
-                       width, zero_pad, left_align);
+            write_uint(buf, &pos, n, lng >= 2 ? va_arg(args, uint64_t)
+                                              : (uint64_t)va_arg(args, uint32_t),
+                       8, 0, width, zero_pad, left_align);
             break;
         case 'p': {
             /* Pointer: 0x + 8 hex digits */

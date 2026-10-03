@@ -7,7 +7,8 @@
  * dead process's adjustment back, IPC_NOWAIT is EAGAIN and semtimedop times
  * out with EAGAIN; msgrcv selects by type (exact, lowest <= -type, any),
  * truncates only with MSG_NOERROR and blocks until a message arrives; a
- * removed set or queue wakes its sleepers with EIDRM; a key names one object
+ * removed set or queue wakes its sleepers with EIDRM; a SHM_RDONLY attach
+ * cannot be made writable with mprotect (EACCES); a key names one object
  * (IPC_CREAT|IPC_EXCL on it again is EEXIST); a 0600 object refuses another
  * user (EACCES) and only its owner may remove it (EPERM).
  *
@@ -19,6 +20,7 @@
 #include <sys/msg.h>
 #include <sys/sem.h>
 #include <sys/shm.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 
 union semun { int val; struct semid_ds *buf; unsigned short *array; };
@@ -77,6 +79,8 @@ static void test_shm(void)
         volatile int *q = shmat(id, NULL, SHM_RDONLY);
         if (q == (void *)-1) _exit(2);
         if (q[0] != 0x1234) _exit(3);
+        /* Nor can mprotect make it writable (Linux: EACCES). */
+        if (mprotect((void *)q, 4096, PROT_READ | PROT_WRITE) == 0 || errno != EACCES) _exit(5);
         q[0] = 1;                          /* SIGSEGV */
         _exit(4);
     }

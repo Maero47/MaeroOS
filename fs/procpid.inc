@@ -135,6 +135,7 @@ static void pnode_sweep(void) {
         if (!pn->dead_tick) pn->dead_tick = now ? now : 1;
         if (pn->refs <= 0 && now - pn->dead_tick > 300) {
             *pp = pn->next;
+            vfs_forget_last_lookup();         /* it may name this node */
             kfree(pn);
             continue;
         }
@@ -468,6 +469,10 @@ static void pp_build_stat(pbuf_t *pb, struct proc *p, int thread) {
     for (uint32_t c = 0; c < MAX_CPUS; c++)
         if (cpus[c].proc == p) cpu = (int)c;
     struct proc *own = p->vm_owner ? p->vm_owner : l;
+    /* Linux hides the address-space layout without ptrace read access. */
+    int lay = procfs_may_read(p);
+    uint32_t a_start = lay ? own->image_start : 0, a_end = lay ? own->image_end : 0;
+    uint32_t a_brk = lay ? own->brk_base : 0, a_stack = lay ? (uint32_t)USER_STACK_TOP - 16 : 0;
     pb_printf(pb, "%d (%s) %c %d %d %d %u %d %u ",
               thread ? p->pid : l->pid, p->name, pp_state_char(p), ppid,
               l->pgrp, l->sid, pp_tty_nr(l), tpgid,
@@ -479,8 +484,7 @@ static void pp_build_stat(pbuf_t *pb, struct proc *p, int thread) {
               l->start_tick);
     /* vsize rss rsslim startcode endcode startstack kstkesp kstkeip */
     pb_printf(pb, "%u %u 4294967295 %u %u %u 0 0 ",
-              m.size * PAGE_SIZE, m.rss, own->image_start,
-              own->image_end, (uint32_t)USER_STACK_TOP - 16);
+              m.size * PAGE_SIZE, m.rss, a_start, a_end, a_stack);
     /* signal blocked sigignore sigcatch wchan nswap cnswap exit_signal
      * processor rt_priority policy delayacct guest_time cguest_time */
     pb_printf(pb, "%u %u %u %u %u 0 0 %d %d 0 0 0 0 0 ",
@@ -489,8 +493,8 @@ static void pp_build_stat(pbuf_t *pb, struct proc *p, int thread) {
               p->pid == p->tgid ? 17 : -1, cpu);
     /* start_data end_data start_brk arg_start arg_end env_start env_end
      * exit_code */
-    pb_printf(pb, "%u %u %u 0 0 0 0 %d\n", own->image_start, own->image_end,
-              own->brk_base, p->state == PROC_ZOMBIE ? p->exit_status : 0);
+    pb_printf(pb, "%u %u %u 0 0 0 0 %d\n", a_start, a_end,
+              a_brk, p->state == PROC_ZOMBIE ? p->exit_status : 0);
 }
 
 static void pp_build_status(pbuf_t *pb, struct proc *p, int thread) {
@@ -647,6 +651,7 @@ static uint32_t pp_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf)
     if (priv && !procfs_may_read(p)) return (uint32_t)-13;  /* -EACCES */
 
     uint32_t cap = pn->kind == PK_MAPS ? 32768 :
+                   pn->kind == PK_CMDLINE || pn->kind == PK_ENVIRON ? 4096 + sizeof(p->environ) :
                    pn->kind == PK_MOUNTINFO || pn->kind == PK_MOUNTS ? 8192 : 4096;
     pbuf_t pb = { (char *)kmalloc(cap), 0, cap };
     if (!pb.b) return (uint32_t)-12;

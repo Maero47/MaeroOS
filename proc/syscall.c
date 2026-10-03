@@ -4556,8 +4556,9 @@ uint32_t mm_shm_attach_at(const uint32_t *frames, uint32_t npages, uint32_t addr
      * either happens whole or leaves the address space as it was (Linux
      * shmat() returns ENOMEM here too). */
     if (paging_reserve_range(base, base + len, 1) != 0) return 0;
+    /* SHM_RDONLY: VMA_F_NOWRITE, so mprotect cannot make it writable. */
     if (!vma_add(base, base + len, rdonly ? PROT_READ_K : PROT_READ_K | PROT_WRITE_K,
-                 VMA_F_SHARED | VMA_F_SHM, NULL, 0))
+                 VMA_F_SHARED | VMA_F_SHM | (rdonly ? VMA_F_NOWRITE : 0), NULL, 0))
         return 0;
     for (uint32_t i = 0; i < npages; i++) {
         pmm_frame_incref(frames[i]);        /* this PTE's reference */
@@ -6715,6 +6716,13 @@ static int sys_ugetrlimit(registers_t *regs) {
     return 0;
 }
 
+/* Dumpability belongs to the process (Linux mm->flags): every thread. */
+static void proc_set_dumpable(struct proc *p, int dumpable) {
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (ptable[i].state != PROC_UNUSED && ptable[i].tgid == p->tgid)
+            ptable[i].nondumpable = dumpable ? 0 : 1;
+}
+
 /* ── sys_prctl(option, arg2…) — EAX=172 ─────────────────────────────────────
  * PR_{GET,SET}_DUMPABLE and PR_{SET,GET}_NAME are real; every other option
  * is accepted and ignored, as before. */
@@ -6724,7 +6732,7 @@ static int sys_prctl(registers_t *regs) {
         return current_proc->nondumpable ? 0 : 1;
     case 4:                                   /* PR_SET_DUMPABLE */
         if (regs->ecx > 1) return -22;
-        current_proc->nondumpable = regs->ecx ? 0 : 1;
+        proc_set_dumpable(current_proc, regs->ecx != 0);
         return 0;
     case 15: {                                /* PR_SET_NAME: the thread's comm */
         char name[16];
@@ -10142,6 +10150,9 @@ static int sys_inotify_add_watch(registers_t *regs) {
     if (!n) return err;
     if ((mask & IN_ONLYDIR) && n->flags != VFS_FLAG_DIR) return -20;   /* -ENOTDIR */
     if (proc_access_check(n, VFS_WANT_R) < 0) return -13;             /* -EACCES */
+    /* An instance watching an instance (through /proc/self/fd/N) would let
+     * a watch keep its own or another instance alive: refused. */
+    if (inotify_is(n)) return -22;
     return inotify_add(in, n, mask);
 }
 
@@ -10166,6 +10177,10 @@ void syscall_dispatch(registers_t *regs) {
     kprof_probe_end(KPP_SYS_PRO, kp_pro);
 
     uint64_t kp_body = kprof_probe_begin();
+    /* Linux commit_creds(): a change of effective ids makes the process not
+     * dumpable (its /proc files then need root), until its next exec. */
+    uint32_t cred_euid = current_proc ? current_proc->euid : 0;
+    uint32_t cred_egid = current_proc ? current_proc->egid : 0;
     switch (num) {
     case 1:   sys_exit(regs);                  break;  /* noreturn */
     case 2:   ret = sys_fork(regs);            break;
@@ -10480,6 +10495,9 @@ void syscall_dispatch(registers_t *regs) {
 
     kprof_probe_end(KPP_SYS_BODY, kp_body);
     regs->eax = (uint32_t)(int32_t)ret;
+    if (current_proc && num != 11 &&
+        (current_proc->euid != cred_euid || current_proc->egid != cred_egid))
+        proc_set_dumpable(current_proc, 0);
 
     /* inotify IN_MODIFY for a write that changed a file (write, writev,
      * pwrite64). */

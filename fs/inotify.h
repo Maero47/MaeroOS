@@ -71,6 +71,9 @@ extern uint32_t inotify_nwatches;
 void inotify_dir_event(vfs_node_t *dir, uint32_t mask, uint32_t cookie,
                        const char *name);
 void inotify_self_event(vfs_node_t *node, uint32_t mask);
+/* The same for a directory known only by address (vfs_last_parent): never
+ * dereferenced, since it may have gone since. */
+void inotify_parent_event(vfs_node_t *dir, uint32_t mask, const char *name);
 /* An event about `node` reached through a path: its own watches, and its
  * directory's with its name when the last lookup that produced it is
  * known.  `path` (may be NULL) is looked up first to learn it. */

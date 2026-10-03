@@ -166,7 +166,7 @@ int vfs_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid) {
     if (r == 0 && inotify_nwatches) {
         uint32_t m = IN_ATTRIB | (node->flags == VFS_FLAG_DIR ? IN_ISDIR : 0);
         inotify_self_event(node, m);
-        if (haveparent) inotify_dir_event(parent, m, 0, name);
+        if (haveparent) inotify_parent_event(parent, m, name);
     }
     return r;
 }
@@ -182,7 +182,7 @@ int vfs_settimes(vfs_node_t *node, uint32_t atime, uint32_t mtime) {
     if (r == 0 && inotify_nwatches) {
         uint32_t m = IN_ATTRIB | (node->flags == VFS_FLAG_DIR ? IN_ISDIR : 0);
         inotify_self_event(node, m);
-        if (haveparent) inotify_dir_event(parent, m, 0, name);
+        if (haveparent) inotify_parent_event(parent, m, name);
     }
     return r;
 }
@@ -229,6 +229,11 @@ static struct {
     vfs_node_t  *parent, *node;
     char         name[256];
 } last_lookup;
+
+void vfs_forget_last_lookup(void) {
+    last_lookup.who = NULL;
+    last_lookup.parent = last_lookup.node = NULL;
+}
 
 int vfs_last_parent(vfs_node_t *node, vfs_node_t **parent, char *name) {
     if (!node || last_lookup.node != node || last_lookup.who != current_proc ||
@@ -559,15 +564,17 @@ int vfs_rename(vfs_node_t *old_dir, const char *old_name,
         victim = vfs_finddir(new_dir, new_name);
         if (victim == moved) victim = NULL;
     }
+    /* Everything about the replaced node is read now: the rename may free
+     * it (only its address is compared afterwards). */
+    uint32_t isdir = moved && moved->flags == VFS_FLAG_DIR ? IN_ISDIR : 0;
+    int victim_last = victim && (victim->flags == VFS_FLAG_DIR || victim->nlink <= 1);
     int r = old_dir->rename_fn(old_dir, old_name, new_dir, new_name);
     if (r == 0 && inotify_nwatches) {
-        uint32_t isdir = moved && moved->flags == VFS_FLAG_DIR ? IN_ISDIR : 0;
         uint32_t cookie = inotify_next_cookie();
         inotify_dir_event(old_dir, IN_MOVED_FROM | isdir, cookie, old_name);
         inotify_dir_event(new_dir, IN_MOVED_TO | isdir, cookie, new_name);
         if (moved) inotify_self_event(moved, IN_MOVE_SELF);
-        if (victim && (victim->flags == VFS_FLAG_DIR || victim->nlink <= 1))
-            inotify_node_gone(victim);
+        if (victim_last) inotify_node_gone(victim);
     }
     return r;
 }
