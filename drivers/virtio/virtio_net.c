@@ -166,10 +166,12 @@ static int vnet_poll(netif_t *iface) {
     }
 
     int packets = 0;
+    uint32_t taken = 0;
     void *c;
     uint32_t len;
-    while (packets < (int)nrx && (c = virtq_get_used(&rxq, &len)) != 0) {
+    while (taken < nrx && (c = virtq_get_used(&rxq, &len)) != 0) {
         uint32_t i = INDEX(c);
+        taken++;
         if (i >= nrx)
             continue;
         if (len >= hdr_len + 14 && len <= BUF_SIZE) {
@@ -182,7 +184,7 @@ static int vnet_poll(netif_t *iface) {
         }
         rx_post(i);
     }
-    if (packets || rx_errors)
+    if (taken)
         virtio_pci_publish(&vp, &rxq);
     tx_reclaim();
     return packets;
@@ -236,7 +238,7 @@ static int vnet_describe(netif_t *iface, char *buf, uint32_t cap) {
     char irq[24];
     virtio_pci_describe_irq(&vp, irq, sizeof(irq));
     return snprintf(buf, cap,
-                    "virtio%s %04x:%04x%s mac=%02x:%02x:%02x:%02x:%02x:%02x link=%s features=0x%08x rxq=%u txq=%u txfree=%u rxmode=%s irqs=%u kicks=%u/%u rxerr=%u txfull=%u",
+                    "virtio%s %04x:%04x%s mac=%02x:%02x:%02x:%02x:%02x:%02x link=%s features=0x%08x rxq=%u txq=%u txfree=%u rxmode=%s irqs=%u kicks=%u/%u rxerr=%u txfull=%u linkchg=%u",
                     vp.legacy ? "-legacy" : "",
                     (unsigned)vp.pci->vendor_id, (unsigned)vp.pci->device_id, irq,
                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
@@ -245,7 +247,7 @@ static int vnet_describe(netif_t *iface, char *buf, uint32_t cap) {
                     (unsigned)tx_nfree,
                     allmulti_ok == 0 ? "allmulti" : "default",
                     (unsigned)vp.irqs, (unsigned)rxq.kicks, (unsigned)txq.kicks,
-                    (unsigned)rx_errors, (unsigned)tx_full);
+                    (unsigned)rx_errors, (unsigned)tx_full, (unsigned)link_changes);
 }
 
 /* ── Bring-up ────────────────────────────────────────────────────────────── */
