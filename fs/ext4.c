@@ -382,22 +382,24 @@ static int ext4_fast_symlink(const ext4_vnode_t *vn) {
     return vn->blocks <= ea;
 }
 
-static uint32_t ext4_read_node(vfs_node_t *node, uint32_t off, uint32_t len,
+static uint32_t ext4_read_node(vfs_node_t *node, uint64_t off, uint32_t len,
                                uint8_t *buf) {
     ext4_vnode_t *vn = (ext4_vnode_t *)node;
     ext4_fs_t *fs = vn->fs;
     if (vn->iflags & EXT4_INLINE_DATA_FL) return 0;
     if (off >= vn->size) return 0;
-    if ((uint64_t)off + len > vn->size) len = (uint32_t)(vn->size - off);
+    if (len > vn->size - off) len = (uint32_t)(vn->size - off);
     if (ext4_fast_symlink(vn)) {
-        memcpy(buf, vn->i_block + off, len);
+        memcpy(buf, vn->i_block + (uint32_t)off, len);
         return len;
     }
     uint32_t done = 0;
     while (done < len) {
-        uint32_t pos  = off + done;
-        uint32_t lblk = pos >> fs->log_bs;
-        uint32_t boff = pos & (fs->bs - 1u);
+        uint64_t pos  = off + done;
+        /* Logical block numbers are 32-bit in ext4 (2^32 blocks per file). */
+        if ((pos >> fs->log_bs) > 0xFFFFFFFFull) break;
+        uint32_t lblk = (uint32_t)(pos >> fs->log_bs);
+        uint32_t boff = (uint32_t)pos & (fs->bs - 1u);
         ext4_run_t r;
         if (ext4_map(vn, lblk, &r) < 0) break;
         uint64_t avail = (uint64_t)r.len * fs->bs - boff;
@@ -758,7 +760,7 @@ static int ext4_rofs_symlink(vfs_node_t *d, const char *n, const char *t) {
 static int ext4_rofs_rename(vfs_node_t *a, const char *b, vfs_node_t *c, const char *d) {
     (void)a; (void)b; (void)c; (void)d; return EXT4_ERR_ROFS;
 }
-static int ext4_rofs_truncate(vfs_node_t *n, uint32_t s) {
+static int ext4_rofs_truncate(vfs_node_t *n, uint64_t s) {
     (void)n; (void)s; return EXT4_ERR_ROFS;
 }
 static void ext4_fill_attrs(ext4_vnode_t *vn, const uint8_t *raw);
@@ -817,7 +819,7 @@ static void ext4_fill_node(ext4_vnode_t *vn, const uint8_t *raw) {
     n->inode = vn->ino;
     n->dev   = fs->bp->rdev;
     /* Offsets in the VFS are 32-bit: a file past 4 GiB shows its first 4 GiB. */
-    n->size  = vn->size > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)vn->size;
+    n->size  = vn->size;
     n->flags = ext4_mode_to_vfs(vn->mode);
     n->setattr_fn = ext4_rofs_setattr;
     n->retain_fn  = ext4_retain;

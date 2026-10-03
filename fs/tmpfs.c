@@ -61,9 +61,9 @@ typedef struct tmpfs_node {
 
 /* ── Forward declarations ──────────────────────────────────────────────────── */
 
-static uint32_t          tmpfs_read    (vfs_node_t *, uint32_t, uint32_t, uint8_t *);
-static uint32_t          tmpfs_write   (vfs_node_t *, uint32_t, uint32_t, const uint8_t *);
-static int               tmpfs_truncate(vfs_node_t *, uint32_t);
+static uint32_t          tmpfs_read    (vfs_node_t *, uint64_t, uint32_t, uint8_t *);
+static uint32_t          tmpfs_write   (vfs_node_t *, uint64_t, uint32_t, const uint8_t *);
+static int               tmpfs_truncate(vfs_node_t *, uint64_t);
 static int               tmpfs_readdir (vfs_node_t *, uint32_t, vfs_dirent_t *);
 static vfs_node_t *      tmpfs_finddir (vfs_node_t *, const char *);
 static int               tmpfs_create  (vfs_node_t *, const char *, uint32_t);
@@ -236,11 +236,13 @@ static void tmpfs_release(vfs_node_t *node) {
 
 /* ── File operations ──────────────────────────────────────────────────────── */
 
-static uint32_t tmpfs_read(vfs_node_t *node, uint32_t off, uint32_t len,
+static uint32_t tmpfs_read(vfs_node_t *node, uint64_t off64, uint32_t len,
                             uint8_t *buf) {
     tmpfs_node_t *tn = (tmpfs_node_t *)node;
-    if (off >= node->size) return 0;
-    if (len > node->size - off) len = node->size - off;
+    if (off64 >= node->size) return 0;
+    /* Sizes stay under TMPFS_MAX_FILE, so past here everything fits 32 bits. */
+    uint32_t off = (uint32_t)off64;
+    if (len > node->size - off) len = (uint32_t)(node->size - off);
     if (node->flags == VFS_FLAG_SYMLINK) {
         if (!tn->data) return 0;
         memcpy(buf, tn->data + off, len);
@@ -264,14 +266,15 @@ static uint32_t tmpfs_read(vfs_node_t *node, uint32_t off, uint32_t len,
  * 32-bit wrap and one file from taking all of RAM. */
 #define TMPFS_MAX_FILE  0x40000000U
 
-static uint32_t tmpfs_write(vfs_node_t *node, uint32_t off, uint32_t len,
+static uint32_t tmpfs_write(vfs_node_t *node, uint64_t off64, uint32_t len,
                               const uint8_t *buf) {
     tmpfs_node_t *tn = (tmpfs_node_t *)node;
 
     /* Past the size cap nothing can be written (write(2) gets -EFBIG; 0 would
      * spin a libc write loop).  A write that straddles the cap is shortened,
      * as Linux does at s_maxbytes. */
-    if (off >= TMPFS_MAX_FILE) return VFS_WRITE_EFBIG;
+    if (off64 >= TMPFS_MAX_FILE) return VFS_WRITE_EFBIG;
+    uint32_t off = (uint32_t)off64;
     if (len > TMPFS_MAX_FILE - off) len = TMPFS_MAX_FILE - off;
 
     uint32_t done = 0;
@@ -296,9 +299,10 @@ static uint32_t tmpfs_write(vfs_node_t *node, uint32_t off, uint32_t len,
 /* Linux shmem_setattr: growing is lazy (the new pages are holes that read as
  * zero); shrinking frees the pages past the new end and zeroes the tail of the
  * last partial one, so a later extension reads zeroes, not old bytes. */
-static int tmpfs_truncate(vfs_node_t *node, uint32_t new_size) {
+static int tmpfs_truncate(vfs_node_t *node, uint64_t new_size64) {
     tmpfs_node_t *tn = (tmpfs_node_t *)node;
-    if (new_size > TMPFS_MAX_FILE) return -27;      /* -EFBIG */
+    if (new_size64 > TMPFS_MAX_FILE) return -27;    /* -EFBIG */
+    uint32_t new_size = (uint32_t)new_size64;
     if (new_size < node->size) {
         uint32_t in = new_size & (PAGE_SIZE - 1);
         uint32_t pg = new_size / PAGE_SIZE;

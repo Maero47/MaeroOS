@@ -121,7 +121,7 @@ static int procfs_parse_pid(const char *name) {
     return pid;
 }
 
-static uint32_t procfs_build_status(struct proc *p, uint32_t off,
+static uint32_t procfs_build_status(struct proc *p, uint64_t off,
                                     uint32_t len, uint8_t *buf) {
     char content[512];
     uint32_t pos = 0;
@@ -164,7 +164,7 @@ static uint32_t procfs_build_status(struct proc *p, uint32_t off,
     return avail;
 }
 
-static uint32_t procfs_build_stat(struct proc *p, uint32_t off,
+static uint32_t procfs_build_stat(struct proc *p, uint64_t off,
                                   uint32_t len, uint8_t *buf) {
     char content[256];
     uint32_t pos = 0;
@@ -223,7 +223,7 @@ static uint32_t procfs_build_stat(struct proc *p, uint32_t off,
 
 /* ── /proc/version ────────────────────────────────────────────────────────── */
 
-static uint32_t procfs_version_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_version_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                      uint8_t *buf) {
     (void)n;
     static const char content[] =
@@ -238,7 +238,7 @@ static uint32_t procfs_version_read(vfs_node_t *n, uint32_t off, uint32_t len,
 
 /* ── /proc/mounts, /proc/partitions ───────────────────────────────────────── */
 
-static uint32_t procfs_text_window(char *content, uint32_t total, uint32_t off,
+static uint32_t procfs_text_window(char *content, uint32_t total, uint64_t off,
                                    uint32_t len, uint8_t *buf) {
     if (off >= total) return 0;
     uint32_t avail = total - off;
@@ -247,7 +247,7 @@ static uint32_t procfs_text_window(char *content, uint32_t total, uint32_t off,
     return avail;
 }
 
-static uint32_t procfs_mounts_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_mounts_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                    uint8_t *buf) {
     (void)n;
     enum { CAP = 8192 };
@@ -259,7 +259,7 @@ static uint32_t procfs_mounts_read(vfs_node_t *n, uint32_t off, uint32_t len,
     return r;
 }
 
-static uint32_t procfs_partitions_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_partitions_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                        uint8_t *buf) {
     (void)n;
     enum { CAP = 4096 };
@@ -274,7 +274,7 @@ static uint32_t procfs_partitions_read(vfs_node_t *n, uint32_t off, uint32_t len
 /* /proc/filesystems: what mount(2) takes.  busybox mount without -t tries
  * the types not marked nodev in this order, so vfat and exfat (which only
  * need their boot sector to say no) come before the ext family. */
-static uint32_t procfs_filesystems_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_filesystems_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                         uint8_t *buf) {
     (void)n;
     static const char text[] =
@@ -287,7 +287,7 @@ static uint32_t procfs_filesystems_read(vfs_node_t *n, uint32_t off, uint32_t le
 
 /* ── /proc/kmsg ───────────────────────────────────────────────────────────── */
 
-static uint32_t procfs_kmsg_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_kmsg_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                  uint8_t *buf) {
     (void)n;
     /* Snapshot the kernel ring buffer into a per-read buffer and serve the
@@ -311,7 +311,7 @@ static uint32_t procfs_kmsg_read(vfs_node_t *n, uint32_t off, uint32_t len,
 
 /* ── /proc/self/exe ───────────────────────────────────────────────────────── */
 
-static uint32_t procfs_exe_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_exe_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                  uint8_t *buf) {
     (void)n;
     char content[260];
@@ -353,7 +353,7 @@ static void maps_line(char *b, uint32_t *pos, uint32_t cap,
     pappend(b, pos, cap, "\n");
 }
 
-static uint32_t procfs_maps_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_maps_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                   uint8_t *buf) {
     (void)n;
     /* The VMA registry lists every mapping, so this is big; it is built per
@@ -408,7 +408,7 @@ static uint32_t procfs_maps_read(vfs_node_t *n, uint32_t off, uint32_t len,
 
 /* ── /proc/self/status ────────────────────────────────────────────────────── */
 
-static uint32_t procfs_status_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_status_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                     uint8_t *buf) {
     (void)n;
     return procfs_build_status(current_proc, off, len, buf);
@@ -416,7 +416,7 @@ static uint32_t procfs_status_read(vfs_node_t *n, uint32_t off, uint32_t len,
 
 /* ── /proc/self/stat ──────────────────────────────────────────────────────── */
 
-static uint32_t procfs_stat_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_stat_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                   uint8_t *buf) {
     (void)n;
     return procfs_build_stat(current_proc, off, len, buf);
@@ -424,7 +424,7 @@ static uint32_t procfs_stat_read(vfs_node_t *n, uint32_t off, uint32_t len,
 
 /* Copy a byte range out of a captured buffer (cmdline/environ/auxv). */
 static uint32_t procfs_copy_blob(const uint8_t *blob, uint32_t blob_len,
-                                 uint32_t off, uint32_t len, uint8_t *buf) {
+                                 uint64_t off, uint32_t len, uint8_t *buf) {
     if (off >= blob_len) return 0;
     uint32_t avail = blob_len - off;
     if (avail > len) avail = len;
@@ -433,7 +433,7 @@ static uint32_t procfs_copy_blob(const uint8_t *blob, uint32_t blob_len,
 }
 
 /* ── /proc/self/cmdline ───────────────────────────────────────────────────── */
-static uint32_t procfs_cmdline_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_cmdline_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                     uint8_t *buf) {
     (void)n;
     if (!current_proc) return 0;
@@ -442,7 +442,7 @@ static uint32_t procfs_cmdline_read(vfs_node_t *n, uint32_t off, uint32_t len,
 }
 
 /* ── /proc/self/environ ───────────────────────────────────────────────────── */
-static uint32_t procfs_environ_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_environ_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                     uint8_t *buf) {
     (void)n;
     if (!current_proc) return 0;
@@ -451,7 +451,7 @@ static uint32_t procfs_environ_read(vfs_node_t *n, uint32_t off, uint32_t len,
 }
 
 /* ── /proc/self/auxv (binary type/value pairs) ───────────────────────────── */
-static uint32_t procfs_auxv_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_auxv_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                  uint8_t *buf) {
     (void)n;
     if (!current_proc) return 0;
@@ -460,7 +460,7 @@ static uint32_t procfs_auxv_read(vfs_node_t *n, uint32_t off, uint32_t len,
 }
 
 /* ── /proc/self/statm (size resident shared text lib data dt, in pages) ───── */
-static uint32_t procfs_statm_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_statm_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                   uint8_t *buf) {
     (void)n;
     /* Built on every read, for the reader: a static buffer filled at off == 0
@@ -648,14 +648,14 @@ static int procfs_slot_for_node(vfs_node_t *node) {
     return (int)(p - ptable);
 }
 
-static uint32_t procfs_pid_status_read(vfs_node_t *n, uint32_t off,
+static uint32_t procfs_pid_status_read(vfs_node_t *n, uint64_t off,
                                        uint32_t len, uint8_t *buf) {
     int slot = procfs_slot_for_node(n);
     if (slot < 0) return 0;
     return procfs_build_status(&ptable[slot], off, len, buf);
 }
 
-static uint32_t procfs_pid_stat_read(vfs_node_t *n, uint32_t off,
+static uint32_t procfs_pid_stat_read(vfs_node_t *n, uint64_t off,
                                      uint32_t len, uint8_t *buf) {
     int slot = procfs_slot_for_node(n);
     if (slot < 0) return 0;
@@ -747,7 +747,7 @@ static vfs_node_t proc_root_node;
 
 /* ── /proc/meminfo ────────────────────────────────────────────────────────── */
 
-static uint32_t procfs_meminfo_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_meminfo_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                      uint8_t *buf) {
     (void)n;
     char content[256];
@@ -779,7 +779,7 @@ static uint32_t procfs_meminfo_read(vfs_node_t *n, uint32_t off, uint32_t len,
 
 /* ── /proc/uptime ─────────────────────────────────────────────────────────── */
 
-static uint32_t procfs_uptime_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_uptime_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                     uint8_t *buf) {
     (void)n;
     char content[64];
@@ -810,7 +810,7 @@ static uint32_t procfs_uptime_read(vfs_node_t *n, uint32_t off, uint32_t len,
 
 /* ── /proc/cpuinfo ────────────────────────────────────────────────────────── */
 
-static uint32_t procfs_cpuinfo_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_cpuinfo_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                      uint8_t *buf) {
     (void)n;
     /* The flags line names only what the kernel turned on that a program
@@ -836,7 +836,7 @@ static uint32_t procfs_cpuinfo_read(vfs_node_t *n, uint32_t off, uint32_t len,
 
 /* ── /proc/pci ────────────────────────────────────────────────────────────── */
 
-static uint32_t procfs_pci_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_pci_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                 uint8_t *buf) {
     (void)n;
     /* Built per read (see /proc/kmsg): no shared buffer to tear. */
@@ -888,7 +888,7 @@ static uint32_t procfs_pci_read(vfs_node_t *n, uint32_t off, uint32_t len,
 
 /* ── /proc/netif ──────────────────────────────────────────────────────────── */
 
-static uint32_t procfs_netif_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_netif_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                   uint8_t *buf) {
     (void)n;
     char content[1024];
@@ -932,7 +932,7 @@ static uint32_t procfs_netif_read(vfs_node_t *n, uint32_t off, uint32_t len,
     return avail;
 }
 
-static uint32_t procfs_netif_write(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_netif_write(vfs_node_t *n, uint64_t off, uint32_t len,
                                    const uint8_t *buf) {
     (void)n; (void)off; (void)buf;
     netif_t *iface = net_find_interface("eth0");
@@ -955,7 +955,7 @@ static uint32_t procfs_netif_write(vfs_node_t *n, uint32_t off, uint32_t len,
 
 /* ── /proc/firewall ───────────────────────────────────────────────────────── */
 
-static uint32_t procfs_firewall_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_firewall_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                      uint8_t *buf) {
     (void)n;
     enum { FW_CAP = 4096 };
@@ -970,7 +970,7 @@ static uint32_t procfs_firewall_read(vfs_node_t *n, uint32_t off, uint32_t len,
 /* Each write is one or more newline-separated control lines (fwctl).  A line
  * the firewall rejects fails the write with EINVAL, so fwctl (and a config
  * reload) can tell a bad rule from one that is now in force. */
-static uint32_t procfs_firewall_write(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_firewall_write(vfs_node_t *n, uint64_t off, uint32_t len,
                                       const uint8_t *buf) {
     (void)n; (void)off;
     char line[256];
@@ -992,7 +992,7 @@ static uint32_t procfs_firewall_write(vfs_node_t *n, uint32_t off, uint32_t len,
 
 /* ── /proc/processes ─────────────────────────────────────────────────────── */
 
-static uint32_t procfs_processes_read(vfs_node_t *n, uint32_t off,
+static uint32_t procfs_processes_read(vfs_node_t *n, uint64_t off,
                                       uint32_t len, uint8_t *buf) {
     (void)n;
     /* Built per read (see /proc/kmsg): no shared buffer to tear. */
@@ -1062,7 +1062,7 @@ static void pappend_uint(char *buf, uint32_t *pos, uint32_t cap, uint32_t val) {
 extern uint32_t sched_idle_us;
 extern uint32_t sched_handoffs;
 
-static uint32_t procfs_cputime_read(vfs_node_t *n, uint32_t off,
+static uint32_t procfs_cputime_read(vfs_node_t *n, uint64_t off,
                                     uint32_t len, uint8_t *buf) {
     (void)n;
     enum { CAP = 8192 };
@@ -1101,13 +1101,13 @@ static vfs_node_t proc_sys_node;       /* /proc/sys */
 static vfs_node_t proc_sys_vm_node;    /* /proc/sys/vm */
 static vfs_node_t proc_overcommit_node;/* /proc/sys/vm/overcommit_memory */
 
-static uint32_t procfs_overcommit_read(vfs_node_t *n, uint32_t off,
+static uint32_t procfs_overcommit_read(vfs_node_t *n, uint64_t off,
                                        uint32_t len, uint8_t *buf) {
     (void)n;
     static const char s[] = "0\n";
     return procfs_copy_blob((const uint8_t *)s, 2, off, len, buf);
 }
-static uint32_t procfs_overcommit_write(vfs_node_t *n, uint32_t off,
+static uint32_t procfs_overcommit_write(vfs_node_t *n, uint64_t off,
                                         uint32_t len, const uint8_t *buf) {
     (void)n; (void)off; (void)buf;
     return len;   /* accept + ignore */
@@ -1144,7 +1144,7 @@ static vfs_node_t proc_net_dev_node;
 static vfs_node_t proc_net_route_node;
 static vfs_node_t proc_net_if_inet6_node;
 
-static uint32_t procfs_net_text_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_net_text_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                      uint8_t *buf) {
     uint32_t cap = 4096;
     char *content = (char *)kmalloc(cap);

@@ -22,6 +22,7 @@
 #include "../include/syscall.h"
 #include "../include/unistd.h"
 #include "../include/fcntl.h"
+#include "../include/errno.h"
 #include "../include/signal.h"
 #include "../include/sys/stat.h"
 #include "../include/sys/wait.h"
@@ -322,7 +323,11 @@ static void user_checks(void) {
         check("pwrite to O_RDONLY fd is EBADF", r == -EBADF, r);
         r = syscall2(NR_FTRUNCATE, fd, 0);
         check("ftruncate O_RDONLY fd is EINVAL", r == -EINVAL, r);
-        r = syscall5(NR_FALLOCATE, fd, 0, 0, 0, 4096);   /* offset 0, len 4096 */
+        /* fallocate(fd, 0, offset 0, len 4096): the 64-bit offset and length
+         * are register pairs, len's high word in EBP, which only syscall()
+         * sets. */
+        r = (int)syscall(NR_FALLOCATE, fd, 0, 0, 0, 4096, 0);
+        if (r < 0) r = -errno;
         check("fallocate O_RDONLY fd is EBADF", r == -EBADF, r);
 
         r = sys_mmap2(4096, K_PROT_READ | K_PROT_WRITE, K_MAP_SHARED, fd);

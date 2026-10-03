@@ -1229,12 +1229,15 @@ static int file_shrink(vfat_fs_t *fs, vfat_vnode_t *vn, uint32_t size) {
     return 0;
 }
 
-static uint32_t vfat_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+/* A FAT file is at most 4 GiB - 1 bytes (a 32-bit size in its directory
+ * entry): past the size check every offset fits 32 bits. */
+static uint32_t vfat_read(vfs_node_t *n, uint64_t off64, uint32_t len, uint8_t *buf) {
     vfat_vnode_t *vn = (vfat_vnode_t *)n;
     vfat_fs_t *fs = vn->fs;
     fs_lock(fs);
     uint32_t got = 0;
-    if (off < vn->size) {
+    uint32_t off = (uint32_t)off64;
+    if (off64 < vn->size) {
         /* An I/O error ends the read early (as fs/ext4.c does): callers
          * other than read(2) take the result as a length. */
         if (len > vn->size - off) len = vn->size - off;
@@ -1244,11 +1247,13 @@ static uint32_t vfat_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *bu
     return got;
 }
 
-static uint32_t vfat_write(vfs_node_t *n, uint32_t off, uint32_t len, const uint8_t *buf) {
+static uint32_t vfat_write(vfs_node_t *n, uint64_t off64, uint32_t len, const uint8_t *buf) {
     vfat_vnode_t *vn = (vfat_vnode_t *)n;
     vfat_fs_t *fs = vn->fs;
     if (len == 0) return 0;
-    if (off == 0xFFFFFFFFu) return VFS_WRITE_EFBIG;
+    /* Nothing at or past 4 GiB - 1; a write straddling it is shortened. */
+    if (off64 >= 0xFFFFFFFFu) return VFS_WRITE_EFBIG;
+    uint32_t off = (uint32_t)off64;
     if (len > 0xFFFFFFFFu - off) len = 0xFFFFFFFFu - off;
     fs_lock(fs);
     int r = 0;
@@ -1268,10 +1273,12 @@ static uint32_t vfat_write(vfs_node_t *n, uint32_t off, uint32_t len, const uint
     return r < 0 ? (uint32_t)r : len;
 }
 
-static int vfat_truncate(vfs_node_t *n, uint32_t size) {
+static int vfat_truncate(vfs_node_t *n, uint64_t size64) {
     vfat_vnode_t *vn = (vfat_vnode_t *)n;
     vfat_fs_t *fs = vn->fs;
     if (vn->is_dir) return E_ISDIR;
+    if (size64 > 0xFFFFFFFFu) return -27;              /* -EFBIG */
+    uint32_t size = (uint32_t)size64;
     fs_lock(fs);
     int r = 0;
     if (fs->ro) r = E_ROFS;

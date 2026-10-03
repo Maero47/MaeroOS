@@ -81,8 +81,7 @@ Read support:
 * extent trees of any depth (index and leaf nodes, holes, unwritten extents
   read as zeros) and classic direct/indirect block maps
 * file sizes from `i_size_high` (regular files, and directories with
-  `largedir`); offsets in the VFS are 32-bit, so a file past 4 GiB shows its
-  first 4 GiB
+  `largedir`); VFS offsets are 64-bit, so a file past 4 GiB reads whole
 * directories: linear scan for `readdir` (with a cursor so listing a large
   directory is linear, not quadratic), htree (`dir_index`) for lookups:
   legacy, half-MD4 and TEA hashes, signed and unsigned variants, the hash seed,

@@ -149,7 +149,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-net-virtio smoke-tcpsrv smoke-net6 smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-gfxmode smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-alpinex disk-alpinex smoke-alpine-net smoke-audio disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-net-virtio smoke-tcpsrv smoke-net6 smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-gfxmode smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-largefile smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-alpinex disk-alpinex smoke-alpine-net smoke-audio disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched
 
 all: $(TARGET)
 
@@ -415,6 +415,13 @@ smoke-vfat: $(TARGET) initrd disk
 smoke-exfat: $(TARGET) initrd disk
 	python3 tools/smoke_exfat.py
 
+# Files past 4 GiB: sparse ext4, exFAT, ext2 (block-mapped) and vfat disks
+# in build/largefile/, written by testfiles/lfprobe (ports/largefile/) and
+# busybox, checked after poweroff with e2fsck/debugfs, fsck.exfat +
+# tools/exfatimg.py and fsck.fat (tools/smoke_largefile.py).
+smoke-largefile: $(TARGET) initrd disk
+	python3 tools/smoke_largefile.py
+
 smoke-pkg: $(TARGET) initrd disk repo
 	python3 tools/smoke_pkg.py
 
@@ -494,7 +501,7 @@ smoke-pc: $(TARGET) iso disk
 # with -display none (tools/smokelib.py), so no display is needed.
 # Pick a subset with CHECK_SUITES="smoke smoke-x".
 CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-net-e1000 smoke-net-virtio smoke-net6 smoke-tcpsrv \
-                 smoke-fw smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui smoke-gfxmode smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-uefi \
+                 smoke-fw smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui smoke-gfxmode smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-largefile smoke-uefi \
                  smoke-install smoke-hda smoke-acpi smoke-ahci smoke-nvme smoke-usb smoke-pc
 CHECK_LOG_DIR ?= build/check
 

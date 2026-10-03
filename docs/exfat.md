@@ -66,10 +66,9 @@ device (`EBUSY`), raw writes to a disk with a mounted filesystem are `EBUSY`,
 * **Lengths**: DataLength and ValidDataLength are 64-bit. Reads past
   ValidDataLength return zeros; a write past it zero-fills the gap first;
   `truncate` up allocates clusters and leaves ValidDataLength where it was (the
-  new part reads as zeros without being written). The VFS has 32-bit offsets:
-  a file of 4 GiB or more shows its first 4 GiB − 1 bytes (`stat` reports
-  4294967295), which can be read and written in place, and its real length is
-  kept. Writes stop at 4 GiB − 1 (`EFBIG`).
+  new part reads as zeros without being written). VFS offsets are 64-bit, so
+  files past 4 GiB are read, written, created and truncated whole (`make
+  smoke-largefile`); a file stops at 2^32 − 1 clusters (`EFBIG`).
 * **Directories**: no `.` and `..` on disk (they are made up for `readdir`);
   a directory grows by a zeroed cluster when no run of free entries is long
   enough, up to 256 MiB.

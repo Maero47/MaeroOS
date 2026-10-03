@@ -248,12 +248,12 @@ static int node_unit(const vfs_node_t *n) {
     return (int)(n->inode - NODE_INODE_BASE);
 }
 
-static uint32_t disk_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t disk_read(vfs_node_t *n, uint64_t off, uint32_t len,
                           uint8_t *buf) {
     return disk_io(node_unit(n), off, len, buf, 0);
 }
 
-static uint32_t disk_write(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t disk_write(vfs_node_t *n, uint64_t off, uint32_t len,
                            const uint8_t *buf) {
     msc_disk_t *k = unit_disk(node_unit(n));
     /* The same stick as /dev/sdX: never written behind a mounted
@@ -401,7 +401,7 @@ static int attach_lun(struct usb_device *d, uint8_t ifnum, uint8_t lun) {
     n->flags = VFS_FLAG_BLKDEV;
     n->inode = NODE_INODE_BASE + (uint32_t)unit;
     uint64_t bytes = (uint64_t)k->block_count * bs;
-    n->size = bytes > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (uint32_t)bytes;
+    n->size = bytes;
     n->mask = 0660;
     n->read_fn = disk_read;
     n->write_fn = disk_write;
