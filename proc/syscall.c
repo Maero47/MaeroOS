@@ -1477,7 +1477,7 @@ static void init_new_node(vfs_node_t *dir, vfs_node_t *node, uint32_t mode) {
         else if ((mode & 02010) == 02010 && p->euid != 0 && !proc_in_group(gid))
             mode &= ~02000u;
     }
-    vfs_setattr(node, mode, p->euid, gid);
+    vfs_setattr_quiet(node, mode, p->euid, gid);    /* part of the create */
 }
 
 static int sys_open_kernel_path(const char *path, int flags, uint32_t mode) {
@@ -1505,8 +1505,10 @@ static int sys_open_kernel_path(const char *path, int flags, uint32_t mode) {
             return -40;   /* -ELOOP */
     }
     int lerr;
+    int created = 0;
     vfs_node_t *node = vfs_lookup_at(path, 1, &lerr);
     if (!node) {
+        created = 1;
         /* O_CREAT: create the file if missing — only when it is missing,
          * not when the lookup hit a symlink loop or an over-long path. */
         if (!(flags & O_CREAT) || lerr != -2)
@@ -1527,6 +1529,7 @@ static int sys_open_kernel_path(const char *path, int flags, uint32_t mode) {
         int cr = dir->create_fn(dir, base, VFS_FLAG_FILE);
         if (cr < 0)
             return cr == -1 ? -12 : cr;   /* -EEXIST etc. pass through */
+        inotify_dir_event(dir, IN_CREATE, 0, base);
 
         node = vfs_open_at(path);
         if (!node) return -2;
@@ -1590,8 +1593,10 @@ static int sys_open_kernel_path(const char *path, int flags, uint32_t mode) {
     }
 
     /* O_TRUNC: discard existing content */
-    if ((flags & O_TRUNC) && node->truncate_fn)
+    if ((flags & O_TRUNC) && node->truncate_fn) {
         node->truncate_fn(node, 0);
+        if (!created) inotify_child_event(node, NULL, IN_MODIFY);
+    }
 
     /* Find a free file descriptor slot */
     for (int i = 0; i < MAX_FD; i++) {
@@ -5654,6 +5659,7 @@ static int do_mknod(const char *path, uint32_t mode) {
         return -13;
     int r = dir->create_fn(dir, base, vfs_flag);
     if (r < 0) return r;
+    inotify_dir_event(dir, IN_CREATE | (vfs_flag == VFS_FLAG_DIR ? IN_ISDIR : 0), 0, base);
     vfs_node_t *node = vfs_open_nofollow(path);
     if (node)
         init_new_node(dir, node, mode & ~current_proc->umask);
@@ -5791,7 +5797,7 @@ static int symlink_at(uint32_t utarget, int dirfd, uint32_t ulinkpath) {
     if (rc == 0) {
         vfs_node_t *link = vfs_open_nofollow(abspath);
         if (link)
-            vfs_setattr(link, 0777, current_proc->euid, current_proc->egid);
+            vfs_setattr_quiet(link, 0777, current_proc->euid, current_proc->egid);
     }
     return rc;
 }
@@ -6887,6 +6893,7 @@ static int sys_mkdir_kernel_path(const char *path, uint32_t mode) {
         return -13;
     int r = dir->create_fn(dir, base, VFS_FLAG_DIR);
     if (r < 0) return r;
+    inotify_dir_event(dir, IN_CREATE | IN_ISDIR, 0, base);
     /* mode & ~umask, permission and sticky bits only (Linux vfs_mkdir:
      * S_IRWXUGO|S_ISVTX); set-group-ID comes from the parent, if at all. */
     vfs_node_t *node = vfs_open_at(path);
@@ -8909,6 +8916,7 @@ static int usock_fs_create(const char *path, vfs_node_t **out) {
     r = dir->create_fn(dir, base, VFS_FLAG_SOCK);
     if (r == -17) return -98;
     if (r < 0) return r;
+    inotify_dir_event(dir, IN_CREATE, 0, base);
     vfs_node_t *node = vfs_open_nofollow(resolved);
     if (!node) return -2;
     init_new_node(dir, node, 0777 & ~current_proc->umask);

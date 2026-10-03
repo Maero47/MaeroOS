@@ -107,6 +107,11 @@ PROBES = {
     "p42_netlink":             (60, ""),
     "p43_lock_close_race":     (60, ""),
     "p44_proc_fd_link":        (60, ""),
+    # System V shm/sem/msg, inotify (on tmpfs here; smoke-procipc also runs
+    # it on ext2), and /proc/<pid> with its permission rules.
+    "p45_sysv_ipc":            (60, ""),
+    "p46_inotify":             (120, ""),
+    "p47_proc_pid":            (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

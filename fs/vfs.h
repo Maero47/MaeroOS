@@ -187,6 +187,9 @@ int vfs_access_check_groups(vfs_node_t *node, uint32_t uid, uint32_t gid,
 
 /* Update mode/uid/gid (in-memory + persisted via setattr_fn if present). */
 int vfs_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid);
+/* The same without an inotify IN_ATTRIB: a new node's owner and mode, set as
+ * part of creating it. */
+int vfs_setattr_quiet(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid);
 
 /* link(2): `name` in `dir` becomes another name of `target` (-EPERM without
  * filesystem support, -EXDEV across filesystems). */

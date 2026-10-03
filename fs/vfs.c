@@ -146,6 +146,14 @@ int vfs_access_check_groups(vfs_node_t *node, uint32_t euid, uint32_t egid,
     return (((int)bits & 7 & want) == want) ? 0 : -13;   /* -EACCES */
 }
 
+int vfs_setattr_quiet(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid) {
+    if (!node) return -2;
+    node->mask = mode & 07777;
+    node->uid = uid;
+    node->gid = gid;
+    return node->setattr_fn ? node->setattr_fn(node, node->mask, uid, gid) : 0;
+}
+
 int vfs_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid) {
     if (!node) return -2;
     vfs_node_t *parent = NULL;

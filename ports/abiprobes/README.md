@@ -1,7 +1,7 @@
 # Linux-ABI probes
 
-Thirty-nine small C programs.  P1-P20 are the probes of
-`docs/audit/firefox-first-paint.md` section 8; P21-P39 were added with later
+Forty-seven small C programs.  P1-P20 are the probes of
+`docs/audit/firefox-first-paint.md` section 8; P21-P47 were added with later
 kernel fixes.  Each proves or disproves one kernel-semantics gap and prints
 exactly one final line:
 
@@ -62,6 +62,9 @@ regression tests for the fixes in audit section 5.
 | P42 | `p42_netlink.c`             | rtnetlink `RTM_GETLINK` dump and error ack, `SIOCGIFINDEX`/`SIOCGIFNAME`/`SIOCGIFCONF` agree (busybox `ip`, `ifconfig`, udhcpc) | — |
 | P43 | `p43_lock_close_race.c`     | a descriptor closed while `F_SETLKW`/`flock` waits leaves no lock behind (`F_SETLKW`: `EBADF`) | — |
 | P44 | `p44_proc_fd_link.c`        | `/proc/<pid>/fd/N` links name the open file (`ttyname`); another user's are `EACCES` | — |
+| P45 | `p45_sysv_ipc.c`            | System V shm/sem/msg: sharing across fork, IPC_RMID, SEM_UNDO, blocking, types, keys, permissions | — |
+| P46 | `p46_inotify.c`             | inotify events of each directory operation, poll/epoll/FIONREAD, blocking read, IN_Q_OVERFLOW | — |
+| P47 | `p47_proc_pid.c`            | `/proc/self` link, `/proc/<pid>` files, `/proc/stat`/`loadavg`; another user's `environ`/`fd`/links are `EACCES` | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the
