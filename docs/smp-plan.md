@@ -695,6 +695,7 @@ take it, and how waiting CPUs behave.
 | 1e | No console output busy-waits any more. COM1 transmits from a 64 KiB ring, fed by the transmitter-empty interrupt (IRQ4), one FIFO load per interrupt, with a PIT-tick backstop. Writers only copy bytes. A full ring is back-pressure: the writer feeds the UART itself between short lock holds, nothing is dropped. Synchronous output stays for early boot, panic, double fault, the NMI dump and reboot (`serial_sync_begin` first drains the ring, so order holds). The VGA text console scrolls by moving the CRTC start address over the 32 KiB of text memory, with a RAM copy for the wrap, instead of reading and rewriting 2000 cells per line (each access is an exit under KVM). The cursor is set once per string. The `[SYSCALL] exec` and `[ELF] Loaded` lines stay on the console, because smoke-disk, smoke-toybox and smoke-install wait for them. Not done: (iii) batched CR3 reloads in ELF load and a lazy user stack. | `drivers/serial.c`, `drivers/vga.c`, `kernel/main.c`, `kernel/panic.c`, `arch/i686/cpu/dfault.c`, `fs/devfs.c` (`tty_write` in 64-byte chunks) |
 | 1f | `tlb_shootdown_user()` / `tlb_shootdown_mm(pgdir)` for user-half changes: only CPUs whose current thread runs on that page directory get the IPI. CPUs that are idle, in the scheduler, or in another address space cannot hold its user entries: user pages are not global, and switching out loads the kernel pgdir. `cpus[c].proc` and the CR3 load change only under the BKL, which the caller holds. Kernel-half shootdowns (`kstack`) still go to every CPU. munmap already batched 256 frames per shootdown. | `arch/i686/cpu/smp.c`, `percpu.h`, `proc/syscall.c` (9 sites), `arch/i686/mm/paging.c` (COW) |
 | 1g | printk takes a console spinlock (interrupts off) around klog, serial and VGA, so messages from different CPUs no longer interleave and the klog index update is serialised. `printk_klog` takes it too. A CPU that already holds it (an NMI) writes through; a waiter gives up after ~1 s (a stopped holder during panic). | `kernel/printk.c` |
+| – | `usb_lock` (a sleeping test-and-set) lets newcomers queue behind waiters. smoke-usb failed 1 run in 5 once exec stopped paying the console busy-wait: a reader looping over a pulled stick re-took the lock every time, and kusbd never got to scan the hub that reports the removal. This is the unfairness stage 13 removes with a `kmutex_t`. | `drivers/usb/xhci.c` |
 | 1h | Not done. ATA PIO is not on any measured path (`make check` disks use it, the benches do not). | – |
 
 New tooling: `tools/stress_smp.py` / `make stress-smp`. It runs two fork+exec loops, a pipe loop
@@ -749,7 +750,8 @@ Results:
 
 Verification (stage 1 commit, merged with `yonet/bklplan` 053c2fe):
 
-- `make check`: all 27 suites pass.
+- `make check`: all 27 suites pass (final tree, after the `usb_lock` fix). smoke-usb
+  then passed 3 runs in a row by itself.
 - `SMOKE_SMP=4 smoke_cmds`, `make smoke-abi` (44 pass) and `make smoke-klock` (PASS)
   pass.
 - `make smoke-firefox` and `smoke-firefox-web` pass with `--smp 2`.
