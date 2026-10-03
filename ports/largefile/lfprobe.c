@@ -102,15 +102,18 @@ static void check_off32(int fd, const char *path) {
      * checks it (Linux ksys_lseek). */
     struct utsname u;
     int compat = uname(&u) == 0 && strcmp(u.machine, "x86_64") == 0;
-    long cur = lseek(fd, 0, SEEK_CUR);
+    long r;
     if (compat) {
         info("x86_64 kernel: compat lseek(2) does not report EOVERFLOW; not checked");
         goto open32;
     }
+    if (lseek(fd, 0, SEEK_SET) != 0) fail("lseek to 0");
     errno = 0;
-    long r = syscall(SYS_lseek, fd, 0L, SEEK_END);
+    r = syscall(SYS_lseek, fd, 0L, SEEK_END);
     if (r != -1 || errno != EOVERFLOW) fail("lseek(2) 32-bit SEEK_END = %ld, want EOVERFLOW", r);
-    if (lseek(fd, 0, SEEK_CUR) != cur) fail("a failed 32-bit lseek moved the offset");
+    /* Linux ksys_lseek moves the position first and then finds that the
+     * result does not fit. */
+    if (lseek(fd, 0, SEEK_CUR) != fsize(fd)) fail("offset after the EOVERFLOW lseek");
     errno = 0;
     r = syscall(SYS_lseek, fd, 0x7FFFFFFFL, SEEK_SET);
     if (r != 0x7FFFFFFFL) fail("lseek(2) to 2 GiB - 1 = %ld", r);
@@ -119,7 +122,6 @@ static void check_off32(int fd, const char *path) {
     if (r != -1 || errno != EOVERFLOW) fail("lseek(2) to 2 GiB = %ld, want EOVERFLOW", r);
     info("lseek(2) with a 32-bit off_t: EOVERFLOW past 2 GiB - 1");
 open32:
-    (void)cur;
 
     errno = 0;
     r = syscall(SYS_open, path, O_RDONLY);

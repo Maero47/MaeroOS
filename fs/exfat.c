@@ -86,7 +86,7 @@
 #define XF_CACHE_BYTES  (256u * 1024u)
 #define XF_CACHE_WAYS   4
 #define XF_MAX_DIRBYTES (256u << 20)     /* the specification's limit */
-#define XF_ZBUF         8192u
+#define XF_ZBUF         65536u   /* zero-fill writes: 128 sectors, one command */
 #define XF_MAX_SEC      18               /* secondaries of a file entry set */
 #define NAME_UNITS      255
 

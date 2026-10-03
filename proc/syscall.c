@@ -2830,10 +2830,11 @@ static int sys_lseek(registers_t *regs) {
     uint64_t new_off;
     r = seek_target(f, off, whence, &new_off);
     if (r < 0) return r;
-    /* A 32-bit off_t cannot carry the result (Linux ksys_lseek: -EOVERFLOW).
-     * The position stays where it was. */
-    if (new_off > MAX_NON_LFS) return -75;
+    /* A 32-bit off_t cannot carry the result: -EOVERFLOW, with the position
+     * already moved, exactly as Linux ksys_lseek (vfs_llseek, then the
+     * check). */
     f->offset = new_off;
+    if (new_off > MAX_NON_LFS) return -75;
     return (int)new_off;
 }
 
