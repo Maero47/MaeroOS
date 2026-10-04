@@ -114,7 +114,14 @@
 #define LO_ADDR        0x0100007Fu      /* 127.0.0.1, network order */
 #define LO_MASK        0x000000FFu      /* 255.0.0.0 */
 
-#define NL_QUEUE_MAX   (256 * 1024)   /* replies waiting to be read */
+/* Replies waiting to be read, per socket; and, since a user can open many
+ * sockets and never read any, per user and for all non-root users together
+ * (the heap never shrinks: 128 sockets of 256 KB pinned ~58 MB).  Root's
+ * replies are bounded per socket only, so they still arrive while users sit
+ * on their budgets.  Linux bounds each socket by its sk_rcvbuf. */
+#define NL_QUEUE_MAX   (256 * 1024)
+#define NL_USER_MAX    (1024 * 1024)
+#define NL_USERS_MAX   (4 * 1024 * 1024)
 
 static uint32_t bswap32(uint32_t v) {
     return (v >> 24) | ((v >> 8) & 0xFF00) | ((v << 8) & 0xFF0000) | (v << 24);
@@ -251,6 +258,7 @@ typedef struct nlmsg_q {
 
 typedef struct nlsock {
     struct nlsock *next;     /* every netlink socket, for port ids */
+    uint32_t uid;            /* the opener's euid */
     uint32_t portid;         /* 0 until bound */
     uint32_t groups;
     nlmsg_q_t *head, *tail;
@@ -277,9 +285,22 @@ static void autobind(nlsock_t *s) {
     s->portid = id;
 }
 
+/* Would queueing n more bytes on s go over a budget? */
+static int over_budget(const nlsock_t *s, uint32_t n) {
+    if (s->queued + n > NL_QUEUE_MAX) return 1;
+    if (s->uid == 0) return 0;
+    uint32_t user = 0, users = 0;
+    for (const nlsock_t *t = nl_all; t; t = t->next) {
+        if (t->uid == 0) continue;
+        users += t->queued;
+        if (t->uid == s->uid) user += t->queued;
+    }
+    return user + n > NL_USER_MAX || users + n > NL_USERS_MAX;
+}
+
 static void queue_reply(nlsock_t *s, nlbuf_t *b) {
     if (b->oom || !b->len) { if (b->oom) s->drops = 1; kfree(b->buf); return; }
-    if (s->queued + b->len > NL_QUEUE_MAX) { s->drops = 1; kfree(b->buf); return; }
+    if (over_budget(s, b->len)) { s->drops = 1; kfree(b->buf); return; }
     nlmsg_q_t *m = (nlmsg_q_t *)kmalloc(sizeof(*m) + b->len);
     if (!m) { s->drops = 1; kfree(b->buf); return; }
     m->next = NULL;
@@ -578,7 +599,19 @@ static int do_getlink(nlsock_t *s, const nlmsghdr_k *h, const ifinfomsg_k *ifi,
     return 0;
 }
 
-static int do_setlink(const ifinfomsg_k *ifi, const attrs_t *a) {
+/* Changing the configuration over netlink takes CAP_NET_ADMIN of both the
+ * socket's opener and the sender (Linux netlink_net_capable ->
+ * netlink_ns_capable: file_ns_capable on the socket's file AND ns_capable on
+ * the current task).  Root (euid 0) stands for the capability here.  So a
+ * root-opened socket handed to a user (fd passing, a set-uid helper that
+ * dropped privileges) cannot change the network, and neither can a socket a
+ * user opened before becoming root.  The SIOCS* ioctls check the caller
+ * only, as Linux's do. */
+static int nl_admin(const nlsock_t *s) {
+    return s->uid == 0 && is_root();
+}
+
+static int do_setlink(const nlsock_t *s, const ifinfomsg_k *ifi, const attrs_t *a) {
     netif_t *iface = ifi->index > 0 ? netdev_by_index(ifi->index) : NULL;
     if (!iface && a->p[IFLA_IFNAME]) {
         char name[16];
@@ -588,7 +621,7 @@ static int do_setlink(const ifinfomsg_k *ifi, const attrs_t *a) {
         iface = net_find_interface(name);
     }
     if (!iface) return -19;
-    if (!is_root()) return -1;                         /* -EPERM */
+    if (!nl_admin(s)) return -1;                       /* -EPERM */
     uint32_t mtu;
     if (attr_u32(a, IFLA_MTU, &mtu) && mtu != iface->mtu)
         return -95;                                    /* fixed by the driver */
@@ -605,12 +638,12 @@ static int do_setlink(const ifinfomsg_k *ifi, const attrs_t *a) {
     return 0;
 }
 
-static int do_newaddr(const nlmsghdr_k *h, const ifaddrmsg_k *ifa,
-                      const attrs_t *a, int del) {
+static int do_newaddr(const nlsock_t *s, const nlmsghdr_k *h,
+                      const ifaddrmsg_k *ifa, const attrs_t *a, int del) {
     if (ifa->family == AF_INET6_K) {
         /* Removing one works (busybox `ip addr flush`); adding is SLAAC's. */
         if (!del) return -95;
-        if (!is_root()) return -1;
+        if (!nl_admin(s)) return -1;
         netif_t *i6 = netdev_by_index((int)ifa->index);
         if (!i6) return -19;
         const void *p6 = a->p[IFA_LOCAL] ? a->p[IFA_LOCAL] : a->p[IFA_ADDRESS];
@@ -620,7 +653,7 @@ static int do_newaddr(const nlmsghdr_k *h, const ifaddrmsg_k *ifa,
         return net_lwip_ip6_del(i6, (const uint8_t *)p6);
     }
     if (ifa->family != AF_INET_K) return -97;          /* -EAFNOSUPPORT */
-    if (!is_root()) return -1;
+    if (!nl_admin(s)) return -1;
     netif_t *iface = netdev_by_index((int)ifa->index);
     if (!iface) return -19;
     if (iface->loopback) {
@@ -655,13 +688,13 @@ static int do_newaddr(const nlmsghdr_k *h, const ifaddrmsg_k *ifa,
     return net_lwip_set_addr(want, nmask);
 }
 
-static int do_route(const nlmsghdr_k *h, const rtmsg_k *rt, const attrs_t *a,
-                    int del) {
+static int do_route(const nlsock_t *s, const nlmsghdr_k *h, const rtmsg_k *rt,
+                    const attrs_t *a, int del) {
     if (rt->family != AF_INET_K) return -97;
     uint32_t table = rt->table, v;
     if (attr_u32(a, RTA_TABLE, &v)) table = v;
     if (table != RT_TABLE_MAIN && table != RT_TABLE_UNSPEC) return -95;
-    if (!is_root()) return -1;
+    if (!nl_admin(s)) return -1;
     uint32_t ip, mask, gw;
     net_lwip_get_config(&ip, &mask, &gw);
     uint32_t want_gw = 0, oif = 0, dst = 0, metric = 0;
@@ -734,13 +767,13 @@ static int handle_msg(nlsock_t *s, const nlmsghdr_k *h) {
         if (h->type == RTM_NEWLINK && (h->flags & NLM_F_CREATE) &&
             ifi->index <= 0)
             return -95;
-        return do_setlink(ifi, &a);
+        return do_setlink(s, ifi, &a);
     }
     case RTM_NEWADDR: case RTM_DELADDR: {
         if (plen < sizeof(ifaddrmsg_k)) return -22;
         const ifaddrmsg_k *ifa = (const ifaddrmsg_k *)body;
         parse_attrs(&a, body + sizeof(*ifa), plen - sizeof(*ifa));
-        return do_newaddr(h, ifa, &a, h->type == RTM_DELADDR);
+        return do_newaddr(s, h, ifa, &a, h->type == RTM_DELADDR);
     }
     case RTM_NEWROUTE: case RTM_DELROUTE: case RTM_GETROUTE: {
         if (plen < sizeof(rtmsg_k)) return -22;
@@ -750,7 +783,7 @@ static int handle_msg(nlsock_t *s, const nlmsghdr_k *h) {
             int r = do_route_get(s, h, &a);
             return r < 0 ? r : 1;
         }
-        return do_route(h, rt, &a, h->type == RTM_DELROUTE);
+        return do_route(s, h, rt, &a, h->type == RTM_DELROUTE);
     }
     case RTM_GETADDR:
         do_dump(s, h, plen);       /* a single-address get is a dump here */
@@ -907,6 +940,7 @@ int netlink_create(int type, int protocol, const xsock_ops_t **ops, void **x) {
     nlsock_t *s = (nlsock_t *)kmalloc(sizeof(*s));
     if (!s) return -12;
     memset(s, 0, sizeof(*s));
+    s->uid = current_proc ? current_proc->euid : 0;
     s->next = nl_all;
     nl_all = s;
     *ops = &nl_ops;

@@ -364,12 +364,13 @@ static int pk_send(void *x, const void *buf, uint32_t len,
     uint32_t total;
     if (s->type == 3) {                                /* the whole frame */
         if (len < ETH_HLEN) return -22;
-        if (len > iface->mtu + ETH_HLEN) return -90;   /* -EMSGSIZE */
+        if (len > iface->mtu + ETH_HLEN || len > FRAME_MAX)
+            return -90;                                /* -EMSGSIZE */
         memcpy(frame, buf, len);
         total = len;
     } else {
         if (!has) return -89;                          /* -EDESTADDRREQ */
-        if (len > iface->mtu) return -90;
+        if (len > iface->mtu || len > FRAME_MAX - ETH_HLEN) return -90;
         uint16_t proto = sa.protocol ? sa.protocol : s->proto;
         memcpy(frame, sa.addr, 6);
         memcpy(frame + 6, iface->mac, 6);
@@ -566,6 +567,7 @@ static int rw_send(void *x, const void *buf, uint32_t len,
     }
     if (!dst) return -89;                              /* -EDESTADDRREQ */
     if (len > 65535) return -90;
+    if (s->hdrincl && len < 20) return -22;    /* Linux raw_send_hdrinc */
     struct pbuf *p = pbuf_alloc(s->hdrincl ? PBUF_LINK : PBUF_IP, (u16_t)len,
                                 PBUF_RAM);
     if (!p) return -105;
@@ -874,6 +876,11 @@ static int is_send(void *x, const void *buf, uint32_t len,
         return -89;                                      /* -EDESTADDRREQ */
     }
     if (len > 65535 - 48) return -90;
+    /* ICMPv6 carries a checksum at offset 2 that the stack fills in: a
+     * message shorter than its 4-byte type/code/checksum has nowhere to put
+     * it (Linux rawv6_push_pending_frames: EINVAL).  lwIP's raw_sendto
+     * asserts on it, which halts the machine. */
+    if (s->proto == IPPROTO_ICMPV6_K && len < 4) return -22;
     if (s->ping) {
         uint8_t req = s->domain == AF_INET_K ? 8 : 128;
         if (len < 8 || ((const uint8_t *)buf)[0] != req ||

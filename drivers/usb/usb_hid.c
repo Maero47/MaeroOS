@@ -330,6 +330,7 @@ static int parse_consumer(hid_state_t *st, const uint8_t *d, uint32_t len) {
 static int32_t get_field(const hid_field_t *f, const uint8_t *data,
                          uint32_t len) {
     uint32_t v = 0;
+    if (!f->size) return 0;
     for (uint32_t b = 0; b < f->size; b++) {
         uint32_t bit = f->offset + b;
         if (bit / 8 >= len) break;
@@ -417,17 +418,21 @@ static void screen_size(int32_t *w, int32_t *h) {
 }
 
 static int32_t scale_abs(const hid_field_t *f, int32_t v, int32_t extent) {
-    if (f->lmax <= f->lmin) return 0;
+    if (f->lmax <= f->lmin || extent <= 0) return 0;
+    if (extent > 0x10000) extent = 0x10000;
     if (v < f->lmin) v = f->lmin;
     if (v > f->lmax) v = f->lmax;
-    /* 32-bit arithmetic only (no libgcc 64-bit division in the kernel). */
-    uint32_t num = (uint32_t)(v - f->lmin);
-    uint32_t range = (uint32_t)(f->lmax - f->lmin) + 1;
+    /* The span of a full 32-bit range (lmin = INT32_MIN, lmax = INT32_MAX)
+     * is 2^32, which wraps a 32-bit range to 0: take the differences in
+     * 64 bits, then shift both down to 16 bits so the division is 32-bit
+     * (no libgcc 64-bit division in the kernel).  range stays >= 0x8000. */
+    uint64_t num = (uint64_t)((int64_t)v - f->lmin);
+    uint64_t range = (uint64_t)((int64_t)f->lmax - f->lmin) + 1;
     while (range > 0x10000U) {
         num >>= 1;
         range >>= 1;
     }
-    return (int32_t)((num * (uint32_t)extent) / range);
+    return (int32_t)(((uint32_t)num * (uint32_t)extent) / (uint32_t)range);
 }
 
 static void pointer_report(hid_state_t *st, const uint8_t *r, uint32_t len) {

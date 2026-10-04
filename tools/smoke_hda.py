@@ -5,6 +5,7 @@ Boots (2 CPUs) with an ICH6 HDA controller + hda-duplex codec whose output goes 
 QEMU's wav audiodev (build/smoke-hda/out.wav), then plays two tones:
   1. `tone 1000 1500`     — 1 kHz for 1.5 s at full volume
   2. `tone 2500 1000 25`  — 2.5 kHz for 1 s at 25 % mixer volume
+then runs the p76_alsa_close_race probe (close vs a running START),
 and checks the captured WAV: each tone is present (not silence), its
 spectral peak sits at the played frequency, it lasts about as long as was
 played without dropouts (1.5 s is more than two trips round the driver's
@@ -139,6 +140,13 @@ def main():
         if "tone: done" not in out or "cannot set volume" in out:
             raise AssertionError("tone 2500 at 25% failed")
         smokelib.wait_for(proc, sel, "[HDA] playback done", log, 10.0, at)
+        # close of the PCM while a sibling thread's START still writes the
+        # staged buffer, the close interrupted by a signal (silence: the
+        # capture checks above are unaffected).
+        at = smokelib.mark(log)
+        out = run(proc, sel, log, "/abiprobes/p76_alsa_close_race", timeout=60.0)
+        if "PASS p76_alsa_close_race" not in out:
+            raise AssertionError("p76_alsa_close_race did not pass:\n" + out[-1500:])
         # let the wav backend catch up with the last silence
         run(proc, sel, log, "sleep 1")
     finally:

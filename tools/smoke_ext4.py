@@ -16,6 +16,8 @@ disk, and checks from inside the guest, with busybox mount/umount:
   * tmpfs mount + remount,ro; unprivileged mount refused; unknown types refused
   * on q35, the same partitions found and mounted on AHCI (sdb2) and NVMe
     (nvme0n1p5), with the boot disk on AHCI as /disk (/dev/sda)
+  * root=/dev/hdb2 mounts the IDE slave's partition at /disk (not hda's
+    sectors at the same offsets)
 
 and afterwards, on the host, that neither filesystem was modified (byte
 comparison with the image it was copied from) and that e2fsck -fn is clean.
@@ -148,6 +150,41 @@ def sata_nvme_boot(gpt, mbr, accel):
         rc, out = g.sh("busybox mount -o ro -t ext4 /dev/nvme0n1p5 /mnt && "
                        "busybox cat /mnt/readme-link && busybox umount /mnt")
         check(rc == 0 and "logical partition" in out, "q35: mount /dev/nvme0n1p5 (NVMe)")
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+def root_second_ide_boot(gpt, accel):
+    """root=/dev/hdb2: /disk is the GPT disk's ext4 partition on the IDE
+    primary slave, read through that disk (drivers/blkdev.c once sent every
+    boot-disk read to the primary master, hda, at hdb2's offsets).  Every
+    disk is a snapshot; nothing is written back."""
+    proc = subprocess.Popen(
+        ["qemu-system-i386", *smokelib.QEMU_DISPLAY, *accel,
+         "-kernel", "kernel.elf", "-initrd", "initrd.tar", "-append", "root=/dev/hdb2",
+         "-drive", "file=disk.img,format=raw,index=0,media=disk,snapshot=on",
+         "-drive", f"file={gpt['image']},format=raw,index=1,media=disk,snapshot=on",
+         "-serial", "stdio", "-m", "256M", "-no-reboot", "-no-shutdown"],
+        cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, bufsize=0)
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+    log = []
+    g = Guest(proc, sel, log)
+    try:
+        smokelib.login(proc, sel, log, timeout=90.0)
+        boot = "".join(log)
+        check("[BOOT] root=/dev/hdb2 is /dev/hdb2" in boot and
+              "no ext2/ext4 filesystem" not in boot, "root=/dev/hdb2 found and mounted")
+        rc, out = g.sh("busybox grep /disk /proc/mounts")
+        check("/dev/hdb2 /disk" in out, "root=/dev/hdb2: /proc/mounts names /dev/hdb2 as /disk")
+        rc, out = g.sh("busybox cat /disk/hello.txt")
+        check(rc == 0 and "hello from ext4" in out, "root=/dev/hdb2: /disk is hdb2's ext4, not hda")
     finally:
         if proc.poll() is None:
             proc.terminate()
@@ -359,6 +396,7 @@ def main():
             check(r.returncode == 0, f"e2fsck -fn {os.path.basename(fs)} clean")
 
         sata_nvme_boot(gpt, mbr, accel)
+        root_second_ide_boot(gpt, accel)
 
         if failures:
             print(f"\n[SMOKE-EXT4] {len(failures)} check(s) failed:")

@@ -31,9 +31,19 @@ typedef struct uscm {
     struct uscm *next;
     uint32_t     id;                  /* identity for usocket_cancel_fds() */
     uint32_t     at;                  /* tx total_in where the message starts */
+    uint32_t     charge;              /* bytes charged to the ring (its size) */
     int          nfds;
-    proc_file_t  files[SCM_MAX_FDS];  /* retained file refs (ownership in queue) */
+    proc_file_t  files[];             /* retained file refs (ownership in queue) */
 } uscm_t;
+
+/* Queued batches are kernel heap the receiver may never read, so each ring
+ * carries at most SCM_BUDGET bytes of them, charged at their real size: a
+ * sender over budget waits (or gets EAGAIN) exactly as for a full ring, the
+ * way Linux charges each fd-carrying skb's truesize to the sender's sk_sndbuf.
+ * One 1-byte message per batch used to queue ~65,000 batches of 5 KiB on one
+ * ring and exhaust the heap. */
+#define SCM_BUDGET     UBUF_SIZE
+#define USCM_SIZE(n)   ((uint32_t)(sizeof(uscm_t) + (uint32_t)(n) * sizeof(proc_file_t)))
 
 /* A refcounted unidirectional ring: tx endpoints feed it, one rx endpoint
  * drains it.  Either side closing (or shutting down) is recorded so the other
@@ -46,6 +56,7 @@ typedef struct ucbuf {
     uint32_t head, count;
     uint32_t total_in, total_out;     /* cumulative bytes written / read */
     uscm_t  *scm_head, *scm_tail;     /* FIFO of in-flight SCM_RIGHTS batches */
+    uint32_t scm_charge;              /* their size, at most SCM_BUDGET */
     int      writer_closed;   /* tx endpoint gone / SHUT_WR → reader EOF */
     int      reader_closed;   /* rx endpoint gone / SHUT_RD → writer EPIPE */
     uint8_t  data[UBUF_SIZE];
@@ -95,8 +106,22 @@ static ucbuf_t *ucbuf_alloc(int record) {
     b->head = b->count = 0;
     b->total_in = b->total_out = 0;
     b->scm_head = b->scm_tail = NULL;
+    b->scm_charge = 0;
     b->writer_closed = b->reader_closed = 0;
     return b;
+}
+
+/* Can a batch of n fds be queued on b now? */
+static int scm_fits(ucbuf_t *b, int n) {
+    return b->scm_charge + USCM_SIZE(n) <= SCM_BUDGET;
+}
+
+/* A batch left b's queue: give its charge back and wake a sender waiting
+ * for budget. */
+static void scm_uncharge(ucbuf_t *b, uscm_t *m) {
+    b->scm_charge -= m->charge;
+    wake_up(b);
+    io_wake();
 }
 
 /* A batch left its queue: the socket refs it holds are no longer in flight
@@ -136,6 +161,7 @@ static void uscm_destroy(uscm_t *m) {
 static void ucbuf_purge_fds(ucbuf_t *b) {
     uscm_t *m = b->scm_head;
     b->scm_head = b->scm_tail = NULL;
+    b->scm_charge = 0;
     while (m) {
         uscm_t *next = m->next;
         uscm_destroy(m);
@@ -171,6 +197,7 @@ static void ucbuf_drop_ready_fds(ucbuf_t *b) {
         uscm_t *m = b->scm_head;
         b->scm_head = m->next;
         if (!b->scm_head) b->scm_tail = NULL;
+        scm_uncharge(b, m);
         uscm_destroy(m);
     }
 }
@@ -599,7 +626,8 @@ int usocket_send_record(usocket_t *s, const usock_iov_t *iov, int niov,
             r = (s->type == USOCK_DGRAM) ? -111 : epipe(flags);
             break;
         }
-        if (UBUF_SIZE - b->count >= rec) break;
+        if (UBUF_SIZE - b->count >= rec && (nfds <= 0 || scm_fits(b, nfds)))
+            break;
         if (flags & USOCK_NONBLOCK) { r = -11; break; }
         if (signal_interrupt_pending(current_proc)) { r = -4; break; }
         sleep_on(b);
@@ -701,9 +729,12 @@ static int usocket_send_fds_locked(ucbuf_t *b, proc_file_t *files, int n,
     static uint32_t next_id = 1;
     if (n <= 0) return 0;
     if (n > SCM_MAX_FDS) n = SCM_MAX_FDS;
-    uscm_t *m = (uscm_t *)kmalloc(sizeof(uscm_t));
+    if (!scm_fits(b, n)) return -11;                   /* callers wait first */
+    uscm_t *m = (uscm_t *)kmalloc(USCM_SIZE(n));
     if (!m) return -12;
     m->next = NULL;
+    m->charge = USCM_SIZE(n);
+    b->scm_charge += m->charge;
     /* Syscalls run under the BKL, but take the id atomically anyway so this
      * never depends on it; 0 means "no batch", so skip it on wrap. */
     uint32_t id;
@@ -731,11 +762,20 @@ static int usocket_send_fds_locked(ucbuf_t *b, proc_file_t *files, int n,
  * recvmsg that consumes any of the bytes that follow.  Ownership of the refs
  * transfers into the queue.  On success *id_out identifies the batch for
  * usocket_cancel_fds(). */
-int usocket_send_fds(usocket_t *s, proc_file_t *files, int n, uint32_t *id_out) {
+int usocket_send_fds(usocket_t *s, proc_file_t *files, int n, uint32_t *id_out,
+                     int flags) {
     ucbuf_t *b = s->tx;
     if (!b) return -107;                               /* -ENOTCONN */
-    /* Nobody can ever receive them: the reader is gone for good. */
-    if (b->reader_closed) return -32;
+    if (n > SCM_MAX_FDS) n = SCM_MAX_FDS;
+    for (;;) {
+        if (s->closed) return -9;
+        /* Nobody can ever receive them: the reader is gone for good. */
+        if (b->reader_closed) return -32;
+        if (n <= 0 || scm_fits(b, n)) break;
+        if (flags & USOCK_NONBLOCK) return -11;        /* -EAGAIN */
+        if (signal_interrupt_pending(current_proc)) return -4;
+        sleep_on(b);
+    }
     return usocket_send_fds_locked(b, files, n, id_out);
 }
 
@@ -752,6 +792,7 @@ int usocket_cancel_fds(usocket_t *s, uint32_t id) {
         if (m->id != id) continue;
         if (prev) prev->next = m->next; else b->scm_head = m->next;
         if (b->scm_tail == m) b->scm_tail = prev;
+        scm_uncharge(b, m);
         uscm_unflight(m);
         kfree(m);
         return 1;
@@ -770,6 +811,7 @@ int usocket_recv_fds(usocket_t *s, proc_file_t *out, int max) {
     uscm_t *m = b->scm_head;
     b->scm_head = m->next;
     if (!b->scm_head) b->scm_tail = NULL;
+    scm_uncharge(b, m);
     uscm_unflight(m);
     int n = m->nfds;
     if (n > max) n = max;
@@ -862,8 +904,10 @@ int usocket_read_ready(usocket_t *s) {
 
 int usocket_write_ready(usocket_t *s) {
     if (s->closed || !s->tx || s->shut_wr) return 1;
+    /* Room for data and for a one-fd batch: a sender of fds polling for
+     * POLLOUT must not spin on EAGAIN from an exhausted SCM budget. */
     return s->tx->reader_closed || s->tx->writer_closed ||
-           s->tx->count < UBUF_SIZE;
+           (s->tx->count < UBUF_SIZE && scm_fits(s->tx, 1));
 }
 
 /* Diagnostic: identify a usocket's rx/tx buffers (shared with the peer) so the
@@ -992,6 +1036,31 @@ static void gc_scan(ucbuf_t *b, void (*fn)(usocket_t *)) {
                 fn(m->files[i].usock);
 }
 
+/* A socket's receive queue, and for a listener the receive queues of the
+ * connections still in its backlog: those embryos are only reachable through
+ * the listener, so what they hold is the listener's too (Linux scan_children).
+ * Without them, L sent over a connection L itself has not accepted yet
+ * (connect, sendmsg(C, SCM_RIGHTS[L]), close both) was never collected. */
+static void gc_scan_sock(usocket_t *s, void (*fn)(usocket_t *)) {
+    gc_scan(s->rx, fn);
+    for (int i = 0; i < s->bl_count; i++)
+        gc_scan(s->backlog[(s->bl_head + i) % UBACKLOG]->rx, fn);
+}
+
+/* Detach every batch queued on b onto *dead. */
+static void gc_take(ucbuf_t *b, uscm_t **dead) {
+    if (!b) return;
+    uscm_t *m = b->scm_head;
+    b->scm_head = b->scm_tail = NULL;
+    b->scm_charge = 0;
+    while (m) {
+        uscm_t *next = m->next;
+        m->next = *dead;
+        *dead = m;
+        m = next;
+    }
+}
+
 static void gc_dec(usocket_t *t) { t->gc_count--; }
 
 static int gc_changed;
@@ -1015,28 +1084,23 @@ static void unix_gc(void) {
         }
         if (!ncand) break;
         for (usocket_t *s = all_sockets; s; s = s->all_next)
-            if (s->gc_cand) gc_scan(s->rx, gc_dec);
+            if (s->gc_cand) gc_scan_sock(s, gc_dec);
         for (usocket_t *s = all_sockets; s; s = s->all_next)
             if (s->gc_cand && s->gc_count > 0) s->gc_alive = 1;
         do {
             gc_changed = 0;
             for (usocket_t *s = all_sockets; s; s = s->all_next)
-                if (s->gc_cand && s->gc_alive) gc_scan(s->rx, gc_mark);
+                if (s->gc_cand && s->gc_alive) gc_scan_sock(s, gc_mark);
         } while (gc_changed);
 
         /* Detach the garbage's queued batches first, then close them all:
          * closing frees sockets, which must not happen mid-walk. */
         uscm_t *dead = NULL;
         for (usocket_t *s = all_sockets; s; s = s->all_next) {
-            if (!s->gc_cand || s->gc_alive || !s->rx) continue;
-            uscm_t *m = s->rx->scm_head;
-            s->rx->scm_head = s->rx->scm_tail = NULL;
-            while (m) {
-                uscm_t *next = m->next;
-                m->next = dead;
-                dead = m;
-                m = next;
-            }
+            if (!s->gc_cand || s->gc_alive) continue;
+            gc_take(s->rx, &dead);
+            for (int i = 0; i < s->bl_count; i++)
+                gc_take(s->backlog[(s->bl_head + i) % UBACKLOG]->rx, &dead);
         }
         while (dead) {
             uscm_t *next = dead->next;

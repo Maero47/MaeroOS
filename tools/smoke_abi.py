@@ -142,6 +142,19 @@ PROBES = {
     "p63_fb0_identity":        (60, ""),
     "p64_kill_target":         (60, ""),
     "p65_lock_limits":         (120, ""),
+    # SCM_RIGHTS batches charged to the ring; the unix GC walks a listener's
+    # backlog (drivers + network review, 2026-10-04).
+    "p70_scm_rights_budget":   (120, ""),
+    "p71_unix_gc_backlog":     (60, ""),
+    "p72_recvmsg_bad_control": (60, ""),
+    # netlink reply budgets, per-user socket slots, opener + sender privilege.
+    "p73_netlink_limits":      (120, ""),
+    # Short raw sends refused (an ICMPv6 one halted the machine in lwIP).
+    "p74_raw_short_send":      (60, ""),
+    # Ephemeral ports drawn at random (LWIP_RAND() was the constant 4).
+    "p75_ephemeral_ports":     (60, ""),
+    # Needs a sound card: SKIP here, required by smoke-hda.
+    "p76_alsa_close_race":     (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

@@ -10,6 +10,7 @@
 #include "../proc/scheduler.h"
 #include "../proc/process.h"
 #include "../proc/signal.h"
+#include "../kernel/random.h"
 
 #include "lwip/udp.h"
 #include "lwip/tcp.h"
@@ -54,6 +55,12 @@ static int timed_out(uint32_t ms, uint32_t start) {
  * close.  Held in the slot they made the table 2.2 MiB of .bss at 32 entries,
  * and the kernel image must fit boot.asm's initial mapping (linker.ld). */
 #define MAX_NET_SOCKETS 128
+/* One user holding every slot made socket() fail for everyone, root
+ * included: a user may hold at most NET_SOCKETS_PER_USER, and the last
+ * NET_SOCKETS_ROOT_RESERVE free slots are root's only.  Accepted connections
+ * count against their listener's owner. */
+#define NET_SOCKETS_PER_USER     64
+#define NET_SOCKETS_ROOT_RESERVE 16
 #define UDP_QUEUE_DEPTH 4
 #define UDP_PACKET_MAX 1536
 #define TCP_RX_SIZE 65536   /* per-socket RX ring (burst headroom) */
@@ -82,6 +89,7 @@ typedef struct udp_packet {
 struct net_socket {
     int used;
     int refs;
+    uint32_t uid;       /* owner (creator's euid; a listener's for accepted) */
     int domain;
     int type;
     int protocol;
@@ -435,17 +443,48 @@ void net_sockets_init(void) {
     memset(sockets, 0, sizeof(sockets));
 }
 
-static net_socket_t *socket_free_slot(void) {
-    for (int i = 0; i < MAX_NET_SOCKETS; i++)
-        if (!sockets[i].used)
-            return &sockets[i];
-    printk("[NET] socket: all %d sockets in use\n", MAX_NET_SOCKETS);
-    return NULL;
+static uint32_t current_uid(void) {
+    return current_proc ? current_proc->euid : 0;
+}
+
+/* A free slot that `uid` may take (see NET_SOCKETS_PER_USER). */
+static net_socket_t *socket_free_slot(uint32_t uid) {
+    net_socket_t *slot = NULL;
+    int used = 0, mine = 0;
+    for (int i = 0; i < MAX_NET_SOCKETS; i++) {
+        if (!sockets[i].used) {
+            if (!slot) slot = &sockets[i];
+            continue;
+        }
+        used++;
+        if (sockets[i].uid == uid) mine++;
+    }
+    if (!slot) {
+        printk("[NET] socket: all %d sockets in use\n", MAX_NET_SOCKETS);
+        return NULL;
+    }
+    if (uid != 0 && (mine >= NET_SOCKETS_PER_USER ||
+                     MAX_NET_SOCKETS - used <= NET_SOCKETS_ROOT_RESERVE))
+        return NULL;
+    return slot;
+}
+
+/* An unbound socket's ephemeral port, drawn at random from lwIP's range
+ * (RFC 6056 algorithm 1; Linux also randomizes).  lwIP's own allocator hands
+ * ports out in sequence, so the next DNS query's source port could be
+ * guessed.  If 32 draws all collide, lwIP's sequential pick takes over. */
+static void bind_random_port(net_socket_t *s) {
+    for (int tries = 0; tries < 32; tries++) {
+        u16_t port = (u16_t)(0xC000u + (random_u32() & 0x3FFFu));
+        err_t e = s->udp ? udp_bind(s->udp, &s->udp->local_ip, port)
+                         : tcp_bind(s->tcp, &s->tcp->local_ip, port);
+        if (e != ERR_USE) return;
+    }
 }
 
 static int xsocket_create_locked(int domain, int type, int protocol,
                                  net_socket_t **out) {
-    net_socket_t *s = socket_free_slot();
+    net_socket_t *s = socket_free_slot(current_uid());
     if (!s)
         return -24;
     const xsock_ops_t *ops = NULL;
@@ -463,6 +502,7 @@ static int xsocket_create_locked(int domain, int type, int protocol,
     s->domain = domain;
     s->type = type;
     s->protocol = protocol;
+    s->uid = current_uid();
     s->xops = ops;
     s->xs = x;
     *out = s;
@@ -488,7 +528,7 @@ static int socket_create_locked(int domain, int type, int protocol, net_socket_t
     if (type == SOCK_STREAM_K && protocol != 0 && protocol != IPPROTO_TCP_K)
         return -93;
 
-    net_socket_t *s = socket_free_slot();
+    net_socket_t *s = socket_free_slot(current_uid());
     if (!s)
         return -24;
 
@@ -523,6 +563,7 @@ static int socket_create_locked(int domain, int type, int protocol, net_socket_t
     s->type = type;
     s->protocol = protocol ? protocol :
                   (type == SOCK_DGRAM_K ? IPPROTO_UDP_K : IPPROTO_TCP_K);
+    s->uid = current_uid();
     s->udp = upcb;
     s->tcp = tpcb;
     if (s->udp) {
@@ -637,7 +678,7 @@ static err_t tcp_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err) {
         return ERR_VAL;
     if (ls->aq_count >= ACCEPTQ_MAX)
         return ERR_MEM;
-    net_socket_t *c = socket_free_slot();
+    net_socket_t *c = socket_free_slot(ls->uid);
     if (!c)
         return ERR_MEM;
     uint8_t *ring = (uint8_t *)kmalloc(TCP_RX_SIZE);
@@ -646,6 +687,7 @@ static err_t tcp_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err) {
     memset(c, 0, sizeof(*c));
     c->used = 1;
     c->refs = 1;
+    c->uid = ls->uid;
     c->domain = ls->domain;
     c->v6only = ls->v6only;
     c->linger_on = ls->linger_on;
@@ -701,6 +743,10 @@ static int socket_listen_locked(net_socket_t *s, int backlog) {
     /* An unbound socket gets an ephemeral port (Linux inet_autobind). */
     const ip_addr_t *any = s->domain == AF_INET_K ? IP4_ADDR_ANY
                          : s->v6only ? IP6_ADDR_ANY : IP_ANY_TYPE;
+    if (s->tcp->local_port == 0) {
+        ip_addr_copy(s->tcp->local_ip, *any);
+        bind_random_port(s);
+    }
     if (s->tcp->local_port == 0 && tcp_bind(s->tcp, any, 0) != ERR_OK) {
         kfree(q);
         return -98;
@@ -798,6 +844,7 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
         ip_addr_copy(s->remote_addr, dst);
         s->remote_port = bswap16(addr->port);
         preempt_disable();
+        if (s->udp->local_port == 0) bind_random_port(s);
         err_t e = udp_connect(s->udp, &s->remote_addr, s->remote_port);
         preempt_enable();
         if (e != ERR_OK)
@@ -831,6 +878,7 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
     s->tcp_state = TCP_STATE_CONNECTING;
     s->tcp_error = 0;
     preempt_disable();
+    if (s->tcp->local_port == 0) bind_random_port(s);
     err_t e = tcp_connect(s->tcp, &s->remote_addr, s->remote_port,
                           tcp_connected_cb);
     preempt_enable();
@@ -939,6 +987,7 @@ static int socket_sendto_locked(net_socket_t *s, const void *buf, uint32_t len,
             pbuf_free(p);
             return -13;   /* -EACCES */
         }
+        if (s->udp->local_port == 0) bind_random_port(s);
         e = udp_sendto(s->udp, p, &ip, bswap16(addr->port));
     } else if (s->connected) {
         e = udp_send(s->udp, p);

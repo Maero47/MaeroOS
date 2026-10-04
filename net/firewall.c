@@ -92,7 +92,9 @@ int firewall_ip6_input_hook(struct pbuf *p, struct netif *inp) {
     uint8_t nh = ip[6];
     uint32_t off = 40;
     for (int i = 0; i < 8 && (nh == 0 || nh == 43 || nh == 60); i++) {
-        if (p->len < off + 8) return 0;
+        /* An extension chain running past the first pbuf (or the
+         * packet) is judged by the policy, not let through unjudged. */
+        if (p->len < off + 8) { nh = 255; break; }
         nh = ip[off];
         off += 8u + 8u * ip[off + 1];
     }

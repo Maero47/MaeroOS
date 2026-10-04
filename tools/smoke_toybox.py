@@ -25,10 +25,14 @@ def send(proc, text):
 def main():
     # pkg's tar/name and index-signature checks, the libc regex engine, the
     # e1000 TX ring bookkeeping, the r8169 driver core (against a simulated
-    # chip) and the virtio ring logic (against a simulated device) are plain
-    # C: exercise them on the host first.
+    # chip), the virtio ring logic (against a simulated device), the USB HID
+    # descriptor parser (against hostile descriptors), the USB stick
+    # transport (against a simulated stick with short transfers) and the
+    # kernel's ChaCha20 random generator are plain C: exercise them on the
+    # host first.
     for test in ("test_pkg_tarx.py", "test_pkg_sign.py", "test_regex.py",
-                 "test_e1000_tx.py", "test_r8169.py", "test_virtqueue.py"):
+                 "test_e1000_tx.py", "test_r8169.py", "test_virtqueue.py",
+                 "test_usb_hid.py", "test_usb_msc.py", "test_random.py"):
         if subprocess.run([sys.executable,
                            os.path.join(ROOT, "tools", test)]).returncode:
             raise AssertionError(f"tools/{test} failed")

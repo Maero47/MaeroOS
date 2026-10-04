@@ -459,8 +459,14 @@ static void read_resconf(struct resconf *c) {
 
 /* ── DNS messages ──────────────────────────────────────────────────────── */
 
+/* A DNS transaction id from the kernel's ChaCha20 generator: an off-path
+ * forger has to guess it (and the random source port).  The clock/pid LCG
+ * stays only as a fallback should getrandom fail. */
 static uint16_t next_id(void) {
     static uint32_t seed;
+    uint16_t id;
+    if (getrandom(&id, sizeof(id), 0) == (int)sizeof(id))
+        return id;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     seed = seed * 1103515245U + 12345U + (uint32_t)ts.tv_nsec +
@@ -812,16 +818,14 @@ static int dns_name(const struct resconf *c, const char *name, int family,
     unsigned char qa[300], q6[300], ra[DNS_BUFSZ], r6[DNS_BUFSZ];
     unsigned char *qs[2], *as[2];
     int qlens[2], alens[2], types[2], nq = 0;
-    uint16_t id = next_id();
-
     if (want_family(family, AF_INET)) {
-        qlens[nq] = build_query(name, C_IN, T_A, id, qa, sizeof(qa));
+        qlens[nq] = build_query(name, C_IN, T_A, next_id(), qa, sizeof(qa));
         qs[nq] = qa; as[nq] = ra; types[nq] = T_A;
         if (qlens[nq] < 0) return EAI_NONAME;
         nq++;
     }
     if (want_family(family, AF_INET6)) {
-        qlens[nq] = build_query(name, C_IN, T_AAAA, (uint16_t)(id + 1), q6, sizeof(q6));
+        qlens[nq] = build_query(name, C_IN, T_AAAA, next_id(), q6, sizeof(q6));
         qs[nq] = q6; as[nq] = r6; types[nq] = T_AAAA;
         if (qlens[nq] < 0) return EAI_NONAME;
         nq++;
