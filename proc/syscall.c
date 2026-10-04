@@ -8318,6 +8318,9 @@ static int sys_rename_kernel_path(const char *oldpath, const char *newpath) {
     int r = may_delete(src_dir, src);
     if (r < 0) return r;
     vfs_node_t *dst = vfs_finddir(dst_dir, new_base);
+    /* A mountpoint is neither moved nor replaced (Linux -EBUSY). */
+    if (vfs_is_mountpoint(src) || (dst && vfs_is_mountpoint(dst)))
+        return -16;                                      /* -EBUSY */
     if (dst) {
         r = may_delete(dst_dir, dst);
         if (r < 0) return r;

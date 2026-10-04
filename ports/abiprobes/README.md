@@ -73,6 +73,7 @@ regression tests for the fixes in audit section 5.
 | P53 | `p53_ext2_open_many.c`      | with 160 other files open (each unlinked), a written, open, unlinked ext2 file keeps its data while other files are written (the 128-slot open-inode table let the 129th go untracked and freed) | — |
 | P54 | `p54_dev_perms.c`           | as uid 65534: `/dev/null`, `zero`, `urandom`, `ptmx` open; `/dev/input/event*`, `fb0`, `dsp`, `snd/*` and disks are EACCES; root's `/dev/pts/N` is 0620 root-owned and EACCES, its own pty slave is its own (mode-0 device nodes used to be world read/write) | — |
 | P55 | `p55_path_search.c`         | as uid 65534, in /tmp and /disk: open/stat/readlink/create/chdir under a 0700 directory are EACCES (also two levels down and through a symlink); a 0711 directory is walked through and chdir'd into but not listed (the walk checked no search permission) | — |
+| P56 | `p56_mount_refs.c`          | a tmpfs bind mount whose source directory is removed still stats as an empty directory while 300 new directories are made (the table kept raw pointers, so the mount showed freed memory); rmdir/rename of a mountpoint and rename over one are EBUSY; umount works after | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the

@@ -128,6 +128,8 @@ PROBES = {
     # every directory of a path (tmpfs and ext2).
     "p54_dev_perms":           (60, ""),
     "p55_path_search":         (60, "/disk"),
+    # Mounts hold their mountpoint and root (bind source removed, EBUSY).
+    "p56_mount_refs":          (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.
