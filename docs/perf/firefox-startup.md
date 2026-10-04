@@ -856,3 +856,37 @@ same 6400 commands.
 
 ### Where it stands
 
+Launch to paint marker as `ff` measures it, KVM, 2 GiB, no NIC (`make
+smoke-firefox`), five boots each after one warm-up boot of a fresh image
+(the first boot after `make disk-ff` creates Firefox's `profiles.ini` on the
+ext2 disk and is ~0.5 s slower). "Before" is the base tree (`349821e`) with
+only the instrumentation above added to `ff`; the host was shared with other
+QEMU workers (load ~3.5), which is the spread in the before runs:
+
+| | before | after |
+|---|---|---|
+| `-smp 1` | 2565 ms median (2356 2375 2565 3447 3625) | **1715 ms** median (1655 1715 1715 1716 1775) |
+| `-smp 2` | 2301 ms median (2091 2212 2301 2415 2739) | **1596 ms** median (1475 1536 1596 1774 1776) |
+| `-smp 1`, `--web` (NIC attached) | 3224 ms median (3165 3224 3283) | **2256 ms** median (2165 2256 2285) |
+
+The "after" tree carries 26 MB of fonts that the "before" tree does not,
+and passes `smoke-firefox --fonts`. At the marker of a typical `-smp 1`
+run: `user` 658, `ata` 487, `pgfault` 406, syscalls 120, `irq` 19, `sched`
+12 ms, `idle` 0. Firefox's own timeline: `main` at 130 ms, the top-level
+window created at 790 ms, first paint at ~1680 ms.
+
+What is left, largest first:
+
+* **Firefox's own code**, 0.66 s, about 40 %. Nothing in its profile or
+  prefs moved it; the warm-cache experiment above was the best lead.
+* **The disk**, ~0.45 s, as fixed cost per IDE command. The same tree with
+  the disk on NVMe (`smoke_firefox.py --disk-if nvme`) paints in 1475-1566 ms
+  and on AHCI in 1596 ms (three boots each), because their commands take a
+  couple of MMIO exits instead of a dozen port I/Os; the reads then land in
+  `pgfault`. Real hardware has no exit cost, but the ATA read is still a
+  busy-poll with interrupts off: an interrupt-driven read that lets another
+  thread run meanwhile is the structural fix, and a larger change.
+* **Page faults**, ~0.4 s for ~62 k faults. `vma_find` is a linear walk
+  (70 ms, KTRACE probe), the rest is zeroing fresh frames (host first-touch
+  under KVM, 50-150 ms run to run) and copying 1 KiB blocks out of the ext2
+  cache. A last-hit VMA hint is the cheap next step.
