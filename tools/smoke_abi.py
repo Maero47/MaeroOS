@@ -127,6 +127,8 @@ PROBES = {
     "p70_scm_rights_budget":   (120, ""),
     "p71_unix_gc_backlog":     (60, ""),
     "p72_recvmsg_bad_control": (60, ""),
+    # netlink reply budgets, per-user socket slots, opener + sender privilege.
+    "p73_netlink_limits":      (120, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

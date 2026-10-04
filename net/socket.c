@@ -54,6 +54,12 @@ static int timed_out(uint32_t ms, uint32_t start) {
  * close.  Held in the slot they made the table 2.2 MiB of .bss at 32 entries,
  * and the kernel image must fit boot.asm's initial mapping (linker.ld). */
 #define MAX_NET_SOCKETS 128
+/* One user holding every slot made socket() fail for everyone, root
+ * included: a user may hold at most NET_SOCKETS_PER_USER, and the last
+ * NET_SOCKETS_ROOT_RESERVE free slots are root's only.  Accepted connections
+ * count against their listener's owner. */
+#define NET_SOCKETS_PER_USER     64
+#define NET_SOCKETS_ROOT_RESERVE 16
 #define UDP_QUEUE_DEPTH 4
 #define UDP_PACKET_MAX 1536
 #define TCP_RX_SIZE 65536   /* per-socket RX ring (burst headroom) */
@@ -82,6 +88,7 @@ typedef struct udp_packet {
 struct net_socket {
     int used;
     int refs;
+    uint32_t uid;       /* owner (creator's euid; a listener's for accepted) */
     int domain;
     int type;
     int protocol;
@@ -435,17 +442,35 @@ void net_sockets_init(void) {
     memset(sockets, 0, sizeof(sockets));
 }
 
-static net_socket_t *socket_free_slot(void) {
-    for (int i = 0; i < MAX_NET_SOCKETS; i++)
-        if (!sockets[i].used)
-            return &sockets[i];
-    printk("[NET] socket: all %d sockets in use\n", MAX_NET_SOCKETS);
-    return NULL;
+static uint32_t current_uid(void) {
+    return current_proc ? current_proc->euid : 0;
+}
+
+/* A free slot that `uid` may take (see NET_SOCKETS_PER_USER). */
+static net_socket_t *socket_free_slot(uint32_t uid) {
+    net_socket_t *slot = NULL;
+    int used = 0, mine = 0;
+    for (int i = 0; i < MAX_NET_SOCKETS; i++) {
+        if (!sockets[i].used) {
+            if (!slot) slot = &sockets[i];
+            continue;
+        }
+        used++;
+        if (sockets[i].uid == uid) mine++;
+    }
+    if (!slot) {
+        printk("[NET] socket: all %d sockets in use\n", MAX_NET_SOCKETS);
+        return NULL;
+    }
+    if (uid != 0 && (mine >= NET_SOCKETS_PER_USER ||
+                     MAX_NET_SOCKETS - used <= NET_SOCKETS_ROOT_RESERVE))
+        return NULL;
+    return slot;
 }
 
 static int xsocket_create_locked(int domain, int type, int protocol,
                                  net_socket_t **out) {
-    net_socket_t *s = socket_free_slot();
+    net_socket_t *s = socket_free_slot(current_uid());
     if (!s)
         return -24;
     const xsock_ops_t *ops = NULL;
@@ -463,6 +488,7 @@ static int xsocket_create_locked(int domain, int type, int protocol,
     s->domain = domain;
     s->type = type;
     s->protocol = protocol;
+    s->uid = current_uid();
     s->xops = ops;
     s->xs = x;
     *out = s;
@@ -488,7 +514,7 @@ static int socket_create_locked(int domain, int type, int protocol, net_socket_t
     if (type == SOCK_STREAM_K && protocol != 0 && protocol != IPPROTO_TCP_K)
         return -93;
 
-    net_socket_t *s = socket_free_slot();
+    net_socket_t *s = socket_free_slot(current_uid());
     if (!s)
         return -24;
 
@@ -523,6 +549,7 @@ static int socket_create_locked(int domain, int type, int protocol, net_socket_t
     s->type = type;
     s->protocol = protocol ? protocol :
                   (type == SOCK_DGRAM_K ? IPPROTO_UDP_K : IPPROTO_TCP_K);
+    s->uid = current_uid();
     s->udp = upcb;
     s->tcp = tpcb;
     if (s->udp) {
@@ -637,7 +664,7 @@ static err_t tcp_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err) {
         return ERR_VAL;
     if (ls->aq_count >= ACCEPTQ_MAX)
         return ERR_MEM;
-    net_socket_t *c = socket_free_slot();
+    net_socket_t *c = socket_free_slot(ls->uid);
     if (!c)
         return ERR_MEM;
     uint8_t *ring = (uint8_t *)kmalloc(TCP_RX_SIZE);
@@ -646,6 +673,7 @@ static err_t tcp_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err) {
     memset(c, 0, sizeof(*c));
     c->used = 1;
     c->refs = 1;
+    c->uid = ls->uid;
     c->domain = ls->domain;
     c->v6only = ls->v6only;
     c->linger_on = ls->linger_on;

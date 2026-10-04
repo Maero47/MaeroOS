@@ -73,6 +73,7 @@ regression tests for the fixes in audit section 5.
 | P70 | `p70_scm_rights_budget.c`  | a stream and a seqpacket socketpair flooded with unread 1-byte SCM_RIGHTS messages stop with EAGAIN (Linux: sk_sndbuf, ~280 messages) instead of queueing ~65,000 5 KiB batches; a blocked sender wakes when the reader drains; every fd arrives; writable again after | — |
 | P71 | `p71_unix_gc_backlog.c`    | a listener sent over a connection still in its own backlog and then closed is collected (the name can be bound again) | — |
 | P72 | `p72_recvmsg_bad_control.c` | recvmsg whose control buffer is read-only installs none of the passed fds (dropped, MSG_CTRUNC), data still returned | — |
+| P73 | `p73_netlink_limits.c`     | nobody holding as many netlink sockets as it can, 16 of them flooded with unread NOOP\|ACK replies, keeps at most 2 MiB queued, and root can still open AF_NETLINK/AF_INET sockets and get replies meanwhile; RTM_DELADDR through a socket nobody opened is EPERM even for root (opener and sender both need the privilege) | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the
