@@ -42,9 +42,14 @@ int wm_open_fifo(const char *name, int flags) {
     if (owner < 0) return -1;
     strcat(path, "/");
     strcat(path, name);
+    /* The owner from the name: fstat() of an open FIFO here reports the
+     * pipe, not the inode's owner.  Only the directory's owner can add or
+     * replace names in it (0700), so the name and the opened FIFO agree. */
+    if (lstat(path, &st) < 0 || !S_ISFIFO(st.st_mode) || (int)st.st_uid != owner)
+        return -1;
     fd = open(path, flags | O_NOFOLLOW);
     if (fd < 0) return -1;
-    if (fstat(fd, &st) < 0 || !S_ISFIFO(st.st_mode) || (int)st.st_uid != owner) {
+    if (fstat(fd, &st) < 0 || !S_ISFIFO(st.st_mode)) {
         close(fd);
         return -1;
     }
