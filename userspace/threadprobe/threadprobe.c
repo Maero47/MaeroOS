@@ -12,6 +12,7 @@
  *   3. getpid() is the group id in every thread; gettid() differs
  *   4. set_thread_area TLS: each thread sees its own %gs-based slot
  *   5. create/join recycles descriptors: more cycles than the table has slots
+ *   6. malloc/free from three threads at once: no block handed out twice
  */
 
 #define LOOPS 50000
@@ -44,6 +45,54 @@ static unsigned tls_read(void) {
  * sibling never sees it (write → EBADF) — that was the bug that mmap'd the
  * compositor's render buffer EBADF and blocked all painting. */
 static volatile int fd_go, fd_pub = -1, fd_result = -99;
+
+/* Three threads churn the heap: each keeps 16 live blocks filled with its
+ * own tag and checks the tag before freeing.  Without the allocator lock two
+ * threads take the same free block (or race the list append) and one sees
+ * the other's bytes. */
+#define HEAP_ROUNDS 20000
+static volatile int heap_bad;
+
+static void *heap_worker(void *arg) {
+    unsigned char tag = (unsigned char)(uintptr_t)arg;
+    unsigned char *live[16] = { 0 };
+    size_t len[16] = { 0 };
+    unsigned seed = tag * 2654435761u;
+
+    for (int i = 0; i < HEAP_ROUNDS && !heap_bad; i++) {
+        int k = i & 15;
+        if (live[k]) {
+            for (size_t j = 0; j < len[k]; j++)
+                if (live[k][j] != tag) { heap_bad = tag; break; }
+            free(live[k]);
+        }
+        seed = seed * 1103515245u + 12345u;
+        len[k] = 8 + (seed >> 16) % 249;
+        live[k] = malloc(len[k]);
+        if (!live[k]) { heap_bad = 100 + tag; break; }
+        memset(live[k], tag, len[k]);
+    }
+    for (int k = 0; k < 16; k++) free(live[k]);
+    return 0;
+}
+
+static int heap_race(void) {
+    pthread_t a, b;
+    if (pthread_create(&a, 0, heap_worker, (void *)1) != 0 ||
+        pthread_create(&b, 0, heap_worker, (void *)2) != 0) {
+        printf("threadprobe: heap: create failed\n");
+        return 1;
+    }
+    heap_worker((void *)3);
+    pthread_join(a, 0);
+    pthread_join(b, 0);
+    if (heap_bad) {
+        printf("threadprobe: heap: thread %d saw a block corrupted by another "
+               "(malloc not thread-safe)\n", heap_bad);
+        return 1;
+    }
+    return 0;
+}
 
 static void *fdworker(void *arg) {
     (void)arg;
@@ -183,6 +232,8 @@ int main(void) {
     }
 
     if (join_cycles() != 0)
+        return 1;
+    if (heap_race() != 0)
         return 1;
 
     printf("threadprobe ok\n");

@@ -12,6 +12,10 @@
 #include "../include/syscall.h"
 #include "../include/unistd.h"
 #include "../include/sys/uio.h"
+#include "../include/limits.h"
+#include "../include/netdb.h"
+#include "../include/arpa/inet.h"
+#include "../include/sys/socket.h"
 
 static int failures;
 
@@ -45,6 +49,60 @@ static void test_malloc(void) {
     for (int i = 0; p && i < 300; i++) if (p[i]) zero = 0;
     check(zero, "calloc(100, 3) returns zeroed memory");
     free(p);
+}
+
+/* C11 7.22.1.4 overflow behaviour, and the parsers built on it. */
+static void test_strtol(void) {
+    char *e;
+    errno = 0;
+    long l = strtol("99999999999", &e, 10);
+    check(l == LONG_MAX && errno == ERANGE && !*e, "strtol overflow: LONG_MAX, ERANGE");
+    errno = 0;
+    l = strtol("-99999999999", &e, 10);
+    check(l == LONG_MIN && errno == ERANGE, "strtol underflow: LONG_MIN, ERANGE");
+    errno = 0;
+    l = strtol("-2147483648", &e, 10);
+    check(l == LONG_MIN && errno == 0, "strtol(LONG_MIN) exact");
+    errno = 0;
+    unsigned long u = strtoul("4294967423", &e, 10);
+    check(u == ULONG_MAX && errno == ERANGE, "strtoul overflow: ULONG_MAX, ERANGE");
+    errno = 0;
+    u = strtoul("4294967295", &e, 10);
+    check(u == ULONG_MAX && errno == 0, "strtoul(ULONG_MAX) exact");
+    u = strtoul("-1", &e, 10);
+    check(u == ULONG_MAX, "strtoul(-1) is ULONG_MAX");
+    errno = 0;
+    unsigned long long ull = strtoull("-99999999999999999999", &e, 10);
+    check(ull == ULLONG_MAX && errno == ERANGE, "strtoull negative overflow: ULLONG_MAX");
+    l = strtol("0x", &e, 0);
+    check(l == 0 && *e == 'x', "strtol(\"0x\") parses the 0 only");
+    l = strtol("zz", &e, 10);
+    check(l == 0 && !strcmp(e, "zz"), "strtol with no digits: endp = s");
+
+    struct in_addr in;
+    check(!inet_aton("4294967423.0.0.1", &in), "inet_aton rejects a wrapped first part");
+    check(!inet_aton("4294967296", &in), "inet_aton rejects 2^32");
+    check(!inet_aton("1.2.3.4294967552", &in), "inet_aton rejects a wrapped last part");
+    check(inet_aton("127.1", &in) && in.s_addr == htonl(0x7F000001), "inet_aton(127.1)");
+    check(inet_aton("0x7f000001", &in) && in.s_addr == htonl(0x7F000001), "inet_aton(0x7f000001)");
+
+    struct addrinfo hints, *res = 0;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+    int r = getaddrinfo("4294967423.0.0.1", "80", &hints, &res);
+    check(r != 0, "getaddrinfo rejects 4294967423.0.0.1 as a numeric host");
+    if (!r) freeaddrinfo(res);
+    res = 0;
+    r = getaddrinfo("127.0.0.1", "4294967376", &hints, &res);
+    check(r != 0, "getaddrinfo rejects service 4294967376 (not port 80)");
+    if (!r) freeaddrinfo(res);
+    res = 0;
+    r = getaddrinfo("127.0.0.1", "80", &hints, &res);
+    check(r == 0 && res && ntohs(((struct sockaddr_in *)res->ai_addr)->sin_port) == 80,
+          "getaddrinfo(127.0.0.1, 80)");
+    if (!r) freeaddrinfo(res);
 }
 
 static void test_asprintf(void) {
@@ -404,6 +462,7 @@ int main(void) {
     test_rwv();
     test_snprintf();
     test_malloc();
+    test_strtol();
     test_asprintf();
     test_printf_ll();
     test_sscanf();

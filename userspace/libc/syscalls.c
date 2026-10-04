@@ -1,3 +1,4 @@
+#include "libc_lock.h"
 #include "../include/syscall.h"
 #include "../include/unistd.h"
 #include "../include/fcntl.h"
@@ -76,7 +77,15 @@ void *brk(void *addr) {
 }
 
 int fork(void) {
-    return __chkerr(syscall0(2));
+    /* Hold the heap and stdio locks across the fork (stdio first, the libc
+     * lock order): the child gets them free and its state consistent, not
+     * frozen mid-update by a thread that does not exist in the child. */
+    libc_lock(&__libc_stdio_lock);
+    libc_lock(&__libc_heap_lock);
+    int r = syscall0(2);
+    libc_unlock(&__libc_heap_lock);
+    libc_unlock(&__libc_stdio_lock);
+    return __chkerr(r);
 }
 
 void exit(int status) {

@@ -620,14 +620,16 @@ static int digit_val(int c) {
     return 99;
 }
 
-/* Shared by strtoll/strtoull: the magnitude, saturated at `limit`. */
-static unsigned long long strto_u64(const char *s, char **endp, int base,
-                                    int *neg, unsigned long long limit) {
+/* Shared by strtol/strtoul (stdlib.c) and strtoll/strtoull: the magnitude,
+ * saturated at `limit` with *over set (errno ERANGE) when it is larger. */
+unsigned long long __strto_u64(const char *s, char **endp, int base,
+                               int *neg, unsigned long long limit, int *over_out) {
     const char *p = s;
     unsigned long long v = 0;
     int any = 0, over = 0;
 
     *neg = 0;
+    *over_out = 0;
     while (*p == ' ' || (*p >= '\t' && *p <= '\r')) p++;
     if (*p == '-' || *p == '+') *neg = *p++ == '-';
     if ((base == 0 || base == 16) && p[0] == '0' && (p[1] == 'x' || p[1] == 'X')
@@ -643,20 +645,23 @@ static unsigned long long strto_u64(const char *s, char **endp, int base,
         else v = v * (unsigned)base + (unsigned)d;
     }
     if (endp) *endp = (char *)(any ? p : s);
-    if (over) { errno = ERANGE; return limit; }
+    if (over) { errno = ERANGE; *over_out = 1; return limit; }
     return v;
 }
 
 long long strtoll(const char *s, char **endp, int base) {
-    int neg;
-    unsigned long long v = strto_u64(s, endp, base, &neg, (unsigned long long)LLONG_MAX + 1);
+    int neg, over;
+    unsigned long long v = __strto_u64(s, endp, base, &neg,
+                                       (unsigned long long)LLONG_MAX + 1, &over);
+    if (over) return neg ? LLONG_MIN : LLONG_MAX;
     if (!neg && v > (unsigned long long)LLONG_MAX) { errno = ERANGE; return LLONG_MAX; }
     return neg ? (long long)(0ULL - v) : (long long)v;
 }
 
 unsigned long long strtoull(const char *s, char **endp, int base) {
-    int neg;
-    unsigned long long v = strto_u64(s, endp, base, &neg, ULLONG_MAX);
+    int neg, over;
+    unsigned long long v = __strto_u64(s, endp, base, &neg, ULLONG_MAX, &over);
+    if (over) return ULLONG_MAX;              /* C: even for a negative value */
     return neg ? 0ULL - v : v;
 }
 

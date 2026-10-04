@@ -120,7 +120,7 @@ static char *next_tok(char **p) {
 
 /* inet_aton: a, a.b, a.b.c or a.b.c.d, each part decimal, 0x hex or 0 octal. */
 int inet_aton(const char *s, struct in_addr *out) {
-    unsigned long parts[4];
+    unsigned long long parts[4];
     int n = 0;
     const char *p = s;
 
@@ -128,7 +128,9 @@ int inet_aton(const char *s, struct in_addr *out) {
     for (;;) {
         char *end;
         if (*p < '0' || *p > '9') return 0;
-        parts[n] = strtoul(p, &end, 0);
+        /* 64-bit and saturating: a part past 2^32 must fail the range
+         * checks below, not wrap into them ("4294967423.0.0.1"). */
+        parts[n] = strtoull(p, &end, 0);
         if (end == p) return 0;
         n++;
         p = end;
@@ -142,7 +144,10 @@ int inet_aton(const char *s, struct in_addr *out) {
     }
     uint32_t v;
     switch (n) {
-    case 1: v = (uint32_t)parts[0]; break;
+    case 1:
+        if (parts[0] > 0xFFFFFFFFULL) return 0;
+        v = (uint32_t)parts[0];
+        break;
     case 2:
         if (parts[0] > 255 || parts[1] > 0xFFFFFFUL) return 0;
         v = (uint32_t)(parts[0] << 24 | parts[1]);
@@ -410,7 +415,12 @@ static void read_resconf(struct resconf *c) {
                     char *rb = strchr(v, ']');
                     if (!rb) continue;
                     *rb = 0;
-                    if (rb[1] == ':') port = atoi(rb + 2);
+                    if (rb[1] == ':') {
+                        char *pe;
+                        unsigned long long pv = strtoull(rb + 2, &pe, 10);
+                        port = (rb[2] >= '0' && rb[2] <= '9' && !*pe && pv <= 65535)
+                               ? (int)pv : -1;
+                    }
                     v++;
                 }
                 unsigned char a4[4];
@@ -459,13 +469,36 @@ static void read_resconf(struct resconf *c) {
 
 /* ── DNS messages ──────────────────────────────────────────────────────── */
 
-static uint16_t next_id(void) {
+/* Unpredictable bits for query IDs and source ports: an off-path attacker
+ * who can guess both forges answers (Kaminsky).  getrandom() is the kernel's
+ * generator; the clock/pid mix is only a fallback if it ever fails. */
+static uint32_t dns_random(void) {
     static uint32_t seed;
+    uint32_t r;
+    if (getrandom(&r, sizeof(r), 0) == (int)sizeof(r)) return r;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     seed = seed * 1103515245U + 12345U + (uint32_t)ts.tv_nsec +
            ((uint32_t)getpid() << 16);
-    return (uint16_t)(seed >> 8);
+    return seed >> 8;
+}
+
+static uint16_t next_id(void) { return (uint16_t)dns_random(); }
+
+/* A UDP socket bound to a random port in 49152-65535 (the IANA dynamic
+ * range), so the source port adds ~14 bits an attacker must guess too.  If
+ * no port is free after a few tries, the kernel picks one. */
+static int dns_socket(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    for (int i = 0; i < 8; i++) {
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons((uint16_t)(49152 + dns_random() % 16384));
+        if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) break;
+    }
+    return fd;
 }
 
 /* Encode `name` (dotted, optional trailing dot) as DNS labels.  Returns the
@@ -619,7 +652,7 @@ static int parse_reply(const unsigned char *m, int len, int qtype,
 static int exchange(const struct resconf *c, unsigned char *const *qs,
                     const int *qlens, int nq, unsigned char *const *ans,
                     int *alens, int anscap) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    int fd = dns_socket();
     if (fd < 0) return -1;
     int final[4] = { 0, 0, 0, 0 };
     for (int i = 0; i < nq; i++) alens[i] = 0;
@@ -812,16 +845,14 @@ static int dns_name(const struct resconf *c, const char *name, int family,
     unsigned char qa[300], q6[300], ra[DNS_BUFSZ], r6[DNS_BUFSZ];
     unsigned char *qs[2], *as[2];
     int qlens[2], alens[2], types[2], nq = 0;
-    uint16_t id = next_id();
-
     if (want_family(family, AF_INET)) {
-        qlens[nq] = build_query(name, C_IN, T_A, id, qa, sizeof(qa));
+        qlens[nq] = build_query(name, C_IN, T_A, next_id(), qa, sizeof(qa));
         qs[nq] = qa; as[nq] = ra; types[nq] = T_A;
         if (qlens[nq] < 0) return EAI_NONAME;
         nq++;
     }
     if (want_family(family, AF_INET6)) {
-        qlens[nq] = build_query(name, C_IN, T_AAAA, (uint16_t)(id + 1), q6, sizeof(q6));
+        qlens[nq] = build_query(name, C_IN, T_AAAA, next_id(), q6, sizeof(q6));
         qs[nq] = q6; as[nq] = r6; types[nq] = T_AAAA;
         if (qlens[nq] < 0) return EAI_NONAME;
         nq++;
@@ -974,8 +1005,10 @@ static int parse_service(const char *service, int socktype, int flags,
     *port = 0;
     if (!service) return 0;
     char *end;
-    unsigned long v = strtoul(service, &end, 10);
-    if (*service && !*end) {
+    /* Plain decimal digits only (no sign or blanks), range-checked before
+     * any wrap: "4294967376" is not port 80. */
+    unsigned long long v = strtoull(service, &end, 10);
+    if (*service >= '0' && *service <= '9' && !*end) {
         if (v > 65535) return EAI_SERVICE;
         *port = (int)v;
         return 0;

@@ -1,3 +1,4 @@
+#include "libc_lock.h"
 #include "../include/stdio.h"
 #include "../include/unistd.h"
 #include "../include/string.h"
@@ -46,6 +47,13 @@ FILE *stderr = &_stderr_s;
  * write marks the stream in error and returns EOF so callers (fclose, fwrite,
  * fflush) can report it — silently dropping it lets a writer replace a file
  * with a truncated copy and believe it succeeded. */
+/* Every FILE's buffers and the stdout/stderr order are guarded by one lock:
+ * two threads printing at once must not both advance wpos past the buffer.
+ * Public entry points take it; the _unlocked helpers expect it held. */
+volatile int __libc_stdio_lock;
+#define STDIO_LOCK()   libc_lock(&__libc_stdio_lock)
+#define STDIO_UNLOCK() libc_unlock(&__libc_stdio_lock)
+
 static int _fflush_unlocked(FILE *f) {
     int off = 0;
     while (off < f->wpos) {
@@ -109,27 +117,43 @@ FILE *fdopen(int fd, const char *mode) {
 
 int fclose(FILE *f) {
     if (!f) return EOF;
+    STDIO_LOCK();
     int r = _fflush_unlocked(f);
     if (f->error && f->mode != FILE_RDONLY) r = EOF;   /* an earlier write failed */
     if (close(f->fd) < 0) r = EOF;
+    STDIO_UNLOCK();
     if (f != stdin && f != stdout && f != stderr)
         free(f);
     return r;
 }
 
 int fflush(FILE *f) {
+    int r;
+    STDIO_LOCK();
     if (!f) {
         /* fflush(NULL): only the standard streams are tracked. */
-        int r = _fflush_unlocked(stdout);
+        r = _fflush_unlocked(stdout);
         if (_fflush_unlocked(stderr)) r = EOF;
-        return r;
+    } else {
+        r = _fflush_unlocked(f);
     }
-    return _fflush_unlocked(f);
+    STDIO_UNLOCK();
+    return r;
 }
 
 /* ── fread / fwrite ──────────────────────────────────────────────────────────── */
 
+static size_t _fwrite_unlocked(const void *ptr, size_t sz, size_t n, FILE *f);
+
 size_t fwrite(const void *ptr, size_t sz, size_t n, FILE *f) {
+    if (!f) return 0;
+    STDIO_LOCK();
+    size_t r = _fwrite_unlocked(ptr, sz, n, f);
+    STDIO_UNLOCK();
+    return r;
+}
+
+static size_t _fwrite_unlocked(const void *ptr, size_t sz, size_t n, FILE *f) {
     if (!f || f->error || !sz || !n) return 0;
     if (n > (size_t)-1 / sz) { f->error = 1; return 0; }
     size_t total = sz * n;
@@ -146,7 +170,17 @@ size_t fwrite(const void *ptr, size_t sz, size_t n, FILE *f) {
     return n;
 }
 
+static size_t _fread_unlocked(void *ptr, size_t sz, size_t n, FILE *f);
+
 size_t fread(void *ptr, size_t sz, size_t n, FILE *f) {
+    if (!f) return 0;
+    STDIO_LOCK();
+    size_t r = _fread_unlocked(ptr, sz, n, f);
+    STDIO_UNLOCK();
+    return r;
+}
+
+static size_t _fread_unlocked(void *ptr, size_t sz, size_t n, FILE *f) {
     if (!f || f->error || f->eof) return 0;
     size_t total = sz * n;
     if (!total) return 0;
@@ -176,16 +210,23 @@ size_t fread(void *ptr, size_t sz, size_t n, FILE *f) {
 /* ── fputc / fgetc ───────────────────────────────────────────────────────────── */
 
 int fputc(int c, FILE *f) {
-    if (!f || f->error) return EOF;
-    char ch = (char)c;
-    f->wbuf[f->wpos++] = ch;
-    if ((f->wpos == FILE_BUFSZ || ch == '\n') && _fflush_unlocked(f))
-        return EOF;
-    return (unsigned char)c;
+    if (!f) return EOF;
+    STDIO_LOCK();
+    int r = (unsigned char)c;
+    if (f->error) {
+        r = EOF;
+    } else {
+        char ch = (char)c;
+        f->wbuf[f->wpos++] = ch;
+        if ((f->wpos == FILE_BUFSZ || ch == '\n') && _fflush_unlocked(f))
+            r = EOF;
+    }
+    STDIO_UNLOCK();
+    return r;
 }
 
-int fgetc(FILE *f) {
-    if (!f || f->error || f->eof) return EOF;
+static int _fgetc_unlocked(FILE *f) {
+    if (f->error || f->eof) return EOF;
     if (f->unget >= 0) { int c = f->unget; f->unget = -1; return c; }
     if (f->rpos >= f->rlen) {
         int r = read(f->fd, f->rbuf, FILE_BUFSZ);
@@ -195,10 +236,20 @@ int fgetc(FILE *f) {
     return (unsigned char)f->rbuf[f->rpos++];
 }
 
+int fgetc(FILE *f) {
+    if (!f) return EOF;
+    STDIO_LOCK();
+    int c = _fgetc_unlocked(f);
+    STDIO_UNLOCK();
+    return c;
+}
+
 int ungetc(int c, FILE *f) {
     if (!f || c == EOF) return EOF;
+    STDIO_LOCK();
     f->unget = (unsigned char)c;
     f->eof   = 0;
+    STDIO_UNLOCK();
     return c;
 }
 
@@ -226,11 +277,14 @@ char *fgets(char *buf, int size, FILE *f) {
 
 int fseek(FILE *f, long offset, int whence) {
     if (!f) return -1;
+    STDIO_LOCK();
     _fflush_unlocked(f);
     f->rpos = f->rlen = 0;
     f->unget = -1;
     f->eof   = 0;
-    return lseek(f->fd, (int)offset, whence) < 0 ? -1 : 0;
+    int r = lseek(f->fd, (int)offset, whence) < 0 ? -1 : 0;
+    STDIO_UNLOCK();
+    return r;
 }
 
 long ftell(FILE *f) {
@@ -579,6 +633,7 @@ int vprintf(const char *fmt, va_list ap) {
     int off = 0;
     /* printf writes at once, but whatever putchar/fputs left in stdout's
      * buffer has to go out first to keep the order. */
+    STDIO_LOCK();
     _fflush_unlocked(stdout);
     while (off < n) {
         int w = write(1, out + off, n - off);
@@ -586,6 +641,7 @@ int vprintf(const char *fmt, va_list ap) {
         if (w <= 0) { n = -1; break; }
         off += w;
     }
+    STDIO_UNLOCK();
     if (out != buf) free(out);
     return n;
 }

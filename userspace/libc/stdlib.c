@@ -2,6 +2,8 @@
 #include "../include/unistd.h"
 #include "../include/string.h"
 #include "../include/errno.h"
+#include "../include/limits.h"
+#include "libc_lock.h"
 
 /* environ is defined in crt0.asm as a .bss word, exported as a global symbol */
 extern char **environ;
@@ -26,7 +28,20 @@ typedef struct blk {
 
 static blk_t *heap_head = (void *)0;
 
+/* The free list and the break are shared by every thread (browse, store and
+ * linuxapps allocate from workers): each operation holds this lock. */
+volatile int __libc_heap_lock;
+
+static void *malloc_locked(size_t size);
+
 void *malloc(size_t size) {
+    libc_lock(&__libc_heap_lock);
+    void *p = malloc_locked(size);
+    libc_unlock(&__libc_heap_lock);
+    return p;
+}
+
+static void *malloc_locked(size_t size) {
     if (!size) return (void *)0;
 
     /* sbrk() takes an int: anything that cannot be aligned and given a header
@@ -68,7 +83,9 @@ void *malloc(size_t size) {
 void free(void *ptr) {
     if (!ptr) return;
     blk_t *b = (blk_t *)((char *)ptr - sizeof(blk_t));
+    libc_lock(&__libc_heap_lock);
     b->free = 1;
+    libc_unlock(&__libc_heap_lock);
 }
 
 char *getenv(const char *name) {
@@ -90,32 +107,27 @@ int atoi(const char *s) {
     return neg ? -n : n;
 }
 
+/* posix.c: the digits of s as a magnitude, saturated at limit (*over). */
+unsigned long long __strto_u64(const char *s, char **endp, int base,
+                               int *neg, unsigned long long limit, int *over);
+
+/* C11 7.22.1.4: out of range gives LONG_MAX / LONG_MIN / ULONG_MAX and
+ * errno ERANGE (callers such as inet_aton range-check the result, which a
+ * wrapped value would pass). */
 long strtol(const char *s, char **endp, int base) {
-    long n = 0; int neg = 0;
-    while (*s == ' ' || *s == '\t') s++;
-    if (*s == '-') { neg = 1; s++; }
-    else if (*s == '+') s++;
-    if (base == 0) {
-        if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { base = 16; s += 2; }
-        else if (s[0] == '0') { base = 8; s++; }
-        else base = 10;
-    } else if (base == 16 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
-    while (*s) {
-        int d;
-        if (*s >= '0' && *s <= '9') d = *s - '0';
-        else if (*s >= 'a' && *s <= 'z') d = *s - 'a' + 10;
-        else if (*s >= 'A' && *s <= 'Z') d = *s - 'A' + 10;
-        else break;
-        if (d >= base) break;
-        n = n * base + d;
-        s++;
-    }
-    if (endp) *endp = (char *)s;
-    return neg ? -n : n;
+    int neg, over;
+    unsigned long long v = __strto_u64(s, endp, base, &neg,
+                                       (unsigned long long)LONG_MAX + 1, &over);
+    if (over) return neg ? LONG_MIN : LONG_MAX;
+    if (!neg && v > (unsigned long long)LONG_MAX) { errno = ERANGE; return LONG_MAX; }
+    return neg ? (long)(0UL - (unsigned long)v) : (long)v;
 }
 
 unsigned long strtoul(const char *s, char **endp, int base) {
-    return (unsigned long)strtol(s, endp, base);
+    int neg, over;
+    unsigned long long v = __strto_u64(s, endp, base, &neg, ULONG_MAX, &over);
+    if (over) return ULONG_MAX;
+    return neg ? 0UL - (unsigned long)v : (unsigned long)v;
 }
 
 long atol(const char *s) { return strtol(s, (char **)0, 10); }
