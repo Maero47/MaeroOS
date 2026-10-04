@@ -105,13 +105,18 @@ static uint64_t cpu_run_t0(uint32_t c) {
     }
 }
 
-/* Only the CPU itself writes its run_t0. */
+/* Only the CPU itself writes its run_t0, with interrupts off: a tick landing
+ * between the two increments would read this CPU's own run_t0 in
+ * scheduler_tick and wait forever for the count to turn even. */
 static void sched_set_run_t0(struct cpu *me, uint64_t t0) {
+    uint32_t fl;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
     me->run_seq++;
     __sync_synchronize();
     me->run_t0 = t0;
     __sync_synchronize();
     me->run_seq++;
+    if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
 }
 
 /* The vruntime a running thread has now, including its current stint. */

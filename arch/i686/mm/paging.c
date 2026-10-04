@@ -1014,13 +1014,18 @@ static void page_fault_handler(registers_t *regs) {
  * it under the others. */
 #define PGDIR_SHARES (MAX_PROCS / 2 + 1)
 static struct { uint32_t phys; int count; } pgdir_shares[PGDIR_SHARES];
+/* The table is searched and updated as a whole, so one irqsave leaf lock
+ * guards it (stage 2d) rather than per-entry atomics. */
+static kspinlock_t pgdir_shares_lock = KSPINLOCK_INIT("pgdir_shares");
 
 void pgdir_retain(uint32_t pgdir_phys) {
     int free_slot = -1;
+    uint32_t fl = kspin_lock_irqsave(&pgdir_shares_lock);
 
     for (int i = 0; i < PGDIR_SHARES; i++) {
         if (pgdir_shares[i].phys == pgdir_phys && pgdir_shares[i].count > 0) {
             pgdir_shares[i].count++;
+            kspin_unlock_irqrestore(&pgdir_shares_lock, fl);
             return;
         }
         if (free_slot < 0 && pgdir_shares[i].count == 0)
@@ -1033,9 +1038,11 @@ void pgdir_retain(uint32_t pgdir_phys) {
     /* First share: the original owner + the new user. */
     pgdir_shares[free_slot].phys = pgdir_phys;
     pgdir_shares[free_slot].count = 2;
+    kspin_unlock_irqrestore(&pgdir_shares_lock, fl);
 }
 
 int pgdir_release(uint32_t pgdir_phys) {
+    uint32_t fl = kspin_lock_irqsave(&pgdir_shares_lock);
     for (int i = 0; i < PGDIR_SHARES; i++) {
         if (pgdir_shares[i].phys == pgdir_phys && pgdir_shares[i].count > 0) {
             if (--pgdir_shares[i].count <= 1) {
@@ -1044,9 +1051,11 @@ int pgdir_release(uint32_t pgdir_phys) {
                 pgdir_shares[i].count = 0;
                 pgdir_shares[i].phys = 0;
             }
+            kspin_unlock_irqrestore(&pgdir_shares_lock, fl);
             return 1;   /* still referenced by someone */
         }
     }
+    kspin_unlock_irqrestore(&pgdir_shares_lock, fl);
     return 0;           /* unshared: caller frees */
 }
 

@@ -1,3 +1,4 @@
+#include <kernel/refcount.h>
 #include "signal.h"
 #include "process.h"
 #include "scheduler.h"
@@ -78,7 +79,7 @@ struct sighand *sighand_copy(struct sighand *src) {
 
 void sighand_put(struct sighand *sh) {
     if (!sh) return;
-    if (--sh->refcount > 0) return;
+    if (!ref_put(&sh->refcount)) return;
     kfree(sh);
 }
 
@@ -94,7 +95,7 @@ struct sigshared *sigshared_alloc(void) {
 
 void sigshared_put(struct sigshared *ss) {
     if (!ss) return;
-    if (--ss->refcount > 0) return;
+    if (!ref_put(&ss->refcount)) return;
     kfree(ss);
 }
 

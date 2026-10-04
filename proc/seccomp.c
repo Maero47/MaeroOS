@@ -27,6 +27,7 @@
  *
  * Written from the documentation and the uapi definitions; no Linux code.
  */
+#include <kernel/refcount.h>
 #include "seccomp.h"
 #include "process.h"
 #include "signal.h"
@@ -261,7 +262,7 @@ static int32_t action_rank(uint32_t ret) {
 /* ── filter chains ───────────────────────────────────────────────────────── */
 
 static void filter_put(struct seccomp_filter *f) {
-    while (f && --f->refcount == 0) {
+    while (f && ref_put(&f->refcount)) {
         struct seccomp_filter *prev = f->prev;
         kfree(f);
         f = prev;
@@ -278,7 +279,7 @@ void seccomp_fork(struct proc *child, struct proc *parent) {
     child->no_new_privs   = parent->no_new_privs;
     child->seccomp_mode   = parent->seccomp_mode;
     child->seccomp_filter = parent->seccomp_filter;
-    if (child->seccomp_filter) child->seccomp_filter->refcount++;
+    if (child->seccomp_filter) ref_get(&child->seccomp_filter->refcount);
 }
 
 void seccomp_release(struct proc *p) {
@@ -385,7 +386,7 @@ static int set_mode_filter(uint32_t flags, uint32_t uprog) {
             if (q == p || q->tgid != p->tgid) continue;
             if (q->state == PROC_UNUSED || q->state == PROC_ZOMBIE) continue;
             struct seccomp_filter *old = q->seccomp_filter;
-            f->refcount++;
+            ref_get(&f->refcount);
             q->seccomp_filter = f;
             filter_put(old);
             if (p->no_new_privs) q->no_new_privs = 1;

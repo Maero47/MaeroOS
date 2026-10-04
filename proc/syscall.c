@@ -1,3 +1,4 @@
+#include <kernel/refcount.h>
 #include "syscall.h"
 #include "scheduler.h"
 #include "process.h"
@@ -741,12 +742,18 @@ void vma_clone(struct proc *parent, struct proc *child);
 struct eventfd_obj {
     uint64_t count;
     int      flags;       /* EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC */
-    int      refcount;
+    int      refcount;    /* atomic (stage 2d) */
+    /* Guards count; the wait-queue lock of the counter (it is the channel):
+     * waiters test under it and sleep with sleep_locked, changes wake under
+     * it (docs/smp-plan.md stage 2a). */
+    kspinlock_t lock;
 };
+
+static void eventfd_get(struct eventfd_obj *e) { ref_get(&e->refcount); }
 
 static void eventfd_release(struct eventfd_obj *e) {
     if (!e) return;
-    if (--e->refcount <= 0) kfree(e);
+    if (ref_put(&e->refcount)) kfree(e);
 }
 
 /* read/write hold a reference across the sleep: a thread sharing the fd
@@ -755,13 +762,13 @@ static void eventfd_release(struct eventfd_obj *e) {
 static int eventfd_read_held(struct eventfd_obj *e, char *buf, int len, int nonblock);
 static int eventfd_write_held(struct eventfd_obj *e, const char *buf, int len, int nonblock);
 static int eventfd_read(struct eventfd_obj *e, char *buf, int len, int nonblock) {
-    e->refcount++;
+    eventfd_get(e);
     int r = eventfd_read_held(e, buf, len, nonblock);
     eventfd_release(e);
     return r;
 }
 static int eventfd_write(struct eventfd_obj *e, const char *buf, int len, int nonblock) {
-    e->refcount++;
+    eventfd_get(e);
     int r = eventfd_write_held(e, buf, len, nonblock);
     eventfd_release(e);
     return r;
@@ -769,17 +776,27 @@ static int eventfd_write(struct eventfd_obj *e, const char *buf, int len, int no
 
 static int eventfd_read_held(struct eventfd_obj *e, char *buf, int len, int nonblock) {
     if (len < 8) return -22;                       /* -EINVAL */
+    uint32_t fl = kspin_lock_irqsave(&e->lock);
     while (e->count == 0) {
-        if (nonblock) return -11;                  /* -EAGAIN */
-        if (signal_interrupt_pending(current_proc)) return -4;  /* -EINTR */
-        sleep_on(e);
+        int err = nonblock ? -11                   /* -EAGAIN */
+                : signal_interrupt_pending(current_proc) ? -4 : 0;   /* -EINTR */
+        if (err) { kspin_unlock_irqrestore(&e->lock, fl); return err; }
+        sleep_locked(e, &e->lock);
     }
-    /* Copy the value out before consuming it: buf is a user pointer, and a
-     * bad one must fail with -EFAULT and leave the counter as it was. */
+    /* Consumed under the lock, copied out after it (the copy can fault and
+     * sleep).  buf is a user pointer: a bad one fails with -EFAULT and puts
+     * the value back, so the counter ends as it was. */
     uint64_t out = (e->flags & EFD_SEMAPHORE) ? 1 : e->count;
-    if (copy_to_user(buf, &out, 8) < 0) return -14;
     e->count -= out;
     wake_up(e);                                    /* wake blocked writers */
+    kspin_unlock_irqrestore(&e->lock, fl);
+    if (copy_to_user(buf, &out, 8) < 0) {
+        fl = kspin_lock_irqsave(&e->lock);
+        e->count += out;
+        wake_up(e);                                /* readable again */
+        kspin_unlock_irqrestore(&e->lock, fl);
+        return -14;
+    }
     io_wake_poll();                                /* wake pollers (space avail) */
     return 8;
 }
@@ -790,14 +807,17 @@ static int eventfd_write_held(struct eventfd_obj *e, const char *buf, int len, i
     if (copy_from_user(&add, buf, 8) < 0) return -14;
     if (add == 0xFFFFFFFFFFFFFFFFULL) return -22;   /* -EINVAL: ~0 is reserved */
     /* Block while the add would push the counter past its max (0xFFFF…FFFE). */
+    uint32_t fl = kspin_lock_irqsave(&e->lock);
     while (e->count + add < e->count ||
            e->count + add > 0xFFFFFFFFFFFFFFFEULL) {
-        if (nonblock) return -11;                   /* -EAGAIN */
-        if (signal_interrupt_pending(current_proc)) return -4;  /* -EINTR */
-        sleep_on(e);
+        int err = nonblock ? -11                    /* -EAGAIN */
+                : signal_interrupt_pending(current_proc) ? -4 : 0;   /* -EINTR */
+        if (err) { kspin_unlock_irqrestore(&e->lock, fl); return err; }
+        sleep_locked(e, &e->lock);
     }
     e->count += add;
     wake_up(e);                                     /* wake blocked readers */
+    kspin_unlock_irqrestore(&e->lock, fl);
     io_wake_poll();                                 /* wake pollers (now readable) */
     return 8;
 }
@@ -809,6 +829,7 @@ static int sys_eventfd(unsigned int initval, int flags) {
     e->count    = initval;
     e->flags    = flags;
     e->refcount = 1;
+    kspin_init(&e->lock, "eventfd");
     int fd = -1;
     for (int i = 0; i < MAX_FD; i++) {
         if (current_proc->ofile[i].type == FD_NONE) { fd = i; break; }
@@ -897,7 +918,7 @@ void fd_retain(proc_file_t *f) {
     if (f->type == FD_SOCKET)  net_socket_retain(f->socket);
     if (f->type == FD_USOCKET) usocket_retain(f->usock);
     if (f->type == FD_EPOLL)   epoll_retain(f->epoll);
-    if (f->type == FD_EVENTFD) f->efd->refcount++;
+    if (f->type == FD_EVENTFD) eventfd_get(f->efd);
 }
 
 void fd_release(proc_file_t *f) {
@@ -953,7 +974,7 @@ void fdtable_put(struct proc *p) {
     p->fdt = (struct fdtable *)0;
     p->ofile = (proc_file_t *)0;
     if (!t) return;
-    if (--t->refcount > 0) return;       /* other threads still share it */
+    if (!ref_put(&t->refcount)) return;  /* other threads still share it */
     flock_owner_gone(t);                 /* its POSIX record locks */
     for (int i = 0; i < MAX_FD; i++)
         if (t->f[i].type != FD_NONE) fd_release(&t->f[i]);
@@ -2527,7 +2548,7 @@ static int sys_exec(registers_t *regs) {
      * with other tasks (CLONE_SIGHAND without CLONE_THREAD), unshare it first
      * as a private copy (Linux unshare_sighand) so their dispositions are
      * untouched and our SIG_IGN entries carry over. */
-    if (current_proc->sighand && current_proc->sighand->refcount > 1) {
+    if (current_proc->sighand && ref_read(&current_proc->sighand->refcount) > 1) {
         struct sighand *fresh = sighand_copy(current_proc->sighand);
         if (fresh) {
             sighand_put(current_proc->sighand);
@@ -6534,11 +6555,11 @@ struct epoll {
 };
 
 static void epoll_retain(struct epoll *ep) {
-    if (ep) ep->refcount++;
+    if (ep) ref_get(&ep->refcount);
 }
 static void epoll_release(struct epoll *ep) {
     if (!ep) return;
-    if (--ep->refcount <= 0) kfree(ep);
+    if (ref_put(&ep->refcount)) kfree(ep);
 }
 
 /* Does item i still watch the open file it was added for, in the caller's
@@ -8216,9 +8237,47 @@ static uint32_t futex_resolve_phys(uint32_t uaddr) {
  * content-process launch).  Mirrors Linux get_futex_key: (mm,addr) private / phys
  * shared.  Wakes up to n waiters, OLDEST sleep_seq first (per-key FIFO, preserving
  * glibc's happens-before condvar ordering). */
+/* Futex hash buckets (docs/smp-plan.md stage 2a; Linux futex_hash_bucket).
+ * A waiter re-reads the futex word under its key's bucket lock and sleeps
+ * with sleep_locked on it; a waker scans and wakes under the same lock.  So
+ * a FUTEX_WAKE that follows the user's store either sees the waiter asleep
+ * or ran before the waiter's read, which then sees the new value: the wake
+ * cannot fall between "value still matches" and "asleep".  The waiter list
+ * itself is still the ptable scan, under the BKL. */
+#define FUTEX_BUCKETS 64
+static kspinlock_t futex_bucket[FUTEX_BUCKETS];
+static int futex_buckets_ready;
+
+static kspinlock_t *futex_bucket_of(uint32_t uaddr, int is_private, uint32_t phys, int tgid) {
+    if (!futex_buckets_ready) {
+        for (int i = 0; i < FUTEX_BUCKETS; i++) kspin_init(&futex_bucket[i], "futex_bucket");
+        futex_buckets_ready = 1;
+    }
+    uint32_t k = is_private ? (uaddr >> 2) ^ ((uint32_t)tgid * 0x9E3779B1U) : phys;
+    k ^= k >> 16;
+    k *= 0x85EBCA6BU;
+    k ^= k >> 13;
+    return &futex_bucket[k % FUTEX_BUCKETS];
+}
+
+/* Read the futex word at uaddr without faulting (a bucket lock is held, so
+ * nothing may sleep): 1 and *val if both ends of it are present, 0 if the
+ * caller has to fault the page in first. */
+static int futex_read_nofault(uint32_t uaddr, uint32_t *val) {
+    if (uaddr >= 0xBFFFFFFCU) return 0;
+    uint32_t a = uaddr & ~0xFFFU, b = (uaddr + 3) & ~0xFFFU;
+    if (!pde_present(a) || !(pte_get(a) & PAGE_PRESENT) || !(pte_get(a) & PAGE_USER)) return 0;
+    if (b != a && (!pde_present(b) || !(pte_get(b) & PAGE_PRESENT) || !(pte_get(b) & PAGE_USER)))
+        return 0;
+    *val = *(volatile uint32_t *)(uintptr_t)uaddr;
+    return 1;
+}
+
 static int futex_wake_n(uint32_t uaddr, int is_private, uint32_t phys,
                         int tgid, int n) {
     if (n <= 0) return 0;
+    kspinlock_t *hb = futex_bucket_of(uaddr, is_private, phys, tgid);
+    uint32_t hfl = kspin_lock_irqsave(hb);
     /* A waiter matches this wake iff it is a futex waiter on the same key. */
     #define FUTEX_MATCH(p)                                                     \
         ((p)->state == PROC_SLEEPING && (p)->futex_wait &&                     \
@@ -8256,6 +8315,7 @@ static int futex_wake_n(uint32_t uaddr, int is_private, uint32_t phys,
         }
     }
     #undef FUTEX_MATCH
+    kspin_unlock_irqrestore(hb, hfl);
     return woken;
 }
 
@@ -8281,7 +8341,7 @@ static int sys_futex(registers_t *regs, int time64) {
         uint32_t cur = 0;
         int cr = copy_from_user(&cur, uaddr, sizeof(cur));
         if (cr < 0) return cr;
-        if (cur != val) return -11;  /* -EAGAIN */
+        if (cur != val) return -11;  /* -EAGAIN (checked again under the bucket lock) */
 
         if (utmo) {
             int64_t tsec = 0; int32_t tnsec = 0;
@@ -8321,21 +8381,42 @@ static int sys_futex(registers_t *regs, int time64) {
             }
             current_proc->wake_tick = deadline_wake_tick(&dl);
         }
-        current_proc->futex_wait = 1;
         /* Address-space-scoped futex key (mirrors Linux get_futex_key): private
          * futexes match by (tgid, uaddr); shared by physical page.  A shared futex
          * whose page can't be resolved falls back to private-by-(tgid,uaddr) so we
          * never drop the waiter.  THIS is what stops a private condvar signal in
-         * one process from being mis-delivered to a same-vaddr waiter in another. */
-        {
+         * one process from being mis-delivered to a same-vaddr waiter in another.
+         * The word is read again under the key's bucket lock, without faulting
+         * (Linux futex_wait_setup's get_futex_value_locked); if its page went
+         * away meanwhile, fault it back in outside the lock and start over. */
+        kspinlock_t *hb;
+        uint32_t hfl;
+        for (;;) {
             uint32_t fphys = is_private ? 0
                            : futex_resolve_phys((uint32_t)(uintptr_t)uaddr);
-            current_proc->futex_shared = (!is_private && fphys) ? 1 : 0;
-            current_proc->futex_phys   = fphys;
+            int shared = (!is_private && fphys) ? 1 : 0;
+            hb = futex_bucket_of((uint32_t)(uintptr_t)uaddr, !shared, fphys,
+                                 current_proc->tgid);
+            hfl = kspin_lock_irqsave(hb);
+            if (futex_read_nofault((uint32_t)(uintptr_t)uaddr, &cur)) {
+                current_proc->futex_shared = shared;
+                current_proc->futex_phys   = fphys;
+                break;
+            }
+            kspin_unlock_irqrestore(hb, hfl);
+            cr = copy_from_user(&cur, uaddr, sizeof(cur));
+            if (cr < 0) { current_proc->wake_tick = 0; return cr; }
         }
-        int timed_out = sleep_on((void *)uaddr);
+        if (cur != val) {
+            kspin_unlock_irqrestore(hb, hfl);
+            current_proc->wake_tick = 0;
+            return -11;                                    /* -EAGAIN */
+        }
+        current_proc->futex_wait = 1;
+        int timed_out = sleep_locked((void *)uaddr, hb);
         int woken = (current_proc->futex_wait == 2);
         current_proc->futex_wait = 0;
+        kspin_unlock_irqrestore(hb, hfl);
         /* Linux kernel/futex/waitwake.c futex_wait(): a wake by FUTEX_WAKE
          * returns 0 (checked first: "If we were woken (and unqueued), we
          * succeeded"); deadline expiry returns -ETIMEDOUT; a signal returns
@@ -9049,7 +9130,7 @@ static int sys_clone(registers_t *regs) {
         /* One handler table for the group (Linux copy_sighand: refcount++). */
         sighand_put(child->sighand);
         child->sighand = parent->sighand;
-        child->sighand->refcount++;
+        ref_get(&child->sighand->refcount);
     } else if (parent->sighand) {
         __builtin_memcpy(child->sighand->handlers, parent->sighand->handlers,
                          sizeof(child->sighand->handlers));
@@ -9094,7 +9175,7 @@ static int sys_clone(registers_t *regs) {
         if (parent->sigshared) {
             sigshared_put(child->sigshared);
             child->sigshared = parent->sigshared;
-            child->sigshared->refcount++;
+            ref_get(&child->sigshared->refcount);
         }
     } else {
         /* Own group in a shared address space.  Its parent is the creating
@@ -9134,7 +9215,7 @@ static int sys_clone(registers_t *regs) {
          * gave the child and point at the shared one. */
         fdtable_put(child);
         child->fdt = parent->fdt;
-        child->fdt->refcount++;
+        ref_get(&child->fdt->refcount);
         child->ofile = child->fdt->f;
     } else {
         /* Private copy (CLONE_VM without CLONE_FILES: posix_spawn, vfork). */

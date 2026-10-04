@@ -21,6 +21,15 @@
  *   schedlat audio HOGS N   a producer sends a buffer every 10 ms (absolute
  *                           clock_nanosleep) through a pipe; the consumer counts
  *                           late deliveries
+ *   schedlat torture P SECS  P processes for SECS seconds, each with threads
+ *                           doing at once: a checksummed pipe stream (odd
+ *                           lengths across the pipe size, both ends blocking),
+ *                           a futex mutex over a counter pair, mmap/munmap of
+ *                           anonymous memory with content checks in two
+ *                           threads (munmap shootdowns from several CPUs into
+ *                           one address space), signals between threads, and
+ *                           fork+exit+wait.  Prints "schedlat torture PASS" or
+ *                           a FAIL line (docs/smp-plan.md stage 2)
  *
  * HOGS busy-looping processes run the whole time (fork; killed at the end).
  * Wake latency is rdtsc at the waker's write/wake to rdtsc after the sleeper
@@ -347,8 +356,160 @@ static int run_handoff(void) {
     return ok ? 0 : 1;
 }
 
+/* ── torture ──────────────────────────────────────────────────────────── */
+static volatile int t_stop, t_fail;
+static int t_pipe[2];
+static volatile int t_lock;                 /* 0 free, 1 locked, 2 contended */
+static volatile unsigned t_c1, t_c2, t_incs;
+static volatile unsigned t_sigs, t_pipe_bytes, t_mmaps, t_forks;
+
+static void t_failf(const char *what, unsigned a, unsigned b) {
+    if (__sync_fetch_and_add(&t_fail, 1) == 0)
+        printf("schedlat torture FAIL pid %d: %s (%u vs %u)\n", (int)getpid(), what, a, b);
+    t_stop = 1;
+}
+
+static uint8_t t_byte(uint32_t off) { return (uint8_t)(off * 2654435761U >> 13); }
+
+static void *t_pipe_writer(void *arg) {
+    (void)arg;
+    static uint8_t buf[9000];
+    uint32_t off = 0, seed = 7;
+    while (!t_stop) {
+        seed = seed * 1103515245U + 12345U;
+        uint32_t n = 1 + (seed >> 8) % sizeof(buf);
+        for (uint32_t i = 0; i < n; i++) buf[i] = t_byte(off + i);
+        uint32_t done = 0;
+        while (done < n) {
+            ssize_t w = write(t_pipe[1], buf + done, n - done);
+            if (w <= 0) { if (!t_stop) t_failf("pipe write", (unsigned)w, done); goto out; }
+            done += (uint32_t)w;
+        }
+        off += n;
+    }
+out:
+    close(t_pipe[1]);                   /* the reader sees EOF */
+    return NULL;
+}
+
+static void *t_pipe_reader(void *arg) {
+    (void)arg;
+    static uint8_t buf[5000];
+    uint32_t off = 0;
+    for (;;) {
+        ssize_t r = read(t_pipe[0], buf, sizeof(buf));
+        if (r == 0) break;
+        if (r < 0) { t_failf("pipe read", (unsigned)r, off); break; }
+        for (ssize_t i = 0; i < r; i++)
+            if (buf[i] != t_byte(off + (uint32_t)i)) { t_failf("pipe data corrupt", off, (unsigned)i); return NULL; }
+        off += (uint32_t)r;
+        t_pipe_bytes = off;
+    }
+    return NULL;
+}
+
+static void t_mutex_lock(void) {
+    int c = __sync_val_compare_and_swap(&t_lock, 0, 1);
+    if (!c) return;
+    if (c != 2) c = __sync_lock_test_and_set(&t_lock, 2);
+    while (c) {
+        futex(&t_lock, FUTEX_WAIT_PRIVATE, 2);
+        c = __sync_lock_test_and_set(&t_lock, 2);
+    }
+}
+
+static void t_mutex_unlock(void) {
+    if (__sync_fetch_and_sub(&t_lock, 1) != 1) {
+        t_lock = 0;
+        futex(&t_lock, FUTEX_WAKE_PRIVATE, 1);
+    }
+}
+
+static void *t_counter(void *arg) {
+    (void)arg;
+    while (!t_stop) {
+        t_mutex_lock();
+        unsigned v = t_c1;
+        t_c1 = v + 1;
+        if ((v & 15) == 0) sched_yield();       /* hold it across a switch */
+        t_c2 = t_c2 + 1;
+        if (t_c1 != t_c2) t_failf("futex mutex let two threads in", t_c1, t_c2);
+        t_mutex_unlock();
+        __sync_fetch_and_add(&t_incs, 1);
+    }
+    return NULL;
+}
+
+static void *t_mapper(void *arg) {
+    uint32_t tag = (uint32_t)(uintptr_t)arg;
+    while (!t_stop) {
+        size_t pages = 1 + (tag++ % 16);
+        uint32_t *m = mmap(NULL, pages * 4096, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m == MAP_FAILED) { t_failf("mmap", (unsigned)pages, 0); break; }
+        for (size_t p = 0; p < pages; p++) m[p * 1024] = tag ^ (uint32_t)p;
+        for (size_t p = 0; p < pages; p++)
+            if (m[p * 1024] != (tag ^ (uint32_t)p)) { t_failf("mmap page content", (unsigned)p, tag); break; }
+        munmap(m, pages * 4096);
+        __sync_fetch_and_add(&t_mmaps, 1);
+    }
+    return NULL;
+}
+
+static void t_sigusr1(int sig) { (void)sig; __sync_fetch_and_add(&t_sigs, 1); }
+
+static int t_child(int secs) {
+    signal(SIGUSR1, t_sigusr1);
+    if (pipe(t_pipe) < 0) { perror("pipe"); return 1; }
+    pthread_t th[7];
+    pthread_create(&th[0], NULL, t_pipe_writer, NULL);
+    pthread_create(&th[1], NULL, t_pipe_reader, NULL);
+    for (int i = 0; i < 3; i++) pthread_create(&th[2 + i], NULL, t_counter, NULL);
+    pthread_create(&th[5], NULL, t_mapper, (void *)(uintptr_t)0x1000);
+    pthread_create(&th[6], NULL, t_mapper, (void *)(uintptr_t)0x2000);
+    uint64_t end = mono_ns() + (uint64_t)secs * 1000000000ULL;
+    while (!t_stop && mono_ns() < end) {
+        pid_t c = fork();
+        if (c == 0) _exit(42);
+        int st = 0;
+        if (c < 0 || waitpid(c, &st, 0) != c || !WIFEXITED(st) || WEXITSTATUS(st) != 42)
+            t_failf("fork/exit/wait", (unsigned)c, (unsigned)st);
+        t_forks++;
+        pthread_kill(th[2 + t_forks % 3], SIGUSR1);
+    }
+    t_stop = 1;
+    for (int i = 0; i < 7; i++) pthread_join(th[i], NULL);
+    close(t_pipe[0]);
+    if (!t_fail && (t_c1 != t_incs || !t_pipe_bytes || !t_mmaps || !t_forks || !t_sigs))
+        t_failf("counters", t_c1, t_incs);
+    printf("schedlat torture child %d: pipe_bytes=%u futex_incs=%u mmaps=%u forks=%u signals=%u %s\n",
+           (int)getpid(), t_pipe_bytes, t_incs, t_mmaps, t_forks, t_sigs, t_fail ? "FAIL" : "ok");
+    return t_fail ? 1 : 0;
+}
+
+static int run_torture(int procs, int secs) {
+    if (procs < 1) procs = 1;
+    if (procs > 16) procs = 16;
+    pid_t pid[16];
+    for (int i = 0; i < procs; i++) {
+        fflush(stdout);
+        pid[i] = fork();
+        if (pid[i] == 0) _exit(t_child(secs));
+    }
+    int bad = 0;
+    for (int i = 0; i < procs; i++) {
+        int st = 0;
+        if (pid[i] < 0 || waitpid(pid[i], &st, 0) != pid[i] || !WIFEXITED(st) || WEXITSTATUS(st))
+            bad++;
+    }
+    printf("schedlat torture %s procs=%d secs=%d failed=%d\n", bad ? "FAIL" : "PASS",
+           procs, secs, bad);
+    return bad ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "handoff")) return run_handoff();
+    if (argc > 3 && !strcmp(argv[1], "torture")) return run_torture(atoi(argv[2]), atoi(argv[3]));
     if (argc > 2 && !strcmp(argv[1], "time")) return run_time(argv[2]);
     if (argc > 1 && !strcmp(argv[1], "nice")) return run_nice();
     if (argc > 4 && !strcmp(argv[1], "scale"))
