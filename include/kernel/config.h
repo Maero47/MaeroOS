@@ -116,6 +116,11 @@ _Static_assert(MMIO_WINDOW_END <= ACPI_MAP_START,
 _Static_assert(ACPI_MAP_END <= 0xFEC00000UL,
                "ACPI window overlaps the I/O APIC");
 
+/* Lowest user address any mapping may cover (Linux vm.mmap_min_addr): the
+ * NULL page and the 64 KiB above it stay unmapped, so a kernel NULL (or
+ * small-offset) dereference faults instead of reading user-controlled data. */
+#define USER_MIN_ADDR     0x00010000UL
+
 #define USER_STACK_TOP    0xC0000000UL
 #define USER_STACK_PAGES  64
 #define USER_STACK_BASE   (USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE))

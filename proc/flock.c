@@ -8,8 +8,15 @@
 #include "../lib/string.h"
 
 /* Advisory locking: flock(2), POSIX record locks and OFD locks (flock.h).
- * Every syscall runs under the BKL, so the list needs no lock of its own;
- * waiters sleep on `lock_wq` and are all woken whenever a lock goes away. */
+ * Every syscall runs under the BKL, so the lists need no lock of their own;
+ * waiters sleep on `lock_wq` and are all woken whenever a lock goes away.
+ *
+ * Locks are hashed by file, so a close or a lock call walks only the locks
+ * that can be on its file, not every lock in the system.  And they are
+ * bounded: LOCKS_PER_UID per real uid (root is exempt) and LOCKS_MAX in all,
+ * past which F_SETLK answers -ENOLCK.  Unbounded, one unprivileged loop of
+ * non-mergeable byte-range locks ate the kernel heap and made every close()
+ * in the system walk the whole list under the BKL. */
 
 enum { LK_FLOCK, LK_POSIX, LK_OFD };
 
@@ -29,10 +36,58 @@ typedef struct flk {
     int64_t     start, end;    /* inclusive byte range; flock: whole file */
     uintptr_t   owner;         /* fid (flock, OFD) or fd table (POSIX) */
     int         pid;           /* reported by F_GETLK */
+    uint32_t    uid;           /* real uid charged for it */
 } flk_t;
 
-static flk_t *locks;
+#define LOCK_HASH      64
+#define LOCKS_MAX      16384
+#define LOCKS_PER_UID  4096
+#define LOCK_UID_SLOTS 64
+
+static flk_t *lock_hash[LOCK_HASH];
+static int nlocks;
 static int lock_wq;
+
+/* Locks held per non-root uid.  A uid that finds no slot gets -ENOLCK too:
+ * 64 distinct users holding locks at once is far beyond this system. */
+static struct { uint32_t uid; int n; } lock_uids[LOCK_UID_SLOTS];
+
+static int lock_charge(uint32_t uid) {
+    if (nlocks >= LOCKS_MAX) return -37;                /* -ENOLCK */
+    if (uid != 0) {
+        int slot = -1;
+        for (int i = 0; i < LOCK_UID_SLOTS && slot < 0; i++)
+            if (lock_uids[i].n > 0 && lock_uids[i].uid == uid) slot = i;
+        for (int i = 0; i < LOCK_UID_SLOTS && slot < 0; i++)
+            if (lock_uids[i].n == 0) slot = i;
+        if (slot < 0 || lock_uids[slot].n >= LOCKS_PER_UID) return -37;
+        lock_uids[slot].uid = uid;
+        lock_uids[slot].n++;
+    }
+    nlocks++;
+    return 0;
+}
+
+static void lock_uncharge(uint32_t uid) {
+    nlocks--;
+    if (uid == 0) return;
+    for (int i = 0; i < LOCK_UID_SLOTS; i++)
+        if (lock_uids[i].n > 0 && lock_uids[i].uid == uid) { lock_uids[i].n--; return; }
+}
+
+/* A new lock record charged to `uid`, or NULL (-ENOLCK). */
+static flk_t *flk_alloc(uint32_t uid) {
+    if (lock_charge(uid) < 0) return NULL;
+    flk_t *l = (flk_t *)kmalloc(sizeof(*l));
+    if (!l) { lock_uncharge(uid); return NULL; }
+    l->uid = uid;
+    return l;
+}
+
+static void flk_free(flk_t *l) {
+    lock_uncharge(l->uid);
+    kfree(l);
+}
 
 typedef struct { uint32_t dev, ino; uintptr_t fs; } fkey_t;
 
@@ -56,6 +111,13 @@ static int same_file(const flk_t *l, fkey_t k) {
     return l->dev == k.dev && l->ino == k.ino && l->fs == k.fs;
 }
 
+/* The list every lock on file `k` lives in. */
+static flk_t **bucket(fkey_t k) {
+    uint32_t h = k.dev * 2654435761u ^ k.ino * 40503u ^ (uint32_t)k.fs;
+    h ^= h >> 16;
+    return &lock_hash[h % LOCK_HASH];
+}
+
 static int bsd_kind(int kind) { return kind == LK_FLOCK; }
 
 /* The lock `l` stands in the way of a `type` lock over [start, end] of
@@ -73,7 +135,7 @@ static int conflicts(const flk_t *l, fkey_t k, int kind, uintptr_t owner,
 
 static flk_t *find_conflict(fkey_t k, int kind, uintptr_t owner, int type,
                             int64_t start, int64_t end) {
-    for (flk_t *l = locks; l; l = l->next)
+    for (flk_t *l = *bucket(k); l; l = l->next)
         if (conflicts(l, k, kind, owner, type, start, end))
             return l;
     return NULL;
@@ -85,7 +147,7 @@ static flk_t *find_conflict(fkey_t k, int kind, uintptr_t owner, int type,
 static int unlock_range(fkey_t k, int kind, uintptr_t owner,
                         int64_t start, int64_t end) {
     int woke = 0;
-    for (flk_t **pp = &locks; *pp; ) {
+    for (flk_t **pp = bucket(k); *pp; ) {
         flk_t *l = *pp;
         if (!same_file(l, k) || l->kind != kind || l->owner != owner ||
             l->end < start || l->start > end) {
@@ -94,7 +156,7 @@ static int unlock_range(fkey_t k, int kind, uintptr_t owner,
         }
         woke = 1;
         if (l->start < start && l->end > end) {        /* punch a hole */
-            flk_t *tail = (flk_t *)kmalloc(sizeof(*tail));
+            flk_t *tail = flk_alloc(l->uid);
             if (!tail) return -37;                     /* -ENOLCK */
             *tail = *l;
             tail->start = end + 1;
@@ -106,23 +168,29 @@ static int unlock_range(fkey_t k, int kind, uintptr_t owner,
         if (l->start < start) { l->end = start - 1; pp = &l->next; continue; }
         if (l->end > end)     { l->start = end + 1; pp = &l->next; continue; }
         *pp = l->next;
-        kfree(l);
+        flk_free(l);
     }
     if (woke) wake_up(&lock_wq);
     return 0;
 }
 
-static void unlock_all(int (*match)(const flk_t *, const void *), const void *arg) {
+/* Drop every lock `match` selects in one hash list (`only`), or in all. */
+static void unlock_all(flk_t **only, int (*match)(const flk_t *, const void *),
+                       const void *arg) {
     int woke = 0;
-    for (flk_t **pp = &locks; *pp; ) {
-        flk_t *l = *pp;
-        if (match(l, arg)) {
-            *pp = l->next;
-            kfree(l);
-            woke = 1;
-        } else {
-            pp = &l->next;
+    for (int b = 0; b < LOCK_HASH; b++) {
+        flk_t **head = only ? only : &lock_hash[b];
+        for (flk_t **pp = head; *pp; ) {
+            flk_t *l = *pp;
+            if (match(l, arg)) {
+                *pp = l->next;
+                flk_free(l);
+                woke = 1;
+            } else {
+                pp = &l->next;
+            }
         }
+        if (only) break;
     }
     if (woke) wake_up(&lock_wq);
 }
@@ -154,11 +222,11 @@ static int set_lock(proc_file_t *f, fkey_t k, int kind, uintptr_t owner, int typ
         sleep_on(&lock_wq);
         if (!fd_unchanged(f, node, fid)) return -9;    /* -EBADF */
     }
-    flk_t *n = (flk_t *)kmalloc(sizeof(*n));
-    if (!n) return -37;
+    flk_t *n = flk_alloc(current_proc ? current_proc->uid : 0);
+    if (!n) return -37;                                /* -ENOLCK */
     /* The new lock replaces whatever the owner held over the range. */
     int r = unlock_range(k, kind, owner, start, end);
-    if (r < 0) { kfree(n); return r; }
+    if (r < 0) { flk_free(n); return r; }
     n->dev = k.dev; n->ino = k.ino; n->fs = k.fs;
     n->kind = kind;
     n->type = type;
@@ -166,8 +234,9 @@ static int set_lock(proc_file_t *f, fkey_t k, int kind, uintptr_t owner, int typ
     n->end = end;
     n->owner = owner;
     n->pid = current_proc ? current_proc->tgid : 0;
-    n->next = locks;
-    locks = n;
+    flk_t **head = bucket(k);
+    n->next = *head;
+    *head = n;
     return 0;
 }
 
@@ -191,7 +260,7 @@ int flock_bsd(proc_file_t *f, int op) {
     fkey_t k = key_of(f->node);
     /* Converting a lock drops the old one first (Linux flock_lock_inode):
      * a waiting converter does not keep its old lock. */
-    for (flk_t *l = locks; l; l = l->next)
+    for (flk_t *l = *bucket(k); l; l = l->next)
         if (same_file(l, k) && l->kind == LK_FLOCK && l->owner == f->fid) {
             if (l->type == type) return 0;
             unlock_range(k, LK_FLOCK, f->fid, 0, OFF_MAX);
@@ -320,7 +389,7 @@ static int match_posix_close(const flk_t *l, const void *a) {
 
 static int match_fid(const flk_t *l, const void *a) {
     const struct close_arg *c = (const struct close_arg *)a;
-    return l->kind != LK_POSIX && l->owner == c->owner;
+    return l->kind != LK_POSIX && l->owner == c->owner && same_file(l, c->k);
 }
 
 static int match_table(const flk_t *l, const void *a) {
@@ -328,32 +397,37 @@ static int match_table(const flk_t *l, const void *a) {
 }
 
 void flock_fd_closed(proc_file_t *f) {
-    if (!locks || f->type != FD_FILE || !f->node)
+    if (!nlocks || f->type != FD_FILE || !f->node)
         return;
     struct close_arg c;
+    c.k = key_of(f->node);
+    flk_t **head = bucket(c.k);
+    if (!*head) return;
     /* POSIX: closing any descriptor of the file drops the closing table's
      * locks on it.  Only a descriptor in the caller's own table counts;
      * one in flight over SCM_RIGHTS has no table. */
     struct fdtable *t = current_proc ? current_proc->fdt : NULL;
     if (t && f >= t->f && f < t->f + MAX_FD) {
-        c.k = key_of(f->node);
         c.owner = (uintptr_t)t;
-        unlock_all(match_posix_close, &c);
+        unlock_all(head, match_posix_close, &c);
     }
     /* flock and OFD: once the open file description's last descriptor
-     * closes. */
+     * closes.  Its locks are all on this file, so on this hash list. */
     int held = 0;
-    for (flk_t *l = locks; l && f->fid; l = l->next)
-        if (l->kind != LK_POSIX && l->owner == f->fid) { held = 1; break; }
+    for (flk_t *l = *head; l && f->fid; l = l->next)
+        if (l->kind != LK_POSIX && l->owner == f->fid && same_file(l, c.k)) {
+            held = 1;
+            break;
+        }
     /* (The scan of every descriptor table runs only for a description
      * that holds such a lock.) */
     if (held && !fid_in_use(f->fid, f)) {
         c.owner = f->fid;
-        unlock_all(match_fid, &c);
+        unlock_all(head, match_fid, &c);
     }
 }
 
 void flock_owner_gone(void *owner) {
-    if (locks)
-        unlock_all(match_table, owner);
+    if (nlocks)
+        unlock_all(NULL, match_table, owner);
 }

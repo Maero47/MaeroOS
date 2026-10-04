@@ -134,6 +134,14 @@ PROBES = {
     "p57_mode_zero":           (60, "/disk"),
     # A read asleep on a pty freed by another thread sees no later pty.
     "p58_pty_reuse":           (60, ""),
+    # Kernel-core review 2026-10-04 (proc/, mm/, arch/).
+    "p53_sigpage_interp":      (60, ""),
+    "p54_setid_auxv":          (60, ""),
+    "p55_fstat_low_map":       (60, ""),
+    "p56_memfd_anon":          (60, ""),
+    "p57_fb0_identity":        (60, ""),
+    "p58_kill_target":         (60, ""),
+    "p59_lock_limits":         (120, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

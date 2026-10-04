@@ -10,6 +10,9 @@ typedef struct pipe_buf {
     int      nreaders;  /* open read-end FD count (across all procs) */
     int      nwriters;  /* open write-end FD count */
     int      fifo;      /* owned by a named FIFO's node: see pipe_fifo_alloc */
+    int      pins;      /* pipe_read/pipe_write calls in progress: the buffer
+                         * is not freed under a sleeper whose descriptor a
+                         * sibling thread (CLONE_FILES) closed meanwhile */
 } pipe_buf_t;
 
 /* Allocate and initialise a new pipe. Returns NULL on OOM. */

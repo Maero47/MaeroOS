@@ -1,7 +1,7 @@
 # Linux-ABI probes
 
-Forty-nine small C programs.  P1-P20 are the probes of
-`docs/audit/firefox-first-paint.md` section 8; P21-P52 were added with later
+Fifty-nine small C programs.  P1-P20 are the probes of
+`docs/audit/firefox-first-paint.md` section 8; P21-P59 were added with later
 kernel fixes.  Each proves or disproves one kernel-semantics gap and prints
 exactly one final line:
 
@@ -76,6 +76,13 @@ regression tests for the fixes in audit section 5.
 | P56 | `p56_mount_refs.c`          | a tmpfs bind mount whose source directory is removed still stats as an empty directory while 300 new directories are made (the table kept raw pointers, so the mount showed freed memory); rmdir/rename of a mountpoint and rename over one are EBUSY; umount works after | — |
 | P57 | `p57_mode_zero.c`           | as uid 65534, in /tmp and /disk: a chmod-000 file, a file created with mode 0 and a file in a chmod-000 directory are EACCES; /etc/shadow does not open (also run by smoke-cmds on the diskless initrd, whose files were all 0755) | — |
 | P58 | `p58_pty_reuse.c`           | a thread asleep in read() on a pty slave whose descriptors another thread closes does not return the input written to the next pty opened (the pair was freed and reused under the sleeper) | — |
+| P53 | `p53_sigpage_interp.c`      | an ELF interpreter segment at the sigreturn page's address must not overwrite the shared trampoline (signal handlers still return afterwards) | — |
+| P54 | `p54_setid_auxv.c`          | set-uid-root exec from uid 65534: `AT_SECURE=1`, `AT_EUID=0`; a plain exec `AT_SECURE=0` (root only) | — |
+| P55 | `p55_fstat_low_map.c`       | old `fstat` (108) on eventfd/epoll/socket/pipe; unprivileged `MAP_FIXED` below 64 KiB refused | — |
+| P56 | `p56_memfd_anon.c`          | a memfd has no name in `/tmp` (`/memfd:<name> (deleted)`), and a reopen through `/proc/self/fd` shares its pages | — |
+| P57 | `p57_fb0_identity.c`        | a regular file named `fb0` maps its own bytes; read-only `/dev/fb0` gives no writable view (MaeroOS) | — |
+| P58 | `p58_kill_target.c`         | MaeroOS syscall 505: no init, no process the caller could not signal (EPERM); own child allowed | — |
+| P59 | `p59_lock_limits.c`         | record locks bounded per uid (ENOLCK past 4096 here); a second user can still lock; close releases all | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the

@@ -12,6 +12,8 @@
  * Returns a directory vfs_node_t representing the /dev root.
  */
 vfs_node_t *devfs_mount(void);
+/* The /dev/fb0 node itself (mmap maps the physical framebuffer for it only). */
+int devfs_is_fb0(const vfs_node_t *n);
 
 /* One byte from the serial console, sleeping (not spinning) while the line is
  * idle — see the comment on the definition in devfs.c. */

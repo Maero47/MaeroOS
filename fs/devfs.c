@@ -497,6 +497,7 @@ static vfs_node_t dev_zero;
 static vfs_node_t dev_tty;
 static vfs_node_t dev_urandom;
 static vfs_node_t dev_fb0;
+int devfs_is_fb0(const vfs_node_t *n) { return n == &dev_fb0; }
 static vfs_node_t dev_input_dir;
 static vfs_node_t dev_input_event0;
 static vfs_node_t dev_input_event1;

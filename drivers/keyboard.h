@@ -26,4 +26,4 @@ void keyboard_input_key(uint16_t key, int pressed);
  * boot LED report). */
 uint8_t keyboard_leds(void);
 /* Register a pid that Ctrl+Alt+Backspace will SIGKILL (fullscreen escape). */
-void keyboard_set_kill_target(int pid);
+void keyboard_set_kill_target(int pid, uint32_t uid, uint32_t euid);

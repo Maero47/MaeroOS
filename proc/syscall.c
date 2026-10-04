@@ -749,7 +749,25 @@ static void eventfd_release(struct eventfd_obj *e) {
     if (--e->refcount <= 0) kfree(e);
 }
 
+/* read/write hold a reference across the sleep: a thread sharing the fd
+ * table can close the descriptor meanwhile, and the counter must outlive the
+ * sleeper (as pipes and AF_UNIX sockets do). */
+static int eventfd_read_held(struct eventfd_obj *e, char *buf, int len, int nonblock);
+static int eventfd_write_held(struct eventfd_obj *e, const char *buf, int len, int nonblock);
 static int eventfd_read(struct eventfd_obj *e, char *buf, int len, int nonblock) {
+    e->refcount++;
+    int r = eventfd_read_held(e, buf, len, nonblock);
+    eventfd_release(e);
+    return r;
+}
+static int eventfd_write(struct eventfd_obj *e, const char *buf, int len, int nonblock) {
+    e->refcount++;
+    int r = eventfd_write_held(e, buf, len, nonblock);
+    eventfd_release(e);
+    return r;
+}
+
+static int eventfd_read_held(struct eventfd_obj *e, char *buf, int len, int nonblock) {
     if (len < 8) return -22;                       /* -EINVAL */
     while (e->count == 0) {
         if (nonblock) return -11;                  /* -EAGAIN */
@@ -766,7 +784,7 @@ static int eventfd_read(struct eventfd_obj *e, char *buf, int len, int nonblock)
     return 8;
 }
 
-static int eventfd_write(struct eventfd_obj *e, const char *buf, int len, int nonblock) {
+static int eventfd_write_held(struct eventfd_obj *e, const char *buf, int len, int nonblock) {
     if (len < 8) return -22;                        /* -EINVAL */
     uint64_t add;
     if (copy_from_user(&add, buf, 8) < 0) return -14;
@@ -1737,6 +1755,10 @@ static int sys_brk(registers_t *regs) {
     /* Clamp: must be in user address space below the stack guard. */
     if (new_brk >= USER_STACK_BASE)
         return -12;  /* -ENOMEM */
+    /* Nor into the NULL-page floor (an image with no loadable segment has
+     * its break at 0). */
+    if (new_brk < USER_MIN_ADDR || current_proc->heap_end < USER_MIN_ADDR)
+        return -12;
 
     uint32_t old_brk = current_proc->heap_end;
 
@@ -2306,16 +2328,24 @@ static int sys_exec(registers_t *regs) {
         AUX(7, interp_base);                 /* AT_BASE — dynamic linker base */
     AUX(6, PAGE_SIZE);                       /* AT_PAGESZ */
     AUX(9, prog_entry);                      /* AT_ENTRY — the program, not ld.so */
+    /* The credentials the new image runs with: new_euid/new_egid already
+     * carry a set-uid/set-gid bit, which is stored into current_proc only
+     * further down.  Reporting the caller's old euid here would tell ld.so
+     * AT_SECURE=0 in a set-uid-root image and let it honour LD_PRELOAD. */
     AUX(11, current_proc->uid);              /* AT_UID  — real credentials, not */
-    AUX(12, current_proc->euid);             /* AT_EUID   hardcoded 0; glibc's   */
+    AUX(12, new_euid);                       /* AT_EUID   hardcoded 0; glibc's   */
     AUX(13, current_proc->gid);              /* AT_GID    loader inspects these   */
-    AUX(14, current_proc->egid);             /* AT_EGID   (e.g. dynamic-linker).  */
-    /* AT_SECURE: set only on a real privilege transition (setuid/setgid exec).
+    AUX(14, new_egid);                       /* AT_EGID   (e.g. dynamic-linker).  */
+    /* AT_SECURE: set on a real privilege transition (setuid/setgid exec) or
+     * whenever the image runs with ids other than the real ones (Linux
+     * cap_bprm_creds_from_file: secureexec when euid != uid or egid != gid).
      * For a normal exec where ruid==euid it must be 0, else glibc enters secure
      * mode and ignores LD_LIBRARY_PATH — which breaks the desktop's GTK/X apps
      * (they run as the unprivileged session user and need LD_LIBRARY_PATH). */
-    AUX(23, (current_proc->uid != current_proc->euid ||
-             current_proc->gid != current_proc->egid) ? 1 : 0);
+    AUX(23, (current_proc->uid != new_euid ||
+             current_proc->gid != new_egid ||
+             new_euid != current_proc->euid ||
+             new_egid != current_proc->egid) ? 1 : 0);
     AUX(17, 100);                            /* AT_CLKTCK */
     AUX(25, at_random_uaddr);                /* AT_RANDOM */
     AUX(16, cpuid_hwcap());                  /* AT_HWCAP — CPUID.1:EDX feature bits */
@@ -2566,6 +2596,29 @@ static int kill_permitted(struct proc *t, int sig) {
     return 0;
 }
 
+/* MaeroOS syscall 505: register the process the Ctrl+Alt+Backspace hotkey
+ * SIGKILLs (the desktop's fullscreen raw-input app).  pid <= 0 clears it.  The
+ * caller must be allowed to SIGKILL the target itself (kill_permitted) and the
+ * target is never init: otherwise any user could have init or a root daemon
+ * killed by whoever next pressed the keys.  The keyboard path re-checks the
+ * registrant's ids against the process holding the pid at that moment. */
+static int sys_set_kill_target(int pid) {
+    if (pid <= 0) {
+        keyboard_set_kill_target(-1, 0, 0);
+        return 0;
+    }
+    struct proc *t = NULL;
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (ptable[i].state != PROC_UNUSED && ptable[i].pid == pid) {
+            t = &ptable[i];
+            break;
+        }
+    if (!t) return -3;                                        /* -ESRCH */
+    if (t->pid == 1 || !kill_permitted(t, SIGKILL)) return -1;  /* -EPERM */
+    keyboard_set_kill_target(pid, current_proc->uid, current_proc->euid);
+    return 0;
+}
+
 /* Signal every process (one per thread group) that `match` selects.  Linux
  * __kill_pgrp_info()/kill_something_info(-1): success if at least one was
  * signalled; otherwise -EPERM if some were refused, -ESRCH if none matched. */
@@ -2686,8 +2739,10 @@ static void sys_sigreturn(registers_t *regs) {
 }
 
 /* ── sys_pipe(int fd[2]) — EAX=42 ───────────────────────────────────────── */
-static int sys_pipe(registers_t *regs) {
-    int *fds = (int *)(uintptr_t)regs->ebx;
+/* pipe/pipe2: O_CLOEXEC and O_NONBLOCK are applied to the kernel's own fd
+ * numbers before they are published to user memory (never re-read from it:
+ * another thread can rewrite fds[] in between). */
+static int do_pipe(int *fds, int flags) {
 
     if (!access_ok(fds, 2 * sizeof(int)))
         return -14;  /* -EFAULT */
@@ -2705,12 +2760,16 @@ static int sys_pipe(registers_t *regs) {
     }
     if (rfd < 0 || wfd < 0) { kfree(pb); return -24; }  /* -EMFILE */
 
+    int fl = flags & 0x800;                    /* O_NONBLOCK */
+    int ce = (flags & O_CLOEXEC) ? 1 : 0;
     current_proc->ofile[rfd].type  = FD_PIPE_R;
     current_proc->ofile[rfd].pipe  = pb;
-    current_proc->ofile[rfd].flags = 0;
+    current_proc->ofile[rfd].flags = fl;
+    current_proc->ofile[rfd].cloexec = ce;
     current_proc->ofile[wfd].type  = FD_PIPE_W;
     current_proc->ofile[wfd].pipe  = pb;
-    current_proc->ofile[wfd].flags = 0;
+    current_proc->ofile[wfd].flags = fl;
+    current_proc->ofile[wfd].cloexec = ce;
 
     int kfds[2] = { rfd, wfd };
     int cr = copy_to_user(fds, kfds, sizeof(kfds));
@@ -2720,6 +2779,10 @@ static int sys_pipe(registers_t *regs) {
         return cr;
     }
     return 0;
+}
+
+static int sys_pipe(registers_t *regs) {
+    return do_pipe((int *)(uintptr_t)regs->ebx, 0);
 }
 
 /* ── sys_dup2(int oldfd, int newfd) — EAX=63 ───────────────────────────── */
@@ -3614,34 +3677,36 @@ static int sys_stat(registers_t *regs) {
 }
 
 /* ── sys_fstat(fd, stat*) — EAX=108 ─────────────────────────────────────── */
+/* Every kind of descriptor goes through fd_kstat64, as fstat64/statx do: only
+ * FD_FILE has a vfs node, and calling fill_kstat() on an eventfd, socket or
+ * epoll descriptor dereferenced a NULL node (an unprivileged kernel panic).
+ * The result is narrowed to the old layout as Linux cp_old_stat/cp_new_stat
+ * do: -EOVERFLOW for a size past 2 GiB, overflowuid for wide ids. */
 static int sys_fstat(registers_t *regs) {
     int fd = (int)regs->ebx;
     struct kstat *st = (struct kstat *)(uintptr_t)regs->ecx;
     if (!access_ok(st, sizeof(*st))) return -14;
 
-    if (fd < 0 || fd >= MAX_FD) return -9;
-    proc_file_t *f = &current_proc->ofile[fd];
-
-    if (f->type == FD_NONE) {
-        /* stdin/stdout/stderr: pretend it's a char device */
-        if (fd <= 2) {
-            struct kstat kst;
-            __builtin_memset(&kst, 0, sizeof(kst));
-            kst.st_mode = 0020666; /* S_IFCHR | rw-rw-rw- */
-            return copy_to_user(st, &kst, sizeof(kst));
-        }
-        return -9;
-    }
-    if (f->type == FD_PIPE_R || f->type == FD_PIPE_W) {
-        struct kstat kst;
-        __builtin_memset(&kst, 0, sizeof(kst));
-        kst.st_mode  = 0010666;  /* S_IFIFO */
-        kst.st_blksize = 4096;
-        return copy_to_user(st, &kst, sizeof(kst));
-    }
-    struct kstat kst;
-    int r = fill_kstat(&kst, f->node);
+    struct kstat64 k64;
+    int r = fd_kstat64(fd, &k64);
     if (r < 0) return r;
+    if (k64.st_size < 0 || (uint64_t)k64.st_size > MAX_NON_LFS)
+        return -75;                                           /* -EOVERFLOW */
+    struct kstat kst;
+    __builtin_memset(&kst, 0, sizeof(kst));
+    kst.st_dev     = (uint16_t)k64.st_dev;
+    kst.st_rdev    = (uint16_t)k64.st_rdev;
+    kst.st_ino     = (uint32_t)k64.st_ino;
+    kst.st_mode    = (uint16_t)k64.st_mode;
+    kst.st_nlink   = (uint16_t)k64.st_nlink;
+    kst.st_uid     = k64.st_uid > 0xFFFFU ? 65534U : (uint16_t)k64.st_uid;
+    kst.st_gid     = k64.st_gid > 0xFFFFU ? 65534U : (uint16_t)k64.st_gid;
+    kst.st_size    = (uint32_t)k64.st_size;
+    kst.st_blksize = (uint32_t)k64.st_blksize;
+    kst.st_blocks  = (uint32_t)k64.st_blocks;
+    kst.st_atime   = (uint32_t)k64.st_atime;
+    kst.st_mtime   = (uint32_t)k64.st_mtime;
+    kst.st_ctime   = (uint32_t)k64.st_ctime;
     return copy_to_user(st, &kst, sizeof(kst));
 }
 
@@ -4253,10 +4318,11 @@ static uint32_t shmap_peek(struct shmap_entry *e, uint32_t pg) {
 /* Reclaim a shmap slot IFF no process still maps any of its frames.  Each frame
  * carries one "registry" ref (taken in shmap_frame); a frame whose refcount is
  * <=1 is mapped by nobody else, so the whole entry is dead once ALL its frames
- * are <=1.  This is how leaked memfd/tmpfs shared maps get freed: our memfd is a
- * named /tmp/.memfd-N tmpfs file that persists (no delete-on-close), so without
- * this the 128-slot table filled across watchdog restarts → shmap_get()==NULL →
- * mmap(MAP_SHARED) failed → Firefox MOZ_RELEASE_ASSERT(mMap.initialized()). */
+ * are <=1.  This is how dead memfd/tmpfs shared maps get freed: a memfd whose
+ * last descriptor closed while it was still mapped keeps its entry (and its
+ * node) until here, and without this the table filled across watchdog
+ * restarts → shmap_get()==NULL → mmap(MAP_SHARED) failed → Firefox
+ * MOZ_RELEASE_ASSERT(mMap.initialized()). */
 /* True iff any process still holds an open fd to this node.  A memfd whose fd is
  * open must keep its data even while unmapped (POSIX memfd/shm persistence), so
  * such an entry is NOT dead and must never be reclaimed — freeing its frames
@@ -4642,6 +4708,9 @@ uint32_t mm_shm_attach_at(const uint32_t *frames, uint32_t npages, uint32_t addr
         base = vma_gap_find(len, PAGE_SIZE);
     }
     if (!base) return 0;
+    /* One reference per attachment: refuse before a frame count saturates. */
+    for (uint32_t i = 0; i < npages; i++)
+        if (pmm_frame_refcount(frames[i]) >= PMM_REF_LIMIT) return 0;
     /* Reserve the page tables before taking any reference, so the attach
      * either happens whole or leaves the address space as it was (Linux
      * shmat() returns ENOMEM here too). */
@@ -4743,6 +4812,12 @@ static int sys_mmap2(registers_t *regs) {
         if (shared && (prot & PROT_WRITE_K) &&
             (mf->flags & O_ACCMODE) != O_RDWR)
             return -13;                                           /* -EACCES */
+        /* The framebuffer is device memory, mapped shared whatever the
+         * flags say: a MAP_PRIVATE writable view would still write the real
+         * screen, so it needs a read-write descriptor too. */
+        if (devfs_is_fb0(fnode) && (prot & PROT_WRITE_K) &&
+            (mf->flags & O_ACCMODE) != O_RDWR)
+            return -13;                                           /* -EACCES */
     }
     /* Page offsets are 32-bit: an offset plus length past 2^32 pages is
      * -EOVERFLOW (Linux do_mmap), and a shared file mapping must stay inside
@@ -4751,12 +4826,11 @@ static int sys_mmap2(registers_t *regs) {
     if (fnode) {
         uint64_t last = (uint64_t)pgoff + length / PAGE_SIZE;
         if (last > 0xFFFFFFFFULL) return -75;                     /* -EOVERFLOW */
-        if (shared && __builtin_strcmp(fnode->name, "fb0") != 0 &&
-            last > SHMAP_MAX_PAGES)
+        if (shared && !devfs_is_fb0(fnode) && last > SHMAP_MAX_PAGES)
             return -12;                                           /* -ENOMEM */
     }
     /* Shared file mappings the descriptor cannot write through stay so. */
-    uint32_t nowrite = (fnode && shared &&
+    uint32_t nowrite = (fnode && (shared || devfs_is_fb0(fnode)) &&
                         (current_proc->ofile[fd].flags & O_ACCMODE) != O_RDWR)
                        ? VMA_F_NOWRITE : 0;
 
@@ -4771,6 +4845,10 @@ static int sys_mmap2(registers_t *regs) {
     uint32_t va;
     if (fixed) {
         if (addr & (PAGE_SIZE - 1)) return -22;
+        /* vm.mmap_min_addr: nothing is ever mapped over the NULL page and
+         * the 64 KiB above it (Linux security_mmap_addr: -EPERM), so a
+         * kernel NULL dereference can never read user-chosen data. */
+        if (addr < USER_MIN_ADDR) return -1;                      /* -EPERM */
         if (addr + length < addr || addr + length > (uint32_t)USER_STACK_BASE) return -12;
         va = addr;
         if (flags & MAP_FIXED_NOREPLACE_K) {
@@ -4802,7 +4880,9 @@ static int sys_mmap2(registers_t *regs) {
     /* ── /dev/fb0: map the real framebuffer (DOOM, links -g) ──
      * Page by page: a virtio-gpu framebuffer is scattered guest RAM (and
      * mapped cached), a VGA one is contiguous device memory. */
-    if (fnode && __builtin_strcmp(fnode->name, "fb0") == 0) {
+    /* Identified by the node itself, never by its name: any file called
+     * "fb0" (/tmp/fb0) used to get the physical framebuffer. */
+    if (fnode && devfs_is_fb0(fnode)) {
         uint32_t fb_len = framebuffer_size();
         if (!framebuffer_phys()) return -19;
         if (length > ((fb_len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1)))
@@ -4816,6 +4896,8 @@ static int sys_mmap2(registers_t *regs) {
                             ((prot & PROT_WRITE_K) ? PAGE_WRITABLE : 0);
         for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
             uint32_t fb_page = framebuffer_page_phys(i);
+            if (fb_page && pmm_frame_refcount(fb_page) >= PMM_REF_LIMIT)
+                fb_page = 0;                 /* refused below: -ENOMEM */
             /* RAM frames (virtio-gpu) carry a reference per PTE like any
              * shared page, which munmap and exit drop again; device frames
              * have no refcount and pmm ignores them. */
@@ -4849,6 +4931,12 @@ static int sys_mmap2(registers_t *regs) {
         for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
             uint32_t phys = shmap_frame(e, fnode, pgoff + i / PAGE_SIZE);
             if (!phys) { unmap_range(va, end); return -12; }
+            /* One reference per mapping of the page: refuse before the 16-bit
+             * frame count could saturate (Linux stops at vm.max_map_count). */
+            if (pmm_frame_refcount(phys) >= PMM_REF_LIMIT) {
+                unmap_range(va, end);
+                return -12;                                       /* -ENOMEM */
+            }
             pmm_frame_incref(phys);          /* this mapping's ref */
             if (paging_map(va + i, phys, pte_flags_for(prot, 1)) != 0) {
                 pmm_frame_decref(phys);      /* give this mapping's ref back;
@@ -5260,6 +5348,7 @@ static int sys_mremap(registers_t *regs) {
     int ret;
 
     if (flags & MREMAP_FIXED_K) {
+        if (new_addr < USER_MIN_ADDR) { ret = -1; goto out; }   /* -EPERM */
         if ((new_addr & (PAGE_SIZE - 1)) || new_addr + new_size < new_addr ||
             new_addr + new_size > (uint32_t)USER_STACK_BASE ||
             (new_addr < old_addr + old_size && old_addr < new_addr + new_size)) {
@@ -6538,6 +6627,7 @@ static int sys_epoll_ctl(registers_t *regs) {
 }
 
 /* epoll_wait(epfd, events, maxevents, timeout) — EAX=256 (also epoll_pwait/319). */
+static int epoll_wait_held(struct epoll *ep, void *uevents, int maxevents, int toms);
 static int sys_epoll_wait(registers_t *regs) {
     int epfd = (int)regs->ebx;
     void *uevents = (void *)(uintptr_t)regs->ecx;
@@ -6547,8 +6637,17 @@ static int sys_epoll_wait(registers_t *regs) {
         current_proc->ofile[epfd].type != FD_EPOLL) return -9;
     if (maxevents <= 0) return -22;
     if (!uevents || !access_ok(uevents, (size_t)maxevents * 12)) return -14;
+    /* The wait holds its own reference: a thread sharing the fd table can
+     * close epfd while this one sleeps, which would otherwise free the
+     * instance under the loop below (Linux holds the struct file via fdget). */
     struct epoll *ep = current_proc->ofile[epfd].epoll;
+    epoll_retain(ep);
+    int r = epoll_wait_held(ep, uevents, maxevents, toms);
+    epoll_release(ep);
+    return r;
+}
 
+static int epoll_wait_held(struct epoll *ep, void *uevents, int maxevents, int toms) {
     struct kdeadline dl;
     if (toms > 0) deadline_set_ms(&dl, (uint32_t)toms);
 
@@ -7756,36 +7855,101 @@ static int sys_fstatfs64(registers_t *regs) {
  * (Cross-process sharing via SCM_RIGHTS fd-passing is a separate step; this
  * makes the single-process path work so the parent stops aborting on shm.) */
 static int sys_open_kernel_path(const char *path, int flags, uint32_t mode);
+/* A memfd is an anonymous node of its own, never a name in any directory
+ * (Linux memfd_create: an unlinked shmem inode).  It used to be a file
+ * /tmp/.memfd-<counter> opened with O_CREAT|O_TRUNC: the name was predictable
+ * and the final symlink was followed, so a planted /tmp/.memfd-N -> /etc/shadow
+ * was truncated (and its node rewired) when root called memfd_create, and a
+ * pre-created 0666 file let another user read the shared memory.  Here nobody
+ * can reach the node except through a descriptor (or /proc/<pid>/fd/N, which
+ * hands back the same node and checks its 0600 owner-only mode).
+ *
+ * The data lives in the shmap registry (shmem_read/shmem_write).  The node
+ * counts its references: descriptors, private mappings and the registry's own.
+ * When only the registry's is left and no mapping holds a frame, the entry is
+ * released, which drops that last reference and frees the node. */
+struct memfd_node {
+    vfs_node_t vnode;     /* first: a vfs_node_t * is a struct memfd_node * */
+    int        refs;
+};
+
+static void memfd_retain(vfs_node_t *n) {
+    if (n) ((struct memfd_node *)n)->refs++;
+}
+
+static void memfd_release(vfs_node_t *n) {
+    if (!n) return;
+    struct memfd_node *m = (struct memfd_node *)n;
+    if (--m->refs <= 0) {
+        inotify_node_gone(n);
+        kfree(m);
+        return;
+    }
+    if (m->refs == 1) {
+        struct shmap_entry *e = shmap_lookup(n);
+        /* Every descriptor and mapping holds a reference, so the one left
+         * is the registry's when it has an entry for this node. */
+        if (e && shmap_unmapped(e))
+            shmap_release(e);      /* drops the last reference: frees m */
+    }
+}
+
 static int sys_memfd_create(registers_t *regs) {
     static uint32_t memfd_seq = 0;
     char name[64];
     if (copy_user_str((const char *)(uintptr_t)regs->ebx, name, sizeof(name)) < 0)
         name[0] = '\0';
-    /* Build a unique anonymous path under /tmp (tmpfs, writable). */
-    char path[96];
-    uint32_t seq = ++memfd_seq;
-    const char *pfx = "/tmp/.memfd-";
-    int p = 0;
-    for (const char *s = pfx; *s; s++) path[p++] = *s;
-    /* append decimal seq */
-    char num[12]; int n = 0;
-    if (seq == 0) num[n++] = '0';
-    while (seq) { num[n++] = '0' + (seq % 10); seq /= 10; }
-    while (n) path[p++] = num[--n];
-    path[p] = '\0';
-    int fd = sys_open_kernel_path(path, O_RDWR | O_CREAT | O_TRUNC | O_LARGEFILE, 0600);
-    if (fd < 0) return fd;
+    int fd = -1;
+    for (int i = 0; i < MAX_FD; i++)
+        if (current_proc->ofile[i].type == FD_NONE) { fd = i; break; }
+    if (fd < 0) return -24;                                   /* -EMFILE */
+    struct memfd_node *m = (struct memfd_node *)kmalloc(sizeof(*m));
+    if (!m) return -12;
+    __builtin_memset(m, 0, sizeof(*m));
+    vfs_node_t *mn = &m->vnode;
+    /* "memfd:<name>" is what Linux reports as the dentry name. */
+    {
+        const char *pfx = "memfd:";
+        int p = 0;
+        for (const char *c = pfx; *c; c++) mn->name[p++] = *c;
+        for (const char *c = name; *c && p < (int)sizeof(mn->name) - 1; c++)
+            mn->name[p++] = *c;
+        mn->name[p] = '\0';
+    }
+    mn->flags       = VFS_FLAG_FILE;
+    mn->inode       = ++memfd_seq;
+    mn->size        = 0;
+    mn->mask        = 0600;          /* Linux: S_IFREG | 0777 & ~umask is not
+                                      * used for memfd; owner-only is the safe
+                                      * subset and what the old file had */
+    mn->uid         = current_proc->euid;
+    mn->gid         = current_proc->egid;
+    mn->nlink       = 0;             /* unlinked */
+    mn->read_fn     = shmem_read;
+    mn->write_fn    = shmem_write;
+    mn->truncate_fn = shmem_truncate;
+    mn->retain_fn   = memfd_retain;
+    mn->close_fn    = memfd_release;
+    m->refs = 1;                     /* the descriptor's */
+
+    proc_file_t *f = &current_proc->ofile[fd];
+    f->type    = FD_FILE;
+    f->node    = mn;
+    f->offset  = 0;
+    f->flags   = O_RDWR | O_LARGEFILE;
     /* MFD_CLOEXEC = 0x0001 (Linux mm/memfd.c hands O_CLOEXEC to get_unused_fd). */
-    current_proc->ofile[fd].cloexec = (regs->ecx & 0x1) ? 1 : 0;
-    /* Back the file with the shared page registry rather than a contiguous
-     * tmpfs buffer, so the file's pages and every MAP_SHARED mapping of it are
-     * the same frames (Linux shmem — see shmem_read above). */
-    vfs_node_t *mn = current_proc->ofile[fd].node;
-    if (mn) {
-        mn->read_fn     = shmem_read;
-        mn->write_fn    = shmem_write;
-        mn->truncate_fn = shmem_truncate;
-        mn->size        = 0;
+    f->cloexec = (regs->ecx & 0x1) ? 1 : 0;
+    f->seals   = 0;
+    f->mnt     = NULL;
+    f->mnt_seq = 0;
+    /* readlink(/proc/self/fd/N) as on Linux: "/memfd:<name> (deleted)". */
+    {
+        int p = 0;
+        f->path[p++] = '/';
+        for (const char *c = mn->name; *c && p < 240; c++) f->path[p++] = *c;
+        const char *sfx = " (deleted)";
+        for (const char *c = sfx; *c; c++) f->path[p++] = *c;
+        f->path[p] = '\0';
     }
     return fd;
 }
@@ -7894,27 +8058,7 @@ static int sys_tkill(registers_t *regs) {
 
 /* ── sys_pipe2(fds[2], flags) — EAX=331 ─────────────────────────────────── */
 static int sys_pipe2(registers_t *regs) {
-    int flags = (int)regs->ecx;
-    /* Create the pipe using sys_pipe */
-    registers_t fake = *regs;
-    int r = sys_pipe(&fake);
-    if (r < 0) return r;
-    /* Apply flags: O_CLOEXEC = 0x80000, O_NONBLOCK = 0x800 */
-    int *fds = (int *)(uintptr_t)regs->ebx;
-    if (flags & (O_CLOEXEC | 0x800)) {
-        int kfds[2];
-        int cr = copy_from_user(kfds, fds, sizeof(kfds));
-        if (cr < 0) return cr;
-        if (flags & O_CLOEXEC) {
-            current_proc->ofile[kfds[0]].cloexec = 1;
-            current_proc->ofile[kfds[1]].cloexec = 1;
-        }
-        if (flags & 0x800) {
-            current_proc->ofile[kfds[0]].flags |= 0x800;
-            current_proc->ofile[kfds[1]].flags |= 0x800;
-        }
-    }
-    return 0;
+    return do_pipe((int *)(uintptr_t)regs->ebx, (int)regs->ecx);
 }
 
 /* ── sys_readv(fd, iov, iovcnt) — EAX=145 ───────────────────────────────── */
@@ -10766,8 +10910,7 @@ void syscall_dispatch(registers_t *regs) {
         break;
 #endif
     case 505:  /* register Ctrl+Alt+Backspace kill target (desktop only) */
-        keyboard_set_kill_target((int)regs->ebx);
-        ret = 0;
+        ret = sys_set_kill_target((int)regs->ebx);
         break;
 
     case 296: ret = sys_mkdirat(regs);         break;

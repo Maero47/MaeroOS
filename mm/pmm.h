@@ -36,6 +36,10 @@ void    pmm_refcount_init(void);
 void    pmm_frame_incref(phys_t phys);
 void    pmm_frame_decref(phys_t phys); /* frees frame when count reaches 0 */
 uint16_t pmm_frame_refcount(phys_t phys); /* current refcount (0 if invalid) */
+/* A frame whose count reaches PMM_REF_SATURATED is pinned for good (see
+ * pmm_frame_incref); user-driven increfs stop at PMM_REF_LIMIT (-ENOMEM). */
+#define PMM_REF_SATURATED 65535U
+#define PMM_REF_LIMIT     60000U
 /* Frames above 4 GiB: total, and how many are free. */
 uint32_t pmm_high_frames(void);
 uint32_t pmm_high_free_frames(void);
