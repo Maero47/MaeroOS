@@ -67,6 +67,8 @@ static void thread_trampoline(void *p) {
 int pthread_create(pthread_t *thread, const void *attr,
                    void *(*fn)(void *), void *arg) {
     (void)attr;
+    extern int __libc_threaded;
+    __libc_threaded = 1;                /* stdlib.c: heap grows by mmap now */
     char *block = (char *)malloc(THREAD_STACK + sizeof(thread_desc_t) + 16);
     thread_desc_t *st;
     int tid, slot = -1;

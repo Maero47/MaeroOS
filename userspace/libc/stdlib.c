@@ -3,6 +3,7 @@
 #include "../include/string.h"
 #include "../include/errno.h"
 #include "../include/limits.h"
+#include "../include/sys/mman.h"
 #include "libc_lock.h"
 
 /* environ is defined in crt0.asm as a .bss word, exported as a global symbol */
@@ -31,6 +32,33 @@ static blk_t *heap_head = (void *)0;
 /* The free list and the break are shared by every thread (browse, store and
  * linuxapps allocate from workers): each operation holds this lock. */
 volatile int __libc_heap_lock;
+
+/* Set by pthread_create.  The kernel's brk() keeps the break per thread, so
+ * a worker's brk starts from a stale break and maps fresh pages over heap
+ * another thread already uses.  Once a process has threads the heap grows
+ * with anonymous mmap instead (whole chunks, carved under the heap lock). */
+int __libc_threaded;
+static char *arena_cur, *arena_end;
+
+#define ARENA_CHUNK (256u * 1024u)
+
+static void *heap_grow(size_t n) {
+    if (!__libc_threaded) return sbrk((int)n);
+    if ((size_t)(arena_end - arena_cur) < n) {
+        size_t len = n > ARENA_CHUNK ? (n + 4095) & ~(size_t)4095 : ARENA_CHUNK;
+        /* The kernel's mmap2 itself: libc's mmap() of anonymous memory is
+         * malloc() (toybox_compat.c), which would take this lock again. */
+        long r = syscall(192, 0L, (long)len, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1L, 0L);
+        if (r < 0 && r > -4096) return (void *)-1;
+        char *p = (char *)r;
+        if (p != arena_end) arena_cur = p;     /* the old tail is left unused */
+        arena_end = p + len;
+    }
+    void *r = arena_cur;
+    arena_cur += n;
+    return r;
+}
 
 static void *malloc_locked(size_t size);
 
@@ -62,7 +90,7 @@ static void *malloc_locked(size_t size) {
     }
 
     /* Expand heap */
-    blk_t *nb = sbrk(sizeof(blk_t) + size);
+    blk_t *nb = heap_grow(sizeof(blk_t) + size);
     if (nb == (void *)-1) return (void *)0;
     nb->size = size;
     nb->free = 0;
@@ -78,6 +106,18 @@ static void *malloc_locked(size_t size) {
     }
 
     return (char *)nb + sizeof(blk_t);
+}
+
+/* Is p a block malloc() handed out?  munmap() (toybox_compat.c) frees the
+ * anonymous "mappings" mmap() took from the heap, which in a threaded
+ * process lie in the mmap range too. */
+int __libc_heap_owns(const void *p) {
+    int found = 0;
+    libc_lock(&__libc_heap_lock);
+    for (blk_t *b = heap_head; b; b = b->next)
+        if ((const char *)b + sizeof(blk_t) == (const char *)p) { found = 1; break; }
+    libc_unlock(&__libc_heap_lock);
+    return found;
 }
 
 void free(void *ptr) {

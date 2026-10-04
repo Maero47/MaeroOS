@@ -649,7 +649,9 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, int offset) {
     return r == -1 ? MAP_FAILED : (void *)r;
 }
 int munmap(void *addr, size_t length) {
-    if ((uintptr_t)addr >= MMAP_BASE) return chkerr(syscall2(91, (int)addr, (int)length));
+    extern int __libc_heap_owns(const void *p);
+    if ((uintptr_t)addr >= MMAP_BASE && !__libc_heap_owns(addr))
+        return chkerr(syscall2(91, (int)addr, (int)length));
     free(addr);
     return 0;
 }
