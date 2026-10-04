@@ -43,7 +43,7 @@ STATS = (r"\[desktop\] stats frames=(\d+) rows=(\d+) commits=(\d+) "
 def desktop_stats(con):
     """The desktop's compositor counters, or None when it has none."""
     start = con.mark()
-    con.run("echo stats > /tmp/wmctl")
+    con.run("echo stats > /tmp/.wm-1000/ctl")
     try:
         m = con.wait_re(STATS, timeout=3, start=start)
     except TimeoutError:

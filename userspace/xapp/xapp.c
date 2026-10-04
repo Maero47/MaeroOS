@@ -43,6 +43,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <wm.h>
 #include "xapps.h"
 
 #define APPS_DIR "/disk/apps"
@@ -80,12 +81,10 @@ static int x_up(void) {
 }
 
 static void notify_desktop(const char *cmd) {
-    /* /tmp is world-writable: never follow a link there, and write only into
-     * the desktop's FIFO, not a file someone put in its place. */
-    int fd = open("/tmp/wmctl", O_WRONLY | O_NONBLOCK | O_NOFOLLOW);
+    /* The desktop's FIFO in the real user's runtime directory (checked:
+     * a private directory of theirs, a FIFO, no link followed). */
+    int fd = wm_open_fifo("ctl", O_WRONLY | O_NONBLOCK);
     if (fd < 0) return;
-    struct stat st;
-    if (fstat(fd, &st) != 0 || !S_ISFIFO(st.st_mode)) { close(fd); return; }
     char line[64];
     int n = snprintf(line, sizeof(line), "%s\n", cmd);
     write(fd, line, (size_t)n);

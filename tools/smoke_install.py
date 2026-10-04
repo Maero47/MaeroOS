@@ -183,6 +183,16 @@ def live_install(accel):
         with open(TARGET, "rb") as f:
             if f.read(1 << 20).strip(b"\0"):
                 raise AssertionError("maeros-install -n wrote to the target")
+        # Scan-to-copy race: after the scan, while the installer waits for
+        # "yes", a file is swapped for a symlink to a root-only file.  The
+        # copy keeps the scanned owner and mode, so it must not follow the
+        # link: the installed file is empty (checked on the host).
+        con.run("mkdir -p /tmp/rs/u; echo public > /tmp/rs/u/f; "
+                "echo RACE_SECRET > /tmp/rs_secret; chmod 600 /tmp/rs_secret", timeout=30)
+        race = con.run("sh -c 'sleep 4; rm /tmp/rs/u/f; ln -s /tmp/rs_secret /tmp/rs/u/f; echo yes' "
+                       "| maeros-install --source /tmp/rs /dev/sdd; echo rc=$?", timeout=300)
+        if "rc=0" not in race or "/tmp/rs/u/f changed since the scan" not in race:
+            raise AssertionError(f"scan/copy race install:\n{race[-3000:]}")
         t0 = time.time()
         log = con.run("maeros-install -y /dev/sdb; echo rc=$?", timeout=900)
         took = time.time() - t0
@@ -261,8 +271,25 @@ def ext2_oversized(accel):
         os.remove(img)
 
 
+def race_check():
+    """The file swapped for a symlink after the scan went in empty."""
+    sgdisk = shutil.which("sgdisk")
+    debugfs = shutil.which("debugfs") or "/usr/sbin/debugfs"
+    if not sgdisk or not os.path.exists(debugfs):
+        return "race SKIP (no sgdisk or debugfs)"
+    odd = os.path.join(OUT, "odd.img")
+    r = subprocess.run([sgdisk, "-i", "3", odd], capture_output=True, text=True)
+    first = int(re.search(r"First sector: (\d+)", r.stdout).group(1))
+    img = f"{odd}?offset={first * 512}"
+    got = subprocess.run([debugfs, "-R", "cat /u/f", img], capture_output=True).stdout
+    st = subprocess.run([debugfs, "-R", "stat /u/f", img], capture_output=True, text=True).stdout
+    if b"RACE_SECRET" in got or not re.search(r"Size: 0\b", st):
+        raise AssertionError(f"race: installed /u/f is {got!r}\n{st[:800]}")
+    return "swapped file installed empty"
+
+
 def host_checks(uuid):
-    notes = []
+    notes = [race_check()]
     sgdisk = shutil.which("sgdisk")
     parts = {}
     if sgdisk:

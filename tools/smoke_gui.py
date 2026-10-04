@@ -582,6 +582,27 @@ class GuiSmoke:
         self.settle(0.5)
         self.shot("term-after-vi")
 
+    def wm_channels(self, term):
+        """The desktop's FIFOs and app-out live in its private runtime
+        directory /tmp/.wm-1000 (0700, uid 1000), none in the shared /tmp;
+        a surface bigger than its shm object is refused (it used to read
+        past the mapping and kill the desktop)."""
+        out = self.con.run("busybox stat -c '%n %a %u %F' /tmp/.wm-1000 "
+                           "/tmp/.wm-1000/ctl /tmp/.wm-1000/events1; "
+                           "busybox ls /tmp/wmctl /tmp/wmevents1 /tmp/app-out")
+        for want in ("/tmp/.wm-1000 700 1000 directory",
+                     "/tmp/.wm-1000/ctl 600 1000 fifo",
+                     "/tmp/.wm-1000/events1 600 1000 fifo"):
+            if want not in out:
+                raise AssertionError(f"runtime dir: {want!r} not in\n{out}")
+        if re.search(r"^/tmp/(wmctl|wmevents1|app-out)\r?$", out, re.M):
+            raise AssertionError(f"desktop channel left in the shared /tmp:\n{out}")
+        start = self.con.mark()
+        self.type_in_terminal(term, "wmevtest --small-surface", "/tmp/guismoke.surf")
+        self.con.wait_re(r"\[desktop\] surface too small: slot=12 ", timeout=20, start=start)
+        self.settle()
+        self.expect_focus(term)
+
     def viewer(self, term):
         """Launch the viewer from the terminal, which still has the focus."""
         before = self.shot("before-view")
@@ -917,6 +938,7 @@ class GuiSmoke:
         step("close viewer (button)", self.close, view, "button", term)
         step("terminal vi", self.term_vi, term)
         step("terminal maximize", self.term_maximize, term)
+        step("wm channels", self.wm_channels, term)
         step("close terminal (button)", self.close, term)
         files = step("files", self.files)
         step("close files (button)", self.close, files)

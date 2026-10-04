@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <sys/ioctl.h>
@@ -74,7 +75,6 @@ static char *const desktop_envp[] = {
 #define CLIENT_ICON_USES 32   /* icon placements per client surface */
 #define ICON_MAX 32           /* max icon dimension */
 #define WM_LINE_MAX 128
-#define WM_EVENTS_PATH "/tmp/wmevents"
 #define TIOCGPTN 0x80045430U
 #define TIOCSPTLCK 0x40045431U
 #define CTRL_D 4
@@ -2109,6 +2109,33 @@ static void set_client_line(int idx, const char *arg) {
 
 /* surface SHMID W H — adopt a client-rendered pixel buffer as the window
  * content (the modern path: the client draws, we composite). */
+/* Bytes mapped from addr to the end of the mapping holding it, from
+ * /proc/self/maps (0 when none).  The shm object behind a "surface" is the
+ * client's: its size, not the w and h the client claims, bounds the reads. */
+static uint32_t mapped_bytes_from(uint32_t addr) {
+    char line[160];
+    uint32_t got = 0;
+    FILE *f = fopen("/proc/self/maps", "r");
+
+    if (!f) return 0;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long lo, hi;
+        size_t n = strlen(line);
+        int whole = n && line[n - 1] == '\n';
+        if (sscanf(line, "%lx-%lx", &lo, &hi) == 2 && lo <= addr && addr < hi) {
+            got = (uint32_t)(hi - addr);
+            break;
+        }
+        /* skip the rest of an over-long line */
+        while (!whole && fgets(line, sizeof(line), f)) {
+            n = strlen(line);
+            whole = n && line[n - 1] == '\n';
+        }
+    }
+    fclose(f);
+    return got;
+}
+
 static void set_client_pixels(int idx, const char *arg) {
     int shmid, w, h;
     int addr;
@@ -2124,6 +2151,14 @@ static void set_client_pixels(int idx, const char *arg) {
     addr = syscall1(SYS_SHM_MAP, shmid);
     if (addr <= 0) {
         add_log("WMCTL SURFACE MAP FAILED");
+        return;
+    }
+    /* w*h*4 <= 2048*2048*4, no overflow; the blit, the fast path and the
+     * thumbnail read all of it. */
+    if (mapped_bytes_from((uint32_t)addr) < (uint32_t)w * (uint32_t)h * 4u) {
+        syscall1(SYS_SHM_UNMAP, shmid);
+        add_log("WMCTL SURFACE TOO SMALL");
+        trace("surface too small: slot=%d shm=%d %dx%d", idx + 1, shmid, w, h);
         return;
     }
     client_surfaces[idx].surf = (uint32_t *)(uintptr_t)(unsigned)addr;
@@ -2562,12 +2597,52 @@ static void handle_wmctl_input(void) {
     }
 }
 
+/* The runtime directory /tmp/.wm-<uid> (include/wm.h) holding the control
+ * and event FIFOs and app-out.  Created 0700; anything already there must be
+ * our own directory (not a link), else another user put it there and the
+ * channels stay closed rather than open into their hands. */
+static char wm_dir[48];
+static int wm_dir_ok;
+
+static int setup_runtime_dir(void) {
+    struct stat st;
+    int uid = getuid();
+
+    snprintf(wm_dir, sizeof(wm_dir), "/tmp/.wm-%d", uid);
+    mkdir(wm_dir, 0700);
+    if (lstat(wm_dir, &st) < 0 || !S_ISDIR(st.st_mode) || (int)st.st_uid != uid) {
+        add_log("WM RUNTIME DIR NOT OURS");
+        printf("[desktop] %s is not our directory: no wmctl\n", wm_dir);
+        return 0;
+    }
+    if ((st.st_mode & 077) && chmod(wm_dir, 0700) < 0) return 0;
+    wm_dir_ok = 1;
+    return 1;
+}
+
+/* <runtime dir>/<name> for a channel or log the desktop creates. */
+static void wm_path(char *out, int size, const char *name) {
+    snprintf(out, (size_t)size, "%s/%s", wm_dir, name);
+}
+
+/* A fresh FIFO <runtime dir>/<name>, opened with flags (no link followed). */
+static int open_new_fifo(const char *name, int flags) {
+    char path[72];
+
+    wm_path(path, sizeof(path), name);
+    unlink(path);
+    if (mkfifo(path, 0600) < 0) return -1;
+    return open(path, flags | O_NOFOLLOW);
+}
+
 static void setup_wmctl(void) {
-    mkdir("/tmp", 0755);
-    mkfifo("/tmp/wmctl", 0600);
-    wm_fd = open("/tmp/wmctl", O_RDONLY);
-    if (wm_fd >= 0)
-        wm_keepalive_fd = open("/tmp/wmctl", O_WRONLY);
+    if (wm_dir_ok) {
+        char path[72];
+        wm_fd = open_new_fifo("ctl", O_RDONLY);
+        wm_path(path, sizeof(path), "ctl");
+        if (wm_fd >= 0)
+            wm_keepalive_fd = open(path, O_WRONLY | O_NOFOLLOW);
+    }
     if (wm_fd >= 0 && wm_keepalive_fd >= 0)
         add_log("WMCTL READY");
     else
@@ -2575,17 +2650,33 @@ static void setup_wmctl(void) {
 }
 
 static void setup_wmevents(void) {
-    int ok = 1;
+    int ok = wm_dir_ok;
 
-    for (int i = 0; i < MAX_CLIENT_WINDOWS; i++) {
-        char path[40];
-        sprintf(path, WM_EVENTS_PATH "%d", i + 1);
-        mkfifo(path, 0600);
-        wm_event_keepalives[i] = open(path, O_RDONLY | O_NONBLOCK);
-        wm_event_fds[i] = open(path, O_WRONLY | O_NONBLOCK);
+    for (int i = 0; ok && i < MAX_CLIENT_WINDOWS; i++) {
+        char name[16], path[72];
+        snprintf(name, sizeof(name), "events%d", i + 1);
+        wm_event_keepalives[i] = open_new_fifo(name, O_RDONLY | O_NONBLOCK);
+        wm_path(path, sizeof(path), name);
+        wm_event_fds[i] = open(path, O_WRONLY | O_NONBLOCK | O_NOFOLLOW);
         if (wm_event_fds[i] < 0) ok = 0;
     }
     add_log(ok ? "WM EVENTS READY" : "WM EVENTS UNAVAILABLE");
+}
+
+/* Output of a fullscreen app (cat <runtime dir>/app-out): a new file in the
+ * private directory, so nothing planted can redirect or read it. */
+static void redirect_app_output(void) {
+    char path[72];
+    int lfd;
+
+    if (!wm_dir_ok) return;
+    wm_path(path, sizeof(path), "app-out");
+    unlink(path);
+    lfd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (lfd < 0) return;
+    dup2(lfd, 1);
+    dup2(lfd, 2);
+    if (lfd > 2) close(lfd);
 }
 
 static void close_wm_channels(void) {
@@ -3318,9 +3409,7 @@ static void launch_installed(const inst_app_t *a) {
         if (a->rawinput) {
             int pid2 = fork();
             if (pid2 == 0) {
-                int lfd = open("/tmp/app-out", O_WRONLY | O_CREAT | O_TRUNC, 0666);
-                if (lfd >= 0) { dup2(lfd, 1); dup2(lfd, 2);
-                                if (lfd > 2) close(lfd); }
+                redirect_app_output();
                 char *argv[8]; int ac = 0; static char argbuf[96];
                 argv[ac++] = (char *)a->exec;
                 if (a->args[0]) {
@@ -3376,13 +3465,8 @@ static void launch_installed(const inst_app_t *a) {
                 if (slave > 2) close(slave);
             }
             if (master >= 0) close(master);
-            /* capture the app's output for debugging (cat /tmp/app-out) */
-            int lfd = open("/tmp/app-out", O_WRONLY | O_CREAT | O_TRUNC, 0666);
-            if (lfd >= 0) {
-                dup2(lfd, 1);
-                dup2(lfd, 2);
-                if (lfd > 2) close(lfd);
-            }
+            /* capture the app's output for debugging */
+            redirect_app_output();
             argv[ac++] = (char *)a->exec;
             if (a->args[0]) {
                 char *p;
@@ -5641,6 +5725,7 @@ int main(void) {
     mouse_fd = open("/dev/input/event1", O_RDONLY);
     if (mouse_fd >= 0) add_log("MOUSE ONLINE");
     else add_log("NO MOUSE DEVICE");
+    setup_runtime_dir();
     setup_wmctl();
     setup_wmevents();
     start_shell();

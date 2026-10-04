@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <syscall.h>
 #include <time.h>
 #include <unistd.h>
 #include <wm.h>
@@ -26,11 +28,37 @@ static int setup_window(wm_client_t *wm) {
     return wm_focus_app(wm, 3);
 }
 
+/* --small-surface: announce a one-page shm object as a 2048x2048 surface.
+ * The desktop must refuse it (it would read 16 MiB past the mapping) and
+ * trace "surface too small"; smoke-gui checks it is still alive after. */
+static int small_surface(void) {
+    wm_client_t wm;
+    int slot = WM_MAX_SLOTS;
+    int id = syscall1(500, 1);              /* SYS_SHM_CREATE: one page */
+
+    if (id < 0 || wm_connect(&wm) < 0) {
+        printf("wmevtest: setup failed\n");
+        return 1;
+    }
+    wm_app(&wm, slot, "Surface Probe");
+    wm_geom(&wm, slot, 40, 40, 200, 120);
+    wm_surface(&wm, slot, id, 2048, 2048);
+    wm_commit(&wm, slot);
+    sleep_ms(1000);
+    wm_command(&wm, "close %d", slot);
+    wm_close(&wm);
+    printf("wmevtest: small surface sent\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int ticks = 300;
     int seen = 0;
     wm_client_t wm;
     wm_event_client_t events;
+
+    if (argc > 1 && strcmp(argv[1], "--small-surface") == 0)
+        return small_surface();
 
     if (argc > 1) {
         ticks = atoi(argv[1]) * 10;

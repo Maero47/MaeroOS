@@ -155,7 +155,7 @@ class GfxSmoke(GuiSmoke):
 
     def desktop_stats(self):
         start = self.con.mark()
-        self.con.run("echo stats > /tmp/wmctl")
+        self.con.run("echo stats > /tmp/.wm-1000/ctl")
         m = self.con.wait_re(r"\[desktop\] stats frames=(\d+) .* flushes=(\d+) "
                              r"flush_rects=(\d+) flush_kpx=(\d+)", start=start)
         return [int(g) for g in m.groups()]

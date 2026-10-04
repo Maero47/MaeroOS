@@ -59,6 +59,23 @@ typedef struct {
     int h;
 } wm_event_t;
 
+/*
+ * The desktop's channels live in its runtime directory /tmp/.wm-<uid>
+ * (mode 0700, owned by the desktop's user): "ctl" (commands in), "events<N>"
+ * (one per client slot, events out) and "app-out" (output of fullscreen
+ * apps).  A private directory, so no other user can plant, read or replace
+ * them.  The desktop runs as WM_SESSION_UID (init's session user); root
+ * talks to that desktop.  WM_RUNTIME_DIR overrides the path.
+ */
+#define WM_SESSION_UID 1000
+/* The runtime directory for this process: written to out; returns its owner
+ * uid when it is a real directory (not a link) closed to everyone else and
+ * owned by the expected user, or -1. */
+int wm_runtime_dir(char *out, int size);
+/* Open <runtime dir>/<name> (a FIFO) with flags | O_NOFOLLOW; -1 unless it
+ * is a FIFO owned by the directory's owner. */
+int wm_open_fifo(const char *name, int flags);
+
 int wm_connect(wm_client_t *wm);
 void wm_close(wm_client_t *wm);
 int wm_command(wm_client_t *wm, const char *fmt, ...);
@@ -95,7 +112,7 @@ int wm_commit(wm_client_t *wm, int slot);
  * last commit, so the compositor recomposites just that part of the screen.
  * A plain wm_commit() damages the whole surface. */
 int wm_commit_rect(wm_client_t *wm, int slot, int x, int y, int w, int h);
-/* Open this slot's private event channel (/tmp/wmevents<slot>). */
+/* Open this slot's private event channel (<runtime dir>/events<slot>). */
 int wm_open_events(wm_event_client_t *events, int slot);
 void wm_close_events(wm_event_client_t *events);
 int wm_next_event(wm_event_client_t *events, wm_event_t *event);

@@ -1,21 +1,58 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <wm.h>
 
-#define WMCTL_PATH "/tmp/wmctl"
-#define WMEVENTS_PATH "/tmp/wmevents"
 #define WM_COMMAND_MAX 128
 
 static int valid_slot(int slot) {
     return slot >= 1 && slot <= WM_MAX_SLOTS;
 }
 
+int wm_runtime_dir(char *out, int size) {
+    const char *env = getenv("WM_RUNTIME_DIR");
+    int me = getuid();
+    int want;
+    struct stat st;
+
+    if (env && env[0] == '/') {
+        snprintf(out, (size_t)size, "%s", env);
+        want = me == 0 ? -1 : me;       /* root may name any user's desktop */
+    } else {
+        want = me == 0 ? WM_SESSION_UID : me;
+        snprintf(out, (size_t)size, "/tmp/.wm-%d", want);
+    }
+    if (lstat(out, &st) < 0 || !S_ISDIR(st.st_mode) || (st.st_mode & 077) ||
+        (want >= 0 && (int)st.st_uid != want))
+        return -1;
+    return (int)st.st_uid;
+}
+
+int wm_open_fifo(const char *name, int flags) {
+    char path[160];
+    struct stat st;
+    int owner = wm_runtime_dir(path, sizeof(path) - 32);
+    int fd;
+
+    if (owner < 0) return -1;
+    strcat(path, "/");
+    strcat(path, name);
+    fd = open(path, flags | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    if (fstat(fd, &st) < 0 || !S_ISFIFO(st.st_mode) || (int)st.st_uid != owner) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 int wm_connect(wm_client_t *wm) {
     if (!wm) return -1;
-    wm->fd = open(WMCTL_PATH, O_WRONLY);
+    wm->fd = wm_open_fifo("ctl", O_WRONLY);
     return wm->fd < 0 ? -1 : 0;
 }
 
@@ -134,13 +171,13 @@ int wm_commit_rect(wm_client_t *wm, int slot, int x, int y, int w, int h) {
 }
 
 int wm_open_events(wm_event_client_t *events, int slot) {
-    char path[40];
+    char name[16];
 
     if (!events || !valid_slot(slot)) return -1;
     /* Per-slot FIFO: with a shared channel, concurrent clients steal each
      * other's events (first reader wins). */
-    snprintf(path, sizeof(path), WMEVENTS_PATH "%d", slot);
-    events->fd = open(path, O_RDONLY | O_NONBLOCK);
+    snprintf(name, sizeof(name), "events%d", slot);
+    events->fd = wm_open_fifo(name, O_RDONLY | O_NONBLOCK);
     events->used = 0;
     return events->fd < 0 ? -1 : 0;
 }
