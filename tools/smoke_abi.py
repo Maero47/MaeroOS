@@ -122,6 +122,8 @@ PROBES = {
     "p51_procfs_fair":         (150, ""),
     # SIGKILL of a parent with an unreaped child (hung the kernel).
     "p52_kill_zombie_child":   (60, ""),
+    # An unlinked file held open keeps its blocks past 128 open inodes (ext2).
+    "p53_ext2_open_many":      (120, "/disk"),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

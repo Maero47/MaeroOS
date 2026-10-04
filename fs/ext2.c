@@ -221,18 +221,13 @@ typedef struct {
 
 #define EXT2_NODE_BUCKETS 256
 
-#define EXT2_OPEN_MAX 128
-typedef struct {
-    uint32_t ino;        /* 0 = free slot */
-    int      refs;
-    int      orphan;     /* name is gone; release when refs reaches 0 */
-} ext2_open_t;
-
 /* Per-node private data */
 typedef struct ext2_priv {
     uint32_t          ino;
     ext2_fs_t        *fs;        /* the instance the inode belongs to */
     struct ext2_priv *hnext;     /* node-cache hash chain, see ext2_make_node */
+    int               refs;      /* descriptors, mappings (see "open inodes") */
+    int               orphan;    /* name is gone; release when refs reaches 0 */
 } ext2_priv_t;
 
 /* One mounted filesystem.  /disk is one of these (fs->boot), and mount(2)
@@ -261,7 +256,6 @@ struct ext2_fs {
     int                 cache_ready;
     uint8_t            *seen;        /* bit per block: fetched at least once */
     uint32_t            seen_blocks;
-    ext2_open_t         open[EXT2_OPEN_MAX];
     ext2_priv_t        *nodes[EXT2_NODE_BUCKETS];
 
     /* ext3/ext4 (see "ext4: checksums, uninitialised groups, extents" and
@@ -3453,15 +3447,16 @@ static void ext2_free_inode_blocks(ext2_fs_t *fs, uint32_t ino, ext2_inode_t *in
  * On ext3/ext4 (x4) such an orphan is also recorded on disk (below), so one
  * whose last reference is dropped by a crash rather than a close is deleted
  * at the next read-write mount; plain ext2 keeps no orphan list (as Linux's
- * ext2 driver) and leaks it until fsck.  Table exhaustion degrades to the old
- * behaviour (immediate release) rather than to a dangling inode. */
+ * ext2 driver) and leaks it until fsck.
+ *
+ * The count lives in the inode's cached node (ext2_make_node keeps exactly
+ * one per inode number, for the life of the instance), so it cannot run out.
+ * It used to be a 128-slot table: the 129th open inode went untracked, and
+ * unlinking it freed the inode and its blocks under the open descriptor,
+ * which then read and wrote whatever file got those blocks next. */
 
-
-static ext2_open_t *ext2_open_find(ext2_fs_t *fs, uint32_t ino) {
-    for (int i = 0; i < EXT2_OPEN_MAX; i++)
-        if (fs->open[i].ino == ino) return &fs->open[i];
-    return (ext2_open_t *)0;
-}
+static ext2_priv_t *ext2_node_peek(ext2_fs_t *fs, uint32_t ino);
+static void ext2_node_nlink(ext2_fs_t *fs, uint32_t ino, uint32_t nlink);
 
 /* bg_used_dirs_count of the group holding `ino`, changed by `delta`: mkdir
  * and the release of a directory inode keep it what e2fsck counts. */
@@ -3715,14 +3710,9 @@ static void x4_orphan_cleanup(ext2_fs_t *fs) {
 static void ext2_retain_node(vfs_node_t *node) {
     if (!node || !node->private) return;
     ext2_fs_t *fs = ((ext2_priv_t *)node->private)->fs;
-    uint32_t ino = ((ext2_priv_t *)node->private)->ino;
+    ext2_priv_t *e = (ext2_priv_t *)node->private;
     preempt_disable();
-    ext2_open_t *e = ext2_open_find(fs, ino);
-    if (!e) {
-        e = ext2_open_find(fs, 0);
-        if (e) { e->ino = ino; e->refs = 0; e->orphan = 0; }
-    }
-    if (e) e->refs++;
+    e->refs++;
     fs->open_refs++;
     preempt_enable();
 }
@@ -3731,12 +3721,12 @@ static void ext2_close_node(vfs_node_t *node) {
     if (!node || !node->private) return;
     ext2_fs_t *fs = ((ext2_priv_t *)node->private)->fs;
     uint32_t ino = ((ext2_priv_t *)node->private)->ino;
+    ext2_priv_t *e = (ext2_priv_t *)node->private;
     int release = 0;
     preempt_disable();
-    ext2_open_t *e = ext2_open_find(fs, ino);
-    if (e && --e->refs <= 0) {
+    if (e->refs > 0 && --e->refs == 0) {
         release = e->orphan;
-        e->ino = 0; e->refs = 0; e->orphan = 0;
+        e->orphan = 0;
     }
     preempt_enable();
     if (release) {
@@ -3862,6 +3852,23 @@ static void ext2_fill_node(vfs_node_t *node, const ext2_inode_t *inode) {
     node->setattr_fn = ext2_setattr;
     node->settimes_fn = ext2_settimes;
     node->link_fn = ext2_link;
+}
+
+/* The cached node of `ino`, if a lookup ever made one (call with preemption
+ * off). */
+static ext2_priv_t *ext2_node_peek(ext2_fs_t *fs, uint32_t ino) {
+    for (ext2_priv_t *p = fs->nodes[ino % EXT2_NODE_BUCKETS]; p; p = p->hnext)
+        if (p->ino == ino) return p;
+    return (ext2_priv_t *)0;
+}
+
+/* fstat() on a descriptor reads the cached node: keep its link count what
+ * the inode now has (0 once the last name is gone). */
+static void ext2_node_nlink(ext2_fs_t *fs, uint32_t ino, uint32_t nlink) {
+    preempt_disable();
+    ext2_priv_t *p = ext2_node_peek(fs, ino);
+    if (p) ((ext2_vnode_t *)((uint8_t *)p - offsetof(ext2_vnode_t, priv)))->vnode.nlink = nlink;
+    preempt_enable();
 }
 
 /* Return the node for inode `ino_num`, found as `name`, creating it on the
@@ -4064,8 +4071,9 @@ static int ext2_symlink_do(vfs_node_t *dir, const char *name, const char *target
  * or — while a descriptor or a mapping still holds it — mark it orphaned so
  * ext2_close_node() frees it when the last one closes. */
 static void ext2_put_unlinked(ext2_fs_t *fs, uint32_t ino, ext2_inode_t *victim, uint32_t now) {
+    ext2_node_nlink(fs, ino, 0);
     preempt_disable();
-    ext2_open_t *e = ext2_open_find(fs, ino);
+    ext2_priv_t *e = ext2_node_peek(fs, ino);
     int in_use = (e && e->refs > 0);
     if (in_use) e->orphan = 1;
     preempt_enable();
@@ -4131,9 +4139,10 @@ static int ext2_unlink_do(vfs_node_t *dir, const char *name) {
     if (type == EXT2_S_IFDIR) victim.i_links_count = 0;
     victim.i_ctime = now;
 
-    if (victim.i_links_count > 0)            /* another name still refers to it */
+    if (victim.i_links_count > 0) {          /* another name still refers to it */
         ext2_write_inode(fs, victim_ino, &victim);
-    else
+        ext2_node_nlink(fs, victim_ino, victim.i_links_count);
+    } else
         ext2_put_unlinked(fs, victim_ino, &victim, now);
 
     dir_inode.i_mtime = now;
@@ -4306,9 +4315,10 @@ static int ext2_rename_do(vfs_node_t *old_dir, const char *old_name,
             dst.i_links_count--;
         }
         dst.i_ctime = now;
-        if (dst.i_links_count > 0)
+        if (dst.i_links_count > 0) {
             ext2_write_inode(fs, dst_ino, &dst);
-        else
+            ext2_node_nlink(fs, dst_ino, dst.i_links_count);
+        } else
             ext2_put_unlinked(fs, dst_ino, &dst, now);
     }
 
@@ -5369,7 +5379,7 @@ static int ext2_truncate(vfs_node_t *node, uint64_t new_size) {
         (in.i_mode & EXT2_S_IFMT) == EXT2_S_IFREG && in.i_links_count && x4_is_ext(&in) &&
         new_size / fs->st.block_size + 1 < ext2_isize(&in) / fs->st.block_size) {
         preempt_disable();
-        ext2_open_t *e = ext2_open_find(fs, ino);
+        ext2_priv_t *e = ext2_node_peek(fs, ino);
         orph = !(e && e->orphan);
         preempt_enable();
         if (orph) {
