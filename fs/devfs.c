@@ -512,6 +512,7 @@ static vfs_node_t dev_dir;   /* the /dev directory itself */
 typedef struct {
     int used;
     int id;
+    uint32_t gen;                /* changes each time the slot is handed out */
     int master_refs;
     int slave_refs;
     int master_closed;
@@ -532,6 +533,15 @@ typedef struct {
 } pty_pair_t;
 
 static pty_pair_t ptys[MAX_PTYS];
+static uint32_t pty_gen;
+
+/* A read or write that slept may find the pair closed by its last holder,
+ * freed and handed to someone else (a thread sharing the descriptor table
+ * can close it under a sleeping sibling): it must not carry on in another
+ * user's terminal. */
+static int pty_gone(pty_pair_t *p, uint32_t gen) {
+    return !p->used || p->gen != gen;
+}
 static vfs_node_t dev_ptmx;
 static vfs_node_t dev_pts_dir;
 static vfs_node_t *dev_shm_root;   /* tmpfs mounted at /dev/shm (POSIX shm_open) */
@@ -542,6 +552,7 @@ static uint32_t pty_buf_read(pty_pair_t *p, int from_slave,
     uint32_t *head = from_slave ? &p->s2m_head : &p->m2s_head;
     uint32_t *count = from_slave ? &p->s2m_count : &p->m2s_count;
     uint32_t n = 0;
+    uint32_t gen = p->gen;
 
     /* POSIX read semantics: wait until at least one byte is available (or
      * EOF/signal), then return whatever is buffered, up to len. */
@@ -558,6 +569,7 @@ static uint32_t pty_buf_read(pty_pair_t *p, int from_slave,
         if (signal_interrupt_pending(current_proc))
             return n;
         sleep_on(p);
+        if (pty_gone(p, gen)) return n;
     }
     uint32_t take = len;
     if (take > *count) take = *count;
@@ -577,6 +589,7 @@ static uint32_t pty_buf_write(pty_pair_t *p, int to_slave,
     uint32_t *head = to_slave ? &p->m2s_head : &p->s2m_head;
     uint32_t *count = to_slave ? &p->m2s_count : &p->s2m_count;
     uint32_t n = 0;
+    uint32_t gen = p->gen;
 
     while (n < len) {
         if ((to_slave && p->slave_closed) ||
@@ -589,6 +602,7 @@ static uint32_t pty_buf_write(pty_pair_t *p, int to_slave,
             if (signal_interrupt_pending(current_proc))
                 return n;
             sleep_on(p);
+            if (pty_gone(p, gen)) return n;
         }
         uint32_t tail = (*head + *count) % PTY_BUF_SIZE;
         ring[tail] = buf[n++];
@@ -985,13 +999,24 @@ static void pty_slave_close(vfs_node_t *n) {
  * descriptors — must reserve nothing.  It used to be called from the lookup,
  * and because pty_maybe_free() is only reachable from the close paths, eight
  * stat("/dev/ptmx") calls exhausted the table for the life of the boot. */
+/* Slots kept for root (Linux kernel.pty.reserve): one user holding every
+ * pty must not lock root out of a terminal. */
+#define PTY_ROOT_RESERVE 2
+
 static vfs_node_t *pty_alloc_master(void) {
+    uint32_t euid = current_proc ? current_proc->euid : 0;
+    if (euid != 0) {
+        int inuse = 0;
+        for (int i = 0; i < MAX_PTYS; i++) inuse += ptys[i].used;
+        if (inuse >= MAX_PTYS - PTY_ROOT_RESERVE) return NULL;
+    }
     for (int i = 0; i < MAX_PTYS; i++) {
         pty_pair_t *p = &ptys[i];
         if (p->used) continue;
         memset(p, 0, sizeof(*p));
         p->used = 1;
         p->id = i;
+        p->gen = ++pty_gen;
         /* The descriptor that this open is feeding takes the reference itself
          * (vfs_retain -> pty_master_retain), the same way every other
          * filesystem's nodes are referenced.  Pre-taking it here as well

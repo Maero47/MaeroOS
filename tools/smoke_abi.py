@@ -130,6 +130,10 @@ PROBES = {
     "p55_path_search":         (60, "/disk"),
     # Mounts hold their mountpoint and root (bind source removed, EBUSY).
     "p56_mount_refs":          (60, ""),
+    # chmod 000 / mode-0 files are root's alone; /etc/shadow is not readable.
+    "p57_mode_zero":           (60, "/disk"),
+    # A read asleep on a pty freed by another thread sees no later pty.
+    "p58_pty_reuse":           (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

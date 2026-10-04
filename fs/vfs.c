@@ -133,7 +133,9 @@ int vfs_access_check_groups(vfs_node_t *node, uint32_t euid, uint32_t egid,
      * one -- /dev/input/event0 with every keystroke, /dev/fb0 -- world
      * readable and writable. */
     if (m == 0) {
-        if (node->flags == VFS_FLAG_CHARDEV || node->flags == VFS_FLAG_BLKDEV)
+        /* chmod 000, or a disk inode with no permission bits: nothing. */
+        if (node->flags == VFS_FLAG_CHARDEV || node->flags == VFS_FLAG_BLKDEV ||
+            (node->vflags & VFS_V_MODE_SET) || node->setattr_fn)
             return -13;                                       /* -EACCES */
         if (node->flags != VFS_FLAG_FILE && node->flags != VFS_FLAG_DIR)
             m = 0666;
@@ -151,6 +153,7 @@ int vfs_access_check_groups(vfs_node_t *node, uint32_t euid, uint32_t egid,
 
 int vfs_setattr_quiet(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid) {
     if (!node) return -2;
+    if ((mode & 07777) != node->mask) node->vflags |= VFS_V_MODE_SET;
     node->mask = mode & 07777;
     node->uid = uid;
     node->gid = gid;
@@ -159,6 +162,7 @@ int vfs_setattr_quiet(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gi
 
 int vfs_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid) {
     if (!node) return -2;
+    if ((mode & 07777) != node->mask) node->vflags |= VFS_V_MODE_SET;
     vfs_node_t *parent = NULL;
     char name[256];
     int haveparent = inotify_nwatches && vfs_last_parent(node, &parent, name);

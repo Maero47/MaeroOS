@@ -74,6 +74,8 @@ regression tests for the fixes in audit section 5.
 | P54 | `p54_dev_perms.c`           | as uid 65534: `/dev/null`, `zero`, `urandom`, `ptmx` open; `/dev/input/event*`, `fb0`, `dsp`, `snd/*` and disks are EACCES; root's `/dev/pts/N` is 0620 root-owned and EACCES, its own pty slave is its own (mode-0 device nodes used to be world read/write) | — |
 | P55 | `p55_path_search.c`         | as uid 65534, in /tmp and /disk: open/stat/readlink/create/chdir under a 0700 directory are EACCES (also two levels down and through a symlink); a 0711 directory is walked through and chdir'd into but not listed (the walk checked no search permission) | — |
 | P56 | `p56_mount_refs.c`          | a tmpfs bind mount whose source directory is removed still stats as an empty directory while 300 new directories are made (the table kept raw pointers, so the mount showed freed memory); rmdir/rename of a mountpoint and rename over one are EBUSY; umount works after | — |
+| P57 | `p57_mode_zero.c`           | as uid 65534, in /tmp and /disk: a chmod-000 file, a file created with mode 0 and a file in a chmod-000 directory are EACCES; /etc/shadow does not open (also run by smoke-cmds on the diskless initrd, whose files were all 0755) | — |
+| P58 | `p58_pty_reuse.c`           | a thread asleep in read() on a pty slave whose descriptors another thread closes does not return the input written to the next pty opened (the pair was freed and reused under the sleeper) | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the
