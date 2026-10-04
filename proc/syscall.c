@@ -706,10 +706,18 @@ static int fd_kstat64(int fd, struct kstat64 *kst) {
         fill_kstat64(kst, f->node);
         return 0;
     case FD_PIPE_R: case FD_PIPE_W:
+        /* An opened named FIFO is its inode (owner, mode, st_ino/st_dev);
+         * only a pipe(2) end, which has no node, is synthetic. */
+        if (f->node) {
+            fill_kstat64(kst, f->node);
+            kst->st_size = 0;
+            kst->st_blocks = 0;
+            return 0;
+        }
         kst->st_mode = 0010666;                 /* S_IFIFO  */
         return 0;
     case FD_SOCKET: case FD_USOCKET:
-        kst->st_mode = 0140777;                 /* S_IFSOCK */
+        kst->st_mode = 0140777;                /* S_IFSOCK */
         return 0;
     case FD_NONE:
         if (fd > 2) return -9;                  /* -EBADF */
@@ -728,6 +736,8 @@ static void epoll_retain(struct epoll *ep);
 static void epoll_release(struct epoll *ep);
 static void vfork_wake_parent(void);                  /* CLONE_VFORK unblock */
 void vma_clear(struct proc *p);                       /* free a proc's VMAs */
+void vma_exit(struct proc *p);
+void vma_release(struct proc *p);
 void vma_clone(struct proc *parent, struct proc *child);
 
 /* ── eventfd ──────────────────────────────────────────────────────────────
@@ -1745,22 +1755,28 @@ static int sys_getpid(registers_t *regs) {
 static void unmap_pages(uint32_t start, uint32_t end);
 
 /* ── sys_brk(void *addr) — EAX=45 ───────────────────────────────────────── */
+static struct proc *mmap_owner(void);
+
+/* The break belongs to the address space (Linux mm->brk), so it lives on the
+ * thread-group leader with the VMA list and the mmap cursor: a worker thread's
+ * brk must see, and move, the break the main thread set. */
 static int sys_brk(registers_t *regs) {
     uint32_t new_brk = (uint32_t)regs->ebx;
+    struct proc *mo = mmap_owner();
 
     /* Query: return current break */
     if (new_brk == 0)
-        return (int)current_proc->heap_end;
+        return (int)mo->heap_end;
 
     /* Clamp: must be in user address space below the stack guard. */
     if (new_brk >= USER_STACK_BASE)
         return -12;  /* -ENOMEM */
     /* Nor into the NULL-page floor (an image with no loadable segment has
      * its break at 0). */
-    if (new_brk < USER_MIN_ADDR || current_proc->heap_end < USER_MIN_ADDR)
+    if (new_brk < USER_MIN_ADDR || mo->heap_end < USER_MIN_ADDR)
         return -12;
 
-    uint32_t old_brk = current_proc->heap_end;
+    uint32_t old_brk = mo->heap_end;
 
     if (new_brk > old_brk) {
         /* Grow heap: map pages from old_brk up to new_brk */
@@ -1800,7 +1816,7 @@ static int sys_brk(registers_t *regs) {
         if (va < end) unmap_pages(va, end);
     }
 
-    current_proc->heap_end = new_brk;
+    mo->heap_end = new_brk;
     return (int)new_brk;
 }
 
@@ -4257,6 +4273,69 @@ void vma_clear(struct proc *p) {
     while (v) { struct vma *n = v->next; vma_free_one(v); v = n; }
 }
 
+/* Does anyone other than `p` still run in the address space `mm`? */
+static int mm_has_live_user(uint32_t mm, struct proc *p) {
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (q == p || q->pgdir_phys != mm) continue;
+        if (q->state == PROC_UNUSED || q->state == PROC_ZOMBIE) continue;
+        return 1;
+    }
+    return 0;
+}
+
+/* A thread is exiting (already a zombie).  The VMA list belongs to the address
+ * space, and it lives on the group leader (or on the vm_owner a CLONE_VM child
+ * points at) — which may itself have exited first: the leader of a process
+ * whose other threads run on stays a zombie (waitpid reports it only when the
+ * group is empty) and must keep the VMAs they fault through.  So the list goes
+ * when the LAST thread running in the address space does (Linux mmput when
+ * mm_users drops to 0), from whichever zombie holds it. */
+void vma_exit(struct proc *p) {
+    uint32_t mm = p ? p->pgdir_phys : 0;
+    if (!mm) { vma_clear(p); return; }
+    if (mm_has_live_user(mm, p)) return;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (q->pgdir_phys == mm && q->state == PROC_ZOMBIE && q->vmas)
+            vma_clear(q);
+    }
+}
+
+/* A zombie is being freed.  Its VMAs are normally gone already (vma_exit); the
+ * exception is an address-space owner that a CLONE_VM child (vfork,
+ * posix_spawn, a crash-dumper clone) still runs in after the owner's whole
+ * group has been reaped: hand the list and the cursors to that child so the
+ * slot can be reused without leaving it a dangling vm_owner. */
+void vma_release(struct proc *p) {
+    struct proc *heir = NULL;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (q == p || q->state == PROC_UNUSED || q->vm_owner != p) continue;
+        if (!heir && q->state != PROC_ZOMBIE && q->pgdir_phys == p->pgdir_phys)
+            heir = q;
+        q->vm_owner = NULL;
+    }
+    if (!heir) { vma_clear(p); return; }
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (q != heir && q->state != PROC_UNUSED &&
+            q->pgdir_phys == p->pgdir_phys && q->tgid == q->pid &&
+            q->tgid != p->tgid)
+            q->vm_owner = heir;
+    }
+    vma_clear(heir);                    /* its own list was never used */
+    uint32_t irq = vma_irq_save();
+    heir->vmas = p->vmas;
+    p->vmas = NULL;
+    vma_irq_restore(irq);
+    heir->heap_end    = p->heap_end;
+    heir->brk_base    = p->brk_base;
+    heir->mmap_next   = p->mmap_next;
+    heir->image_start = p->image_start;
+    heir->image_end   = p->image_end;
+}
+
 /* Copy parent's VMA list to child (fork), preserving order. */
 void vma_clone(struct proc *parent, struct proc *child) {
     child->vmas = NULL;
@@ -6515,6 +6594,8 @@ static int sys_ppoll(registers_t *regs, int time64) {
 #define EPOLL_MAX_ITEMS 256
 #define EPOLLIN_K   0x001
 #define EPOLLOUT_K  0x004
+#define EPOLLONESHOT_K 0x40000000U
+#define EPOLLET_K      0x80000000U
 /* An item names a descriptor NUMBER plus the identity (proc_file_t.fid) of
  * the open file it held when it was added.  Linux ties a registration to the
  * struct file, so it ends when that file's last descriptor closes: here an
@@ -6529,6 +6610,9 @@ struct epoll {
         uint32_t fid;         /* open-file identity at ADD time */
         uint32_t events;      /* requested EPOLL* mask */
         uint8_t  data[8];     /* opaque epoll_data, echoed back */
+        uint8_t  quiet;       /* EPOLLONESHOT fired, or an EPOLLET edge of a
+                               * file whose readiness never changes was
+                               * reported: silent until the next MOD */
     } items[EPOLL_MAX_ITEMS];
     int refcount;
 };
@@ -6604,6 +6688,7 @@ static int sys_epoll_ctl(registers_t *regs) {
         ep->items[slot].fd  = fd;
         ep->items[slot].fid = wf->fid;
         ep->items[slot].events = ev.events;
+        ep->items[slot].quiet  = 0;
         __builtin_memcpy(ep->items[slot].data, ev.data, 8);
         return 0;
     }
@@ -6611,6 +6696,7 @@ static int sys_epoll_ctl(registers_t *regs) {
         for (int i = 0; i < EPOLL_MAX_ITEMS; i++)
             if (ep->items[i].fd == fd && epoll_item_live(ep, i)) {
                 ep->items[i].events = ev.events;
+                ep->items[i].quiet  = 0;          /* re-armed (Linux ep_modify) */
                 __builtin_memcpy(ep->items[i].data, ev.data, 8);
                 return 0;
             }
@@ -6655,11 +6741,25 @@ static int epoll_wait_held(struct epoll *ep, void *uevents, int maxevents, int t
         int n = 0;
         for (int i = 0; i < EPOLL_MAX_ITEMS && n < maxevents; i++) {
             int wfd = ep->items[i].fd;
-            if (!epoll_item_live(ep, i)) continue;
+            if (!epoll_item_live(ep, i) || ep->items[i].quiet) continue;
             uint32_t want = ep->items[i].events, rev = 0;
             if ((want & EPOLLIN_K)  && fd_read_ready(wfd))  rev |= EPOLLIN_K;
             if ((want & EPOLLOUT_K) && fd_write_ready(wfd)) rev |= EPOLLOUT_K;
             if (rev) {
+                /* EPOLLONESHOT: one report, then disabled until MOD.
+                 * EPOLLET on a file with no readiness hooks (a regular or
+                 * /proc file: always ready, nothing ever wakes it): Linux
+                 * reports it once, at ADD/MOD, and never again.  Reporting it
+                 * level-triggered made libmount's /proc/self/mountinfo
+                 * monitor (GIO's mount monitor, the GTK file chooser) spin
+                 * in epoll_pwait forever.  Other kinds stay level-triggered:
+                 * spurious ET reports are harmless to a reader that drains
+                 * to EAGAIN, a missed edge would not be. */
+                proc_file_t *wf = &current_proc->ofile[wfd];
+                if ((want & EPOLLONESHOT_K) ||
+                    ((want & EPOLLET_K) && wf->type == FD_FILE && wf->node &&
+                     !wf->node->read_ready_fn && !wf->node->write_ready_fn))
+                    ep->items[i].quiet = 1;
                 struct { uint32_t events; uint8_t data[8]; } __attribute__((packed)) out;
                 out.events = rev;
                 __builtin_memcpy(out.data, ep->items[i].data, 8);
@@ -10905,6 +11005,7 @@ void syscall_dispatch(registers_t *regs) {
     case 501: ret = shm_sys_map((int)regs->ebx);   break;
     case 502: ret = shm_sys_unmap((int)regs->ebx); break;
     case 506: ret = shm_sys_chmod((int)regs->ebx, regs->ecx); break;
+    case 509: ret = shm_sys_size((int)regs->ebx);  break;
     case 503:  /* kprof: dump the cycle accounting (see include/kernel/kprof.h) */
         kprof_dump("mark");
         ret = 0;

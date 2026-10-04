@@ -100,6 +100,10 @@ connects, logs every request (`c2 #173 MapWindow len=8`), reply, event and
 error per client to `/tmp/maerox.log` — the last request of a client that
 stalls is the first thing to read.  `ps` plus an NMI (`inject-nmi` in the
 QEMU monitor) shows which syscall each of its threads sleeps in.
+`tools/debug_mousepad_save.py` does exactly that for Mousepad's Ctrl+S: it
+found GLib's `gmain` thread spinning in `epoll_pwait` on libmount's
+`EPOLLET` watch of `/proc/self/mountinfo` while the main thread waited on it
+(fixed: epoll honours `EPOLLET` for always-ready files and `EPOLLONESHOT`).
 
 `tools/maerox-host/run.sh` builds maeroX for the Linux build host (a stub
 libgui with a control FIFO and PPM screen dumps) and runs it with an app from

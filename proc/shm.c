@@ -206,6 +206,24 @@ int shm_sys_chmod(int id, uint32_t mode) {
     return 0;
 }
 
+/* The object's size in bytes (Linux shmctl IPC_STAT shm_segsz): what bounds
+ * reads of a mapping of it, whatever a client claims its surface is.  Like
+ * IPC_STAT it needs read permission, which the address space that has it
+ * attached already proved. */
+int shm_sys_size(int id) {
+    shm_object_t *obj = shm_get(id);
+    struct proc *p = current_proc;
+    if (!obj || !p) return -22;
+    if (p->euid != 0 && !attach_find(cur_mm(), id)) {
+        uint32_t bits;
+        if (p->euid == obj->uid)        bits = obj->mode >> 6;
+        else if (in_group(p, obj->gid)) bits = obj->mode >> 3;
+        else                            bits = obj->mode;
+        if (!(bits & 4)) return -13;        /* -EACCES */
+    }
+    return (int)(obj->npages * PAGE_SIZE);
+}
+
 void shm_proc_fork(struct proc *parent, struct proc *child) {
     uint32_t pm = parent->pgdir_phys, cm = child->pgdir_phys;
     if (!pm || !cm || pm == cm) return;     /* CLONE_VM: records are shared */

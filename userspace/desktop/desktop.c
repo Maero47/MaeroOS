@@ -140,6 +140,7 @@ typedef struct {
 #define SYS_SHM_CREATE 500
 #define SYS_SHM_MAP    501
 #define SYS_SHM_UNMAP  502
+#define SYS_SHM_SIZE   509   /* the object's size in bytes */
 
 #define TERM_LINES 28   /* terminal scrollback (display tail) */
 
@@ -2109,33 +2110,6 @@ static void set_client_line(int idx, const char *arg) {
 
 /* surface SHMID W H — adopt a client-rendered pixel buffer as the window
  * content (the modern path: the client draws, we composite). */
-/* Bytes mapped from addr to the end of the mapping holding it, from
- * /proc/self/maps (0 when none).  The shm object behind a "surface" is the
- * client's: its size, not the w and h the client claims, bounds the reads. */
-static uint32_t mapped_bytes_from(uint32_t addr) {
-    char line[160];
-    uint32_t got = 0;
-    FILE *f = fopen("/proc/self/maps", "r");
-
-    if (!f) return 0;
-    while (fgets(line, sizeof(line), f)) {
-        unsigned long lo, hi;
-        size_t n = strlen(line);
-        int whole = n && line[n - 1] == '\n';
-        if (sscanf(line, "%lx-%lx", &lo, &hi) == 2 && lo <= addr && addr < hi) {
-            got = (uint32_t)(hi - addr);
-            break;
-        }
-        /* skip the rest of an over-long line */
-        while (!whole && fgets(line, sizeof(line), f)) {
-            n = strlen(line);
-            whole = n && line[n - 1] == '\n';
-        }
-    }
-    fclose(f);
-    return got;
-}
-
 static void set_client_pixels(int idx, const char *arg) {
     int shmid, w, h;
     int addr;
@@ -2153,9 +2127,9 @@ static void set_client_pixels(int idx, const char *arg) {
         add_log("WMCTL SURFACE MAP FAILED");
         return;
     }
-    /* w*h*4 <= 2048*2048*4, no overflow; the blit, the fast path and the
-     * thumbnail read all of it. */
-    if (mapped_bytes_from((uint32_t)addr) < (uint32_t)w * (uint32_t)h * 4u) {
+    /* The mapped object's size, not the w and h the client claims, bounds
+     * the reads (w*h*4 <= 2048*2048*4, no overflow). */
+    if (syscall1(SYS_SHM_SIZE, shmid) < w * h * 4) {
         syscall1(SYS_SHM_UNMAP, shmid);
         add_log("WMCTL SURFACE TOO SMALL");
         trace("surface too small: slot=%d shm=%d %dx%d", idx + 1, shmid, w, h);

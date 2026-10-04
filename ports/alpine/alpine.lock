@@ -45,7 +45,9 @@ file openssh-server-10.0_p1-r10.apk 41b6c14ba5852123d2c465ed6a20fefe86cbe526f968
 file openssh-server-common-10.0_p1-r10.apk 2cdfaed423be753dc226a8ddc449c3536ae1e093949df68072f21a8c7f7827b1
 file pcre2-10.46-r0.18ec3011.apk eafeb653254c467dcdf2032a6a936db0c5f500733a49d16d6a1a8e5b0225f0b9
 file python3-3.12.14-r0.1920ab30.apk 70c6d810b653962908715c5151bdde06db5cddf6578a656e75534f2af338f8d5
+file python3-3.12.15-r0.19087d58.apk 7bc3685f88e85e926f7b204c88a371079e383d913f8977fb30b453177e8c4461
 file python3-pycache-pyc0-3.12.14-r0.6c641485.apk e002cd4aac067d848d194c1bdf4aae516fc4f05a2687f1c28561a87eb7027ca7
+file python3-pycache-pyc0-3.12.15-r0.042b9d44.apk 26e6ffde3dc972acf5f328dcdfede32f214292f68b9a98a742b36ee7a70e177a
 file readline-8.2.13-r1.cca6bcd2.apk 29e35b5876481d0d1d4f60fdfdbd59a0c974d86e6355f7c38ea85518645ada6b
 file skalibs-libs-2.14.4.0-r0.b33bdf36.apk 8973ee7375fea1ba1757cee0c2590e1a3b3f1ad0407df79cd2054729088fb70a
 file sqlite-libs-3.49.2-r1.63e86c9c.apk 8f02658fa7fb60a4d25b8a167fbd140bd58ea26d2d56f8ef15d8c16b3d1e6447
@@ -109,10 +111,10 @@ pkg openssh-client-common-10.0_p1-r10
 pkg openssh-client-default-10.0_p1-r10
 pkg openssh-keygen-10.0_p1-r10
 pkg pcre2-10.46-r0
-pkg pyc-3.12.14-r0
-pkg python3-3.12.14-r0
-pkg python3-pyc-3.12.14-r0
-pkg python3-pycache-pyc0-3.12.14-r0
+pkg pyc-3.12.15-r0
+pkg python3-3.12.15-r0
+pkg python3-pyc-3.12.15-r0
+pkg python3-pycache-pyc0-3.12.15-r0
 pkg readline-8.2.13-r1
 pkg repo:openssh-server-10.0_p1-r10
 pkg repo:openssh-server-common-10.0_p1-r10

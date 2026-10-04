@@ -28,11 +28,13 @@ struct proc;
  * euid/egid with mode 0600.  Mapping (read-write) needs rw permission for the
  * caller's class; root bypasses.  The owner may widen the mode.
  *
- * Syscalls (custom numbers 500-502 and 506, outside the Linux i386 table):
+ * Syscalls (custom numbers 500-502, 506 and 509, outside the Linux i386 table):
  *   shm_create(npages)   → id  (-ENOSPC past SHM_UID_MAX_PAGES, non-root)
  *   shm_map(id)          → vaddr (mapped PAGE_SHARED|WRITABLE|USER)
  *   shm_unmap(id)        → 0   (also drops an unused creator reservation)
  *   shm_chmod(id, mode)  → 0   (506; owner or root; mode & 0666)
+ *   shm_size(id)         → bytes (509; the object's size, as IPC_STAT shm_segsz;
+ *                          needs read permission or an attachment here)
  */
 
 #define SHM_MAX_OBJECTS 32
@@ -51,6 +53,7 @@ int shm_sys_create(uint32_t npages);
 int shm_sys_map(int id);
 int shm_sys_unmap(int id);
 int shm_sys_chmod(int id, uint32_t mode);
+int shm_sys_size(int id);
 
 /* fork: the child's new address space inherited every PTE (shared ones are
  * increfed by the clone loop); copy the parent's attachment records to it.  A

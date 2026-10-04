@@ -4,7 +4,7 @@
 #include "seccomp.h"
 #include "ktimer.h"
 
-extern void vma_clear(struct proc *p);   /* free demand-paged VMAs (syscall.c) */
+extern void vma_exit(struct proc *p);    /* free the VMAs with the last thread (syscall.c) */
 #include "pipe.h"
 #include "usocket.h"
 #include "shm.h"
@@ -800,7 +800,7 @@ void proc_exit(int status) {
         current_proc->exit_status = status;
     current_proc->state = PROC_ZOMBIE;
 
-    vma_clear(current_proc);   /* free demand-paged anon VMAs (no-op for threads) */
+    vma_exit(current_proc);    /* the VMAs go with the address space's last thread */
 
     if (current_proc->sid == current_proc->pid && current_proc->ctty)
         devfs_session_tty_hangup(current_proc->sid, current_proc->ctty);
@@ -855,6 +855,14 @@ void proc_exit(int status) {
         notify = proc_group_empty(current_proc);
     } else if (leader && leader != current_proc && leader->state == PROC_ZOMBIE) {
         notify = proc_group_empty(leader);
+        /* The last thread of a process whose leader exited first: without a
+         * group exit, its own code is what the parent's wait reports, not
+         * the zombie leader's.  Measured on Linux 7.0 (i386 musl and x86_64
+         * glibc, raw exit syscalls, no exit_group under strace): leader
+         * SYS_exit(0) or SYS_exit(3), then worker SYS_exit(5), waits as 0x500
+         * and strace shows the leader "exited with 5".  abiprobe p60. */
+        if (notify && !leader->group_exit)
+            leader->exit_status = status;
     }
 
     /* The process is gone once its last thread is: so are its timers. */
