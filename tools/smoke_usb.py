@@ -54,6 +54,10 @@ Checks:
     host (tools/exfatimg.py and fsck.exfat -n); stick Y pulled out while
     mounted with a reader on it: no panic, the mount can be taken down, and
     plugged back in it mounts again with its data;
+  - a usb-uas device with a scsi-hd (USB Attached SCSI) on a SuperSpeed
+    port: brought up as UAS with streams (stream 1 on its status and data
+    pipes), mounted (vfat), a file checked by md5, a copy and a new file
+    written, and after umount both found in the image on the host;
   - kusbd's CPU time over 10 idle seconds (/proc/cputime), reported.
 
 The serial console is only used to log in a root shell for those checks (the
@@ -89,6 +93,8 @@ STICK_SIZE, STICK_B_SIZE = 8 << 20, 16 << 20
 WRITE_AT, WRITE_TEXT = STICK_SIZE - 3000, "written-over-usb"
 REPLUGS = 5
 LUN_SIZES = (2 << 20, 3 << 20)
+# A usb-uas disk (UAS, streams) on a SuperSpeed-only root port.
+UAS_SIZE = 12 << 20
 # Two exFAT sticks plugged in late, behind the hub.
 EXFAT_STICKS = (("X", "uexx", "3.4", 4 << 20), ("Y", "uexy", "3.5", 6 << 20))
 ENV = dict(os.environ, MTOOLS_SKIP_CHECK="1")
@@ -639,6 +645,39 @@ class UsbSmoke(GuiSmoke):
               f"no panic, the mount taken down; back as {node2}/{y2} it "
               f"mounts with its data")
 
+    def uas(self):
+        """The UAS disk: streams, mount, read, write."""
+        con = self.con
+        m = con.wait_re(r"\[USB-MSC\] slot (\d+): UAS on interface \d+ alt "
+                        r"\d+, streams", start=0)
+        slot = m.group(1)
+        m = con.wait_re(r"\[USB-MSC\] /dev/(usbdisk\d): .* %d blocks of 512 "
+                        r"bytes .*, slot %s LUN 0, UAS with streams"
+                        % (UAS_SIZE // 512, slot), start=0)
+        node = m.group(1)
+        sd = con.wait_re(r"\[USB-MSC\] /dev/%s is /dev/(sd[a-z])" % node,
+                         start=0).group(1)
+        rc, out = self.bsh(
+            f"busybox mkdir -p /mnt/uas && "
+            f"busybox mount -t vfat /dev/{sd} /mnt/uas && "
+            f"busybox md5sum /mnt/uas/ubig.bin && "
+            f"busybox cp /mnt/uas/ubig.bin /mnt/uas/ucopy.bin && "
+            f"echo hello-uas > /mnt/uas/u-new.txt && "
+            f"busybox md5sum /mnt/uas/ucopy.bin && busybox sync && "
+            f"busybox umount /mnt/uas", timeout=120)
+        want = md5(self.uas_files["ubig.bin"])
+        if rc != 0 or out.count(want) != 2:
+            raise AssertionError(f"UAS mount/read/write ({rc}): {out!r}")
+        if md5(stick_file(self.uas_img, "ucopy.bin")) != want or \
+                stick_file(self.uas_img, "u-new.txt") != b"hello-uas\n":
+            raise AssertionError("the UAS writes are not in the image")
+        bad = [l for l in con.text().splitlines()
+               if re.search(r"slot %s: .*(timed out|failed)" % slot, l)]
+        if bad:
+            raise AssertionError(f"UAS transfer errors: {bad[:5]}")
+        print(f"\n[SMOKE-USB] UAS disk {node} = {sd}: streams, vfat mounted, "
+              f"md5 ok, a copy and a new file written and found in the image")
+
     def cputime(self):
         """kusbd's CPU time over 10 idle seconds."""
         def sample():
@@ -680,6 +719,7 @@ class UsbSmoke(GuiSmoke):
         step("two sticks mounted together", self.two_sticks)
         step("replug the sticks", self.hotplug)
         step("two exFAT sticks, one pulled out mounted", self.exfat_sticks)
+        step("UAS disk", self.uas)
         step("idle CPU", self.cputime)
         self.settle()
         self.shot("final")
@@ -717,6 +757,9 @@ def main():
                       "x-hello.txt": b"hello X\n"})
     make_exfat_stick(exfat["Y"], EXFAT_STICKS[1][3],
                      {"ybig.bin": exfiles["ybig.bin"]})
+    uas_img = os.path.join(OUT, "uas.img")
+    uas_files = {"ubig.bin": os.urandom(400 * 1024)}
+    make_stick(uas_img, UAS_SIZE, "UASDISK", uas_files)
     sockdir = tempfile.mkdtemp(prefix="susb")
     qmp_path = os.path.join(sockdir, "qmp")
     accel = smoke_gui.pick_accel()
@@ -729,7 +772,8 @@ def main():
            # an HDA card for the volume keys' mixer (output discarded)
            "-audiodev", "none,id=hdanull", "-device", "intel-hda",
            "-device", "hda-duplex,audiodev=hdanull",
-           "-device", "qemu-xhci,id=xhci",
+           # p3=8: root ports 5-8 are SuperSpeed only (the UAS disk)
+           "-device", "qemu-xhci,id=xhci,p2=4,p3=8",
            "-device", f"usb-kbd,id={KBD},display={DISPLAY},bus=xhci.0,port=1",
            "-device", f"usb-tablet,id={TABLET},display={DISPLAY},bus=xhci.0,"
                       "port=2",
@@ -746,6 +790,9 @@ def main():
            "-drive", f"if=none,id=stickb,format=raw,file={stick_b}",
            "-device", f"usb-storage,drive=stickb,id={STICK_B},bus=xhci.0,"
                       "port=4",
+           "-drive", f"if=none,id=uasd,format=raw,file={uas_img}",
+           "-device", "usb-uas,id=uas,bus=xhci.0,port=5",
+           "-device", "scsi-hd,bus=uas.0,scsi-id=0,lun=0,drive=uasd",
            "-qmp", f"unix:{qmp_path},server=on,wait=off"]
     with open(os.path.join(OUT, "qemu-cmdline.txt"), "w") as f:
         f.write(" ".join(cmd) + "\n")
@@ -764,6 +811,8 @@ def main():
         smoke.files = files
         smoke.exfat = exfat
         smoke.exfiles = exfiles
+        smoke.uas_img = uas_img
+        smoke.uas_files = uas_files
         steps = smoke.run()
         print("\n[SMOKE-USB] timings: " +
               ", ".join(f"{n} {s:.1f}s" for n, s in steps))
