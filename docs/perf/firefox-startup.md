@@ -754,3 +754,105 @@ no free TCP pcb`); now 64.
   Twemoji only. *(Since done: DejaVu Sans, Serif and Sans Mono in four styles
   plus fontconfig aliases; `make smoke-firefox-web` checks for boxes.)*
 
+
+## Round five (2026-10-04): 3.0 s -> 1.7 s, with CJK and Indic fonts
+
+### Measuring Firefox, not the harness
+
+`summary.txt`'s "first paint (ff verdict)" was 8.3-8.8 s after the
+launcher started, and none of that number was Firefox: `ff` prints its
+verdict only after a 5 s grace check, and the line then waits on the serial
+port behind whatever Firefox printed before it (47 KiB at 115200 baud is
+four seconds). `ff` now measures the time itself, from launching
+`firefox-bin` to the paint marker, polling every 20 ms
+(`ff: paint marker N ms after launch`); it also zeroes kprof at the launch
+(syscall 504), so the dump at the marker covers exactly that span. And
+`maeros.cfg` prints Firefox's own timeline from
+`Services.startup.getStartupInfo()` (`maeros-startup:` on the console,
+`firefox startup timeline` in `summary.txt`). The base tree measured
+**3.0 s** this way, and at the marker:
+
+| Bucket | Time |
+|---|---:|
+| `user` | 767 ms |
+| syscalls | 762 ms, of which `mmap2` 600 ms over 1984 calls |
+| `ata` | 710 ms (7546 commands, 258 k sectors) |
+| `pgfault` | 521 ms |
+| `irq` | 231 ms |
+| `idle` | 0 |
+
+### `mmap2` populated what nobody touched
+
+Private mappings under 4 MiB (anonymous) or 1 MiB (file) were filled at
+`mmap` time. Two Firefox habits made that the most expensive syscall of the
+startup. mozjemalloc maps 1 MiB chunks, each of which was zeroed whole on
+the spot. And `ld.so` maps every library twice: first its whole span,
+PROT_READ from the file, to reserve the address range, then each LOAD
+segment over it with MAP_FIXED. For every library under 1 MiB the
+reservation was read in from the file in full and then thrown away by the
+overlay, which read the pages again. The KTRACE probe on that path
+(`mmap_pop`) said 859 ms.
+
+Private mappings now always fault in on first touch, as on Linux. The
+demand path already served every large mapping (thread stacks, libxul), and
+kernel-mode faults on user pages were already handled (`copy_to_user`
+demand-faults, `vfs_read` into user memory goes through a bounce buffer), so
+nothing new had to learn about it. File-backed faults fell from 67 k to
+31 k, disk commands by 14 %, `mmap2` from 600 ms to 5 ms, and the paint
+from **3.0 s to 2.1 s**.
+
+### The sandbox's console output
+
+`MOZ_SANDBOX_LOGGING=1` makes every sandboxed child print its whole seccomp
+BPF program, 2466 lines: 40 KiB of the 48 KiB on the serial console before
+the paint. The UART is interrupt-driven now, so the writer does not wait
+for it, but each byte is still a port write (a VM exit) and each FIFO's
+worth an interrupt: `irq` was 198 ms. `ff` now sets the variable only when
+`/disk/ffcfg/ffsandboxlog` exists (violations still reach about:support's
+`syscallLog`, which `smoke-firefox` checks): `irq` 198 -> 19 ms, paint
+**2.08 s -> 1.87 s**.
+
+### Fonts, and fontconfig's cache
+
+The new fonts (Noto Sans CJK, Devanagari, Bengali, Tamil, Arabic, Hebrew;
+`ports/firefox/README.md`) are 20.6 MB, most of it one CJK collection of
+ten faces. fontconfig keeps its cache in `/tmp/fontcache`, on tmpfs, so
+every boot's Firefox scanned every font file with FreeType before it could
+draw. The cache is now built on the host, by the suite's own i386 `fc-cache
+--sysroot`, into `/disk/firefox/share/fontcache`, and holds in the guest
+because `make disk` keeps the directories' mtimes. Same tree, cache files
+deleted from the image: 2073, 1925, 1806 ms; with them: 1745, 1776,
+1776 ms. So the cache is worth about 150 ms at the median, and with it the
+new fonts cost nothing measurable at startup.
+
+### The disk: port writes, not sectors
+
+With DMA a read costs ~85 us a command and ~0.2 us a sector (fitted from
+two runs that moved 198 k and 269 k sectors in 6519 and 5594 commands). Under
+KVM every port access in that sequence is an exit to QEMU, and the sequence
+had about 17 of them plus two per poll. Loading the PRD table address once
+at init, dropping the features register (READ DMA ignores it) and the
+redundant stop/direction writes, and polling the bus-master status alone
+until its interrupt bit is set: `ata` 515-536 ms -> 422-473 ms for the
+same 6400 commands.
+
+### Measured and not kept
+
+* **4 KiB blocks on `disk-ff`** (one cache lookup per page instead of
+  four, indirect blocks every 4 MiB instead of every 256 KiB): 1.84-1.92 s
+  against 1.87-1.96 s. Within the noise, and it would have been the only
+  4 KiB-block ext2 volume the tests boot.
+* **A 128-block read-ahead window**: 15 % fewer commands but 35 % more
+  sectors, `ata` unchanged.
+* **Spacing the DMA status polls** with `pause`: slower (1.87-2.04 s).
+* **A warm startup cache.** Every boot starts Firefox on a fresh profile,
+  so its script cache is always cold. A profile seeded with the
+  `scriptCache.bin` / `scriptCache-child.bin` / `urlCache.bin` that a
+  previous boot wrote, and the matching `compatibility.ini`: 1685-1774 ms
+  against ~1760 ms. About 3 %, for a build step that would need a guest boot
+  to produce its input, so it is not done. (Writing those 11 MB back to the
+  ext2 disk took the guest about two and a half minutes: the write path is
+  slow, which is worth its own look.)
+
+### Where it stands
+

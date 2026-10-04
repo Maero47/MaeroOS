@@ -14,15 +14,16 @@ make disk-ff && make run-firefox             # then boot it
 
 Requirements on the host: `curl`, `dpkg-deb` (package `dpkg`), `readelf`
 (binutils), `xz`, `bzip2`, `sha256sum`, `awk`, `tar`.  No apt, no root, no
-Docker.  Network: about 100 MB on the first run (84 MB Firefox tarball, 9 MB
-package index, 17 MB of `.deb` files); everything is cached under
+Docker.  Network: about 170 MB on the first run (84 MB Firefox tarball, 9 MB
+package index, 17 MB of `.deb` files, and 69 MB for the two Noto font
+packages, of which 21 MB is kept); everything is cached under
 `ports/firefox/prebuilt/` and later runs are offline and take a few seconds.
 
 ## What it produces
 
 | Path | Contents | Size |
 |------|----------|------|
-| `testfiles/firefox/` | Firefox tarball as-is (`firefox-bin`, `libxul.so`, `omni.ja`, `browser/`, `gmp-clearkey/`, `fonts/`, `defaults/`, `dependentlibs.list`, ...) plus the Debian shared objects, `pixbuf-loaders/` and the GL stubs, all flat, and the DejaVu fonts in `share/fonts/dejavu/` | 288 MB |
+| `testfiles/firefox/` | Firefox tarball as-is (`firefox-bin`, `libxul.so`, `omni.ja`, `browser/`, `gmp-clearkey/`, `fonts/`, `defaults/`, `dependentlibs.list`, ...) plus the Debian shared objects, `pixbuf-loaders/` and the GL stubs, all flat, the DejaVu fonts in `share/fonts/dejavu/`, the Noto fonts in `share/fonts/noto/` and fontconfig's cache of them in `share/fontcache/` | 309 MB |
 | `testfiles/lib/` | glibc runtime (`ld-linux.so.2`, `libc.so.6`, `libm`, `libdl`, `libpthread`, `librt`, `libresolv`, `libnss_*`, `libanl`, `libutil`, `libthread_db`) plus `libgcc_s.so.1`, `libstdc++.so.6`, mirrored into `i386-linux-gnu/`; `GLIBC-VERSION` records the suite | 11 MB |
 
 `testfiles/lib/` is committed (the initrd needs it); `testfiles/firefox/` is
@@ -54,7 +55,27 @@ The runtime layout mirrors what the launchers (`userspace/ff/ff.c`,
   installed into `testfiles/firefox/share/fonts/dejavu/` (5.3 MB); the list
   is `FONT_FILES` in `fetch-runtime.sh`.  Before this set existed, serif,
   monospace, Times and Courier all fell back to DejaVu Sans and bold/italic
-  were synthesized.
+  were synthesized.  For the scripts DejaVu lacks, `share/fonts/noto/` holds
+  Noto Sans CJK Regular (`NotoSansCJK-Regular.ttc`, 19.5 MB: SC, TC, HK, JP
+  and KR faces in one collection; the bold collection, 20 MB more, is left
+  out and bold CJK is synthesized) and Noto Sans Devanagari, Bengali, Tamil,
+  Arabic and Hebrew, regular and bold (1.6 MB), from the pinned
+  `fonts-noto-cjk` and `fonts-noto-core` packages (SIL OFL 1.1).  Emoji are
+  Firefox's own `fonts/TwemojiMozilla.ttf` (COLR), turned on by
+  `gfx.bundled-fonts.activate` in the profile, so Noto Color Emoji (11 MB)
+  is not shipped.  The whole font set costs 26 MB on the disk.
+* `share/fontcache/` — fontconfig's cache of `/disk/firefox/share/fonts`,
+  `/disk/firefox/fonts` and `/disk/usr/share/fonts`, made by the suite's own
+  i386 `fc-cache` (package `fontconfig`, the same source version as the
+  runtime's `libfontconfig1`) run under the suite's `ld.so` with
+  `--sysroot`, so the cache files are named after and record the guest
+  paths.  `fonts.conf` lists it after `/tmp/fontcache`.  fontconfig accepts a
+  directory's cache only while the directory's mtime (seconds and
+  nanoseconds; MaeroOS reports 0 ns) equals the one recorded in it: the
+  script sets the font directories to `FONT_DIR_MTIME` and `make disk`
+  copies every directory's mtime into the image.  If the host cannot run
+  i386 binaries the cache is skipped with a warning and Firefox scans the
+  fonts at every start (about 150 ms more, measured).
 * `libGL.so.1`, `libEGL.so.1`, `libGLESv2.so.2`, `libpci.so.3`, `libdrm.so.2`
   are empty stubs so Firefox's `glxtest` probe fails fast instead of timing
   out (see `build-glstubs.sh` for the story).  They are compiled with the
@@ -93,8 +114,9 @@ What the script verifies, and what it merely relies on:
   recorded in `Packages.xz`. So with a keyring the chain is
   signature → InRelease → Packages.xz → .deb; without one it is
   https → InRelease → Packages.xz → .deb.
-* **Pinned packages**: `libc6`, `libgcc-s1`, `libstdc++6` and
-  `fonts-dejavu-core` / `-extra` / `-mono` are the exception to "take
+* **Pinned packages**: `libc6`, `libgcc-s1`, `libstdc++6`,
+  `fonts-dejavu-core` / `-extra` / `-mono`, `fonts-noto-cjk` and
+  `fonts-noto-core` are the exception to "take
   whatever the index says", pinned to an exact version and sha256 in
   `DEBIAN_PINS` in `fetch-runtime.sh`. The libraries land in the committed
   `testfiles/lib/`, where a Debian point/security update would otherwise

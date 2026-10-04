@@ -55,9 +55,11 @@ What still stands between MaeroOS and daily use on real hardware:
   SuperSpeed hub to test it on), isochronous transfers (webcams, USB audio),
   UAS, a HID keyboard driven in report protocol (today boot protocol, plus a
   separate media-key interface), the volume keys wired to an ALSA mixer.
-- **Firefox.** Turn the content sandbox back on, cover CJK and Indic text
-  with fonts, and shorten the roughly 5 s startup
-  (`docs/perf/firefox-startup.md`); audio is only checked by an opt-in run.
+- **Firefox.** Startup is about 1.7 s from launch to first paint
+  (`docs/perf/firefox-startup.md`); what is left there is Firefox's own code
+  and a disk read path that polls with interrupts off. Scripts beyond CJK,
+  Indic (Devanagari, Bengali, Tamil), Arabic and Hebrew have no font; the
+  content sandbox has no namespaces; audio is only checked by an opt-in run.
 - **Credentials.** A separate fsuid; search permission on the directories a
   path lookup walks through.
 - **Missing interfaces.** SysV IPC, utmp, `/proc/stat` and

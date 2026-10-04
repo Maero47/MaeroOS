@@ -412,6 +412,19 @@ def png_bytes(w, h, rgb):
             chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 
 
+def disk_args(path, how):
+    """QEMU arguments attaching the Firefox disk as an IDE disk (the default),
+    an AHCI port or an NVMe namespace; the kernel mounts the first block
+    device it finds as /disk whichever it is."""
+    if how == "ahci":
+        return ["-drive", "file=%s,format=raw,if=none,id=ffdisk" % path,
+                "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=ffdisk,bus=ahci0.0"]
+    if how == "nvme":
+        return ["-drive", "file=%s,format=raw,if=none,id=ffdisk" % path,
+                "-device", "nvme,drive=ffdisk,serial=ffdisk"]
+    return ["-drive", "file=%s,format=raw,if=ide" % path]
+
+
 class WebServer:
     """The page --web loads, served from a thread; records every request and
     the font report the page POSTs back."""
@@ -1647,6 +1660,8 @@ def main():
     ap.add_argument("--out", default=os.path.join("build", "ff-smoke"), help="artifact root")
     ap.add_argument("--tag", default=None, help="suffix for the artifact directory (default: accel-smpN)")
     ap.add_argument("--qemu", default="qemu-system-i386")
+    ap.add_argument("--disk-if", default="ide", choices=["ide", "ahci", "nvme"],
+                    help="how the Firefox disk is attached (default ide)")
     ap.add_argument("--cpu", default=os.environ.get("SMOKE_CPU", "qemu32,+nx") or None,
                     help="QEMU -cpu model (default: $SMOKE_CPU, else qemu32,+nx: QEMU's "
                          "own model plus NX, so the JIT runs under W^X; \"\" = QEMU's own). "
@@ -1756,8 +1771,7 @@ def main():
     if args.scroll:
         set_gfxstats_marker(args.disk, tmp, True)
     cmd = [qemu,
-           "-cdrom", args.iso,
-           "-drive", "file=%s,format=raw,if=ide" % args.disk,
+           "-cdrom", args.iso] + disk_args(args.disk, args.disk_if) + [
            "-m", args.mem,
            "-smp", str(args.smp),
            "-accel", accel,
@@ -1784,8 +1798,9 @@ def main():
                 "-device", "intel-hda", "-device", "hda-duplex,audiodev=snd0"]
         audio_web = WebServer(audio=True)
         disk = audio_disk(args, audio_web.port)
-        cmd = [("file=%s,format=raw,if=ide" % disk) if c == "file=%s,format=raw,if=ide" % args.disk
-               else c for c in cmd]
+        old = disk_args(args.disk, args.disk_if)
+        i = cmd.index(old[1])
+        cmd[i - 1:i - 1 + len(old)] = disk_args(disk, args.disk_if)
     with open(os.path.join(args.outdir, "qemu-cmdline.txt"), "w") as f:
         f.write(" ".join(cmd) + "\n")
 

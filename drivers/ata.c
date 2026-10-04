@@ -337,11 +337,24 @@ static void ata_dma_init(const uint16_t *ident) {
     ata_bm = (uint16_t)(bar4 & ~3u);
     outb(ata_bm + BM_CMD, 0);
     outb(ata_bm + BM_STATUS, BM_ST_ERR | BM_ST_IRQ);
+    /* The PRD table never moves and nothing else programs this channel's
+     * bus master, so its address is loaded once rather than per command. */
+    outl(ata_bm + BM_PRDT, kphys(ata_prdt));
 }
 
 /* One READ DMA of nsect (1..256) sectors into the bounce buffer.  0 on
  * success, -1 if the transfer failed (the caller then falls back to PIO).
- * Runs with interrupts off. */
+ * Runs with interrupts off.
+ *
+ * Under a hypervisor every port access here is an exit to the device model,
+ * and those exits, not the transfer, were the cost of a read (~85 us a
+ * command against ~0.2 us a sector, docs/perf/firefox-startup.md round five).
+ * So the sequence has no access it does not need: the PRD table address is
+ * loaded once (ata_dma_init), the engine is idle on entry (every exit below
+ * stops it), the features register means nothing to READ DMA, direction and
+ * start go in one write once the command is issued, and the wait polls the
+ * bus-master status alone, reading the drive's status only once the
+ * interrupt bit says the transfer is over. */
 static int ata_read_dma(uint32_t lba, uint8_t count, uint32_t nsect) {
     uint32_t left = nsect * 512u, pa = kphys(ata_dma_buf);
     int n = 0;
@@ -357,13 +370,11 @@ static int ata_read_dma(uint32_t lba, uint8_t count, uint32_t nsect) {
 
     if (ata_wait_bsy() < 0)
         return -1;
-    outb(ata_bm + BM_CMD, 0);
-    outl(ata_bm + BM_PRDT, kphys(ata_prdt));
-    outb(ata_bm + BM_CMD, BM_CMD_READ);
+    /* A PIO command since the last DMA may have left the interrupt bit set
+     * (it follows the drive's INTRQ whatever the transfer mode). */
     outb(ata_bm + BM_STATUS, BM_ST_ERR | BM_ST_IRQ);
 
     outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
-    outb(ATA_FEAT,  0x00);
     outb(ATA_NSECT, count);
     outb(ATA_LBAL,  (uint8_t)(lba));
     outb(ATA_LBAM,  (uint8_t)(lba >> 8));
@@ -375,20 +386,21 @@ static int ata_read_dma(uint32_t lba, uint8_t count, uint32_t nsect) {
      * error) and the drive has dropped BSY. */
     ata_timer_t t;
     ata_timer_start(&t, ATA_TIMEOUT_MS);
-    uint8_t bst;
+    uint8_t bst, st = ATA_SR_BSY;
     int ok = 0;
     do {
         bst = inb(ata_bm + BM_STATUS);
         if (bst & BM_ST_ERR)
             break;
-        if ((bst & BM_ST_IRQ) && !(inb(ATA_ALT) & ATA_SR_BSY)) {
+        if ((bst & BM_ST_IRQ) &&
+            !((st = inb(ATA_STATUS)) & ATA_SR_BSY)) { /* also acks INTRQ */
             ok = 1;
             break;
         }
     } while (!ata_timer_expired(&t));
     outb(ata_bm + BM_CMD, 0);
-    uint8_t st = inb(ATA_STATUS);                  /* also acks the drive's INTRQ */
-    outb(ata_bm + BM_STATUS, BM_ST_ERR | BM_ST_IRQ);
+    if (!ok)
+        st = inb(ATA_STATUS);
     if (!ok || (bst & BM_ST_ERR) || (st & (ATA_SR_ERR | ATA_SR_DF | ATA_SR_BSY)))
         return -1;
     return 0;

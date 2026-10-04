@@ -88,7 +88,12 @@ see "Evidence" below):
 - The `MOZ_DISABLE_{CONTENT,GMP,RDD,SOCKET_PROCESS,UTILITY}_SANDBOX` variables
   are gone. `MOZ_SANDBOX_LOGGING=1` (with `security.sandbox.logging.enabled`)
   sends the broker's policy and denials and any filter violation to the
-  serial console as `Sandbox: ...` lines.
+  serial console as `Sandbox: ...` lines. `ff` sets it only when
+  `/disk/ffcfg/ffsandboxlog` exists: it also prints every child's whole BPF
+  program, about 45 KiB before the first paint, and the UART interrupts
+  that cost were a tenth of the startup (`docs/perf/firefox-startup.md`,
+  round five). A filter violation still reaches about:support's
+  `syscallLog`, which `smoke-firefox` checks either way.
 - `security.sandbox.content.level` is 4 and `media.cubeb.sandbox` is true.
   Firefox lowers the content level to 3 unless audio is remoted to the
   parent, which is what `media.cubeb.sandbox` does (cubeb runs in the parent
