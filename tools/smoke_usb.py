@@ -39,7 +39,9 @@ Checks:
   - a usb-bot device with two SCSI LUNs behind the hub: one disk each;
   - Caps Lock pressed on the USB keyboard: the kernel sends the keyboard
     its LED report (SET_REPORT, traced), on and off again;
-  - the keyboard's Volume Up key reaches the desktop (its volume trace);
+  - the keyboard's Volume Down, Up and Mute keys reach the desktop, which
+    sets the HDA card's ALSA Master Playback Volume / Switch (desktop and
+    kernel traces agree);
   - stick B unplugged and plugged back in five times (QMP device_del /
     device_add) while a reader loops over it, each time found again under
     the same names with the same data; stick A once on the hub's port; no
@@ -419,12 +421,31 @@ class UsbSmoke(GuiSmoke):
             print(f"\n[SMOKE-USB] Caps Lock {state}: {m.group(0)}")
 
     def media_key(self):
-        """Volume Up on the USB keyboard reaches the desktop."""
-        start = self.con.mark()
-        self.inp.press("volumeup")
-        m = self.con.wait_re(r"\[desktop\] volume (\d+)", timeout=10,
-                             start=start)
-        print(f"\n[SMOKE-USB] Volume Up: {m.group(0)}")
+        """The keyboard's Volume Down / Up / Mute keys reach the desktop,
+        which sets the HDA card's ALSA Master volume and switch."""
+        steps = (("volumedown", r"volume (\d+) \(mixer: card0 (\d+)%\)",
+                  "Volume = "),
+                 ("volumeup", r"volume (\d+) \(mixer: card0 (\d+)%\)",
+                  "Volume = "),
+                 ("audiomute", r"volume (\d+) muted \(mixer: card0 (\d+)% "
+                               r"off\)", "Switch = 0"),
+                 ("audiomute", r"volume (\d+) \(mixer: card0 (\d+)%\)",
+                  "Switch = 1"))
+        levels = []
+        for qcode, pat, kernel in steps:
+            start = self.con.mark()
+            self.inp.press(qcode)
+            m = self.con.wait_re(r"\[desktop\] " + pat, timeout=10,
+                                 start=start)
+            if m.group(1) != m.group(2):
+                raise AssertionError(f"mixer not at the desktop's level: "
+                                     f"{m.group(0)}")
+            self.con.wait_re(r"\[ALSA\] card 0: Master Playback " +
+                             re.escape(kernel), timeout=10, start=start)
+            levels.append(int(m.group(1)))
+            print(f"\n[SMOKE-USB] {qcode}: {m.group(0)}")
+        if levels[1] != levels[0] + 5 and levels[1] != 100:
+            raise AssertionError(f"volume levels {levels}")
 
     def in_use(self):
         found = re.findall(r"\[USB\] (\d+) device\(s\) in use",
@@ -705,6 +726,9 @@ def main():
            "-serial", "stdio", "-m", "512M", "-no-reboot", "-no-shutdown",
            # Keyboard and tablet on root ports; the mouse and stick A
            # behind a (full-speed) hub on root port 3; stick B on port 4.
+           # an HDA card for the volume keys' mixer (output discarded)
+           "-audiodev", "none,id=hdanull", "-device", "intel-hda",
+           "-device", "hda-duplex,audiodev=hdanull",
            "-device", "qemu-xhci,id=xhci",
            "-device", f"usb-kbd,id={KBD},display={DISPLAY},bus=xhci.0,port=1",
            "-device", f"usb-tablet,id={TABLET},display={DISPLAY},bus=xhci.0,"
