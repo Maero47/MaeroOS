@@ -895,8 +895,14 @@ static uint32_t pp_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf)
     case PK_STAT:    pp_build_stat(&pb, p, pn->thread); break;
     case PK_STATUS:  pp_build_status(&pb, p, pn->thread); break;
     case PK_STATM:   pp_build_statm(&pb, p); break;
-    case PK_CMDLINE: pb_bytes(&pb, p->cmdline, p->cmdline_len); break;
-    case PK_ENVIRON: pb_bytes(&pb, p->environ, p->environ_len); break;
+    /* A zombie has no address space left: Linux reads its cmdline and
+     * environ as empty (so pgrep -f no longer matches an unreaped child). */
+    case PK_CMDLINE:
+        if (p->state != PROC_ZOMBIE) pb_bytes(&pb, p->cmdline, p->cmdline_len);
+        break;
+    case PK_ENVIRON:
+        if (p->state != PROC_ZOMBIE) pb_bytes(&pb, p->environ, p->environ_len);
+        break;
     case PK_AUXV:    pb_bytes(&pb, p->auxv_data, p->auxv_bytes); break;
     case PK_COMM:    pb_printf(&pb, "%s\n", p->name); break;
     case PK_MAPS:    pp_build_maps(&pb, p); break;
