@@ -1,5 +1,5 @@
 /*
- * P63 MaeroOS shm_size (syscall 509): a shm object's real size.
+ * P81 MaeroOS shm_size (syscall 509): a shm object's real size.
  *
  * The desktop maps a client's surface by shm id; the client also claims its
  * width and height.  The object's own size must bound what the compositor
@@ -10,7 +10,7 @@
  * refused (EACCES) while the object is 0600, allowed once it is 0644.
  * MaeroOS only: on Linux the custom syscalls do not exist (SKIP).
  */
-#define PROBE_NAME "p63_shm_size"
+#define PROBE_NAME "p81_shm_size"
 #include "probe.h"
 #include <sys/wait.h>
 

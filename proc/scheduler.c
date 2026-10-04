@@ -860,7 +860,7 @@ void proc_exit(int status) {
          * the zombie leader's.  Measured on Linux 7.0 (i386 musl and x86_64
          * glibc, raw exit syscalls, no exit_group under strace): leader
          * SYS_exit(0) or SYS_exit(3), then worker SYS_exit(5), waits as 0x500
-         * and strace shows the leader "exited with 5".  abiprobe p60. */
+         * and strace shows the leader "exited with 5".  abiprobe p78. */
         if (notify && !leader->group_exit)
             leader->exit_status = status;
     }

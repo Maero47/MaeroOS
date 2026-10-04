@@ -164,13 +164,13 @@ PROBES = {
     "p59_lock_limits":         (120, ""),
     # Kernel follow-ups from the userspace review: a leader that exits alone,
     # brk per process, fstat of a named FIFO, MaeroOS shm_size.
-    "p60_leader_exit":         (60, ""),
-    "p61_thread_brk":          (60, ""),
-    "p62_fifo_fstat":          (60, ""),
-    "p63_shm_size":            (60, ""),
+    "p78_leader_exit":         (60, ""),
+    "p79_thread_brk":          (60, ""),
+    "p80_fifo_fstat":          (60, ""),
+    "p81_shm_size":            (60, ""),
     # EPOLLET on an always-ready /proc file, EPOLLONESHOT (the GTK file
     # chooser's mount monitor spun in epoll_pwait).
-    "p64_epoll_et_oneshot":    (60, ""),
+    "p82_epoll_et_oneshot":    (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

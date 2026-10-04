@@ -1,5 +1,5 @@
 /*
- * P61 the program break belongs to the process, not to a thread.
+ * P79 the program break belongs to the process, not to a thread.
  *
  * Linux keeps brk in the mm: every thread sees and moves the same break.
  *
@@ -11,7 +11,7 @@
  * fills the new heap; the worker must see the moved break, move it further,
  * and the main thread must see that and find its data intact.
  */
-#define PROBE_NAME "p61_thread_brk"
+#define PROBE_NAME "p79_thread_brk"
 #include "probe.h"
 #include <semaphore.h>
 

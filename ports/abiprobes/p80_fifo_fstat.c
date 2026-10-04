@@ -1,5 +1,5 @@
 /*
- * P62 fstat of an open named FIFO is the FIFO's inode.
+ * P80 fstat of an open named FIFO is the FIFO's inode.
  *
  * Linux: fstat on a descriptor of a named FIFO reports the node's owner,
  * mode, st_ino and st_dev, the same as stat() of its name; only pipe(2) ends
@@ -9,7 +9,7 @@
  * st_ino 0, so a program checking who owns the FIFO it opened (libwm) could
  * not trust fstat.
  */
-#define PROBE_NAME "p62_fifo_fstat"
+#define PROBE_NAME "p80_fifo_fstat"
 #include "probe.h"
 #include <sys/stat.h>
 
@@ -17,7 +17,7 @@ int main(void)
 {
     probe_watchdog(60);
     char path[64];
-    snprintf(path, sizeof path, "/tmp/p62-fifo-%d", (int)getpid());
+    snprintf(path, sizeof path, "/tmp/p80-fifo-%d", (int)getpid());
     unlink(path);
     if (mkfifo(path, 0640) != 0) probe_fail("mkfifo: %s", strerror(errno));
     if (getuid() == 0 && chown(path, 1234, 5678) != 0)

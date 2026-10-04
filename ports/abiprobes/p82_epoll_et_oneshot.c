@@ -1,5 +1,5 @@
 /*
- * P64 EPOLLET and EPOLLONESHOT.
+ * P82 EPOLLET and EPOLLONESHOT.
  *
  * Linux: an edge-triggered registration of /proc/self/mountinfo (always
  * readable; it wakes waiters only when the mount table changes) is reported
@@ -12,7 +12,7 @@
  * item was reported on every epoll_wait, so GLib's worker thread spun in
  * epoll_pwait forever and Mousepad hung after Ctrl+S.
  */
-#define PROBE_NAME "p64_epoll_et_oneshot"
+#define PROBE_NAME "p82_epoll_et_oneshot"
 #include "probe.h"
 #include <sys/epoll.h>
 

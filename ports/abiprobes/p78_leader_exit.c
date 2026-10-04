@@ -1,5 +1,5 @@
 /*
- * P60 the thread-group leader exits alone; the process lives on.
+ * P78 the thread-group leader exits alone; the process lives on.
  *
  * Linux: a main thread that calls SYS_exit (not exit_group) while other
  * threads run leaves the address space to them (the mm goes when its last
@@ -22,7 +22,7 @@
  * (checked with raw exit syscalls under strace on Linux 7.0, i386 and
  * x86_64: "+++ exited with 5 +++" for the leader too).
  */
-#define PROBE_NAME "p60_leader_exit"
+#define PROBE_NAME "p78_leader_exit"
 #include "probe.h"
 #include <sys/mman.h>
 #include <sys/wait.h>
