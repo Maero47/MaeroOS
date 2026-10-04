@@ -343,11 +343,19 @@ void pmm_refcount_init(void) {
 }
 
 /* Frames outside RAM (a framebuffer mapped into a process, say) are not
- * counted: they read as 0 and are never freed, as before. */
+ * counted: they read as 0 and are never freed, as before.
+ *
+ * The count is 16 bits.  It saturates at PMM_REF_SATURATED and then sticks
+ * there: a saturated frame is never decremented and never freed (it leaks,
+ * which is safe), because past that point the stored count no longer equals
+ * the true number of references, and counting down from it would free the
+ * frame while it is still mapped.  Paths a user can drive to arbitrary counts
+ * (MAP_SHARED of one memfd page over and over) refuse at PMM_REF_LIMIT with
+ * -ENOMEM long before that, so saturation is a last-resort backstop. */
 void pmm_frame_incref(phys_t phys) {
     uint32_t idx = (uint32_t)(phys / PAGE_SIZE);
     uint32_t irq = pmm_irq_save();
-    if (idx < refcount_frames && frame_refcount[idx] < 65535)
+    if (idx < refcount_frames && frame_refcount[idx] < PMM_REF_SATURATED)
         frame_refcount[idx]++;
     pmm_irq_restore(irq);
 }
@@ -366,7 +374,7 @@ void pmm_frame_decref(phys_t phys) {
     if (idx >= refcount_frames) return;
     uint32_t irq = pmm_irq_save();
     int do_free = 0;
-    if (frame_refcount[idx] > 0) {
+    if (frame_refcount[idx] > 0 && frame_refcount[idx] < PMM_REF_SATURATED) {
         frame_refcount[idx]--;
         if (frame_refcount[idx] == 0) do_free = 1;
     }

@@ -2596,6 +2596,29 @@ static int kill_permitted(struct proc *t, int sig) {
     return 0;
 }
 
+/* MaeroOS syscall 505: register the process the Ctrl+Alt+Backspace hotkey
+ * SIGKILLs (the desktop's fullscreen raw-input app).  pid <= 0 clears it.  The
+ * caller must be allowed to SIGKILL the target itself (kill_permitted) and the
+ * target is never init: otherwise any user could have init or a root daemon
+ * killed by whoever next pressed the keys.  The keyboard path re-checks the
+ * registrant's ids against the process holding the pid at that moment. */
+static int sys_set_kill_target(int pid) {
+    if (pid <= 0) {
+        keyboard_set_kill_target(-1, 0, 0);
+        return 0;
+    }
+    struct proc *t = NULL;
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (ptable[i].state != PROC_UNUSED && ptable[i].pid == pid) {
+            t = &ptable[i];
+            break;
+        }
+    if (!t) return -3;                                        /* -ESRCH */
+    if (t->pid == 1 || !kill_permitted(t, SIGKILL)) return -1;  /* -EPERM */
+    keyboard_set_kill_target(pid, current_proc->uid, current_proc->euid);
+    return 0;
+}
+
 /* Signal every process (one per thread group) that `match` selects.  Linux
  * __kill_pgrp_info()/kill_something_info(-1): success if at least one was
  * signalled; otherwise -EPERM if some were refused, -ESRCH if none matched. */
@@ -4682,6 +4705,9 @@ uint32_t mm_shm_attach_at(const uint32_t *frames, uint32_t npages, uint32_t addr
         base = vma_gap_find(len, PAGE_SIZE);
     }
     if (!base) return 0;
+    /* One reference per attachment: refuse before a frame count saturates. */
+    for (uint32_t i = 0; i < npages; i++)
+        if (pmm_frame_refcount(frames[i]) >= PMM_REF_LIMIT) return 0;
     /* Reserve the page tables before taking any reference, so the attach
      * either happens whole or leaves the address space as it was (Linux
      * shmat() returns ENOMEM here too). */
@@ -4783,6 +4809,12 @@ static int sys_mmap2(registers_t *regs) {
         if (shared && (prot & PROT_WRITE_K) &&
             (mf->flags & O_ACCMODE) != O_RDWR)
             return -13;                                           /* -EACCES */
+        /* The framebuffer is device memory, mapped shared whatever the
+         * flags say: a MAP_PRIVATE writable view would still write the real
+         * screen, so it needs a read-write descriptor too. */
+        if (devfs_is_fb0(fnode) && (prot & PROT_WRITE_K) &&
+            (mf->flags & O_ACCMODE) != O_RDWR)
+            return -13;                                           /* -EACCES */
     }
     /* Page offsets are 32-bit: an offset plus length past 2^32 pages is
      * -EOVERFLOW (Linux do_mmap), and a shared file mapping must stay inside
@@ -4791,12 +4823,11 @@ static int sys_mmap2(registers_t *regs) {
     if (fnode) {
         uint64_t last = (uint64_t)pgoff + length / PAGE_SIZE;
         if (last > 0xFFFFFFFFULL) return -75;                     /* -EOVERFLOW */
-        if (shared && __builtin_strcmp(fnode->name, "fb0") != 0 &&
-            last > SHMAP_MAX_PAGES)
+        if (shared && !devfs_is_fb0(fnode) && last > SHMAP_MAX_PAGES)
             return -12;                                           /* -ENOMEM */
     }
     /* Shared file mappings the descriptor cannot write through stay so. */
-    uint32_t nowrite = (fnode && shared &&
+    uint32_t nowrite = (fnode && (shared || devfs_is_fb0(fnode)) &&
                         (current_proc->ofile[fd].flags & O_ACCMODE) != O_RDWR)
                        ? VMA_F_NOWRITE : 0;
 
@@ -4846,7 +4877,9 @@ static int sys_mmap2(registers_t *regs) {
     /* ── /dev/fb0: map the real framebuffer (DOOM, links -g) ──
      * Page by page: a virtio-gpu framebuffer is scattered guest RAM (and
      * mapped cached), a VGA one is contiguous device memory. */
-    if (fnode && __builtin_strcmp(fnode->name, "fb0") == 0) {
+    /* Identified by the node itself, never by its name: any file called
+     * "fb0" (/tmp/fb0) used to get the physical framebuffer. */
+    if (fnode && devfs_is_fb0(fnode)) {
         uint32_t fb_len = framebuffer_size();
         if (!framebuffer_phys()) return -19;
         if (length > ((fb_len + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1)))
@@ -4860,6 +4893,8 @@ static int sys_mmap2(registers_t *regs) {
                             ((prot & PROT_WRITE_K) ? PAGE_WRITABLE : 0);
         for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
             uint32_t fb_page = framebuffer_page_phys(i);
+            if (fb_page && pmm_frame_refcount(fb_page) >= PMM_REF_LIMIT)
+                fb_page = 0;                 /* refused below: -ENOMEM */
             /* RAM frames (virtio-gpu) carry a reference per PTE like any
              * shared page, which munmap and exit drop again; device frames
              * have no refcount and pmm ignores them. */
@@ -4893,6 +4928,12 @@ static int sys_mmap2(registers_t *regs) {
         for (uint32_t i = 0; i < length; i += PAGE_SIZE) {
             uint32_t phys = shmap_frame(e, fnode, pgoff + i / PAGE_SIZE);
             if (!phys) { unmap_range(va, end); return -12; }
+            /* One reference per mapping of the page: refuse before the 16-bit
+             * frame count could saturate (Linux stops at vm.max_map_count). */
+            if (pmm_frame_refcount(phys) >= PMM_REF_LIMIT) {
+                unmap_range(va, end);
+                return -12;                                       /* -ENOMEM */
+            }
             pmm_frame_incref(phys);          /* this mapping's ref */
             if (paging_map(va + i, phys, pte_flags_for(prot, 1)) != 0) {
                 pmm_frame_decref(phys);      /* give this mapping's ref back;
@@ -10863,8 +10904,7 @@ void syscall_dispatch(registers_t *regs) {
         break;
 #endif
     case 505:  /* register Ctrl+Alt+Backspace kill target (desktop only) */
-        keyboard_set_kill_target((int)regs->ebx);
-        ret = 0;
+        ret = sys_set_kill_target((int)regs->ebx);
         break;
 
     case 296: ret = sys_mkdirat(regs);         break;

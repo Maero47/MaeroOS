@@ -177,9 +177,24 @@ static const uint16_t e0_keys[128] = {
  * The desktop registers the pid of a fullscreen app it can't otherwise reach
  * (DOOM owns the keyboard); this lets the user always escape.  -1 = none. */
 volatile int kbd_kill_target_pid = -1;
+/* Credentials of whoever registered the target (syscall 505 checks them
+ * against the target then); the hotkey re-checks them against the process
+ * that has the pid when the keys are pressed, since the pid may have been
+ * reused by a process the registrant could never signal. */
+static uint32_t kbd_kill_uid, kbd_kill_euid;
 
-void keyboard_set_kill_target(int pid) {
+void keyboard_set_kill_target(int pid, uint32_t uid, uint32_t euid) {
+    kbd_kill_uid  = uid;
+    kbd_kill_euid = euid;
     kbd_kill_target_pid = pid;
+}
+
+/* Linux check_kill_permission with the registrant as sender; never init. */
+static int kbd_kill_allowed(const struct proc *t) {
+    if (t->pid == 1) return 0;
+    if (kbd_kill_euid == 0) return 1;
+    return kbd_kill_euid == t->uid || kbd_kill_euid == t->suid ||
+           kbd_kill_uid  == t->uid || kbd_kill_uid  == t->suid;
 }
 
 static int kbd_ctrl_down, kbd_alt_down;
@@ -251,7 +266,8 @@ void keyboard_input_key(uint16_t key, int pressed) {
         for (int i = 0; i < MAX_PROCS; i++) {
             if (ptable[i].state != PROC_UNUSED &&
                 ptable[i].pid == kbd_kill_target_pid) {
-                signal_send(&ptable[i], SIGKILL);
+                if (kbd_kill_allowed(&ptable[i]))
+                    signal_send(&ptable[i], SIGKILL);
                 break;
             }
         }
