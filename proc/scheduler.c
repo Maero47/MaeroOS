@@ -856,9 +856,11 @@ void proc_exit(int status) {
     } else if (leader && leader != current_proc && leader->state == PROC_ZOMBIE) {
         notify = proc_group_empty(leader);
         /* The last thread of a process whose leader exited first: without a
-         * group exit, its own code is what the parent's wait reports (Linux
-         * gives the last thread's code, e.g. leader SYS_exit(3) then worker
-         * SYS_exit(5) waits as exit 5). */
+         * group exit, its own code is what the parent's wait reports, not
+         * the zombie leader's.  Measured on Linux 7.0 (i386 musl and x86_64
+         * glibc, raw exit syscalls, no exit_group under strace): leader
+         * SYS_exit(0) or SYS_exit(3), then worker SYS_exit(5), waits as 0x500
+         * and strace shows the leader "exited with 5".  abiprobe p60. */
         if (notify && !leader->group_exit)
             leader->exit_status = status;
     }

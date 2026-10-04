@@ -16,8 +16,11 @@
  * the parent checks waitpid(WNOHANG) does not report the child yet, releases
  * the worker, which calls exit_group(7), and requires exit status 7.
  * Two more children end the same way but with the worker dying of SIGSEGV
- * (status: killed by SIGSEGV) or calling SYS_exit(5) itself (status: exit
- * 5 - Linux reports the last thread's code, not the leader's 0).
+ * (status: killed by SIGSEGV) or calling SYS_exit(5) itself.  Without a
+ * group exit, Linux reports the LAST thread's code, not the zombie leader's:
+ * leader SYS_exit(0) or SYS_exit(3), then worker SYS_exit(5), waits as exit 5
+ * (checked with raw exit syscalls under strace on Linux 7.0, i386 and
+ * x86_64: "+++ exited with 5 +++" for the leader too).
  */
 #define PROBE_NAME "p60_leader_exit"
 #include "probe.h"
@@ -63,9 +66,9 @@ static void *worker2(void *arg)
     return NULL;
 }
 
-/* A child whose leader exits first and whose worker then ends as g_how says;
- * returns its wait status. */
-static int leader_first(int how)
+/* A child whose leader exits first with leader_code and whose worker then
+ * ends as how says; returns its wait status. */
+static int leader_first(int how, int leader_code)
 {
     pid_t pid = fork();
     if (pid < 0) probe_fail("fork: %s", strerror(errno));
@@ -73,7 +76,7 @@ static int leader_first(int how)
         g_how = how;
         pthread_t t;
         if (pthread_create(&t, NULL, worker2, NULL) != 0) _exit(11);
-        syscall(SYS_exit, 0);
+        syscall(SYS_exit, leader_code);
         _exit(12);
     }
     int st = 0;
@@ -84,14 +87,16 @@ static int leader_first(int how)
 int main(void)
 {
     probe_watchdog(60);
-    int st2 = leader_first(1);
+    int st2 = leader_first(1, 0);
     if (!WIFSIGNALED(st2) || WTERMSIG(st2) != SIGSEGV)
         probe_fail("worker SIGSEGV after the leader exited: status 0x%x, want "
                    "killed by SIGSEGV", st2);
-    st2 = leader_first(2);
-    if (!WIFEXITED(st2) || WEXITSTATUS(st2) != 5)
-        probe_fail("worker SYS_exit(5) after the leader's SYS_exit(0): status "
-                   "0x%x, want exit 5 (the last thread's code)", st2);
+    for (int lc = 0; lc <= 3; lc += 3) {
+        st2 = leader_first(2, lc);
+        if (!WIFEXITED(st2) || WEXITSTATUS(st2) != 5)
+            probe_fail("leader SYS_exit(%d), then worker SYS_exit(5): status 0x%x, "
+                       "want exit 5 (the last thread's code)", lc, st2);
+    }
 
     if (pipe(g_up) || pipe(g_down)) probe_fail("pipe: %s", strerror(errno));
     pid_t pid = fork();
