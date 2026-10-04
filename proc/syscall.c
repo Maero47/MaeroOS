@@ -4316,10 +4316,11 @@ static uint32_t shmap_peek(struct shmap_entry *e, uint32_t pg) {
 /* Reclaim a shmap slot IFF no process still maps any of its frames.  Each frame
  * carries one "registry" ref (taken in shmap_frame); a frame whose refcount is
  * <=1 is mapped by nobody else, so the whole entry is dead once ALL its frames
- * are <=1.  This is how leaked memfd/tmpfs shared maps get freed: our memfd is a
- * named /tmp/.memfd-N tmpfs file that persists (no delete-on-close), so without
- * this the 128-slot table filled across watchdog restarts → shmap_get()==NULL →
- * mmap(MAP_SHARED) failed → Firefox MOZ_RELEASE_ASSERT(mMap.initialized()). */
+ * are <=1.  This is how dead memfd/tmpfs shared maps get freed: a memfd whose
+ * last descriptor closed while it was still mapped keeps its entry (and its
+ * node) until here, and without this the table filled across watchdog
+ * restarts → shmap_get()==NULL → mmap(MAP_SHARED) failed → Firefox
+ * MOZ_RELEASE_ASSERT(mMap.initialized()). */
 /* True iff any process still holds an open fd to this node.  A memfd whose fd is
  * open must keep its data even while unmapped (POSIX memfd/shm persistence), so
  * such an entry is NOT dead and must never be reclaimed — freeing its frames
