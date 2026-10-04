@@ -230,7 +230,7 @@ void inotify_node_gone(vfs_node_t *node) {
 
 static int ino_ready(vfs_node_t *n) { return ((inotify_t *)n)->nq != 0; }
 
-static uint32_t ino_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+static uint32_t ino_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf) {
     inotify_t *in = (inotify_t *)n;
     (void)off;
     in->refs++;                              /* a close meanwhile must not free it */

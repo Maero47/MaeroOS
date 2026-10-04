@@ -7,7 +7,7 @@ extern uint32_t sched_ctxt;
 extern uint32_t sched_loadavg[3];
 
 static uint32_t procfs_build_text(vfs_node_t *n, void (*build)(pbuf_t *),
-                                  uint32_t cap, uint32_t off, uint32_t len,
+                                  uint32_t cap, uint64_t off, uint32_t len,
                                   uint8_t *buf) {
     (void)n;
     pbuf_t pb = { (char *)kmalloc(cap), 0, cap };
@@ -54,7 +54,7 @@ static void build_stat(pbuf_t *pb) {
               running ? running : 1, blocked);
 }
 
-static uint32_t procfs_stat_sys_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+static uint32_t procfs_stat_sys_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf) {
     return procfs_build_text(n, build_stat, 2048, off, len, buf);
 }
 
@@ -70,7 +70,7 @@ static void build_uptime(pbuf_t *pb) {
               (uint32_t)(idle % 100));
 }
 
-static uint32_t procfs_uptime_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+static uint32_t procfs_uptime_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf) {
     return procfs_build_text(n, build_uptime, 128, off, len, buf);
 }
 
@@ -92,7 +92,7 @@ static void build_loadavg(pbuf_t *pb) {
     pb_printf(pb, "%u/%u %d\n", running ? running : 1, total, last);
 }
 
-static uint32_t procfs_loadavg_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+static uint32_t procfs_loadavg_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf) {
     return procfs_build_text(n, build_loadavg, 128, off, len, buf);
 }
 
@@ -133,7 +133,7 @@ static void build_meminfo(pbuf_t *pb) {
     }
 }
 
-static uint32_t procfs_meminfo_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+static uint32_t procfs_meminfo_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf) {
     return procfs_build_text(n, build_meminfo, 4096, off, len, buf);
 }
 
@@ -149,12 +149,12 @@ static void build_vmstat(pbuf_t *pb) {
               pmm_ram_frames() - pmm_free_frames(), sysvipc_shm_pages(), sched_ctxt);
 }
 
-static uint32_t procfs_vmstat_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+static uint32_t procfs_vmstat_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf) {
     return procfs_build_text(n, build_vmstat, 2048, off, len, buf);
 }
 
 /* /proc/sysvipc/{shm,sem,msg}: the tables ipcs reads. */
-static uint32_t procfs_sysvipc_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+static uint32_t procfs_sysvipc_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf) {
     pbuf_t pb = { (char *)kmalloc(16384), 0, 16384 };
     if (!pb.b) return (uint32_t)-12;
     pb.pos = sysvipc_proc_format(n->name, pb.b, pb.cap);
@@ -220,7 +220,7 @@ static const char *const sysctl_dirs[] = { "vm", "kernel", "fs", "fs/inotify" };
 static vfs_node_t sysctl_nodes[N_SYSCTL];
 static vfs_node_t sysctl_dir_nodes[N_SYSCTL_DIRS];
 
-static uint32_t sysctl_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+static uint32_t sysctl_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf) {
     const sysctl_ent_t *e = &sysctl_ents[(int)(uintptr_t)n->private];
     char t[96];
     int l = 0;
@@ -258,7 +258,7 @@ static uint32_t sysctl_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *
     return procfs_copy_blob((const uint8_t *)t, (uint32_t)l, off, len, buf);
 }
 
-static uint32_t sysctl_write(vfs_node_t *n, uint32_t off, uint32_t len, const uint8_t *buf) {
+static uint32_t sysctl_write(vfs_node_t *n, uint64_t off, uint32_t len, const uint8_t *buf) {
     (void)off;
     const sysctl_ent_t *e = &sysctl_ents[(int)(uintptr_t)n->private];
     if (e->which == SC_INO_ACCT_SLOTS) {

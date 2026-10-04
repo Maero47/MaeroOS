@@ -348,8 +348,8 @@ static int pn_make_room(uint32_t uid) {
     return 1;
 }
 
-static uint32_t pp_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf);
-static uint32_t pp_write(vfs_node_t *n, uint32_t off, uint32_t len, const uint8_t *buf);
+static uint32_t pp_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf);
+static uint32_t pp_write(vfs_node_t *n, uint64_t off, uint32_t len, const uint8_t *buf);
 static int pp_dir_readdir(vfs_node_t *n, uint32_t idx, vfs_dirent_t *out);
 static vfs_node_t *pp_dir_finddir(vfs_node_t *n, const char *name);
 static int pp_task_readdir(vfs_node_t *n, uint32_t idx, vfs_dirent_t *out);
@@ -874,7 +874,7 @@ static void pp_build_link(pbuf_t *pb, struct proc *p, int kind) {
     }
 }
 
-static uint32_t pp_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf) {
+static uint32_t pp_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf) {
     pnode_t *pn = (pnode_t *)n;
     struct proc *t = pp_task(pn->pid);
     if (!t) return (uint32_t)-3;                       /* -ESRCH */
@@ -943,7 +943,7 @@ static uint32_t pp_read(vfs_node_t *n, uint32_t off, uint32_t len, uint8_t *buf)
 
 /* comm: a process may rename its own threads (Linux: same thread group);
  * oom_score_adj, loginuid and sched take any write and keep nothing. */
-static uint32_t pp_write(vfs_node_t *n, uint32_t off, uint32_t len, const uint8_t *buf) {
+static uint32_t pp_write(vfs_node_t *n, uint64_t off, uint32_t len, const uint8_t *buf) {
     pnode_t *pn = (pnode_t *)n;
     (void)off;
     struct proc *t = pp_task(pn->pid);
@@ -965,7 +965,7 @@ static uint32_t pp_write(vfs_node_t *n, uint32_t off, uint32_t len, const uint8_
 static vfs_node_t proc_selflink_node;
 static vfs_node_t proc_threadself_node;
 
-static uint32_t procfs_selflink_read(vfs_node_t *n, uint32_t off, uint32_t len,
+static uint32_t procfs_selflink_read(vfs_node_t *n, uint64_t off, uint32_t len,
                                      uint8_t *buf) {
     char t[48];
     if (!current_proc) return 0;
