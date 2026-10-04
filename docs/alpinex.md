@@ -150,7 +150,7 @@ What it took, besides maeroX itself:
 
 The extensions maeroX lacks (see above) cost none of these apps more than a
 fallback (mpv: no MIT-SHM, plain XPutImage).  No D-Bus session bus (`DBUS_SESSION_BUS_ADDRESS=disabled:`): Ristretto's thumbnails
-and Xfconf settings, GIMP's single-instance check are off.  GLib has no file
-monitor (no inotify).  apk in the guest is slow for big packages (~35 s for
+and Xfconf settings, GIMP's single-instance check are off.  GLib's inotify file
+monitor has not been tried with these apps (inotify came after this note).  apk in the guest is slow for big packages (~35 s for
 Galculator alone, minutes for the GTK/ICU stack), which is why Mousepad's GTK
 stack is preinstalled on the image.

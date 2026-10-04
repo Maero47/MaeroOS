@@ -639,7 +639,7 @@ focused engineer-days.
 | Unit / lock | `make smoke-klock` (`KLOCK_TEST=1`): 4 kernel threads leave the BKL and run 800k spinlock and ~1.5k kmutex rounds in parallel. Torn pairs, lost updates or two CPUs inside fail it, and lockdep must catch exactly one deliberate inversion. Extend it with every new primitive (wait queues, `sleep_locked`, seqcount, per-CPU run queues). | every stage |
 | Order | A `KLOCKDEP=1` build through `make check` and the SMP smokes: zero `[lockdep]` lines. | before merging each stage |
 | Contention | `make bench-bkl` (`--smp 4`, `--smp 8`, `--smp 1` as the reference), recorded in `build/bench-bkl/results.txt`. Each stage states which row it expects to move. | each stage |
-| System | `make check` (27 suites; most are `-smp 1`), `SMOKE_SMP=4` and `=8` `smoke_cmds`, `make smoke-abi`, `smoke-pc` (q35, 2 CPUs), `smoke-alpine`/`alpinex` and `smoke-firefox` for the heavy multi-threaded load | each stage |
+| System | `make check` (31 suites; most are `-smp 1`), `SMOKE_SMP=4` and `=8` `smoke_cmds`, `make smoke-abi`, `smoke-pc` (q35, 2 CPUs), `smoke-alpine`/`alpinex` and `smoke-firefox` for the heavy multi-threaded load | each stage |
 | Stress (new) | `schedlat torture`: N processes × M threads doing pipe ping-pong with checksums, futex mutex/condvar, fork+exec+exit+wait, mmap/munmap/mprotect of shared memory with content checks, signals between threads, run for minutes under SMP4 and SMP8 with a KLOCKDEP kernel. Plus a filesystem variant: 4 writers on one ext4/vfat mount, then fsck on the host. | from stage 2 |
 | Hang detection | kwatch (`kernel/kwatch.c`) NMI dump on stalls; `bkl_state` shows a wedged lock | always |
 

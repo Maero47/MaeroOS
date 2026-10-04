@@ -22,7 +22,9 @@ desktop application and reporting `0 clients, DISPLAY=:0`.
 - **Dynamic linking works.** The real musl `ld-musl-i386.so.1` loads PIEs and external
   shared objects, which is what makes prebuilt Linux packages usable at all.
 - **SMP.** Application processors are booted through a real-mode trampoline and run
-  threads under a recursive Big Kernel Lock with IPI-based TLB shootdown.
+  threads under a recursive Big Kernel Lock; idle CPUs halt without taking it, and a TLB
+  shootdown goes only to the CPUs running the address space that changed
+  ([docs/smp-plan.md](docs/smp-plan.md)).
 - **PAE paging with NX** on a 32-bit kernel: 64-bit page-table entries, execute
   protection (W^X) for user and kernel pages, and user pages in RAM above 4 GiB.
 - **The X11 wire protocol.** `maeroX` is a native MaeroOS GUI application that acts as
@@ -69,10 +71,11 @@ What is proven by the automated QEMU tests in `tools/`:
 | UEFI and BIOS boot (Limine, Multiboot 2) | `maeros-limine.iso` under SeaBIOS, OVMF x64 and OVMF IA32: the kernel sees Multiboot 2 from Limine on the expected firmware with an ACPI RSDP tag, the framebuffer (VBE or GOP) comes from the boot info, login works, the desktop starts and a screendump is that size and not blank, and `poweroff` exits through S5 (a firmware that is not installed is reported as SKIP) | `make smoke-uefi` |
 | Display modes (Bochs DISPI, virtio-gpu) | Settings -> Display driven with QMP clicks on `-vga std` and on `virtio-vga`: the mode list comes from the expected driver and holds 1024x768, 1280x800 and 1920x1080; Apply switches (screendump size, colour count, the orb at the new bottom opens the launcher), Revert and the 15 s timeout go back, Keep stays and writes `mode=` to `desktop.conf`, which the next login applies; on virtio the desktop's flushes cover only its damage; the Limine ISO on OVMF with `ramfb` keeps its one fixed GOP mode | `make smoke-gfxmode` |
 | /proc, System V IPC, utmp, inotify | busybox `ps`/`top`/`free`/`uptime` and toybox `ps`/`top`/`free`/`uptime`/`vmstat`/`pgrep`/`killall` read `/proc/stat`, `/proc/loadavg` and `/proc/<pid>`; toybox `who`/`w`/`last` show the console logins from utmp/wtmp; SysV shm/sem/msg between processes with permissions, `IPC_RMID` and `SEM_UNDO` (p46); inotify events on tmpfs and ext2 (p47); another user's `/proc/<pid>` `environ`, `fd/` and links are refused (p48). `SMOKE_PROCIPC_ARGS=--alpine` adds Alpine's procps-ng and htop | `make smoke-procipc` |
-| Linux ABI conformance | 52 musl-built probes (`ports/abiprobes/`), each printing the same `PASS` on Linux, covering findings of the Firefox audit plus later additions: `splice`, `flock`/`fcntl` record locks, `renameat2`, rtnetlink and `/proc/<pid>/fd` link permissions among them; any `FAIL`, missing verdict or wedge fails the run | `make smoke-abi` |
-| Firefox 115.15.0esr | `ff: Firefox painted` (the browser window, about 5 s after `firefox-bin` starts); with `--web`, a page served from the host (HTML, a CSS rule, a PNG) requested and its image on screen about 3 s after Enter (needs the Firefox tree, see `ports/firefox/`) | `make smoke-firefox`, `make smoke-firefox-web` |
+| Linux ABI conformance | 52 musl-built probes (`ports/abiprobes/`), each printing the same `PASS` on Linux, covering findings of the Firefox audit plus later additions: `splice`, `flock`/`fcntl` record locks, `renameat2`, rtnetlink, `/proc/<pid>/fd` link permissions, seccomp filters, System V IPC and inotify among them; any `FAIL`, missing verdict or wedge fails the run | `make smoke-abi` |
+| Firefox 115.15.0esr | `ff: Firefox painted` (the browser window, about 5 s after `firefox-bin` starts); with `--web`, a page served from the host (HTML, a CSS rule, a PNG) requested and its image on screen about 3 s after Enter; both fail unless about:support reports the content sandbox on (level 4 in the test profile, seccomp-bpf with TSYNC) with no syscall refused (`docs/sandbox.md`; needs the Firefox tree, see `ports/firefox/`) | `make smoke-firefox`, `make smoke-firefox-web` |
 | Alpine Linux x86 userland (chroot) | Alpine 3.22 (apk-tools 2) and 3.24 (apk-tools 3) roots from pinned, signature-checked packages, run with `chroot /disk/alpine`: `bash -c 'echo ok'`, GNU `ls --version`, `python3 -c 'print(1+1)'`, `vim --version`, `git init/commit/log`, `ssh -V`, `less` on a pipe, `apk add tree` / `apk del tree` from an offline repo on the disk, `apk verify`, and no unimplemented syscall on the way; `--net` also installs from a host-served HTTP mirror (needs network on the build host the first time, see `ports/alpine/`) | `make smoke-alpine` |
 | Alpine networking and sshd (chroot) | In the Alpine chroot on an e1000: busybox `ip addr`/`ip route`/`ip link` (rtnetlink), `ifconfig` and `route -n` (SIOC* ioctls, `/proc/net/route`) show eth0's DHCP address and the default route; `udhcpc -i eth0 -n -q` gets a lease over `AF_PACKET` and its script reconfigures eth0 through rtnetlink; `ping` over a raw ICMP socket; `flock -n` fails while another process holds the lock and a blocking `flock` waits, and `apk` refuses to run while its database lock is held; `openssh-server` installed with `apk` from the offline repo, `ssh-keygen -A`, `sshd` on port 22, and the host logs in through hostfwd with a throwaway key (`ssh ... true`, a command, an interactive `ssh -tt` session on `/dev/pts/0`); no unimplemented syscall. Needs `ssh` on the host | `make smoke-alpine-net` |
+| SMP locking (not in `make check`) | `-smp 4`: a `KLOCK_TEST` kernel's torture threads run a spinlock and a mutex outside the BKL on several CPUs at once without a lost update, and the lock-order checker catches one deliberate inversion; two fork+exec loops, pipelines, mmap/stat loops and `tar \| gzip` run together for 180 s without a hang, panic, kwatch STALL or lockdep report | `make smoke-klock`, `make stress-smp` |
 
 ### What does not work
 
@@ -116,8 +119,12 @@ What is proven by the automated QEMU tests in `tools/`:
   or across a key change, do not work together. There is no key rotation or revocation,
   and the rollback check is only as strong as the cached index, which the desktop user
   owns.
-- **No SMP scaling.** One Big Kernel Lock serialises all kernel execution
-  (`arch/i686/cpu/bkl.c`).
+- **Little SMP scaling in the kernel.** One Big Kernel Lock still serialises kernel
+  execution (`arch/i686/cpu/bkl.c`). Stage 1 of the plan in `docs/smp-plan.md` stopped
+  idle CPUs and console output from paying for it: on `-smp 4` a single process's
+  pipe, stat and mmap loops now run at the `-smp 1` rate, and fork+exec is 17× faster,
+  but four processes in the kernel at once still spend most of their time spinning
+  (pipe ×4: 0.82 M ops/s against 1.26 M on one CPU).
 - **Hardware coverage is what QEMU emulates.** Every driver is tested against QEMU's
   device models only (the Realtek r8169 driver, which QEMU cannot emulate, is
   tested on the host against a simulated chip: `docs/r8169.md`). There is no
@@ -173,13 +180,13 @@ What is proven by the automated QEMU tests in `tools/`:
   `linker.ld` links the image at `KERNEL_VMA + 0x00100000`.
 - Boot order lives in one readable function, `kernel_main` in `kernel/main.c`: serial,
   RTC, GDT/TSS/IDT/FPU, PIC, VGA, physical memory, RNG, paging, LAPIC, framebuffer,
-  heap, VFS, initrd, network, PCI and its drivers (NICs, AC'97, xHCI, HDA, ALSA), the
+  heap, VFS, initrd, network, PCI and its drivers (mode-setting display, NICs, AC'97, xHCI, HDA, ALSA), the
   disks (ATA, AHCI, NVMe, the block-device table and partitions) and ext2, tmpfs,
   devfs, procfs, scheduler, input, PIT, TSC, ACPI, application processors, kernel
   threads, then `/disk/init` or `/init`.
-- About 49,600 lines of C, headers and assembly in `arch/`, `drivers/`, `fs/`,
+- About 66,800 lines of C, headers and assembly in `arch/`, `drivers/`, `fs/`,
   `kernel/`, `lib/`, `mm/`, `net/`, `proc/` and `include/` (vendored code not counted),
-  of which `proc/syscall.c` is about 10,200.
+  of which `proc/syscall.c` is about 10,900.
 - Limits in `include/kernel/config.h`: `MAX_PROCS` 256, `MAX_FD` 512, 32 KiB kernel
   stacks, a 256 MiB kernel heap window at `0xD0000000`, 64-page user stacks below
   `0xC0000000`.
@@ -238,6 +245,13 @@ What is proven by the automated QEMU tests in `tools/`:
   `sigcontext`/`ucontext` frame laid out exactly as glibc expects, so a handler can read
   `uc_mcontext`; process-directed signals wait in a pending set shared by all threads,
   and a stop signal stops the whole thread group.
+- System V shared memory, semaphores (with `SEM_UNDO`) and message queues through
+  `ipc(2)` and the direct syscalls (`proc/sysvipc.c`), inotify (`fs/inotify.c`, events
+  charged to the kernel heap per user), and utmp/wtmp written by `init` and `login`
+  (`docs/procipc.md`).
+- seccomp-bpf: classic-BPF syscall filters (ALLOW, ERRNO, TRAP, KILL and LOG actions), `TSYNC`, `SIGSYS`
+  traps, and `no_new_privs` (`proc/seccomp.c`, `docs/sandbox.md`); this is what turns
+  Firefox's content sandbox on.
 - `proc/elf.c` loads `ET_EXEC` and `ET_DYN` (the latter at a load bias) and records
   `PT_INTERP` rather than rejecting it. `sys_exec` in `proc/syscall.c` is what acts on it:
   it maps the interpreter at `0x40000000`, then enters it with a full aux vector
@@ -247,9 +261,14 @@ What is proven by the automated QEMU tests in `tools/`:
 
 `arch/i686/cpu/` holds the LAPIC driver (`apic.c`), AP startup through
 `arch/i686/boot/ap_trampoline.asm` (`smp.c`), per-CPU scheduler state (`percpu.h`) and
-the recursive Big Kernel Lock (`bkl.c`). A CPU spinning for the lock keeps servicing TLB
-shootdown requests while it waits, because it holds interrupts off and would otherwise
-deadlock the sender.
+the recursive Big Kernel Lock (`bkl.c`, a test-and-test-and-set spin). A CPU spinning for
+the lock keeps servicing TLB shootdown requests while it waits, because it holds
+interrupts off and would otherwise deadlock the sender. An idle CPU halts with the lock
+released, and its timer tick and the reschedule IPI are acknowledged without it
+(`irq_idle_fast` in `irq.c`); user-half TLB shootdowns go only to the CPUs running that
+address space. `kernel/klock.c` has the spinlock and mutex types the later stages will
+use, with an opt-in lock-order checker (`make KLOCKDEP=1`). `docs/smp-plan.md` has the
+measurements and the plan for removing the lock.
 
 ### Scheduler
 
@@ -259,8 +278,7 @@ thread accumulates the nanoseconds it spends on a CPU, weighted by its nice valu
 with the least. A thread that blocked comes back at no less than the queue minimum minus
 3 ms, so a sleeper (input, audio, the compositor, a pipe reader) is ahead of a CPU hog
 without being able to bank its sleep. A wake compares the woken thread with what the
-CPUs are running: an idle CPU is kicked (a reschedule IPI to a halted BSP, a flag the
-idle APs poll), otherwise the CPU running the thread furthest behind gets its
+CPUs are running: an idle CPU is kicked (a reschedule IPI; every idle CPU halts), otherwise the CPU running the thread furthest behind gets its
 `need_resched` set, with an IPI when it is another CPU. The switch happens at the next
 return to user mode (syscall exit, IRQ exit), never inside kernel code. A syscall that
 woke a thread no idle CPU took queues the waker behind it and yields, so a condvar
@@ -333,17 +351,18 @@ and the firewall cover IPv6, and `getaddrinfo` orders its results by RFC 6724
 ATA with bus-master DMA reads and PIO writes (`ata.c`), SATA AHCI with DMA reads and writes on every
 controller and port (`ahci.c`), NVMe with one polled I/O queue pair per controller and every 512-byte
 namespace as a disk (`nvme.c`; `/disk` mounts from the IDE master if there is one, else the first AHCI
-disk, else the first NVMe namespace, via `blkdev.c`), PCI enumeration (`pci.c`), RTL8139 (`rtl8139.c`), Intel 8254x e1000 (`e1000.c`), virtio-net on a
+disk, else the first NVMe namespace, via `blkdev.c`), PCI enumeration (`pci.c`), RTL8139 (`rtl8139.c`), Intel 8254x e1000 (`e1000.c`), Realtek
+r8169 (`r8169.c`, tested on the host against a simulated chip only, [docs/r8169.md](docs/r8169.md)), virtio-net on a
 generic virtio PCI transport, modern with a legacy fallback, MSI-X or INTx (`virtio/`,
 [docs/virtio.md](docs/virtio.md)), Intel 82801AA AC'97
 audio (`ac97.c`), Intel High Definition Audio (`hda.c`: CORB/RIRB, codec widget walk, cyclic BDL
 playback; `/dev/dsp` uses whichever of the two is present, and so does the ALSA
 playback ABI in `alsa.c`, see [docs/audio.md](docs/audio.md)), the framebuffer (`framebuffer.c`: the boot loader's VBE/GOP mode, or a mode-setting
 driver's — Bochs/QEMU std VGA and VirtualBox VGA through VBE DISPI (`bochs_vga.c`),
-virtio-gpu 2D over virtio-pci with damage flushes (`virtio_gpu.c`); see
+virtio-gpu 2D on the same virtio PCI transport, with damage flushes (`virtio_gpu.c`); see
 [docs/display.md](docs/display.md)), VGA text (`vga.c`), PS/2
 keyboard and mouse (`keyboard.c`, `mouse.c`), CMOS RTC (`rtc.c`) and 16550 serial
-(`serial.c`).
+(`serial.c`, transmitting from a ring on the transmitter-empty interrupt).
 
 USB (`drivers/usb/`): an xHCI host controller driver (`xhci.c`) whose kernel thread
 `kusbd` enumerates root-hub ports, USB 2.0 hubs and USB 3 hubs (hot-plug included,
@@ -364,7 +383,7 @@ qemu-xhci -device usb-kbd -device usb-tablet` (and `-device usb-storage,drive=..
 
 ### Userland
 
-`userspace/` is about 39,500 lines across 228 source files, built with the same
+`userspace/` is about 54,200 lines across 261 source files, built with the same
 `i686-elf-gcc` and
 linked against its own freestanding libc (`userspace/libc/`: syscall stubs, stdio, stdlib,
 string, dirent, termios, sockets, signals, time, regex, a small libm, a DNS resolver
@@ -698,7 +717,9 @@ make smoke-nvme     # /disk on an NVMe namespace only (pc and q35)
 make smoke-ext4     # mount/umount, GPT+MBR partitions, read-only ext4 vs host md5s
 make smoke-vfat     # read-write FAT on AHCI, a USB stick and IDE; fsck.fat + mtools after
 make smoke-ext2rw   # two more ext2/ext3 mounted read-write at once, then host e2fsck/debugfs
-make smoke-ext4rw   # mkfs.ext4 images read-write (extents, csums, jbd2), then host e2fsck/debugfs
+make smoke-ext4rw   # mkfs.ext4 images read-write (extents, csums, jbd2, htree, orphans), then host e2fsck/debugfs
+make smoke-exfat    # read-write exFAT on AHCI, a USB stick and a 64 GiB sparse disk; fsck.exfat after
+make smoke-largefile  # files past 4 and 8 GiB on ext4, ext2, exFAT; EFBIG on vfat; host fsck after
 make smoke-net      # DHCP, TCP, HTTP GET from the host
 make smoke-net-e1000  # the same on an e1000, plus resolv.conf from DHCP and DNS lookups
 make smoke-net-virtio # virtio-net with MSI-X, INTx and legacy: DHCP, DNS, hostfwd, IPv6, 50 MiB each way
@@ -716,6 +737,8 @@ make smoke-hda      # Intel HDA playback through /dev/dsp, checked from a wav ca
 make smoke-audio    # Alpine's aplay through the ALSA ABI (/dev/snd), checked the same way (opt-in)
 make smoke-acpi     # poweroff, reboot, power button and halt through ACPI (pc and q35)
 make smoke-pc       # q35 with no PS/2: AHCI disk, USB input, desktop, poweroff
+make smoke-gfxmode  # Settings -> Display: mode switch, revert, keep on Bochs VGA and virtio-gpu
+make smoke-procipc  # /proc, ps/top/vmstat/who, SysV IPC, inotify on five filesystems, /proc fairness
 make smoke-uefi     # the Limine ISO under SeaBIOS, OVMF x64 and OVMF IA32: login, desktop, ACPI poweroff
 make smoke-install  # maeros-install from the live ISO to an empty disk, then boot it (SeaBIOS, OVMF x64)
 make smoke-abi      # Linux-ABI probes (ports/abiprobes/README.md), needs i686-linux-musl-gcc and disk.img
@@ -804,16 +827,19 @@ there: QEMU, started without `-no-shutdown`, must exit through ACPI S5.
 
 ### Continuous integration
 
-`make check` runs the suites that need nothing beyond a fresh clone: `smoke`,
-`smoke-cmds`, `smoke-toybox`, `smoke-disk`, `smoke-net`, `smoke-net-e1000`, `smoke-net-virtio`, `smoke-tcpsrv`, `smoke-fw`,
+`make check` runs 31 suites that need nothing beyond a fresh clone and the host tools
+below: `smoke`,
+`smoke-cmds`, `smoke-toybox`, `smoke-disk`, `smoke-net`, `smoke-net-e1000`, `smoke-net-virtio`, `smoke-net6`, `smoke-tcpsrv`, `smoke-fw`,
 `smoke-dyn`, `smoke-dynlib`, `smoke-x`, `smoke-pkg` (which first builds `repo/` and, on a
 host without one, a repo signing key), `smoke-gui` (which needs the ISO, so `check`
-builds it), `smoke-ext4`, `smoke-ext2rw`, `smoke-ext4rw`, `smoke-vfat` (needs `mkfs.fat`, `fsck.fat` and mtools on
+builds it), `smoke-gfxmode`, `smoke-ext4`, `smoke-ext2rw`, `smoke-ext4rw`, `smoke-vfat` (needs `mkfs.fat`, `fsck.fat` and mtools on
 the host), `smoke-exfat` (needs `mkfs.exfat` and `fsck.exfat` from exfatprogs, and
-about 2 MiB of real disk for a 64 GiB sparse image), `smoke-uefi` (the Limine ISO under SeaBIOS, OVMF x64 and OVMF IA32; `check`
+about 2 MiB of real disk for a 64 GiB sparse image), `smoke-largefile` (sparse 16 GiB
+images; the same host tools), `smoke-uefi` (the Limine ISO under SeaBIOS, OVMF x64 and OVMF IA32; `check`
 builds the ISO, which fetches the pinned Limine release once, and the test skips a
 firmware that is not installed), `smoke-install`, `smoke-hda`, `smoke-acpi`, `smoke-ahci`, `smoke-nvme`,
-`smoke-usb` and `smoke-pc`. It runs them one after another, writes each suite's
+`smoke-usb`, `smoke-pc` and `smoke-procipc` (which runs probes from `ports/abiprobes`, so
+`check` builds them and needs `i686-linux-musl-gcc`). It runs them one after another, writes each suite's
 console to `build/check/<suite>.log`, prints the tail of the log for any suite that
 fails, carries on with the rest and exits non-zero at the end. `CHECK_SUITES="smoke
 smoke-x" make check` runs a subset.
@@ -874,14 +900,14 @@ A wedged boot prints nothing, so three things exist to make one visible.
 | Path | Contents |
 |---|---|
 | `arch/i686/` | boot and AP trampoline assembly, GDT/IDT/TSS/PIC/PIT, LAPIC, SMP, BKL, paging |
-| `drivers/` | ATA, AHCI, NVMe, block-device table and partitions, PCI, RTL8139, e1000, r8169, virtio (PCI transport, virtqueues, virtio-net), AC'97, HDA, ALSA, USB (xHCI, HID, mass storage), framebuffer, VGA, keyboard, mouse, RTC, serial, ACPI (uACPI glue) |
-| `fs/` | VFS and mounts, ustar initrd, ext2, read-only ext4, vfat, tmpfs, devfs, procfs |
+| `drivers/` | ATA, AHCI, NVMe, block-device table and partitions, PCI, RTL8139, e1000, r8169, virtio (PCI transport, virtqueues, virtio-net), AC'97, HDA, ALSA, USB (xHCI, HID, mass storage), framebuffer with Bochs DISPI and virtio-gpu mode setting, VGA, keyboard, mouse, RTC, serial, ACPI (uACPI glue) |
+| `fs/` | VFS and mounts, ustar initrd, ext2/3/4 read-write, read-only ext4, vfat, exFAT, tmpfs, devfs, procfs, inotify |
 | `include/kernel/` | `config.h`, `types.h`, `multiboot.h`, `assert.h` |
-| `kernel/` | `main.c`, `printk`, ring-buffer `klog`, `panic`, RNG, stack protector |
+| `kernel/` | `main.c`, `printk`, ring-buffer `klog`, `panic`, RNG, stack protector, `kwatch`, lock primitives (`klock.c`) |
 | `lib/` | freestanding `string` and `printf` |
 | `mm/` | physical allocator, kernel heap, VMM helpers |
 | `net/` | lwIP port and glue, sockets, rtnetlink, packet and raw sockets, firewall, `knetd` |
-| `proc/` | scheduler, processes, ELF loader, syscalls, signals, pipes, AF_UNIX, shm |
+| `proc/` | scheduler, processes, ELF loader, syscalls, signals, pipes, AF_UNIX, shm, System V IPC, seccomp |
 | `userspace/` | libc, init, shell, libdraw/libwm/libgui, desktop, maeroX, commands |
 | `ports/` | cross-build scripts, Dockerfiles and package recipes for imported software |
 | `testfiles/` | the root filesystem staged into `initrd.tar` and `disk.img` |
@@ -905,8 +931,9 @@ A wedged boot prints nothing, so three things exist to make one visible.
   (create, map, unmap, chmod), 503 and 504 to dump and reset the `kprof` cycle
   accounting, and 505 for the desktop kill target.
 - **One Big Kernel Lock.** Application processors run user threads concurrently, but any
-  CPU entering the kernel takes the recursive BKL. The first user process dispatched
-  releases it in `forkret` on the way to user mode.
+  CPU entering the kernel takes the recursive BKL (an idle CPU's own timer tick and
+  reschedule IPI excepted). The first user process dispatched releases it in `forkret`
+  on the way to user mode.
 - **Boot filesystem then disk.** The initrd is a flat ustar archive that lives in RAM for
   the whole session, so the large GTK and Firefox trees are kept off it and shipped on
   the ext2 disk instead (`INITRD_EXCLUDE` in the Makefile). The disk is also overlaid on
@@ -920,10 +947,19 @@ A wedged boot prints nothing, so three things exist to make one visible.
 |---|---|
 | [docs/boot.md](docs/boot.md) | Multiboot 1 and 2, BIOS and UEFI boot paths, `smoke-uefi` |
 | [docs/install.md](docs/install.md) | `maeros-install`: disk layout, Limine, `root=PARTUUID=` |
-| [docs/ext4.md](docs/ext4.md) | `mount(2)`, partitions, the read-only ext4 driver |
+| [docs/ext4.md](docs/ext4.md) | `mount(2)`, partitions, ext2/3/4 read-write (jbd2, htree, orphans), the read-only ext4 driver |
 | [docs/vfat.md](docs/vfat.md) | read-write FAT and USB sticks |
 | [docs/exfat.md](docs/exfat.md) | read-write exFAT (big USB sticks, SD cards) |
+| [docs/largefile.md](docs/largefile.md) | 64-bit file offsets through the VFS and each filesystem |
+| [docs/procipc.md](docs/procipc.md) | `/proc`, System V IPC, inotify, utmp and their limits |
+| [docs/sandbox.md](docs/sandbox.md) | seccomp-bpf, `no_new_privs` and the Firefox content sandbox |
+| [docs/smp-plan.md](docs/smp-plan.md) | the Big Kernel Lock: measurements, stage 1, the plan for removing it |
+| [docs/net.md](docs/net.md) | loopback, IPv6, the resolver |
+| [docs/virtio.md](docs/virtio.md) | the virtio PCI transport, virtqueues, virtio-net |
+| [docs/r8169.md](docs/r8169.md) | the Realtek r8169 driver and its host-side test |
+| [docs/display.md](docs/display.md) | display modes: Bochs DISPI, virtio-gpu, the Settings page |
 | [docs/audio.md](docs/audio.md) | `/dev/dsp`, the ALSA kernel ABI, Firefox audio |
+| [docs/alpinex.md](docs/alpinex.md) | X11 apps from Alpine on maeroX, the `xapp` helper |
 | [docs/audit/firefox-first-paint.md](docs/audit/firefox-first-paint.md) | the kernel audit behind the ABI probes |
 | [docs/perf/firefox-startup.md](docs/perf/firefox-startup.md) | where Firefox's startup time goes |
 | [ports/alpine/README.md](ports/alpine/README.md) | the Alpine chroot, its networking and sshd |

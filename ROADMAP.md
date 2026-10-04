@@ -18,53 +18,63 @@ the test that proves it, is in the status table of [README.md](README.md).
 
 Each is covered by the test named, which README.md's status table describes.
 
-- **Execute protection.** PAE page tables with NX and W^X for user and kernel
-  pages (`make smoke` runs `wxprobe`); user pages in RAM above 4 GiB (checked
-  by hand with `-m 6G`, not by a suite).
-- **sshd.** `openssh-server` from Alpine runs in the chroot and the host logs
-  in through it (`make smoke-alpine-net`), on top of rtnetlink, `AF_PACKET`,
-  raw sockets and real `flock`/`fcntl` locks.
-- **Filesystems from USB sticks.** USB disks join the block-device table as
-  `sdX`, and FAT12/16/32 and exFAT mount read-write (`make smoke-vfat`,
-  `make smoke-exfat`).
-- **Installing to a disk.** `maeros-install` writes a GPT disk with an ext4
-  root that boots under BIOS and UEFI (`make smoke-install`).
-- **Sound for Linux programs.** The ALSA PCM/control ABI on HDA and AC'97
-  (`make smoke-audio`).
+- **ext4 read-write, finished for what `mkfs.ext4` makes.** htree lookups and new
+  directories indexed past one block, the orphan file (and the old orphan list) for
+  open-unlinked files and multi-commit deletes and truncates, an ext3/ext4 `/disk`
+  with its journal, and an ext4 root from `maeros-install` (`make smoke-ext4rw`,
+  `make smoke-install`, `docs/ext4.md`).
+- **64-bit file offsets** from the system calls down to ext2/ext4, exFAT, vfat, tmpfs
+  and block devices, with `EOVERFLOW`/`EFBIG` where Linux has them
+  (`make smoke-largefile`, `docs/largefile.md`).
+- **Network hardware.** virtio-net on a generic virtio PCI transport with MSI-X
+  (`make smoke-net-virtio`, `docs/virtio.md`); a Realtek r8169 driver, tested on the
+  host against a simulated chip only (`docs/r8169.md`).
+- **Display modes.** Runtime mode setting on Bochs/QEMU std VGA, VirtualBox VGA and
+  virtio-gpu (2D), a Settings page with keep-or-revert, and the desktop re-laid out on a
+  change (`make smoke-gfxmode`, `docs/display.md`).
+- **Firefox content sandbox on.** seccomp-bpf with `TSYNC`, `no_new_privs` and the
+  file broker give level 4 with no syscall refused (`make smoke-firefox-web`,
+  `docs/sandbox.md`).
+- **Missing interfaces filled.** `/proc/stat`, `loadavg`, `vmstat` and the full
+  `/proc/<pid>/`, System V shm/sem/msg, inotify and utmp/wtmp; toybox now builds
+  `killall`, `vmstat`, `who`, `w`, `last`, `ipcs`, `ipcrm` and `inotifyd`
+  (`make smoke-procipc`, `docs/procipc.md`).
+- **SMP stage 1.** Idle CPUs halt off the Big Kernel Lock, per-object poll wakes,
+  interrupt-driven console output and targeted TLB shootdowns: single-process kernel
+  loads on `-smp 4` run at the `-smp 1` rate and fork+exec is 17× faster; lock
+  primitives with a lock-order checker are in place for the next stages
+  (`make smoke-klock`, `make stress-smp`, `docs/smp-plan.md`).
 
 ## Open work
 
 What still stands between MaeroOS and daily use on real hardware:
 
-- **ext4 writes, the rest.** A default `mkfs.ext4` filesystem mounts read-write
-  with jbd2 journaling, htree directories and the orphan file (`make smoke-ext4rw`,
-  `docs/ext4.md`), and the installed root is ext4; still missing are `meta_bg`,
-  `inline_data`, `bigalloc`, quotas, filesystems past 2^32 blocks, an htree deeper
-  than one interior level for inserts (`largedir`), and per-file `fsync`.
-- **SMP scaling.** Replace the single Big Kernel Lock with finer locking.
-- **Networking hardware.** Wi-Fi (an 802.11 stack and a driver), Realtek
-  r8169 and virtio-net; today only RTL8139 and e1000 are supported.
+- **SMP scaling.** Stages 2 and later of `docs/smp-plan.md`: wait queues with object
+  locks and atomic refcounts, then a per-thread BKL dropped across context switches,
+  a scheduler lock with per-CPU run queues, and locks for memory, timers, fd tables,
+  the VFS, block devices, filesystems, the network and drivers until only a residual
+  lock is left. Several processes in the kernel at once still serialise on the BKL.
+- **ext4 writes, the rest.** `meta_bg`, `inline_data`, `bigalloc`, quotas,
+  filesystems past 2^32 blocks, an htree deeper than one interior level for inserts
+  (`largedir`), and per-file `fsync` (`docs/ext4.md`).
+- **Networking hardware.** Wi-Fi (an 802.11 stack and a driver), and the r8169 on
+  real hardware.
 - **Networking stack.** DHCPv6 and static IPv6 addresses, IPv6 nameservers
-  in the native resolver, and a blocking `SO_LINGER` timeout. Loopback, dual-stack
-  IPv6 with SLAAC and ping sockets are in place (`docs/net.md`).
-- **Graphics.** No GPU acceleration: the desktop draws into the boot
-  framebuffer, and the resolution is the one the boot loader set.
+  in the native resolver, and a blocking `SO_LINGER` timeout (`docs/net.md`).
+- **Graphics.** No GPU acceleration: the desktop composites in software, and cards
+  other than Bochs/VirtualBox VGA and virtio-gpu keep the boot loader's mode.
 - **Power.** ACPI sleep states (suspend to RAM); today only S5 power-off,
   reboot and the power button work.
 - **USB.** USB 3 hubs on real hardware (the code is in, but QEMU has no
   SuperSpeed hub to test it on), isochronous transfers (webcams, USB audio),
   UAS, a HID keyboard driven in report protocol (today boot protocol, plus a
   separate media-key interface), the volume keys wired to an ALSA mixer.
-- **Firefox.** Turn the content sandbox back on, cover CJK and Indic text
-  with fonts, and shorten the roughly 5 s startup
-  (`docs/perf/firefox-startup.md`); audio is only checked by an opt-in run.
+- **Firefox.** Cover CJK and Indic text with fonts and shorten the roughly 5 s
+  startup (`docs/perf/firefox-startup.md`); user namespaces, so the level-4 content
+  sandbox also gets its chroot and network/PID namespaces (`docs/sandbox.md`); audio
+  is only checked by an opt-in run.
 - **Credentials.** A separate fsuid; search permission on the directories a
   path lookup walks through.
-- **Missing interfaces.** SysV IPC, utmp, `/proc/stat` and
-  the full per-pid `/proc/<pid>/` set, which would let toybox build `killall`,
-  `vmstat`, `who`, `netcat` and `wget`; inotify (deliberately `ENOSYS` today).
-- **Filesystems.** 64-bit file offsets in the VFS (exFAT and ext4 files past
-  4 GiB show their first 4 GiB − 1 bytes today).
 - **Packages.** Signing-key rotation and revocation; today the key is per
   build host.
 - **Distribution.** A deterministic release artifact: kernel ELF, initrd,
