@@ -499,10 +499,18 @@ class GuiSmoke:
         return win
 
     def check_pty_size(self, win, cols, rows):
+        self.con.run("busybox rm -f /tmp/guismoke.size")
         self.type_in_terminal(win, "busybox stty size > /tmp/guismoke.size",
                               "/tmp/guismoke.term")
-        out = self.con.run("cat /tmp/guismoke.size")
-        size = re.findall(r"^(\d+) (\d+)\r?$", out, re.M)
+        # The proof is written before the command runs, so stty may not
+        # have written the file yet: wait for a complete "rows cols" line.
+        deadline = time.time() + 20
+        while True:
+            out = self.con.run("cat /tmp/guismoke.size")
+            size = re.findall(r"^(\d+) (\d+)\r?$", out, re.M)
+            if size or time.time() >= deadline:
+                break
+            self.settle(0.5)
         size = list(size[-1]) if size else out
         if size != [str(rows), str(cols)]:
             raise AssertionError(f"pty size {size} != terminal grid "
