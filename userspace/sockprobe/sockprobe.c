@@ -59,7 +59,9 @@ static int http_connect(int port) {
     host.sin_port = htons((uint16_t)port);
     host.sin_addr.s_addr = inet_addr("10.0.2.2");
     if (connect(fd, (struct sockaddr *)&host, sizeof(host)) < 0) {
+        int e = errno;          /* close() clears errno on success */
         close(fd);
+        errno = e;
         return -1;
     }
     return fd;
@@ -308,13 +310,24 @@ static int many(int port, int ntcp, int nudp) {
         printf("sockprobe: many: at most %d of each\n", MANY_MAX);
         return 1;
     }
+    long worst_us = 0;
+    int slow = 0;
     for (int i = 0; i < ntcp; i++) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
         tfd[i] = http_connect(port);
+        int e = errno;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long us = (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000;
+        if (us > worst_us) worst_us = us;
+        if (us > 500000) slow++;
         if (tfd[i] < 0) {
-            printf("sockprobe: many: tcp connect %d failed errno=%d\n", i, errno);
+            printf("sockprobe: many: tcp connect %d failed errno=%d after %ld ms\n",
+                   i, e, us / 1000);
             return 1;
         }
     }
+    printf("sockprobe many: slowest connect %ld ms, %d over 500 ms\n", worst_us / 1000, slow);
     for (int i = 0; i < nudp; i++) {
         ufd[i] = socket(AF_INET, SOCK_DGRAM, 0);
         if (ufd[i] < 0) {
