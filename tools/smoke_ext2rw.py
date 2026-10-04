@@ -154,7 +154,10 @@ def build_images():
     return a_img, a_fs, b_img, c_img, files
 
 
-LONG_NAME = "L" * 255                  # needs 264 bytes in a directory block
+# A name whose entry (rec_len 200) fits neither /full's block (168 bytes
+# free) nor, once indexed, its leaf (192 free).  Kept short enough that
+# /mnt/d/full/<name> stays within the 255-byte paths create(2) takes here.
+LONG_NAME = "L" * 190
 
 
 def build_fix_images():
@@ -176,7 +179,7 @@ def build_fix_images():
     for i in range(1, 5):                          # 4 x rec_len 208 = 832 bytes
         open(os.path.join(src, "full", f"n{i}" + "0" * 198), "wb").close()
     with open(os.path.join(src, "spare"), "wb") as f:
-        f.write(bytes(1024))
+        f.write(b"s" * 1024)                       # data: mke2fs -d makes zeros a hole
     for n in ("xa", "xb"):
         with open(os.path.join(src, n), "wb") as f:
             f.write(n.encode() + b"\n")
@@ -414,12 +417,12 @@ def guest_fixes(g):
     # One free block: the one-block /full is indexed, the name does not fit
     # its leaf and the split finds no room.  The name fails, the directory
     # keeps its entries.
-    rc, out = g.sh("busybox dd if=/dev/zero of=/mnt/d/fill bs=1k count=8000; busybox rm /mnt/d/spare; "
+    rc, out = g.sh("busybox dd if=/dev/zero of=/mnt/d/fill bs=1k count=8000; busybox rm /mnt/d/spare; busybox df /mnt/d; "
                    f"busybox touch /mnt/d/full/{LONG_NAME}; echo trc=$?; "
                    "busybox ls /mnt/d/full | busybox wc -l", timeout=180.0)
     m = re.search(r"trc=(\d+)\s+(\d+)", out)
     check(m is not None and m.group(1) != "0",
-          f"a 255-byte name in the full directory with one free block: ENOSPC ({out.strip()[-200:]!r})")
+          f"a 190-byte name in the full directory with one free block: ENOSPC ({out.strip()[-200:]!r})")
     check(m is not None and m.group(2) == "4",
           f"the directory still lists its 4 entries after the failed conversion ({out.strip()[-200:]!r})")
     rc, out = g.sh("busybox rm /mnt/d/fill && busybox umount /mnt/d")
