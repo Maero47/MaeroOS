@@ -7,11 +7,12 @@
 
 /*
  * tone — play a sine wave on /dev/dsp (48 kHz S16LE stereo).
- *   tone [-c card] <hz> <ms> [volume%]
+ *   tone [-c card | -d dsp] <hz> <ms> [volume%]
  * With a volume, sets the mixer volume first (OSS SOUND_MIXER_WRITE_VOLUME).
  * With -c, plays on ALSA card `card` instead (/dev/snd/pcmC<card>D0p through
  * the raw PCM ioctls, 48 kHz S16 stereo, converted by the kernel to the
- * card's rate), the volume going to its Master Playback Volume.
+ * card's rate), the volume going to its Master Playback Volume.  With -d,
+ * plays on another OSS-style device (/dev/dsp1: the USB audio card).
  */
 
 #define RATE 48000
@@ -31,13 +32,18 @@ int main(int argc, char **argv) {
     double sw, cw, x = 0, y = 1;   /* rotating unit vector */
 
     int card = -1;
+    const char *dsp = "/dev/dsp";
     if (argc > 2 && strcmp(argv[1], "-c") == 0) {
         card = atoi(argv[2]);
         argv += 2;
         argc -= 2;
+    } else if (argc > 2 && strcmp(argv[1], "-d") == 0) {
+        dsp = argv[2];
+        argv += 2;
+        argc -= 2;
     }
     if (argc < 3) {
-        printf("usage: tone [-c card] <hz> <ms> [volume%%]\n");
+        printf("usage: tone [-c card | -d dsp] <hz> <ms> [volume%%]\n");
         return 1;
     }
     hz = atoi(argv[1]);
@@ -66,10 +72,10 @@ int main(int argc, char **argv) {
             return 1;
         }
     } else {
-        fd = open("/dev/dsp", O_WRONLY);
+        fd = open(dsp, O_WRONLY);
     }
     if (fd < 0) {
-        printf("tone: /dev/dsp unavailable (no sound device?)\n");
+        printf("tone: %s unavailable (no sound device?)\n", dsp);
         return 1;
     }
     if (argc > 3 && card < 0) {

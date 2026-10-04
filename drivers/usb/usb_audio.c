@@ -386,50 +386,76 @@ static uint32_t fifo_used(void) {
     return ua.wr - ua.rd;
 }
 
-/* S16LE stereo at ua.rate in; the device's format into the FIFO. */
+/* One writer at a time (ALSA's PCM and /dev/dsp1 may both write). */
+static volatile int writer_busy;
+
+static int writer_enter(void) {
+    while (__sync_lock_test_and_set(&writer_busy, 1)) {
+        if (signal_interrupt_pending(current_proc)) return -1;
+        current_proc->wake_tick = pit_ticks() + 1;
+        sleep_on(&writer_chan);
+    }
+    return 0;
+}
+
+static void writer_leave(void) {
+    __sync_lock_release(&writer_busy);
+    wake_up(&writer_chan);
+}
+
+/* S16LE stereo at ua.rate in; the device's format into the FIFO.  The FIFO
+ * is filled under the USB lock, where feed() (and its end-of-stream
+ * padding) also runs. */
 static int ua_write(const uint8_t *data, uint32_t len) {
     uint32_t done = 0;
+    uint8_t conv[128 * 8];
     len &= ~3U;
+    if (writer_enter() < 0) return 0;
     while (done < len) {
-        if (!ua.dev) return -19;                             /* -ENODEV */
-        uint32_t space = FIFO_SIZE - fifo_used();
+        if (!ua.dev) {
+            writer_leave();
+            return done ? (int)done : -19;                   /* -ENODEV */
+        }
+        uint32_t space = FIFO_SIZE - fifo_used();   /* only grows meanwhile */
         uint32_t frames = space / ua.frame_bytes;
         if (frames > (len - done) / 4) frames = (len - done) / 4;
-        if (frames > 256) frames = 256;
+        if (frames > 128) frames = 128;
         if (!frames) {
             if (signal_interrupt_pending(current_proc)) break;
             current_proc->wake_tick = pit_ticks() + 2;
             sleep_on(&writer_chan);
             continue;
         }
-        static uint8_t conv[256 * 8];
         uint8_t *o = conv;
         for (uint32_t f = 0; f < frames; f++) {
             const uint8_t *in = data + done + f * 4;
             int16_t l = (int16_t)(in[0] | (in[1] << 8));
             int16_t r = (int16_t)(in[2] | (in[3] << 8));
-            int16_t s[2] = { l, r };
-            if (ua.channels == 1) s[0] = (int16_t)(((int32_t)l + r) / 2);
+            int16_t sm[2] = { l, r };
+            if (ua.channels == 1) sm[0] = (int16_t)(((int32_t)l + r) / 2);
             for (uint32_t ch = 0; ch < ua.channels; ch++) {
                 /* left-justified in the subframe (little endian) */
                 for (uint32_t z = 0; z + 2 < ua.subframe; z++) *o++ = 0;
-                *o++ = (uint8_t)s[ch];
-                *o++ = (uint8_t)((uint16_t)s[ch] >> 8);
+                *o++ = (uint8_t)sm[ch];
+                *o++ = (uint8_t)((uint16_t)sm[ch] >> 8);
             }
         }
         uint32_t bytes = (uint32_t)(o - conv);
-        uint32_t at = ua.wr % FIFO_SIZE, first = FIFO_SIZE - at;
-        if (first > bytes) first = bytes;
-        memcpy(ua.fifo + at, conv, first);
-        if (first < bytes) memcpy(ua.fifo, conv + first, bytes - first);
-        __sync_synchronize();
-        ua.wr += bytes;
-        done += frames * 4;
         usb_lock();
         ua.draining = 0;
-        feed();
+        if (ua.dev) {
+            uint32_t at = ua.wr % FIFO_SIZE, first = FIFO_SIZE - at;
+            if (first > bytes) first = bytes;
+            memcpy(ua.fifo + at, conv, first);
+            if (first < bytes) memcpy(ua.fifo, conv + first, bytes - first);
+            __sync_synchronize();
+            ua.wr += bytes;
+            feed();
+        }
         usb_unlock();
+        done += frames * 4;
     }
+    writer_leave();
     return (int)done;
 }
 

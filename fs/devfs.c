@@ -481,6 +481,35 @@ static uint32_t dsp_read(vfs_node_t *n, uint64_t off, uint32_t len,
 
 static vfs_node_t dev_dsp;
 
+/* /dev/dsp1: the same raw stream on ALSA card 1 (a USB audio device, while
+ * one is plugged in and runs at 48 kHz), its OSS volume the card's Master. */
+static uint32_t dsp1_write(vfs_node_t *n, uint64_t off, uint32_t len,
+                           const uint8_t *buf) {
+    (void)n;
+    (void)off;
+    int r = alsa_raw_write(1, buf, len);
+    return (uint32_t)r;                 /* -errno passes through */
+}
+
+static int dsp1_ioctl(vfs_node_t *n, uint32_t req, void *arg) {
+    (void)n;
+    if (req == 0x80044D00U || req == 0xC0044D00U) {
+        int *v = (int *)arg, set = -1;
+        if (req == 0xC0044D00U) {
+            int l = *v & 0xFF, r = (*v >> 8) & 0xFF;
+            set = l > r ? l : r;
+            if (set > 100) set = 100;
+        }
+        int cur = alsa_master_volume(1, set);
+        if (cur < 0) return cur;
+        *v = cur | (cur << 8);
+        return 0;
+    }
+    return -25;
+}
+
+static vfs_node_t dev_dsp1;
+
 /* ── /dev/urandom — kernel best-effort pseudo-random bytes ────────────────── */
 
 static uint32_t urandom_read(vfs_node_t *n, uint64_t off, uint32_t len, uint8_t *buf) {
@@ -1051,6 +1080,7 @@ static vfs_node_t *devdir_finddir(vfs_node_t *node, const char *name) {
     if (strcmp(name, "pts")     == 0) return &dev_pts_dir;
     if (strcmp(name, "urandom") == 0) return &dev_urandom;
     if (strcmp(name, "dsp") == 0) return &dev_dsp;
+    if (strcmp(name, "dsp1") == 0 && alsa_card_present(1)) return &dev_dsp1;
     if (strcmp(name, "snd")     == 0) return alsa_dev_dir();   /* or NULL */
     if (strcmp(name, "fb0")     == 0 && framebuffer_available()) return &dev_fb0;
     if (strcmp(name, "input")   == 0) return &dev_input_dir;
@@ -1072,7 +1102,7 @@ static int devdir_readdir(vfs_node_t *node, uint32_t idx, vfs_dirent_t *out) {
     static const char *names[] = { "null", "zero", "tty", "urandom", "dsp",
                                     "fb0", "input", "ptmx", "pts", "shm",
                                     "stdin", "stdout", "stderr", "usbdisk",
-                                    "initrd", "snd" };
+                                    "initrd", "snd", "dsp1" };
     uint32_t out_idx = 0;
     for (uint32_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         if (i == 5 && !framebuffer_available()) continue;   /* "fb0" */
@@ -1093,6 +1123,7 @@ static int devdir_readdir(vfs_node_t *node, uint32_t idx, vfs_dirent_t *out) {
         }
         if (i == 14 && !dev_initrd.size) continue;          /* "initrd" */
         if (i == 15 && !alsa_dev_dir()) continue;           /* "snd" */
+        if (i == 16 && !alsa_card_present(1)) continue;     /* "dsp1" */
         if (out_idx == idx) {
             out->ino  = (uint32_t)(idx + 1);
             out->type = (strcmp(names[i], "input") == 0 ||
@@ -1283,6 +1314,11 @@ vfs_node_t *devfs_mount(void) {
     dev_dsp.ioctl_fn = dsp_ioctl;
     dev_dsp.read_ready_fn = always_ready;
     dev_dsp.write_ready_fn = always_ready;
+    dev_dsp1 = dev_dsp;
+    strncpy(dev_dsp1.name, "dsp1", 255);
+    dev_dsp1.inode    = 39;
+    dev_dsp1.write_fn = dsp1_write;
+    dev_dsp1.ioctl_fn = dsp1_ioctl;
 
     /* /dev/urandom */
     memset(&dev_urandom, 0, sizeof(dev_urandom));

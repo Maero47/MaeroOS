@@ -1266,6 +1266,21 @@ int alsa_master_volume(int index, int set) {
     return elem_read(c, EL_VOLUME);
 }
 
+int alsa_card_present(int index) {
+    return index >= 0 && index < ALSA_MAX_CARDS && cards[index].out != NULL;
+}
+
+int alsa_raw_write(int index, const uint8_t *data, uint32_t len) {
+    const alsa_out_t *o;
+    int r;
+    if (index < 0 || index >= ALSA_MAX_CARDS) return -ENODEV_;
+    o = cards[index].out;
+    if (!o) return -ENODEV_;
+    if (o->rate != 48000) return -EINVAL_;
+    r = o->write(data, len & ~3U);
+    return r < 0 ? -ENODEV_ : r;
+}
+
 /* ── control ioctls ────────────────────────────────────────────────────── */
 
 static int ctl_ioctl(struct card *c, uint32_t req, uint8_t *k) {

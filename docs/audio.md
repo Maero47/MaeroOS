@@ -10,6 +10,7 @@ toybox chroot /disk/alpine aplay -D hw:0 /tmp/some.wav    # no alsa-lib plug lay
 mixer -c 0 40                        # card 0's Master to 40 % (also: mute, unmute)
 toybox chroot /disk/alpine amixer -c 0 sset Master 50%
 tone -c 1 440 1000                   # a USB audio device: ALSA card 1
+tone -d /dev/dsp1 440 1000           # the same card's raw 48 kHz node
 toybox chroot /disk/alpine aplay -D hw:1 /tmp/some.wav
 ```
 
@@ -28,7 +29,7 @@ usb-audio,audiodev=a`.
 |---|---|
 | `drivers/hda.c` | Intel HDA: codec walk, one output stream, 48 kHz S16LE stereo from a 256 KiB byte ring through a 128 KiB cyclic DMA buffer; `hda_queued()` (bytes not yet played) and `hda_drop()` for ALSA |
 | `drivers/ac97.c` | AC'97: the same ring and the same cyclic scheme over its 32 x 4 KiB buffer list (absolute play/write positions from CIV/PICB, LVI kept behind CIV); `ac97_queued()`, `ac97_drop()` |
-| `fs/devfs.c` | `/dev/dsp` (raw 48 kHz S16LE stereo writes, OSS mixer volume on HDA) and `/dev/snd` |
+| `fs/devfs.c` | `/dev/dsp` (raw 48 kHz S16LE stereo writes, OSS mixer volume on HDA), `/dev/dsp1` (the same on card 1 while a 48 kHz USB card is plugged in; its OSS volume is the card's Master) and `/dev/snd` |
 | `drivers/alsa.c` | `/dev/snd/controlC<n>` and `/dev/snd/pcmC<n>D0p` for card 0 (HDA/AC'97) and card 1 (USB, while plugged in): the ALSA control and PCM playback ioctls, the mixer elements, format conversion and resampling |
 | `drivers/usb/usb_audio.c` | USB Audio Class 1/2 playback on xHCI isochronous TDs (`drivers/usb/xhci.c`): the descriptors, the alternate setting and rate, the Feature Unit's volume and mute, a 256 KiB FIFO feeding one TD per service interval |
 | `proc/syscall.c` | `ioctl` on a `/dev/snd` node goes to `alsa_ioctl()` (with the descriptor's `O_NONBLOCK`); `mmap` of one fails with `ENXIO` |

@@ -38,6 +38,11 @@ int         alsa_ioctl(vfs_node_t *n, uint32_t req, void *uarg, int nonblock);
 /* A hot-plugged card (index 1) comes and goes. */
 void        alsa_card_add(int index, const alsa_out_t *out);
 void        alsa_card_remove(int index);
+/* Is card `index` there (card 1: a USB audio device plugged in)? */
+int         alsa_card_present(int index);
+/* /dev/dsp1: raw 48 kHz S16LE stereo straight to card `index`'s driver
+ * (bytes taken, or -errno: -ENODEV unplugged, -EINVAL at another rate). */
+int         alsa_raw_write(int index, const uint8_t *data, uint32_t len);
 /* Card `index`'s Master Playback Volume: set it when `set` >= 0; returns
  * the value (0..100) or -errno. */
 int         alsa_master_volume(int index, int set);

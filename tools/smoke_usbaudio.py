@@ -15,13 +15,15 @@ audiodev (build/smoke-usbaudio/out.wav).  Then, from the serial shell:
      TDs, one per 1 ms frame);
   4. `tone -c 1 1000 1000 30`: 1 kHz at 30 % of the USB card's Master
      volume (a SET_CUR to its Feature Unit);
-  5. hot-unplug while playing: `tone -c 1 660 6000` in the background,
+  5. `tone -d /dev/dsp1 1500 700`: the raw OSS-style node of card 1;
+  6. hot-unplug while playing: `tone -c 1 660 6000` in the background,
      QMP device_del of the usb-audio after ~1.5 s: the card leaves /dev/snd,
      tone fails with an error instead of hanging, no panic, the shell works;
-  6. plugged back in (QMP device_add): card 1 again, `tone -c 1 2000 800`
+  7. plugged back in (QMP device_add): card 1 again, `tone -c 1 2000 800`
      plays.
 The captured WAV must hold the 440 Hz tone for about 2 s with at most a
-few dropout blocks, the quieter 1 kHz tone, part of the 660 Hz one, and the
+few dropout blocks, the quieter 1 kHz tone, the 1.5 kHz one from /dev/dsp1,
+part of the 660 Hz one, and the
 2 kHz one from the replugged device.
 
 Usage: python3 tools/smoke_usbaudio.py  (make smoke-usbaudio)
@@ -146,6 +148,10 @@ def main():
         out = run(proc, sel, log, "mixer -c 1")
         expect(out, "card 1 Master: 30%", "USB card volume read back")
         out = run(proc, sel, log, "mixer -c 1 100")
+        out = run(proc, sel, log, "ls /dev")
+        expect(out, "dsp1", "/dev/dsp1 listing")
+        out = run(proc, sel, log, "tone -d /dev/dsp1 1500 700", timeout=40.0)
+        expect(out, "tone: done", "1.5 kHz tone on /dev/dsp1")
         stats = "".join(log)[at:]
         for line in stats.splitlines():
             if "[USB-AUDIO] stream" in line:
@@ -169,6 +175,9 @@ def main():
         out = run(proc, sel, log, "ls /dev/snd")
         if "pcmC1D0p" in out or "pcmC0D0p" not in out:
             raise AssertionError("/dev/snd after unplug:\n" + out)
+        out = run(proc, sel, log, "ls /dev")
+        if "dsp1" in out:
+            raise AssertionError("/dev/dsp1 still listed after unplug")
 
         # plugged back in
         at = smokelib.mark(log)
@@ -191,8 +200,8 @@ def main():
             f.write("".join(log))
 
     levels = {}
-    check_wav(WAV, [(440, 2.0, 4), (1000, 1.0, 3), (660, None, None)],
-              levels)
+    check_wav(WAV, [(440, 2.0, 4), (1000, 1.0, 3), (1500, 0.7, 3),
+                    (660, None, None)], levels)
     check_wav(WAV2, [(2000, 0.8, 3)], levels)
     if levels[440] < 3000:
         raise AssertionError(f"440 Hz tone too quiet (rms {levels[440]:.0f})")
