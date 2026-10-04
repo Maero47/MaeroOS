@@ -447,15 +447,27 @@ class UsbSmoke(GuiSmoke):
         con.wait_re(r"\[USB\] port [\d.]+: device removed", start=start)
         if node in con.run("ls /dev"):
             raise AssertionError(f"/dev/{node} still listed after unplug")
-        if getattr(self, "node_" + which, None):
-            # The node from the last plug-in holds the image; free it.
-            for _ in range(20):
+        # The guest has seen the unplug, but QEMU drops the old backend only
+        # once the device is finalized, which an in-flight read under load
+        # can delay: the command-line -drive of the first plug-in goes by
+        # itself then, the node from a later plug-in is deleted here.  Wait
+        # until no block node has the image open, or the new one cannot
+        # take its write lock.
+        old = getattr(self, "node_" + which, None)
+        deadline = time.time() + 15
+        while True:
+            if old:
                 try:
-                    self.qmp.cmd("blockdev-del",
-                                 **{"node-name": getattr(self, "node_" + which)})
-                    break
+                    self.qmp.cmd("blockdev-del", **{"node-name": old})
+                    old = None
                 except RuntimeError:
-                    time.sleep(0.2)
+                    pass
+            nodes = self.qmp.cmd("query-named-block-nodes")
+            if not old and not any(n.get("file") == image for n in nodes):
+                break
+            if time.time() > deadline:
+                raise AssertionError(f"{image} still open in QEMU after unplug")
+            time.sleep(0.1)
         start = con.mark()
         self.qmp.cmd("blockdev-add", driver="raw", **{"node-name": node_name},
                      file={"driver": "file", "filename": image})
