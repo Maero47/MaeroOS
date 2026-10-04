@@ -85,8 +85,7 @@ volatile uint32_t g_tlb_sends = 0, g_tlb_timeouts = 0, g_tlb_acks = 0;
 
 static void tlb_ipi_to(uint32_t apicid) {
     /* Fixed delivery, physical destination, edge, assert. */
-    apic_write(LAPIC_REG_ICR_HI, apicid << 24);
-    apic_write(LAPIC_REG_ICR_LO, TLB_IPI_VECTOR | (1U << 14));
+    apic_send_ipi(apicid << 24, TLB_IPI_VECTOR | (1U << 14));
 }
 
 /* Force every other online CPU to flush its TLB before we return.
@@ -99,10 +98,20 @@ static void tlb_ipi_to(uint32_t apicid) {
  * idling, and both loops call tlb_serve_pending(); every trap entry serves as
  * well.  The LAPIC coalesces a same-vector edge IPI that arrives while one is
  * still pending, so a slow target is re-sent the IPI periodically instead. */
+/*
+ * Several CPUs may send at once (stage 2: the senders need not hold the BKL).
+ * Each sender bumps every target's request generation atomically and waits
+ * for that target's ack to reach its own value; a target acks the generation
+ * it sampled before flushing, so one flush covers every request posted before
+ * it, whoever posted it, and a request posted after the sample waits for the
+ * next serve.  Two senders that target each other cannot deadlock: each
+ * serves its own pending requests while it waits.  The ICR pair is written
+ * with interrupts off (apic_send_ipi), so a nested sender cannot retarget it.
+ */
 static void tlb_shootdown_targets(const int *target) {
     uint32_t want[MAX_CPUS];
     int any = 0;
-    g_tlb_sends++;
+    __sync_add_and_fetch(&g_tlb_sends, 1);
 
     for (uint32_t id = 0; id < MAX_CPUS; id++)
         if (target[id]) {
@@ -119,11 +128,11 @@ static void tlb_shootdown_targets(const int *target) {
         uint32_t s = 0;
         int warned = 0;
         while ((int32_t)(cpus[id].tlb_ack_gen - want[id]) < 0) {
-            /* A concurrent sender (none today: callers hold the BKL) would be
-             * waiting on us; serving our own requests keeps that deadlock-free. */
+            /* A concurrent sender may be waiting on us: serving our own
+             * requests keeps that deadlock-free. */
             tlb_serve_pending();
             if ((++s & 0x3FFFFU) == 0) {
-                g_tlb_timeouts++;
+                __sync_add_and_fetch(&g_tlb_timeouts, 1);
                 tlb_ipi_to(cpus[id].apicid);
                 if (s >= 0x10000000U && !warned) {
                     warned = 1;
@@ -134,7 +143,7 @@ static void tlb_shootdown_targets(const int *target) {
             }
             __asm__ volatile("pause");
         }
-        g_tlb_acks++;
+        __sync_add_and_fetch(&g_tlb_acks, 1);
     }
 }
 
@@ -203,16 +212,14 @@ static void ipi_wait_delivery(void) {
         __asm__ volatile("pause");
 }
 static void send_ipi(uint8_t apicid, uint32_t icr_lo) {
-    apic_write(LAPIC_REG_ICR_HI, (uint32_t)apicid << 24);
-    apic_write(LAPIC_REG_ICR_LO, icr_lo);
+    apic_send_ipi((uint32_t)apicid << 24, icr_lo);
     ipi_wait_delivery();
 }
 
 void smp_stop_others(void) {
     if (!apic_available() || g_cpu_count < 2) return;
     /* Destination shorthand "all excluding self", INIT, level assert. */
-    apic_write(LAPIC_REG_ICR_HI, 0);
-    apic_write(LAPIC_REG_ICR_LO, (3U << 18) | (1U << 14) | 0x500U);
+    apic_send_ipi(0, (3U << 18) | (1U << 14) | 0x500U);
     ipi_wait_delivery();
 }
 

@@ -37,6 +37,14 @@ static inline void cpuid(uint32_t leaf, uint32_t *a, uint32_t *b,
 
 uint32_t apic_read(uint32_t reg)            { return g_lapic[reg / 4]; }
 void     apic_write(uint32_t reg, uint32_t v){ g_lapic[reg / 4] = v; }
+
+void apic_send_ipi(uint32_t icr_hi, uint32_t icr_lo) {
+    uint32_t fl;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+    apic_write(LAPIC_REG_ICR_HI, icr_hi);
+    apic_write(LAPIC_REG_ICR_LO, icr_lo);
+    if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
+}
 uint32_t apic_id(void)   { return apic_read(LAPIC_REG_ID) >> 24; }
 void     apic_eoi(void)  { apic_write(LAPIC_REG_EOI, 0); }
 int      apic_available(void) { return g_apic_ok; }

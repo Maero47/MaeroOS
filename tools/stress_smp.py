@@ -8,6 +8,10 @@ in on the serial console and runs, for --secs seconds, in parallel:
   pipes   echo | cat | wc pipelines, plus `schedlat scale pipe 2`
   mmap    `schedlat scale mmap 2` and `schedlat scale stat 2`
   targz   busybox tar cf - /bin | gzip | wc -c
+  torture `schedlat torture 2 10`: two processes of threads doing a
+          checksummed pipe stream, a futex mutex, concurrent mmap/munmap
+          (shootdowns from several CPUs into one address space), signals
+          between threads and fork+exit+wait (docs/smp-plan.md stage 2)
 
 Each worker counts its rounds; at the end the shell must answer, every worker
 must report STRESS-<name> rounds=N with N > 0, and the console must show no
@@ -28,7 +32,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import smokelib  # noqa: E402
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-BAD = ("PANIC", "STALL", "[lockdep]", "slow to ack")
+BAD = ("PANIC", "STALL", "[lockdep]", "slow to ack", "schedlat torture FAIL", "TORTURE-BAD-2")
 
 
 def worker(name, body, secs):
@@ -63,6 +67,8 @@ def main():
                   "/schedlat scale pipe 2 200 >/dev/null"),
         ("mmap", "/schedlat scale mmap 2 200 >/dev/null; /schedlat scale stat 2 200 >/dev/null"),
         ("targz", "busybox tar cf - /bin | busybox gzip | busybox wc -c >/dev/null"),
+        ("torture", "/schedlat torture 2 10 >/tmp/torture.out || "
+                    "{ busybox cat /tmp/torture.out; echo TORTURE-BAD-$((1+1)); }"),
     ]
     try:
         smokelib.login(proc, sel, log, timeout=120 if kvm else 300)

@@ -32,6 +32,11 @@ struct cpu {
     volatile int need_resched;
     volatile int idle;
     uint64_t run_t0;
+    /* Seqcount over run_t0 (stage 2e): a 64-bit store is two 32-bit stores
+     * on i686, so another CPU could read half of an old and half of a new
+     * value.  Only this CPU writes it (sched_set_run_t0); readers retry while
+     * the count is odd or changed. */
+    volatile uint32_t run_seq;
     /* A syscall on this CPU woke threads that no idle CPU took (sync wake):
      * wake_vr is the largest vruntime among them (0: none), and the syscall
      * exit queues the waker behind them.  in_irq: set while a hardware

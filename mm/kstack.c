@@ -1,3 +1,4 @@
+#include <kernel/klock.h>
 #include "kstack.h"
 #include "pmm.h"
 #include "vmm.h"
@@ -45,14 +46,12 @@ static uint8_t  slot_state[KSTACK_SLOTS];
 static unsigned slots_used;
 static unsigned slots_stale;
 
-static inline uint32_t irq_save(void) {
-    uint32_t f;
-    __asm__ volatile("pushf; pop %0; cli" : "=r"(f) :: "memory");
-    return f;
-}
-static inline void irq_restore(uint32_t f) {
-    if (f & 0x200) __asm__ volatile("sti" ::: "memory");
-}
+/* slot_state, slots_used and slots_stale are under kstack_lock (stage 2;
+ * irqsave, a leaf: the page mapping, the PMM and the shootdown all run
+ * outside it), so stacks can be allocated and freed without the BKL. */
+static kspinlock_t kstack_lock = KSPINLOCK_INIT("kstack");
+static inline uint32_t irq_save(void) { return kspin_lock_irqsave(&kstack_lock); }
+static inline void irq_restore(uint32_t f) { kspin_unlock_irqrestore(&kstack_lock, f); }
 
 static inline uint32_t slot_base(unsigned i) {
     return (uint32_t)(KSTACK_REGION_START + i * KSTACK_SLOT_SIZE + KSTACK_GUARD);
@@ -81,8 +80,8 @@ void *kstack_alloc(void) {
                 if (slot_state[i] == SLOT_STALE) slot_state[i] = SLOT_FLUSHING;
             slots_stale = 0;
             irq_restore(f);
-            /* Outside the cli section: the shootdown waits for the other
-             * CPUs' acknowledgements.  Under the BKL, as every caller is. */
+            /* Outside the lock: the shootdown waits for the other CPUs'
+             * acknowledgements. */
             ktrace("[KSTACK] reusing freed slots: TLB shootdown (%u in use)\n",
                    slots_used);
             tlb_flush_all();

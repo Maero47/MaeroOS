@@ -257,6 +257,18 @@ int proc_group_empty(struct proc *leader) {
 
 void proc_release(struct proc *p) {
     if (!p || p->state != PROC_ZOMBIE) return;
+    /* Its CPU may still be switching away from it, on its kernel stack
+     * (stage 2b).  Under the BKL that CPU clears on_cpu before anyone else
+     * can get here; once the BKL is dropped across swtch (stage 3) this wait
+     * is what keeps the stack alive until the switch is done. */
+    if (p->on_cpu) {
+        static int warned;
+        if (!warned++) printk("[proc] release of pid %d while still on a CPU: waiting\n", p->pid);
+        while (p->on_cpu) {
+            tlb_serve_pending();
+            __asm__ volatile("pause");
+        }
+    }
     { extern void vma_release(struct proc *p); vma_release(p); }
     if (p->pgdir_phys && !pgdir_release(p->pgdir_phys))
         pgdir_free_user(p->pgdir_phys);

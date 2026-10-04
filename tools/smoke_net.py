@@ -24,10 +24,21 @@ import smokelib
 import tempfile
 import threading
 from functools import partial
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from http.server import SimpleHTTPRequestHandler
+from http.server import ThreadingHTTPServer as _ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROMPT = "MaeroOS$ "
+
+
+class ThreadingHTTPServer(_ThreadingHTTPServer):
+    """The stdlib server with a listen backlog of 128 instead of 5.  `sockprobe
+    many` and `tcptw` open dozens of connections back to back before (or
+    without) sending a request; when the accept thread falls behind on a busy
+    host, a full 5-deep accept queue makes the host kernel drop slirp's SYN,
+    whose retries (1 s, then 3 s more) outlast the guest's 3 s blocking
+    connect: "tcp connect N failed errno=110 after 2994 ms"."""
+    request_queue_size = 128
 
 
 def wait_for(proc, sel, needle, log, timeout=20.0, start=0):

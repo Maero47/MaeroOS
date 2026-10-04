@@ -216,9 +216,12 @@ class GfxSmoke(GuiSmoke):
         # 2. 1920x1080 and Keep
         self.apply_mode(win, page, (1920, 1080))
         self.check_screen((1920, 1080), "mode-1920x1080")
+        keep_at = self.con.at
         self.click(*self.rel(win, *page["keep"]))
-        self.con.wait_re(r"\[desktop\] mode kept 1920x1080")
-        self.con.wait_re(r"\[settings\] mode keep 1920x1080 saved")
+        # Settings sends "modekeep" to the desktop and then saves the file:
+        # the two processes print these lines in either order.
+        self.con.wait_re(r"\[desktop\] mode kept 1920x1080", start=keep_at)
+        self.con.wait_re(r"\[settings\] mode keep 1920x1080 saved", start=keep_at)
         if run == "virtio":
             self.check_damage_flushes((1920, 1080))
         conf = self.con.run("cat /disk/etc/desktop.conf")

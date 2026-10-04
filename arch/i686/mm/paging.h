@@ -158,17 +158,23 @@ void paging_set_kernel_permissions(void);
 extern uint32_t kernel_pgdir_phys;
 
 /*
- * Temporary kernel virtual addresses for accessing arbitrary physical frames.
- * These use PTEs 1 and 2 of the shared boot_page_table1.  Must only be used
- * with interrupts disabled (IF=0) to avoid races.
+ * Temporary kernel mappings of arbitrary physical frames: two slots per CPU
+ * (slot 1: paging_temp_map, slot 2: paging_temp_map2) in the KMAP window
+ * (include/kernel/config.h).  The address returned belongs to the calling
+ * CPU; a thread holding a slot stays on that CPU until it unmaps it, even if
+ * it sleeps meanwhile (paging.c).  Nesting the same slot is not allowed (the
+ * inner unmap drops the outer mapping).  TEMP_MAP_VIRT/2 are the boot-time
+ * slots, used only until paging_init has reserved the window.
  */
 #define TEMP_MAP_VIRT  0xC0001000U
 #define TEMP_MAP_VIRT2 0xC0002000U
 
-void *paging_temp_map(phys_t phys);     /* maps phys at TEMP_MAP_VIRT */
+void *paging_temp_map(phys_t phys);     /* this CPU's slot 1 */
 void  paging_temp_unmap(void);
-void *paging_temp_map2(phys_t phys);    /* maps phys at TEMP_MAP_VIRT2 */
+void *paging_temp_map2(phys_t phys);    /* this CPU's slot 2 */
 void  paging_temp_unmap2(void);
+struct proc;
+void  paging_temp_restore(struct proc *p);   /* scheduler: p's slots, on dispatch */
 
 /* Allocate a new page directory with kernel mappings copied from the current one */
 uint32_t pgdir_create(void);

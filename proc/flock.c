@@ -8,15 +8,15 @@
 #include "../lib/string.h"
 
 /* Advisory locking: flock(2), POSIX record locks and OFD locks (flock.h).
- * Every syscall runs under the BKL, so the lists need no lock of their own;
- * waiters sleep on `lock_wq` and are all woken whenever a lock goes away.
+ * The lists and counts are under `flock_lock` (below); waiters sleep on
+ * `lock_wq` with sleep_locked and are all woken whenever a lock goes away.
  *
  * Locks are hashed by file, so a close or a lock call walks only the locks
  * that can be on its file, not every lock in the system.  And they are
  * bounded: LOCKS_PER_UID per real uid (root is exempt) and LOCKS_MAX in all,
  * past which F_SETLK answers -ENOLCK.  Unbounded, one unprivileged loop of
  * non-mergeable byte-range locks ate the kernel heap and made every close()
- * in the system walk the whole list under the BKL. */
+ * in the system walk the whole list under the lock. */
 
 enum { LK_FLOCK, LK_POSIX, LK_OFD };
 
@@ -47,6 +47,11 @@ typedef struct flk {
 static flk_t *lock_hash[LOCK_HASH];
 static int nlocks;
 static int lock_wq;
+/* Guards the lock table, the counts and the waiters' condition: set_lock
+ * looks for a conflict and sleeps on lock_wq under it (sleep_locked), and
+ * every release wakes lock_wq under it (docs/smp-plan.md stage 2a).  Taken
+ * in thread context only; kmalloc/kfree run under it (flock -> heap). */
+static kspinlock_t flock_lock = KSPINLOCK_INIT("flock");
 
 /* Locks held per non-root uid.  A uid that finds no slot gets -ENOLCK too:
  * 64 distinct users holding locks at once is far beyond this system. */
@@ -208,8 +213,18 @@ static int fd_unchanged(const proc_file_t *f, const vfs_node_t *node, uint32_t f
  * waiting for conflicting locks to go unless `nb`.  A descriptor closed
  * during the wait gets no lock (-EBADF, as Linux fcntl_setlk answers that
  * race): inserted, it would belong to an owner nothing can release. */
+static int set_lock_locked(proc_file_t *f, fkey_t k, int kind, uintptr_t owner, int type,
+                           int64_t start, int64_t end, int nb);
 static int set_lock(proc_file_t *f, fkey_t k, int kind, uintptr_t owner, int type,
                     int64_t start, int64_t end, int nb) {
+    uint32_t fl = kspin_lock_irqsave(&flock_lock);
+    int r = set_lock_locked(f, k, kind, owner, type, start, end, nb);
+    kspin_unlock_irqrestore(&flock_lock, fl);
+    return r;
+}
+
+static int set_lock_locked(proc_file_t *f, fkey_t k, int kind, uintptr_t owner, int type,
+                           int64_t start, int64_t end, int nb) {
     if (type == F_UNLCK_K)
         return unlock_range(k, kind, owner, start, end);
     const vfs_node_t *node = f->node;
@@ -219,7 +234,7 @@ static int set_lock(proc_file_t *f, fkey_t k, int kind, uintptr_t owner, int typ
             break;
         if (nb) return -11;                            /* -EAGAIN */
         if (signal_interrupt_pending(current_proc)) return -4;
-        sleep_on(&lock_wq);
+        sleep_locked(&lock_wq, &flock_lock);
         if (!fd_unchanged(f, node, fid)) return -9;    /* -EBADF */
     }
     flk_t *n = flk_alloc(current_proc ? current_proc->uid : 0);
@@ -258,15 +273,18 @@ int flock_bsd(proc_file_t *f, int op) {
         f->fid = fd_new_fid();
     }
     fkey_t k = key_of(f->node);
+    uint32_t fl = kspin_lock_irqsave(&flock_lock);
     /* Converting a lock drops the old one first (Linux flock_lock_inode):
      * a waiting converter does not keep its old lock. */
     for (flk_t *l = *bucket(k); l; l = l->next)
         if (same_file(l, k) && l->kind == LK_FLOCK && l->owner == f->fid) {
-            if (l->type == type) return 0;
+            if (l->type == type) { kspin_unlock_irqrestore(&flock_lock, fl); return 0; }
             unlock_range(k, LK_FLOCK, f->fid, 0, OFF_MAX);
             break;
         }
-    return set_lock(f, k, LK_FLOCK, f->fid, type, 0, OFF_MAX, (op & 4) != 0);
+    int r = set_lock_locked(f, k, LK_FLOCK, f->fid, type, 0, OFF_MAX, (op & 4) != 0);
+    kspin_unlock_irqrestore(&flock_lock, fl);
+    return r;
 }
 
 /* struct flock on i386: short l_type, l_whence; then off_t (32-bit) or
@@ -334,6 +352,7 @@ int flock_fcntl(proc_file_t *f, int cmd, void *uarg) {
 
     if (get) {
         if (fl.type == F_UNLCK_K) return -22;
+        uint32_t lfl = kspin_lock_irqsave(&flock_lock);
         flk_t *l = find_conflict(k, kind, owner, fl.type, start, end);
         kflock64_t out = fl;
         if (!l) {
@@ -345,6 +364,7 @@ int flock_fcntl(proc_file_t *f, int cmd, void *uarg) {
             out.len = l->end == OFF_MAX ? 0 : l->end - l->start + 1;
             out.pid = l->kind == LK_OFD ? -1 : l->pid;
         }
+        kspin_unlock_irqrestore(&flock_lock, lfl);
         if (wide)
             return copy_to_user(uarg, &out, sizeof(out)) < 0 ? -14 : 0;
         if (out.type != F_UNLCK_K &&
@@ -407,6 +427,7 @@ void flock_fd_closed(proc_file_t *f) {
      * locks on it.  Only a descriptor in the caller's own table counts;
      * one in flight over SCM_RIGHTS has no table. */
     struct fdtable *t = current_proc ? current_proc->fdt : NULL;
+    uint32_t fl = kspin_lock_irqsave(&flock_lock);
     if (t && f >= t->f && f < t->f + MAX_FD) {
         c.owner = (uintptr_t)t;
         unlock_all(head, match_posix_close, &c);
@@ -419,15 +440,20 @@ void flock_fd_closed(proc_file_t *f) {
             held = 1;
             break;
         }
+    kspin_unlock_irqrestore(&flock_lock, fl);
     /* (The scan of every descriptor table runs only for a description
-     * that holds such a lock.) */
+     * that holds such a lock, outside the lock: the tables are not its.) */
     if (held && !fid_in_use(f->fid, f)) {
         c.owner = f->fid;
+        fl = kspin_lock_irqsave(&flock_lock);
         unlock_all(head, match_fid, &c);
+        kspin_unlock_irqrestore(&flock_lock, fl);
     }
 }
 
 void flock_owner_gone(void *owner) {
-    if (nlocks)
-        unlock_all(NULL, match_table, owner);
+    if (!nlocks) return;
+    uint32_t fl = kspin_lock_irqsave(&flock_lock);
+    unlock_all(NULL, match_table, owner);
+    kspin_unlock_irqrestore(&flock_lock, fl);
 }

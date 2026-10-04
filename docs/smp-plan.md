@@ -11,7 +11,9 @@ Lock (BKL). This document covers four things:
 
 Stage 0 (lock primitives, a lock-order checker and a torture test) is implemented and
 changes no behaviour. Stage 1 (cheap wins that keep the BKL) is implemented; section 11
-has what changed and the before/after numbers. Every later stage is a proposal.
+has what changed and the before/after numbers. Stage 2 (foundations) is implemented,
+with the remaining check-then-sleep sites listed in section 12. Every later stage is a
+proposal.
 
 Numbers come from `make bench-bkl` (below) under KVM, on a 16-thread host that was also
 running other QEMU guests (load average about 10). Expect ±30% run-to-run noise. Every
@@ -323,19 +325,19 @@ Notes:
 | `io_activity` global wait channel | `io_wake` (scheduler.c), 35 callers | yes | BKL | per-object wait queues (stage 2) |
 | `ktimers[]` | `proc/ktimer.c`: `kt_alloc`, `ktimer_tick` (every CPU), `kt_fire` → `signal_send` | yes | BKL | `timer_lock` (irqsave) |
 | Signals: `pending_sigs`, `sighand`/`sigshared` refcounts | `proc/signal.c` (`signal_send` does a non-atomic \|=) | yes (tick, tty ^C, faults) | BKL | per-`sighand` `siglock` (irqsave); atomic refs |
-| Futex | no table: waiters found by a ptable scan on `futex_phys` (`futex_wake_n`, `proc/syscall.c`) | no | BKL | hashed futex buckets, each with a spinlock |
+| Futex | waiters found by a ptable scan (`futex_wake_n`, `proc/syscall.c`), under 64 hash-bucket locks with the wait handshake (stage 2) | no | bucket lock + BKL | per-bucket waiter lists instead of the ptable scan |
 | fd tables: `fdtable->refcount`, `ofile[]`; fd object refs (pipe, eventfd, epoll) | `proc/syscall.c`: `fdtable_put`, `fd_retain`/`fd_release` | no | BKL | per-fdtable spinlock; atomic file refs |
-| Pipes: ring and `count` | `proc/pipe.c` | no | BKL; check-then-sleep | per-pipe spinlock + wait queue |
+| Pipes: ring and `count` | `proc/pipe.c` | no | per-pipe lock + `sleep_locked` (stage 2); copies under the BKL | per-pipe sleeping lock across the copies (stage 8) |
 | Unix sockets: `all_sockets`, GC state | `proc/usocket.c` | no | BKL | per-socket lock + global `unix_gc` mutex |
 | shm `objects[]`, `attaches[]`; `shmaps[]` | `proc/shm.c`, `proc/syscall.c` | no | BKL (bare cli in shm) | `shm` mutex |
-| flock list | `proc/flock.c` (comment: "Every syscall runs under the BKL") | no | BKL | `flock` mutex |
+| flock list | `proc/flock.c` | no | `flock_lock` + `sleep_locked` (stage 2) | a sleeping lock if the hold (list walks) grows |
 | VMA lists (per mm) | `vma_insert`… in `proc/syscall.c` | #PF | cli + BKL | per-mm sleeping lock (mmap_lock) |
-| PMM bitmap, cursors, quarantine, `frame_refcount[]` | `mm/pmm.c` (comment: "Single CPU … sufficient") | #PF, IRQ allocations | cli | `pmm_lock` (irqsave); atomic refcounts |
-| kmalloc heap (TLSF) | `mm/heap.c` (comment relies on the BKL for SMP) | possible | cli | `heap_lock` (irqsave) |
-| Kernel stacks `slot_state[]` | `mm/kstack.c` | no | cli; shootdown "under the BKL" | `kstack_lock` |
-| `pgdir_shares[]`, PDE allocation, `sigpage` | `arch/i686/mm/paging.c` | #PF | cli + BKL | `pgtable_lock`, or per-mm |
-| Temp-map slots `TEMP_MAP_VIRT`/`2` | `paging_temp_map*` (one global PTE each, local `invlpg` only; "IF=0 only") | #PF COW | BKL + cli | **per-CPU slots** (stage 2) |
-| TLB shootdown generations | `arch/i686/cpu/smp.c` (`tlb_shootdown`: "none today: callers hold the BKL") | IPI | atomic req, plain ack | concurrent senders; target only CPUs in the mm's cpumask |
+| PMM bitmap, cursors, quarantine, `frame_refcount[]` | `mm/pmm.c` | #PF, IRQ allocations | **`pmm_lock`** (stage 2) | done |
+| kmalloc heap (TLSF) | `mm/heap.c` | possible | **`heap_lock`** (stage 2) | done |
+| Kernel stacks `slot_state[]` | `mm/kstack.c` | no | **`kstack_lock`** (stage 2) | done |
+| `pgdir_shares[]`, PDE allocation, `sigpage` | `arch/i686/mm/paging.c` | #PF | `pgdir_shares` lock (stage 2); the rest cli + BKL | `pgtable_lock`, or per-mm |
+| Temp-map slots | `paging_temp_map*`: two slots per CPU in the KMAP window, pinned to the CPU while held (stage 2) | #PF COW | per-CPU | done |
+| TLB shootdown generations | `arch/i686/cpu/smp.c` | IPI | atomic req, sampled ack; concurrent senders (stage 2), targeted by `cpus[].proc` (stage 1f) | done |
 | IRQ handler tables | `arch/i686/cpu/irq.c` | read in IRQ | BKL | `irq_lock` on install (rare); RCU-lite read |
 | klog ring, printk → serial/VGA | `kernel/klog.c` ("No locking"), `kernel/printk.c` | yes | none | `log_lock` (irqsave), plus a lockless emergency path for panic and NMI |
 | kprof (single global "current bucket") | `kernel/kprof.c` | yes | cli | per-CPU (it is only correct with `-smp 1` today) |
@@ -352,7 +354,7 @@ Notes:
 | ext4 (ro driver): block cache, nodes | `fs/ext4.c` | no | preempt | per-instance lock |
 | vfat / exfat: `fs->lock`, FAT/metadata cache, nodes | `fs/vfat.c`, `fs/exfat.c` `fs_lock` (test-and-set + `yield`) | no | own lock | `kmutex_t` |
 | tmpfs tree, `refs`, inode numbers | `fs/tmpfs.c` (also uses temp-map slot 2) | no | **BKL only** | per-instance `kmutex_t` |
-| devfs console termios / pgrp; pty rings `ptys[8]` | `fs/devfs.c` (`pty_buf_read`/`write` check-then-sleep) | no | BKL only | per-pty spinlock + wait queues |
+| devfs console termios / pgrp; pty rings `ptys[8]` | `fs/devfs.c` | no | rings, flags, used/gen: per-pair `pty` lock + `sleep_locked` (stage 2); termios/canon/pgrp: BKL | the line discipline under the pair lock too |
 | procfs scratch nodes `fd_file_nodes[]`, `proc_pid_*_nodes[]` | `fs/procfs.c`: rebuilt by `memset` on every lookup; walks `ptable` unlocked | no | **BKL only** (two CPUs would scribble on each other's node) | allocate per lookup; read the ptable under `sched_lock` |
 
 ### 4.3 Block devices and drivers
@@ -588,18 +590,18 @@ focused engineer-days.
 | 1f ✅ | Targeted TLB shootdown: a per-mm cpumask of CPUs that ran it; skip CPUs that are idle or in another mm (they reload CR3 on the next dispatch) | `arch/i686/cpu/smp.c`, `proc/scheduler.c` | bench-bkl mmap ×1/×4; threadprobe/mtmalloc smokes | medium | 2 |
 | 1g ✅ | Locked printk/klog (irqsave `log_lock`; a lockless path for panic and NMI) | `kernel/printk.c`, `kernel/klog.c` | boot logs stop interleaving; smoke-klock FAIL lines are readable | low | 1 |
 | 1h | ATA: poll with interrupts on and the BKL dropped between status reads, or use the IRQ | `drivers/ata.c` | smoke-disk, smoke-ext2rw/ext4rw | medium | 2 |
-| **2** | **Foundations** | | | | |
-| 2a | Wait queues + `sleep_locked(chan, kspinlock)` (xv6 `sleep(chan, lk)`). Convert every check-then-sleep site in section 5, item 1 to check under the object lock. Under the BKL this is behaviour-preserving. | `proc/scheduler.c`, `proc/pipe.c`, futex/wait/flock/usocket, `fs/devfs.c` ptys | smoke-cmds, unixprobe, threadprobe; a new `schedlat torture` (N processes: pipes, futexes, fork/exit, signals, checksummed) | medium | 5 |
-| 2b | `on_cpu` flag: `sched_pick` skips threads still switching out; exit frees the stack only after `on_cpu` clears | `proc/scheduler.c`, `proc/process.c` | as above | medium | 2 |
-| 2c | Per-CPU temp-map slots (`kmap_local`) | `arch/i686/mm/paging.c` and its callers | fork/COW/ELF smokes, smoke-dyn | low | 2 |
-| 2d | Atomic refcounts: file, fdtable, sighand, `pgdir_shares`, `frame_refcount` | `proc/syscall.c`, `proc/signal.c`, `mm/pmm.c`, `paging.c` | heap_stress (leaks), smoke-cmds | low | 2 |
-| 2e | IPI send under irqsave; `run_t0` under a seqcount | `scheduler.c`, `smp.c` | – | low | 0.5 |
-| **3** | **The BKL becomes per-thread and is dropped across `swtch`** (Linux 2.2-2.6 `schedule()`, NetBSD, FreeBSD Giant). Depth is saved in `struct proc`; `swtch` releases the BKL and the resumed thread re-takes it. The scheduler loop runs *without* the BKL under `sched_lock` (stage 4a lands together with this). | `bkl.c`, `percpu.h`, `scheduler.c`, `process.c` (`forkret`), `isr.asm` | everything; smoke-klock extended (mutexes without the BKL); SMP8 stress | **high** (the central change) | 8 |
+| **2** ✅ | **Foundations** (section 12; 2a partly: waitpid, unix sockets and poll remain) | | | | |
+| 2a ◐ | Wait queues + `sleep_locked(chan, kspinlock)` (xv6 `sleep(chan, lk)`). Convert every check-then-sleep site in section 5, item 1 to check under the object lock. Under the BKL this is behaviour-preserving. | `proc/scheduler.c`, `proc/pipe.c`, futex/wait/flock/usocket, `fs/devfs.c` ptys | smoke-cmds, unixprobe, threadprobe; a new `schedlat torture` (N processes: pipes, futexes, fork/exit, signals, checksummed) | medium | 5 |
+| 2b ✅ | `on_cpu` flag: `sched_pick` skips threads still switching out; exit frees the stack only after `on_cpu` clears | `proc/scheduler.c`, `proc/process.c` | as above | medium | 2 |
+| 2c ✅ | Per-CPU temp-map slots (`kmap_local`) | `arch/i686/mm/paging.c` and its callers | fork/COW/ELF smokes, smoke-dyn | low | 2 |
+| 2d ✅ | Atomic refcounts: file, fdtable, sighand, `pgdir_shares`, `frame_refcount` | `proc/syscall.c`, `proc/signal.c`, `mm/pmm.c`, `paging.c` | heap_stress (leaks), smoke-cmds | low | 2 |
+| 2e ✅ | IPI send under irqsave; `run_t0` under a seqcount | `scheduler.c`, `smp.c` | – | low | 0.5 |
+| **3** | **The BKL becomes per-thread and is dropped across `swtch`** (the per-thread depth itself landed in stage 2) (Linux 2.2-2.6 `schedule()`, NetBSD, FreeBSD Giant). Depth is saved in `struct proc`; `swtch` releases the BKL and the resumed thread re-takes it. The scheduler loop runs *without* the BKL under `sched_lock` (stage 4a lands together with this). | `bkl.c`, `percpu.h`, `scheduler.c`, `process.c` (`forkret`), `isr.asm` | everything; smoke-klock extended (mutexes without the BKL); SMP8 stress | **high** (the central change) | 8 |
 | **4** | **Scheduler** | | | | |
 | 4a | `sched_lock` (irqsave) over ptable state, `sleep_on`/`wake_up`, `sched_pick`, vruntime, `scheduler_tick`; `sleep_locked` takes it before releasing the object lock | `proc/scheduler.c`, `proc/process.c` | bench-sched (latency must not regress), smoke-cmds SMP4/8 | high | 5 |
 | 4b | Per-CPU run queues (one lock each) with simple pull balancing; `sched_pick` stops scanning the whole ptable | `proc/scheduler.c` | bench-sched, bench-bkl | medium | 5 |
 | 4c | Interrupt and IPI entry no longer take the BKL: handlers converted to own locks (tick, resched IPI, input, NIC ack); unconverted handlers wrap themselves in `bkl_enter` | `isr.asm`, `irq.c`, drivers | smoke-usb, smoke-net*, smoke-hda | medium | 4 |
-| **5** | **Page allocator, heap, kstacks, page tables** (`pmm_lock`, `heap_lock`, `kstack_lock`, `pgtable_lock`, per-mm `mmap_lock`). This is the task's "page allocator first". It is cheap here because these already have saved-IF cli sections, but it only buys parallelism after stage 3, so it sits after it. Page faults on anonymous memory can then run without Giant. | `mm/*.c`, `arch/i686/mm/paging.c`, `vma_*` in `proc/syscall.c` | KHEAP_TEST=1 under SMP4, mtmalloc, bench-bkl mmap | medium | 5 |
+| **5** | **Page allocator, heap, kstacks, page tables** (`pmm_lock`, `heap_lock`, `kstack_lock`, `pgtable_lock`, per-mm `mmap_lock`). `pmm_lock` and `heap_lock` landed early, in stage 2 (section 12). This is the task's "page allocator first". It is cheap here because these already have saved-IF cli sections, but it only buys parallelism after stage 3, so it sits after it. Page faults on anonymous memory can then run without Giant. | `mm/*.c`, `arch/i686/mm/paging.c`, `vma_*` in `proc/syscall.c` | KHEAP_TEST=1 under SMP4, mtmalloc, bench-bkl mmap | medium | 5 |
 | **6** | **Timers and signals**: `timer_lock`; a timer list or wheel instead of scanning every thread's `wake_tick` on each tick; per-sighand `siglock` | `proc/ktimer.c`, `proc/scheduler.c`, `proc/signal.c` | schedlat audio/nice, smoke-abi (signals, itimers) | medium | 4 |
 | **7** | **Syscall entry takes Giant only for unconverted syscalls**: a per-syscall MPSAFE table (FreeBSD `SYF_MPSAFE`, OpenBSD NOLOCK). First set: getpid/gettid/getppid, clock_gettime, sched_yield, nanosleep, brk/mmap/munmap/mprotect (after 5), futex (hashed buckets), kill (after 6) | `proc/syscall.c` dispatch, `isr.asm` | bench-bkl getpid ×4 should scale ~4× | medium | 3 + per syscall |
 | **8** | **fd tables, pipes, eventfd, epoll**: per-fdtable lock, per-pipe lock + wait queues; read/write/close/dup become MPSAFE for these fd types | `proc/syscall.c`, `proc/pipe.c` | bench-bkl pipe ×4, heap_stress, unixprobe | medium | 5 |
@@ -761,7 +763,142 @@ Verification (stage 1 commit, merged with `yonet/bklplan` 053c2fe):
 
 ---
 
-## 12. References
+## 12. Stage 2, as implemented
+
+Still one BKL, taken at every trap and held across `swtch`. Stage 2 builds what stage 3
+(dropping the BKL across `swtch`) and stage 4 (`sched_lock`) need, and moves the first
+leaf subsystems onto locks of their own. Under the BKL every change is
+behaviour-preserving; the torture test exercises the new locks from several CPUs
+*outside* the BKL.
+
+| Item | Change | Where |
+|---|---|---|
+| 2a | `sleep_locked(chan, lk)`, the xv6 `sleep(chan, lk)` handshake: the caller holds the kspinlock `lk` over the condition it tested; the thread is marked SLEEPING on `chan` first, `lk` is released only after that (interrupts stay off up to the switch), and it is held again on return. Wakers change the condition and call `wake_up` under `lk`. `waitq_t` (`wq_wait`, `wq_wake_all`, `wq_wake_n`) packages a channel with its lock. Converted: **kmutex** (sleeps on its guard; the unlock wakes under it), **pipes** (per-pipe `lock` over head/count/readers/writers/pins; the user copies stay outside it because they can fault and sleep), **eventfd** (per-object lock; read consumes under the lock and puts the value back if the copy-out faults), **futex** (64 hash buckets keyed like the existing match: (tgid, uaddr) private, physical page shared; FUTEX_WAIT re-reads the word under the bucket lock without faulting and, if the page is gone, faults it in outside the lock and retries, as Linux `futex_wait_setup`; every FUTEX_WAKE/REQUEUE/WAKE_OP scans and wakes under the bucket lock; after 8 rounds of a page that keeps disappearing it goes with the copied value), **flock/fcntl locks** (one `flock_lock` over the hashed lock table and counts; set_lock tests for a conflict and sleeps under it; every release wakes under it; the scan of all descriptor tables on close runs outside it), **ptys** (a per-pair lock over the ring heads and counts, the closed/EOF flags and used/gen, kept when the slot is cleared; ring copies run under it, since they go to kernel bounce buffers; termios, the canonical buffer and the process group stay the BKL's). Not converted yet: waitpid/waitid (needs the ptable under `sched_lock`, stage 4a), unix sockets, poll/select (`io_poll_sleep`), the CLEARTID/robust wakes in `proc_exit` (`wake_up_n_tgid`). They stay correct under the BKL. | `proc/scheduler.c`, `scheduler.h`, `kernel/klock.c`, `proc/pipe.c`, `proc/syscall.c`, `proc/flock.c`, `fs/devfs.c` |
+| 2b | `on_cpu`: set at dispatch, cleared once the scheduler is back on its own stack after the switch out (registers saved, kernel stack free). `sched_pick` skips a thread with `on_cpu` set; `proc_release` waits for it before freeing the stack. It cannot be seen set under the BKL (the switching CPU holds the lock until it is clear), and the warning `proc_release` prints if it waits never appeared in any run; from stage 3 on it is the guard. | `proc/scheduler.c`, `proc/process.c` |
+| 2c | Per-CPU temp-map slots. The two global PTEs (`TEMP_MAP_VIRT`/`2` in the direct map) became two slots per CPU in a new 2 MiB KMAP window at 0xF2000000 (page table reserved at boot, shared by every pgdir), with a local `invlpg` only. A thread that sleeps while holding a slot (a page fill reading a file from USB) records the frames in `struct proc` (`kmap_phys`, `kmap_mask`, `kmap_cpu`); while it holds any it is dispatched only on that CPU (`sched_pick`, and `sched_wakeup` kicks that CPU if idle), and the dispatch maps its frames again (`paging_temp_restore`), because another thread on the CPU may have used the slots meanwhile. So the caller's pointer stays valid across a sleep, which the old global slot did not guarantee either. | `arch/i686/mm/paging.c`, `paging.h`, `include/kernel/config.h`, `proc/scheduler.c` |
+| 2d | Atomic refcounts (`include/kernel/refcount.h`: `ref_get`, `ref_put`, `ref_read`) for fd tables, `sighand`, `sigshared`, eventfds, epoll instances and seccomp filters. `pgdir_shares` is a table that is searched and updated as a whole, so it got an irqsave leaf lock (`pgdir_shares`) instead. `frame_refcount` is under `pmm_lock` (below). | `proc/syscall.c`, `proc/signal.c`, `proc/seccomp.c`, `arch/i686/mm/paging.c` |
+| 2e | IPIs go through `apic_send_ipi(hi, lo)`, which writes ICR_HI and ICR_LO with interrupts off (resched, TLB, INIT/SIPI, stop-others). `run_t0` is read cross-CPU through a seqcount (`run_seq`); the owning CPU writes it with interrupts off, since its own tick reads it. | `arch/i686/cpu/apic.c`, `smp.c`, `percpu.h`, `proc/scheduler.c` |
+| – | **Per-thread BKL depth.** `struct proc` keeps the depth the thread switched out with (`bkl_depth`, 0 = never ran = 1); the dispatch restores it and the scheduler loop always runs at depth 1. A thread that sleeps nested (a fault inside a syscall that blocks on USB I/O) no longer hands its depth to the next thread on the CPU (section 5 item 3; `bad_switch` stays as the BKLSTAT counter). | `proc/scheduler.c`, `proc/process.h` |
+| – | **TLB shootdown with several senders.** The generation protocol already tolerated concurrent senders: each sender bumps every target's request generation atomically and waits for that target's ack to reach its own value, the target acks the sample it took before flushing, and a waiting sender serves its own requests. What changed: the ICR pair is written with interrupts off (2e), the counters are atomic, and the comment no longer assumes one sender. The torture test now runs four senders at once without the BKL and checks for stale translations. | `arch/i686/cpu/smp.c` |
+| – | **Frame allocator, kernel heap and kernel stacks without the BKL.** `pmm_lock` (bitmap, cursors, quarantine, frame refcounts), `heap_lock` (TLSF lists; above `pmm_lock`, since heap growth maps pages) and `kstack_lock` (slot states; the mapping, the PMM and the reuse shootdown run outside it) replace the saved-IF `cli` sections. All are irqsave; nothing under `heap_lock` calls kmalloc (the heap's page tables are reserved at boot). Later stages can call kmalloc, the PMM and kstack_alloc without the BKL; the torture test does. | `mm/pmm.c`, `mm/heap.c`, `mm/kstack.c` |
+| – | Lockdep fix: `kspin_lock_irqsave` and the irqsave trylock no longer mark a class "taken with interrupts enabled" because the *caller* had IF=1: the lock is held with IF=0, so an irqsave lock shared with interrupt handlers is fine. Only `kspin_lock` with IF=1 counts. | `kernel/klock.c` |
+
+Lock order additions (section 7.2): object locks (`pipe`, `eventfd`, `futex_bucket`,
+`flock`, `pty`, `kmutex.guard`) → `heap` → `kstack` → `pmm`; `pgdir_shares` is a leaf. `KLOCKDEP=1` runs (smoke-klock,
+stress-smp, smoke_cmds SMP4) reported nothing.
+
+Tests:
+
+- `make smoke-klock` (stage-0 torture plus, all at once):
+  - the four spin threads allocate and free heap blocks (random sizes) and PMM frames
+    outside the BKL every 64 iterations, filling frames through their CPU's temp-map
+    slot and checking the pattern before freeing (two allocators handing out the same
+    block or frame would overwrite each other), and now and then a kernel stack
+    (~1200 per run; reusing freed slots sends a shootdown);
+  - every 256 iterations each of them remaps its own test page in the KMAP window to the
+    frame holding the next generation, sends `tlb_shootdown()` and only then publishes
+    the generation; every 16 iterations each reads all four test pages and fails if one
+    shows less than its published generation (a translation the shootdown should have
+    flushed). Four concurrent senders, ~3100 shootdowns, 50000 checks per run;
+  - two more threads ping-pong a token 20000 times each way through `sleep_locked` on
+    two channels under one lock, with a 3 s deadline on every sleep: a timeout while the
+    turn is already ours is a lost wakeup.
+
+  Both detectors were checked against broken kernels: without the `tlb_shootdown()` call
+  the run fails with "stale TLB entry after a shootdown", and with `pmm_lock` replaced
+  by the old bare `cli` it fails with "frame overwritten (two CPUs got one frame)".
+  The ping-pong cannot fail under the BKL (the waker needs the BKL to wake, so it
+  cannot run inside the sleeper's window); it becomes a real check in stage 3.
+- `schedlat torture P SECS` (new): P processes, each with a checksummed pipe stream
+  (odd lengths up to 9000 bytes, both ends blocking), three threads on a futex mutex
+  over a counter pair with `sched_yield` inside, two threads mapping, touching,
+  checking and unmapping anonymous memory (concurrent munmap shootdowns into one
+  address space), `pthread_kill` between threads and fork+exit+wait. `make stress-smp`
+  runs `schedlat torture 2 10` in a loop next to its other workers.
+
+A bug found on the way: the first `run_t0` seqcount writer left interrupts on, and a
+tick on the same CPU between the two increments spun forever in `scheduler_tick`
+(`cpu_curr_vr` on its own CPU): a 40 s stress-smp hung with all four vCPUs at 100%.
+The writer now runs with interrupts off.
+
+### 12.1 Before and after
+
+`make bench-bkl` (BKLSTAT build, KVM). `base` is the parent commit (c8539a7, built from
+a copy of the tree); `s2` is stage 2 at ceef797 (the pty and kstack locks came after it and
+touch none of these paths). Each cell is the median [individual runs]; units as in 11.1.
+The host was running other workers' guests the whole time (load average 5-7), so expect
+±30%; the SMP4 base runs come from two sessions, one at a quieter moment.
+
+| Workload | base:1 | s2:1 | base:4 | s2:4 | base:8 | s2:8 |
+|---|---|---|---|---|---|---|
+| time forks (ms) | 148 [144,148,159] | 146 [146,145,152] | 170 [174,154,165,314] | 205 [230,176,180,308] | 276 [389,162] | 166 [160,171] |
+| time forks4 (ms) | 292 [290,292,308] | 304 [294,317,304] | 365 [362,332,369,590] | 536 [568,512,446,560] | 656 [812,500] | 371 [358,385] |
+| time targz4 (ms) | 3579 [3562,3579,3842] | 3622 [3568,3622,3622] | 1163 [1219,1108,1072,1416] | 1220 [1187,1189,1250,1441] | 1643 [1456,1830] | 1319 [1363,1274] |
+| time par4 (ms) | 510 [510,508,538] | 524 [509,524,1003] | 196 [201,192,137,227] | 196 [164,198,194,222] | 202 [208,197] | 181 [184,178] |
+| getpid x1 (k ops/s) | 3052 [3052,3073,2856] | 2975 [3057,2975,2116] | 2676 [2633,2720,2722,1511] | 2486 [2628,2501,2471,1624] | 2515 [2341,2689] | 2644 [2601,2686] |
+| getpid x4 | 3030 [3030,3059,2842] | 2962 [3054,2962,2959] | 1487 [1318,1655,1806,1154] | 1515 [1667,1552,1478,1454] | 1310 [1409,1211] | 1635 [1658,1612] |
+| pipe x1 | 1437 [1437,1442,1321] | 1383 [1388,1358,1383] | 979 [591,1266,1311,693] | 1119 [1221,1132,1107,638] | 1186 [1206,1166] | 1248 [1250,1246] |
+| pipe x4 | 1439 [1439,1443,1327] | 1392 [1396,1392,1365] | 652 [741,777,551,562] | 698 [706,710,690,633] | 658 [724,592] | 764 [774,754] |
+| stat x1 | 1316 [1316,1350,1232] | 1312 [1312,1314,1240] | 1146 [1219,1228,1074,732] | 1220 [1379,1275,1143,1165] | 1040 [1255,825] | 1295 [1253,1337] |
+| stat x4 | 1320 [1320,1428,1235] | 1303 [1303,1305,876] | 836 [914,853,819,676] | 859 [924,891,828,771] | 809 [877,741] | 932 [890,974] |
+| mmap x1 | 493 [517,493,470] | 506 [510,506,462] | 419 [455,447,391,353] | 451 [474,433,470,418] | 382 [458,305] | 460 [444,476] |
+| mmap x4 | 481 [515,476,481] | 512 [518,512,478] | 336 [356,347,324,315] | 338 [352,326,350,322] | 330 [320,341] | 336 [317,354] |
+| idle-CPU spin, stat x1 (%) | – | – | 0.1 [0.1,0.1,0.3,0.1] | 0.1 [0.0,0.0,0.1,0.1] | 1.4 [0.1,2.8] | 0.1 [0.1,0.1] |
+| idle-CPU spin, forks (%) | – | – | 3.1 [2.9,3.3,1.1,6.2] | 2.3 [16.0,0.4,0.6,4.1] | 15.7 [11.6,19.8] | 6.8 [8.1,5.4] |
+
+Results:
+
+- **No regression beyond noise, as expected while the BKL is taken at every trap.**
+  SMP1 is within ±4% everywhere (pipe ×1 1437 → 1383 k ops/s; the first stage-2 build
+  took four lock round trips per pipe read/write and lost 13-15% here, so the pin now
+  rides on the wait and update holds: two round trips).
+- SMP4 single-process loads are flat to slightly up (stat ×1 1146 → 1220, mmap ×1
+  419 → 451, pipe ×1 979 → 1119); getpid ×4 is unchanged (1487 → 1515).
+- SMP8 contended rows are up 10-25% (getpid ×4 1310 → 1635, pipe ×4 658 → 764, stat ×4
+  809 → 932, forks4 656 → 371 ms), but base has only two runs there and they are noisy.
+- `forks4` on SMP4 reads 365 → 536 ms in the table. That is the host: run
+  back-to-back, alternating, base and stage 2 gave 480 [369, 590] and 503 [446, 560].
+- The lock work itself only buys parallelism from stage 3 on: these loads still
+  serialise on the BKL at every trap.
+
+
+### 12.2 Verification
+
+Final tree (7025f91), one QEMU at a time, KVM:
+
+- `make check`: all 31 suites pass (999 s).
+- `SMOKE_SMP=4 python3 tools/smoke_cmds.py`: pass (4 CPUs online).
+- `make smoke-abi`: 71 pass, 1 skip (no sound card), 0 fail.
+- `make smoke-klock` (KLOCK_TEST, so KLOCKDEP is on): PASS; threads on 4 CPUs at once,
+  20000+20000 ping-pong rounds with 0 lost wakeups, 3124 concurrent shootdowns, 50000
+  stale-TLB checks, 12500 allocation rounds, 1188 kernel stacks.
+  The only `[lockdep]` line is the deliberate inversion.
+- `make stress-smp`, 180 s each, every worker made progress and no panic, STALL,
+  lockdep line, slow shootdown ack or torture failure was seen:
+  - SMP4: forks 2825 + 2803 rounds, pipes 546, mmap 316, targz 31, torture 18;
+  - SMP8: forks 2695 + 2701, pipes 602, mmap 330, targz 50, torture 18;
+  - SMP4 with `KLOCKDEP=1`: forks 3370 + 3271, pipes 556, mmap 317, targz 34,
+    torture 18. Zero lockdep reports.
+- `SMOKE_SMP=4 smoke_cmds` with `KLOCKDEP=1`: pass, zero lockdep reports.
+- `make smoke-firefox-web SMOKE_FF_ARGS="--smp 2"`: PASS (window up on the first
+  attempt, page image on screen 1.0 s after Enter, fonts OK).
+- `make bench-bkl` on this tree, one run each (to compare with the table above):
+
+  | Workload | `-smp 1` | `-smp 4` | `-smp 8` |
+  |---|---|---|---|
+  | time forks4 (ms) | 290 | 334 | 380 |
+  | getpid x4 | 3059 | 1676 | 1655 |
+  | pipe x1 | 1393 | 1233 | 1238 |
+  | stat x4 | 1323 | 983 | 956 |
+  | mmap x4 | 516 | 366 | 364 |
+
+Earlier full runs of the same chain at 6879a54 and ceef797 (before the pty/kstack
+locks) also passed everything (two complete `make check` runs, 31/31 each).
+
+
+---
+
+## 13. References
 
 - Linux: BKL removed in 2.6.39 (kernelnewbies.org/Linux_2_6_39: "the BKL has been
   removed completely from the kernel sources, including the functions lock_kernel()
@@ -783,6 +920,13 @@ Verification (stage 1 commit, merged with `yonet/bklplan` 053c2fe):
 - S. Peters, A. Danis, K. Elphinstone, G. Heiser, "For a Microkernel, a Big Lock Is
   Fine", APSys 2015.
 - DragonFly BSD LWKT serializing tokens (dragonflybsd.org, "LWKT tokens" documentation).
+- Stage 2: xv6-riscv `sleep`/`wakeup` and `sched` (MIT; the `sleep_locked` handshake,
+  design only); Linux `kmap_local_page` (per-CPU slots, migration disabled while
+  held, re-established on context switch: Documentation/mm/highmem.rst) and
+  `futex_wait_setup`/`get_futex_value_locked` (re-read the word under the hash-bucket
+  lock with faults disabled; kernel/futex/waitwake.c), `p->on_cpu`
+  (kernel/sched/core.c), seqcounts (Documentation/locking/seqlock.rst). GPL: reference
+  only, nothing copied.
 - Stage 1: the 16550 UART's IER/IIR/LSR transmitter-empty interrupt (TI/National
   PC16550D datasheet; OSDev wiki "Serial Ports"). The VGA CRTC start address
   (0x0C/0x0D) and cursor location (0x0E/0x0F) registers (OSDev wiki "VGA Hardware",

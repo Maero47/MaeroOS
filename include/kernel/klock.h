@@ -1,8 +1,9 @@
 #pragma once
 /*
  * Kernel lock primitives for splitting the Big Kernel Lock (docs/smp-plan.md,
- * stage 0).  Nothing in the kernel uses them yet; the BKL still serialises
- * every kernel path.  They exist so that each later stage moves one subsystem
+ * stage 0).  Stage 2 put the first users on them (the frame allocator, the
+ * kernel heap, pipes, kmutex sleeps); the BKL still serialises every other
+ * kernel path.  They exist so that each later stage moves one subsystem
  * onto a lock of its own without inventing the lock at the same time.
  *
  *   kspinlock_t   spinning lock.  kspin_lock_irqsave() is the default: it
@@ -16,11 +17,11 @@
  *                 waiter sleeps instead of spinning.  Thread context only,
  *                 never from an interrupt handler or under a spinlock.
  *
- * Today a kmutex sleeps through sleep_on(), which relies on the BKL to make
- * "release the guard, then sleep" atomic against a waker on another CPU.  The
- * scheduler stage (smp-plan.md, stage 4) replaces that with a sleep that
- * drops the guard under the scheduler lock, as xv6's sleep(chan, lk) does;
- * the API does not change.
+ * A kmutex sleeps through sleep_locked() (proc/scheduler.h, stage 2a): the
+ * guard is released only after the waiter is marked asleep, and the unlock
+ * wakes under the guard, as xv6's sleep(chan, lk) does.  The scheduler state
+ * itself is still the BKL's until stage 4 puts it under sched_lock; the API
+ * does not change.
  *
  * Lock-order checking (`make KLOCKDEP=1`, off by default, compiled out
  * otherwise): every lock names a class (normally the lock's own name, so all

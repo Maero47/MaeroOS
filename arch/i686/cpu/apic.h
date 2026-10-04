@@ -35,6 +35,12 @@ void apic_init(void);
 uint32_t apic_read(uint32_t reg);
 void     apic_write(uint32_t reg, uint32_t val);
 
+/* Send an IPI: the destination in ICR_HI, then the command in ICR_LO, with
+ * interrupts off across the pair (docs/smp-plan.md stage 2e).  An interrupt
+ * handler that sent its own IPI between the two writes would retarget the
+ * interrupted one. */
+void     apic_send_ipi(uint32_t icr_hi, uint32_t icr_lo);
+
 /* This CPU's Local APIC ID (xAPIC: bits 24-31 of the ID register). */
 uint32_t apic_id(void);
 

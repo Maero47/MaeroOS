@@ -1,3 +1,4 @@
+#include <kernel/klock.h>
 #include "heap.h"
 #include "vmm.h"
 #include "pmm.h"
@@ -85,20 +86,19 @@ _Static_assert(HEAP_MAX - HEAP_START <= (1UL << 28),
                "size classes cover a heap window of at most 256 MiB");
 
 /*
- * The heap lists are shared by all threads (shared address space) and mutated
- * by kmalloc/kfree; an unlocked list corrupts under preemption.  Single CPU
- * (SMP runs the kernel under the BKL) → saved-IF cli/sti.  saved-IF nests
- * correctly (heap_expand→paging→pmm also guard themselves), so the recursive
- * kmalloc path from the page-table code is safe.
+ * The heap lists are shared by every CPU and mutated by kmalloc/kfree, from
+ * threads and interrupt handlers.  heap_lock (docs/smp-plan.md stage 2;
+ * irqsave) guards them, so kmalloc no longer needs the BKL: the lock torture
+ * (KLOCK_TEST) allocates from every CPU at once outside it.  Lock order:
+ * heap_lock is above pmm_lock (heap_expand maps pages: vmm -> paging -> pmm,
+ * which takes pmm_lock; the heap's page tables are reserved at boot, so that
+ * path never comes back into kmalloc).  Not recursive: nothing under it may
+ * call kmalloc or kfree.  Under the BKL it behaves as the saved-IF cli/sti
+ * it replaces.
  */
-static inline uint32_t heap_irq_save(void) {
-    uint32_t f;
-    __asm__ volatile("pushf; pop %0; cli" : "=r"(f) :: "memory");
-    return f;
-}
-static inline void heap_irq_restore(uint32_t f) {
-    if (f & 0x200) __asm__ volatile("sti" ::: "memory");
-}
+static kspinlock_t heap_lock = KSPINLOCK_INIT("heap");
+static inline uint32_t heap_irq_save(void) { return kspin_lock_irqsave(&heap_lock); }
+static inline void heap_irq_restore(uint32_t f) { kspin_unlock_irqrestore(&heap_lock, f); }
 
 static block_header_t *free_head[FL_COUNT][SL_COUNT];
 static uint32_t        fl_bitmap;
