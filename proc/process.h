@@ -353,9 +353,8 @@ struct proc {
     uint8_t          no_new_privs;
     uint8_t          seccomp_mode;
     struct seccomp_filter *seccomp_filter;
-    /* prctl(PR_SET_DUMPABLE, 0) (reset by exec) and PR_SET_PDEATHSIG
-     * (recorded, cleared by fork). */
-    uint8_t          not_dumpable;
+    /* prctl(PR_SET_PDEATHSIG) (recorded, cleared by fork).  Dumpability is
+     * `nondumpable` above. */
     uint8_t          pdeathsig;
 
     /* Process group and session IDs */

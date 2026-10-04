@@ -2515,7 +2515,6 @@ static int sys_exec(registers_t *regs) {
     current_proc->sigframe_addr  = 0;
     current_proc->restore_sigmask = 0;   /* no sigsuspend mask survives exec */
     current_proc->fault_sig      = 0;
-    current_proc->not_dumpable   = 0;
     /* The alternate signal stack belonged to the old image (fs/exec.c
      * begin_new_exec: sas_ss_sp = sas_ss_size = 0). */
     current_proc->sas_sp         = 0;

@@ -776,11 +776,13 @@ static void pp_build_status(pbuf_t *pb, struct proc *p, int thread) {
               0U, sigign, 0U, sigcgt);
     pb_printf(pb, "CapInh:\t0000000000000000\nCapPrm:\t%s\nCapEff:\t%s\n"
                   "CapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n"
-                  "NoNewPrivs:\t0\nSeccomp:\t0\nSpeculation_Store_Bypass:\tvulnerable\n"
+                  "NoNewPrivs:\t%u\nSeccomp:\t%u\nSeccomp_filters:\t%d\n"
+                  "Speculation_Store_Bypass:\tvulnerable\n"
                   "Cpus_allowed:\tff\nCpus_allowed_list:\t0-%u\n"
                   "voluntary_ctxt_switches:\t%u\nnonvoluntary_ctxt_switches:\t0\n",
               p->euid == 0 ? "000001ffffffffff" : "0000000000000000",
               p->euid == 0 ? "000001ffffffffff" : "0000000000000000",
+              (unsigned)p->no_new_privs, (unsigned)p->seccomp_mode, seccomp_filter_count(p),
               smp_cpu_count() ? smp_cpu_count() - 1 : 0, p->sched_count);
 }
 
