@@ -25,8 +25,8 @@ def send(proc, text):
 def main():
     # pkg's tar/name and index-signature checks, the libc regex engine, the
     # e1000 TX ring bookkeeping, the r8169 driver core (against a simulated
-    # chip), the virtio ring logic (against a simulated device) and the USB
-    # HID descriptor parser (against hostile descriptors) and the USB stick
+    # chip), the virtio ring logic (against a simulated device), the USB HID
+    # descriptor parser (against hostile descriptors) and the USB stick
     # transport (against a simulated stick with short transfers) are plain
     # C: exercise them on the host first.
     for test in ("test_pkg_tarx.py", "test_pkg_sign.py", "test_regex.py",
