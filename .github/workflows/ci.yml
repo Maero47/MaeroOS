@@ -43,13 +43,15 @@ jobs:
 
       # --apt installs the host packages with sudo (passwordless on runners),
       # then builds the cross toolchain unless the restored one already works.
-      # The musl toolchain is only for ports/ and smoke-abi, so it is skipped.
+      # It also fetches the musl.cc i686-linux-musl toolchain (sha512-pinned)
+      # into ~/opt/i686-linux-musl-cross: make check builds the ABI probes
+      # that smoke-procipc runs with it.
       # Sources and build trees go to the runner's temp dir, keeping the cache
       # to the installed toolchain.
       - name: Host packages and cross toolchain
         env:
           SRC_DIR: ${{ runner.temp }}/cross-src
-        run: tools/setup-linux.sh --apt --no-musl
+        run: tools/setup-linux.sh --apt
 
       # Saved right away, so a later smoke failure still keeps the toolchain.
       - name: Save i686-elf toolchain
@@ -60,7 +62,9 @@ jobs:
           key: ${{ steps.key.outputs.key }}
 
       - name: Add toolchain to PATH
-        run: echo "$HOME/opt/cross/bin" >> "$GITHUB_PATH"
+        run: |
+          echo "$HOME/opt/cross/bin" >> "$GITHUB_PATH"
+          echo "$HOME/opt/i686-linux-musl-cross/bin" >> "$GITHUB_PATH"
 
       - name: Build kernel, initrd, disk and ISO
         run: make -j"$(nproc)" all initrd disk iso

@@ -848,7 +848,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs the same command on every push 
 pull request, on `ubuntu-latest`:
 
 ```sh
-tools/setup-linux.sh --apt --no-musl      # host packages + i686-elf toolchain
+tools/setup-linux.sh --apt                # host packages, i686-elf and musl toolchains
 make -j"$(nproc)" all initrd disk iso
 make check
 ```

@@ -28,7 +28,12 @@ all: $(BINS)
 $(OUT):
 	mkdir -p $(OUT)
 
+# Without the musl toolchain, say so instead of a "No such file" from the shell
+# (make smoke-abi, smoke-procipc and check all build these probes).
 $(OUT)/%: %.c probe.h | $(OUT)
+	@test -x "$(CC)" || { echo "abiprobes: i686-linux-musl-gcc not found (PATH, /opt or ~/opt/i686-linux-musl-cross)." >&2; \
+	  echo "  make smoke-abi, smoke-procipc and check need it: run tools/setup-linux.sh without --no-musl" >&2; \
+	  echo "  (or see ports/abiprobes/README.md), then add ~/opt/i686-linux-musl-cross/bin to PATH." >&2; exit 1; }
 	$(CC) $(CFLAGS) $(LDFLAGS) $< -o $@ $(LDLIBS)
 
 list:
