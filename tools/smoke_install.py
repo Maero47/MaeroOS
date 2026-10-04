@@ -187,7 +187,7 @@ def live_install(accel):
         # "yes", a file is swapped for a symlink to a root-only file.  The
         # copy keeps the scanned owner and mode, so it must not follow the
         # link: the installed file is empty (checked on the host).
-        con.run("mkdir -p /tmp/rs/u; echo public > /tmp/rs/u/f; "
+        con.run("mkdir /tmp/rs; mkdir /tmp/rs/u; echo public > /tmp/rs/u/f; "
                 "echo RACE_SECRET > /tmp/rs_secret; chmod 600 /tmp/rs_secret", timeout=30)
         race = con.run("shell -c 'sleep 4; rm /tmp/rs/u/f; ln -s /tmp/rs_secret /tmp/rs/u/f; echo yes' "
                        "| maeros-install --source /tmp/rs /dev/sdd; echo rc=$?", timeout=300)
