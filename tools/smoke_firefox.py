@@ -144,6 +144,24 @@ FONT_FAMILIES = [
 ]
 FONT_TEXT = "Latin AaBbGgQq äöüçşğ ÄÖÜÇŞĞİı " \
             "Ελληνικά Кириллица"
+# --fonts adds one row per script beyond Latin/Greek/Cyrillic: key, the lang
+# attribute of its row (which steers fontconfig to the regional CJK face),
+# and the sample.  Every character must come out as a real glyph in both
+# sans-serif and serif, and the emoji in colour.
+FONT_SCRIPTS = [
+    ("zh-Hans", "zh-CN", "简体中文：汉字测试"),
+    ("zh-Hant", "zh-TW", "繁體中文：漢字測試"),
+    ("ja", "ja", "日本語：ひらがな カタカナ 漢字"),
+    ("ko", "ko", "한국어: 한글 테스트"),
+    ("devanagari", "hi", "हिन्दी देवनागरी लिपि"),
+    ("bengali", "bn", "বাংলা লিপি পরীক্ষা"),
+    ("tamil", "ta", "தமிழ் எழுத்துக்கள்"),
+    ("arabic", "ar", "العربية اختبار"),
+    ("hebrew", "he", "עברית בדיקה"),
+    # emoji presentation by default (a text-default one such as U+2764 is
+    # DejaVu's monochrome glyph, as it should be)
+    ("emoji", "", "\U0001F600\U0001F389\U0001F44D\U0001F30D\U0001F680\U0001F355"),
+]
 
 # Runs in the page after load.  For every family and every character of
 # FONT_TEXT it measures the advance and ink box on a canvas and compares them
@@ -157,9 +175,16 @@ FONT_TEXT = "Latin AaBbGgQq äöüçşğ ÄÖÜÇŞĞİı " \
 # serif italic is a real italic face, then POSTs the result to /fontreport and
 # puts the verdict in the title (visible in maeroX's _NET_WM_NAME trace on the
 # serial line).
+#
+# With --fonts, SCRIPTS (FONT_SCRIPTS) are checked the same way in sans-serif
+# and serif.  Firefox's missing-glyph box for a code point past U+FFFF has
+# three hex digits per row instead of two, so those characters are compared
+# with the box of U+2FA20 (unassigned) rather than U+0378.  The emoji are
+# also drawn on a canvas, one at a time, and each must leave coloured pixels:
+# a monochrome fallback glyph has ink but no colour.
 FONT_JS = r"""
 (function () {
-  var FAM = %s, TEXT = %s, SIZE = 37;
+  var FAM = %s, TEXT = %s, SCRIPTS = %s, SIZE = 37;
   var c = document.createElement('canvas').getContext('2d');
   function w(font, s) { c.font = font; return c.measureText(s).width; }
   // advance + ink box; a missing-glyph box matches the reference in all five
@@ -182,6 +207,43 @@ FONT_JS = r"""
     if (boxed.length) r.fails.push(f[0] + ': ' + boxed.length + ' boxed (' + boxed.join('') + ')');
   });
   var sans = SIZE + 'px sans-serif', serif = SIZE + 'px serif', mono = SIZE + 'px monospace';
+  if (SCRIPTS.length) {
+    r.scripts = {};
+    SCRIPTS.forEach(function (sc) {
+      var row = {};
+      ['sans-serif', 'serif'].forEach(function (gen) {
+        var font = SIZE + 'px ' + gen;
+        var box4 = shape(font, '\u0378'), box5 = shape(font, '\u{2FA20}'), boxed = [];
+        Array.from(sc[2]).forEach(function (ch) {
+          if (ch === ' ') return;
+          if (same(shape(font, ch), ch.codePointAt(0) > 0xFFFF ? box5 : box4)) boxed.push(ch);
+        });
+        row[gen] = {boxed: boxed.join(''), text: +w(font, sc[2]).toFixed(2)};
+        if (boxed.length) r.fails.push(sc[0] + ' (' + gen + '): ' + boxed.length + ' boxed (' + boxed.join('') + ')');
+      });
+      r.scripts[sc[0]] = row;
+    });
+    var emoji = SCRIPTS.filter(function (sc) { return sc[0] === 'emoji'; });
+    if (emoji.length) {
+      var cv = document.createElement('canvas'); cv.width = 64; cv.height = 64;
+      var g = cv.getContext('2d'), per = {}, flat = [];
+      Array.from(emoji[0][2]).forEach(function (ch) {
+        g.clearRect(0, 0, 64, 64);
+        g.font = '48px sans-serif'; g.textBaseline = 'top'; g.fillStyle = '#000';
+        g.fillText(ch, 4, 4);
+        var d = g.getImageData(0, 0, 64, 64).data, ink = 0, col = 0;
+        for (var i = 0; i < d.length; i += 4) {
+          if (d[i + 3] < 128) continue;
+          ink++;
+          if (Math.max(d[i], d[i + 1], d[i + 2]) - Math.min(d[i], d[i + 1], d[i + 2]) > 60) col++;
+        }
+        per[ch] = [ink, col];
+        if (col < 100) flat.push(ch);
+      });
+      r.emoji = per;
+      if (flat.length) r.fails.push('emoji not in colour: ' + flat.join(''));
+    }
+  }
   var ck = r.checks;
   // negative control: U+A000 (Yi) is in no installed font, so the detector
   // must call it a box; if it does not, "0 boxed" above proves nothing
@@ -365,18 +427,25 @@ class WebServer:
                  b"<p>Fetched by Firefox through the MaeroOS TCP stack.</p>")
 
     @staticmethod
-    def page():
+    def page(fonts=False):
         rows = []
         for key, fam in FONT_FAMILIES:
             style = "font-family:%s" % fam
             rows.append("<tr><td class=k>%s</td><td style=\"%s\">%s</td>"
                         "<td style=\"%s\"><b>Bold</b> <i>Italic</i> <b><i>BoldItalic</i></b></td></tr>"
                         % (key, style, FONT_TEXT, style))
+        scripts = FONT_SCRIPTS if fonts else []
+        for key, lang, text in scripts:
+            rows.append("<tr><td class=k>%s</td><td%s style=\"font-size:22px\">%s</td>"
+                        "<td%s style=\"font-family:serif\">%s <b>%s</b></td></tr>"
+                        % (key, " lang=%s" % lang if lang else "", text,
+                           " lang=%s" % lang if lang else "", text[:4], text[:4]))
         body = ("<img id=mark src=\"mark.png\" width=\"%d\" height=\"%d\" alt=\"mark\">"
                 "<table>%s</table><p style=\"font-size:15px\">missing-glyph control "
                 "(U+A000, no font has it): \ua000</p><script>%s</script></body></html>"
                 % (WEB_MARK_W, WEB_MARK_H, "".join(rows),
-                   FONT_JS % (json.dumps([list(f) for f in FONT_FAMILIES]), json.dumps(FONT_TEXT))))
+                   FONT_JS % (json.dumps([list(f) for f in FONT_FAMILIES]), json.dumps(FONT_TEXT),
+                              json.dumps([list(x) for x in scripts]))))
         return WebServer.PAGE_HEAD + body.encode("utf-8")
 
     @staticmethod
@@ -394,11 +463,11 @@ class WebServer:
         parts.append(b"</body></html>")
         return b"".join(parts)
 
-    def __init__(self, audio=False):
+    def __init__(self, audio=False, fonts=False):
         self.requests = []          # (host time, path, status)
         self.font_report = None     # (host time, parsed JSON) from the page
         self.audio_events = []      # (host time, parsed JSON) from AUDIO_JS
-        page = self.page()
+        page = self.page(fonts)
         if audio:
             page = page.replace(b"</body>", AUDIO_HTML.replace(
                 "REPORT_URL", "'/audioreport'").encode() + b"</body>")
@@ -1231,6 +1300,14 @@ def web_load(qmp, args, run, pump, web):
             "%s=%d" % (k, len(v.get("boxed", ""))) for k, v in fams.items()))
         run.web_notes.append("fonts: checks %s" % " ".join(
             "%s=%s" % (k, "ok" if v else "NO") for k, v in rep.get("checks", {}).items()))
+        if "scripts" in rep:
+            run.web_notes.append("fonts: boxed chars per script (sans/serif): %s" % ", ".join(
+                "%s=%d/%d" % (k, len(v.get("sans-serif", {}).get("boxed", "")),
+                              len(v.get("serif", {}).get("boxed", "")))
+                for k, v in rep["scripts"].items()))
+        if "emoji" in rep:
+            run.web_notes.append("fonts: emoji ink/coloured pixels at 48px: %s" % " ".join(
+                "U+%X=%d/%d" % (ord(k), v[0], v[1]) for k, v in rep["emoji"].items()))
     else:
         run.web_notes.append("font report: never received")
     for n in run.web_notes:
@@ -1247,7 +1324,9 @@ def web_load(qmp, args, run, pump, web):
         run.result, run.reason = "FAIL", "--web: text rendering: %s" % "; ".join(rep["fails"])
     else:
         run.reason += (" Page loaded: image on screen %.1fs after Enter; fonts OK "
-                       "(no missing-glyph boxes in %d families)." % (t_red - t_enter, len(rep.get("families", {}))))
+                       "(no missing-glyph boxes in %d families%s)." % (
+                           t_red - t_enter, len(rep.get("families", {})),
+                           ", %d scripts, emoji in colour" % len(rep["scripts"]) if "scripts" in rep else ""))
 
 
 CPU_LINE = re.compile(r"\[kprof\] cpu window=(\d+)ms idle=(\d+)ms(.*)")
@@ -1601,6 +1680,10 @@ def main():
     ap.add_argument("--web", action="store_true",
                     help="after the paint verdict, load a page served from the host "
                          "(implies --net) and require its image on screen; see above")
+    ap.add_argument("--fonts", action="store_true",
+                    help="--web, with the page also carrying CJK, Devanagari, Bengali, Tamil, "
+                         "Arabic, Hebrew and emoji rows (FONT_SCRIPTS): no missing-glyph boxes "
+                         "in sans-serif or serif, and colour emoji")
     ap.add_argument("--audio", action="store_true",
                     help="after the paint verdict open file:///disk/audio.html, a page that "
                          "plays a 440 Hz WAV through <audio autoplay> (both written into a "
@@ -1626,7 +1709,7 @@ def main():
     args = ap.parse_args()
 
     os.chdir(ROOT)
-    if args.scroll:
+    if args.scroll or args.fonts:
         args.web = True
     if args.audio:
         args.net = True
@@ -1797,7 +1880,7 @@ def main():
             if args.sites:
                 sites_run(qmp, args, run, pump)
             if args.web:
-                web = WebServer()
+                web = WebServer(fonts=args.fonts)
                 try:
                     web_load(qmp, args, run, pump, web)
                     if args.scroll and run.result == "PASS":

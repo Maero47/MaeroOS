@@ -16,6 +16,12 @@
 #                                 the pinned fonts-dejavu-* .debs; fontconfig
 #                                 finds them as /disk/firefox/share/fonts
 #                                 (testfiles/etc/fonts/fonts.conf)
+#     + share/fonts/noto/         Noto Sans CJK (one TTC: SC, TC, HK, JP, KR),
+#                                 Noto Sans Devanagari, Bengali, Tamil, Arabic
+#                                 and Hebrew from the pinned fonts-noto-*
+#     + share/fontcache/          fontconfig's cache of share/fonts, made by
+#                                 the suite's own i386 fc-cache, so Firefox
+#                                 does not scan the fonts at every start
 #   testfiles/lib/                glibc runtime (ld-linux.so.2, libc.so.6, ...)
 #                                 + libgcc_s / libstdc++ from the same suite
 #
@@ -93,7 +99,8 @@ SNAPSHOT_MIRROR=${SNAPSHOT_MIRROR:-https://snapshot.debian.org/archive/debian}
 # libraries extracted from each .deb are byte-identical to the committed
 # testfiles/lib files.  To bump: see "Bumping the pinned glibc" in README.md.
 # The fonts-dejavu-* sha256s are the live trixie index's, and the
-# snapshot.debian.org copies at 20260601T000000Z hash the same.
+# snapshot.debian.org copies at 20260601T000000Z hash the same.  So are the
+# fonts-noto-cjk and fonts-noto-core ones (taken 2026-10-04).
 DEBIAN_PINS="
 trixie libc6      2.41-12+deb13u3 pool/main/g/glibc/libc6_2.41-12+deb13u3_i386.deb    410dae774925cb89a959a595bb9c9766f910df9ce3fdba334544fd7f0cb04b7e 20260601T000000Z
 trixie libgcc-s1  14.2.0-19       pool/main/g/gcc-14/libgcc-s1_14.2.0-19_i386.deb    a4c71fd856d2a48a7505a087b4186e3cca23f94603c05e3fb7c799b27e72f761 20260601T000000Z
@@ -101,6 +108,8 @@ trixie libstdc++6 14.2.0-19       pool/main/g/gcc-14/libstdc++6_14.2.0-19_i386.d
 trixie fonts-dejavu-core  2.37-8  pool/main/f/fonts-dejavu/fonts-dejavu-core_2.37-8_all.deb  86635b3d25b3655fc11cb3ecc3af59f0bf19643b02b94f2de48bd10253cdba12 20260601T000000Z
 trixie fonts-dejavu-extra 2.37-8  pool/main/f/fonts-dejavu/fonts-dejavu-extra_2.37-8_all.deb 83128d00e5d7db412fe5a7a4e2ee32aebbf8d9ed560ad611202fb43078f80323 20260601T000000Z
 trixie fonts-dejavu-mono  2.37-8  pool/main/f/fonts-dejavu/fonts-dejavu-mono_2.37-8_all.deb  3003e98a5debfdeadc7040a7f715fe9fe6fb67f68deacf6049b54e30f07fc014 20260601T000000Z
+trixie fonts-noto-cjk  1:20240730+repack1-1 pool/main/f/fonts-noto-cjk/fonts-noto-cjk_20240730+repack1-1_all.deb f5dc28a754e17327d99f0a612134d92c8dd6187314ae967cb77f25df60860139 20260601T000000Z
+trixie fonts-noto-core 20201225-2           pool/main/f/fonts-noto/fonts-noto-core_20201225-2_all.deb         97978d09b68445fcf85342b106cd2e812d7813e3d5626f9884a5f344c3a55973 20260601T000000Z
 "
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -136,27 +145,56 @@ PIXBUF_LOADER_SKIP="tiff svg"
 # Stubs for the glxtest GPU probe (see build-glstubs.sh for the rationale).
 GL_STUBS="libGL.so.1 libEGL.so.1 libGLESv2.so.2 libpci.so.3 libdrm.so.2"
 
-# Font faces installed under $FFDIR/$FONT_SUBDIR: package + file.  Sans, Serif
-# and Sans Mono in the four styles CSS asks for, so fontconfig's aliases
-# (testfiles/etc/fonts/fonts.conf) give sans-serif, serif and monospace their
-# own face and bold/italic are real faces, not synthesized.  Condensed,
-# ExtraLight and the math font are left out.  The set covers Latin, Greek,
-# Cyrillic and a wide range of symbols; about 5.3 MB.
-FONT_SUBDIR=share/fonts/dejavu
+# Font faces installed under $FFDIR/$FONT_ROOT: package, directory (below
+# FONT_ROOT), file (below the package's usr/share/fonts).
+#
+# DejaVu Sans, Serif and Sans Mono in the four styles CSS asks for, so
+# fontconfig's aliases (testfiles/etc/fonts/fonts.conf) give sans-serif,
+# serif and monospace their own face and bold/italic are real faces, not
+# synthesized.  Condensed, ExtraLight and the math font are left out.  The set
+# covers Latin, Greek, Cyrillic, Hebrew, basic Arabic and a wide range of
+# symbols; about 5.3 MB.
+#
+# Noto for the scripts DejaVu lacks or covers thinly: Noto Sans CJK Regular
+# is one 19 MB TTC holding Simplified and Traditional Chinese (incl. Hong
+# Kong), Japanese and Korean faces, which share most glyphs (the Bold TTC,
+# another 20 MB, is left out: bold CJK is synthesized; Serif CJK falls back to
+# Sans).  Devanagari, Bengali, Tamil, Arabic and Hebrew in regular and bold
+# are 1.6 MB together.  Emoji come from Firefox's own fonts/TwemojiMozilla.ttf
+# (COLR, which Firefox draws itself; testfiles/ffprofile/user.js turns it on),
+# so Noto Color Emoji (11 MB, CBDT) is not needed.  All Noto fonts are SIL
+# OFL 1.1.
+FONT_ROOT=share/fonts
 FONT_FILES="
-fonts-dejavu-core  DejaVuSans.ttf
-fonts-dejavu-core  DejaVuSans-Bold.ttf
-fonts-dejavu-extra DejaVuSans-Oblique.ttf
-fonts-dejavu-extra DejaVuSans-BoldOblique.ttf
-fonts-dejavu-core  DejaVuSerif.ttf
-fonts-dejavu-core  DejaVuSerif-Bold.ttf
-fonts-dejavu-extra DejaVuSerif-Italic.ttf
-fonts-dejavu-extra DejaVuSerif-BoldItalic.ttf
-fonts-dejavu-mono  DejaVuSansMono.ttf
-fonts-dejavu-mono  DejaVuSansMono-Bold.ttf
-fonts-dejavu-mono  DejaVuSansMono-Oblique.ttf
-fonts-dejavu-mono  DejaVuSansMono-BoldOblique.ttf
+fonts-dejavu-core  dejavu truetype/dejavu/DejaVuSans.ttf
+fonts-dejavu-core  dejavu truetype/dejavu/DejaVuSans-Bold.ttf
+fonts-dejavu-extra dejavu truetype/dejavu/DejaVuSans-Oblique.ttf
+fonts-dejavu-extra dejavu truetype/dejavu/DejaVuSans-BoldOblique.ttf
+fonts-dejavu-core  dejavu truetype/dejavu/DejaVuSerif.ttf
+fonts-dejavu-core  dejavu truetype/dejavu/DejaVuSerif-Bold.ttf
+fonts-dejavu-extra dejavu truetype/dejavu/DejaVuSerif-Italic.ttf
+fonts-dejavu-extra dejavu truetype/dejavu/DejaVuSerif-BoldItalic.ttf
+fonts-dejavu-mono  dejavu truetype/dejavu/DejaVuSansMono.ttf
+fonts-dejavu-mono  dejavu truetype/dejavu/DejaVuSansMono-Bold.ttf
+fonts-dejavu-mono  dejavu truetype/dejavu/DejaVuSansMono-Oblique.ttf
+fonts-dejavu-mono  dejavu truetype/dejavu/DejaVuSansMono-BoldOblique.ttf
+fonts-noto-cjk     noto   opentype/noto/NotoSansCJK-Regular.ttc
+fonts-noto-core    noto   truetype/noto/NotoSansDevanagari-Regular.ttf
+fonts-noto-core    noto   truetype/noto/NotoSansDevanagari-Bold.ttf
+fonts-noto-core    noto   truetype/noto/NotoSansBengali-Regular.ttf
+fonts-noto-core    noto   truetype/noto/NotoSansBengali-Bold.ttf
+fonts-noto-core    noto   truetype/noto/NotoSansTamil-Regular.ttf
+fonts-noto-core    noto   truetype/noto/NotoSansTamil-Bold.ttf
+fonts-noto-core    noto   truetype/noto/NotoSansArabic-Regular.ttf
+fonts-noto-core    noto   truetype/noto/NotoSansArabic-Bold.ttf
+fonts-noto-core    noto   truetype/noto/NotoSansHebrew-Regular.ttf
+fonts-noto-core    noto   truetype/noto/NotoSansHebrew-Bold.ttf
 "
+# fontconfig validates a directory's cache by the directory's mtime (seconds
+# and nanoseconds; MaeroOS reports 0 ns).  The font directories get this one,
+# `make disk` copies every directory's mtime into the image, and the cache
+# made here therefore holds in the guest (fonts.conf lists it as a cachedir).
+FONT_DIR_MTIME=1735689600     # 2025-01-01T00:00:00Z
 
 log()  { printf '[fetch-runtime] %s\n' "$*"; }
 warn() { printf '[fetch-runtime] WARNING: %s\n' "$*" >&2; }
@@ -636,25 +674,29 @@ nbad=$(grep '^"[^"]*\.so"$' "$CACHEFILE" | grep -vc "^\"$DISK_PIXBUF_DIR/" || tr
 log "loaders.cache lists $nmod modules under $DISK_PIXBUF_DIR"
 
 # ---------------------------------------------------------------------------
-# 10. Fonts: the pinned DejaVu faces -> $FFDIR/$FONT_SUBDIR, and DejaVu Sans
+# 10. Fonts: the pinned DejaVu and Noto faces -> $FFDIR/$FONT_ROOT, and DejaVu Sans
 #     in testfiles/usr/share/fonts (committed, on the initrd for the GTK
 #     probes; refetched only if it went missing)
 # ---------------------------------------------------------------------------
-mkdir -p "$FFDIR/$FONT_SUBDIR"
+mkdir -p "$FFDIR/$FONT_ROOT"
 for pkg in $(printf '%s\n' "$FONT_FILES" | awk 'NF { print $1 }' | sort -u); do
     [ -n "$(pin_lookup "$pkg")" ] || die "font package $pkg has no pin in DEBIAN_PINS for $SUITE"
     fetch_pkg "$pkg"
 done
 nfont=0
 printf '%s\n' "$FONT_FILES" | awk 'NF' > "$SUITEDIR/fonts.txt"
-while read -r pkg file; do
-    src="$UNPACK/$pkg/usr/share/fonts/truetype/dejavu/$file"
+while read -r pkg dir file; do
+    src="$UNPACK/$pkg/usr/share/fonts/$file"
     [ -f "$src" ] || die "$file not found in $pkg"
-    install_ff "$src" "$FONT_SUBDIR/$file"
+    mkdir -p "$FFDIR/$FONT_ROOT/$dir"
+    install_ff "$src" "$FONT_ROOT/$dir/$(basename "$file")"
     nfont=$((nfont + 1))
 done < "$SUITEDIR/fonts.txt"
 rm -f "$SUITEDIR/fonts.txt"
-log "$nfont DejaVu faces ($(du -sk "$FFDIR/$FONT_SUBDIR" | cut -f1) KiB) installed in ${FFDIR#"$ROOT"/}/$FONT_SUBDIR"
+for d in $(cd "$FFDIR/$FONT_ROOT" && ls); do
+    log "  $d: $(ls "$FFDIR/$FONT_ROOT/$d" | wc -l) files, $(du -sk "$FFDIR/$FONT_ROOT/$d" | cut -f1) KiB"
+done
+log "$nfont font files ($(du -sk "$FFDIR/$FONT_ROOT" | cut -f1) KiB) installed in ${FFDIR#"$ROOT"/}/$FONT_ROOT"
 
 if [ ! -f "$FONTDIR/DejaVuSans.ttf" ]; then
     log "DejaVuSans.ttf missing; fetching fonts-dejavu-core"
@@ -662,6 +704,51 @@ if [ ! -f "$FONTDIR/DejaVuSans.ttf" ]; then
     mkdir -p "$FONTDIR"
     cp "$(find "$UNPACK/fonts-dejavu-core" -name DejaVuSans.ttf | head -n 1)" "$FONTDIR/DejaVuSans.ttf"
 fi
+
+# 10a. fontconfig's cache of those fonts, as the guest's libfontconfig would
+#      write it (i386: "le32d4"), made by the suite's own fc-cache under the
+#      suite's ld.so.  --sysroot maps the guest path /disk onto testfiles/:
+#      the cache files are named after, and record, the guest paths.  Without
+#      it (no i386 execution on the host) the guest scans the fonts itself
+#      at every start, which is correct and slow (seconds for the CJK TTC).
+#      Firefox's own fonts/ (TwemojiMozilla.ttf, which the profile has it
+#      register as an application font: gfx.bundled-fonts.activate) and
+#      /disk/usr/share/fonts (testfiles/usr/share/fonts) are cached too; the
+#      initrd's /usr/share/fonts is not (the initrd keeps no mtimes), so that
+#      one DejaVu Sans is scanned at each start.
+FCDIR=share/fontcache
+rm -rf "${FFDIR:?}/$FCDIR"
+find "$FFDIR/$FONT_ROOT" "$FFDIR/fonts" "$FONTDIR" -type d -exec touch -d "@$FONT_DIR_MTIME" {} +
+if host_runs_i386; then
+    fetch_pkg fontconfig
+    fccache=$(find "$UNPACK/fontconfig" -type f -name fc-cache | head -n 1)
+    [ -n "$fccache" ] || die "fc-cache not found in the fontconfig package"
+    sysroot="$SUITEDIR/fcroot"
+    rm -rf "$sysroot"; mkdir -p "$sysroot"
+    ln -s "$ROOT/testfiles" "$sysroot/disk"
+    mkdir -p "$FFDIR/$FCDIR"
+    cat > "$sysroot/fonts.conf" <<FCEOF
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <dir>/disk/firefox/$FONT_ROOT</dir>
+  <dir>/disk/usr/share/fonts</dir>
+  <dir>/disk/firefox/fonts</dir>
+  <cachedir>/disk/firefox/$FCDIR</cachedir>
+</fontconfig>
+FCEOF
+    FONTCONFIG_FILE="$sysroot/fonts.conf" "$LIBDIR/ld-linux.so.2" --library-path "$LIBDIR:$FFDIR" \
+        "$fccache" --sysroot="$sysroot" --really-force >/dev/null 2>"$SUITEDIR/fc-cache.log" \
+        || { cat "$SUITEDIR/fc-cache.log" >&2; die "fc-cache failed"; }
+    rm -rf "$sysroot"
+    ncache=$(find "$FFDIR/$FCDIR" -name '*.cache-*' | wc -l)
+    [ "$ncache" -ge 2 ] || die "fc-cache wrote $ncache cache files"
+    for f in "$FFDIR/$FCDIR"/*; do printf '%s\n' "${f#"$FFDIR"/}" >> "$MANIFEST"; done
+    log "fontconfig cache: $ncache files ($(du -sk "$FFDIR/$FCDIR" | cut -f1) KiB) in ${FFDIR#"$ROOT"/}/$FCDIR"
+else
+    warn "host cannot run i386 binaries: no prebuilt fontconfig cache; Firefox rescans its fonts at every start"
+fi
+
 
 # ---------------------------------------------------------------------------
 # 10b. Autoconfig: maeros.cfg prints about:support's sandbox section on stderr

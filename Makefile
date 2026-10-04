@@ -285,6 +285,15 @@ disk: userspace toybox
 	        $(DEBUGFS) -w -R "sif /$$p mode $$m" $(DISK_IMG) 2>/dev/null || true; \
 	    done; \
 	fi
+	@# Every directory keeps its mtime from testfiles/ (debugfs gives it the
+	@# build time): fontconfig only trusts a font directory's prebuilt cache
+	@# (ports/firefox/fetch-runtime.sh) while the directory's mtime matches.
+	@find testfiles \( $(DISK_PRUNE) \) -prune -o -type d -print | while read d; do \
+	    [ "$$d" = "testfiles" ] && continue; \
+	    echo "sif /$${d#testfiles/} mtime @$$(stat -c %Y "$$d")"; \
+	done > $(DISK_IMG).mtimes
+	$(DEBUGFS) -w -f $(DISK_IMG).mtimes $(DISK_IMG) >/dev/null 2>&1 || true
+	@rm -f $(DISK_IMG).mtimes
 	@echo "[DISK]  Done: $(DISK_IMG)"
 
 # Large disk WITH the Firefox + glibc library trees (175 MiB libxul etc.).
