@@ -69,6 +69,7 @@ int main(void)
     struct snd_ctl_elem_info vi, si;
     unsigned vol_id = 0, sw_id = 0;
 
+    probe_watchdog(60);
     fd = open(DEV, O_RDWR);
     if (fd < 0) probe_skip("%s: %s", DEV, strerror(errno));
     memset(&ci, 0, sizeof ci);
