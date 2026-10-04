@@ -15,7 +15,12 @@ audiodev (build/smoke-usbaudio/out.wav).  Then, from the serial shell:
      TDs, one per 1 ms frame);
   4. `tone -c 1 1000 1000 30`: 1 kHz at 30 % of the USB card's Master
      volume (a SET_CUR to its Feature Unit);
-  5. `tone -d /dev/dsp1 1500 700`: the raw OSS-style node of card 1;
+  5. permissions: card 0's nodes and /dev/dsp chowned/chmodded at run
+     time (card 1 plugged in): card 1's nodes and /dev/dsp1 follow at once
+     in stat and in access (`busybox setuidgid user mixer -c 1` works for
+     card 0's owner and is refused once card 0 is root's 0600); a chmod of
+     a card-1 node changes the shared permissions;
+     `tone -d /dev/dsp1 1500 700`: the raw OSS-style node of card 1;
   6. hot-unplug while playing: `tone -c 1 660 6000` in the background,
      QMP device_del of the usb-audio after ~1.5 s: the card leaves /dev/snd,
      tone fails with an error instead of hanging, no panic, the shell works;
@@ -94,6 +99,41 @@ def expect(out, text, what):
         raise AssertionError(f"{what}: {text!r} not in:\n{out[-1500:]}")
 
 
+C0 = "/dev/snd/controlC0 /dev/snd/pcmC0D0p /dev/dsp"
+C1 = ("/dev/snd/controlC1", "/dev/snd/pcmC1D0p", "/dev/dsp1")
+
+
+def c1_perms(proc, sel, log, want, what):
+    out = run(proc, sel, log, "busybox stat -c 'perm %n %a %u %g' " +
+              " ".join(C1))
+    for n in C1:
+        expect(out, f"perm {n} {want}", what)
+
+
+def live_perms(proc, sel, log):
+    """Card 1's nodes and /dev/dsp1 have no permissions of their own: a
+    chown/chmod of card 0's nodes and /dev/dsp applies to them at once, for
+    stat and for access (an unprivileged user opening them)."""
+    run(proc, sel, log, f"busybox chown 1000:18 {C0}; busybox chmod 0600 {C0}")
+    c1_perms(proc, sel, log, "600 1000 18", "card 1 follows card 0 (owner)")
+    out = run(proc, sel, log, "busybox setuidgid user mixer -c 1")
+    expect(out, "card 1 Master:", "the owner of card 0 uses card 1")
+    run(proc, sel, log, f"busybox chown 0:0 {C0}")
+    c1_perms(proc, sel, log, "600 0 0", "card 1 follows card 0 (back to root)")
+    out = run(proc, sel, log, "busybox setuidgid user mixer -c 1")
+    expect(out, "mixer: no card 1", "card 1 refused once card 0 is root's")
+    out = run(proc, sel, log, "busybox setuidgid user tone -d /dev/dsp1 "
+              "1500 100")
+    expect(out, "/dev/dsp1 unavailable", "/dev/dsp1 refused likewise")
+    # chmod through a card-1 node changes the shared permissions
+    run(proc, sel, log, "busybox chmod 0666 /dev/snd/pcmC1D0p")
+    out = run(proc, sel, log, "busybox stat -c 'perm %n %a' /dev/snd/pcmC0D0p")
+    expect(out, "perm /dev/snd/pcmC0D0p 666", "chmod of a card-1 node")
+    run(proc, sel, log, f"busybox chmod 0666 {C0}")
+    c1_perms(proc, sel, log, "666 0 0", "card 1 permissions restored")
+    print("  card 1 + /dev/dsp1 follow card 0 + /dev/dsp live (stat, open)")
+
+
 def main():
     # host side first: the isochronous TD fields on hostile descriptors
     r = subprocess.run([sys.executable, os.path.join(ROOT, "tools",
@@ -159,6 +199,7 @@ def main():
         out = run(proc, sel, log, "mixer -c 1 100")
         out = run(proc, sel, log, "ls /dev")
         expect(out, "dsp1", "/dev/dsp1 listing")
+        live_perms(proc, sel, log)
         out = run(proc, sel, log, "tone -d /dev/dsp1 1500 700", timeout=40.0)
         expect(out, "tone: done", "1.5 kHz tone on /dev/dsp1")
         stats = "".join(log)[at:]
@@ -200,10 +241,7 @@ def main():
         smokelib.wait_for(proc, sel, "[ALSA] card 1: USB Audio", log, 30.0,
                           at)
         time.sleep(0.5)
-        out = run(proc, sel, log, "busybox stat -c 'perm %n %a %u %g' "
-                  "/dev/snd/controlC1 /dev/snd/pcmC1D0p /dev/dsp1")
-        for n in ("/dev/snd/controlC1", "/dev/snd/pcmC1D0p", "/dev/dsp1"):
-            expect(out, f"perm {n} 660 1000 18", "card 1 node owner/mode")
+        c1_perms(proc, sel, log, "660 1000 18", "card 1 after replug")
         out = run(proc, sel, log, "tone -c 1 2000 800", timeout=40.0)
         expect(out, "tone: done", "2 kHz tone after replug")
         run(proc, sel, log, "sleep 1")

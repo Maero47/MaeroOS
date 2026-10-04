@@ -158,12 +158,13 @@ the nominal rate without reading its feedback endpoint.  Unplugged, the
 card leaves `/dev/snd` and an open PCM fails with `ENODEV`
 (`SNDRV_PCM_STATE_DISCONNECTED`) until it is closed.
 
-Permissions: every sound node (card 0's and card 1's `/dev/snd` nodes,
-`/dev/dsp`, `/dev/dsp1`) starts from `alsa_node_perms()` in
-`drivers/alsa.c`; when card 1 arrives, its nodes take card 0's current
-owner, group and mode, and `/dev/dsp1` those of `/dev/dsp` (so a session
-user init handed the console's sound devices to gets the USB card too).
-A tree with root:audio 0660 sound nodes sets that in `alsa_node_perms()`.
+Permissions: every sound node starts from `alsa_node_perms()` in
+`drivers/alsa.c`.  Card 1's `/dev/snd` nodes and `/dev/dsp1` have none of
+their own: they share card 0's and `/dev/dsp`'s through `perm_of`
+(`fs/vfs.h`), which access checks, `stat` and `chmod`/`chown` follow, so
+whatever init (or anyone) does to card 0's owner or mode applies to the USB
+card at once, plugged in or not.  A tree with root:audio 0660 sound nodes
+sets that in `alsa_node_perms()`.
 
 `make smoke-usbaudio` (in `make check`) plays tones on QEMU's `usb-audio`
 with `tone -c 1`, checks them in the wav capture, sets the mixer of both

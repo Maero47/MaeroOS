@@ -166,7 +166,6 @@ enum { EL_VOLUME, EL_SWITCH, EL_COUNT };
 struct card {
     int index;
     const alsa_out_t *out;       /* NULL: no card (or it was unplugged) */
-    uint32_t generation;         /* bumped by every alsa_card_add */
     vfs_node_t ctl_node, pcm_node;
     char ctl_name[12], pcm_name[12];
     int pcm_busy;                /* sleeping mutex for stream-changing ioctls */
@@ -1271,9 +1270,7 @@ int alsa_card_present(int index) {
     return index >= 0 && index < ALSA_MAX_CARDS && cards[index].out != NULL;
 }
 
-uint32_t alsa_card_generation(int index) {
-    return index >= 0 && index < ALSA_MAX_CARDS ? cards[index].generation : 0;
-}
+
 
 int alsa_raw_write(int index, const uint8_t *data, uint32_t len) {
     const alsa_out_t *o;
@@ -1543,9 +1540,10 @@ static int snd_readdir(vfs_node_t *d, uint32_t idx, vfs_dirent_t *out) {
  * /dev/snd nodes and /dev/dsp, /dev/dsp1 (fs/devfs.c).  The one place that
  * says who may play.  Integration note: yonet/fixfs makes the sound nodes
  * root:audio 0660 (DEV_GID_AUDIO) and init chowns card 0's to the session
- * user; with that merged, set it here and every sound node follows,
- * including a USB card plugged in later (alsa_card_add copies card 0's
- * current owner, see there). */
+ * user; with that merged, set it here and every sound node follows.  A
+ * hot-plugged card's nodes have no permissions of their own: they share
+ * card 0's (perm_of, set in card_setup), so whatever init or anyone does to
+ * card 0's owner or mode applies to them at once, plugged in or not. */
 void alsa_node_perms(vfs_node_t *n) {
     n->uid = 0;
     n->gid = 0;
@@ -1597,18 +1595,10 @@ static void card_setup(int index) {
     c->pcm_node.open_fn = pcm_open;
     c->pcm_node.retain_fn = pcm_retain;
     c->pcm_node.close_fn = pcm_close;
-}
-
-/* A node of a card that comes and goes takes card 0's node's current
- * owner, group and mode (who sits at the console, once init has handed the
- * sound devices over), or the default without a card 0. */
-static void perms_like(vfs_node_t *n, const vfs_node_t *like) {
-    if (like) {
-        n->uid = like->uid;
-        n->gid = like->gid;
-        n->mask = like->mask;
-    } else {
-        alsa_node_perms(n);
+    if (index > 0) {
+        /* card 0's owner, group and mode, live (vfs_perm_node) */
+        c->ctl_node.perm_of = &cards[0].ctl_node;
+        c->pcm_node.perm_of = &cards[0].pcm_node;
     }
 }
 
@@ -1616,11 +1606,8 @@ void alsa_card_add(int index, const alsa_out_t *out) {
     struct card *c;
     if (index < 1 || index >= ALSA_MAX_CARDS) return;
     c = &cards[index];
-    perms_like(&c->ctl_node, cards[0].out ? &cards[0].ctl_node : NULL);
-    perms_like(&c->pcm_node, cards[0].out ? &cards[0].pcm_node : NULL);
     LOCK();
     c->out = out;
-    c->generation++;
     UNLOCK();
     printk("[ALSA] card %d: %s, /dev/snd/%s /dev/snd/%s (%u Hz)%s\n", index,
            out->name, c->ctl_name, c->pcm_name, (unsigned)out->rate,

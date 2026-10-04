@@ -509,21 +509,6 @@ static int dsp1_ioctl(vfs_node_t *n, uint32_t req, void *arg) {
 }
 
 static vfs_node_t dev_dsp1;
-static uint32_t dsp1_generation;
-
-/* /dev/dsp1 as the USB card it stands for arrives: owner, group and mode
- * those of /dev/dsp at that moment (handed to the session user by init, or
- * as the kernel made it), like the card's /dev/snd nodes take card 0's. */
-static vfs_node_t *dsp1_node(void) {
-    uint32_t g = alsa_card_generation(1);
-    if (g != dsp1_generation) {
-        dsp1_generation = g;
-        dev_dsp1.uid = dev_dsp.uid;
-        dev_dsp1.gid = dev_dsp.gid;
-        dev_dsp1.mask = dev_dsp.mask;
-    }
-    return &dev_dsp1;
-}
 
 /* ── /dev/urandom — kernel best-effort pseudo-random bytes ────────────────── */
 
@@ -1095,7 +1080,7 @@ static vfs_node_t *devdir_finddir(vfs_node_t *node, const char *name) {
     if (strcmp(name, "pts")     == 0) return &dev_pts_dir;
     if (strcmp(name, "urandom") == 0) return &dev_urandom;
     if (strcmp(name, "dsp") == 0) return &dev_dsp;
-    if (strcmp(name, "dsp1") == 0 && alsa_card_present(1)) return dsp1_node();
+    if (strcmp(name, "dsp1") == 0 && alsa_card_present(1)) return &dev_dsp1;
     if (strcmp(name, "snd")     == 0) return alsa_dev_dir();   /* or NULL */
     if (strcmp(name, "fb0")     == 0 && framebuffer_available()) return &dev_fb0;
     if (strcmp(name, "input")   == 0) return &dev_input_dir;
@@ -1331,7 +1316,7 @@ vfs_node_t *devfs_mount(void) {
     dev_dsp.write_ready_fn = always_ready;
     alsa_node_perms(&dev_dsp);
 
-    /* /dev/dsp1 (card 1); its owner follows /dev/dsp (dsp1_node) */
+    /* /dev/dsp1 (card 1): /dev/dsp's owner, group and mode, live */
     memset(&dev_dsp1, 0, sizeof(dev_dsp1));
     strncpy(dev_dsp1.name, "dsp1", 255);
     dev_dsp1.flags    = VFS_FLAG_CHARDEV;
@@ -1342,6 +1327,7 @@ vfs_node_t *devfs_mount(void) {
     dev_dsp1.read_ready_fn = always_ready;
     dev_dsp1.write_ready_fn = always_ready;
     alsa_node_perms(&dev_dsp1);
+    dev_dsp1.perm_of = &dev_dsp;
 
     /* /dev/urandom */
     memset(&dev_urandom, 0, sizeof(dev_urandom));
