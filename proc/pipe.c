@@ -26,14 +26,10 @@ static void pipe_try_free(pipe_buf_t *p);
  * with a reference): the descriptor that led here can be closed by another
  * thread sharing the fd table while this one sleeps, and with both ends closed
  * the buffer would otherwise be freed under it.  The last unpin frees a pipe
- * whose ends are all gone; the woken caller sees EOF or EPIPE first. */
-static void pipe_pin(pipe_buf_t *p) {
-    uint32_t fl = kspin_lock_irqsave(&p->lock);
-    p->pins++;
-    kspin_unlock_irqrestore(&p->lock, fl);
-}
-static int pipe_unpin(pipe_buf_t *p, int ret) {
-    uint32_t fl = kspin_lock_irqsave(&p->lock);
+ * whose ends are all gone; the woken caller sees EOF or EPIPE first.  The pin
+ * is taken in the first hold of the pipe's lock and dropped in the last one
+ * (pipe_leave), so a read or write costs two lock round trips, not four. */
+static int pipe_leave(pipe_buf_t *p, uint32_t fl, int ret) {
     int last = --p->pins == 0;
     kspin_unlock_irqrestore(&p->lock, fl);
     if (last) pipe_try_free(p);
@@ -45,14 +41,8 @@ static int pipe_signal_pending(void) {
     return signal_interrupt_pending(current_proc);
 }
 
-static int pipe_read_pinned(pipe_buf_t *p, char *buf, int len, int nonblock);
 int pipe_read(pipe_buf_t *p, char *buf, int len, int nonblock) {
     if (len <= 0) return 0;
-    pipe_pin(p);
-    return pipe_unpin(p, pipe_read_pinned(p, buf, len, nonblock));
-}
-
-static int pipe_read_pinned(pipe_buf_t *p, char *buf, int len, int nonblock) {
     /* Wait for data; POSIX: return as soon as any is available (a read may
      * return fewer than len bytes). */
     /* NB: do NOT bound/timeout these blocking reads for Firefox.  A ~500ms
@@ -62,6 +52,7 @@ static int pipe_read_pinned(pipe_buf_t *p, char *buf, int len, int nonblock) {
      * load-bearing (legitimate sync barriers that must wait indefinitely), and
      * any timeout breaks them.  Classic indefinite blocking is required. */
     uint32_t fl = kspin_lock_irqsave(&p->lock);
+    p->pins++;
     int err = 1;
     while (p->count == 0) {
         if (p->nwriters == 0) { err = 0; break; }        /* EOF */
@@ -69,10 +60,7 @@ static int pipe_read_pinned(pipe_buf_t *p, char *buf, int len, int nonblock) {
         if (pipe_signal_pending()) { err = -4; break; }   /* -EINTR */
         sleep_locked(p, &p->lock);
     }
-    if (err <= 0) {
-        kspin_unlock_irqrestore(&p->lock, fl);
-        return err;
-    }
+    if (err <= 0) return pipe_leave(p, fl, err);
     int take = len;
     if ((uint32_t)take > p->count) take = (int)p->count;
     uint32_t head = p->head;
@@ -82,30 +70,24 @@ static int pipe_read_pinned(pipe_buf_t *p, char *buf, int len, int nonblock) {
      * so a read into a bad buffer fails with -EFAULT and loses nothing. */
     int first = (int)(PIPE_BUF_SIZE - head);
     if (first > take) first = take;
-    if (copy_to_user(buf, &p->data[head], (size_t)first) < 0)
-        return -14;
-    if (take > first && copy_to_user(buf + first, &p->data[0], (size_t)(take - first)) < 0)
-        return -14;
+    if (copy_to_user(buf, &p->data[head], (size_t)first) < 0 ||
+        (take > first && copy_to_user(buf + first, &p->data[0], (size_t)(take - first)) < 0))
+        return pipe_leave(p, kspin_lock_irqsave(&p->lock), -14);
     fl = kspin_lock_irqsave(&p->lock);
     p->head   = (p->head + (uint32_t)take) % PIPE_BUF_SIZE;
     p->count -= (uint32_t)take;
     wake_up(p);   /* wake any blocked writers */
-    kspin_unlock_irqrestore(&p->lock, fl);
+    pipe_leave(p, fl, 0);
     io_wake_poll();
     return take;
 }
 
-static int pipe_write_pinned(pipe_buf_t *p, const char *buf, int len, int nonblock);
 int pipe_write(pipe_buf_t *p, const char *buf, int len, int nonblock) {
     if (len <= 0) return 0;
-    pipe_pin(p);
-    return pipe_unpin(p, pipe_write_pinned(p, buf, len, nonblock));
-}
-
-static int pipe_write_pinned(pipe_buf_t *p, const char *buf, int len, int nonblock) {
     uint32_t fl = kspin_lock_irqsave(&p->lock);
+    p->pins++;
     if (p->nreaders == 0) {
-        kspin_unlock_irqrestore(&p->lock, fl);
+        pipe_leave(p, fl, 0);
         signal_send(current_proc, SIGPIPE);
         return -32;  /* -EPIPE */
     }
@@ -119,7 +101,7 @@ static int pipe_write_pinned(pipe_buf_t *p, const char *buf, int len, int nonblo
             sleep_locked(p, &p->lock);
         }
         if (err <= 0) {
-            kspin_unlock_irqrestore(&p->lock, fl);
+            pipe_leave(p, fl, 0);
             if (err == -32) signal_send(current_proc, SIGPIPE);   /* Linux pipe_write */
             return n ? n : err;
         }
@@ -137,16 +119,19 @@ static int pipe_write_pinned(pipe_buf_t *p, const char *buf, int len, int nonblo
         if (copy_from_user(&p->data[tail], buf + n, (size_t)first) < 0 ||
             (put > first &&
              copy_from_user(&p->data[0], buf + n + first, (size_t)(put - first)) < 0))
-            return n ? n : -14;
+            return pipe_leave(p, kspin_lock_irqsave(&p->lock), n ? n : -14);
         n += put;
         fl = kspin_lock_irqsave(&p->lock);
         p->count += (uint32_t)put;
         wake_up(p);   /* wake any blocked readers */
+        if (n == len) break;
+        /* More to write: pollers hear of this chunk before we wait for room. */
         kspin_unlock_irqrestore(&p->lock, fl);
         io_wake_poll();
         fl = kspin_lock_irqsave(&p->lock);
     }
-    kspin_unlock_irqrestore(&p->lock, fl);
+    pipe_leave(p, fl, 0);
+    io_wake_poll();
     return n;
 }
 
@@ -154,7 +139,7 @@ static void pipe_try_free(pipe_buf_t *p) {
     uint32_t fl = kspin_lock_irqsave(&p->lock);
     if (p->nreaders <= 0 && p->nwriters <= 0) {
         wake_up(p);  /* wake anyone still sleeping on it */
-        if (p->pins > 0) {          /* the last pipe_unpin() comes back here */
+        if (p->pins > 0) {          /* the last pipe_leave() comes back here */
             kspin_unlock_irqrestore(&p->lock, fl);
             return;
         }
