@@ -237,6 +237,7 @@ INITRD_EXCLUDE := --exclude=./cairoprobe --exclude=./pangoprobe \
 # COPYFILE_DISABLE=1 stops macOS tar from adding ._* AppleDouble entries; it is
 # an ordinary ignored environment variable for GNU tar on Linux.
 initrd: userspace toybox
+	chmod 600 testfiles/etc/shadow   # initrd.c keeps a file without o+r root's
 	COPYFILE_DISABLE=1 tar --format=ustar $(INITRD_EXCLUDE) -cf initrd.tar -C testfiles .
 	@echo "initrd.tar created."
 
@@ -459,7 +460,7 @@ smoke-pkg: $(TARGET) initrd disk repo
 smoke-toybox: $(TARGET) initrd
 	python3 tools/smoke_toybox.py
 
-smoke-cmds: $(TARGET) initrd
+smoke-cmds: $(TARGET) abiprobes initrd
 	python3 tools/smoke_cmds.py
 
 # ACPI: poweroff, reboot and the power button on the pc and q35 machines.
@@ -601,7 +602,7 @@ smoke-procipc: $(TARGET) abiprobes initrd disk
 	python3 tools/smoke_procipc.py $(SMOKE_PROCIPC_ARGS)
 
 # initrd and disk pack testfiles/abiprobes/, so under -j they must wait for it.
-ifneq ($(filter smoke-abi smoke-procipc check,$(MAKECMDGOALS)),)
+ifneq ($(filter smoke-abi smoke-procipc smoke-cmds check,$(MAKECMDGOALS)),)
 initrd disk: | abiprobes
 endif
 

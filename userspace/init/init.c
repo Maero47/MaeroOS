@@ -172,6 +172,21 @@ static int device_available(const char *path, int flags) {
     return 1;
 }
 
+/* The console's devices belong to whoever sits at it, as logind (or
+ * pam_console) arranges on Linux: the desktop's user while the graphical
+ * session runs, root (and the device's group) otherwise.  The kernel makes
+ * them root:video/input/audio 0660, so another user reads no keystrokes,
+ * takes no screenshots and plays nothing. */
+static const char *const console_devices[] = {
+    "/dev/fb0", "/dev/input/event0", "/dev/input/event1", "/dev/dsp",
+    "/dev/snd/controlC0", "/dev/snd/pcmC0D0p", 0
+};
+
+static void console_devices_owner(int uid) {
+    for (int i = 0; console_devices[i]; i++)
+        chown(console_devices[i], uid, -1);
+}
+
 static int graphics_session_available(void) {
     return device_available("/dev/fb0", O_RDWR) &&
            device_available("/dev/input/event0", O_RDONLY);
@@ -780,6 +795,7 @@ static void monitor_children(char *command_shell_path, char **envp) {
 
         if (pid == desktop_pid) {
             desktop_pid = -1;
+            console_devices_owner(0);
             printf("[init] Graphical session ended\n");
             init_log("graphical session ended");
             continue;
@@ -891,7 +907,9 @@ int main(void) {
         }
         /* Run the desktop as the unprivileged user (root keeps the
          * console).  envp carries USER=user / HOME=/home/user. */
+        console_devices_owner(SESSION_UID);
         desktop_pid = start_program_as_user(desktop_path, desktop_argv, user_envp);
+        if (desktop_pid < 0) console_devices_owner(0);
     } else {
         printf("[init] Graphics unavailable; starting shell\n");
     }

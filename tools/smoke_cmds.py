@@ -59,6 +59,8 @@ def main():
         smokelib.login(proc, sel, log)
         checks = [
             ("kwprobe\n", "kwprobe ok"),
+            # Diskless: /etc/shadow is the initrd's (it was 0755).
+            ("/abiprobes/p57_mode_zero\n", "PASS p57_mode_zero"),
             ("uname\n", "MaeroOS"),
             ("uname -a\n", "i686"),
             ("uname -m\n", "i686"),

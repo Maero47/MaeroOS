@@ -2776,6 +2776,7 @@ static int sys_chdir(registers_t *regs) {
     vfs_node_t *n = vfs_lookup_at(path, 1, &lerr);
     if (!n) return lerr;
     if (!(n->flags & VFS_FLAG_DIR)) return -20;  /* ENOTDIR */
+    if (proc_access_check(n, VFS_WANT_X) < 0) return -13;   /* -EACCES */
     char canonical[256];
     int cr = canonicalize_path_at_cwd(path, canonical, sizeof(canonical));
     if (cr < 0) return cr;
@@ -2826,6 +2827,7 @@ static int sys_fchdir(registers_t *regs) {
     proc_file_t *f = &current_proc->ofile[fd];
     if (f->type != FD_FILE || !f->node || !f->path[0]) return -9;
     if (!(f->node->flags & VFS_FLAG_DIR)) return -20;  /* ENOTDIR */
+    if (proc_access_check(f->node, VFS_WANT_X) < 0) return -13;   /* -EACCES */
     __builtin_memcpy(current_proc->cwd, f->path, sizeof(f->path));
     return 0;
 }
@@ -8316,6 +8318,9 @@ static int sys_rename_kernel_path(const char *oldpath, const char *newpath) {
     int r = may_delete(src_dir, src);
     if (r < 0) return r;
     vfs_node_t *dst = vfs_finddir(dst_dir, new_base);
+    /* A mountpoint is neither moved nor replaced (Linux -EBUSY). */
+    if (vfs_is_mountpoint(src) || (dst && vfs_is_mountpoint(dst)))
+        return -16;                                      /* -EBUSY */
     if (dst) {
         r = may_delete(dst_dir, dst);
         if (r < 0) return r;

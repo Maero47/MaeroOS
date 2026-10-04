@@ -125,13 +125,18 @@ int vfs_access_check_groups(vfs_node_t *node, uint32_t euid, uint32_t egid,
         return 0;
     }
     m = node->mask;
-    /* Many synthetic nodes (devfs, procfs, freshly-created tmpfs dirs) are
-     * built without an explicit mode.  A zero mask should not lock everyone
-     * out: device/pipe/fifo nodes default to world rw (0666); read-only
-     * synthetic files/dirs default to world read + traverse (0555).  Real
-     * on-disk files always carry a non-zero ext2 mode, so this never weakens
-     * an intentionally-restricted file (e.g. /etc/shadow at 0600). */
+    /* Synthetic files and directories (procfs) are built without an explicit
+     * mode and default to world read + traverse (0555); anonymous pipes,
+     * FIFOs and sockets reached through /proc/<pid>/fd to 0666.  A device
+     * node with mode 0 is open to root alone: every devfs and driver node
+     * names its owner and mode, and the old 0666 default made a forgotten
+     * one -- /dev/input/event0 with every keystroke, /dev/fb0 -- world
+     * readable and writable. */
     if (m == 0) {
+        /* chmod 000, or a disk inode with no permission bits: nothing. */
+        if (node->flags == VFS_FLAG_CHARDEV || node->flags == VFS_FLAG_BLKDEV ||
+            (node->vflags & VFS_V_MODE_SET) || node->setattr_fn)
+            return -13;                                       /* -EACCES */
         if (node->flags != VFS_FLAG_FILE && node->flags != VFS_FLAG_DIR)
             m = 0666;
         else
@@ -148,6 +153,7 @@ int vfs_access_check_groups(vfs_node_t *node, uint32_t euid, uint32_t egid,
 
 int vfs_setattr_quiet(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid) {
     if (!node) return -2;
+    if ((mode & 07777) != node->mask) node->vflags |= VFS_V_MODE_SET;
     node->mask = mode & 07777;
     node->uid = uid;
     node->gid = gid;
@@ -156,6 +162,7 @@ int vfs_setattr_quiet(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gi
 
 int vfs_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid) {
     if (!node) return -2;
+    if ((mode & 07777) != node->mask) node->vflags |= VFS_V_MODE_SET;
     vfs_node_t *parent = NULL;
     char name[256];
     int haveparent = inotify_nwatches && vfs_last_parent(node, &parent, name);
@@ -289,6 +296,14 @@ static vfs_node_t *mnt_cross(vfs_node_t *n, vfs_mnt_t **m) {
     return n;
 }
 
+/* The calling process may search `dir` (root may search any directory). */
+static int walk_may_search(vfs_node_t *dir) {
+    struct proc *p = current_proc;
+    if (!p || p->euid == 0) return 0;
+    return vfs_access_check_groups(dir, p->euid, p->egid, p->groups,
+                                   p->ngroups, VFS_WANT_X);
+}
+
 static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
                     int may_follow, int top_restarts, char *alt,
                     vfs_node_t **out, int *err, vfs_mnt_t **mnt_out) {
@@ -316,6 +331,14 @@ static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
         const char *after_component = p;
         while (*after_component == '/') after_component++;
         int is_final = (*after_component == '\0');
+
+        /* Search permission on every directory the walk looks a name up in
+         * (Linux may_lookup): a file in another user's 0700 directory is
+         * out of reach whatever its own mode says. */
+        if (cur->flags == VFS_FLAG_DIR && walk_may_search(cur) < 0) {
+            *err = -13;                                       /* -EACCES */
+            return WALK_MISS;
+        }
 
         /* handle "." */
         if (len == 1 && component[0] == '.') continue;
@@ -457,7 +480,9 @@ static vfs_node_t *vfs_lookup_in(vfs_node_t *croot, const char *path,
             if (vfs_root_overlay && vfs_path_uses_root_overlay(pth))
                 r = vfs_walk(vfs_root_overlay, pth, follow_final, may_follow,
                              0, alt, &node, &e, mnt);
-            if (r == WALK_MISS) {
+            /* A directory the caller may not search hides nothing: the
+             * same path on the boot filesystem is not a fallback for it. */
+            if (r == WALK_MISS && e != -13) {
                 r = vfs_walk(vfs_root, pth, follow_final, may_follow,
                              croot != NULL, alt, &node, &e2, mnt);
                 if (e == -2) e = e2;     /* report a loop over a plain miss */
@@ -689,16 +714,25 @@ int vfs_mount_add(const char *target, vfs_node_t *root, const vfs_mnt_t *tmpl) {
     if (mp->flags != VFS_FLAG_DIR) return -20;                /* -ENOTDIR */
     /* "/" itself is not a node any walk crosses from. */
     if (mp == vfs_root || mp == vfs_root_overlay) return -16; /* -EBUSY */
-    /* The table keeps raw pointers: neither end may be a node that goes
-     * once nothing holds it (per-process /proc nodes: -EINVAL). */
+    /* The entry holds a reference on both ends (an open descriptor's kind:
+     * a tmpfs mountpoint that is removed stays a valid node until the
+     * umount), dropped by vfs_mount_remove.  Per-process /proc nodes are
+     * still refused (-EINVAL): one belongs to a process, not to a name. */
     int pr = vfs_may_pin(mp, VFS_PIN_MOUNT);
     if (!pr) pr = vfs_may_pin(root, VFS_PIN_MOUNT);
     if (pr) return pr;
+    vfs_retain(mp);
+    vfs_retain(root);
     preempt_disable();
     vfs_mnt_t *m = NULL;
     for (int i = 0; i < VFS_MNT_MAX; i++)
         if (!g_mnt[i].used) { m = &g_mnt[i]; break; }
-    if (!m) { preempt_enable(); return -12; }                 /* -ENOMEM */
+    if (!m) {
+        preempt_enable();
+        vfs_close(root);
+        vfs_close(mp);
+        return -12;                                           /* -ENOMEM */
+    }
     *m = *tmpl;
     m->used   = 1;
     m->boot   = 0;
@@ -774,8 +808,15 @@ int vfs_mount_remove(vfs_mnt_t *m, uint32_t flags) {
     for (int i = 0; i < VFS_MNT_MAX; i++)
         if (g_mnt[i].used && (g_mnt[i].parent == m || g_mnt[i].src == m))
             return -16;                                           /* -EBUSY */
+    /* The entry's own reference on its root is not a user of the
+     * filesystem: drop it before asking, take it back if the answer is no. */
+    vfs_node_t *mp = m->mp, *root = m->root;
+    vfs_close(root);
     int busy = m->busy ? m->busy(m->fs) : 0;
-    if (busy && !(flags & VFS_MNT_DETACH)) return -16;            /* -EBUSY */
+    if (busy && !(flags & VFS_MNT_DETACH)) {
+        vfs_retain(root);
+        return -16;                                               /* -EBUSY */
+    }
     void (*release)(void *) = m->release;
     void *fs = m->fs;
     preempt_disable();
@@ -784,6 +825,7 @@ int vfs_mount_remove(vfs_mnt_t *m, uint32_t flags) {
     m->src = NULL;
     g_mnt_active--;
     preempt_enable();
+    vfs_close(mp);
     /* A lazily detached instance that still has open files is left alive:
      * its descriptors keep working, and it keeps its device until it is
      * idle (see g_detached). */

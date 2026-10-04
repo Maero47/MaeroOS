@@ -1,2 +1,7 @@
 root:x:0:
+tty:x:5:
+disk:x:6:
+audio:x:18:
+input:x:23:
+video:x:27:
 users:x:100:user

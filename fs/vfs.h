@@ -11,6 +11,18 @@
 #define VFS_FLAG_FIFO    0x7   /* named pipe (FIFO) */
 /* AF_UNIX socket inode (S_IFSOCK), made by bind().  Outside the low three
  * bits on purpose: several callers test those bits as a mask. */
+/* Groups that own device nodes: Alpine's /etc/group numbers (the Alpine
+ * chroot and the MaeroOS /etc/group both name them). */
+#define DEV_GID_TTY    5
+#define DEV_GID_DISK   6
+#define DEV_GID_AUDIO 18
+#define DEV_GID_INPUT 23
+#define DEV_GID_VIDEO 27
+
+/* vfs_node.vflags: the mode was set by chmod/create, so mode 0 means "no
+ * access" rather than "synthetic node without a mode" (vfs_access_check). */
+#define VFS_V_MODE_SET 0x1
+
 #define VFS_FLAG_SOCK    0x8
 
 /* Returned by vfs_readdir for each entry */
@@ -41,6 +53,7 @@ typedef struct vfs_node {
     uint32_t nlink;    /* hard links (0 = not tracked, stat reports 1) */
     uint32_t dev;      /* st_dev: device of the filesystem (0 = unspecified) */
     uint32_t rdev;     /* st_rdev: the device a BLKDEV/CHARDEV node stands for */
+    uint32_t vflags;   /* VFS_V_* */
 
     /* ── Operations (NULL = use built-in defaults) ──────────────────── */
     /* Offsets are 64-bit; one call moves at most 4 GiB - 1 bytes. */

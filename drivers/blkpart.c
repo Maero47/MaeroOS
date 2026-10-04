@@ -163,6 +163,7 @@ static blkpart_t *blkpart_add(int dev, int partno, uint32_t start, uint32_t nsec
     bp->node.flags   = VFS_FLAG_BLKDEV;
     bp->node.inode   = 0x30000000u + bp->rdev;
     bp->node.mask    = 0660;
+    bp->node.gid     = DEV_GID_DISK;
     bp->node.size    = (uint64_t)nsect * 512u;
     bp->node.rdev    = bp->rdev;
     bp->node.read_fn = blkpart_node_read;

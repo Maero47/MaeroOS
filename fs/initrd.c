@@ -168,7 +168,10 @@ void initrd_init(uint32_t mod_phys_start, uint32_t mod_phys_end) {
                         node->flags = VFS_FLAG_FILE;
                         node->size  = file_size;
                         node->data  = tar + offset + 512;
-                        node->mask  = 0755;
+                        /* Everything is root's and 0755, except that a
+                         * file the archive keeps from others (no o+r:
+                         * etc/shadow, 0600) stays root's alone. */
+                        node->mask  = (octal_str(hdr->mode, 7) & 0004) ? 0755 : 0700;
                         node->uid = node->gid = 0;
                         node->inode = next_ino++;
                         strncpy(node->name, comp, 255);
