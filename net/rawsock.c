@@ -364,12 +364,13 @@ static int pk_send(void *x, const void *buf, uint32_t len,
     uint32_t total;
     if (s->type == 3) {                                /* the whole frame */
         if (len < ETH_HLEN) return -22;
-        if (len > iface->mtu + ETH_HLEN) return -90;   /* -EMSGSIZE */
+        if (len > iface->mtu + ETH_HLEN || len > FRAME_MAX)
+            return -90;                                /* -EMSGSIZE */
         memcpy(frame, buf, len);
         total = len;
     } else {
         if (!has) return -89;                          /* -EDESTADDRREQ */
-        if (len > iface->mtu) return -90;
+        if (len > iface->mtu || len > FRAME_MAX - ETH_HLEN) return -90;
         uint16_t proto = sa.protocol ? sa.protocol : s->proto;
         memcpy(frame, sa.addr, 6);
         memcpy(frame + 6, iface->mac, 6);
