@@ -171,7 +171,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-net-virtio smoke-tcpsrv smoke-net6 smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-gfxmode smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-largefile smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-alpinex disk-alpinex smoke-alpine-net smoke-audio disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched bench-bkl smoke-klock stress-smp
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-net-virtio smoke-tcpsrv smoke-net6 smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-gfxmode smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-largefile smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-alpinex disk-alpinex smoke-alpine-net smoke-audio smoke-procipc disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched bench-bkl smoke-klock stress-smp
 
 all: $(TARGET)
 
@@ -548,13 +548,14 @@ smoke-pc: $(TARGET) iso disk
 # Pick a subset with CHECK_SUITES="smoke smoke-x".
 CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-net-e1000 smoke-net-virtio smoke-net6 smoke-tcpsrv \
                  smoke-fw smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui smoke-gfxmode smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-largefile smoke-uefi \
-                 smoke-install smoke-hda smoke-acpi smoke-ahci smoke-nvme smoke-usb smoke-pc
+                 smoke-install smoke-hda smoke-acpi smoke-ahci smoke-nvme smoke-usb smoke-pc smoke-procipc
 CHECK_LOG_DIR ?= build/check
 
 # repo: smoke-pkg serves packages from repo/ (see the smoke-pkg target).
 # iso: smoke-gui boots the desktop, which needs the ISO's framebuffer.
 # limine-iso: smoke-uefi boots the Limine ISO under SeaBIOS and OVMF.
-check: $(TARGET) initrd disk repo iso limine-iso
+# abiprobes: smoke-procipc runs the SysV IPC, inotify and /proc probes.
+check: $(TARGET) abiprobes initrd disk repo iso limine-iso
 	@mkdir -p $(CHECK_LOG_DIR); rm -f $(CHECK_LOG_DIR)/*.log; failed=""; \
 	for s in $(CHECK_SUITES); do \
 	    log=$(CHECK_LOG_DIR)/$$s.log; t0=$$(date +%s); \
@@ -584,8 +585,14 @@ abiprobes:
 smoke-abi: $(TARGET) abiprobes initrd disk
 	python3 tools/smoke_abi.py
 
+# /proc/stat and /proc/<pid> under ps/top/free/uptime/vmstat/killall/who,
+# System V IPC, utmp and inotify on tmpfs and ext2 (tools/smoke_procipc.py).
+# SMOKE_PROCIPC_ARGS=--alpine adds Alpine's procps and htop (needs disk-alpine).
+smoke-procipc: $(TARGET) abiprobes initrd disk
+	python3 tools/smoke_procipc.py $(SMOKE_PROCIPC_ARGS)
+
 # initrd and disk pack testfiles/abiprobes/, so under -j they must wait for it.
-ifneq ($(filter smoke-abi,$(MAKECMDGOALS)),)
+ifneq ($(filter smoke-abi smoke-procipc check,$(MAKECMDGOALS)),)
 initrd disk: | abiprobes
 endif
 

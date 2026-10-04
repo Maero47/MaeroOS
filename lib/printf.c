@@ -4,7 +4,8 @@
 /*
  * vsnprintf — kernel-mode formatted string writer.
  *
- * Supported specifiers: %d/%i, %u, %x/%X, %o, %c, %s, %p, %%
+ * Supported specifiers: %d/%i, %u, %x/%X, %o, %c, %s, %p, %%; the ll
+ * length modifier on d/i/u/x takes a 64-bit argument (l is ignored)
  * Flags: zero-padding (0), width specifier, left-align (-)
  * No floating point.
  */
@@ -31,7 +32,7 @@ static void write_str(char *buf, size_t *pos, size_t n, const char *s,
     }
 }
 
-static void write_uint(char *buf, size_t *pos, size_t n, uint32_t val,
+static void write_uint(char *buf, size_t *pos, size_t n, uint64_t val,
                        int base, int upper, int width, int zero_pad,
                        int left_align) {
     static const char digits_lower[] = "0123456789abcdef";
@@ -43,7 +44,12 @@ static void write_uint(char *buf, size_t *pos, size_t n, uint32_t val,
     if (val == 0) {
         tmp[len++] = '0';
     } else {
-        uint32_t v = val;
+        uint64_t v64 = val;
+        while (v64 >> 32) {               /* %llu: the wide part first */
+            tmp[len++] = digits[v64 % (uint32_t)base];
+            v64 /= (uint32_t)base;
+        }
+        uint32_t v = (uint32_t)v64;
         while (v) {
             tmp[len++] = digits[v % (uint32_t)base];
             v /= (uint32_t)base;
@@ -63,14 +69,14 @@ static void write_uint(char *buf, size_t *pos, size_t n, uint32_t val,
     }
 }
 
-static void write_int(char *buf, size_t *pos, size_t n, int32_t val,
+static void write_int(char *buf, size_t *pos, size_t n, int64_t val,
                       int width, int zero_pad, int left_align) {
     if (val < 0) {
         write_char(buf, pos, n, '-');
-        write_uint(buf, pos, n, (uint32_t)-val, 10, 0, width > 1 ? width-1 : 0,
-                   zero_pad, left_align);
+        write_uint(buf, pos, n, (uint64_t)0 - (uint64_t)val, 10, 0,
+                   width > 1 ? width-1 : 0, zero_pad, left_align);
     } else {
-        write_uint(buf, pos, n, (uint32_t)val, 10, 0, width, zero_pad, left_align);
+        write_uint(buf, pos, n, (uint64_t)val, 10, 0, width, zero_pad, left_align);
     }
 }
 
@@ -99,27 +105,37 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list args) {
         while (*fmt >= '0' && *fmt <= '9')
             width = width * 10 + (*fmt++ - '0');
 
+        /* Length: 'l' is 32-bit here, 'll' a 64-bit argument (%llu). */
+        int lng = 0;
+        while (*fmt == 'l') { lng++; fmt++; }
+
         /* Dispatch on specifier */
         char spec = *fmt++;
         switch (spec) {
         case 'd': case 'i':
-            write_int(buf, &pos, n, va_arg(args, int32_t), width, zero_pad, left_align);
+            write_int(buf, &pos, n, lng >= 2 ? va_arg(args, int64_t)
+                                             : (int64_t)va_arg(args, int32_t),
+                      width, zero_pad, left_align);
             break;
         case 'u':
-            write_uint(buf, &pos, n, va_arg(args, uint32_t), 10, 0,
-                       width, zero_pad, left_align);
+            write_uint(buf, &pos, n, lng >= 2 ? va_arg(args, uint64_t)
+                                              : (uint64_t)va_arg(args, uint32_t),
+                       10, 0, width, zero_pad, left_align);
             break;
         case 'x':
-            write_uint(buf, &pos, n, va_arg(args, uint32_t), 16, 0,
-                       width, zero_pad, left_align);
+            write_uint(buf, &pos, n, lng >= 2 ? va_arg(args, uint64_t)
+                                              : (uint64_t)va_arg(args, uint32_t),
+                       16, 0, width, zero_pad, left_align);
             break;
         case 'X':
-            write_uint(buf, &pos, n, va_arg(args, uint32_t), 16, 1,
-                       width, zero_pad, left_align);
+            write_uint(buf, &pos, n, lng >= 2 ? va_arg(args, uint64_t)
+                                              : (uint64_t)va_arg(args, uint32_t),
+                       16, 1, width, zero_pad, left_align);
             break;
         case 'o':
-            write_uint(buf, &pos, n, va_arg(args, uint32_t), 8, 0,
-                       width, zero_pad, left_align);
+            write_uint(buf, &pos, n, lng >= 2 ? va_arg(args, uint64_t)
+                                              : (uint64_t)va_arg(args, uint32_t),
+                       8, 0, width, zero_pad, left_align);
             break;
         case 'p': {
             /* Pointer: 0x + 8 hex digits */

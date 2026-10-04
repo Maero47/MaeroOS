@@ -73,5 +73,12 @@ void shm_mm_release(uint32_t pgdir_phys);
  * frames[i], releases their references after the TLB shootdown, and drops the
  * VMA coverage of exactly those pages.  mm_shm_mapped counts such pages. */
 uint32_t mm_shm_attach(const uint32_t *frames, uint32_t npages);
+/* The same at a fixed page-aligned `addr` (0: anywhere), read-only when
+ * `rdonly`: for SysV shmat (proc/sysvipc.c).  0 when the range is taken. */
+uint32_t mm_shm_attach_at(const uint32_t *frames, uint32_t npages, uint32_t addr,
+                          int rdonly);
+/* Largest object either kind of attachment can detach (SysV segments are
+ * bigger than window surfaces). */
+#define MM_SHM_MAX_PAGES 8192
 void     mm_shm_detach(uint32_t base, const uint32_t *frames, uint32_t npages);
 uint32_t mm_shm_mapped(uint32_t base, const uint32_t *frames, uint32_t npages);

@@ -9,6 +9,7 @@
 #include "../kernel/printk.h"
 #include "../arch/i686/cpu/tss.h"
 #include "../arch/i686/cpu/percpu.h"
+#include "../arch/i686/cpu/pit.h"
 #include "../arch/i686/mm/paging.h"
 #include "../arch/i686/cpu/fpu.h"
 #include "../fs/vfs.h"
@@ -32,6 +33,7 @@ static void ptable_note_slot(struct proc *p) {
 /* current_proc is now a per-CPU macro (see process.h) — no global definition. */
 
 static int next_pid = 1;
+uint32_t proc_forks_total;
 
 extern void trapret(void);  /* defined in isr.asm */
 
@@ -113,6 +115,8 @@ struct proc *allocproc(void) {
 
     p->state          = PROC_EMBRYO;
     p->pid            = next_pid++;
+    p->start_tick     = pit_ticks();
+    proc_forks_total++;
     p->pgdir_phys     = 0;
     p->parent         = NULL;
     p->exit_status    = 0;
@@ -276,6 +280,8 @@ struct proc *proc_create_kthread(void (*fn)(void), const char *name) {
 
     p->state       = PROC_EMBRYO;
     p->pid         = next_pid++;
+    p->start_tick  = pit_ticks();
+    proc_forks_total++;
     p->pgdir_phys  = 0;   /* kthreads use the kernel pgdir */
     p->parent      = NULL;
     p->exit_status = 0;

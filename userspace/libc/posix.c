@@ -1076,3 +1076,12 @@ const char *hstrerror(int err) {
     return "Resolver error";
 }
 int setlogmask(int mask) { (void)mask; return 0xff; }
+
+/* mount(2) family. */
+int mount(const char *source, const char *target, const char *filesystemtype,
+          unsigned long mountflags, const void *data) {
+    return chkerr(syscall5(21, (int)source, (int)target, (int)filesystemtype,
+                           (int)mountflags, (int)data));
+}
+int umount2(const char *target, int flags) { return chkerr(syscall2(52, (int)target, flags)); }
+int umount(const char *target) { return umount2(target, 0); }

@@ -73,6 +73,12 @@ typedef struct vfs_node {
      * exactly as a missing node would.  A finddir_fn that allocates per lookup
      * instead of setting this leaks on every stat(). */
     struct vfs_node * (*open_fn)   (struct vfs_node *);
+    /* About to be held for longer than the current syscall (how: VFS_PIN_*):
+     * 0, or a negative errno that refuses it.  Node caches whose entries go
+     * once nothing holds them (per-process /proc nodes) charge the holder
+     * here, and refuse what a raw pointer would outlive (mounts keep no
+     * reference).  NULL = always allowed.  See vfs_may_pin(). */
+    int               (*may_pin_fn)(struct vfs_node *, int how);
     /* Persist mode/uid/gid changes (chmod/chown); NULL = in-memory only. */
     int               (*setattr_fn)(struct vfs_node *, uint32_t mode,
                                     uint32_t uid, uint32_t gid);
@@ -184,6 +190,13 @@ void vfs_retain(vfs_node_t *node);
  * -13 (-EACCES).  euid 0 (root) bypasses, except X on a file still needs an
  * execute bit somewhere. */
 int vfs_access_check(vfs_node_t *node, uint32_t euid, uint32_t egid, int want);
+
+/* may_pin_fn: an open file, an inotify watch or a chroot root (references
+ * that vfs_retain counts), or a mount (which keeps a raw pointer). */
+enum { VFS_PIN_OPEN = 1, VFS_PIN_WATCH, VFS_PIN_ROOT, VFS_PIN_MOUNT };
+static inline int vfs_may_pin(vfs_node_t *node, int how) {
+    return node && node->may_pin_fn ? node->may_pin_fn(node, how) : 0;
+}
 /* The same, where the group class also applies when the file's group is any of
  * the `ngroups` supplementary gids in `groups` (Linux in_group_p). */
 int vfs_access_check_groups(vfs_node_t *node, uint32_t uid, uint32_t gid,
@@ -191,6 +204,9 @@ int vfs_access_check_groups(vfs_node_t *node, uint32_t uid, uint32_t gid,
 
 /* Update mode/uid/gid (in-memory + persisted via setattr_fn if present). */
 int vfs_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid);
+/* The same without an inotify IN_ATTRIB: a new node's owner and mode, set as
+ * part of creating it. */
+int vfs_setattr_quiet(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid);
 
 /* link(2): `name` in `dir` becomes another name of `target` (-EPERM without
  * filesystem support, -EXDEV across filesystems). */
@@ -349,3 +365,17 @@ int vfs_path_rdonly(const char *path, int parent);
  * instance still has open files (used to refuse a second mount of a device,
  * and raw writes to it).  Releases detached instances that have gone idle. */
 int vfs_mount_has_fs_source(const char *source);
+
+/* The filesystem root a boot-time mount shim stands for (the node itself
+ * when it is not one): what inotify watches and reports on. */
+vfs_node_t *vfs_resolve_mount(vfs_node_t *dir);
+
+/* The directory and name through which the calling process's last path
+ * lookup reached `node` (its final component), for inotify's events on a
+ * directory's entries.  1 and *parent / name (256 bytes) set, or 0. */
+int vfs_last_parent(vfs_node_t *node, vfs_node_t **parent, char *name);
+/* Drop that record (the nodes it names may be about to go). */
+void vfs_forget_last_lookup(void);
+
+/* /proc/<pid>/mountinfo text; returns its length. */
+uint32_t vfs_mountinfo_format(char *buf, uint32_t size);

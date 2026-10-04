@@ -109,6 +109,19 @@ PROBES = {
     "p44_proc_fd_link":        (60, ""),
     # seccomp filters and no_new_privs (the Firefox content sandbox).
     "p45_seccomp":             (60, ""),
+    # System V shm/sem/msg, inotify (on tmpfs here; smoke-procipc also runs
+    # it on ext2), and /proc/<pid> with its permission rules.
+    "p45_sysv_ipc":            (60, ""),
+    "p46_inotify":             (120, ""),
+    "p47_proc_pid":            (60, ""),
+    # Unprivileged inotify queues, message queues and shm stay bounded.
+    "p48_ipc_limits":          (240, ""),
+    # /proc node cache and inotify accounting buckets do not drift.
+    "p49_accounting":          (120, ""),
+    # One user hammering /proc lookups cannot make them fail for others.
+    "p50_procfs_fair":         (150, ""),
+    # SIGKILL of a parent with an unreaped child (hung the kernel).
+    "p51_kill_zombie_child":   (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

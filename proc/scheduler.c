@@ -8,9 +8,11 @@ extern void vma_clear(struct proc *p);   /* free demand-paged VMAs (syscall.c) *
 #include "pipe.h"
 #include "usocket.h"
 #include "shm.h"
+#include "sysvipc.h"
 #include "syscall.h"       /* copy_to_user / copy_from_user */
 #include "../fs/devfs.h"
 #include "../fs/vfs.h"
+#include "../fs/procfs.h"
 #include "../net/socket.h"
 #include "../arch/i686/cpu/tss.h"
 #include "../arch/i686/cpu/gdt.h"
@@ -235,6 +237,40 @@ uint32_t sched_idle_us;
  * test see that futex wakes still yield to the woken thread. */
 uint32_t sched_handoffs;
 static uint32_t sched_idle_ns_rem;
+/* Context switches (dispatches) since boot: /proc/stat "ctxt". */
+uint32_t sched_ctxt;
+
+/* Load average (Linux kernel/sched/loadavg.c's fixed-point scheme: FSHIFT
+ * 11, the exp(-5s/1min), exp(-5s/5min), exp(-5s/15min) factors), sampled
+ * every five seconds from the threads that are running or runnable. */
+#define LOAD_FSHIFT 11
+#define LOAD_FIXED1 (1U << LOAD_FSHIFT)
+#define LOAD_EXP_1  1884U
+#define LOAD_EXP_5  2014U
+#define LOAD_EXP_15 2037U
+uint32_t sched_loadavg[3];
+static uint32_t load_next_tick;
+
+static uint32_t calc_load(uint32_t load, uint32_t exp, uint32_t active) {
+    uint32_t newload = load * exp + active * (LOAD_FIXED1 - exp);
+    if (active >= load) newload += LOAD_FIXED1 - 1;
+    return newload / LOAD_FIXED1;
+}
+
+static void sched_calc_load(uint32_t now) {
+    if ((int32_t)(now - load_next_tick) < 0) return;
+    load_next_tick = now + 5 * 100;     /* every 5 s of 100 Hz ticks */
+    uint32_t active = 0;
+    for (int i = 0; i < ptable_hwm; i++)
+        if (ptable[i].state == PROC_RUNNABLE || ptable[i].state == PROC_RUNNING)
+            active++;
+    /* The thread taking this tick is counted when it is a user thread;
+     * the idle loop is not a thread. */
+    active *= LOAD_FIXED1;
+    sched_loadavg[0] = calc_load(sched_loadavg[0], LOAD_EXP_1, active);
+    sched_loadavg[1] = calc_load(sched_loadavg[1], LOAD_EXP_5, active);
+    sched_loadavg[2] = calc_load(sched_loadavg[2], LOAD_EXP_15, active);
+}
 
 /* Add an interval to a us counter, carrying the sub-us part.  32-bit only:
  * one interval is a time slice or one idle halt, far below 4 s. */
@@ -289,6 +325,9 @@ void scheduler_start(void) {
             bklstat_sched_out((int)(p - ptable), me->bkl_depth == 1);
             uint64_t ran = clock_mono_ns() - run_t0;
             add_ns(&p->run_us, &p->run_ns_rem, ran);
+            p->run_ns_total += ran;
+            me->busy_ns += ran;
+            sched_ctxt++;
             p->vruntime += vr_scale(p, ran);
             /* Back in the scheduler: the outgoing thread already parked its own
              * bucket and left KPB_SCHED current (see kprof_park below). */
@@ -341,7 +380,11 @@ void scheduler_start(void) {
         __asm__ volatile("sti");
         bkl_acquire();
         me->idle = 0;
-        add_ns(&sched_idle_us, &sched_idle_ns_rem, clock_mono_ns() - idle_t0);
+        {
+            uint64_t idle_ns = clock_mono_ns() - idle_t0;
+            add_ns(&sched_idle_us, &sched_idle_ns_rem, idle_ns);
+            me->idle_ns += idle_ns;
+        }
         kprof_switch(kp_old);
     }
 }
@@ -387,8 +430,16 @@ void scheduler_tick(int user_mode) {
         if (any && m != ~0ULL && m > sched_min_vr) sched_min_vr = m;
     }
 
+    {
+        struct cpu *tc = &cpus[this_cpu_id()];
+        if (!cur) tc->tick_idle++;
+        else if (user_mode) tc->tick_user++;
+        else tc->tick_sys++;
+        if (this_cpu_id() == 0) sched_calc_load(now);
+    }
     if (!cur) return;
     cur->utime_ticks++;
+    if (!user_mode) cur->stime_ticks++;
     /* Slice expiry: the thread has had SCHED_SLICE_NS and another runnable
      * one is behind it.  The switch happens at the IRQ's return to user mode
      * (sched_irq_exit); kernel-mode execution is never preempted. */
@@ -765,6 +816,8 @@ void proc_exit(int status) {
         vfs_close(current_proc->ctty);
         current_proc->ctty = (void *)0;
     }
+    /* /proc nodes held by a syscall that is not coming back. */
+    if (current_proc->pn_nwalk) procfs_walk_done(current_proc);
     if (current_proc->root_node) {           /* chroot(2)'s pinned root */
         vfs_close(current_proc->root_node);
         current_proc->root_node = (void *)0;
@@ -785,6 +838,8 @@ void proc_exit(int status) {
      * running in it (frame refs are released when the pgdir is torn down at
      * reap time). */
     shm_proc_exit(current_proc);
+    /* SEM_UNDO: the last thread of a process gives its adjustments back. */
+    sysv_sem_exit(current_proc);
 
     /* Linux exit_notify(): children belong to the PROCESS, and the parent is
      * told about the PROCESS.  A non-leader thread exiting says nothing to

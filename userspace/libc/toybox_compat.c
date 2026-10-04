@@ -607,9 +607,12 @@ void *setmntent(const char *filename, const char *type) { (void)filename; (void)
 struct mntent *getmntent(void *stream) { (void)stream; return 0; }
 int endmntent(void *stream) { (void)stream; return 0; }
 
-int inotify_init(void) { return nosys(); }
-int inotify_add_watch(int fd, const char *pathname, uint32_t mask) { (void)fd; (void)pathname; (void)mask; return nosys(); }
-int inotify_rm_watch(int fd, int wd) { (void)fd; (void)wd; return nosys(); }
+int inotify_init1(int flags) { return chkerr(syscall1(332, flags)); }
+int inotify_init(void) { return inotify_init1(0); }
+int inotify_add_watch(int fd, const char *pathname, uint32_t mask) {
+    return chkerr(syscall3(292, fd, (int)pathname, (int)mask));
+}
+int inotify_rm_watch(int fd, int wd) { return chkerr(syscall2(293, fd, wd)); }
 
 ssize_t getxattr(const char *p, const char *n, void *v, size_t s) { (void)p; (void)n; (void)v; (void)s; return nosys(); }
 ssize_t lgetxattr(const char *p, const char *n, void *v, size_t s) { return getxattr(p, n, v, s); }

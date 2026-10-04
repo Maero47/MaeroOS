@@ -2,6 +2,8 @@
 #include <termios.h>
 
 #define TIOCNOTTY 0x5422
+#define FIONREAD  0x541B
+#define FIONBIO   0x5421
 #define BLKGETSIZE64 0x80081272
 
 #define FBIOGET_VSCREENINFO 0x4600

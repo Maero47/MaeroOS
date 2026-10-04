@@ -3,6 +3,9 @@
 #include "../include/unistd.h"
 #include "../include/grp.h"
 #include "../include/signal.h"
+#include "../include/utmpx.h"
+#include "../include/stdlib.h"
+#include "../include/sys/time.h"
 #include "../auth/auth.h"
 
 #define FIELD_MAX 192
@@ -193,6 +196,32 @@ static void fail_delay(void) {
         usleep(500000);
 }
 
+/* utmp/wtmp: this process becomes the session (login execs the shell), so
+ * the record carries its pid; init marks it dead when the pid exits.  The
+ * line is the terminal on stdin ("pts/3"), or getty's $TTY ("tty0") for the
+ * console. */
+static void record_login(void) {
+    struct utmpx u;
+    struct timeval tv;
+    const char *line = ttyname(0);
+    if (line && !strncmp(line, "/dev/", 5)) line += 5;
+    /* The console answers as the generic /dev/tty; getty says which. */
+    if ((!line || !line[0] || !strcmp(line, "tty")) && getenv("TTY")) line = getenv("TTY");
+    if (!line || !line[0]) line = "console";
+    memset(&u, 0, sizeof(u));
+    u.ut_type = USER_PROCESS;
+    u.ut_pid = getpid();
+    strncpy(u.ut_line, line, sizeof(u.ut_line) - 1);
+    size_t l = strlen(line);
+    strncpy(u.ut_id, l > 4 ? line + l - 4 : line, sizeof(u.ut_id));
+    strncpy(u.ut_user, username, sizeof(u.ut_user) - 1);
+    gettimeofday(&tv, 0);
+    u.ut_tv.tv_sec = (int)tv.tv_sec;
+    u.ut_tv.tv_usec = (int)tv.tv_usec;
+    pututxline(&u);
+    updwtmpx(_PATH_WTMP, &u);
+}
+
 int main(int argc, char *argv[]) {
     int forced = 0;
     const char *name = "root";
@@ -269,6 +298,7 @@ int main(int argc, char *argv[]) {
     select_shell_path();
     build_env();
 
+    record_login();                 /* root still: utmp is root's */
     if (!drop_privileges()) {
         printf("login: cannot drop privileges to %s\n", username);
         return 1;

@@ -1,4 +1,5 @@
 #include "shm.h"
+#include "sysvipc.h"
 #include "process.h"
 #include "../arch/i686/mm/paging.h"
 #include "../mm/pmm.h"
@@ -208,6 +209,7 @@ int shm_sys_chmod(int id, uint32_t mode) {
 void shm_proc_fork(struct proc *parent, struct proc *child) {
     uint32_t pm = parent->pgdir_phys, cm = child->pgdir_phys;
     if (!pm || !cm || pm == cm) return;     /* CLONE_VM: records are shared */
+    sysv_shm_fork(parent, child);
     for (int i = 0; i < SHM_MAX_ATTACH; i++) {
         if (attaches[i].mm != pm) continue;
         shm_object_t *obj = shm_get(attaches[i].id);
@@ -227,6 +229,7 @@ void shm_proc_fork(struct proc *parent, struct proc *child) {
 
 void shm_mm_release(uint32_t mm) {
     if (!mm) return;
+    sysv_shm_mm_release(mm);
     for (int i = 0; i < SHM_MAX_ATTACH; i++) {
         if (attaches[i].mm != mm) continue;
         shm_object_t *obj = shm_get(attaches[i].id);
