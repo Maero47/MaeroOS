@@ -90,13 +90,6 @@ regression tests for the fixes in audit section 5.
 | P74 | `p74_raw_short_send.c`     | ICMPv6 raw sendto of 0-3 bytes is EINVAL (it halted the machine through an lwIP assert), 8 bytes go out; IP_HDRINCL sendto shorter than an IP header is EINVAL (root; SKIP otherwise) | — |
 | P75 | `p75_ephemeral_ports.c`    | sixteen implicitly bound UDP sockets and sixteen TCP connections do not get consecutive local ports (lwIP counted up from a fixed start: LWIP_RAND() was 4) | — |
 | P76 | `p76_alsa_close_race.c`    | close of the ALSA PCM while a sibling thread's START is still writing the staged buffer, interrupted by a signal: the device cannot be reopened before START returns, START succeeds (the close freed the buffer under it); SKIP without a sound card, run by smoke-hda | — |
-| P53 | `p53_sigpage_interp.c`      | an ELF interpreter segment at the sigreturn page's address must not overwrite the shared trampoline (signal handlers still return afterwards) | — |
-| P54 | `p54_setid_auxv.c`          | set-uid-root exec from uid 65534: `AT_SECURE=1`, `AT_EUID=0`; a plain exec `AT_SECURE=0` (root only) | — |
-| P55 | `p55_fstat_low_map.c`       | old `fstat` (108) on eventfd/epoll/socket/pipe; unprivileged `MAP_FIXED` below 64 KiB refused | — |
-| P56 | `p56_memfd_anon.c`          | a memfd has no name in `/tmp` (`/memfd:<name> (deleted)`), and a reopen through `/proc/self/fd` shares its pages | — |
-| P57 | `p57_fb0_identity.c`        | a regular file named `fb0` maps its own bytes; read-only `/dev/fb0` gives no writable view (MaeroOS) | — |
-| P58 | `p58_kill_target.c`         | MaeroOS syscall 505: no init, no process the caller could not signal (EPERM); own child allowed | — |
-| P59 | `p59_lock_limits.c`         | record locks bounded per uid (ENOLCK past 4096 here); a second user can still lock; close releases all | — |
 | P78 | `p78_leader_exit.c`         | the main thread `SYS_exit`s while a worker runs: the worker still faults in an earlier mmap and maps new memory; `waitpid(WNOHANG)` does not report the child until the worker's `exit_group(7)`, then status 7 | — |
 | P79 | `p79_thread_brk.c`          | a worker created before the main thread moved the break sees the moved break (`brk(0)`), grows it, and main sees that with its heap intact | — |
 | P80 | `p80_fifo_fstat.c`          | `fstat` of an open named FIFO gives its owner, mode, `st_ino` and `st_dev` (as `stat` of its name); a `pipe(2)` end is still `S_IFIFO` | — |

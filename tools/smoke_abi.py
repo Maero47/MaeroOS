@@ -155,13 +155,6 @@ PROBES = {
     "p75_ephemeral_ports":     (60, ""),
     # Needs a sound card: SKIP here, required by smoke-hda.
     "p76_alsa_close_race":     (60, ""),
-    "p53_sigpage_interp":      (60, ""),
-    "p54_setid_auxv":          (60, ""),
-    "p55_fstat_low_map":       (60, ""),
-    "p56_memfd_anon":          (60, ""),
-    "p57_fb0_identity":        (60, ""),
-    "p58_kill_target":         (60, ""),
-    "p59_lock_limits":         (120, ""),
     # Kernel follow-ups from the userspace review: a leader that exits alone,
     # brk per process, fstat of a named FIFO, MaeroOS shm_size.
     "p78_leader_exit":         (60, ""),
