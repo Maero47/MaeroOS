@@ -6592,6 +6592,8 @@ static int sys_ppoll(registers_t *regs, int time64) {
 #define EPOLL_MAX_ITEMS 256
 #define EPOLLIN_K   0x001
 #define EPOLLOUT_K  0x004
+#define EPOLLONESHOT_K 0x40000000U
+#define EPOLLET_K      0x80000000U
 /* An item names a descriptor NUMBER plus the identity (proc_file_t.fid) of
  * the open file it held when it was added.  Linux ties a registration to the
  * struct file, so it ends when that file's last descriptor closes: here an
@@ -6606,6 +6608,9 @@ struct epoll {
         uint32_t fid;         /* open-file identity at ADD time */
         uint32_t events;      /* requested EPOLL* mask */
         uint8_t  data[8];     /* opaque epoll_data, echoed back */
+        uint8_t  quiet;       /* EPOLLONESHOT fired, or an EPOLLET edge of a
+                               * file whose readiness never changes was
+                               * reported: silent until the next MOD */
     } items[EPOLL_MAX_ITEMS];
     int refcount;
 };
@@ -6681,6 +6686,7 @@ static int sys_epoll_ctl(registers_t *regs) {
         ep->items[slot].fd  = fd;
         ep->items[slot].fid = wf->fid;
         ep->items[slot].events = ev.events;
+        ep->items[slot].quiet  = 0;
         __builtin_memcpy(ep->items[slot].data, ev.data, 8);
         return 0;
     }
@@ -6688,6 +6694,7 @@ static int sys_epoll_ctl(registers_t *regs) {
         for (int i = 0; i < EPOLL_MAX_ITEMS; i++)
             if (ep->items[i].fd == fd && epoll_item_live(ep, i)) {
                 ep->items[i].events = ev.events;
+                ep->items[i].quiet  = 0;          /* re-armed (Linux ep_modify) */
                 __builtin_memcpy(ep->items[i].data, ev.data, 8);
                 return 0;
             }
@@ -6732,11 +6739,25 @@ static int epoll_wait_held(struct epoll *ep, void *uevents, int maxevents, int t
         int n = 0;
         for (int i = 0; i < EPOLL_MAX_ITEMS && n < maxevents; i++) {
             int wfd = ep->items[i].fd;
-            if (!epoll_item_live(ep, i)) continue;
+            if (!epoll_item_live(ep, i) || ep->items[i].quiet) continue;
             uint32_t want = ep->items[i].events, rev = 0;
             if ((want & EPOLLIN_K)  && fd_read_ready(wfd))  rev |= EPOLLIN_K;
             if ((want & EPOLLOUT_K) && fd_write_ready(wfd)) rev |= EPOLLOUT_K;
             if (rev) {
+                /* EPOLLONESHOT: one report, then disabled until MOD.
+                 * EPOLLET on a file with no readiness hooks (a regular or
+                 * /proc file: always ready, nothing ever wakes it): Linux
+                 * reports it once, at ADD/MOD, and never again.  Reporting it
+                 * level-triggered made libmount's /proc/self/mountinfo
+                 * monitor (GIO's mount monitor, the GTK file chooser) spin
+                 * in epoll_pwait forever.  Other kinds stay level-triggered:
+                 * spurious ET reports are harmless to a reader that drains
+                 * to EAGAIN, a missed edge would not be. */
+                proc_file_t *wf = &current_proc->ofile[wfd];
+                if ((want & EPOLLONESHOT_K) ||
+                    ((want & EPOLLET_K) && wf->type == FD_FILE && wf->node &&
+                     !wf->node->read_ready_fn && !wf->node->write_ready_fn))
+                    ep->items[i].quiet = 1;
                 struct { uint32_t events; uint8_t data[8]; } __attribute__((packed)) out;
                 out.events = rev;
                 __builtin_memcpy(out.data, ep->items[i].data, 8);

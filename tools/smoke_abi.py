@@ -136,6 +136,9 @@ PROBES = {
     "p61_thread_brk":          (60, ""),
     "p62_fifo_fstat":          (60, ""),
     "p63_shm_size":            (60, ""),
+    # EPOLLET on an always-ready /proc file, EPOLLONESHOT (the GTK file
+    # chooser's mount monitor spun in epoll_pwait).
+    "p64_epoll_et_oneshot":    (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

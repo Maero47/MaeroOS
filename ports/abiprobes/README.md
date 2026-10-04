@@ -81,6 +81,7 @@ regression tests for the fixes in audit section 5.
 | P61 | `p61_thread_brk.c`          | a worker created before the main thread moved the break sees the moved break (`brk(0)`), grows it, and main sees that with its heap intact | — |
 | P62 | `p62_fifo_fstat.c`          | `fstat` of an open named FIFO gives its owner, mode, `st_ino` and `st_dev` (as `stat` of its name); a `pipe(2)` end is still `S_IFIFO` | — |
 | P63 | `p63_shm_size.c`            | MaeroOS syscall 509 `shm_size(id)` = npages*4096; EINVAL for a bad id; another user needs read permission (EACCES at 0600, allowed at 0644) | — |
+| P64 | `p64_epoll_et_oneshot.c`   | `EPOLLIN\|EPOLLET` on `/proc/self/mountinfo` is reported once after ADD and again only after MOD; `EPOLLONESHOT` on a ready pipe reports once until MOD; level-triggered items keep reporting | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the
