@@ -855,6 +855,12 @@ void proc_exit(int status) {
         notify = proc_group_empty(current_proc);
     } else if (leader && leader != current_proc && leader->state == PROC_ZOMBIE) {
         notify = proc_group_empty(leader);
+        /* The last thread of a process whose leader exited first: without a
+         * group exit, its own code is what the parent's wait reports (Linux
+         * gives the last thread's code, e.g. leader SYS_exit(3) then worker
+         * SYS_exit(5) waits as exit 5). */
+        if (notify && !leader->group_exit)
+            leader->exit_status = status;
     }
 
     /* The process is gone once its last thread is: so are its timers. */

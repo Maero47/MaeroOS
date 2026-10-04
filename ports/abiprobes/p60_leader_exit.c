@@ -15,6 +15,9 @@
  * reads back every page, maps and uses a fresh region, and tells the parent;
  * the parent checks waitpid(WNOHANG) does not report the child yet, releases
  * the worker, which calls exit_group(7), and requires exit status 7.
+ * Two more children end the same way but with the worker dying of SIGSEGV
+ * (status: killed by SIGSEGV) or calling SYS_exit(5) itself (status: exit
+ * 5 - Linux reports the last thread's code, not the leader's 0).
  */
 #define PROBE_NAME "p60_leader_exit"
 #include "probe.h"
@@ -48,9 +51,48 @@ static void *worker(void *arg)
     return NULL;
 }
 
+static int g_how;
+
+static void *worker2(void *arg)
+{
+    (void)arg;
+    sleep_ms(300);
+    if (g_how == 1)
+        *(volatile int *)0 = 1;            /* SIGSEGV */
+    syscall(SYS_exit, 5);                  /* the last thread, alone */
+    return NULL;
+}
+
+/* A child whose leader exits first and whose worker then ends as g_how says;
+ * returns its wait status. */
+static int leader_first(int how)
+{
+    pid_t pid = fork();
+    if (pid < 0) probe_fail("fork: %s", strerror(errno));
+    if (pid == 0) {
+        g_how = how;
+        pthread_t t;
+        if (pthread_create(&t, NULL, worker2, NULL) != 0) _exit(11);
+        syscall(SYS_exit, 0);
+        _exit(12);
+    }
+    int st = 0;
+    if (waitpid(pid, &st, 0) != pid) probe_fail("waitpid: %s", strerror(errno));
+    return st;
+}
+
 int main(void)
 {
     probe_watchdog(60);
+    int st2 = leader_first(1);
+    if (!WIFSIGNALED(st2) || WTERMSIG(st2) != SIGSEGV)
+        probe_fail("worker SIGSEGV after the leader exited: status 0x%x, want "
+                   "killed by SIGSEGV", st2);
+    st2 = leader_first(2);
+    if (!WIFEXITED(st2) || WEXITSTATUS(st2) != 5)
+        probe_fail("worker SYS_exit(5) after the leader's SYS_exit(0): status "
+                   "0x%x, want exit 5 (the last thread's code)", st2);
+
     if (pipe(g_up) || pipe(g_down)) probe_fail("pipe: %s", strerror(errno));
     pid_t pid = fork();
     if (pid < 0) probe_fail("fork: %s", strerror(errno));
@@ -64,6 +106,8 @@ int main(void)
         syscall(SYS_exit, 0);              /* this thread only */
         _exit(12);
     }
+    close(g_up[1]);
+    close(g_down[0]);
     char c;
     ssize_t n = read(g_up[0], &c, 1);
     int st = 0;
