@@ -1,3 +1,4 @@
+#include <kernel/klock.h>
 #include "pmm.h"
 #include "../kernel/printk.h"
 #include "heap.h"
@@ -21,21 +22,18 @@
 #define BIT_TEST(a,b)  ((a)[(b)/32] &   (1U << ((b)%32)))
 
 /*
- * The frame bitmap and refcounts are shared by all threads of a process (which
- * share an address space) and mutated from both syscalls and the page-fault
- * handler.  The check-then-set in pmm_alloc_frame is NOT atomic: if a thread is
- * preempted between BIT_TEST and BIT_SET, another thread can hand out the SAME
- * frame, and the two map it at different virtual addresses → memory corruption.
- * Single CPU, so a saved-IF cli/sti around each mutator is sufficient.
+ * The frame bitmap, cursors, quarantine and refcounts are shared by every CPU
+ * and mutated from syscalls, the page-fault handler and interrupt handlers.
+ * The check-then-set in pmm_scan is not atomic, so two allocators running at
+ * once would hand out the same frame.  pmm_lock (docs/smp-plan.md stage 2;
+ * irqsave, a leaf: nothing is taken under it but the console lock of a
+ * printk) guards all of it, so the allocator no longer needs the BKL: the
+ * lock torture (KLOCK_TEST) allocates and frees from every CPU at once
+ * outside it.  Under the BKL it behaves as the saved-IF cli/sti it replaces.
  */
-static inline uint32_t pmm_irq_save(void) {
-    uint32_t f;
-    __asm__ volatile("pushf; pop %0; cli" : "=r"(f) :: "memory");
-    return f;
-}
-static inline void pmm_irq_restore(uint32_t f) {
-    if (f & 0x200) __asm__ volatile("sti" ::: "memory");
-}
+static kspinlock_t pmm_lock = KSPINLOCK_INIT("pmm");
+static inline uint32_t pmm_irq_save(void) { return kspin_lock_irqsave(&pmm_lock); }
+static inline void pmm_irq_restore(uint32_t f) { kspin_unlock_irqrestore(&pmm_lock, f); }
 
 /* Linker-provided kernel physical boundaries */
 extern char _kernel_phys_start[];
@@ -329,7 +327,9 @@ uint32_t pmm_high_free_frames(void) {
 }
 
 void pmm_reserve_region(uint32_t phys, uint32_t size) {
+    uint32_t irq = pmm_irq_save();
     pmm_used_region(phys, size);
+    pmm_irq_restore(irq);
 }
 
 void pmm_refcount_init(void) {

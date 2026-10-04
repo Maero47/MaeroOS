@@ -1,4 +1,5 @@
 #pragma once
+#include <kernel/klock.h>
 
 /* The scheduler's saved context is per-CPU (see cpus[].sched_ctx in scheduler.c). */
 
@@ -46,11 +47,41 @@ void resched_on_return(void);
  */
 int sleep_on(void *chan);
 
+/*
+ * The same, for a condition guarded by the spinlock `lk` (xv6 sleep(chan, lk),
+ * docs/smp-plan.md stage 2a).  The caller holds lk, taken with
+ * kspin_lock_irqsave, and has just found the condition false; the thread is
+ * put to sleep on chan before lk is released, and lk is held again (IF still
+ * off) when this returns.  Wakers change the condition under lk and call
+ * wake_up(chan) before releasing it, so no wake falls between the test and
+ * the sleep.  Returns what sleep_on returns.
+ */
+int sleep_locked(void *chan, kspinlock_t *lk);
+
+/*
+ * Wait queue: a sleep channel with its own lock (stage 2a).  The lock guards
+ * whatever condition the waiters test; wq_wait is sleep_locked on the queue.
+ *
+ *     uint32_t fl = kspin_lock_irqsave(&wq->lock);
+ *     while (!cond) wq_wait(wq);
+ *     ... consume under the lock ...
+ *     kspin_unlock_irqrestore(&wq->lock, fl);
+ *
+ * and the producer changes cond under wq->lock and calls wq_wake_all(wq)
+ * before unlocking.
+ */
+typedef struct waitq { kspinlock_t lock; } waitq_t;
+#define WAITQ_INIT(n) { KSPINLOCK_INIT(n) }
+static inline void waitq_init(waitq_t *wq, const char *name) { kspin_init(&wq->lock, name); }
+static inline int  wq_wait(waitq_t *wq) { return sleep_locked(wq, &wq->lock); }
+
 /* Wake all processes sleeping on chan */
 void wake_up(void *chan);
 
 /* Wake at most n processes sleeping on chan; returns the number woken */
 int wake_up_n(void *chan, int n);
+static inline void wq_wake_all(waitq_t *wq) { wake_up(wq); }
+static inline int  wq_wake_n(waitq_t *wq, int n) { return wake_up_n(wq, n); }
 
 /* Wake at most n threads of ONE thread group sleeping on chan (oldest-first).
  * For futex-style wakes on USER virtual addresses issued from kernel paths

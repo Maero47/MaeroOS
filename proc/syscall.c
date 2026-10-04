@@ -892,8 +892,8 @@ void fd_retain(proc_file_t *f) {
     if (f->type == FD_FILE)    vfs_retain(f->node);
     /* A named pipe's descriptor also holds the FIFO's vfs node; an anonymous
      * pipe leaves node NULL and vfs_retain/vfs_close ignore it. */
-    if (f->type == FD_PIPE_R)  { f->pipe->nreaders++; vfs_retain(f->node); }
-    if (f->type == FD_PIPE_W)  { f->pipe->nwriters++; vfs_retain(f->node); }
+    if (f->type == FD_PIPE_R)  { pipe_add_reader(f->pipe); vfs_retain(f->node); }
+    if (f->type == FD_PIPE_W)  { pipe_add_writer(f->pipe); vfs_retain(f->node); }
     if (f->type == FD_SOCKET)  net_socket_retain(f->socket);
     if (f->type == FD_USOCKET) usocket_retain(f->usock);
     if (f->type == FD_EPOLL)   epoll_retain(f->epoll);
@@ -1617,10 +1617,10 @@ static int sys_open_kernel_path(const char *path, int flags, uint32_t mode) {
             if (current_proc->ofile[i].type == FD_NONE) {
                 if (rw == O_WRONLY) {
                     current_proc->ofile[i].type = FD_PIPE_W;
-                    pb->nwriters++;
+                    pipe_add_writer(pb);
                 } else {
                     current_proc->ofile[i].type = FD_PIPE_R;
-                    pb->nreaders++;
+                    pipe_add_reader(pb);
                 }
                 vfs_retain(node);              /* see the FD_FILE case below */
                 current_proc->ofile[i].pipe    = pb;

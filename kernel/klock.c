@@ -257,7 +257,9 @@ void kspin_init(kspinlock_t *l, const char *name) {
 uint32_t kspin_lock_irqsave(kspinlock_t *l) {
     uint32_t fl = irq_save();
 #if KLOCKDEP
-    spin_pre(l, fl);
+    /* Held with interrupts off whatever the caller had: never "taken with
+     * interrupts enabled", so an irqsave lock may be shared with handlers. */
+    spin_pre(l, 0);
 #endif
     raw_acquire(&l->raw);
 #if KLOCKDEP
@@ -286,7 +288,7 @@ int kspin_trylock_irqsave(kspinlock_t *l, uint32_t *flags) {
     if (l->owner == this_cpu_id() + 1)
         kld_report("spinlock taken twice on one CPU (trylock)", l->name, 0);
     int c = kld_class(&l->cls, l->name ? l->name : "?");
-    if (c >= 0) kld_acquire(c, fl, 0);
+    if (c >= 0) kld_acquire(c, 0, 0);
     spin_post(l);
 #endif
     *flags = fl;
@@ -352,12 +354,10 @@ void kmutex_lock(kmutex_t *m) {
             continue;
         }
         m->waiters++;
-        /* Interrupts stay off from the guard's release to the switch inside
-         * sleep_on, and the BKL keeps every other CPU's waker out until then,
-         * so the wake in kmutex_unlock cannot fall between the two. */
-        kspin_unlock(&m->guard);
-        sleep_on(m);
-        kspin_lock_irqsave(&m->guard);
+        /* The guard is released only once this thread is asleep on m, and
+         * kmutex_unlock wakes under the guard, so its wake cannot fall
+         * between the owner test and the sleep (stage 2a). */
+        sleep_locked(m, &m->guard);
         m->waiters--;
     }
     m->owner = me;
@@ -391,9 +391,8 @@ void kmutex_unlock(kmutex_t *m) {
     (void)me;
     uint32_t fl = kspin_lock_irqsave(&m->guard);
     m->owner = 0;
-    int w = m->waiters;
+    if (m->waiters) wake_up(m);         /* under the guard: see kmutex_lock */
     kspin_unlock_irqrestore(&m->guard, fl);
-    if (w) wake_up(m);
 }
 
 int kmutex_owned(const kmutex_t *m) {
@@ -406,6 +405,17 @@ int kmutex_owned(const kmutex_t *m) {
 #define KT_THREADS   4
 #define KT_ITERS     200000
 #define KT_MUTEX_EVERY 512
+/* Stage 2 additions (docs/smp-plan.md): every KT_MEM_EVERY iterations a
+ * spin thread allocates and frees heap blocks and frames (filled through its
+ * CPU's temp-map slot) outside the BKL; every KT_SD_EVERY it remaps its test
+ * page and shoots it down while the other threads read every test page; and
+ * two more threads ping-pong a token KT_PP_ROUNDS times through wait queues
+ * (sleep_locked), with a deadline on each sleep to catch a lost wakeup. */
+#define KT_MEM_EVERY 64
+#define KT_SD_EVERY  256
+#define KT_SD_READ_EVERY 16
+#define KT_PP_ROUNDS 20000
+#define KT_ALL       (KT_THREADS + 2)
 
 static kspinlock_t kt_a = KSPINLOCK_INIT("klocktest.a");
 static kspinlock_t kt_b = KSPINLOCK_INIT("klocktest.b");
@@ -431,6 +441,162 @@ static void kt_failf(const char *what, unsigned a, unsigned b) {
                (unsigned)this_cpu_id());
 }
 
+/* ── stage 2: memory, shootdowns, sleep/wakeup ── */
+static void kt_finish(void) __attribute__((noreturn));
+#include "../mm/heap.h"
+#include "../mm/pmm.h"
+#include "../arch/i686/mm/paging.h"
+#include "../arch/i686/mm/tlb.h"
+#include "../arch/i686/cpu/pit.h"
+
+/* Test pages for the shootdown check: the upper half of the KMAP window,
+ * which the per-CPU slots (lower 16 pages) never reach. */
+#define KT_SD_VA(i) ((uint32_t)KMAP_WINDOW_START + (256U + (uint32_t)(i)) * PAGE_SIZE)
+static uint32_t kt_sd_frame[KT_THREADS][2];
+static volatile uint32_t kt_sd_pub[KT_THREADS];   /* generation every CPU must see */
+static volatile unsigned kt_sd_rounds, kt_sd_checks, kt_mem_rounds;
+
+static void kt_frame_fill(uint32_t f, uint32_t v) {
+    uint32_t *k = (uint32_t *)paging_temp_map2(f);
+    for (int i = 0; i < 1024; i++) k[i] = v ^ (uint32_t)i;
+    paging_temp_unmap2();
+}
+
+static int kt_frame_check(uint32_t f, uint32_t v) {
+    uint32_t *k = (uint32_t *)paging_temp_map(f);
+    int ok = 1;
+    for (int i = 0; i < 1024; i++) if (k[i] != (v ^ (uint32_t)i)) { ok = 0; break; }
+    paging_temp_unmap();
+    return ok;
+}
+
+struct kt_mem {
+    uint32_t *blk[8];
+    uint32_t  words[8], tag[8];
+    uint32_t  frame[4], ftag[4];
+    uint32_t  seed;
+};
+
+static uint32_t kt_rand(uint32_t *s) { *s = *s * 1103515245U + 12345U; return *s >> 8; }
+
+/* One allocation round, BKL not held: replace one heap block and one frame,
+ * checking that what was written into the old ones is still there (two
+ * allocators handing out the same memory would overwrite each other). */
+static void kt_mem_round(struct kt_mem *m, unsigned id) {
+    unsigned b = kt_rand(&m->seed) & 7;
+    if (m->blk[b]) {
+        for (uint32_t w = 0; w < m->words[b]; w++)
+            if (m->blk[b][w] != (m->tag[b] ^ w)) {
+                kt_failf("heap block overwritten (two CPUs got one block)", w, id);
+                break;
+            }
+        kfree(m->blk[b]);
+    }
+    uint32_t words = 4 + kt_rand(&m->seed) % 1000;
+    m->blk[b] = (uint32_t *)kmalloc(words * 4);
+    m->words[b] = words;
+    m->tag[b] = kt_rand(&m->seed) ^ (id << 28);
+    if (m->blk[b]) for (uint32_t w = 0; w < words; w++) m->blk[b][w] = m->tag[b] ^ w;
+
+    unsigned f = kt_rand(&m->seed) & 3;
+    if (m->frame[f]) {
+        if (!kt_frame_check(m->frame[f], m->ftag[f]))
+            kt_failf("frame overwritten (two CPUs got one frame)", m->frame[f], id);
+        pmm_free_frame(m->frame[f]);
+    }
+    m->frame[f] = pmm_alloc_frame();
+    m->ftag[f] = kt_rand(&m->seed) ^ (id << 28);
+    if (m->frame[f]) kt_frame_fill(m->frame[f], m->ftag[f]);
+    __sync_add_and_fetch(&kt_mem_rounds, 1);
+}
+
+static void kt_mem_drain(struct kt_mem *m) {
+    for (int b = 0; b < 8; b++) if (m->blk[b]) kfree(m->blk[b]);
+    for (int f = 0; f < 4; f++) if (m->frame[f]) pmm_free_frame(m->frame[f]);
+}
+
+/* Remap this thread's test page to the frame holding the next generation and
+ * shoot it down; only then publish the generation.  Several threads do this
+ * at once, so the shootdown has several concurrent senders. */
+static void kt_sd_round(unsigned id) {
+    uint32_t g = kt_sd_pub[id] + 1;
+    uint32_t f = kt_sd_frame[id][g & 1];
+    uint32_t *k = (uint32_t *)paging_temp_map2(f);
+    k[0] = g;
+    paging_temp_unmap2();
+    pte_set(KT_SD_VA(id), f | PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX);
+    tlb_flush_single(KT_SD_VA(id));
+    tlb_shootdown();
+    __sync_synchronize();
+    kt_sd_pub[id] = g;
+    __sync_add_and_fetch(&kt_sd_rounds, 1);
+}
+
+/* Every test page must read at least the generation published for it: a
+ * smaller value is a translation the shootdown should have flushed. */
+static void kt_sd_check(void) {
+    for (unsigned j = 0; j < KT_THREADS; j++) {
+        uint32_t pub = kt_sd_pub[j];
+        __sync_synchronize();
+        uint32_t v = *(volatile uint32_t *)KT_SD_VA(j);
+        if ((int32_t)(v - pub) < 0) kt_failf("stale TLB entry after a shootdown", v, pub);
+    }
+    __sync_add_and_fetch(&kt_sd_checks, 1);
+}
+
+static void kt_sd_setup(void) {
+    for (unsigned i = 0; i < KT_THREADS; i++) {
+        for (int k = 0; k < 2; k++) {
+            kt_sd_frame[i][k] = pmm_alloc_frame();
+            uint32_t *p = (uint32_t *)paging_temp_map(kt_sd_frame[i][k]);
+            p[0] = 0;
+            paging_temp_unmap();
+        }
+        pte_set(KT_SD_VA(i), kt_sd_frame[i][0] | PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX);
+        tlb_flush_single(KT_SD_VA(i));
+        kt_sd_pub[i] = 0;
+    }
+}
+
+/* Ping-pong: the token says whose turn it is; each side waits on its own
+ * queue, under the shared lock, for its turn, then hands the turn over and
+ * wakes the other side under the lock (sleep_locked's rule).  A sleep that
+ * times out while the turn is already ours is a lost wakeup. */
+static kspinlock_t kt_pp_lock = KSPINLOCK_INIT("klocktest.pp");
+static volatile int kt_pp_turn;
+static volatile unsigned kt_pp_done[2], kt_pp_lost, kt_pp_sleeps;
+static int kt_pp_chan[2];
+
+static void kt_pp_side(int me) {
+    __sync_add_and_fetch(&kt_started, 1);
+    for (unsigned r = 0; r < KT_PP_ROUNDS && !kt_fail; r++) {
+        uint32_t fl = kspin_lock_irqsave(&kt_pp_lock);
+        while (kt_pp_turn != me && !kt_fail) {
+            current_proc->wake_tick = pit_ticks() + 300;     /* 3 s */
+            kt_pp_sleeps++;
+            int timed_out = sleep_locked(&kt_pp_chan[me], &kt_pp_lock);
+            if (timed_out && kt_pp_turn == me) {
+                kt_pp_lost++;
+                kt_failf("sleep_locked lost a wakeup", r, (unsigned)me);
+            } else if (timed_out) {
+                kt_failf("ping-pong partner stalled for 3 s", r, (unsigned)me);
+            }
+        }
+        kt_pp_turn = !me;
+        wake_up(&kt_pp_chan[!me]);
+        kspin_unlock_irqrestore(&kt_pp_lock, fl);
+        kt_pp_done[me]++;
+    }
+    /* Let a partner that is still waiting see the failure flag and leave. */
+    uint32_t fl = kspin_lock_irqsave(&kt_pp_lock);
+    wake_up(&kt_pp_chan[!me]);
+    kspin_unlock_irqrestore(&kt_pp_lock, fl);
+    kt_finish();
+}
+
+static void kt_pp0(void) { kt_pp_side(0); }
+static void kt_pp1(void) { kt_pp_side(1); }
+
 static void kt_report(void) {
     unsigned before = klockdep_reports();
     /* The deliberate inversion: c then d, later d then c, on one thread (so
@@ -450,19 +616,35 @@ static void kt_report(void) {
     if (kt_x1 != kt_x2 || kt_x1 != (unsigned)KT_THREADS * KT_ITERS)
         kt_failf("spinlock lost an update", kt_x1, kt_x2);
     if (kt_m1 != kt_m2 || kt_m1 != kt_mutexes) kt_failf("kmutex lost an update", kt_m1, kt_m2);
+    if (kt_pp_done[0] != KT_PP_ROUNDS || kt_pp_done[1] != KT_PP_ROUNDS)
+        kt_failf("ping-pong rounds missing", kt_pp_done[0], kt_pp_done[1]);
+    if (kt_sd_rounds != (unsigned)KT_THREADS * (KT_ITERS / KT_SD_EVERY) && !kt_fail)
+        kt_failf("shootdown rounds missing", kt_sd_rounds, 0);
+    printk("[KLOCK-TEST] stage2 pingpong=%u+%u sleeps=%u lost_wakeups=%u shootdowns=%u "
+           "tlb_checks=%u mem_rounds=%u\n", kt_pp_done[0], kt_pp_done[1], kt_pp_sleeps,
+           kt_pp_lost, kt_sd_rounds, kt_sd_checks, kt_mem_rounds);
     printk("[KLOCK-TEST] threads=%d cpus=%u max_parallel=%d spin_iters=%u contended=%u "
            "mutex_iters=%u lockdep_inversion_caught=%u\n", KT_THREADS, cpus_seen,
            kt_max_running, kt_spins, kt_contended, kt_mutexes, caught);
     if (!kt_fail) printk("[KLOCK-TEST] PASS\n");
 }
 
+static void kt_finish(void) {
+    if (__sync_add_and_fetch(&kt_done, 1) == KT_ALL) kt_report();
+    for (;;) sleep_on((void *)&kt_done);    /* never woken: park for good */
+}
+
+static volatile unsigned kt_next_id;
+
 static void kt_thread(void) {
+    unsigned id = __sync_fetch_and_add(&kt_next_id, 1);
+    struct kt_mem mem = { .seed = 0x9E3779B9U * (id + 1) };
     __sync_add_and_fetch(&kt_started, 1);
     /* Step out from under the Big Kernel Lock (kernel threads run holding
      * it), so this CPU and the others really run the loop at once. */
     bkl_leave();
     uint64_t t0 = kt_rdtsc();
-    while (kt_started < KT_THREADS && kt_rdtsc() - t0 < 3000000000ULL)
+    while (kt_started < KT_ALL && kt_rdtsc() - t0 < 3000000000ULL)
         __asm__ volatile("pause");
     __sync_fetch_and_or(&kt_cpu_mask, 1U << this_cpu_id());
     int r = __sync_add_and_fetch(&kt_running, 1);
@@ -491,6 +673,10 @@ static void kt_thread(void) {
         __sync_sub_and_fetch(&kt_inside, 1);
         kspin_unlock_irqrestore(&kt_a, f);
 
+        if (i % KT_MEM_EVERY == 0) kt_mem_round(&mem, id);
+        if (i % KT_SD_EVERY == KT_SD_EVERY - 1) kt_sd_round(id);
+        if (i % KT_SD_READ_EVERY == 0) kt_sd_check();
+
         if (i % KT_MUTEX_EVERY == 0) {
             /* Sleeping locks need the BKL until the scheduler stage. */
             bkl_enter();
@@ -505,15 +691,18 @@ static void kt_thread(void) {
             bkl_leave();
         }
     }
+    kt_mem_drain(&mem);
     __sync_sub_and_fetch(&kt_running, 1);
     bkl_enter();                        /* back to how kernel threads run */
-    if (__sync_add_and_fetch(&kt_done, 1) == KT_THREADS) kt_report();
-    for (;;) sleep_on((void *)&kt_done);    /* never woken: park for good */
+    kt_finish();
 }
 
 void klock_test_start(void) {
     printk("[KLOCK-TEST] starting %d threads x %d iterations\n", KT_THREADS, KT_ITERS);
+    kt_sd_setup();
     for (int i = 0; i < KT_THREADS; i++)
         proc_create_kthread(kt_thread, "klocktest");
+    proc_create_kthread(kt_pp0, "klocktest-pp");
+    proc_create_kthread(kt_pp1, "klocktest-pp");
 }
 #endif /* KLOCK_TEST */

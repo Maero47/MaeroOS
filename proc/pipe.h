@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <kernel/klock.h>
 
 #define PIPE_BUF_SIZE 4096
 
@@ -13,6 +14,14 @@ typedef struct pipe_buf {
     int      pins;      /* pipe_read/pipe_write calls in progress: the buffer
                          * is not freed under a sleeper whose descriptor a
                          * sibling thread (CLONE_FILES) closed meanwhile */
+    /* Guards head/count/nreaders/nwriters/pins and is the lock of the
+     * pipe's wait queue (the pipe itself is the channel): readers and
+     * writers test for data or room under it and sleep with sleep_locked,
+     * and every change that can unblock someone wakes under it
+     * (docs/smp-plan.md stage 2a).  The user copies run outside it (they can
+     * fault and sleep); until stage 8 the BKL still keeps two readers or two
+     * writers of one pipe apart across their copies. */
+    kspinlock_t lock;
 } pipe_buf_t;
 
 /* Allocate and initialise a new pipe. Returns NULL on OOM. */
@@ -46,6 +55,10 @@ int pipe_read(pipe_buf_t *p, char *buf, int len, int nonblock);
  * partial count if some bytes were already written).
  */
 int pipe_write(pipe_buf_t *p, const char *buf, int len, int nonblock);
+
+/* A new descriptor for an end (dup, fork, FIFO open). */
+void pipe_add_reader(pipe_buf_t *p);
+void pipe_add_writer(pipe_buf_t *p);
 
 /* Called when a read-end FD is closed; frees pipe if both ends gone (a FIFO's
  * buffer is only emptied, see pipe_fifo_alloc). */

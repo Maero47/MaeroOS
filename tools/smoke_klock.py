@@ -5,7 +5,11 @@ kernel/klock.c starts four kernel threads at boot.  They step out from under
 the Big Kernel Lock and hammer a kspinlock (with a nested second lock) and a
 kmutex from several CPUs at once, checking that no update is lost and no two
 CPUs are ever inside together; the lock-order checker must stay silent for
-the consistent order and catch one deliberate inversion.  The log must show
+the consistent order and catch one deliberate inversion.  Stage 2 adds: the
+same threads allocate heap blocks and frames outside the BKL and send TLB
+shootdowns at once (every test page must read at least its published
+generation afterwards), and two more threads ping-pong a token 20000 times
+through sleep_locked with a deadline that catches a lost wakeup.  The log must show
 "[KLOCK-TEST] PASS" with the threads seen on at least two CPUs at the same
 time, no "[lockdep]" line other than the deliberate one, and a working shell
 afterwards.  KVM when /dev/kvm is usable (real parallel CPUs), else TCG.
@@ -52,6 +56,17 @@ def main():
         if not m:
             raise SystemExit("smoke-klock: malformed [KLOCK-TEST] summary line")
         threads, cpus, par, spins, cont, mutexes, caught = map(int, m.groups())
+        # Stage 2 (docs/smp-plan.md): sleep_locked ping-pong, concurrent
+        # shootdowns checked against stale translations, heap/frame traffic
+        # from every CPU outside the BKL.
+        m2 = re.search(r"\[KLOCK-TEST\] stage2 pingpong=(\d+)\+(\d+) sleeps=(\d+) "
+                       r"lost_wakeups=(\d+) shootdowns=(\d+) tlb_checks=(\d+) "
+                       r"mem_rounds=(\d+)", text)
+        if not m2:
+            raise SystemExit("smoke-klock: no [KLOCK-TEST] stage2 summary line")
+        pp0, pp1, sleeps, lost, sds, checks, mems = map(int, m2.groups())
+        if lost or not sds or not checks or not mems or not sleeps:
+            raise SystemExit("smoke-klock: stage2 counters wrong: " + m2.group(0))
         if "[KLOCK-TEST] FAIL" in text:
             raise SystemExit("smoke-klock: " + re.search(r"\[KLOCK-TEST\] FAIL[^\n]*", text).group(0))
         try:
@@ -75,7 +90,9 @@ def main():
         smokelib.send(proc, "echo klock-shell-ok\n")
         smokelib.wait_for(proc, sel, "klock-shell-ok\n", log, timeout=30, start=at)
         print("\nsmoke-klock: PASS (threads=%d cpus=%d max_parallel=%d spin_iters=%d "
-              "contended=%d mutex_iters=%d)" % (threads, cpus, par, spins, cont, mutexes))
+              "contended=%d mutex_iters=%d; pingpong=%d+%d sleeps=%d shootdowns=%d "
+              "tlb_checks=%d mem_rounds=%d)" % (threads, cpus, par, spins, cont, mutexes,
+                                                pp0, pp1, sleeps, sds, checks, mems))
     finally:
         proc.kill()
         proc.wait()

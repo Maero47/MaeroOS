@@ -293,6 +293,26 @@ struct proc {
      * non-reentrant critical section, e.g. the lwIP stack).  Nests. */
     int              no_preempt;
 
+    /* SMP foundations (docs/smp-plan.md stage 2).
+     *  bkl_depth: the Big Kernel Lock nesting this thread had when it last
+     *    switched out (0: never ran, taken as 1).  The scheduler restores it
+     *    on dispatch and runs with depth 1 itself, so a thread that sleeps
+     *    nested no longer hands its depth to the next thread on the CPU.
+     *  on_cpu: set from dispatch until the scheduler is back on its own
+     *    stack after the switch out (Linux p->on_cpu): until then the
+     *    thread's registers are not saved and its stack is in use, whatever
+     *    its state says.  sched_pick skips such a thread, release waits.
+     *  kmap_phys/kmap_cpu: the frames this thread has in its temp-map slots
+     *    (paging_temp_map/2) and the CPU + 1 whose slots they are.  While any
+     *    is held the thread runs only on that CPU, and the dispatch maps them
+     *    again (another thread on the CPU may have used the slots while this
+     *    one slept). */
+    int              bkl_depth;
+    volatile int     on_cpu;
+    uint64_t         kmap_phys[2];
+    int              kmap_mask;     /* bit k: slot k held */
+    int              kmap_cpu;
+
     /* Threads: thread-group id (== leader pid; getpid returns this) and
      * the user TLS segment base loaded into the GDT on context switch.
      * `parent` above always points at a thread-group LEADER (Linux real_parent

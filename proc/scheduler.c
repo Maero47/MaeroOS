@@ -93,11 +93,32 @@ static inline uint64_t vr_scale(const struct proc *p, uint64_t ns) {
     return ns * 1024U / nice_weight[n + 20];
 }
 
+/* run_t0 of CPU c, read consistently from any CPU (seqcount, stage 2e). */
+static uint64_t cpu_run_t0(uint32_t c) {
+    for (;;) {
+        uint32_t s0 = cpus[c].run_seq;
+        __sync_synchronize();
+        uint64_t t0 = cpus[c].run_t0;
+        __sync_synchronize();
+        if (!(s0 & 1) && cpus[c].run_seq == s0) return t0;
+        __asm__ volatile("pause");
+    }
+}
+
+/* Only the CPU itself writes its run_t0. */
+static void sched_set_run_t0(struct cpu *me, uint64_t t0) {
+    me->run_seq++;
+    __sync_synchronize();
+    me->run_t0 = t0;
+    __sync_synchronize();
+    me->run_seq++;
+}
+
 /* The vruntime a running thread has now, including its current stint. */
 static uint64_t cpu_curr_vr(uint32_t c, uint64_t now) {
     struct proc *p = cpus[c].proc;
     if (!p) return 0;
-    uint64_t t0 = cpus[c].run_t0;
+    uint64_t t0 = cpu_run_t0(c);
     return p->vruntime + (now > t0 ? vr_scale(p, now - t0) : 0);
 }
 
@@ -119,8 +140,7 @@ static void sched_place(struct proc *p) {
 
 static void resched_ipi(uint32_t c) {
     if (!apic_available() || !cpus[c].online) return;
-    apic_write(LAPIC_REG_ICR_HI, cpus[c].apicid << 24);
-    apic_write(LAPIC_REG_ICR_LO, RESCHED_IPI_VECTOR | (1U << 14));
+    apic_send_ipi(cpus[c].apicid << 24, RESCHED_IPI_VECTOR | (1U << 14));
 }
 
 /* Ask CPU c to reschedule: a flag for itself, an IPI for another CPU (the
@@ -153,6 +173,12 @@ static void sched_wakeup(struct proc *p, int sync) {
     uint32_t ncpu = smp_cpu_count();
     if (ncpu > MAX_CPUS) ncpu = MAX_CPUS;
     uint32_t self = this_cpu_id();
+    /* It slept holding temp-map slots: only their CPU may run it. */
+    if (p->kmap_cpu) {
+        uint32_t c = (uint32_t)p->kmap_cpu - 1;
+        if (cpus[c].idle) resched_cpu(c);   /* a busy one picks it up at its next switch */
+        return;
+    }
     /* An idle CPU takes it at once.  Prefer this one if idle (a wake from an
      * IRQ that interrupted the idle wait). */
     if (cpus[self].idle) { cpus[self].need_resched = 1; return; }
@@ -200,9 +226,16 @@ void sched_make_runnable_sync(struct proc *p) {
  * once (its skip flag is consumed).  NULL if nothing is runnable. */
 static struct proc *sched_pick(void) {
     struct proc *best = NULL, *skipped = NULL;
+    int self = (int)this_cpu_id() + 1;
     for (int i = 0; i < ptable_hwm; i++) {
         struct proc *p = &ptable[i];
         if (p->state != PROC_RUNNABLE) continue;
+        /* Still switching out on another CPU (stage 2b): its context is not
+         * saved yet.  Under the BKL this cannot be seen (the CPU switching
+         * out holds it until on_cpu is clear); from stage 3 on it can. */
+        if (p->on_cpu) continue;
+        /* Holds temp-map slots of another CPU: it waits for that CPU. */
+        if (p->kmap_cpu && p->kmap_cpu != self) continue;
         sched_place(p);
         if (p->vr_skip) {
             p->vr_skip = 0;
@@ -319,10 +352,20 @@ void scheduler_start(void) {
             kprof_count(KPE_CTXSW);
             kprof_switch(p->kprof_bucket);   /* charge the dispatch to KPB_SCHED */
             uint64_t run_t0 = clock_mono_ns();
-            me->run_t0 = run_t0;
+            sched_set_run_t0(me, run_t0);
+            /* The thread's own temp-map slots (it slept holding them, and
+             * another thread on this CPU may have used the slots since). */
+            if (p->kmap_cpu) paging_temp_restore(p);
             bklstat_sched_in((int)(p - ptable), p->pgdir_phys == 0);
+            /* Per-thread BKL depth (stage 2): the thread gets back the
+             * nesting it switched out with; the scheduler loop itself always
+             * runs at depth 1. */
+            p->on_cpu = 1;
+            me->bkl_depth = p->bkl_depth > 0 ? p->bkl_depth : 1;
             swtch(&scheduler_ctx, p->context);
             bklstat_sched_out((int)(p - ptable), me->bkl_depth == 1);
+            p->bkl_depth = me->bkl_depth;
+            me->bkl_depth = 1;
             uint64_t ran = clock_mono_ns() - run_t0;
             add_ns(&p->run_us, &p->run_ns_rem, ran);
             p->run_ns_total += ran;
@@ -339,6 +382,9 @@ void scheduler_start(void) {
             __asm__ volatile("mov %0, %%cr3" :: "r"(kernel_pgdir_phys) : "memory");
             kprof_probe_end(KPP_SCHED_KCR3, s_c);
             current_proc = NULL;
+            /* Its registers are saved and its stack is no longer in use. */
+            __sync_synchronize();
+            p->on_cpu = 0;
             /* A non-leader thread that just exited is released here, on the
              * scheduler's own stack, now that its kernel stack is no longer in
              * use.  Linux release_task()s such threads immediately in
@@ -516,9 +562,14 @@ void yield(void) {
  * Waking an arbitrary waiter feeds glibc-2.36's BZ#25847 signal-steal. */
 static uint32_t g_sleep_seq = 0;
 
-int sleep_on(void *chan) {
-    if (!current_proc) return 0;
-    klock_might_sleep("sleep_on");
+/* sleep_on and sleep_locked: lk, when given, is a spinlock the caller holds
+ * (interrupts off) over the condition it just tested.  The thread is marked
+ * SLEEPING on chan first and lk is released only after that, so a waker that
+ * changes the condition under lk and then calls wake_up(chan) either ran
+ * before the test or finds the thread asleep: the xv6 sleep(chan, lk)
+ * handshake.  Under the BKL the waker cannot run in that window anyway; from
+ * stage 3 on (BKL dropped across swtch) this is what keeps the wake. */
+static int sleep_common(void *chan, kspinlock_t *lk) {
     current_proc->sleep_chan = chan;
     current_proc->sleep_tick = pit_ticks();
     current_proc->sleep_seq  = ++g_sleep_seq;
@@ -530,8 +581,13 @@ int sleep_on(void *chan) {
     uint64_t slp_t0 = kprof_sleep_begin();
     kprof_park();
     __asm__ volatile("cli");
+    if (lk) {
+        kspin_unlock(lk);               /* interrupts stay off */
+        klock_might_sleep("sleep_locked");
+    }
     swtch(&current_proc->context, scheduler_ctx);
-    __asm__ volatile("sti");
+    if (lk) kspin_lock(lk);             /* still IF=0: caller's irqsave */
+    else __asm__ volatile("sti");
     kprof_sleep_end(slp_t0, slp_sys);
     /* Every wake path clears wake_tick, but make it unconditional here so a
      * deadline set for THIS sleep can never fire into a later untimed sleep
@@ -540,6 +596,23 @@ int sleep_on(void *chan) {
     int timed_out = current_proc->sleep_timed_out;
     current_proc->sleep_timed_out = 0;
     return timed_out;
+}
+
+int sleep_on(void *chan) {
+    if (!current_proc) return 0;
+    klock_might_sleep("sleep_on");
+    return sleep_common(chan, 0);
+}
+
+int sleep_locked(void *chan, kspinlock_t *lk) {
+    if (!current_proc) {
+        /* No thread to put to sleep (boot code): let the waker in. */
+        kspin_unlock(lk);
+        __asm__ volatile("sti; pause; cli" ::: "memory");
+        kspin_lock(lk);
+        return 0;
+    }
+    return sleep_common(chan, lk);
 }
 
 void proc_stop_self(void) {

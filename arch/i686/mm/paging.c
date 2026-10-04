@@ -10,6 +10,7 @@
 #include "../cpu/gdt.h"
 #include "../cpu/pit.h"
 #include "../cpu/tss.h"
+#include "../cpu/percpu.h"
 #include "../cpu/dfault.h"
 #include "../../../mm/kstack.h"
 #include <kernel/config.h>
@@ -83,6 +84,8 @@ void  paging_temp_unmap(void);
  * have their PDEs in place before any process pgdir snapshots PDE 768-1022 —
  * the page tables are then shared and growth is globally visible.
  */
+static int kmap_ready;   /* the per-CPU temp-map window exists (below) */
+
 static void reserve_kernel_pagetables(uint32_t start, uint32_t end) {
     for (uint32_t va = start & ~(PT_SPAN - 1); va < end; va += PT_SPAN) {
         if (pde_present(va)) continue;
@@ -227,6 +230,9 @@ loaded:
     reserve_kernel_pagetables(HEAP_START, HEAP_MAX);
     /* Same for the guarded kernel-stack window (mm/kstack.c). */
     reserve_kernel_pagetables(KSTACK_REGION_START, KSTACK_REGION_END);
+    /* And the per-CPU temp-map slots, which take over from here. */
+    reserve_kernel_pagetables(KMAP_WINDOW_START, KMAP_WINDOW_END);
+    kmap_ready = 1;
 
     /* The double-fault task switches CR3; give it this directory, which maps
      * every kernel region (arch/i686/cpu/tss.c). */
@@ -447,32 +453,87 @@ void paging_set_kernel_permissions(void) {
 
 /* ─── Temporary page mapping ─────────────────────────────────────────────── */
 /*
- * TEMP_MAP_VIRT and TEMP_MAP_VIRT2 use PTEs 1 and 2 of the shared
- * boot_page_table1 (PDE[768] in every pgdir points to the same physical
- * frame for boot_page_table1).  Modifying these PTEs is globally visible
- * across all page directories.  Must only be used with IF=0.
+ * Two slots per CPU in the KMAP window (docs/smp-plan.md stage 2c, the
+ * kmap_local model).  They used to be PTEs 1 and 2 of the shared
+ * boot_page_table1, one pair for the whole machine with a local invlpg only,
+ * which two CPUs mapping at once would have shared.  Now each CPU maps into
+ * its own pair, so a local invlpg is all it needs: no other CPU ever touches
+ * those addresses.
+ *
+ * A thread can sleep while it holds a slot (a page fill that reads a file
+ * from a USB disk).  So the frames a thread holds are recorded in it; while
+ * it holds any it is only dispatched on that same CPU (sched_pick), and the
+ * dispatch maps them again (paging_temp_restore), because another thread
+ * running on the CPU meanwhile may have used the slots.  The caller's pointer
+ * stays valid across the sleep.
+ *
+ * Before the window's page table exists (paging_init) the old boot slots
+ * are used: one CPU runs then.
  */
+static inline uint32_t kmap_va(uint32_t cpu, int k) {
+    return (uint32_t)KMAP_WINDOW_START + (cpu * 2U + (uint32_t)k) * PAGE_SIZE;
+}
+_Static_assert(KMAP_WINDOW_START + 2UL * MAX_CPUS * PAGE_SIZE <= KMAP_WINDOW_END,
+               "temp-map window too small for every CPU's slots");
 
-void *paging_temp_map(phys_t phys) {
-    pte_set(TEMP_MAP_VIRT, (phys & ~(phys_t)0xFFFU) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX);
-    tlb_flush_single(TEMP_MAP_VIRT);
-    return (void *)TEMP_MAP_VIRT;
+static void *temp_map_slot(int k, phys_t phys) {
+    uint32_t fl;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+    uint32_t va;
+    if (!kmap_ready) {
+        va = k ? TEMP_MAP_VIRT2 : TEMP_MAP_VIRT;
+    } else {
+        uint32_t cpu = this_cpu_id();
+        va = kmap_va(cpu, k);
+        struct proc *p = current_proc;
+        if (p) {
+            p->kmap_phys[k] = phys;
+            p->kmap_mask |= 1 << k;
+            p->kmap_cpu = (int)cpu + 1;
+        }
+    }
+    pte_set(va, (phys & ~(phys_t)0xFFFU) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX);
+    tlb_flush_single(va);
+    if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
+    return (void *)va;
 }
 
-void paging_temp_unmap(void) {
-    pte_set(TEMP_MAP_VIRT, 0);
-    tlb_flush_single(TEMP_MAP_VIRT);
+static void temp_unmap_slot(int k) {
+    uint32_t fl;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+    uint32_t va;
+    if (!kmap_ready) {
+        va = k ? TEMP_MAP_VIRT2 : TEMP_MAP_VIRT;
+    } else {
+        va = kmap_va(this_cpu_id(), k);
+        struct proc *p = current_proc;
+        if (p) {
+            p->kmap_mask &= ~(1 << k);
+            if (!p->kmap_mask) p->kmap_cpu = 0;
+        }
+    }
+    pte_set(va, 0);
+    tlb_flush_single(va);
+    if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
 }
 
-void *paging_temp_map2(phys_t phys) {
-    pte_set(TEMP_MAP_VIRT2, (phys & ~(phys_t)0xFFFU) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX);
-    tlb_flush_single(TEMP_MAP_VIRT2);
-    return (void *)TEMP_MAP_VIRT2;
-}
+void *paging_temp_map(phys_t phys)  { return temp_map_slot(0, phys); }
+void  paging_temp_unmap(void)       { temp_unmap_slot(0); }
+void *paging_temp_map2(phys_t phys) { return temp_map_slot(1, phys); }
+void  paging_temp_unmap2(void)      { temp_unmap_slot(1); }
 
-void paging_temp_unmap2(void) {
-    pte_set(TEMP_MAP_VIRT2, 0);
-    tlb_flush_single(TEMP_MAP_VIRT2);
+/* The scheduler is about to run p on this CPU (its kmap_cpu): put p's slots
+ * back the way it left them. */
+void paging_temp_restore(struct proc *p) {
+    uint32_t cpu = this_cpu_id();
+    if (!kmap_ready || p->kmap_cpu != (int)cpu + 1) return;
+    for (int k = 0; k < 2; k++)
+        if (p->kmap_mask & (1 << k)) {
+            uint32_t va = kmap_va(cpu, k);
+            pte_set(va, (p->kmap_phys[k] & ~(phys_t)0xFFFU) |
+                        PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX);
+            tlb_flush_single(va);
+        }
 }
 
 /* ─── Page directory management ──────────────────────────────────────────── */
