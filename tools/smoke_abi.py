@@ -129,6 +129,8 @@ PROBES = {
     "p72_recvmsg_bad_control": (60, ""),
     # netlink reply budgets, per-user socket slots, opener + sender privilege.
     "p73_netlink_limits":      (120, ""),
+    # Short raw sends refused (an ICMPv6 one halted the machine in lwIP).
+    "p74_raw_short_send":      (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

@@ -74,6 +74,7 @@ regression tests for the fixes in audit section 5.
 | P71 | `p71_unix_gc_backlog.c`    | a listener sent over a connection still in its own backlog and then closed is collected (the name can be bound again) | — |
 | P72 | `p72_recvmsg_bad_control.c` | recvmsg whose control buffer is read-only installs none of the passed fds (dropped, MSG_CTRUNC), data still returned | — |
 | P73 | `p73_netlink_limits.c`     | nobody holding as many netlink sockets as it can, 16 of them flooded with unread NOOP\|ACK replies, keeps at most 2 MiB queued, and root can still open AF_NETLINK/AF_INET sockets and get replies meanwhile; RTM_DELADDR through a socket nobody opened is EPERM even for root (opener and sender both need the privilege) | — |
+| P74 | `p74_raw_short_send.c`     | ICMPv6 raw sendto of 0-3 bytes is EINVAL (it halted the machine through an lwIP assert), 8 bytes go out; IP_HDRINCL sendto shorter than an IP header is EINVAL (root; SKIP otherwise) | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the
