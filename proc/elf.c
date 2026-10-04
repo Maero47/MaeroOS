@@ -176,9 +176,15 @@ int elf_load_bias(vfs_node_t *node, uint32_t pgdir_phys, uint32_t want_bias,
         uint32_t vstart = bvaddr & ~(PAGE_SIZE - 1);
         uint32_t vend   = (bvaddr + phdr->p_memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
-        /* Reject any segment that overlaps the kernel */
-        if (vend > KERNEL_VMA || vend < vstart) {
-            printk("[ELF] Segment extends into kernel VA space\n");
+        /* Reject any segment that overlaps the kernel, or the sigreturn page
+         * and the main stack window above it (SIGPAGE_VA..USER_STACK_TOP).  The
+         * sigreturn page is one frame shared by every process; it is mapped
+         * before ld.so is loaded, so a crafted interpreter segment landing on
+         * it would otherwise take the "already-mapped frame" path below and
+         * write file bytes into the global trampoline.  Nor may a segment sit
+         * below the mmap_min_addr floor (the NULL page). */
+        if (vend > SIGPAGE_VA || vend < vstart || vstart < USER_MIN_ADDR) {
+            printk("[ELF] Segment outside the user image window\n");
             if (owned_hdr) { kfree(owned_hdr); }
             if (bounce)    { kfree(bounce); }
             return -1;
@@ -207,6 +213,16 @@ int elf_load_bias(vfs_node_t *node, uint32_t pgdir_phys, uint32_t want_bias,
             uint8_t *dst;
             pte_t old = pgdir_virt_to_pte(pgdir_phys, va);
             phys_t existing = (old & PAGE_PRESENT) ? pte_frame(old) : 0;
+            if (existing && pmm_frame_refcount(existing) != 1) {
+                /* Only frames this load allocated (one reference each) may be
+                 * shared between two segments; anything else is a frame
+                 * someone else owns and must never be written. */
+                printk("[ELF] Segment overlaps a shared page at 0x%08x\n",
+                       (unsigned)va);
+                if (owned_hdr) { kfree(owned_hdr); }
+                if (bounce)    { kfree(bounce); }
+                return -1;
+            }
             if (existing) {
                 /* The union: writable if either half is, executable if
                  * either half is. */

@@ -2306,16 +2306,24 @@ static int sys_exec(registers_t *regs) {
         AUX(7, interp_base);                 /* AT_BASE — dynamic linker base */
     AUX(6, PAGE_SIZE);                       /* AT_PAGESZ */
     AUX(9, prog_entry);                      /* AT_ENTRY — the program, not ld.so */
+    /* The credentials the new image runs with: new_euid/new_egid already
+     * carry a set-uid/set-gid bit, which is stored into current_proc only
+     * further down.  Reporting the caller's old euid here would tell ld.so
+     * AT_SECURE=0 in a set-uid-root image and let it honour LD_PRELOAD. */
     AUX(11, current_proc->uid);              /* AT_UID  — real credentials, not */
-    AUX(12, current_proc->euid);             /* AT_EUID   hardcoded 0; glibc's   */
+    AUX(12, new_euid);                       /* AT_EUID   hardcoded 0; glibc's   */
     AUX(13, current_proc->gid);              /* AT_GID    loader inspects these   */
-    AUX(14, current_proc->egid);             /* AT_EGID   (e.g. dynamic-linker).  */
-    /* AT_SECURE: set only on a real privilege transition (setuid/setgid exec).
+    AUX(14, new_egid);                       /* AT_EGID   (e.g. dynamic-linker).  */
+    /* AT_SECURE: set on a real privilege transition (setuid/setgid exec) or
+     * whenever the image runs with ids other than the real ones (Linux
+     * cap_bprm_creds_from_file: secureexec when euid != uid or egid != gid).
      * For a normal exec where ruid==euid it must be 0, else glibc enters secure
      * mode and ignores LD_LIBRARY_PATH — which breaks the desktop's GTK/X apps
      * (they run as the unprivileged session user and need LD_LIBRARY_PATH). */
-    AUX(23, (current_proc->uid != current_proc->euid ||
-             current_proc->gid != current_proc->egid) ? 1 : 0);
+    AUX(23, (current_proc->uid != new_euid ||
+             current_proc->gid != new_egid ||
+             new_euid != current_proc->euid ||
+             new_egid != current_proc->egid) ? 1 : 0);
     AUX(17, 100);                            /* AT_CLKTCK */
     AUX(25, at_random_uaddr);                /* AT_RANDOM */
     AUX(16, cpuid_hwcap());                  /* AT_HWCAP — CPUID.1:EDX feature bits */
@@ -2686,8 +2694,10 @@ static void sys_sigreturn(registers_t *regs) {
 }
 
 /* ── sys_pipe(int fd[2]) — EAX=42 ───────────────────────────────────────── */
-static int sys_pipe(registers_t *regs) {
-    int *fds = (int *)(uintptr_t)regs->ebx;
+/* pipe/pipe2: O_CLOEXEC and O_NONBLOCK are applied to the kernel's own fd
+ * numbers before they are published to user memory (never re-read from it:
+ * another thread can rewrite fds[] in between). */
+static int do_pipe(int *fds, int flags) {
 
     if (!access_ok(fds, 2 * sizeof(int)))
         return -14;  /* -EFAULT */
@@ -2705,12 +2715,16 @@ static int sys_pipe(registers_t *regs) {
     }
     if (rfd < 0 || wfd < 0) { kfree(pb); return -24; }  /* -EMFILE */
 
+    int fl = flags & 0x800;                    /* O_NONBLOCK */
+    int ce = (flags & O_CLOEXEC) ? 1 : 0;
     current_proc->ofile[rfd].type  = FD_PIPE_R;
     current_proc->ofile[rfd].pipe  = pb;
-    current_proc->ofile[rfd].flags = 0;
+    current_proc->ofile[rfd].flags = fl;
+    current_proc->ofile[rfd].cloexec = ce;
     current_proc->ofile[wfd].type  = FD_PIPE_W;
     current_proc->ofile[wfd].pipe  = pb;
-    current_proc->ofile[wfd].flags = 0;
+    current_proc->ofile[wfd].flags = fl;
+    current_proc->ofile[wfd].cloexec = ce;
 
     int kfds[2] = { rfd, wfd };
     int cr = copy_to_user(fds, kfds, sizeof(kfds));
@@ -2720,6 +2734,10 @@ static int sys_pipe(registers_t *regs) {
         return cr;
     }
     return 0;
+}
+
+static int sys_pipe(registers_t *regs) {
+    return do_pipe((int *)(uintptr_t)regs->ebx, 0);
 }
 
 /* ── sys_dup2(int oldfd, int newfd) — EAX=63 ───────────────────────────── */
@@ -7754,36 +7772,101 @@ static int sys_fstatfs64(registers_t *regs) {
  * (Cross-process sharing via SCM_RIGHTS fd-passing is a separate step; this
  * makes the single-process path work so the parent stops aborting on shm.) */
 static int sys_open_kernel_path(const char *path, int flags, uint32_t mode);
+/* A memfd is an anonymous node of its own, never a name in any directory
+ * (Linux memfd_create: an unlinked shmem inode).  It used to be a file
+ * /tmp/.memfd-<counter> opened with O_CREAT|O_TRUNC: the name was predictable
+ * and the final symlink was followed, so a planted /tmp/.memfd-N -> /etc/shadow
+ * was truncated (and its node rewired) when root called memfd_create, and a
+ * pre-created 0666 file let another user read the shared memory.  Here nobody
+ * can reach the node except through a descriptor (or /proc/<pid>/fd/N, which
+ * hands back the same node and checks its 0600 owner-only mode).
+ *
+ * The data lives in the shmap registry (shmem_read/shmem_write).  The node
+ * counts its references: descriptors, private mappings and the registry's own.
+ * When only the registry's is left and no mapping holds a frame, the entry is
+ * released, which drops that last reference and frees the node. */
+struct memfd_node {
+    vfs_node_t vnode;     /* first: a vfs_node_t * is a struct memfd_node * */
+    int        refs;
+};
+
+static void memfd_retain(vfs_node_t *n) {
+    if (n) ((struct memfd_node *)n)->refs++;
+}
+
+static void memfd_release(vfs_node_t *n) {
+    if (!n) return;
+    struct memfd_node *m = (struct memfd_node *)n;
+    if (--m->refs <= 0) {
+        inotify_node_gone(n);
+        kfree(m);
+        return;
+    }
+    if (m->refs == 1) {
+        struct shmap_entry *e = shmap_lookup(n);
+        /* Every descriptor and mapping holds a reference, so the one left
+         * is the registry's when it has an entry for this node. */
+        if (e && shmap_unmapped(e))
+            shmap_release(e);      /* drops the last reference: frees m */
+    }
+}
+
 static int sys_memfd_create(registers_t *regs) {
     static uint32_t memfd_seq = 0;
     char name[64];
     if (copy_user_str((const char *)(uintptr_t)regs->ebx, name, sizeof(name)) < 0)
         name[0] = '\0';
-    /* Build a unique anonymous path under /tmp (tmpfs, writable). */
-    char path[96];
-    uint32_t seq = ++memfd_seq;
-    const char *pfx = "/tmp/.memfd-";
-    int p = 0;
-    for (const char *s = pfx; *s; s++) path[p++] = *s;
-    /* append decimal seq */
-    char num[12]; int n = 0;
-    if (seq == 0) num[n++] = '0';
-    while (seq) { num[n++] = '0' + (seq % 10); seq /= 10; }
-    while (n) path[p++] = num[--n];
-    path[p] = '\0';
-    int fd = sys_open_kernel_path(path, O_RDWR | O_CREAT | O_TRUNC | O_LARGEFILE, 0600);
-    if (fd < 0) return fd;
+    int fd = -1;
+    for (int i = 0; i < MAX_FD; i++)
+        if (current_proc->ofile[i].type == FD_NONE) { fd = i; break; }
+    if (fd < 0) return -24;                                   /* -EMFILE */
+    struct memfd_node *m = (struct memfd_node *)kmalloc(sizeof(*m));
+    if (!m) return -12;
+    __builtin_memset(m, 0, sizeof(*m));
+    vfs_node_t *mn = &m->vnode;
+    /* "memfd:<name>" is what Linux reports as the dentry name. */
+    {
+        const char *pfx = "memfd:";
+        int p = 0;
+        for (const char *c = pfx; *c; c++) mn->name[p++] = *c;
+        for (const char *c = name; *c && p < (int)sizeof(mn->name) - 1; c++)
+            mn->name[p++] = *c;
+        mn->name[p] = '\0';
+    }
+    mn->flags       = VFS_FLAG_FILE;
+    mn->inode       = ++memfd_seq;
+    mn->size        = 0;
+    mn->mask        = 0600;          /* Linux: S_IFREG | 0777 & ~umask is not
+                                      * used for memfd; owner-only is the safe
+                                      * subset and what the old file had */
+    mn->uid         = current_proc->euid;
+    mn->gid         = current_proc->egid;
+    mn->nlink       = 0;             /* unlinked */
+    mn->read_fn     = shmem_read;
+    mn->write_fn    = shmem_write;
+    mn->truncate_fn = shmem_truncate;
+    mn->retain_fn   = memfd_retain;
+    mn->close_fn    = memfd_release;
+    m->refs = 1;                     /* the descriptor's */
+
+    proc_file_t *f = &current_proc->ofile[fd];
+    f->type    = FD_FILE;
+    f->node    = mn;
+    f->offset  = 0;
+    f->flags   = O_RDWR | O_LARGEFILE;
     /* MFD_CLOEXEC = 0x0001 (Linux mm/memfd.c hands O_CLOEXEC to get_unused_fd). */
-    current_proc->ofile[fd].cloexec = (regs->ecx & 0x1) ? 1 : 0;
-    /* Back the file with the shared page registry rather than a contiguous
-     * tmpfs buffer, so the file's pages and every MAP_SHARED mapping of it are
-     * the same frames (Linux shmem — see shmem_read above). */
-    vfs_node_t *mn = current_proc->ofile[fd].node;
-    if (mn) {
-        mn->read_fn     = shmem_read;
-        mn->write_fn    = shmem_write;
-        mn->truncate_fn = shmem_truncate;
-        mn->size        = 0;
+    f->cloexec = (regs->ecx & 0x1) ? 1 : 0;
+    f->seals   = 0;
+    f->mnt     = NULL;
+    f->mnt_seq = 0;
+    /* readlink(/proc/self/fd/N) as on Linux: "/memfd:<name> (deleted)". */
+    {
+        int p = 0;
+        f->path[p++] = '/';
+        for (const char *c = mn->name; *c && p < 240; c++) f->path[p++] = *c;
+        const char *sfx = " (deleted)";
+        for (const char *c = sfx; *c; c++) f->path[p++] = *c;
+        f->path[p] = '\0';
     }
     return fd;
 }
@@ -7892,27 +7975,7 @@ static int sys_tkill(registers_t *regs) {
 
 /* ── sys_pipe2(fds[2], flags) — EAX=331 ─────────────────────────────────── */
 static int sys_pipe2(registers_t *regs) {
-    int flags = (int)regs->ecx;
-    /* Create the pipe using sys_pipe */
-    registers_t fake = *regs;
-    int r = sys_pipe(&fake);
-    if (r < 0) return r;
-    /* Apply flags: O_CLOEXEC = 0x80000, O_NONBLOCK = 0x800 */
-    int *fds = (int *)(uintptr_t)regs->ebx;
-    if (flags & (O_CLOEXEC | 0x800)) {
-        int kfds[2];
-        int cr = copy_from_user(kfds, fds, sizeof(kfds));
-        if (cr < 0) return cr;
-        if (flags & O_CLOEXEC) {
-            current_proc->ofile[kfds[0]].cloexec = 1;
-            current_proc->ofile[kfds[1]].cloexec = 1;
-        }
-        if (flags & 0x800) {
-            current_proc->ofile[kfds[0]].flags |= 0x800;
-            current_proc->ofile[kfds[1]].flags |= 0x800;
-        }
-    }
-    return 0;
+    return do_pipe((int *)(uintptr_t)regs->ebx, (int)regs->ecx);
 }
 
 /* ── sys_readv(fd, iov, iovcnt) — EAX=145 ───────────────────────────────── */
