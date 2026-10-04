@@ -155,6 +155,8 @@ PROBES = {
     "p75_ephemeral_ports":     (60, ""),
     # Needs a sound card: SKIP here, required by smoke-hda.
     "p76_alsa_close_race":     (60, ""),
+    # ALSA mixer elements (Master volume/switch): SKIP here, smoke-hda.
+    "p77_alsa_mixer":          (60, ""),
     # Kernel follow-ups from the userspace review: a leader that exits alone,
     # brk per process, fstat of a named FIFO, MaeroOS shm_size.
     "p78_leader_exit":         (60, ""),

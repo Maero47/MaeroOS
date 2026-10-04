@@ -55,6 +55,27 @@ int usb_configure_eps(struct usb_device *dev,
     return 0;
 }
 int usb_clear_halt(struct usb_device *dev, int i) { (void)dev; (void)i; return 0; }
+/* UAS paths (not exercised here: the simulated stick is bulk-only) */
+int usb_configure_eps_x(struct usb_device *dev, const usb_ep_cfg_t *eps,
+                        int n) {
+    (void)dev; (void)eps; (void)n;
+    return -1;
+}
+int usb_bulk_submit(struct usb_device *dev, int i, uint32_t phys,
+                    uint32_t len) {
+    (void)dev; (void)i; (void)phys; (void)len;
+    return -1;
+}
+int usb_bulk_wait(struct usb_device *dev, int i, uint32_t *actual,
+                  uint32_t timeout_ms) {
+    (void)dev; (void)i; (void)actual; (void)timeout_ms;
+    return -1;
+}
+int usb_set_interface(struct usb_device *dev, int ifnum, int alt) {
+    (void)dev; (void)ifnum; (void)alt;
+    return -1;
+}
+int usb_device_speed(const struct usb_device *dev) { (void)dev; return 3; }
 const char *blk_disk_devname(int disk) { (void)disk; return "sdz"; }
 int blk_usb_attach(int unit) { (void)unit; return -1; }
 void blk_usb_detach(int disk) { (void)disk; }

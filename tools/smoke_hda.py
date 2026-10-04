@@ -5,7 +5,8 @@ Boots (2 CPUs) with an ICH6 HDA controller + hda-duplex codec whose output goes 
 QEMU's wav audiodev (build/smoke-hda/out.wav), then plays two tones:
   1. `tone 1000 1500`     — 1 kHz for 1.5 s at full volume
   2. `tone 2500 1000 25`  — 2.5 kHz for 1 s at 25 % mixer volume
-then runs the p76_alsa_close_race probe (close vs a running START),
+then runs the p76_alsa_close_race probe (close vs a running START) and
+p77_alsa_mixer (the Master volume/switch mixer elements),
 and checks the captured WAV: each tone is present (not silence), its
 spectral peak sits at the played frequency, it lasts about as long as was
 played without dropouts (1.5 s is more than two trips round the driver's
@@ -147,6 +148,11 @@ def main():
         out = run(proc, sel, log, "/abiprobes/p76_alsa_close_race", timeout=60.0)
         if "PASS p76_alsa_close_race" not in out:
             raise AssertionError("p76_alsa_close_race did not pass:\n" + out[-1500:])
+        # the ALSA mixer elements (Master volume/switch) through the
+        # control ioctls, against the OSS mixer of the same amplifier
+        out = run(proc, sel, log, "/abiprobes/p77_alsa_mixer", timeout=60.0)
+        if "PASS p77_alsa_mixer" not in out:
+            raise AssertionError("p77_alsa_mixer did not pass:\n" + out[-1500:])
         # let the wav backend catch up with the last silence
         run(proc, sel, log, "sleep 1")
     finally:

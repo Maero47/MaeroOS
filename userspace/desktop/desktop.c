@@ -15,6 +15,7 @@
 #include <syscall.h>
 #include <unistd.h>
 #include <wm.h>          /* WM_MOD_* — the modifier mask sent to clients */
+#include <alsactl.h>     /* the ALSA Master mixer elements */
 
 #include "font8x16.h"
 #include "font_ui16.h"   /* AA proportional UI font (tools/mkfont.py) */
@@ -237,9 +238,48 @@ static int caps_on;
 static int super_down;           /* either Super/Windows key held (Mod4) */
 static int num_on;               /* Num Lock latched (Mod2) */
 /* Volume as the media keys set it (USB consumer-control keys, or a
- * keyboard's own Mute/Volume keys): traced for now, no mixer behind it. */
+ * keyboard's own Mute/Volume keys): applied to the Master Playback Volume /
+ * Switch of every ALSA card (/dev/snd/controlC0, and C1 while a USB audio
+ * device is plugged in), starting from card 0's current level. */
 static int media_volume = 50;
 static int media_muted;
+static int media_synced;
+
+/* The current Master level of the first card that has one (once). */
+static void media_sync(void) {
+    if (media_synced) return;
+    media_synced = 1;
+    for (int card = 0; card < 2; card++) {
+        int fd = alsactl_open(card), v, sw;
+        if (fd < 0) continue;
+        v = alsactl_elem(fd, "Master Playback Volume", -1);
+        sw = alsactl_elem(fd, "Master Playback Switch", -1);
+        close(fd);
+        if (v < 0) continue;
+        media_volume = v;
+        media_muted = sw == 0;
+        return;
+    }
+}
+
+/* Push media_volume / media_muted to every card's mixer; describes what
+ * happened in `out` for the trace. */
+static void media_apply(char *out, int len) {
+    int n = 0;
+    out[0] = 0;
+    for (int card = 0; card < 2; card++) {
+        int fd = alsactl_open(card), v, sw;
+        if (fd < 0) continue;
+        v = alsactl_elem(fd, "Master Playback Volume", media_volume);
+        sw = alsactl_elem(fd, "Master Playback Switch", !media_muted);
+        close(fd);
+        if (v < 0 && sw < 0) continue;
+        n += snprintf(out + n, (size_t)(len - n), "%scard%d %d%%%s",
+                      n ? ", " : "", card, v, sw == 0 ? " off" : "");
+        if (n >= len) break;
+    }
+    if (!out[0]) snprintf(out, (size_t)len, "no mixer");
+}
 static int altgr_down;           /* right Alt: third level on the TR layout */
 /* Clients that asked for Escape ("grabesc"): terminals and editors need the
  * key itself, so Esc does not close their window. */
@@ -3967,6 +4007,8 @@ static void handle_key(uint16_t code, int value) {
     }
     if (!value) return;
     if (code == KEY_MUTE || code == KEY_VOLUMEDOWN || code == KEY_VOLUMEUP) {
+        char mixed[64];
+        media_sync();
         if (code == KEY_MUTE) media_muted = !media_muted;
         else {
             media_volume += code == KEY_VOLUMEUP ? 5 : -5;
@@ -3974,7 +4016,9 @@ static void handle_key(uint16_t code, int value) {
             if (media_volume > 100) media_volume = 100;
             media_muted = 0;
         }
-        trace("volume %d%s", media_volume, media_muted ? " muted" : "");
+        media_apply(mixed, sizeof(mixed));
+        trace("volume %d%s (mixer: %s)", media_volume,
+              media_muted ? " muted" : "", mixed);
         return;
     }
     if (code == KEY_NUMLOCK) {

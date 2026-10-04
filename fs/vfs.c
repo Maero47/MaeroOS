@@ -118,6 +118,7 @@ int vfs_access_check_groups(vfs_node_t *node, uint32_t euid, uint32_t egid,
     int in_group;
 
     if (!node) return -2;            /* -ENOENT */
+    node = vfs_perm_node(node);      /* shared permissions (perm_of) */
     if (euid == 0) {                 /* root bypasses, except X needs an x bit */
         if ((want & VFS_WANT_X) && node->flags == VFS_FLAG_FILE &&
             !(node->mask & 0111))
@@ -153,6 +154,7 @@ int vfs_access_check_groups(vfs_node_t *node, uint32_t euid, uint32_t egid,
 
 int vfs_setattr_quiet(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid) {
     if (!node) return -2;
+    node = vfs_perm_node(node);
     if ((mode & 07777) != node->mask) node->vflags |= VFS_V_MODE_SET;
     node->mask = mode & 07777;
     node->uid = uid;
@@ -162,6 +164,7 @@ int vfs_setattr_quiet(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gi
 
 int vfs_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid) {
     if (!node) return -2;
+    node = vfs_perm_node(node);
     if ((mode & 07777) != node->mask) node->vflags |= VFS_V_MODE_SET;
     vfs_node_t *parent = NULL;
     char name[256];

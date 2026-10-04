@@ -7,12 +7,21 @@ tone 440 1000                        # MaeroOS's own player, through /dev/dsp
 toybox chroot /disk/alpine aplay -l  # Alpine's alsa-utils: "card 0: MaeroOS [MaeroOS HDA]"
 toybox chroot /disk/alpine aplay /tmp/some.wav
 toybox chroot /disk/alpine aplay -D hw:0 /tmp/some.wav    # no alsa-lib plug layer
+mixer -c 0 40                        # card 0's Master to 40 % (also: mute, unmute)
+toybox chroot /disk/alpine amixer -c 0 sset Master 50%
+tone -c 1 440 1000                   # a USB audio device: ALSA card 1
+tone -d /dev/dsp1 440 1000           # the same card's raw 48 kHz node
+toybox chroot /disk/alpine aplay -D hw:1 /tmp/some.wav
 ```
+
+The desktop's Volume Up / Down / Mute keys set the Master volume and switch
+of every card (`[desktop] volume 55 (mixer: card0 55%)` in its trace).
 
 QEMU needs a sound card with an audio backend, e.g.
 `-device intel-hda -device hda-duplex,audiodev=a -audiodev pa,id=a` (or
 `-device AC97,audiodev=a`); `-audiodev wav,id=a,path=out.wav` records what the
-card plays.
+card plays.  A USB audio device: `-device qemu-xhci -device
+usb-audio,audiodev=a`.
 
 ## Pieces
 
@@ -20,8 +29,9 @@ card plays.
 |---|---|
 | `drivers/hda.c` | Intel HDA: codec walk, one output stream, 48 kHz S16LE stereo from a 256 KiB byte ring through a 128 KiB cyclic DMA buffer; `hda_queued()` (bytes not yet played) and `hda_drop()` for ALSA |
 | `drivers/ac97.c` | AC'97: the same ring and the same cyclic scheme over its 32 x 4 KiB buffer list (absolute play/write positions from CIV/PICB, LVI kept behind CIV); `ac97_queued()`, `ac97_drop()` |
-| `fs/devfs.c` | `/dev/dsp` (raw 48 kHz S16LE stereo writes, OSS mixer volume on HDA) and `/dev/snd` |
-| `drivers/alsa.c` | `/dev/snd/controlC0` and `/dev/snd/pcmC0D0p`: the ALSA control and PCM playback ioctls, format conversion and resampling |
+| `fs/devfs.c` | `/dev/dsp` (raw 48 kHz S16LE stereo writes, OSS mixer volume on HDA), `/dev/dsp1` (the same on card 1 while a 48 kHz USB card is plugged in; its OSS volume is the card's Master) and `/dev/snd` |
+| `drivers/alsa.c` | `/dev/snd/controlC<n>` and `/dev/snd/pcmC<n>D0p` for card 0 (HDA/AC'97) and card 1 (USB, while plugged in): the ALSA control and PCM playback ioctls, the mixer elements, format conversion and resampling |
+| `drivers/usb/usb_audio.c` | USB Audio Class 1/2 playback on xHCI isochronous TDs (`drivers/usb/xhci.c`): the descriptors, the alternate setting and rate, the Feature Unit's volume and mute, a 256 KiB FIFO feeding one TD per service interval |
 | `proc/syscall.c` | `ioctl` on a `/dev/snd` node goes to `alsa_ioctl()` (with the descriptor's `O_NONBLOCK`); `mmap` of one fails with `ENXIO` |
 
 ## The ALSA ABI subset
@@ -38,9 +48,20 @@ has a 32-bit one and uses 108 and 132 bytes. Both are answered.
 
 Control device: `PVERSION`, `CARD_INFO` (driver name `MaeroOS`, which has
 no `cards/*.conf` in alsa-lib, so the `default` PCM is `plug` over `hw`),
-`PCM_NEXT_DEVICE`, `PCM_INFO`, `PCM_PREFER_SUBDEVICE`, an empty
-`ELEM_LIST`, `SUBSCRIBE_EVENTS`, and the "no such device" answers for
-hwdep, rawmidi and UMP.
+`PCM_NEXT_DEVICE`, `PCM_INFO`, `PCM_PREFER_SUBDEVICE`, `ELEM_LIST`,
+`ELEM_INFO`, `ELEM_READ`, `ELEM_WRITE`, `ELEM_LOCK`/`UNLOCK`,
+`SUBSCRIBE_EVENTS`, and the "no such device" answers for hwdep, rawmidi and
+UMP.
+
+Mixer elements: "Master Playback Volume" (integer 0..100, one value) and
+"Master Playback Switch" (boolean, 1 = sound on), which alsa-lib's simple
+mixer shows as `Master`.  On HDA they are the output amplifiers' gain and
+mute (the same gain `/dev/dsp`'s OSS mixer sets); on a USB card the Feature
+Unit's master (or per-channel) volume, the percentage spread over the top
+48 dB of its range, and its mute.  An AC'97 card has none.  An element is
+found by numid or by interface + name + index, as alsa-lib looks them up.
+No dB TLVs and no change events (`read()` on the control device returns
+nothing).
 
 PCM device: `PVERSION`, `INFO`, `TSTAMP`/`TTSTAMP`/`USER_PVERSION`,
 `HW_REFINE`, `HW_PARAMS`, `HW_FREE`, `SW_PARAMS`, `STATUS`, `STATUS_EXT`,
@@ -58,10 +79,12 @@ PCM device: `PVERSION`, `INFO`, `TSTAMP`/`TTSTAMP`/`USER_PVERSION`,
   in interval arithmetic until nothing changes, the way a Linux driver's
   constraint rules do; alsa-lib's `snd_pcm_hw_params_set_*_near` and its
   plug layer depend on that.
-- **Data path.** The hardware stream is fixed at 48 kHz S16LE stereo.
-  `WRITEI_FRAMES` decodes each frame to 16-bit stereo (float through its bit
-  pattern, as the kernel uses no FPU), resamples to 48 kHz by linear
-  interpolation and hands the result to the HDA or AC'97 ring. Before the
+- **Data path.** The hardware stream is fixed at 48 kHz S16LE stereo (a
+  USB card: 16-bit stereo at the rate the device was set to, 48 or
+  44.1 kHz).  `WRITEI_FRAMES` decodes each frame to 16-bit stereo (float
+  through its bit pattern, as the kernel uses no FPU), resamples to the
+  card's rate by linear interpolation and hands the result to the HDA or
+  AC'97 ring or the USB driver's FIFO. Before the
   stream starts (`start_threshold`, or `START`), the converted PCM waits in
   a staging buffer.
 - **Pointers.** `appl_ptr` is what the application wrote; `hw_ptr` is
@@ -74,9 +97,8 @@ PCM device: `PVERSION`, `INFO`, `TSTAMP`/`TTSTAMP`/`USER_PVERSION`,
 - **Not provided.** mmap of the status/control pages (alsa-lib falls back
   to `SYNC_PTR`, as on any kernel without them) and of the sample buffer (no
   `MMAP_*` access, so `dmix` cannot run; the `default` device does not use
-  it here), capture, pause and resume, linked streams, mixer controls (no
-  `amixer` elements; `/dev/dsp`'s OSS volume ioctl still works on HDA),
-  timers (`/dev/snd/timer`). The PCM has one substream: a second open fails
+  it here), capture, pause and resume, linked streams, mixer elements beyond
+  Master, timers (`/dev/snd/timer`). The PCM has one substream: a second open fails
   (`ENOENT` here, `EBUSY` on Linux).
 
 ## Tests
@@ -110,7 +132,44 @@ on the host:
 It feeds a full-scale 44.1 kHz square wave and a sine. Every output frame must
 be within 1 LSB of the exact interpolation, and 48000/44100 as many frames must
 come out.
-`make smoke-hda` (in `make check`) still covers `/dev/dsp` on HDA.
+`make smoke-hda` (in `make check`) still covers `/dev/dsp` on HDA, and runs
+probe p77 on the mixer elements.  smoke-audio also drives Alpine's `amixer
+-c 0` and plays `aplay -D hw:1` on a `usb-audio` device.
+
+## USB audio (card 1)
+
+`drivers/usb/usb_audio.c` takes a USB Audio Class 1 (or 2) device with a
+PCM playback interface; one at a time, as card 1.  It prefers 16-bit stereo
+at 48 kHz (then other widths, mono, 44.1 kHz), selects that alternate
+setting, sets the rate (UAC1: SET_CUR on the endpoint when it has the
+control; UAC2: on the clock source), and finds the Feature Unit between the
+stream's input terminal and an output terminal for the mixer elements.
+`write` converts ALSA's 16-bit stereo to the device's format into a 256 KiB
+FIFO; TDs of one service interval each (the rate x interval, remainder
+carried: 44.1 kHz on 1 ms sends 44 frames nine times and 45 the tenth) are
+copied into 512-byte DMA slots and queued on the endpoint's isochronous
+ring with Start Isoch ASAP, at most 128 at a time.  Each completion, handled
+on kusbd's interrupt, frees its slot, queues more and wakes `poll()`.  The
+stream stops by running dry (Ring Underrun) and starts again with the next
+write; DRAIN pads the last partial TD with silence.  ALSA's buffer is at
+least 20 ms on this card, so it always holds a whole TD.  Adaptive and
+synchronous endpoints need nothing more; an asynchronous one is played at
+the nominal rate without reading its feedback endpoint.  Unplugged, the
+card leaves `/dev/snd` and an open PCM fails with `ENODEV`
+(`SNDRV_PCM_STATE_DISCONNECTED`) until it is closed.
+
+Permissions: every sound node starts from `alsa_node_perms()` in
+`drivers/alsa.c`.  Card 1's `/dev/snd` nodes and `/dev/dsp1` have none of
+their own: they share card 0's and `/dev/dsp`'s through `perm_of`
+(`fs/vfs.h`), which access checks, `stat` and `chmod`/`chown` follow, so
+whatever init (or anyone) does to card 0's owner or mode applies to the USB
+card at once, plugged in or not.  A tree with root:audio 0660 sound nodes
+sets that in `alsa_node_perms()`.
+
+`make smoke-usbaudio` (in `make check`) plays tones on QEMU's `usb-audio`
+with `tone -c 1`, checks them in the wav capture, sets the mixer of both
+cards with `mixer`, and unplugs and replugs the device in the middle of a
+tone.
 
 Firefox: `python3 tools/smoke_firefox.py --audio` (see below).
 

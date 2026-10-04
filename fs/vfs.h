@@ -49,6 +49,10 @@ typedef struct vfs_node {
     uint64_t size;     /* file size in bytes (64-bit: files past 4 GiB) */
     uint32_t mask;     /* Unix permission bits */
     uint32_t uid, gid;
+    /* Permissions shared with another node: when set, the owner, group and
+     * mode that access checks, stat and chmod/chown see are perm_of's, live
+     * (card 1's /dev/snd nodes and /dev/dsp1: card 0's and /dev/dsp's). */
+    struct vfs_node *perm_of;
     uint32_t atime, mtime, ctime;
     uint32_t nlink;    /* hard links (0 = not tracked, stat reports 1) */
     uint32_t dev;      /* st_dev: device of the filesystem (0 = unspecified) */
@@ -215,7 +219,13 @@ static inline int vfs_may_pin(vfs_node_t *node, int how) {
 int vfs_access_check_groups(vfs_node_t *node, uint32_t uid, uint32_t gid,
                             const uint32_t *groups, uint32_t ngroups, int want);
 
-/* Update mode/uid/gid (in-memory + persisted via setattr_fn if present). */
+/* The node whose uid/gid/mask apply to `n` (itself unless perm_of). */
+static inline vfs_node_t *vfs_perm_node(vfs_node_t *n) {
+    return n && n->perm_of ? n->perm_of : n;
+}
+
+/* Update mode/uid/gid (in-memory + persisted via setattr_fn if present).
+ * On a node with perm_of, the shared node's are changed. */
 int vfs_setattr(vfs_node_t *node, uint32_t mode, uint32_t uid, uint32_t gid);
 /* The same without an inotify IN_ATTRIB: a new node's owner and mode, set as
  * part of creating it. */

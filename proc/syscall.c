@@ -614,8 +614,9 @@ static uint32_t vnode_mode(vfs_node_t *n) {
     /* Filesystems store permissions in mask (often without the S_IFMT
      * type bits) — synthesize the type from the VFS node kind so the
      * userspace S_ISREG/S_ISDIR family actually works. */
-    uint32_t perm = n->mask ? (n->mask & 07777U)
-                            : (n->flags == VFS_FLAG_DIR ? 0755U : 0644U);
+    const vfs_node_t *pn = vfs_perm_node(n);     /* shared permissions */
+    uint32_t perm = pn->mask ? (pn->mask & 07777U)
+                             : (n->flags == VFS_FLAG_DIR ? 0755U : 0644U);
     uint32_t type = n->mask & 0170000U;
 
     if (!type && n->flags == VFS_FLAG_SOCK) type = 0140000U;   /* S_IFSOCK */
@@ -660,8 +661,10 @@ static int fill_kstat(struct kstat *st, vfs_node_t *n) {
     st->st_mode    = (uint16_t)vnode_mode(n);
     st->st_nlink   = n->nlink ? (uint16_t)n->nlink : 1;
     /* Legacy 16-bit ids: anything wider reads as overflowuid (65534). */
-    st->st_uid     = n->uid > 0xFFFFU ? 65534U : (uint16_t)n->uid;
-    st->st_gid     = n->gid > 0xFFFFU ? 65534U : (uint16_t)n->gid;
+    st->st_uid     = vfs_perm_node(n)->uid > 0xFFFFU ? 65534U
+                   : (uint16_t)vfs_perm_node(n)->uid;
+    st->st_gid     = vfs_perm_node(n)->gid > 0xFFFFU ? 65534U
+                   : (uint16_t)vfs_perm_node(n)->gid;
     st->st_size    = (uint32_t)n->size;
     st->st_blksize = 4096;
     st->st_blocks  = (uint32_t)((n->size + 511) / 512);
@@ -679,8 +682,8 @@ static void fill_kstat64(struct kstat64 *st, vfs_node_t *n) {
     st->__st_ino   = n->inode;
     st->st_mode    = vnode_mode(n);
     st->st_nlink   = n->nlink ? n->nlink : 1;
-    st->st_uid     = n->uid;     /* the owner the permission checks use */
-    st->st_gid     = n->gid;
+    st->st_uid     = vfs_perm_node(n)->uid;   /* the owner the checks use */
+    st->st_gid     = vfs_perm_node(n)->gid;
     st->st_size    = (int64_t)n->size;
     st->st_blksize = 4096;
     st->st_blocks  = (n->size + 511) / 512;
@@ -8663,6 +8666,7 @@ static int sys_link_paths(int olddirfd, const char *uold, int newdirfd,
  * dropped (Linux setattr_prepare / setattr_should_drop_sgid). */
 static int do_chmod_node(vfs_node_t *n, uint32_t mode) {
     if (!n) return -2;
+    n = vfs_perm_node(n);                /* shared permissions (perm_of) */
     if (current_proc->euid != 0 && current_proc->euid != n->uid)
         return -1;  /* -EPERM */
     mode &= 07777;
@@ -8676,6 +8680,7 @@ static int do_chmod_node(vfs_node_t *n, uint32_t mode) {
  * (0xFFFFFFFF) means "unchanged". */
 static int do_chown_node(vfs_node_t *n, uint32_t uid, uint32_t gid) {
     if (!n) return -2;
+    n = vfs_perm_node(n);                /* shared permissions (perm_of) */
     uint32_t new_uid = n->uid, new_gid = n->gid;
     if (uid != 0xFFFFFFFFU && uid != n->uid) {
         if (current_proc->euid != 0) return -1; /* -EPERM */

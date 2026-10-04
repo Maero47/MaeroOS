@@ -168,6 +168,7 @@ testfiles/awk
 /testfiles/view
 /testfiles/wavplay
 /testfiles/tone
+/testfiles/mixer
 /testfiles/wc
 /testfiles/wget
 /testfiles/which

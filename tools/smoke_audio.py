@@ -17,6 +17,13 @@ The capture must contain each tone, in order, at its frequency (DFT peak and
 zero crossings), for about as long as it was played, without dropouts.  Also
 checked: `aplay -l` lists card 0, and `aplay` exits 0 each time.
 
+Then the mixer and a USB card: Alpine's `amixer -c 0` reads and sets the HDA
+card's Master volume (50 %, mute, unmute, back to 100 %; the kernel traces
+each element write), and a QEMU usb-audio device on a qemu-xhci is ALSA card
+1 (`aplay -l` lists it), where `aplay -D hw:1 a440.wav` (44.1 kHz mono,
+converted by the kernel to the device's 48 kHz stereo, carried by
+isochronous TDs) must show up in that device's own capture (usb.wav).
+
 --ac97 runs the same on an AC'97 card instead of HDA.
 """
 import math
@@ -36,6 +43,7 @@ IMG = os.path.abspath(os.environ.get("ALPINE_IMG", os.path.join(ROOT, "disk-alpi
 OUT_DIR = os.path.join(ROOT, "build", os.environ.get("SMOKE_AUDIO_DIR", "smoke-audio"))
 WORK = os.path.join(OUT_DIR, "disk.img")
 WAV = os.path.join(OUT_DIR, "out.wav")
+WAV_USB = os.path.join(OUT_DIR, "usb.wav")
 PROMPT = smokelib.PROMPT
 ENV = "/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=vt100"
 CHROOT = "toybox chroot /disk/alpine " + ENV
@@ -110,8 +118,9 @@ def main():
         f.write("\n".join(cmds) + "\n")
     subprocess.run(["debugfs", "-w", "-f", cmdfile, WORK], check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if os.path.exists(WAV):
-        os.unlink(WAV)
+    for f in (WAV, WAV_USB):
+        if os.path.exists(f):
+            os.unlink(f)
 
     dev = (["-device", "AC97,audiodev=snd0"] if ac97 else
            ["-device", "intel-hda", "-device", "hda-duplex,audiodev=snd0"])
@@ -120,7 +129,11 @@ def main():
            "-drive", f"file={WORK},format=raw,index=0,media=disk",
            "-serial", "stdio", "-m", "1024M", "-no-reboot", "-no-shutdown",
            "-audiodev", f"wav,id=snd0,path={WAV},out.frequency=48000,"
-                        "out.channels=2,out.format=s16"] + dev + accel + smokelib.QEMU_DISPLAY
+                        "out.channels=2,out.format=s16",
+           "-audiodev", f"wav,id=snd1,path={WAV_USB},out.frequency=48000,"
+                        "out.channels=2,out.format=s16",
+           "-device", "qemu-xhci,id=xhci",
+           "-device", "usb-audio,audiodev=snd1,bus=xhci.0"] + dev + accel + smokelib.QEMU_DISPLAY
     proc = subprocess.Popen(cmd, cwd=ROOT, stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
     sel = selectors.DefaultSelector()
@@ -154,6 +167,24 @@ def main():
         at = smokelib.mark(log)
         run(DSP_TONE[0], "tone: done", timeout=30)
         smokelib.wait_for(proc, sel, done, log, 10.0, at)
+        if not ac97:
+            # alsa-lib's simple mixer on the kernel's mixer elements
+            run(f"{CHROOT} amixer -c 0 scontrols", "Simple mixer control 'Master',0")
+            run(f"{CHROOT} amixer -c 0 sset Master 50%", "Playback 50 [50%] [on]",
+                "[ALSA] card 0: Master Playback Volume = 50")
+            run(f"{CHROOT} amixer -c 0 sset Master mute", "[50%] [off]",
+                "[ALSA] card 0: Master Playback Switch = 0")
+            run(f"{CHROOT} amixer -c 0 sset Master unmute", "[50%] [on]")
+            run(f"{CHROOT} amixer -c 0 sset Master 100%", "Playback 100 [100%] [on]")
+            print("[smoke-audio] amixer -c 0: Master read, set to 50 %, muted, "
+                  "unmuted, back to 100 %")
+        # the USB card
+        run(f"{CHROOT} aplay -l", "card 1: USB", "MaeroOS USB Audio")
+        at = smokelib.mark(log)
+        run(f"{CHROOT} /bin/sh -c 'aplay -D hw:1 /tmp/a440.wav && echo AP_\"\"OK'",
+            "AP_OK", timeout=60)
+        smokelib.wait_for(proc, sel, "[USB-AUDIO] stream ran out of data", log,
+                          10.0, at)
         run("sleep 1")
     finally:
         proc.send_signal(signal.SIGTERM)       # QEMU finalises the WAV on exit
@@ -192,6 +223,20 @@ def main():
             raise AssertionError(f"{name}: lasted {dur:.2f} s, expected {secs}")
         if holes > 2:
             raise AssertionError(f"{name}: {holes} dropout blocks")
+    rate, _, s = read_wav(WAV_USB)
+    labels = classify(s, rate, [440])
+    run = main_run(labels, 0)
+    if not run:
+        raise AssertionError("no 440 Hz tone in the USB card's capture")
+    first, last, n = run
+    part = s[first * blk:(last + 1) * blk]
+    f = peak_freq(part, rate)
+    holes = (last - first + 1) - n
+    print(f"[smoke-audio] USB card (aplay -D hw:1 a440.wav): blocks "
+          f"{first}-{last}, peak {f} Hz, {n / 100:.2f} s, {holes} dropout "
+          f"blocks, rms {rms(part):.0f}")
+    if abs(f - 440) > 440 * 0.02 or not 1.4 <= n / 100 <= 1.6 or holes > 2:
+        raise AssertionError("the USB card's tone is wrong")
     print("[smoke-audio] PASS")
 
 
