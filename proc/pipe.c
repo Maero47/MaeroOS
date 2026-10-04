@@ -15,7 +15,21 @@ pipe_buf_t *pipe_alloc(void) {
     p->nreaders = 1;
     p->nwriters = 1;
     p->fifo     = 0;
+    p->pins     = 0;
     return p;
+}
+
+static void pipe_try_free(pipe_buf_t *p);
+
+/* A blocking read or write holds a pin for its whole duration (as usocket does
+ * with a reference): the descriptor that led here can be closed by another
+ * thread sharing the fd table while this one sleeps, and with both ends closed
+ * the buffer would otherwise be freed under it.  The last unpin frees a pipe
+ * whose ends are all gone; the woken caller sees EOF or EPIPE first. */
+static void pipe_pin(pipe_buf_t *p) { p->pins++; }
+static int pipe_unpin(pipe_buf_t *p, int ret) {
+    if (--p->pins == 0) pipe_try_free(p);
+    return ret;
 }
 
 /* True when the current process has a deliverable signal (not ignored). */
@@ -23,8 +37,14 @@ static int pipe_signal_pending(void) {
     return signal_interrupt_pending(current_proc);
 }
 
+static int pipe_read_pinned(pipe_buf_t *p, char *buf, int len, int nonblock);
 int pipe_read(pipe_buf_t *p, char *buf, int len, int nonblock) {
     if (len <= 0) return 0;
+    pipe_pin(p);
+    return pipe_unpin(p, pipe_read_pinned(p, buf, len, nonblock));
+}
+
+static int pipe_read_pinned(pipe_buf_t *p, char *buf, int len, int nonblock) {
     /* Wait for data; POSIX: return as soon as any is available (a read may
      * return fewer than len bytes). */
     /* NB: do NOT bound/timeout these blocking reads for Firefox.  A ~500ms
@@ -57,8 +77,14 @@ int pipe_read(pipe_buf_t *p, char *buf, int len, int nonblock) {
     return take;
 }
 
+static int pipe_write_pinned(pipe_buf_t *p, const char *buf, int len, int nonblock);
 int pipe_write(pipe_buf_t *p, const char *buf, int len, int nonblock) {
     if (len <= 0) return 0;
+    pipe_pin(p);
+    return pipe_unpin(p, pipe_write_pinned(p, buf, len, nonblock));
+}
+
+static int pipe_write_pinned(pipe_buf_t *p, const char *buf, int len, int nonblock) {
     if (p->nreaders == 0) {
         signal_send(current_proc, SIGPIPE);
         return -32;  /* -EPIPE */
@@ -98,6 +124,7 @@ int pipe_write(pipe_buf_t *p, const char *buf, int len, int nonblock) {
 static void pipe_try_free(pipe_buf_t *p) {
     if (p->nreaders <= 0 && p->nwriters <= 0) {
         wake_up(p);  /* wake anyone still sleeping on it */
+        if (p->pins > 0) return;   /* the last pipe_unpin() comes back here */
         if (p->fifo) {
             /* The FIFO's node still points at this buffer and the next open
              * reuses it; like Linux, data nobody read is dropped here. */
@@ -138,5 +165,10 @@ pipe_buf_t *pipe_fifo_alloc(void) {
 void pipe_fifo_free(pipe_buf_t *p) {
     if (!p) return;
     wake_up(p);
+    if (p->pins > 0) {          /* a sleeper still holds it: it frees it */
+        p->fifo = 0;
+        p->nreaders = p->nwriters = 0;
+        return;
+    }
     kfree(p);
 }

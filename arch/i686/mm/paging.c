@@ -820,10 +820,29 @@ static void page_fault_handler(registers_t *regs) {
         if (!(err & 0x1U) && !protnone && current_proc &&
             cr2 >= stack_grow_floor && cr2 < (uint32_t)USER_STACK_BASE) {
             uint32_t page = cr2 & ~0xFFFU;
+            /* Two threads of the process (one page directory) can fault on
+             * the same stack page on two CPUs; the second runs this only after
+             * the first has mapped the page and returned.  It must not map a
+             * fresh frame over the one the first thread is already using:
+             * re-read the entry, now that this CPU holds the lock. */
+            if (pde_present(page) && (pte_get(page) & PAGE_PRESENT)) {
+                tlb_flush_single(page);
+                return;
+            }
             phys_t phys = pmm_alloc_user_frame();
             if (phys) {
                 kprof_count(KPE_PF_STACK);
                 pmm_frame_incref(phys);
+                /* Zero the frame BEFORE it becomes visible: once mapped, a
+                 * sibling thread on another CPU can read it at once, and must
+                 * never see the previous owner's data. */
+                {
+                    uint32_t fl;
+                    __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+                    __builtin_memset(paging_temp_map(phys), 0, PAGE_SIZE);
+                    paging_temp_unmap();
+                    if (fl & 0x200U) __asm__ volatile("sti" ::: "memory");
+                }
                 if (paging_map(page, phys,
                                PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER |
                                page_nx_unless(proc_stack_exec(current_proc))) != 0) {
@@ -832,7 +851,6 @@ static void page_fault_handler(registers_t *regs) {
                      * is what a stack that cannot grow means. */
                     pmm_frame_decref(phys);
                 } else {
-                    __builtin_memset((void *)page, 0, PAGE_SIZE);
                     tlb_flush_single(page);
                     return;
                 }

@@ -749,7 +749,25 @@ static void eventfd_release(struct eventfd_obj *e) {
     if (--e->refcount <= 0) kfree(e);
 }
 
+/* read/write hold a reference across the sleep: a thread sharing the fd
+ * table can close the descriptor meanwhile, and the counter must outlive the
+ * sleeper (as pipes and AF_UNIX sockets do). */
+static int eventfd_read_held(struct eventfd_obj *e, char *buf, int len, int nonblock);
+static int eventfd_write_held(struct eventfd_obj *e, const char *buf, int len, int nonblock);
 static int eventfd_read(struct eventfd_obj *e, char *buf, int len, int nonblock) {
+    e->refcount++;
+    int r = eventfd_read_held(e, buf, len, nonblock);
+    eventfd_release(e);
+    return r;
+}
+static int eventfd_write(struct eventfd_obj *e, const char *buf, int len, int nonblock) {
+    e->refcount++;
+    int r = eventfd_write_held(e, buf, len, nonblock);
+    eventfd_release(e);
+    return r;
+}
+
+static int eventfd_read_held(struct eventfd_obj *e, char *buf, int len, int nonblock) {
     if (len < 8) return -22;                       /* -EINVAL */
     while (e->count == 0) {
         if (nonblock) return -11;                  /* -EAGAIN */
@@ -766,7 +784,7 @@ static int eventfd_read(struct eventfd_obj *e, char *buf, int len, int nonblock)
     return 8;
 }
 
-static int eventfd_write(struct eventfd_obj *e, const char *buf, int len, int nonblock) {
+static int eventfd_write_held(struct eventfd_obj *e, const char *buf, int len, int nonblock) {
     if (len < 8) return -22;                        /* -EINVAL */
     uint64_t add;
     if (copy_from_user(&add, buf, 8) < 0) return -14;
@@ -1737,6 +1755,10 @@ static int sys_brk(registers_t *regs) {
     /* Clamp: must be in user address space below the stack guard. */
     if (new_brk >= USER_STACK_BASE)
         return -12;  /* -ENOMEM */
+    /* Nor into the NULL-page floor (an image with no loadable segment has
+     * its break at 0). */
+    if (new_brk < USER_MIN_ADDR || current_proc->heap_end < USER_MIN_ADDR)
+        return -12;
 
     uint32_t old_brk = current_proc->heap_end;
 
@@ -3630,34 +3652,36 @@ static int sys_stat(registers_t *regs) {
 }
 
 /* ── sys_fstat(fd, stat*) — EAX=108 ─────────────────────────────────────── */
+/* Every kind of descriptor goes through fd_kstat64, as fstat64/statx do: only
+ * FD_FILE has a vfs node, and calling fill_kstat() on an eventfd, socket or
+ * epoll descriptor dereferenced a NULL node (an unprivileged kernel panic).
+ * The result is narrowed to the old layout as Linux cp_old_stat/cp_new_stat
+ * do: -EOVERFLOW for a size past 2 GiB, overflowuid for wide ids. */
 static int sys_fstat(registers_t *regs) {
     int fd = (int)regs->ebx;
     struct kstat *st = (struct kstat *)(uintptr_t)regs->ecx;
     if (!access_ok(st, sizeof(*st))) return -14;
 
-    if (fd < 0 || fd >= MAX_FD) return -9;
-    proc_file_t *f = &current_proc->ofile[fd];
-
-    if (f->type == FD_NONE) {
-        /* stdin/stdout/stderr: pretend it's a char device */
-        if (fd <= 2) {
-            struct kstat kst;
-            __builtin_memset(&kst, 0, sizeof(kst));
-            kst.st_mode = 0020666; /* S_IFCHR | rw-rw-rw- */
-            return copy_to_user(st, &kst, sizeof(kst));
-        }
-        return -9;
-    }
-    if (f->type == FD_PIPE_R || f->type == FD_PIPE_W) {
-        struct kstat kst;
-        __builtin_memset(&kst, 0, sizeof(kst));
-        kst.st_mode  = 0010666;  /* S_IFIFO */
-        kst.st_blksize = 4096;
-        return copy_to_user(st, &kst, sizeof(kst));
-    }
-    struct kstat kst;
-    int r = fill_kstat(&kst, f->node);
+    struct kstat64 k64;
+    int r = fd_kstat64(fd, &k64);
     if (r < 0) return r;
+    if (k64.st_size < 0 || (uint64_t)k64.st_size > MAX_NON_LFS)
+        return -75;                                           /* -EOVERFLOW */
+    struct kstat kst;
+    __builtin_memset(&kst, 0, sizeof(kst));
+    kst.st_dev     = (uint16_t)k64.st_dev;
+    kst.st_rdev    = (uint16_t)k64.st_rdev;
+    kst.st_ino     = (uint32_t)k64.st_ino;
+    kst.st_mode    = (uint16_t)k64.st_mode;
+    kst.st_nlink   = (uint16_t)k64.st_nlink;
+    kst.st_uid     = k64.st_uid > 0xFFFFU ? 65534U : (uint16_t)k64.st_uid;
+    kst.st_gid     = k64.st_gid > 0xFFFFU ? 65534U : (uint16_t)k64.st_gid;
+    kst.st_size    = (uint32_t)k64.st_size;
+    kst.st_blksize = (uint32_t)k64.st_blksize;
+    kst.st_blocks  = (uint32_t)k64.st_blocks;
+    kst.st_atime   = (uint32_t)k64.st_atime;
+    kst.st_mtime   = (uint32_t)k64.st_mtime;
+    kst.st_ctime   = (uint32_t)k64.st_ctime;
     return copy_to_user(st, &kst, sizeof(kst));
 }
 
@@ -4787,6 +4811,10 @@ static int sys_mmap2(registers_t *regs) {
     uint32_t va;
     if (fixed) {
         if (addr & (PAGE_SIZE - 1)) return -22;
+        /* vm.mmap_min_addr: nothing is ever mapped over the NULL page and
+         * the 64 KiB above it (Linux security_mmap_addr: -EPERM), so a
+         * kernel NULL dereference can never read user-chosen data. */
+        if (addr < USER_MIN_ADDR) return -1;                      /* -EPERM */
         if (addr + length < addr || addr + length > (uint32_t)USER_STACK_BASE) return -12;
         va = addr;
         if (flags & MAP_FIXED_NOREPLACE_K) {
@@ -5276,6 +5304,7 @@ static int sys_mremap(registers_t *regs) {
     int ret;
 
     if (flags & MREMAP_FIXED_K) {
+        if (new_addr < USER_MIN_ADDR) { ret = -1; goto out; }   /* -EPERM */
         if ((new_addr & (PAGE_SIZE - 1)) || new_addr + new_size < new_addr ||
             new_addr + new_size > (uint32_t)USER_STACK_BASE ||
             (new_addr < old_addr + old_size && old_addr < new_addr + new_size)) {
@@ -6554,6 +6583,7 @@ static int sys_epoll_ctl(registers_t *regs) {
 }
 
 /* epoll_wait(epfd, events, maxevents, timeout) — EAX=256 (also epoll_pwait/319). */
+static int epoll_wait_held(struct epoll *ep, void *uevents, int maxevents, int toms);
 static int sys_epoll_wait(registers_t *regs) {
     int epfd = (int)regs->ebx;
     void *uevents = (void *)(uintptr_t)regs->ecx;
@@ -6563,8 +6593,17 @@ static int sys_epoll_wait(registers_t *regs) {
         current_proc->ofile[epfd].type != FD_EPOLL) return -9;
     if (maxevents <= 0) return -22;
     if (!uevents || !access_ok(uevents, (size_t)maxevents * 12)) return -14;
+    /* The wait holds its own reference: a thread sharing the fd table can
+     * close epfd while this one sleeps, which would otherwise free the
+     * instance under the loop below (Linux holds the struct file via fdget). */
     struct epoll *ep = current_proc->ofile[epfd].epoll;
+    epoll_retain(ep);
+    int r = epoll_wait_held(ep, uevents, maxevents, toms);
+    epoll_release(ep);
+    return r;
+}
 
+static int epoll_wait_held(struct epoll *ep, void *uevents, int maxevents, int toms) {
     struct kdeadline dl;
     if (toms > 0) deadline_set_ms(&dl, (uint32_t)toms);
 

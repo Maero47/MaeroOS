@@ -7,6 +7,7 @@
 #include "../drivers/ac97.h"
 #include "../drivers/hda.h"
 #include "../arch/i686/cpu/fpu.h"
+#include "../arch/i686/cpu/cpuid.h"
 #include "../drivers/vga.h"
 #include "../kernel/printk.h"
 #include "../arch/i686/cpu/gdt.h"
@@ -159,10 +160,12 @@ void kernel_main(u32 mb_magic, u32 mb_phys) {
     tss_init();
     idt_init();
     fpu_init();
+    int smep_on = cpu_enable_smep();   /* reported once printk is up */
     pic_remap();
 
     /* ── M4: VGA + printk ────────────────────────────────────────────────── */
     vga_init();
+    if (smep_on) printk("[CPU]  SMEP enabled (no kernel execution of user pages).\n");
     printk("=== MaeroOS Kernel (M15: ATA + ext2 + syscalls) ===\n");
     printk("[BOOT] Magic: 0x%08x   MB_info_phys: 0x%08x\n", mb_magic, mb_phys);
 

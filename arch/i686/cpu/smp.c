@@ -4,6 +4,7 @@
 #include "tss.h"
 #include "idt.h"
 #include "fpu.h"
+#include "cpuid.h"
 #include "percpu.h"
 #include "../mm/paging.h"
 #include "../../../kernel/printk.h"
@@ -223,6 +224,7 @@ void ap_entry(void) {
     idt_load();                  /* load the shared IDT on this CPU          */
     fpu_init();                  /* CR0/CR4 are per-CPU: enable SSE+OSFXSR   *
                                   * here too, else user SSE #UDs on the AP.  */
+    (void)cpu_enable_smep();     /* CR4.SMEP, as on the BSP                  */
 
     /* Tell the BSP we made it — unless it already gave up on us.  An AP the
      * BSP has written off is not counted online, so no TLB shootdown would
