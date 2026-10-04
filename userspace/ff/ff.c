@@ -28,6 +28,18 @@ static void kprof_mark(void) {
     __asm__ volatile("int $0x80" :: "a"(503) : "memory");
 }
 
+/* ...and to zero them (syscall 504) as Firefox is launched, so that dump
+ * covers launch -> paint and nothing of the boot before it. */
+static void kprof_reset(void) {
+    __asm__ volatile("int $0x80" :: "a"(504) : "memory");
+}
+
+static long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static char *const ff_envp[] = {
     "PATH=/disk:/disk/bin:/:/bin",
     /* HOME must be WRITABLE: nsToolkitProfileService creates/writes
@@ -75,10 +87,13 @@ static char *const ff_envp[] = {
     /* The content process sandbox is ON (docs/sandbox.md): the kernel has
      * seccomp-bpf with TSYNC and no_new_privs, so each child filters its own
      * system calls and reaches files only through the parent's SandboxBroker.
-     * MOZ_SANDBOX_LOGGING makes a child report every syscall its filter
-     * refuses or traps for the broker ("Sandbox: ..." on stderr), and the
-     * parent log the sandbox features it found at start. */
-    "MOZ_SANDBOX_LOGGING=1",
+     * MOZ_SANDBOX_LOGGING (added by build_env when /disk/ffcfg/ffsandboxlog
+     * exists) makes a child report every syscall its filter refuses or traps
+     * for the broker ("Sandbox: ..." on stderr), and the parent log its broker
+     * policies and each child's whole BPF program.  That is ~45 KiB on the
+     * serial console before the first paint, and the UART interrupts it costs
+     * were a tenth of the startup, so it is off unless asked for; violations
+     * still reach about:support's syscallLog, which smoke-firefox checks. */
     /* alsa-lib (under apulse) reads its configuration from here instead of
      * its compiled-in /usr/share/alsa; ports/firefox/fetch-runtime.sh
      * installs it from libasound2-data. */
@@ -145,7 +160,7 @@ static char *const ff_envp[] = {
  * deal cheaper than rebuilding the 1 GiB image for every experiment. */
 static char  moz_log_buf[512];
 static char  moz_log_file_buf[256];
-static char *ff_env[sizeof(ff_envp) / sizeof(ff_envp[0])];
+static char *ff_env[sizeof(ff_envp) / sizeof(ff_envp[0]) + 1];
 
 /* Read a one-line override file into buf after `prefix`; 1 if it had content. */
 static int read_override(const char *path, char *buf, int cap, const char *prefix) {
@@ -166,6 +181,10 @@ static int read_override(const char *path, char *buf, int cap, const char *prefi
 static char *const *build_env(void) {
     unsigned n = 0;
     for (; ff_envp[n]; n++) ff_env[n] = ff_envp[n];
+    if (access("/disk/ffcfg/ffsandboxlog", F_OK) == 0) {
+        ff_env[n++] = "MOZ_SANDBOX_LOGGING=1";
+        printf("ff: MOZ_SANDBOX_LOGGING=1\n");
+    }
     ff_env[n] = 0;
 
     /* /disk/ffcfg/ffmozlogfile moves the log onto the ext2 disk, where it
@@ -361,6 +380,8 @@ int main(void) {
         copyfile("/disk/ffprofile/prefs.js", "/tmp/ffp/prefs.js");
         copyfile("/disk/ffprofile/user.js",  "/tmp/ffp/user.js");
 
+        kprof_reset();
+        long t_launch = now_ms();
         int fpid = fork();
         if (fpid == 0) {
             int tty = open("/dev/tty", O_WRONLY);   /* GTK errors → host serial */
@@ -373,14 +394,19 @@ int main(void) {
         int status = 0, painted = 0, exited = 0;
         time_t deadline = time((time_t *)0) + PAINT_TIMEOUT_S;
         /* Iteration cap as a backstop in case the clock ever misbehaves: each
-         * pass costs >= 100 ms of usleep, so this can only fire after the
+         * pass costs >= 20 ms of usleep, so this can only fire after the
          * deadline would have. */
-        int max_iters = PAINT_TIMEOUT_S * 20;
+        int max_iters = PAINT_TIMEOUT_S * 50;
         for (int t = 0; t < max_iters && time((time_t *)0) < deadline; t++) {
             if (waitpid(fpid, &status, 1 /* WNOHANG */) == fpid) { exited = 1; break; }
             if (access("/tmp/ff_painted", F_OK) == 0) { kprof_mark(); painted = 1; break; }
-            usleep(100000);   /* 100 ms */
+            usleep(20000);    /* 20 ms: the resolution of the paint time below */
         }
+        if (painted)
+            /* Measured here, not by the harness: the serial line this lands on
+             * can sit behind tens of KiB of queued console output. */
+            printf("ff: paint marker %ld ms after launch (attempt %d)\n",
+                   now_ms() - t_launch, attempt + 1);
 
         if (painted) {
             /* The marker means SOMETHING painted — but if the browser process

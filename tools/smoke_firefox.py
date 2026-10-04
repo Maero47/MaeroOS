@@ -472,6 +472,8 @@ def red_pixels(frame):
 
 
 SANDBOX_REPORT = "maeros-sandbox: "
+STARTUP_REPORT = "maeros-startup: "     # Services.startup.getStartupInfo(), ms since process start
+PAINT_MS = re.compile(r"ff: paint marker (\d+) ms after launch")
 SANDBOX_WAIT = 45          # s after the verdict to wait for the sandbox report
 
 
@@ -794,6 +796,8 @@ class Run:
         self.key_notes = None
         self.key_ok = None
         self.sandbox = None        # about:support's sandbox section (maeros.cfg)
+        self.startup = None        # Firefox's startup timeline (maeros.cfg)
+        self.paint_ms = None       # launch -> paint marker, measured by ff in the guest
 
     # ── serial intake ────────────────────────────────────────────────────
     def feed(self, chunk):
@@ -864,6 +868,15 @@ class Run:
             interesting = True
         elif self.panic_lines and len(self.panic_lines) < 30:
             self.panic_lines.append(line)
+        elif PAINT_MS.search(line):
+            self.paint_ms = int(PAINT_MS.search(line).group(1))
+            interesting = True
+        elif STARTUP_REPORT in line:
+            try:
+                self.startup = json.loads(line.split(STARTUP_REPORT, 1)[1])
+            except ValueError:
+                self.startup = {"unparsed": line.split(STARTUP_REPORT, 1)[1].strip()}
+            interesting = True
         elif SANDBOX_REPORT in line:
             try:
                 self.sandbox = json.loads(line.split(SANDBOX_REPORT, 1)[1])
@@ -913,6 +926,12 @@ class Run:
             ("   (%.1fs after the launcher started)" % (self.t_paint - self.t_ff))
             if self.t_paint is not None and self.t_ff is not None else ""))
         L.append("  first Firefox X window    : %s" % fmt_t(self.t_xwindow))
+        L.append("  launch -> paint marker    : %s" % (
+            "%d ms (ff's clock in the guest)" % self.paint_ms if self.paint_ms is not None else "-"))
+        if self.startup:
+            L.append("  firefox startup timeline  : %s" % " ".join(
+                "%s=%s" % (k, self.startup[k]) for k in sorted(self.startup, key=lambda k: (
+                    self.startup[k] if isinstance(self.startup[k], (int, float)) else 1e12, k))))
         if self.desktop_ended is not None:
             L.append("  desktop session ended     : %s" % fmt_t(self.desktop_ended))
         L.append("")

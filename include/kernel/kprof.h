@@ -72,7 +72,6 @@ enum {
     KPP_SCHED_DISP,     /* dispatch prologue: tss, tls, cr3, fpu             */
     KPP_GAP_FIND,       /* vma_gap_find                                      */
     KPP_FIRST_MAPPED,   /* first_mapped_page                                 */
-    KPP_MMAP_POP,       /* eager population inside mmap2                     */
     KPP_MMAP_UNMAP,     /* unmap_range inside mmap2                          */
     KPP_FAULT_READ,     /* vfs_read inside a file-backed fault               */
     KPP_FAULT_ZERO,     /* the memset of a freshly allocated fault frame     */
