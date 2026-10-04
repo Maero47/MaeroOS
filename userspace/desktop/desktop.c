@@ -2609,6 +2609,7 @@ static int setup_runtime_dir(void) {
     int uid = getuid();
 
     snprintf(wm_dir, sizeof(wm_dir), "/tmp/.wm-%d", uid);
+    mkdir("/tmp", 0755);
     mkdir(wm_dir, 0700);
     if (lstat(wm_dir, &st) < 0 || !S_ISDIR(st.st_mode) || (int)st.st_uid != uid) {
         add_log("WM RUNTIME DIR NOT OURS");

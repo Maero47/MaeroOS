@@ -189,7 +189,7 @@ def live_install(accel):
         # link: the installed file is empty (checked on the host).
         con.run("mkdir -p /tmp/rs/u; echo public > /tmp/rs/u/f; "
                 "echo RACE_SECRET > /tmp/rs_secret; chmod 600 /tmp/rs_secret", timeout=30)
-        race = con.run("sh -c 'sleep 4; rm /tmp/rs/u/f; ln -s /tmp/rs_secret /tmp/rs/u/f; echo yes' "
+        race = con.run("shell -c 'sleep 4; rm /tmp/rs/u/f; ln -s /tmp/rs_secret /tmp/rs/u/f; echo yes' "
                        "| maeros-install --source /tmp/rs /dev/sdd; echo rc=$?", timeout=300)
         if "rc=0" not in race or "/tmp/rs/u/f changed since the scan" not in race:
             raise AssertionError(f"scan/copy race install:\n{race[-3000:]}")

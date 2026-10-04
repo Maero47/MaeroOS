@@ -19,7 +19,8 @@ int wm_runtime_dir(char *out, int size) {
     int want;
     struct stat st;
 
-    if (env && env[0] == '/') {
+    /* A set-uid caller (xapp) takes no path from its environment. */
+    if (env && env[0] == '/' && getuid() == geteuid()) {
         snprintf(out, (size_t)size, "%s", env);
         want = me == 0 ? -1 : me;       /* root may name any user's desktop */
     } else {
