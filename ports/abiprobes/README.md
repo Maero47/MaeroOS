@@ -76,6 +76,7 @@ regression tests for the fixes in audit section 5.
 | P73 | `p73_netlink_limits.c`     | nobody holding as many netlink sockets as it can, 16 of them flooded with unread NOOP\|ACK replies, keeps at most 2 MiB queued, and root can still open AF_NETLINK/AF_INET sockets and get replies meanwhile; RTM_DELADDR through a socket nobody opened is EPERM even for root (opener and sender both need the privilege) | — |
 | P74 | `p74_raw_short_send.c`     | ICMPv6 raw sendto of 0-3 bytes is EINVAL (it halted the machine through an lwIP assert), 8 bytes go out; IP_HDRINCL sendto shorter than an IP header is EINVAL (root; SKIP otherwise) | — |
 | P75 | `p75_ephemeral_ports.c`    | sixteen implicitly bound UDP sockets and sixteen TCP connections do not get consecutive local ports (lwIP counted up from a fixed start: LWIP_RAND() was 4) | — |
+| P76 | `p76_alsa_close_race.c`    | close of the ALSA PCM while a sibling thread's START is still writing the staged buffer, interrupted by a signal: the device cannot be reopened before START returns, START succeeds (the close freed the buffer under it); SKIP without a sound card, run by smoke-hda | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the

@@ -133,6 +133,8 @@ PROBES = {
     "p74_raw_short_send":      (60, ""),
     # Ephemeral ports drawn at random (LWIP_RAND() was the constant 4).
     "p75_ephemeral_ports":     (60, ""),
+    # Needs a sound card: SKIP here, required by smoke-hda.
+    "p76_alsa_close_race":     (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.
