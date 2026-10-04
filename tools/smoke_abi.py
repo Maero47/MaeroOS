@@ -122,6 +122,10 @@ PROBES = {
     "p51_procfs_fair":         (150, ""),
     # SIGKILL of a parent with an unreaped child (hung the kernel).
     "p52_kill_zombie_child":   (60, ""),
+    # SCM_RIGHTS batches charged to the ring; the unix GC walks a listener's
+    # backlog (drivers + network review, 2026-10-04).
+    "p70_scm_rights_budget":   (120, ""),
+    "p71_unix_gc_backlog":     (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

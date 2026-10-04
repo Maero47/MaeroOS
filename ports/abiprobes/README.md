@@ -70,6 +70,8 @@ regression tests for the fixes in audit section 5.
 | P50 | `p50_accounting.c`          | `/proc/self/fd`/`fdinfo` nodes are dropped once the fds close (`procfs_nodes`); inotify's spill bucket returns to 0 after a spilled user gets a slot | — |
 | P51 | `p51_procfs_fair.c`         | an unprivileged user looking up ~6000 distinct `/proc/<pid>/fd`/`fdinfo` nodes in tight loops cannot make root's or another user's `/proc` lookups (or `ps`) fail; `procfs_nodes` stays within `procfs_nodes_max` and falls back once it stops; a user cannot hold (open/inotify-watch) more than its share of nodes; per-pid `/proc` dirs are refused as bind source/target | — |
 | P52 | `p52_kill_zombie_child.c`   | `kill(pid, SIGKILL)` and `kill(-pgrp, SIGKILL)` of a process with an unreaped zombie child return and kill it (the SIGKILL subtree walk used to spin forever under the BKL) | — |
+| P70 | `p70_scm_rights_budget.c`  | a stream and a seqpacket socketpair flooded with unread 1-byte SCM_RIGHTS messages stop with EAGAIN (Linux: sk_sndbuf, ~280 messages) instead of queueing ~65,000 5 KiB batches; a blocked sender wakes when the reader drains; every fd arrives; writable again after | — |
+| P71 | `p71_unix_gc_backlog.c`    | a listener sent over a connection still in its own backlog and then closed is collected (the name can be bound again) | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the

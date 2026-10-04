@@ -9663,7 +9663,7 @@ static int usock_call(int call, uint32_t *kargs, usocket_t *us, int nb,
          * scm_abort() takes the batch back out. */
         uint32_t scm_id = 0;
         if (call == 16 && npass > 0) {
-            int sr = usocket_send_fds(us, pass, npass, &scm_id);
+            int sr = usocket_send_fds(us, pass, npass, &scm_id, mflags);
             if (sr < 0) {
                 for (int k = 0; k < npass; k++) fd_release(&pass[k]);
                 npass = 0;
