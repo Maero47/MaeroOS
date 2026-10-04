@@ -624,15 +624,15 @@ $(TESTFILES)/cttytest: $(CRT0_OBJ) cttytest/cttytest.o libc/libc.a
 desktop/desktop.o: desktop/desktop.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(TESTFILES)/desktop: $(CRT0_OBJ) desktop/desktop.o libc/libc.a
-	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) desktop/desktop.o libc/libc.a
+$(TESTFILES)/desktop: $(CRT0_OBJ) desktop/desktop.o libwm/wm.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) desktop/desktop.o libwm/wm.o libc/libc.a
 
 # wmctl
 wmctl/wmctl.o: wmctl/wmctl.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(TESTFILES)/wmctl: $(CRT0_OBJ) wmctl/wmctl.o libc/libc.a
-	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) wmctl/wmctl.o libc/libc.a
+$(TESTFILES)/wmctl: $(CRT0_OBJ) wmctl/wmctl.o libwm/wm.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) wmctl/wmctl.o libwm/wm.o libc/libc.a
 
 # gui_demo
 gui_demo/gui_demo.o: gui_demo/gui_demo.c
@@ -711,8 +711,8 @@ $(TESTFILES)/view: view/view.o $(GUIAPP_DEPS)
 # Alpine X11 apps (docs/alpinex.md): the set-uid helper prepare.py puts on
 # disk-alpinex.img as /disk/xapp, and the Linux Apps window.
 xapp/xapp.o xapp/linuxapps.o: xapp/xapps.h
-$(TESTFILES)/xapp: xapp/xapp.o $(CRT0_OBJ) libc/libc.a
-	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) xapp/xapp.o libc/libc.a
+$(TESTFILES)/xapp: xapp/xapp.o $(CRT0_OBJ) libwm/wm.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) xapp/xapp.o libwm/wm.o libc/libc.a
 $(TESTFILES)/xappattack: xapp/xappattack.o $(CRT0_OBJ) libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) xapp/xappattack.o libc/libc.a
 $(TESTFILES)/linuxapps: xapp/linuxapps.o $(GUIAPP_DEPS)

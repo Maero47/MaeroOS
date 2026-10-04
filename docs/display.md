@@ -83,7 +83,7 @@ allocates anything.
 On a flush display the desktop's `present()` turns the spans it wrote into
 rectangles (rows with the same span merge; past 16 the last one grows) and
 flushes them with one ioctl per frame, so a pointer move flushes a few hundred
-pixels, not the screen.  `echo stats > /tmp/wmctl` prints `flushes=`,
+pixels, not the screen.  `echo stats > /tmp/.wm-1000/ctl` prints `flushes=`,
 `flush_rects=` and `flush_kpx=` with the other compositor counters.
 
 ## Test

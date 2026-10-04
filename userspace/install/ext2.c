@@ -64,6 +64,7 @@ struct node {
     char      *name;
     uint32_t   mode, uid, gid, atime, mtime, ctime, rdev;
     uint64_t   size;
+    uint64_t   sdev, sino;         /* the source file as the scan saw it */
     uint32_t   ino;
     uint32_t   nlink;              /* names that point at the inode */
     node_t    *link_of;            /* a later name of an earlier inode */
@@ -237,6 +238,8 @@ static node_t *new_node(const char *path, const char *name, const struct stat *s
     n->mtime = (uint32_t)st->st_mtime;
     n->ctime = (uint32_t)st->st_ctime;
     n->size  = (uint64_t)st->st_size;
+    n->sdev  = (uint64_t)st->st_dev;
+    n->sino  = (uint64_t)st->st_ino;
     n->nlink = 1;
     return n;
 }
@@ -658,11 +661,37 @@ static uint8_t *g_io;               /* file read buffer */
 #define IO_SIZE (256u * 1024u)
 static uint64_t g_copied;
 
+/* Open the regular file the scan recorded, or return -1 if `path` is now
+ * something else.  The copy gets the scanned owner and mode, so between the
+ * scan and the copy a user who owns a directory on the way must not be able
+ * to swap their file for a link to (or another name of) a file they cannot
+ * read, e.g. /disk/etc/shadow: no link is followed, and the file opened must
+ * be the same inode on the same device.  O_NONBLOCK keeps a FIFO put in its
+ * place from blocking the open. */
+static int open_scanned(const node_t *n) {
+    int fd = open(n->path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) ||
+        (uint64_t)st.st_dev != n->sdev || (uint64_t)st.st_ino != n->sino) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 static void write_file(node_t *n) {
     fmap_t m;
     memset(&m, 0, sizeof(m));
-    int fd = open(n->path, O_RDONLY);
-    if (fd < 0) die("cannot open %s", n->path);
+    int fd = open_scanned(n);
+    if (fd < 0) {
+        /* Gone or replaced since the scan: install it empty. */
+        fprintf(stderr, "maeros-install: %s changed since the scan, copied empty\n", n->path);
+        g_copied += n->size;
+        n->size = 0;
+        fmap_finish(&m, n->ino);
+        return;
+    }
     uint64_t left = n->size;
     while (left) {
         size_t want = left < IO_SIZE ? (size_t)left : IO_SIZE;

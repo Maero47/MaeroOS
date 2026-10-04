@@ -296,6 +296,11 @@ def dns_checks(proc, sel, log, webdir):
                   ("7.2.0.192.in-addr.arpa", "PTR")]:
             if q not in seen:
                 raise AssertionError(f"DNS responder never saw {q}: {dns.queries}")
+        # IDs come from getrandom(): no counter, and the AAAA query of a pair
+        # does not reuse the A query's ID + 1 (off-path spoofing).
+        steps = sum(1 for a, b in zip(dns.ids, dns.ids[1:]) if (b - a) % 65536 in (1, 65535))
+        if len(dns.ids) >= 6 and steps > 1:
+            raise AssertionError(f"DNS query IDs look sequential: {dns.ids}")
         print(f"dns ok: {len(dns.queries)} queries answered by the test responder")
     finally:
         dns.close()

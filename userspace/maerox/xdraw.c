@@ -648,7 +648,10 @@ static void get_image(client_t *c, const uint8_t *q) {
     if (d->o.type == XT_WINDOW && ((window_t *)d)->bottom)
         composite_children((window_t *)d, pix, x, y, w, h);
     int stride = z_stride(d->depth, w);
-    size_t n = (size_t)stride * h;
+    size_t n;
+    if (!size_mul3((size_t)stride, (size_t)h, 1, &n) || n > OUTBUF_MAX) {
+        free(pix); x_error(c, BadAlloc, 0); return;
+    }
     uint8_t *data = calloc(n ? n : 1, 1);
     if (!data) { free(pix); x_error(c, BadAlloc, 0); return; }
     for (int yy = 0; yy < h; yy++) {
@@ -736,8 +739,10 @@ void draw_dispatch(client_t *c, const uint8_t *q, int qlen) {
         if (!lookup_drawable(r32(q + 8)) && r32(q + 8) != ROOT_WINDOW) { x_error(c, BadDrawable, r32(q + 8)); return; }
         if (!depth_ok(depth)) { x_error(c, BadValue, (uint32_t)depth); return; }
         if (w == 0 || h == 0) { x_error(c, BadValue, 0); return; }
+        size_t bytes;
+        if (!size_mul3((size_t)w, (size_t)h, 4, &bytes)) { x_error(c, BadAlloc, pid); return; }
         pixmap_t *p = calloc(1, sizeof(*p));
-        if (p) p->px = calloc((size_t)w * h, 4);
+        if (p) p->px = calloc(bytes / 4, 4);
         if (!p || !p->px) { free(p); x_error(c, BadAlloc, pid); return; }
         p->o.id = pid; p->o.type = XT_PIXMAP; p->o.owner = (int8_t)c->index;
         p->w = w; p->h = h; p->depth = depth; p->refs = 1;

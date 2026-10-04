@@ -34,6 +34,7 @@
 
 #define INBUF_SIZE    (65535 * 4 + 4096)
 #define OUTBUF_MAX    (24u << 20)
+#define PROP_MAX      (64u << 20)   /* bytes in one window property */
 
 /* Resource types. */
 enum { XT_NONE, XT_WINDOW, XT_PIXMAP, XT_GC, XT_FONT, XT_CURSOR, XT_COLORMAP,
@@ -283,6 +284,14 @@ static inline uint32_t r32(const uint8_t *p) {
 static inline void put16(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static inline void put32(uint8_t *p, uint32_t v) {
     p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+/* a*b*c for a buffer sized from request fields.  size_t is 32 bits here, so
+ * 16-bit widths and heights times a pixel size can wrap: returns 0 when the
+ * product does not fit, and the caller fails the request instead of
+ * allocating the wrapped size. */
+static inline int size_mul3(size_t a, size_t b, size_t c, size_t *out) {
+    size_t ab;
+    return !__builtin_mul_overflow(a, b, &ab) && !__builtin_mul_overflow(ab, c, out);
 }
 static inline int imin(int a, int b) { return a < b ? a : b; }
 static inline int imax(int a, int b) { return a > b ? a : b; }

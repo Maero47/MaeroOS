@@ -2,6 +2,9 @@
 #include "../include/unistd.h"
 #include "../include/string.h"
 #include "../include/errno.h"
+#include "../include/limits.h"
+#include "../include/sys/mman.h"
+#include "libc_lock.h"
 
 /* environ is defined in crt0.asm as a .bss word, exported as a global symbol */
 extern char **environ;
@@ -26,7 +29,51 @@ typedef struct blk {
 
 static blk_t *heap_head = (void *)0;
 
+/* The free list and the break are shared by every thread (browse, store and
+ * linuxapps allocate from workers): each operation holds this lock. */
+volatile int __libc_heap_lock;
+
+/* Set by pthread_create.  The kernel's brk() keeps the break per thread, so
+ * a worker's brk starts from a stale break and maps fresh pages over heap
+ * another thread already uses.  Once a process has threads the heap grows
+ * with anonymous mmap instead (whole chunks, carved under the heap lock). */
+int __libc_threaded;
+static char *arena_cur, *arena_end;
+
+#define ARENA_CHUNK (256u * 1024u)
+
+static void *heap_grow(size_t n) {
+    if (!__libc_threaded) return sbrk((int)n);
+    if ((size_t)(arena_end - arena_cur) < n) {
+        size_t len = n > ARENA_CHUNK ? (n + 4095) & ~(size_t)4095 : ARENA_CHUNK;
+        /* The kernel's mmap2 itself: libc's mmap() of anonymous memory is
+         * malloc() (toybox_compat.c), which would take this lock again. */
+        long r = syscall(192, 0L, (long)len, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1L, 0L);
+        if (r < 0 && r > -4096) return (void *)-1;
+        char *p = (char *)r;
+        /* Populate it now, as brk does: the kernel drops the leader's VMAs
+         * when the leader thread exits alone, and a surviving thread would
+         * then fault on a lazily-mapped page of its own stack. */
+        for (size_t o = 0; o < len; o += 4096) ((volatile char *)p)[o] = 0;
+        if (p != arena_end) arena_cur = p;     /* the old tail is left unused */
+        arena_end = p + len;
+    }
+    void *r = arena_cur;
+    arena_cur += n;
+    return r;
+}
+
+static void *malloc_locked(size_t size);
+
 void *malloc(size_t size) {
+    libc_lock(&__libc_heap_lock);
+    void *p = malloc_locked(size);
+    libc_unlock(&__libc_heap_lock);
+    return p;
+}
+
+static void *malloc_locked(size_t size) {
     if (!size) return (void *)0;
 
     /* sbrk() takes an int: anything that cannot be aligned and given a header
@@ -47,7 +94,7 @@ void *malloc(size_t size) {
     }
 
     /* Expand heap */
-    blk_t *nb = sbrk(sizeof(blk_t) + size);
+    blk_t *nb = heap_grow(sizeof(blk_t) + size);
     if (nb == (void *)-1) return (void *)0;
     nb->size = size;
     nb->free = 0;
@@ -65,10 +112,24 @@ void *malloc(size_t size) {
     return (char *)nb + sizeof(blk_t);
 }
 
+/* Is p a block malloc() handed out?  munmap() (toybox_compat.c) frees the
+ * anonymous "mappings" mmap() took from the heap, which in a threaded
+ * process lie in the mmap range too. */
+int __libc_heap_owns(const void *p) {
+    int found = 0;
+    libc_lock(&__libc_heap_lock);
+    for (blk_t *b = heap_head; b; b = b->next)
+        if ((const char *)b + sizeof(blk_t) == (const char *)p) { found = 1; break; }
+    libc_unlock(&__libc_heap_lock);
+    return found;
+}
+
 void free(void *ptr) {
     if (!ptr) return;
     blk_t *b = (blk_t *)((char *)ptr - sizeof(blk_t));
+    libc_lock(&__libc_heap_lock);
     b->free = 1;
+    libc_unlock(&__libc_heap_lock);
 }
 
 char *getenv(const char *name) {
@@ -90,32 +151,27 @@ int atoi(const char *s) {
     return neg ? -n : n;
 }
 
+/* posix.c: the digits of s as a magnitude, saturated at limit (*over). */
+unsigned long long __strto_u64(const char *s, char **endp, int base,
+                               int *neg, unsigned long long limit, int *over);
+
+/* C11 7.22.1.4: out of range gives LONG_MAX / LONG_MIN / ULONG_MAX and
+ * errno ERANGE (callers such as inet_aton range-check the result, which a
+ * wrapped value would pass). */
 long strtol(const char *s, char **endp, int base) {
-    long n = 0; int neg = 0;
-    while (*s == ' ' || *s == '\t') s++;
-    if (*s == '-') { neg = 1; s++; }
-    else if (*s == '+') s++;
-    if (base == 0) {
-        if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { base = 16; s += 2; }
-        else if (s[0] == '0') { base = 8; s++; }
-        else base = 10;
-    } else if (base == 16 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
-    while (*s) {
-        int d;
-        if (*s >= '0' && *s <= '9') d = *s - '0';
-        else if (*s >= 'a' && *s <= 'z') d = *s - 'a' + 10;
-        else if (*s >= 'A' && *s <= 'Z') d = *s - 'A' + 10;
-        else break;
-        if (d >= base) break;
-        n = n * base + d;
-        s++;
-    }
-    if (endp) *endp = (char *)s;
-    return neg ? -n : n;
+    int neg, over;
+    unsigned long long v = __strto_u64(s, endp, base, &neg,
+                                       (unsigned long long)LONG_MAX + 1, &over);
+    if (over) return neg ? LONG_MIN : LONG_MAX;
+    if (!neg && v > (unsigned long long)LONG_MAX) { errno = ERANGE; return LONG_MAX; }
+    return neg ? (long)(0UL - (unsigned long)v) : (long)v;
 }
 
 unsigned long strtoul(const char *s, char **endp, int base) {
-    return (unsigned long)strtol(s, endp, base);
+    int neg, over;
+    unsigned long long v = __strto_u64(s, endp, base, &neg, ULONG_MAX, &over);
+    if (over) return ULONG_MAX;
+    return neg ? 0UL - (unsigned long)v : (unsigned long)v;
 }
 
 long atol(const char *s) { return strtol(s, (char **)0, 10); }

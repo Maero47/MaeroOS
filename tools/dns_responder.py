@@ -58,6 +58,7 @@ class DnsResponder:
             for ip in recs.get("A", []) + recs.get("AAAA", []):
                 self.ptr.setdefault(ipaddress.ip_address(ip).reverse_pointer, name)
         self.queries = []
+        self.ids = []             # query IDs in arrival order
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((bind, 0))
         self.port = self.sock.getsockname()[1]
@@ -115,6 +116,7 @@ class DnsResponder:
             except (IndexError, struct.error):
                 continue
             self.queries.append((qname.lower(), TYPE_NAMES.get(qtype, qtype)))
+            self.ids.append(ident)
             rcode, rrs = self._answer(qname, qtype) if qclass == 1 else (4, [])
             # QR, AA, RD copied, RA; RCODE.
             rflags = 0x8000 | 0x0400 | (flags & 0x0100) | 0x0080 | rcode

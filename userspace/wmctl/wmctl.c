@@ -2,8 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-
-#define WMCTL_PATH "/tmp/wmctl"
+#include <wm.h>
 
 static void usage(void) {
     printf("usage: wmctl COMMAND [TEXT]\n");
@@ -48,7 +47,8 @@ int main(int argc, char **argv) {
     }
     strcat(line, "\n");
 
-    fd = open(WMCTL_PATH, O_WRONLY);
+    /* <runtime dir>/ctl: root reaches the session user's desktop. */
+    fd = wm_open_fifo("ctl", O_WRONLY);
     if (fd < 0) {
         printf("wmctl: desktop control fifo unavailable\n");
         return 1;

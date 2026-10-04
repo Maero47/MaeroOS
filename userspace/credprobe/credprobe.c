@@ -5,8 +5,11 @@
  * Run as root (smoke-disk does), it prepares root-owned fixtures, checks the
  * root-side rules (atomic rename that keeps the renamed file's mode and owner,
  * O_EXCL, "#!" interpreter checks), then drops its real ids to uid 1000 /
- * gid 100 and re-executes /disk/credprobe, which the disk manifest installs
- * set-uid root (04755).  That second half starts as ruid 1000 / euid 0 /
+ * gid 100 and re-executes a set-uid root (04755) copy of itself.  The disk
+ * image ships /disk/credprobe as a plain 0755 program: the root half copies it
+ * into a fresh root-owned 0755 directory (SUID_DIR, which no other user can
+ * add to), sets the bit on the copy only for the length of the run and
+ * removes it afterwards.  That second half starts as ruid 1000 / euid 0 /
  * suid 0, checks the saved-set-uid rules, drops for good with
  * setresuid(1000,1000,1000), and then checks that an ordinary user cannot
  * unlink, rename or truncate root's files, write through a read-only
@@ -58,6 +61,7 @@
 #define K_O_TRUNC    0x200
 #define K_O_APPEND   0x400
 #define K_O_NONBLOCK 0x800
+#define K_O_NOFOLLOW 0x20000
 #define K_F_SETFL    4
 
 #define K_PROT_READ  1
@@ -83,6 +87,12 @@
 #define TMP_ROOT_FILE "/tmp/cp_sticky"
 #define TMP_ROOT_DIR  "/tmp/cp_rdir"
 #define TMP_DIR_FILE  "/tmp/cp_rdir/f"
+/* The set-uid copy lives in a directory only root can write to, created
+ * fresh for the run; files the set-uid half creates go there too, never
+ * into the shared /tmp where another user could plant a symlink. */
+#define SUID_DIR      "/tmp/cp_suid"
+#define SUID_BIN      SUID_DIR "/credprobe"
+#define SUID_MADE     SUID_DIR "/made"
 
 static int failures;
 
@@ -108,10 +118,12 @@ static int kopen(const char *path, int flags) {
     return syscall3(NR_OPEN, (int)path, flags, 0644);
 }
 
-/* Create `path` holding `text`, owned by uid:gid with `mode`. */
+/* Create `path` holding `text`, owned by uid:gid with `mode`.  The old file
+ * is removed first and the new one made with O_EXCL|O_NOFOLLOW, so a symlink
+ * planted in /tmp is never followed. */
 static int make_file(const char *path, const char *text, int mode, int uid, int gid) {
     syscall1(NR_UNLINK, (int)path);
-    int fd = kopen(path, K_O_WRONLY | K_O_CREAT | K_O_TRUNC);
+    int fd = kopen(path, K_O_WRONLY | K_O_CREAT | K_O_EXCL | K_O_NOFOLLOW);
     if (fd < 0) { printf("credprobe: cannot create %s (%d)\n", path, fd); return -1; }
     syscall3(NR_WRITE, fd, (int)text, (int)strlen(text));
     syscall3(NR_FCHOWN32, fd, uid, gid);
@@ -241,18 +253,20 @@ static void setuid_checks(void) {
     check("exec of set-uid binary sets euid and suid",
           r == USER_UID && e == 0 && s == 0, e);
     if (e != 0) {
-        printf("credprobe: /disk/credprobe is not set-uid root; skipping\n");
+        printf("credprobe: %s is not set-uid root; skipping\n", SUID_BIN);
         return;
     }
 
-    /* Files are created with the effective ids. */
-    int fd = kopen("/tmp/cp_suid_made", K_O_WRONLY | K_O_CREAT | K_O_TRUNC);
+    /* Files are created with the effective ids.  Only in the root-owned
+     * SUID_DIR, and never through a link: this half runs at euid 0 on behalf
+     * of whoever started it. */
+    int fd = kopen(SUID_MADE, K_O_WRONLY | K_O_CREAT | K_O_EXCL | K_O_NOFOLLOW);
     struct stat st;
     int sr = (fd >= 0) ? fstat(fd, &st) : fd;
     check("set-uid creates files as euid", sr == 0 && st.st_uid == 0,
           sr == 0 ? (int)st.st_uid : sr);
     if (fd >= 0) close(fd);
-    syscall1(NR_UNLINK, (int)"/tmp/cp_suid_made");
+    syscall1(NR_UNLINK, (int)SUID_MADE);
 
     /* A temporary drop keeps the saved id, so it can be undone. */
     int x = syscall3(NR_SETRESUID32, -1, USER_UID, -1);
@@ -391,6 +405,39 @@ static void user_checks(void) {
     waitpid(child, &st, 0);
 }
 
+/* Copy /disk/credprobe to SUID_BIN, owned by root with mode 04755.  SUID_DIR
+ * must be new (mkdir fails on anything already there, a link included), so
+ * no other user can have a hand in what ends up set-uid. */
+static int make_suid_copy(void) {
+    if (mkdir(SUID_DIR, 0755) != 0) {
+        printf("credprobe: cannot create %s (left over or planted?)\n", SUID_DIR);
+        return -1;
+    }
+    chmod(SUID_DIR, 0755);
+    int in = kopen("/disk/credprobe", K_O_RDONLY);
+    int out = kopen(SUID_BIN, K_O_WRONLY | K_O_CREAT | K_O_EXCL | K_O_NOFOLLOW);
+    int ok = in >= 0 && out >= 0;
+    char buf[4096];
+    while (ok) {
+        int n = read(in, buf, sizeof(buf));
+        if (n == 0) break;
+        if (n < 0 || write(out, buf, n) != n) ok = 0;
+    }
+    if (in >= 0) close(in);
+    if (out >= 0) {
+        if (ok && fchmod(out, 04755) != 0) ok = 0;
+        close(out);
+    }
+    if (!ok) printf("credprobe: cannot copy /disk/credprobe to %s\n", SUID_BIN);
+    return ok ? 0 : -1;
+}
+
+static void remove_suid_copy(void) {
+    syscall1(NR_UNLINK, (int)SUID_MADE);
+    syscall1(NR_UNLINK, (int)SUID_BIN);
+    rmdir(SUID_DIR);
+}
+
 static int run_user_half(void) {
     setuid_checks();
     user_checks();
@@ -415,20 +462,31 @@ int main(int argc, char *argv[]) {
     chmod(TMP_ROOT_DIR, 0755);
     make_file(TMP_DIR_FILE, "f", 0644, 0, 0);
 
-    int pid = fork();
+    /* The shipped program must not be set-uid. */
+    struct stat dst;
+    int sr = stat("/disk/credprobe", &dst);
+    check("/disk/credprobe is not set-uid", sr == 0 && !(dst.st_mode & 06000),
+          sr == 0 ? (int)dst.st_mode : sr);
+
+    int made = make_suid_copy();
+    check("set-uid copy made", made == 0, made);
+    int pid = made == 0 ? fork() : -1;
     if (pid == 0) {
         syscall3(NR_SETRESGID32, USER_GID, USER_GID, USER_GID);
         syscall3(NR_SETRESUID32, USER_UID, USER_UID, USER_UID);
         char *uargv[] = { "credprobe", "--user", (char *)0 };
         char *uenvp[] = { (char *)0 };
-        execve("/disk/credprobe", uargv, uenvp);
-        printf("credprobe: exec of /disk/credprobe FAILED\n");
+        execve(SUID_BIN, uargv, uenvp);
+        printf("credprobe: exec of %s FAILED\n", SUID_BIN);
         _exit(1);
     }
     int st = 0;
-    int w = waitpid(pid, &st, 0);
+    int w = pid > 0 ? waitpid(pid, &st, 0) : -1;
     check("unprivileged half passed", w == pid && !WIFSIGNALED(st) &&
           WEXITSTATUS(st) == 0, WEXITSTATUS(st));
+    remove_suid_copy();
+    sr = stat(SUID_DIR, &dst);
+    check("set-uid copy removed", sr != 0, sr);
 
     syscall1(NR_UNLINK, (int)ROOT_FILE);
     syscall1(NR_UNLINK, (int)TMP_ROOT_FILE);

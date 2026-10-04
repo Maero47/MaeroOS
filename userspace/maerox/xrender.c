@@ -845,8 +845,16 @@ static void do_add_glyphs(client_t *c, const uint8_t *q, int qlen) {
         const uint8_t *gi = infos + 12 * i;
         int w = (int)r16(gi), h = (int)r16(gi + 2);
         int stride = fmt == PICTFMT_A1 ? ((w + 31) / 32) * 4 : fmt == PICTFMT_ARGB32 ? w * 4 : (w + 3) & ~3;
-        size_t sz = (size_t)stride * h;
-        if (off + sz > avail) { x_error(c, BadLength, 0); return; }
+        /* The image must be in the request: checked in 64 bits, since
+         * stride * h (4*w*h for ARGB32) can wrap a 32-bit size_t. */
+        uint64_t sz64 = (uint64_t)stride * (uint64_t)h;
+        if (sz64 > avail - off) { x_error(c, BadLength, 0); return; }
+        size_t sz = (size_t)sz64;
+        size_t n;
+        if (!size_mul3((size_t)w, (size_t)h, fmt == PICTFMT_ARGB32 ? 4 : 1, &n)) {
+            x_error(c, BadAlloc, 0);
+            return;
+        }
         uint32_t gid = r32(ids + 4 * i);
         glyph_t *g = glyph_slot(gs, gid, 1);
         if (!g) { off += sz; continue; }
@@ -855,9 +863,8 @@ static void do_add_glyphs(client_t *c, const uint8_t *q, int qlen) {
         g->w = w; g->h = h; g->x = rs16(gi + 4); g->y = rs16(gi + 6);
         g->xoff = rs16(gi + 8); g->yoff = rs16(gi + 10);
         const uint8_t *src = img + off;
-        size_t n = (size_t)w * h;
         if (fmt == PICTFMT_ARGB32) {
-            g->argb = malloc(n ? n * 4 : 4);
+            g->argb = malloc(n ? n : 4);
             if (g->argb)
                 for (int y = 0; y < h; y++) memcpy(g->argb + (size_t)y * w, src + (size_t)y * stride, (size_t)w * 4);
         } else {
