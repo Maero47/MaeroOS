@@ -11,10 +11,12 @@
 #define USB_TYPE_CLASS      0x20
 #define USB_RECIP_DEVICE    0x00
 #define USB_RECIP_INTERFACE 0x01
+#define USB_RECIP_ENDPOINT  0x02
 
 /* bRequest */
 #define USB_REQ_GET_DESCRIPTOR    6
 #define USB_REQ_SET_CONFIGURATION 9
+#define USB_REQ_SET_INTERFACE     11
 #define HID_REQ_SET_IDLE          0x0A
 #define HID_REQ_SET_PROTOCOL      0x0B
 
@@ -23,9 +25,13 @@
 #define USB_DT_CONFIG        2
 #define USB_DT_INTERFACE     4
 #define USB_DT_ENDPOINT      5
+#define USB_DT_SS_EP_COMP    0x30   /* SuperSpeed endpoint companion */
+#define USB_DT_CS_INTERFACE  0x24   /* class-specific (audio, UAS pipe usage) */
+#define USB_DT_CS_ENDPOINT   0x25
 #define USB_DT_HID           0x21
 #define USB_DT_REPORT        0x22
 
+#define USB_CLASS_AUDIO      1
 #define USB_CLASS_HID        3
 #define USB_CLASS_HUB        9
 #define USB_CLASS_MASS_STORAGE 8
@@ -76,15 +82,17 @@ typedef struct __attribute__((packed)) {
 /* What a class driver gets to see of a device (owned by xhci.c). */
 struct usb_device;
 
-#define USB_MAX_EPS  3       /* endpoints per device besides EP0 */
+#define USB_MAX_EPS  4       /* endpoints per device besides EP0 (UAS: 4) */
 #define USB_CLS_HID  1
 #define USB_CLS_MSC  2
 #define USB_CLS_HUB  3
+#define USB_CLS_AUDIO 4
 #define USB_STALL    (-2)
 /* what an endpoint carries (xhci.c) */
 #define EP_BULK      0
 #define EP_HID       1       /* interrupt-IN HID reports */
 #define EP_HUB       2       /* interrupt-IN hub status changes */
+#define EP_ISO       3       /* isochronous (usb_iso_*) */
 
 /* Physical address of a buffer in the kernel image (.data/.bss), which is
  * where every DMA buffer of the USB stack lives. */
@@ -108,12 +116,62 @@ int usb_control(struct usb_device *dev, const usb_setup_t *setup, void *data);
 /* Set up endpoints (bulk or interrupt); eps[i] becomes index i below. */
 int usb_configure_eps(struct usb_device *dev,
                       const usb_endpoint_desc_t *const *eps, int n);
+/* The same with what SuperSpeed and isochronous endpoints need besides the
+ * endpoint descriptor: its SuperSpeed companion (Max Burst, Mult, streams;
+ * NULL below SuperSpeed) and, for a bulk endpoint, whether it uses stream
+ * 1 (UAS on SuperSpeed) instead of a plain ring.  Isochronous endpoints
+ * (at most two in the whole system at once) are driven by usb_iso_*. */
+typedef struct {
+    const usb_endpoint_desc_t *desc;
+    const uint8_t *ss_comp;
+    int stream;
+} usb_ep_cfg_t;
+int usb_configure_eps_x(struct usb_device *dev, const usb_ep_cfg_t *eps,
+                        int n);
 /* Bulk transfer on endpoint index i: 0 (bytes moved in *actual), USB_STALL,
  * or -1.  `phys` must not cross a 64 KiB boundary. */
 int usb_bulk(struct usb_device *dev, int i, uint32_t phys, uint32_t len,
              uint32_t *actual, uint32_t timeout_ms);
+/* The same in two halves, so transfers on several endpoints can be in
+ * flight at once (UAS: status and data queued before the command goes
+ * out); one transfer per endpoint at a time.  A failed submit (-1) needs
+ * no wait. */
+int usb_bulk_submit(struct usb_device *dev, int i, uint32_t phys,
+                    uint32_t len);
+int usb_bulk_wait(struct usb_device *dev, int i, uint32_t *actual,
+                  uint32_t timeout_ms);
 /* Reset a halted endpoint on both sides. */
 int usb_clear_halt(struct usb_device *dev, int i);
+/* SET_INTERFACE (USB 2.0 9.4.10); 0, or -1 (a STALL from a device with one
+ * alternate setting counts as success). */
+int usb_set_interface(struct usb_device *dev, int ifnum, int alt);
+int usb_device_speed(const struct usb_device *dev);
+int usb_device_gone(const struct usb_device *dev);
+
+/* Isochronous endpoints (xHCI 4.11.2.5, 4.14.2).  Each TD is one service
+ * interval's worth of data, scheduled "as soon as possible" after the one
+ * before it (SIA), so a stream kept fed plays continuously.  `done` runs
+ * once per TD, oldest first, from the event handler (USB lock held): `ok`
+ * is 0 for a TD that was skipped (missed service) or taken back.  It may
+ * queue more TDs. */
+typedef void (*usb_iso_done_fn)(void *ctx, uint32_t len, int ok);
+int  usb_iso_start(struct usb_device *dev, int i, usb_iso_done_fn done,
+                   void *ctx);
+/* TDs that can be queued right now. */
+int  usb_iso_room(struct usb_device *dev, int i);
+/* Queue one TD of l1 bytes at p1 then l2 (may be 0) at p2, neither piece
+ * crossing a 64 KiB boundary; `irq` asks for an interrupt on its
+ * completion (else the event waits for the next one).  usb_iso_kick()
+ * rings the doorbell after a batch.  0 or -1. */
+int  usb_iso_queue(struct usb_device *dev, int i, uint32_t p1, uint32_t l1,
+                   uint32_t p2, uint32_t l2, int irq);
+void usb_iso_kick(struct usb_device *dev, int i);
+/* Take back every queued TD (their `done` runs with ok = 0). */
+void usb_iso_stop(struct usb_device *dev, int i);
+/* Service interval in microseconds, and counters for the trace. */
+uint32_t usb_iso_interval_us(struct usb_device *dev, int i);
+void usb_iso_stats(struct usb_device *dev, int i, uint32_t *tds,
+                   uint32_t *missed, uint32_t *underruns);
 
 /* ── mass storage (usb_msc.c) ─────────────────────────────────────────────── */
 
@@ -138,6 +196,15 @@ int usb_msc_write(int unit, uint32_t lba, uint32_t count, const void *buf);
 /* kusbd, without the USB lock: put a newly attached disk into the disk
  * table and scan its partitions. */
 void usb_msc_service(void);
+
+/* ── audio class driver (usb_audio.c) ─────────────────────────────────── */
+
+/* A USB Audio Class 1 (or 2) device with a PCM playback interface? */
+int  usb_audio_match(const uint8_t *cfg, uint32_t len);
+/* kusbd, lock held, after SET_CONFIGURATION: 0 = attached (ALSA card 1). */
+int  usb_audio_attach(struct usb_device *dev, const uint8_t *cfg,
+                      uint32_t len);
+void usb_audio_detach(struct usb_device *dev);
 
 /* ── HID class driver (usb_hid.c) ─────────────────────────────────────────── */
 

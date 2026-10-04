@@ -1,12 +1,17 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
+#include "alsactl.h"
 
 /*
  * tone — play a sine wave on /dev/dsp (48 kHz S16LE stereo).
- *   tone <hz> <ms> [volume%]
+ *   tone [-c card] <hz> <ms> [volume%]
  * With a volume, sets the mixer volume first (OSS SOUND_MIXER_WRITE_VOLUME).
+ * With -c, plays on ALSA card `card` instead (/dev/snd/pcmC<card>D0p through
+ * the raw PCM ioctls, 48 kHz S16 stereo, converted by the kernel to the
+ * card's rate), the volume going to its Master Playback Volume.
  */
 
 #define RATE 48000
@@ -25,8 +30,14 @@ int main(int argc, char **argv) {
     long frames;
     double sw, cw, x = 0, y = 1;   /* rotating unit vector */
 
+    int card = -1;
+    if (argc > 2 && strcmp(argv[1], "-c") == 0) {
+        card = atoi(argv[2]);
+        argv += 2;
+        argc -= 2;
+    }
     if (argc < 3) {
-        printf("usage: tone <hz> <ms> [volume%%]\n");
+        printf("usage: tone [-c card] <hz> <ms> [volume%%]\n");
         return 1;
     }
     hz = atoi(argv[1]);
@@ -35,12 +46,33 @@ int main(int argc, char **argv) {
         printf("tone: bad arguments\n");
         return 1;
     }
-    fd = open("/dev/dsp", O_WRONLY);
+    if (card >= 0) {
+        char path[32];
+        snprintf(path, sizeof(path), "/dev/snd/pcmC%dD0p", card);
+        fd = open(path, O_RDWR);
+        if (fd < 0) {
+            printf("tone: %s unavailable\n", path);
+            return 1;
+        }
+        if (argc > 3) {
+            int c = alsactl_open(card);
+            if (c < 0 || alsactl_elem(c, "Master Playback Volume",
+                                      atoi(argv[3])) < 0)
+                printf("tone: cannot set volume\n");
+            if (c >= 0) close(c);
+        }
+        if (alsapcm_setup(fd, 2, RATE) < 0) {
+            printf("tone: cannot set up the PCM\n");
+            return 1;
+        }
+    } else {
+        fd = open("/dev/dsp", O_WRONLY);
+    }
     if (fd < 0) {
         printf("tone: /dev/dsp unavailable (no sound device?)\n");
         return 1;
     }
-    if (argc > 3) {
+    if (argc > 3 && card < 0) {
         int v = atoi(argv[3]);
         v = v | (v << 8);
         if (ioctl(fd, SOUND_MIXER_WRITE_VOLUME, &v) < 0)
@@ -57,7 +89,18 @@ int main(int argc, char **argv) {
             y = ny;
             buf[2 * i] = buf[2 * i + 1] = v;
         }
-        {
+        if (card >= 0) {
+            int off = 0;
+            while (off < n) {
+                int w = alsapcm_write(fd, buf + 2 * off, (unsigned)(n - off));
+                if (w <= 0) {
+                    printf("tone: write failed\n");
+                    close(fd);
+                    return 1;
+                }
+                off += w;
+            }
+        } else {
             int len = n * 4, off = 0;
             while (off < len) {
                 int w = write(fd, (char *)buf + off, len - off);
@@ -68,6 +111,11 @@ int main(int argc, char **argv) {
         frames -= n;
     }
 done:
+    if (card >= 0 && ioctl(fd, ALSAPCM_DRAIN, 0) < 0) {
+        printf("tone: drain failed\n");
+        close(fd);
+        return 1;
+    }
     close(fd);
     printf("tone: done\n");
     return 0;

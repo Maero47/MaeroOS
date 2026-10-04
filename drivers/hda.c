@@ -176,6 +176,7 @@ static int drop_chan;                             /* its sleep channel */
 static struct { uint8_t nid; uint8_t steps; } vol_amp[MAX_OUTS];
 static int n_vol_amps;
 static int volume = 100;
+static int muted;
 
 static uint32_t virt_to_phys(const void *p) {
     return (uint32_t)((uintptr_t)p - KERNEL_VMA);
@@ -404,7 +405,7 @@ static int find_dac(uint8_t nid, int depth, uint8_t *path, uint8_t *sel) {
 static void apply_volume(void) {
     for (int i = 0; i < n_vol_amps; i++) {
         uint32_t g = (uint32_t)vol_amp[i].steps * (uint32_t)volume / 100U;
-        set_amp(vol_amp[i].nid, 1, 0, g, volume == 0);
+        set_amp(vol_amp[i].nid, 1, 0, g, volume == 0 || muted);
     }
 }
 
@@ -672,6 +673,17 @@ void hda_start_thread(void) {
 
 int hda_get_volume(void) {
     return present ? volume : -19;
+}
+
+int hda_get_mute(void) {
+    return present ? muted : -19;
+}
+
+int hda_set_mute(int on) {
+    if (!present) return -19;
+    muted = on != 0;
+    apply_volume();
+    return 0;
 }
 
 int hda_set_volume(int percent) {

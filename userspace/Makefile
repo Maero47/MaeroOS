@@ -62,7 +62,7 @@ USER_BINS := $(TESTFILES)/init $(TESTFILES)/shell $(TESTFILES)/ls \
 	     $(TESTFILES)/desktop $(TESTFILES)/wmctl $(TESTFILES)/gui_demo \
 	     $(TESTFILES)/wmevtest $(TESTFILES)/uidemo $(TESTFILES)/files \
 	     $(TESTFILES)/dmesg $(TESTFILES)/shmprobe $(TESTFILES)/memprobe $(TESTFILES)/credprobe $(TESTFILES)/threadprobe $(TESTFILES)/term $(TESTFILES)/browse \
-     $(TESTFILES)/raceprobe $(TESTFILES)/extprobe $(TESTFILES)/store $(TESTFILES)/pkg $(TESTFILES)/wavplay $(TESTFILES)/tone $(TESTFILES)/statprobe $(TESTFILES)/edit $(TESTFILES)/calc $(TESTFILES)/taskmgr $(TESTFILES)/view $(TESTFILES)/settings \
+     $(TESTFILES)/raceprobe $(TESTFILES)/extprobe $(TESTFILES)/store $(TESTFILES)/pkg $(TESTFILES)/wavplay $(TESTFILES)/tone $(TESTFILES)/mixer $(TESTFILES)/statprobe $(TESTFILES)/edit $(TESTFILES)/calc $(TESTFILES)/taskmgr $(TESTFILES)/view $(TESTFILES)/settings \
      $(TESTFILES)/reboot $(TESTFILES)/shutdown $(TESTFILES)/poweroff $(TESTFILES)/halt \
      $(TESTFILES)/sudo $(TESTFILES)/whoami $(TESTFILES)/uname $(TESTFILES)/clear $(TESTFILES)/hostname \
      $(TESTFILES)/which $(TESTFILES)/free $(TESTFILES)/uptime $(TESTFILES)/du $(TESTFILES)/df $(TESTFILES)/top $(TESTFILES)/wget $(TESTFILES)/bbwrap \
@@ -784,6 +784,11 @@ tone/tone.o: tone/tone.c
 	$(CC) $(CFLAGS) -c $< -o $@
 $(TESTFILES)/tone: $(CRT0_OBJ) tone/tone.o libc/libc.a
 	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) tone/tone.o libc/libc.a
+
+mixer/mixer.o: mixer/mixer.c
+	$(CC) $(CFLAGS) -c $< -o $@
+$(TESTFILES)/mixer: $(CRT0_OBJ) mixer/mixer.o libc/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(CRT0_OBJ) mixer/mixer.o libc/libc.a
 
 statprobe/statprobe.o: statprobe/statprobe.c
 	$(CC) $(CFLAGS) -c $< -o $@

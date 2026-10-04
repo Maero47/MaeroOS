@@ -11,5 +11,7 @@ int  hda_present(void);
 int  hda_write(const uint8_t *data, uint32_t len);   /* blocking */
 int  hda_set_volume(int percent);                    /* 0..100; <0 on error */
 int  hda_get_volume(void);
+int  hda_set_mute(int on);                           /* <0 on error */
+int  hda_get_mute(void);
 uint32_t hda_queued(void);       /* PCM bytes written but not yet played */
 void hda_drop(void);             /* discard them (blocks until done) */

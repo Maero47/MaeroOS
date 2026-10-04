@@ -171,7 +171,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-net-virtio smoke-tcpsrv smoke-net6 smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-gfxmode smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-largefile smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-firefox-fonts smoke-alpine smoke-alpinex disk-alpinex smoke-alpine-net smoke-audio smoke-procipc disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched bench-bkl smoke-klock stress-smp
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-net-virtio smoke-tcpsrv smoke-net6 smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-gfxmode smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-largefile smoke-install smoke-hda smoke-usbaudio smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-firefox-fonts smoke-alpine smoke-alpinex disk-alpinex smoke-alpine-net smoke-audio smoke-procipc disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched bench-bkl smoke-klock stress-smp
 
 all: $(TARGET)
 
@@ -483,6 +483,13 @@ smoke-gtk: $(TARGET) initrd
 smoke-hda: $(TARGET) initrd
 	python3 tools/smoke_hda.py
 
+# USB Audio Class playback over xHCI isochronous transfers (QEMU usb-audio
+# as ALSA card 1, next to the HDA card 0) checked from the wav capture
+# (build/smoke-usbaudio/), the Master mixer elements of both cards, and the
+# device unplugged mid-tone and plugged back in; see tools/smoke_usbaudio.py.
+smoke-usbaudio: $(TARGET) initrd
+	python3 tools/smoke_usbaudio.py
+
 # The desktop and its apps, driven through QMP mouse/keyboard input on the
 # ISO + a copy of disk.img (~30 s).  Screendumps and the serial log land in
 # build/smoke-gui/; see tools/smoke_gui.py.
@@ -557,7 +564,7 @@ smoke-pc: $(TARGET) iso disk
 # Pick a subset with CHECK_SUITES="smoke smoke-x".
 CHECK_SUITES  ?= smoke smoke-cmds smoke-toybox smoke-disk smoke-net smoke-net-e1000 smoke-net-virtio smoke-net6 smoke-tcpsrv \
                  smoke-fw smoke-dyn smoke-dynlib smoke-x smoke-pkg smoke-gui smoke-gfxmode smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-largefile smoke-uefi \
-                 smoke-install smoke-hda smoke-acpi smoke-ahci smoke-nvme smoke-usb smoke-pc smoke-procipc
+                 smoke-install smoke-hda smoke-usbaudio smoke-acpi smoke-ahci smoke-nvme smoke-usb smoke-pc smoke-procipc
 CHECK_LOG_DIR ?= build/check
 
 # repo: smoke-pkg serves packages from repo/ (see the smoke-pkg target).

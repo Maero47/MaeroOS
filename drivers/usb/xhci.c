@@ -1,8 +1,10 @@
 /*
  * xHCI host controller driver: low/full/high/super-speed devices on the root
  * hub and behind USB 2.0 and USB 3 hubs, with control transfers on endpoint
- * 0, bulk endpoints (mass storage, usb_msc.c) and interrupt-IN endpoints
- * (every HID interface of a device, see usb_hid.c; hub status changes).
+ * 0, bulk endpoints (mass storage, usb_msc.c; stream 1 of SuperSpeed bulk
+ * endpoints for UAS), interrupt-IN endpoints (every HID interface of a
+ * device, see usb_hid.c; hub status changes) and isochronous endpoints
+ * (USB audio, usb_audio.c).
  *
  * Written from the eXtensible Host Controller Interface specification (Intel,
  * revision 1.2), sections cited as "xHCI 4.x".  The OSDev wiki's xHCI page
@@ -29,15 +31,31 @@
  *     A device whose root port lost its connection is marked gone at once,
  *     so transfers waiting on it fail without running into their timeouts.
  *
- * Class drivers: usb_hid.c (keyboards, mice, tablets) and usb_msc.c (mass
- * storage, bulk-only transport); USB 2.0 and USB 3 hubs are handled here
+ * Class drivers: usb_hid.c (keyboards, mice, tablets), usb_msc.c (mass
+ * storage, bulk-only transport and UAS) and usb_audio.c (USB Audio Class
+ * playback); USB 2.0 and USB 3 hubs are handled here
  * (hub_*), their ports looked at when the hub's status-change endpoint says
  * so (and every few seconds regardless).  They call back in through usb.h:
  * usb_control(), usb_configure_eps() and usb_bulk().  usb_lock() serialises
  * every use of the controller between kusbd and processes doing disk I/O.
  *
- * Not done (see the report / ROADMAP): MSI-X, isochronous transfers,
- * streams, 64-bit DMA addresses.
+ * Isochronous endpoints (xHCI 4.11.2.5, 4.14.2): each TD is one Isoch TRB
+ * (plus a chained Normal TRB where the buffer crosses a 64 KiB boundary)
+ * with Start Isoch ASAP set, so the controller schedules it one service
+ * interval after the previous TD while the ring stays fed; every TD asks for
+ * a completion event, most of them with Block Event Interrupt so the
+ * controller interrupts about every 8 ms (the class driver asks for one on
+ * the last TD of a batch).  Completions are matched to TDs by TRB address,
+ * oldest first; a Missed Service Error or a skipped TD reports its TD as not
+ * played, and Ring Underrun / Overrun (the class driver did not keep up) are
+ * counted.  Rings come from a pool of ISO_MAX_EPS 4 KiB rings.
+ *
+ * Streams (xHCI 4.12): a bulk endpoint can use stream 1 of a linear Primary
+ * Stream Context Array (MaxPStreams 1), which is what UAS on SuperSpeed
+ * needs for its one command in flight.
+ *
+ * Not done (see the report / ROADMAP): 64-bit DMA addresses, more than one
+ * stream per endpoint.
  */
 #include "xhci.h"
 #include "usb.h"
@@ -71,6 +89,8 @@
 #define CTRL_BUF_SIZE    1024
 #define REPORT_BUF_SIZE  64
 #define XFER_MAX_PIECES  4      /* TRBs per bulk transfer (64 KiB pieces) */
+#define ISO_MAX_EPS      2      /* isochronous endpoints in the system */
+#define ISO_RING_TRBS    256    /* one 4 KiB ring each */
 
 /* ── registers (xHCI 5) ──────────────────────────────────────────────────── */
 
@@ -141,6 +161,8 @@ typedef struct {
 #define TRB_CHAIN       (1U << 4)
 #define TRB_IOC         (1U << 5)
 #define TRB_IDT         (1U << 6)
+#define TRB_BEI         (1U << 9)       /* Block Event Interrupt */
+#define TRB_SIA         (1U << 31)      /* Isoch: start as soon as possible */
 #define TRB_DIR_IN      (1U << 16)
 #define TRB_TYPE(t)     ((uint32_t)(t) << 10)
 #define TRB_GET_TYPE(c) (((c) >> 10) & 0x3F)
@@ -150,6 +172,7 @@ typedef struct {
 #define TRB_SETUP        2
 #define TRB_DATA         3
 #define TRB_STATUS       4
+#define TRB_ISOCH        5
 #define TRB_LINK         6
 #define TRB_ENABLE_SLOT  9
 #define TRB_DISABLE_SLOT 10
@@ -167,6 +190,9 @@ typedef struct {
 #define CC_SUCCESS       1
 #define CC_STALL         6
 #define CC_SHORT_PACKET  13
+#define CC_RING_UNDERRUN 14
+#define CC_RING_OVERRUN  15
+#define CC_MISSED_SERVICE 23
 #define CC_CONTEXT_STATE 19
 #define CC_STOPPED       26
 #define CC_STOPPED_LEN   27
@@ -187,14 +213,17 @@ typedef struct {
 
 /* ── DMA memory ──────────────────────────────────────────────────────────── */
 
-/* Per-device structures, one page-aligned block per device slot we use. */
+/* Per-device structures, one page-aligned block per device slot we use.
+ * The 1 KiB rings come first, so none crosses a page (or 64 KiB) boundary. */
 typedef struct {
-    uint8_t    in_ctx[4096];                 /* input context: 33 x 64 bytes  */
     uint8_t    out_ctx[2048];                /* device context: 32 x 64 bytes */
     xhci_trb_t ep0[XFER_RING_TRBS];          /* 1 KiB */
     xhci_trb_t rings[USB_MAX_EPS][XFER_RING_TRBS];   /* 1 KiB each */
+    uint8_t    in_ctx[34 * 64];              /* input context: 33 x 64 bytes  */
     uint8_t    buf[CTRL_BUF_SIZE];           /* control transfer data */
     uint8_t    report[USB_MAX_EPS][REPORT_BUF_SIZE];   /* interrupt-IN data */
+    /* stream endpoints: a Primary Stream Context Array of 4 (xHCI 6.2.4) */
+    uint8_t    sctx[USB_MAX_EPS][64];
 } __attribute__((aligned(4096))) dev_dma_t;
 
 static dev_dma_t dev_dma[XHCI_MAX_DEVS];
@@ -250,9 +279,13 @@ struct usb_device {
         uint32_t actual;
         /* interrupt-IN endpoints: what the reports are for, and whether a
          * TD is queued (a failed one is not queued again) */
-        int role;            /* EP_BULK, EP_HID or EP_HUB */
+        int role;            /* EP_BULK, EP_HID, EP_HUB or EP_ISO */
         int active;
         int reported;        /* HID: logged the first report */
+        int stream;          /* bulk on stream 1 (doorbell stream ID) */
+        int iso;             /* EP_ISO: index in iso_eps */
+        int maxburst;        /* packets per burst - 1 (SS; HS isoch: mult) */
+        uint32_t interval;   /* endpoint context Interval (2^n x 125 us) */
     } eps[USB_MAX_EPS];
     int cls;                 /* USB_CLS_* */
     int nhid;                /* HID interfaces, eps[0..nhid-1] */
@@ -267,6 +300,24 @@ struct usb_device {
 static struct usb_device devs[XHCI_MAX_DEVS];
 static struct usb_device *slot_dev[256];
 static struct usb_device *port_dev[256];
+
+/* Isochronous endpoints: their rings, and the TDs queued on each, oldest at
+ * tail (TD k is first[k % N] .. last[k % N], ntrb TRBs, len bytes). */
+typedef struct {
+    struct usb_device *dev;          /* NULL: free */
+    int idx;                         /* endpoint index on dev */
+    ring_t ring;
+    usb_iso_done_fn done;
+    void *ctx;
+    uint32_t first[ISO_RING_TRBS], last[ISO_RING_TRBS], len[ISO_RING_TRBS];
+    uint8_t ntrb[ISO_RING_TRBS];
+    uint32_t head, tail;
+    uint32_t trbs;                   /* TRBs the queued TDs take */
+    uint32_t n_tds, n_missed, n_underruns, n_errors;
+} iso_ep_t;
+static iso_ep_t iso_eps[ISO_MAX_EPS];
+static xhci_trb_t iso_trbs[ISO_MAX_EPS][ISO_RING_TRBS]
+    __attribute__((aligned(4096)));
 
 /* ── controller state ────────────────────────────────────────────────────── */
 
@@ -478,6 +529,7 @@ static inline void ring_doorbell(uint32_t slot, uint32_t target) {
 
 static void intr_transfer_done(struct usb_device *d, int i, int code,
                                uint32_t residual);
+static void iso_event(struct usb_device *d, int i, uint32_t trb, int code);
 
 /* A transfer event for a bulk transfer in flight.  Only the last TRB
  * interrupts on completion; a short packet in an earlier piece reports that
@@ -534,7 +586,9 @@ static void handle_event(const xhci_trb_t *ev) {
         } else {
             for (int i = 0; i < USB_MAX_EPS; i++) {
                 if (d->eps[i].dci != ep) continue;
-                if (d->eps[i].role != EP_BULK) {
+                if (d->eps[i].role == EP_ISO) {
+                    iso_event(d, i, ev->param_lo, code);
+                } else if (d->eps[i].role != EP_BULK) {
                     intr_transfer_done(d, i, code, ev->status & 0xFFFFFF);
                 } else {
                     bulk_event(d, i, ev->param_lo, code,
@@ -638,7 +692,17 @@ static inline uint32_t *out_ep_ctx(struct usb_device *d, int dci);
  * dequeue pointer is moved to our enqueue pointer, so the controller never
  * touches the abandoned TRBs or the buffers they point at again.  Returns
  * 0 when the endpoint ended up Stopped at our enqueue pointer. */
+static int ep_abort_stream(struct usb_device *d, int dci, ring_t *r,
+                           int stream);
+
 static int ep_abort(struct usb_device *d, int dci, ring_t *r) {
+    return ep_abort_stream(d, dci, r, 0);
+}
+
+/* The same for a stream endpoint (`stream` = the stream ID whose ring `r`
+ * is; 0 for an endpoint without streams). */
+static int ep_abort_stream(struct usb_device *d, int dci, ring_t *r,
+                           int stream) {
     uint32_t ep = (uint32_t)dci << 16;
     uint32_t state = out_ep_ctx(d, dci)[0] & 7;
     int cc = CC_SUCCESS;
@@ -652,13 +716,17 @@ static int ep_abort(struct usb_device *d, int dci, ring_t *r) {
         printk("[USB] slot %d: %s endpoint %d failed, code %d\n", d->slot,
                state == EP_STATE_HALTED ? "reset" : "stop", dci, cc);
     uint32_t deq = r->phys + r->enq * (uint32_t)sizeof(xhci_trb_t);
-    cc = run_command(deq | r->cycle, 0,
+    /* With streams, the stream's context is set: Stream Context Type 1
+     * (primary ring) next to DCS, and the stream ID (xHCI 6.4.3.9). */
+    cc = run_command(deq | r->cycle | (stream ? 1U << 1 : 0),
+                     (uint32_t)stream << 16,
                      TRB_TYPE(TRB_SET_TR_DEQ) | TRB_SLOT(d->slot) | ep, 0);
     if (cc != CC_SUCCESS) {
         printk("[USB] slot %d: set dequeue pointer on endpoint %d failed, "
                "code %d\n", d->slot, dci, cc);
         return -1;
     }
+    if (stream) return 0;
     uint32_t *ec = out_ep_ctx(d, dci);
     return ((ec[0] & 7) == 3 && (ec[2] & ~0xFU) == deq) ? 0 : -1;
 }
@@ -811,6 +879,16 @@ static uint32_t ep_interval(int speed, uint8_t binterval) {
     return n > 15 ? 15 : n;
 }
 
+/* Interval field for an isochronous endpoint: bInterval is the exponent at
+ * every speed (2^(bInterval-1) frames or microframes; xHCI 6.2.3.6). */
+static uint32_t iso_ep_interval(int speed, uint8_t binterval) {
+    uint32_t n = binterval < 1 ? 0 : binterval > 16 ? 15 : binterval - 1U;
+    if (speed == USB_SPEED_LOW || speed == USB_SPEED_FULL) n += 3;
+    return n > 15 ? 15 : n;
+}
+
+static void iso_release(struct usb_device *d);
+
 /* ── enumeration ─────────────────────────────────────────────────────────── */
 
 static void free_device(struct usb_device *d) {
@@ -819,6 +897,8 @@ static void free_device(struct usb_device *d) {
             if (d->child[p]) free_device(d->child[p]);
     }
     if (d->cls == USB_CLS_MSC) usb_msc_detach(d);
+    if (d->cls == USB_CLS_AUDIO) usb_audio_detach(d);
+    iso_release(d);
     d->cls = 0;
     for (int i = 0; i < USB_MAX_EPS; i++) d->eps[i].active = 0;
     if (d->slot) {
@@ -921,41 +1001,112 @@ static void hub_slot_bits(struct usb_device *d, uint32_t *sc) {
         sc[2] = (sc[2] & ~(3U << 16)) | ((d->hub_ttt & 3) << 16);
 }
 
+/* An isochronous ring for endpoint index i of d: the one it has, or a free
+ * one from the pool; -1 when all are taken. */
+static int iso_claim(struct usb_device *d, int i) {
+    int free_k = -1;
+    for (int k = 0; k < ISO_MAX_EPS; k++) {
+        if (iso_eps[k].dev == d && iso_eps[k].idx == i) return k;
+        if (!iso_eps[k].dev && free_k < 0) free_k = k;
+    }
+    if (free_k < 0) return -1;
+    iso_ep_t *q = &iso_eps[free_k];
+    memset(q, 0, sizeof(*q));
+    q->dev = d;
+    q->idx = i;
+    return free_k;
+}
+
+static void iso_release(struct usb_device *d) {
+    for (int k = 0; k < ISO_MAX_EPS; k++)
+        if (iso_eps[k].dev == d) iso_eps[k].dev = 0;
+}
+
 /* Configure Endpoint (xHCI 4.6.6) for up to USB_MAX_EPS endpoints; eps[i]
- * becomes endpoint index i for usb_bulk(). */
-int usb_configure_eps(struct usb_device *d,
-                      const usb_endpoint_desc_t *const *eps, int n) {
+ * becomes endpoint index i for usb_bulk() / usb_iso_*(). */
+int usb_configure_eps_x(struct usb_device *d, const usb_ep_cfg_t *cfgs,
+                        int n) {
     if (n < 1 || n > USB_MAX_EPS) return -1;
     memset(d->dma->in_ctx, 0, sizeof(d->dma->in_ctx));
     uint32_t add = 1;
     int max_dci = 1;
     for (int i = 0; i < n; i++) {
-        const usb_endpoint_desc_t *ep = eps[i];
+        const usb_endpoint_desc_t *ep = cfgs[i].desc;
+        const uint8_t *comp = cfgs[i].ss_comp;
         int in = (ep->bEndpointAddress & 0x80) != 0;
         int dci = (ep->bEndpointAddress & 0x0F) * 2 + in;
-        int xfer = ep->bmAttributes & 3;            /* 2 bulk, 3 interrupt */
+        int xfer = ep->bmAttributes & 3;   /* 1 isoch, 2 bulk, 3 interrupt */
         uint32_t mps = ep->wMaxPacketSize & 0x7FF;
-        if (dci < 2 || mps == 0 || (xfer != 2 && xfer != 3)) return -1;
+        if (dci < 2 || mps == 0 || xfer == 0) return -1;
+        if (d->speed < USB_SPEED_SUPER) comp = 0;
         d->eps[i].dci = dci;
         d->eps[i].addr = ep->bEndpointAddress;
         d->eps[i].mps = (int)mps;
-        d->eps[i].role = EP_BULK;
+        d->eps[i].role = xfer == 1 ? EP_ISO : EP_BULK;
         d->eps[i].active = 0;
         d->eps[i].reported = 0;
-        ring_init(&d->eps[i].ring, d->dma->rings[i], XFER_RING_TRBS);
+        d->eps[i].stream = 0;
+        d->eps[i].iso = -1;
+        d->eps[i].interval = 0;
+        /* Max Burst: SuperSpeed from the companion, high-speed periodic
+         * endpoints from wMaxPacketSize bits 12:11 (xHCI 6.2.3.4). */
+        uint32_t burst = comp ? comp[2] : 0, mult = 0;
+        if (!comp && d->speed == USB_SPEED_HIGH && xfer != 2)
+            burst = (ep->wMaxPacketSize >> 11) & 3;
+        if (comp && xfer == 1) mult = comp[3] & 3;
+        d->eps[i].maxburst = (int)burst;
         add |= 1U << dci;
         if (dci > max_dci) max_dci = dci;
 
-        /* EP type: 2 bulk OUT, 3 interrupt OUT, 6 bulk IN, 7 interrupt IN */
+        /* EP type: 1 isoch OUT, 2 bulk OUT, 3 interrupt OUT, 5 isoch IN,
+         * 6 bulk IN, 7 interrupt IN */
         uint32_t type = (uint32_t)xfer + (in ? 4U : 0U);
         uint32_t *ec = in_entry(d, dci);
+        uint32_t esit = mps * (burst + 1) * (mult + 1);
+        if (xfer == 1) {
+            int k = iso_claim(d, i);
+            if (k < 0) {
+                printk("[USB] slot %d: no isochronous ring free\n", d->slot);
+                return -1;
+            }
+            d->eps[i].iso = k;
+            ring_init(&iso_eps[k].ring, iso_trbs[k], ISO_RING_TRBS);
+            d->eps[i].interval = iso_ep_interval(d->speed, ep->bInterval);
+            /* CErr 0 for isochronous endpoints (xHCI 4.10.2.4) */
+            ec[0] = (d->eps[i].interval << 16) | (mult << 8);
+            ec[1] = (type << 3) | (burst << 8) | (mps << 16);
+            ec[2] = iso_eps[k].ring.phys | 1;
+            ec[3] = 0;
+            ec[4] = esit | (esit << 16);
+            continue;
+        }
+        ring_init(&d->eps[i].ring, d->dma->rings[i], XFER_RING_TRBS);
         ec[0] = xfer == 3 ? ep_interval(d->speed, ep->bInterval) << 16 : 0;
-        ec[1] = (3U << 1) | (type << 3) | (mps << 16);
+        ec[1] = (3U << 1) | (type << 3) | (burst << 8) | (mps << 16);
         ec[2] = d->eps[i].ring.phys | 1;
         ec[3] = 0;
         /* Average TRB length, and for periodic endpoints the max ESIT
          * payload (xHCI 4.14.1.1, 6.2.3). */
-        ec[4] = xfer == 3 ? (mps | (mps << 16)) : 3072;
+        ec[4] = xfer == 3 ? (esit | (esit << 16)) : 3072;
+        if (cfgs[i].stream && xfer == 2) {
+            /* Stream 1 of a linear Primary Stream Context Array of four
+             * (MaxPStreams 1, LSA; xHCI 4.12.2): the endpoint's ring
+             * becomes stream 1's.  Needs MaxPSASize >= 1 and a device
+             * that has streams on this endpoint (companion MaxStreams). */
+            uint32_t psa = (rd32(cap_regs, CAP_HCCPARAMS1) >> 12) & 0xF;
+            if (!psa || !comp || !(comp[3] & 0x1F)) {
+                printk("[USB] slot %d: endpoint %02x: no streams (controller "
+                       "MaxPSASize %u)\n", d->slot, ep->bEndpointAddress,
+                       (unsigned)psa);
+                return -1;
+            }
+            uint32_t *sc = (uint32_t *)d->dma->sctx[i];
+            memset(sc, 0, 64);
+            sc[4] = d->eps[i].ring.phys | 1 | (1U << 1);   /* DCS, SCT 1 */
+            ec[0] |= (1U << 10) | (1U << 15);      /* MaxPStreams 1, LSA */
+            ec[2] = phys_of(sc);
+            d->eps[i].stream = 1;
+        }
     }
     in_ctrl(d)[1] = add;
     uint32_t *sc = in_entry(d, 0);
@@ -969,20 +1120,53 @@ int usb_configure_eps(struct usb_device *d,
     if (cc != CC_SUCCESS) {
         printk("[USB] slot %d: configure endpoint failed, code %d\n",
                d->slot, cc);
+        iso_release(d);
         return -1;
     }
     return 0;
 }
 
+int usb_configure_eps(struct usb_device *d,
+                      const usb_endpoint_desc_t *const *eps, int n) {
+    usb_ep_cfg_t c[USB_MAX_EPS];
+    if (n < 1 || n > USB_MAX_EPS) return -1;
+    for (int i = 0; i < n; i++) {
+        if ((eps[i]->bmAttributes & 3) == 1) return -1;  /* not here */
+        c[i].desc = eps[i];
+        c[i].ss_comp = 0;
+        c[i].stream = 0;
+    }
+    return usb_configure_eps_x(d, c, n);
+}
+
+int usb_set_interface(struct usb_device *d, int ifnum, int alt) {
+    usb_setup_t s = { USB_TYPE_STANDARD | USB_RECIP_INTERFACE,
+                      USB_REQ_SET_INTERFACE, (uint16_t)alt, (uint16_t)ifnum,
+                      0 };
+    return usb_control(d, &s, 0) < 0 && alt != 0 ? -1 : 0;
+}
+
+int usb_device_speed(const struct usb_device *d) {
+    return d->speed;
+}
+
+int usb_device_gone(const struct usb_device *d) {
+    return d->gone;
+}
+
+static inline uint32_t ep_target(struct usb_device *d, int i) {
+    return (uint32_t)d->eps[i].dci | ((uint32_t)d->eps[i].stream << 16);
+}
+
 /* One bulk transfer of `len` bytes (at most 64 KiB) at physical address
  * `phys` on endpoint index `i`, queued as one TD of chained Normal TRBs
  * split where the buffer crosses a 64 KiB boundary (xHCI 4.11.7.1).
- * Returns 0 (with the byte count in *actual), USB_STALL, or -1 on another
- * error or a timeout. */
-int usb_bulk(struct usb_device *d, int i, uint32_t phys, uint32_t len,
-             uint32_t *actual, uint32_t timeout_ms) {
+ * usb_bulk_wait() then returns 0 (with the byte count in *actual),
+ * USB_STALL, or -1 on another error or a timeout. */
+int usb_bulk_submit(struct usb_device *d, int i, uint32_t phys,
+                    uint32_t len) {
     if (i < 0 || i >= USB_MAX_EPS || !d->eps[i].dci || len == 0 ||
-        len > 0x10000 || d->gone) return -1;
+        len > 0x10000 || d->gone || d->eps[i].role != EP_BULK) return -1;
     int n = 0;
     uint32_t p = phys, left = len, piece[XFER_MAX_PIECES];
     while (left && n < XFER_MAX_PIECES) {
@@ -1008,7 +1192,13 @@ int usb_bulk(struct usb_device *d, int i, uint32_t phys, uint32_t len,
         d->eps[i].ntrb = k + 1;
         p += piece[k];
     }
-    ring_doorbell((uint32_t)d->slot, (uint32_t)d->eps[i].dci);
+    ring_doorbell((uint32_t)d->slot, ep_target(d, i));
+    return 0;
+}
+
+int usb_bulk_wait(struct usb_device *d, int i, uint32_t *actual,
+                  uint32_t timeout_ms) {
+    if (i < 0 || i >= USB_MAX_EPS || !d->eps[i].dci) return -1;
     uint32_t end = pit_ticks() + (timeout_ms + 9) / 10 + 1;
     for (uint32_t spin = 0; !d->eps[i].done; spin++) {
         uint32_t seen = evt_seq;
@@ -1019,7 +1209,8 @@ int usb_bulk(struct usb_device *d, int i, uint32_t phys, uint32_t len,
             printk("[USB] slot %d: bulk transfer on endpoint %02x timed out\n",
                    d->slot, d->eps[i].addr);
             /* Take the TD back before the caller reuses its buffer. */
-            ep_abort(d, d->eps[i].dci, &d->eps[i].ring);
+            ep_abort_stream(d, d->eps[i].dci, &d->eps[i].ring,
+                            d->eps[i].stream);
             return -1;
         }
         wait_progress(seen, spin);
@@ -1029,19 +1220,163 @@ int usb_bulk(struct usb_device *d, int i, uint32_t phys, uint32_t len,
     if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) {
         printk("[USB] slot %d: bulk transfer on endpoint %02x failed, "
                "code %d\n", d->slot, d->eps[i].addr, cc);
-        ep_abort(d, d->eps[i].dci, &d->eps[i].ring);
+        ep_abort_stream(d, d->eps[i].dci, &d->eps[i].ring, d->eps[i].stream);
         return -1;
     }
     if (actual) *actual = d->eps[i].actual;
     return 0;
 }
 
+int usb_bulk(struct usb_device *d, int i, uint32_t phys, uint32_t len,
+             uint32_t *actual, uint32_t timeout_ms) {
+    if (usb_bulk_submit(d, i, phys, len) != 0) return -1;
+    return usb_bulk_wait(d, i, actual, timeout_ms);
+}
+
+/* ── isochronous transfers (xHCI 4.11.2.5, 4.14.2, 6.4.1.3) ─────────────── */
+
+static iso_ep_t *iso_of(struct usb_device *d, int i) {
+    if (i < 0 || i >= USB_MAX_EPS || d->eps[i].role != EP_ISO ||
+        d->eps[i].iso < 0) return 0;
+    iso_ep_t *q = &iso_eps[d->eps[i].iso];
+    return q->dev == d && q->idx == i ? q : 0;
+}
+
+int usb_iso_start(struct usb_device *d, int i, usb_iso_done_fn done,
+                  void *ctx) {
+    iso_ep_t *q = iso_of(d, i);
+    if (!q) return -1;
+    q->done = done;
+    q->ctx = ctx;
+    d->eps[i].active = 1;
+    return 0;
+}
+
+int usb_iso_room(struct usb_device *d, int i) {
+    iso_ep_t *q = iso_of(d, i);
+    if (!q || d->gone) return 0;
+    /* Two TRBs per TD at worst; the Link TRB and one spare stay out. */
+    int by_trbs = (int)(ISO_RING_TRBS - 3 - q->trbs) / 2;
+    int by_tds = (int)(ISO_RING_TRBS - 1 - (q->head - q->tail));
+    int r = by_trbs < by_tds ? by_trbs : by_tds;
+    return r < 0 ? 0 : r;
+}
+
+/* One TD: an Isoch TRB for the first piece, a chained Normal TRB for the
+ * second (the buffer wrapped, or crossed a 64 KiB boundary).  Transfer
+ * Burst Count and Last Burst Packet Count from the packet count (xHCI
+ * 4.11.2.3); TD Size is the packets left after the TRB. */
+static int iso_queue2(struct usb_device *d, int i, uint32_t p1, uint32_t l1,
+                      uint32_t p2, uint32_t l2, int irq) {
+    iso_ep_t *q = iso_of(d, i);
+    if (!q || d->gone || usb_iso_room(d, i) < 1 || !l1 || l1 + l2 > 0xFFFF)
+        return -1;
+    uint32_t mps = (uint32_t)d->eps[i].mps, mb = (uint32_t)d->eps[i].maxburst;
+    uint32_t len = l1 + l2;
+    uint32_t pk = (len + mps - 1) / mps;
+    uint32_t tbc = (pk + mb) / (mb + 1) - 1;
+    uint32_t tlbpc = (pk - 1) % (mb + 1);
+    uint32_t ioc = TRB_IOC | (irq ? 0 : TRB_BEI);
+    uint32_t left = l2 ? (l2 + mps - 1) / mps : 0;
+    if (left > 31) left = 31;
+    uint32_t dir = (d->eps[i].addr & 0x80) ? TRB_ISP : 0;
+    uint32_t slot = q->head % ISO_RING_TRBS;
+    q->first[slot] = ring_push(&q->ring, p1, 0, l1 | (left << 17),
+                               TRB_TYPE(TRB_ISOCH) | TRB_SIA | (tbc << 7) |
+                               (tlbpc << 16) | dir |
+                               (l2 ? TRB_CHAIN : ioc));
+    q->last[slot] = q->first[slot];
+    q->ntrb[slot] = 1;
+    if (l2) {
+        q->last[slot] = ring_push(&q->ring, p2, 0, l2,
+                                  TRB_TYPE(TRB_NORMAL) | dir | ioc);
+        q->ntrb[slot] = 2;
+    }
+    q->len[slot] = len;
+    q->trbs += q->ntrb[slot];
+    q->head++;
+    return 0;
+}
+
+int usb_iso_queue(struct usb_device *d, int i, uint32_t p1, uint32_t l1,
+                  uint32_t p2, uint32_t l2, int irq) {
+    if (0x10000U - (p1 & 0xFFFFU) < l1 ||
+        (l2 && 0x10000U - (p2 & 0xFFFFU) < l2)) return -1;
+    return iso_queue2(d, i, p1, l1, p2, l2, irq);
+}
+
+void usb_iso_kick(struct usb_device *d, int i) {
+    iso_ep_t *q = iso_of(d, i);
+    if (!q || d->gone || q->head == q->tail) return;
+    ring_doorbell((uint32_t)d->slot, ep_target(d, i));
+}
+
+static void iso_event(struct usb_device *d, int i, uint32_t trb, int code) {
+    iso_ep_t *q = iso_of(d, i);
+    if (!q) return;
+    if (code == CC_RING_UNDERRUN || code == CC_RING_OVERRUN) {
+        /* The ring ran dry (OUT) or full (IN): nothing queued to match. */
+        q->n_underruns++;
+        return;
+    }
+    if (CC_IS_STOPPED(code)) return;          /* usb_iso_stop() takes them */
+    uint32_t n = q->head - q->tail, k;
+    for (k = 0; k < n; k++) {
+        uint32_t slot = (q->tail + k) % ISO_RING_TRBS;
+        if (q->first[slot] == trb || q->last[slot] == trb) break;
+    }
+    if (k == n) return;        /* a Missed Service event without a TD, etc. */
+    int ok = code == CC_SUCCESS || code == CC_SHORT_PACKET;
+    if (code == CC_MISSED_SERVICE) {
+        q->n_missed++;
+    } else if (!ok && q->n_errors++ < 4) {
+        printk("[USB] slot %d: isochronous TD on endpoint %02x: code %d\n",
+               d->slot, d->eps[i].addr, code);
+    }
+    /* TDs before this one had no event: skipped. */
+    for (uint32_t j = 0; j <= k; j++) {
+        uint32_t slot = q->tail % ISO_RING_TRBS;
+        uint32_t len = q->len[slot];
+        q->trbs -= q->ntrb[slot];
+        q->tail++;
+        q->n_tds++;
+        if (j < k) q->n_missed++;
+        if (q->done) q->done(q->ctx, len, j == k ? ok : 0);
+    }
+}
+
+void usb_iso_stop(struct usb_device *d, int i) {
+    iso_ep_t *q = iso_of(d, i);
+    if (!q) return;
+    usb_iso_done_fn fn = q->done;
+    q->done = 0;                  /* no callbacks while the ring is taken */
+    if (!d->gone && q->head != q->tail)
+        ep_abort(d, d->eps[i].dci, &q->ring);
+    q->tail = q->head;
+    q->trbs = 0;
+    q->done = fn;
+}
+
+uint32_t usb_iso_interval_us(struct usb_device *d, int i) {
+    if (!iso_of(d, i)) return 0;
+    return 125U << d->eps[i].interval;
+}
+
+void usb_iso_stats(struct usb_device *d, int i, uint32_t *tds,
+                   uint32_t *missed, uint32_t *underruns) {
+    iso_ep_t *q = iso_of(d, i);
+    *tds = q ? q->n_tds : 0;
+    *missed = q ? q->n_missed : 0;
+    *underruns = q ? q->n_underruns : 0;
+}
+
 /* Recover a halted endpoint (xHCI 4.6.8, 4.6.10; USB 2.0 9.4.1): Reset
  * Endpoint, move its dequeue pointer past whatever was queued, and clear the
  * device's halt feature. */
 int usb_clear_halt(struct usb_device *d, int i) {
-    if (i < 0 || i >= USB_MAX_EPS || !d->eps[i].dci) return -1;
-    ep_abort(d, d->eps[i].dci, &d->eps[i].ring);
+    if (i < 0 || i >= USB_MAX_EPS || !d->eps[i].dci ||
+        d->eps[i].role == EP_ISO) return -1;
+    ep_abort_stream(d, d->eps[i].dci, &d->eps[i].ring, d->eps[i].stream);
     usb_setup_t s = { 0x02, 1 /* CLEAR_FEATURE */, 0 /* ENDPOINT_HALT */,
                       (uint16_t)d->eps[i].addr, 0 };
     return usb_control(d, &s, 0) < 0 ? -1 : 0;
@@ -1291,10 +1626,14 @@ static struct usb_device *enumerate(int port, int speed,
 
     hid_intf_t hids[USB_MAX_EPS];
     int is_hub = dd.bDeviceClass == USB_CLASS_HUB;
-    int nhids = is_hub ? 0 : find_hids(cfg, (uint32_t)clen, hids);
+    /* Audio first: a headset's HID buttons are left alone (one class
+     * driver per device). */
+    int is_audio = !is_hub && usb_audio_match(cfg, (uint32_t)clen);
+    int nhids = is_hub || is_audio ? 0 : find_hids(cfg, (uint32_t)clen, hids);
     int is_hid = nhids > 0;
-    int is_msc = !is_hub && !is_hid && usb_msc_match(cfg, (uint32_t)clen);
-    if (!is_hub && !is_hid && !is_msc) {
+    int is_msc = !is_hub && !is_hid && !is_audio &&
+                 usb_msc_match(cfg, (uint32_t)clen);
+    if (!is_hub && !is_hid && !is_msc && !is_audio) {
         printk("[USB] port %s: device %04x:%04x class %u, %s speed: "
                "no driver\n", where(d), dd.idVendor, dd.idProduct,
                dd.bDeviceClass, speed_name(speed));
@@ -1315,6 +1654,13 @@ static struct usb_device *enumerate(int port, int speed,
                where(d), dd.idVendor, dd.idProduct, speed_name(speed), slot);
         if (usb_msc_attach(d, cfg, (uint32_t)clen) == 0)
             d->cls = USB_CLS_MSC;
+        return d;
+    }
+    if (is_audio) {
+        printk("[USB] port %s: %04x:%04x %s speed, slot %d: audio\n",
+               where(d), dd.idVendor, dd.idProduct, speed_name(speed), slot);
+        if (usb_audio_attach(d, cfg, (uint32_t)clen) == 0)
+            d->cls = USB_CLS_AUDIO;
         return d;
     }
     if (!setup_hid(d, hids, nhids)) {
