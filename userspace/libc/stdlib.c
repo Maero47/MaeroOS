@@ -52,6 +52,10 @@ static void *heap_grow(size_t n) {
                          MAP_PRIVATE | MAP_ANONYMOUS, -1L, 0L);
         if (r < 0 && r > -4096) return (void *)-1;
         char *p = (char *)r;
+        /* Populate it now, as brk does: the kernel drops the leader's VMAs
+         * when the leader thread exits alone, and a surviving thread would
+         * then fault on a lazily-mapped page of its own stack. */
+        for (size_t o = 0; o < len; o += 4096) ((volatile char *)p)[o] = 0;
         if (p != arena_end) arena_cur = p;     /* the old tail is left unused */
         arena_end = p + len;
     }
