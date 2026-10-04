@@ -227,9 +227,13 @@ file poppler-glib-25.04.0-r0.apk a7c13795d770449b5b7b20691404d499aba63cada5ec542
 file py3-gobject3-3.52.3-r1.apk 714ec2de0b4999fae4bb347190c58041e6ef66062ac74b804ee40b8439de5eff
 file py3-gobject3-pyc-3.52.3-r1.apk 4afabfcebf5cb9c153587986cb2a8b39668d84e2ba5d6d6f1c9bb9c520239b9f
 file pyc-3.12.14-r0.apk 664e6fe4ed64cc0a9c061db80309a277461a4701131e3ecd6ea75e94cb60703c
+file pyc-3.12.15-r0.apk e969209145280979eef898061f40162ed7b3f12d2504e1b4506d6069e8bf74d2
 file python3-3.12.14-r0.apk 70c6d810b653962908715c5151bdde06db5cddf6578a656e75534f2af338f8d5
+file python3-3.12.15-r0.apk 7bc3685f88e85e926f7b204c88a371079e383d913f8977fb30b453177e8c4461
 file python3-pyc-3.12.14-r0.apk 23f93d08eb46d9c7c9e6b53a747ba4574279e1833dd4ae15454e75f624db1dd8
+file python3-pyc-3.12.15-r0.apk c3f0f1d5253b2c2377fcec220bc6cfd3a9d86b56895c41572d5a50b596efc0be
 file python3-pycache-pyc0-3.12.14-r0.apk e002cd4aac067d848d194c1bdf4aae516fc4f05a2687f1c28561a87eb7027ca7
+file python3-pycache-pyc0-3.12.15-r0.apk 26e6ffde3dc972acf5f328dcdfede32f214292f68b9a98a742b36ee7a70e177a
 file rav1e-libs-0.7.1-r2.apk 128a9be76efacdd88b5d006c4aef0c5f10b544c05b2eda270b73bc1db89a6227
 file readline-8.2.13-r1.apk 29e35b5876481d0d1d4f60fdfdbd59a0c974d86e6355f7c38ea85518645ada6b
 file ristretto-0.13.3-r0.apk 2d8346f00cf0d4a8fcdcf44543178e72637453be8cc02f748d772499824b43bb
@@ -506,10 +510,10 @@ pkg poppler-25.04.0-r0
 pkg poppler-glib-25.04.0-r0
 pkg py3-gobject3-3.52.3-r1
 pkg py3-gobject3-pyc-3.52.3-r1
-pkg pyc-3.12.14-r0
-pkg python3-3.12.14-r0
-pkg python3-pyc-3.12.14-r0
-pkg python3-pycache-pyc0-3.12.14-r0
+pkg pyc-3.12.15-r0
+pkg python3-3.12.15-r0
+pkg python3-pyc-3.12.15-r0
+pkg python3-pycache-pyc0-3.12.15-r0
 pkg rav1e-libs-0.7.1-r2
 pkg readline-8.2.13-r1
 pkg ristretto-0.13.3-r0
