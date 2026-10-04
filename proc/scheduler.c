@@ -591,7 +591,9 @@ static int sleep_common(void *chan, kspinlock_t *lk) {
         klock_might_sleep("sleep_locked");
     }
     swtch(&current_proc->context, scheduler_ctx);
-    if (lk) kspin_lock(lk);             /* still IF=0: caller's irqsave */
+    /* The scheduler may resume us with interrupts on: lk goes back to how
+     * the caller's kspin_lock_irqsave left it, IF=0. */
+    if (lk) { __asm__ volatile("cli" ::: "memory"); kspin_lock(lk); }
     else __asm__ volatile("sti");
     kprof_sleep_end(slp_t0, slp_sys);
     /* Every wake path clears wake_tick, but make it unconditional here so a

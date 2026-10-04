@@ -8391,14 +8391,17 @@ static int sys_futex(registers_t *regs, int time64) {
          * away meanwhile, fault it back in outside the lock and start over. */
         kspinlock_t *hb;
         uint32_t hfl;
-        for (;;) {
+        for (int tries = 0;; tries++) {
             uint32_t fphys = is_private ? 0
                            : futex_resolve_phys((uint32_t)(uintptr_t)uaddr);
             int shared = (!is_private && fphys) ? 1 : 0;
             hb = futex_bucket_of((uint32_t)(uintptr_t)uaddr, !shared, fphys,
                                  current_proc->tgid);
             hfl = kspin_lock_irqsave(hb);
-            if (futex_read_nofault((uint32_t)(uintptr_t)uaddr, &cur)) {
+            /* After a few rounds of a page that keeps going away (a sibling
+             * looping on MADV_DONTNEED), go with the value just copied in:
+             * the BKL still covers the window until stage 3. */
+            if (futex_read_nofault((uint32_t)(uintptr_t)uaddr, &cur) || tries >= 8) {
                 current_proc->futex_shared = shared;
                 current_proc->futex_phys   = fphys;
                 break;
