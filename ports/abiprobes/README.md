@@ -45,7 +45,7 @@ regression tests for the fixes in audit section 5.
 | P25 | `p25_ptmx_lookup.c`         | fix round 1: PTY leaked by a lookup | — |
 | P26 | `p26_unlink_frees_space.c`  | perf round 2: unlink and truncate leaked blocks | — |
 | P27 | `p27_indirect_blocks.c`     | perf round 3: the rewritten ext2 block map | — |
-| P28 | `p28_alloc_failure.c`       | kernel allocators must refuse (ENOMEM/EMFILE), not halt | — |
+| P28 | `p28_alloc_failure.c`       | kernel allocators must refuse (ENOMEM/EMFILE), not halt; at fault-time OOM (every page touched) the touch is a SIGSEGV and a `read()` into an untouched buffer `EFAULT`, not a hang | — |
 | P29 | `p29_tmpfs_big_file.c`      | a 288 MiB tmpfs file, bigger than the kernel heap window | — |
 | P30 | `p30_waitid.c`              | `waitid` with `WNOWAIT`/`WNOHANG` (Firefox's process watcher) | — |
 | P31 | `p31_chroot.c`              | `chroot` (absolute symlinks, `..`, fork, nesting; root only) for Alpine (`ports/alpine/`) | — |

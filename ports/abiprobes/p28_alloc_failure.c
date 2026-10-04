@@ -13,7 +13,12 @@
  * requires the SAME property of each - a clean errno, the process still
  * running afterwards, and a kernel that can still fork and exec.
  *
- *   A  eager anonymous mmap, until the physical allocator runs dry      ENOMEM
+ *   A  anonymous mmap until the address space runs out                  ENOMEM
+ *      then, in a child, every page of each mapping TOUCHED until the
+ *      physical allocator runs dry: the faulting touch is a SIGSEGV the
+ *      child catches (fault-time OOM), and a read() into a never-touched
+ *      buffer at that point must end in EFAULT/ENOMEM or a short count -
+ *      the kernel's copy_to_user fault cannot be backed either
  *   B  pipes, until the descriptor table / kernel objects run out       EMFILE
  *   C  AF_UNIX socketpairs, likewise                                    EMFILE
  *   D  a large tmpfs write - file bodies used to come straight out of   ENOMEM
@@ -27,7 +32,10 @@
  * calls.  On Linux the mmap flood ends at address-space exhaustion rather
  * than at physical exhaustion (nothing is touched, so nothing is committed),
  * which is the same observable - mmap fails with ENOMEM and the process
- * lives.  Where a phase completes within its budget without failing, that is
+ * lives.  Private mappings fault in lazily on both kernels, so physical
+ * exhaustion needs the touching child; on Linux the OOM killer may take that
+ * child with SIGKILL instead, which is accepted too (the parent and the
+ * kernel live on).  Where a phase completes within its budget without failing, that is
  * reported and accepted: the assertion is conditional ("if it fails, it fails
  * cleanly"), because forcing a real Linux host to its knees is not the point.
  *
@@ -41,10 +49,12 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <setjmp.h>
+#include <signal.h>
 
-/* Below MaeroOS's VMA_DEMAND_MIN (4 MiB), so each mapping is populated
- * EAGERLY at mmap() time and the failure surfaces as an mmap errno rather
- * than as a page fault the kernel would answer with SIGSEGV. */
+/* Private anonymous mappings are populated lazily, at first touch (MaeroOS
+ * and Linux alike), so mmap() alone only uses address space; phase A's child
+ * touches every page to reach physical exhaustion. */
 #define CHUNK       (2u * 1024 * 1024)
 #define MAX_CHUNKS  2048            /* 4 GiB of address space: 32-bit runs out */
 #define MAX_FDS     4096
@@ -64,7 +74,7 @@ static void still_alive(const char *when)
         probe_fail("%s: getpid() returned %d", when, (int)p);
 }
 
-/* ── A: eager anonymous mmap ─────────────────────────────────────────────── */
+/* ── A: anonymous mmap until the address space runs out ─────────────────── */
 static void phase_mmap(void)
 {
     size_t n = 0;
@@ -90,7 +100,7 @@ static void phase_mmap(void)
         probe_info("A: mmap refused chunk %zu with ENOMEM after %zu MiB "
                    "(the process is still running)", n, (n * CHUNK) >> 20);
     else
-        probe_info("A: %zu MiB of eager anonymous mappings all succeeded "
+        probe_info("A: %zu MiB of anonymous mappings all succeeded "
                    "(budget reached, nothing to refuse)", (n * CHUNK) >> 20);
 
     /* Hand it all back before the next phase, and prove munmap survives a
@@ -111,6 +121,132 @@ static void phase_mmap(void)
         probe_fail("the reclaimed mapping did not hold what was written to it");
     munmap(again, CHUNK);
     probe_info("A: the address space is reusable after the refusal");
+}
+
+/* ── A': every page touched, until a touch cannot be backed ──────────────── */
+static sigjmp_buf      oom_env;
+static volatile void  *oom_addr;
+static char            oom_stack[64 * 1024];
+
+static void oom_segv(int sig, siginfo_t *si, void *uc)
+{
+    (void)sig; (void)uc;
+    oom_addr = si->si_addr;
+    siglongjmp(oom_env, 1);
+}
+
+/* Child exit codes: what happened, for the parent to judge. */
+enum { T_BUDGET = 0, T_OOM_OK = 10, T_STRAY_SEGV = 20, T_READ_BAD = 21,
+       T_SETUP = 22 };
+
+static int touch_child(void)
+{
+    /* Live across the siglongjmp, so volatile. */
+    volatile size_t n = 0, touched = 0;
+    int zfd = open("/dev/zero", O_RDONLY);
+    if (zfd < 0)
+        return T_SETUP;
+
+    /* The handler's stack and frame must not need a new page. */
+    memset(oom_stack, 0, sizeof oom_stack);
+    stack_t ss = { .ss_sp = oom_stack, .ss_size = sizeof oom_stack };
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = oom_segv;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    if (sigaltstack(&ss, NULL) != 0 || sigaction(SIGSEGV, &sa, NULL) != 0)
+        return T_SETUP;
+
+    unsigned char *volatile cur = NULL;
+    if (sigsetjmp(oom_env, 1) == 0) {
+        for (; n < MAX_CHUNKS; n++) {
+            void *p = mmap(NULL, CHUNK, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p == MAP_FAILED)
+                break;                       /* address space first: budget */
+            chunks[n] = p;
+            cur = p;
+            for (size_t off = 0; off < CHUNK; off += 4096) {
+                ((volatile unsigned char *)cur)[off] = 1;
+                touched += 4096;
+            }
+        }
+        for (size_t i = 0; i < n; i++)
+            munmap(chunks[i], CHUNK);
+        probe_info("A': touched %zu MiB without running out (budget reached)",
+                   (size_t)touched >> 20);
+        fflush(stdout);
+        return T_BUDGET;
+    }
+
+    /* Here a touch could not be backed.  It must have been our own chunk. */
+    unsigned char *a = (unsigned char *)oom_addr;
+    if (!cur || a < (unsigned char *)cur || a >= (unsigned char *)cur + CHUNK)
+        return T_STRAY_SEGV;
+    n++;                                     /* chunks[n] is mapped too */
+
+    /* Still exhausted: a syscall writing into an untouched buffer. */
+    int rc = T_OOM_OK;
+    ssize_t r = -1;
+    int err = 0;
+    void *buf = mmap(NULL, CHUNK, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (buf != MAP_FAILED) {
+        errno = 0;
+        r = read(zfd, buf, CHUNK);
+        err = errno;
+        if (r < 0 && err != EFAULT && err != ENOMEM)
+            rc = T_READ_BAD;
+        munmap(buf, CHUNK);
+    }
+    for (size_t i = 0; i < n; i++)
+        munmap(chunks[i], CHUNK);
+    probe_info("A': SIGSEGV on the touch at %zu MiB (fault-time OOM), caught",
+               (size_t)touched >> 20);
+    if (buf == MAP_FAILED)
+        probe_info("A': no address space left for the read() buffer");
+    else if (r < 0)
+        probe_info("A': read() into an untouched buffer at OOM: %s", strerror(err));
+    else
+        probe_info("A': read() into an untouched buffer at OOM: %zd of %u bytes",
+                   r, (unsigned)CHUNK);
+    fflush(stdout);
+    return rc;
+}
+
+static void phase_touch(void)
+{
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid < 0)
+        probe_fail("fork for the touch phase failed: %s", strerror(errno));
+    if (pid == 0)
+        _exit(touch_child());
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+        ;
+    still_alive("after the touch child");
+    if (WIFSIGNALED(st)) {
+        if (WTERMSIG(st) != SIGKILL)
+            probe_fail("the touching child died of signal %d (expected a "
+                       "caught SIGSEGV, or the OOM killer's SIGKILL)", WTERMSIG(st));
+        probe_info("A': the touching child was OOM-killed (SIGKILL)");
+        return;
+    }
+    switch (WIFEXITED(st) ? WEXITSTATUS(st) : -1) {
+    case T_BUDGET: case T_OOM_OK:
+        return;
+    case T_STRAY_SEGV:
+        probe_fail("fault-time OOM: SIGSEGV for an address outside the chunk being touched");
+    case T_READ_BAD:
+        probe_fail("fault-time OOM: read() into an untouched buffer failed with an "
+                   "errno other than EFAULT/ENOMEM");
+    case T_SETUP:
+        probe_fail("touch phase: /dev/zero, sigaltstack or sigaction failed");
+    default:
+        probe_fail("the touching child exited %d", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    }
 }
 
 /* ── B: pipes ────────────────────────────────────────────────────────────── */
@@ -337,6 +473,7 @@ int main(int argc, char **argv)
     }
 
     phase_mmap();
+    phase_touch();
     phase_pipes();
     phase_sockets();
     phase_tmpfs();
