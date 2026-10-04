@@ -214,7 +214,10 @@ static int sleep_ticks(uint32_t ticks) {
     return 0;
 }
 
-static int pcm_enter(void) {
+/* intr: a pending signal gives up with -EINTR.  The last close waits
+ * regardless (intr 0): the holder may be a sibling thread blocked in START,
+ * WRITEI or DRAIN on pcm.stage, which pcm_release frees. */
+static int pcm_enter_how(int intr) {
     for (;;) {
         int got;
         LOCK();
@@ -222,10 +225,14 @@ static int pcm_enter(void) {
         if (got) pcm_busy = 1;
         UNLOCK();
         if (got) return 0;
-        if (signal_interrupt_pending(current_proc)) return -EINTR_;
+        if (intr && signal_interrupt_pending(current_proc)) return -EINTR_;
         current_proc->wake_tick = pit_ticks() + 1;
         sleep_on(&pcm_busy);
     }
+}
+
+static int pcm_enter(void) {
+    return pcm_enter_how(1);
 }
 
 static void pcm_leave(void) {
@@ -1240,17 +1247,24 @@ static void pcm_retain(vfs_node_t *n) {
 static void pcm_close(vfs_node_t *n) {
     int last;
     (void)n;
+    /* The last reference keeps opens at 1 until the release is done, so
+     * no new open can start a stream that the release would then free. */
     LOCK();
-    last = --pcm.opens == 0;
+    last = pcm.opens == 1;
+    if (!last) pcm.opens--;
     UNLOCK();
     if (last) {
-        /* Linux drains nothing on close either: queued PCM is dropped */
-        if (pcm_enter() == 0) {
-            pcm_release();
-            pcm_leave();
-        } else {
-            pcm_release();
-        }
+        /* Linux drains nothing on close either: queued PCM is dropped.
+         * Linux also defers the release until no ioctl is running; here
+         * close_fn runs as soon as the fd goes, so wait out the holder (a
+         * sibling thread in START/WRITEI/DRAIN, which finishes as the device
+         * plays) instead of freeing pcm.stage under it. */
+        pcm_enter_how(0);
+        pcm_release();
+        LOCK();
+        pcm.opens--;
+        UNLOCK();
+        pcm_leave();
     }
 }
 
