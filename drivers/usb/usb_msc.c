@@ -127,9 +127,16 @@ static void reset_recovery(struct usb_device *d, uint8_t ifnum) {
 
 /* One SCSI command to `lun` of `d`.  Data (`len` bytes, at most
  * BOUNCE_SIZE) moves through `bounce`.  Returns the CSW status (0 passed,
- * 1 failed) or -1 on a transport error (after reset recovery). */
+ * 1 failed) or -1 on a transport error (after reset recovery).  *moved
+ * (when not NULL) gets the bytes the device really transferred: the data
+ * phase's actual length, capped by what the CSW claims (len less
+ * dCSWDataResidue, BOT 6.7).  Bytes of an IN transfer that did not arrive
+ * are zeroed, so `bounce` never hands out an earlier command's data (another
+ * disk's blocks) as this one's. */
 static int scsi(struct usb_device *d, uint8_t ifnum, uint8_t lun,
-                const uint8_t *cb, uint8_t cb_len, int in, uint32_t len) {
+                const uint8_t *cb, uint8_t cb_len, int in, uint32_t len,
+                uint32_t *moved) {
+    if (moved) *moved = 0;
     memset(&cbw_buf, 0, sizeof(cbw_buf));
     cbw_buf.sig = CBW_SIGNATURE;
     cbw_buf.tag = ++tag_seq;
@@ -139,7 +146,8 @@ static int scsi(struct usb_device *d, uint8_t ifnum, uint8_t lun,
     cbw_buf.cb_len = cb_len;
     memcpy(cbw_buf.cb, cb, cb_len);
 
-    uint32_t got = 0;
+    uint32_t got = 0, data_got = 0;
+    if (in && len) memset(bounce, 0, len);   /* what does not arrive reads 0 */
     if (usb_bulk(d, EP_OUT, usb_phys(&cbw_buf), 31, &got, 2000) != 0 ||
         got != 31) {
         reset_recovery(d, ifnum);
@@ -148,6 +156,7 @@ static int scsi(struct usb_device *d, uint8_t ifnum, uint8_t lun,
     if (len) {
         int r = usb_bulk(d, in ? EP_IN : EP_OUT, usb_phys(bounce), len, &got,
                          10000);
+        data_got = got > len ? len : got;
         if (r == USB_STALL) {
             usb_clear_halt(d, in ? EP_IN : EP_OUT);   /* then read the CSW */
         } else if (r != 0) {
@@ -161,16 +170,21 @@ static int scsi(struct usb_device *d, uint8_t ifnum, uint8_t lun,
         r = usb_bulk(d, EP_IN, usb_phys(&csw_buf), 13, &got, 2000);
     }
     if (r != 0 || got != 13 || csw_buf.sig != CSW_SIGNATURE ||
-        csw_buf.tag != cbw_buf.tag || csw_buf.status > 1) {
+        csw_buf.tag != cbw_buf.tag || csw_buf.status > 1 ||
+        csw_buf.residue > len) {                  /* residue > length: bogus */
         reset_recovery(d, ifnum);
         return -1;
+    }
+    if (moved) {
+        uint32_t claimed = len - csw_buf.residue;
+        *moved = data_got < claimed ? data_got : claimed;
     }
     return csw_buf.status;
 }
 
 static int disk_scsi(msc_disk_t *k, const uint8_t *cb, uint8_t cb_len,
                      int in, uint32_t len) {
-    return scsi(k->dev, k->ifnum, k->lun, cb, cb_len, in, len);
+    return scsi(k->dev, k->ifnum, k->lun, cb, cb_len, in, len, 0);
 }
 
 static void request_sense(msc_disk_t *k) {
@@ -186,8 +200,18 @@ static int rw10(msc_disk_t *k, int write, uint32_t lba, uint32_t count) {
                        (uint8_t)(lba >> 24), (uint8_t)(lba >> 16),
                        (uint8_t)(lba >> 8), (uint8_t)lba, 0,
                        (uint8_t)(count >> 8), (uint8_t)count, 0 };
-    int r = disk_scsi(k, cb, 10, !write, count * k->block_size);
+    uint32_t len = count * k->block_size, moved;
+    int r = scsi(k->dev, k->ifnum, k->lun, cb, 10, !write, len, &moved);
     if (r == 1) request_sense(k);
+    if (r == 0 && moved != len) {
+        /* Passed, but short (a residue, or a short data phase): those
+         * blocks were not read or written; fail rather than return zeroes
+         * (or report a write that did not happen) as data. */
+        printk("[USB-MSC] %s: %s of %u blocks at %u moved %u of %u bytes\n",
+               k->name, write ? "WRITE(10)" : "READ(10)", (unsigned)count,
+               (unsigned)lba, (unsigned)moved, (unsigned)len);
+        return -1;
+    }
     return r == 0 ? 0 : -1;
 }
 
