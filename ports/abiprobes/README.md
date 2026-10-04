@@ -72,6 +72,7 @@ regression tests for the fixes in audit section 5.
 | P52 | `p52_kill_zombie_child.c`   | `kill(pid, SIGKILL)` and `kill(-pgrp, SIGKILL)` of a process with an unreaped zombie child return and kill it (the SIGKILL subtree walk used to spin forever under the BKL) | — |
 | P70 | `p70_scm_rights_budget.c`  | a stream and a seqpacket socketpair flooded with unread 1-byte SCM_RIGHTS messages stop with EAGAIN (Linux: sk_sndbuf, ~280 messages) instead of queueing ~65,000 5 KiB batches; a blocked sender wakes when the reader drains; every fd arrives; writable again after | — |
 | P71 | `p71_unix_gc_backlog.c`    | a listener sent over a connection still in its own backlog and then closed is collected (the name can be bound again) | — |
+| P72 | `p72_recvmsg_bad_control.c` | recvmsg whose control buffer is read-only installs none of the passed fds (dropped, MSG_CTRUNC), data still returned | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the

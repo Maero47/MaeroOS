@@ -9267,10 +9267,16 @@ static void usock_deliver_fds(usocket_t *us, uint32_t umsg, uint32_t uctrl,
     if (ngot > 0) {
         int cloex = (msgflags & MSG_CMSG_CLOEXEC_K) ? 1 : 0;
         int newfds[SCM_MAX_FDS]; int ninst = 0;
+        proc_file_t *take[SCM_MAX_FDS];
+        int next_free = 0;
+        /* Pick the slots first; nothing is installed until the cmsg naming
+         * them has reached the caller, so a bad control buffer cannot leave
+         * fds in the table that the caller never learns about (Linux
+         * receive_fd_user: put_user before fd_install). */
         for (int k = 0; k < ngot; k++) {
             int slot = -1;
             if (ninst < room) {         /* the cmsg can name it */
-                for (int j = 0; j < MAX_FD; j++)
+                for (int j = next_free; j < MAX_FD; j++)
                     if (current_proc->ofile[j].type == FD_NONE) { slot = j; break; }
                 if (slot < 0)
                     printk("[scm] fd table FULL on recv (pid %d)\n",
@@ -9281,8 +9287,8 @@ static void usock_deliver_fds(usocket_t *us, uint32_t umsg, uint32_t uctrl,
                 out_flags |= MSG_CTRUNC_K;
                 continue;
             }
-            current_proc->ofile[slot] = got[k];
-            current_proc->ofile[slot].cloexec = (uint8_t)cloex;
+            next_free = slot + 1;
+            take[ninst] = &got[k];
             newfds[ninst++] = slot;
         }
         if (ninst > 0) {
@@ -9294,8 +9300,16 @@ static void usock_deliver_fds(usocket_t *us, uint32_t umsg, uint32_t uctrl,
             __builtin_memcpy(cbuf + 8, &typ, 4);
             for (int k = 0; k < ninst; k++)
                 __builtin_memcpy(cbuf + 12 + k * 4, &newfds[k], 4);
-            copy_to_user((void *)(uintptr_t)uctrl, cbuf, clen);
-            ctrl_used = clen;
+            if (copy_to_user((void *)(uintptr_t)uctrl, cbuf, clen) < 0) {
+                for (int k = 0; k < ninst; k++) fd_release(take[k]);
+                out_flags |= MSG_CTRUNC_K;
+            } else {
+                for (int k = 0; k < ninst; k++) {
+                    current_proc->ofile[newfds[k]] = *take[k];
+                    current_proc->ofile[newfds[k]].cloexec = (uint8_t)cloex;
+                }
+                ctrl_used = clen;
+            }
         }
     }
     copy_to_user((void *)(uintptr_t)(umsg + 20), &ctrl_used, 4);

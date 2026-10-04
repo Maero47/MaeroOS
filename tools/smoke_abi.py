@@ -126,6 +126,7 @@ PROBES = {
     # backlog (drivers + network review, 2026-10-04).
     "p70_scm_rights_budget":   (120, ""),
     "p71_unix_gc_backlog":     (60, ""),
+    "p72_recvmsg_bad_control": (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.
