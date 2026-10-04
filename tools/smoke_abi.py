@@ -122,6 +122,14 @@ PROBES = {
     "p51_procfs_fair":         (150, ""),
     # SIGKILL of a parent with an unreaped child (hung the kernel).
     "p52_kill_zombie_child":   (60, ""),
+    # Kernel-core review 2026-10-04 (proc/, mm/, arch/).
+    "p53_sigpage_interp":      (60, ""),
+    "p54_setid_auxv":          (60, ""),
+    "p55_fstat_low_map":       (60, ""),
+    "p56_memfd_anon":          (60, ""),
+    "p57_fb0_identity":        (60, ""),
+    "p58_kill_target":         (60, ""),
+    "p59_lock_limits":         (120, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

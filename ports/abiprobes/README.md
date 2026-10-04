@@ -1,7 +1,7 @@
 # Linux-ABI probes
 
-Forty-nine small C programs.  P1-P20 are the probes of
-`docs/audit/firefox-first-paint.md` section 8; P21-P52 were added with later
+Fifty-nine small C programs.  P1-P20 are the probes of
+`docs/audit/firefox-first-paint.md` section 8; P21-P59 were added with later
 kernel fixes.  Each proves or disproves one kernel-semantics gap and prints
 exactly one final line:
 
@@ -70,6 +70,13 @@ regression tests for the fixes in audit section 5.
 | P50 | `p50_accounting.c`          | `/proc/self/fd`/`fdinfo` nodes are dropped once the fds close (`procfs_nodes`); inotify's spill bucket returns to 0 after a spilled user gets a slot | — |
 | P51 | `p51_procfs_fair.c`         | an unprivileged user looking up ~6000 distinct `/proc/<pid>/fd`/`fdinfo` nodes in tight loops cannot make root's or another user's `/proc` lookups (or `ps`) fail; `procfs_nodes` stays within `procfs_nodes_max` and falls back once it stops; a user cannot hold (open/inotify-watch) more than its share of nodes; per-pid `/proc` dirs are refused as bind source/target | — |
 | P52 | `p52_kill_zombie_child.c`   | `kill(pid, SIGKILL)` and `kill(-pgrp, SIGKILL)` of a process with an unreaped zombie child return and kill it (the SIGKILL subtree walk used to spin forever under the BKL) | — |
+| P53 | `p53_sigpage_interp.c`      | an ELF interpreter segment at the sigreturn page's address must not overwrite the shared trampoline (signal handlers still return afterwards) | — |
+| P54 | `p54_setid_auxv.c`          | set-uid-root exec from uid 65534: `AT_SECURE=1`, `AT_EUID=0`; a plain exec `AT_SECURE=0` (root only) | — |
+| P55 | `p55_fstat_low_map.c`       | old `fstat` (108) on eventfd/epoll/socket/pipe; unprivileged `MAP_FIXED` below 64 KiB refused | — |
+| P56 | `p56_memfd_anon.c`          | a memfd has no name in `/tmp` (`/memfd:<name> (deleted)`), and a reopen through `/proc/self/fd` shares its pages | — |
+| P57 | `p57_fb0_identity.c`        | a regular file named `fb0` maps its own bytes; read-only `/dev/fb0` gives no writable view (MaeroOS) | — |
+| P58 | `p58_kill_target.c`         | MaeroOS syscall 505: no init, no process the caller could not signal (EPERM); own child allowed | — |
+| P59 | `p59_lock_limits.c`         | record locks bounded per uid (ENOLCK past 4096 here); a second user can still lock; close releases all | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the
