@@ -38,6 +38,9 @@ typedef struct pnode {
     uint8_t        kind;
     uint8_t        thread;     /* under task/<tid>: the thread's own view */
     uint8_t        bucket;     /* accounting bucket it is charged to */
+    /* While open (refs > 0): every bucket charged for it, one bit each
+     * (bit `bucket` included).  See pnode_may_pin. */
+    uint32_t       holders[3];
     uint16_t       walks;      /* running syscalls that looked it up */
     int            refs;       /* open references (retain/close) */
     uint32_t       used_tick;  /* PIT tick of its last lookup or close */
@@ -136,10 +139,13 @@ int procfs_may_read(struct proc *t) {
  *    running syscall has looked up can be freed at any time, oldest first,
  *    to make room; a lookup that needs room never fails while such a node
  *    exists.
- *  - every node is charged to one user: the last to look it up while it was
- *    not open, or whoever first opened, watched or chroot'ed to it (refused
- *    with EMFILE/ENOSPC when that user's share is all held; see
- *    pnode_may_pin).  A non-root user with PNODE_USER_MAX
+ *  - a node nobody holds is charged to one user: the last to look it up.  A
+ *    node that is held (open, watched, a chroot) is charged to EVERY user
+ *    that took a hold on it since it was last not held, each once, and
+ *    each only with room in its share (else EMFILE/ENOSPC; see
+ *    pnode_may_pin); when the last hold goes, the extra charges go with it.
+ *    So a user's charges are the nodes it last looked up plus those it
+ *    holds (or held while others still do).  A non-root user with PNODE_USER_MAX
  *    nodes charged frees one of its own before it gets another (and its
  *    lookup fails only when all of them are open or in use by its own
  *    syscalls), so one user can hold at most that many and the rest of
@@ -157,6 +163,7 @@ int procfs_may_read(struct proc *t) {
 #define PN_SPILL PN_USERS
 #define PN_ROOT  (PN_USERS + 1)
 static struct { uint32_t uid, n; pnode_t *head, *tail; } pn_acct[PN_USERS + 2];
+_Static_assert(PN_USERS + 2 <= 32 * 3, "pnode_t.holders has a bit per bucket");
 static pnode_t *pn_ghead, *pn_gtail;
 #define PN_HASH 512
 static pnode_t *pn_hash[PN_HASH];
@@ -242,42 +249,65 @@ static void pnode_sweep(uint32_t now) {
     }
 }
 
-/* may_pin_fn: before an open, a watch or a chroot takes the first
- * reference, the node is charged to that user, who must have room for it
- * like for a lookup: one of its own unheld nodes goes to make it, and with
- * none left the pin is refused.  So the nodes held open count against the
- * share of whoever holds them, and nobody can hold nodes in another user's
- * share.  Mounts keep raw pointers, so a node that can be freed is never
- * one of their ends. */
+static int pn_holds(pnode_t *pn, int b) { return (int)(pn->holders[b >> 5] >> (b & 31) & 1); }
+
+/* Is pn charged to bucket b already (for a holder: while held, any of its
+ * holders' buckets; otherwise its one bucket)? */
+static int pn_charged_to(pnode_t *pn, int b) {
+    return pn->refs > 0 ? pn_holds(pn, b) : b == pn->bucket;
+}
+
+/* may_pin_fn: before an open, a watch or a chroot takes a reference, the
+ * node is charged to that user, who must have room for it like for a
+ * lookup: one of its own unheld nodes goes to make it, and with none left
+ * the pin is refused.  A node nobody holds moves to that user's bucket; a
+ * node others hold gains a charge in it as well (holders), kept until the
+ * node is no longer held.  So every node held counts against the share of
+ * each user holding it, and nobody holds a node on someone else's share.
+ * (A descriptor passed to another user, or inherited, adds no charge: its
+ * sender was charged.)  Mounts keep raw pointers, so a node that can be
+ * freed is never one of their ends. */
 static int pnode_may_pin(vfs_node_t *n, int how) {
     pnode_t *pn = (pnode_t *)n;
     if (how == VFS_PIN_MOUNT) return -22;                     /* -EINVAL */
-    if (pn->refs > 0) return 0;              /* already charged to a holder */
     uint32_t uid = current_proc ? current_proc->euid : 0;
     int b = pn_bucket_of(uid);
-    if (b == pn->bucket) return 0;
+    if (pn_charged_to(pn, b)) return 0;
     if (b != PN_ROOT) {
-        /* pn is in another bucket: making room in b cannot free it. */
+        /* Not charged to b: pn is on no list of b, so making room there
+         * cannot free it. */
         while (pn_acct[b].n >= PNODE_USER_MAX && pn_evict(b)) {}
         b = pn_bucket_of(uid);
-        if (b != pn->bucket && pn_acct[b].n >= PNODE_USER_MAX)
+        if (pn_charged_to(pn, b)) return 0;
+        if (pn_acct[b].n >= PNODE_USER_MAX)
             return how == VFS_PIN_WATCH ? -28 : -24;          /* ENOSPC, EMFILE */
     }
-    pn_charge(pn, b, uid);
+    if (pn->refs > 0) {
+        pn->holders[b >> 5] |= 1u << (b & 31);
+        if (!pn_acct[b].n++) pn_acct[b].uid = uid;
+    } else {
+        pn_charge(pn, b, uid);
+    }
     return 0;
 }
 
-/* The first reference takes it off the LRU lists; it stays charged where
- * pnode_may_pin (or the last lookup) put it. */
+/* The first reference takes it off the LRU lists; its holders start as the
+ * bucket it is charged to (pnode_may_pin put it there for a pin). */
 static void pnode_retain(vfs_node_t *n) {
     pnode_t *pn = (pnode_t *)n;
     if (pn->refs++ > 0) return;
     pn_lru_del(pn);
+    memset(pn->holders, 0, sizeof(pn->holders));
+    pn->holders[pn->bucket >> 5] |= 1u << (pn->bucket & 31);
 }
 
 static void pnode_close(vfs_node_t *n) {
     pnode_t *pn = (pnode_t *)n;
     if (pn->refs <= 0 || --pn->refs > 0) return;
+    /* No longer held: back to one charge, in its own bucket. */
+    for (int b = 0; b < PN_USERS + 2; b++)
+        if (b != pn->bucket && pn_holds(pn, b) && pn_acct[b].n) pn_acct[b].n--;
+    memset(pn->holders, 0, sizeof(pn->holders));
     pn->used_tick = pit_ticks();
     pn_lru_add(pn);
 }

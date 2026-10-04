@@ -74,17 +74,23 @@ count, without letting one user deny `/proc` to the others:
 - A lookup that needs room frees the least recently used node that is
   neither open nor held by a running syscall; it never fails while one
   exists. Nothing is kept merely because it was used recently.
-- Each node is charged to one user: the last to look it up while it was not
-  open, or whoever first holds it (opens it, watches it with inotify, or
-  chroots to it). A non-root user with 1024 nodes charged
-  (`/proc/sys/kernel/procfs_user_nodes_max`) frees one of its own first.
-  When all of its nodes are open or held by its own running syscalls, its
-  new lookups fail (ENOENT) and its opens and watches of nodes charged to
-  others are refused (EMFILE, ENOSPC), so nodes held open count against the
-  holder's share. One user therefore holds at most 1024, and the rest of the
-  8192 that non-root lookups may fill stays available to everyone else.
-  Root has no per-user limit and may also use the last 1024 of the 9216
-  total (`procfs_nodes_max`, about 4 MiB of heap at most).
+- Charges. A node nobody holds is charged to one user, the last to look it
+  up. A held node (open, watched with inotify, or a chroot root) is charged
+  to every user that took a hold on it since it was last unheld, once per
+  user. When the last hold goes, the extra charges go too, and the node
+  keeps one charge. A descriptor passed to another user (SCM_RIGHTS) or
+  inherited adds no charge, because whoever took it was charged.
+- The limit. A user may gain a charge only with room in its share of 1024
+  (`/proc/sys/kernel/procfs_user_nodes_max`). To make room it first frees
+  its own least recently used unheld node. With none left, its lookups of
+  new nodes fail (ENOENT), and its opens and watches of nodes not already
+  charged to it are refused (EMFILE, ENOSPC). Invariant: each non-root
+  user's charges, which are the nodes it last looked up plus those it holds
+  (or held while others still do), never exceed 1024. Each node carries at
+  least one charge. So one user can account for at most 1024 nodes, and
+  the rest of the 8192 that non-root lookups may fill stays available to
+  the others. Root has no per-user limit and may also use the last 1024 of
+  the 9216 total (`procfs_nodes_max`, about 4 MiB of heap at most).
 - The mount table keeps raw node pointers, with no reference. A
   per-process `/proc` directory therefore cannot be a bind mount's source or
   mount point (EINVAL; Linux allows both).
@@ -98,7 +104,11 @@ p50 has one user look up about 6000 distinct nodes in tight loops while
 root and a second user run `ps` and read every `/proc/<pid>/stat` and
 `status`. Before this change, past 4096 nodes only nodes idle for 3 s could
 be evicted, so the hammer kept the whole cache busy and every new lookup
-failed for everyone, `/proc/<pid>` and `/proc/self` included.
+failed for everyone, `/proc/<pid>` and `/proc/self` included. p50 also has
+one user try to open and watch 2800 nodes, 400 of which another user
+already holds open. It ends up holding at most 1024 (it held 1414 before
+holders were charged), and per-process directories are refused as bind
+mounts.
 
 ## System V IPC
 

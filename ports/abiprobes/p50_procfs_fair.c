@@ -55,6 +55,7 @@ struct shared {
     volatile long misses[2];     /* the hammer's own failed lookups */
     volatile long other_bad;     /* the second user's failures */
     volatile char other_what[128];
+    volatile long b_held, b_ready;
 };
 static struct shared *sh;
 
@@ -277,10 +278,13 @@ static void part_hammer(void)
 /* Part 2: holding nodes open or watched counts against the holder's share.
  * Root looks up ~2800 nodes of 100 of its own processes (charged to root);
  * a user then tries to open them (two processes) and to inotify-watch them
- * (two more, no descriptor limit there) and keep them all.  It must end up
- * holding at most procfs_user_nodes_max, the rest refused (EMFILE/ENOSPC/ENOENT),
- * while another user's ps still works. */
+ * (two more, no descriptor limit there) and keep them all.  A third user
+ * already holds every 7th of them open: holding a node someone else holds
+ * counts against one's share too.  The user must end up holding at most
+ * procfs_user_nodes_max, the rest refused (EMFILE/ENOSPC/ENOENT), while
+ * another user's ps still works. */
 #define PIN_UID   65526
+#define HOLD_UID  65524
 #define NSLEEP    100
 #define NKINDS    14
 static const char *const pin_kinds[NKINDS] = {
@@ -315,6 +319,21 @@ static void part_pin(void)
     memset((void *)sh, 0, sizeof *sh);
     int go[2];
     if (pipe(go) != 0) probe_fail("pipe");
+    /* The first holder. */
+    pid_t hb = fork();
+    if (hb == 0) {
+        close(go[1]);
+        if (setgid(HOLD_UID) != 0 || setuid(HOLD_UID) != 0) _exit(99);
+        for (int i = 0; i < total; i += 7) {
+            pin_path(i, path, sizeof path);
+            if (open(path, O_RDONLY) >= 0) sh->b_held++;
+        }
+        sh->b_ready = 1;
+        char x;
+        if (read(go[0], &x, 1) < 0) _exit(98);
+        _exit(0);
+    }
+    while (!sh->b_ready) usleep(20000);
     pid_t w[4];
     for (int j = 0; j < 4; j++) {
         w[j] = fork();
@@ -360,11 +379,13 @@ static void part_pin(void)
     if (!WIFEXITED(ost) || WEXITSTATUS(ost) != 0) bad = 1;
     close(go[1]);
     for (int j = 0; j < 4; j++) waitpid(w[j], NULL, 0);
+    waitpid(hb, NULL, 0);
     for (int i = 0; i < NSLEEP; i++) kill(sleepers[i], SIGKILL);
     for (int i = 0; i < NSLEEP; i++) waitpid(sleepers[i], NULL, 0);
 
-    probe_info("pins: %ld of %d nodes held open/watched by one user, %ld refused (share %ld)",
-               held, total, refused, umax);
+    probe_info("pins: %ld of %d nodes held open/watched by one user, %ld refused (share %ld); "
+               "%ld of them already held by another user", held, total, refused, umax, sh->b_held);
+    if (sh->b_held < total / 7) probe_fail("the first holder opened only %ld nodes", sh->b_held);
     if (bad) probe_fail("another user's lookups failed while one user held nodes");
     if (umax > 0 && held > umax)
         probe_fail("one user holds %ld nodes, over its share of %ld", held, umax);
