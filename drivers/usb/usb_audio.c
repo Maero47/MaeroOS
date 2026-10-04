@@ -294,6 +294,7 @@ static struct {
     volatile uint32_t inflight;    /* bytes in queued TDs */
     uint32_t slot_next, nqueued;
     int streaming;
+    int draining;                  /* the stream ends: pad its last TD */
     char longname[64];
 } ua;
 
@@ -325,6 +326,14 @@ static void feed(void) {
     while (room-- > 0) {
         uint32_t acc, frames = next_frames(&acc);
         uint32_t bytes = frames * ua.frame_bytes;
+        uint32_t have = ua.wr - ua.rd;
+        if (ua.draining && have && have < bytes && FIFO_SIZE - have >= bytes) {
+            /* the last partial TD of a stream that ends: silence after it */
+            for (uint32_t k = have; k < bytes; k++)
+                ua.fifo[(ua.wr + (k - have)) % FIFO_SIZE] = 0;
+            __sync_synchronize();
+            ua.wr += bytes - have;
+        }
         if (!bytes || ua.wr - ua.rd < bytes) break;
         uint8_t *slot = slots[ua.slot_next];
         uint32_t at = ua.rd % FIFO_SIZE, first = FIFO_SIZE - at;
@@ -367,6 +376,8 @@ static void td_done(void *ctx, uint32_t len, int ok) {
         stream_trace("ran out of data");
     }
     wake_up(&writer_chan);
+    /* the hw pointer moved: poll()/select() on the PCM (aplay) looks again */
+    io_wake_poll();
 }
 
 /* ── ALSA card operations (process context, USB lock not held) ──────────── */
@@ -415,6 +426,7 @@ static int ua_write(const uint8_t *data, uint32_t len) {
         ua.wr += bytes;
         done += frames * 4;
         usb_lock();
+        ua.draining = 0;
         feed();
         usb_unlock();
     }
@@ -439,24 +451,17 @@ static void ua_drop(void) {
     ua.nqueued = 0;
     ua.acc = 0;
     ua.streaming = 0;
+    ua.draining = 0;
     usb_unlock();
     wake_up(&writer_chan);
 }
 
-/* The stream ends: pad the last partial TD with silence so it plays. */
+/* The stream ends (ALSA DRAIN): from now until the next write, a partial
+ * TD left at the end of the FIFO is padded with silence and played. */
 static void ua_flush(void) {
     usb_lock();
-    if (ua.dev) {
-        uint32_t acc, bytes = next_frames(&acc) * ua.frame_bytes;
-        uint32_t have = fifo_used();
-        if (have && have < bytes && FIFO_SIZE - have >= bytes) {
-            for (uint32_t k = have; k < bytes; k++)
-                ua.fifo[(ua.wr + (k - have)) % FIFO_SIZE] = 0;
-            __sync_synchronize();
-            ua.wr += bytes - have;
-        }
-        feed();
-    }
+    ua.draining = 1;
+    if (ua.dev) feed();
     usb_unlock();
 }
 

@@ -77,6 +77,7 @@ regression tests for the fixes in audit section 5.
 | P74 | `p74_raw_short_send.c`     | ICMPv6 raw sendto of 0-3 bytes is EINVAL (it halted the machine through an lwIP assert), 8 bytes go out; IP_HDRINCL sendto shorter than an IP header is EINVAL (root; SKIP otherwise) | — |
 | P75 | `p75_ephemeral_ports.c`    | sixteen implicitly bound UDP sockets and sixteen TCP connections do not get consecutive local ports (lwIP counted up from a fixed start: LWIP_RAND() was 4) | — |
 | P76 | `p76_alsa_close_race.c`    | close of the ALSA PCM while a sibling thread's START is still writing the staged buffer, interrupted by a signal: the device cannot be reopened before START returns, START succeeds (the close freed the buffer under it); SKIP without a sound card, run by smoke-hda | — |
+| P77 | `p77_alsa_mixer.c`         | the ALSA control mixer elements as amixer uses them: ELEM_LIST (count, then ids), ELEM_INFO of "Master Playback Volume" (integer) and "Master Playback Switch" (boolean), a volume written by name and read back by numid (and through the OSS mixer of /dev/dsp), the switch off/on, an unknown name ENOENT, values restored; SKIP without such a card, run by smoke-hda | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the
