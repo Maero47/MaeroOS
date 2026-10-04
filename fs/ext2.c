@@ -4362,11 +4362,17 @@ static int ext2_rename_do(vfs_node_t *old_dir, const char *old_name,
         if (dst_is_dir && !ext2_dir_is_empty(fs, &dst)) return -39;  /* -ENOTEMPTY */
     }
 
-    /* A directory cannot move below itself: walk up from the new parent. */
+    /* A directory cannot move below itself: walk up from the new parent, all
+     * the way to the root.  (This used to give up after 256 levels and allow
+     * the move, which would make a cycle cut off from the tree; the VFS's
+     * 512-byte expanded paths keep a walk shallower than that today, but the
+     * check should not depend on it.)  Every step is a different directory,
+     * so more than inodes_count steps is a loop. */
     if (src_is_dir && !same_dir) {
         uint32_t cur = n_ino;
-        for (int depth = 0; depth < 256 && cur != 2; depth++) {
+        for (uint32_t depth = 0; cur != 2; depth++) {
             if (cur == src_ino) return -22;                  /* -EINVAL */
+            if (depth > fs->st.inodes_count) return -40;     /* -ELOOP */
             ext2_inode_t ci;
             if (ext2_read_inode(fs, cur, &ci) < 0) return -5;
             uint32_t up = ext2_dir_lookup(fs, cur, &ci, "..", (uint8_t *)0);
