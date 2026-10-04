@@ -131,6 +131,8 @@ PROBES = {
     "p73_netlink_limits":      (120, ""),
     # Short raw sends refused (an ICMPv6 one halted the machine in lwIP).
     "p74_raw_short_send":      (60, ""),
+    # Ephemeral ports drawn at random (LWIP_RAND() was the constant 4).
+    "p75_ephemeral_ports":     (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

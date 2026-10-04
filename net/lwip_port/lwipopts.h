@@ -86,6 +86,14 @@
 #define TCP_WND                         (16 * TCP_MSS)
 
 
+/* TCP initial sequence numbers per RFC 6528 (net/lwip_glue.c); lwIP's own
+ * tcp_next_iss() is a counter advanced by tcp_ticks, so an off-path host
+ * could guess the next connection's ISN. */
+struct ip_addr;
+unsigned int maeros_tcp_isn(const struct ip_addr *local_ip, unsigned short local_port,
+                            const struct ip_addr *remote_ip, unsigned short remote_port);
+#define LWIP_HOOK_TCP_ISN(lip, lport, rip, rport) maeros_tcp_isn((lip), (lport), (rip), (rport))
+
 /* ── MaeroOS firewall: filter inbound IPv4/IPv6 after the ethernet demux ── */
 struct pbuf;
 struct netif;

@@ -4,6 +4,8 @@
 #include "../lib/printf.h"
 #include "../kernel/printk.h"
 #include "../fs/vfs.h"
+#include "../kernel/random.h"
+#include "../arch/i686/cpu/tsc.h"
 
 #include "lwip/init.h"
 #include "lwip/dhcp.h"
@@ -474,4 +476,23 @@ void net_lwip_set_up(int up) {
         return;
     if (up) netif_set_up(&lwip_eth0);
     else    netif_set_down(&lwip_eth0);
+}
+
+/* LWIP_HOOK_TCP_ISN (lwipopts.h): RFC 6528 sequence numbers, keyed by the
+ * connection's addresses and ports (kernel/random.c). */
+unsigned int maeros_tcp_isn(const struct ip_addr *local_ip, unsigned short local_port,
+                            const struct ip_addr *remote_ip, unsigned short remote_port) {
+    uint32_t ids[11];
+    uint32_t n = 0;
+    ids[n++] = ((uint32_t)local_port << 16) | remote_port;
+    const ip_addr_t *a[2] = { local_ip, remote_ip };
+    for (int k = 0; k < 2; k++) {
+        if (IP_IS_V6(a[k])) {
+            for (int i = 0; i < 4; i++) ids[n++] = ip_2_ip6(a[k])->addr[i];
+            ids[n++] = 6;
+        } else {
+            ids[n++] = ip4_addr_get_u32(ip_2_ip4(a[k]));
+        }
+    }
+    return random_tcp_isn(ids, n, clock_mono_ns());
 }

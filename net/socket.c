@@ -10,6 +10,7 @@
 #include "../proc/scheduler.h"
 #include "../proc/process.h"
 #include "../proc/signal.h"
+#include "../kernel/random.h"
 
 #include "lwip/udp.h"
 #include "lwip/tcp.h"
@@ -468,6 +469,19 @@ static net_socket_t *socket_free_slot(uint32_t uid) {
     return slot;
 }
 
+/* An unbound socket's ephemeral port, drawn at random from lwIP's range
+ * (RFC 6056 algorithm 1; Linux also randomizes).  lwIP's own allocator hands
+ * ports out in sequence, so the next DNS query's source port could be
+ * guessed.  If 32 draws all collide, lwIP's sequential pick takes over. */
+static void bind_random_port(net_socket_t *s) {
+    for (int tries = 0; tries < 32; tries++) {
+        u16_t port = (u16_t)(0xC000u + (random_u32() & 0x3FFFu));
+        err_t e = s->udp ? udp_bind(s->udp, &s->udp->local_ip, port)
+                         : tcp_bind(s->tcp, &s->tcp->local_ip, port);
+        if (e != ERR_USE) return;
+    }
+}
+
 static int xsocket_create_locked(int domain, int type, int protocol,
                                  net_socket_t **out) {
     net_socket_t *s = socket_free_slot(current_uid());
@@ -729,6 +743,10 @@ static int socket_listen_locked(net_socket_t *s, int backlog) {
     /* An unbound socket gets an ephemeral port (Linux inet_autobind). */
     const ip_addr_t *any = s->domain == AF_INET_K ? IP4_ADDR_ANY
                          : s->v6only ? IP6_ADDR_ANY : IP_ANY_TYPE;
+    if (s->tcp->local_port == 0) {
+        ip_addr_copy(s->tcp->local_ip, *any);
+        bind_random_port(s);
+    }
     if (s->tcp->local_port == 0 && tcp_bind(s->tcp, any, 0) != ERR_OK) {
         kfree(q);
         return -98;
@@ -826,6 +844,7 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
         ip_addr_copy(s->remote_addr, dst);
         s->remote_port = bswap16(addr->port);
         preempt_disable();
+        if (s->udp->local_port == 0) bind_random_port(s);
         err_t e = udp_connect(s->udp, &s->remote_addr, s->remote_port);
         preempt_enable();
         if (e != ERR_OK)
@@ -859,6 +878,7 @@ int net_socket_connect(net_socket_t *s, const net_sockaddr_in_t *addr,
     s->tcp_state = TCP_STATE_CONNECTING;
     s->tcp_error = 0;
     preempt_disable();
+    if (s->tcp->local_port == 0) bind_random_port(s);
     err_t e = tcp_connect(s->tcp, &s->remote_addr, s->remote_port,
                           tcp_connected_cb);
     preempt_enable();
@@ -967,6 +987,7 @@ static int socket_sendto_locked(net_socket_t *s, const void *buf, uint32_t len,
             pbuf_free(p);
             return -13;   /* -EACCES */
         }
+        if (s->udp->local_port == 0) bind_random_port(s);
         e = udp_sendto(s->udp, p, &ip, bswap16(addr->port));
     } else if (s->connected) {
         e = udp_send(s->udp, p);

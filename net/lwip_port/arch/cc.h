@@ -25,7 +25,10 @@
     for (;;) __asm__ volatile("hlt"); \
 } while (0)
 
-#define LWIP_RAND() 4
+/* kernel/random.c's ChaCha20 generator: DNS transaction ids and the
+ * initial UDP/TCP local ports.  It was the constant 4. */
+uint32_t random_u32(void);
+#define LWIP_RAND() random_u32()
 
 #define PACK_STRUCT_FIELD(x) x
 #define PACK_STRUCT_STRUCT __attribute__((packed))
