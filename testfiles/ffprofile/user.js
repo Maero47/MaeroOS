@@ -117,3 +117,10 @@ user_pref("datareporting.healthreport.uploadEnabled", false);
 user_pref("app.normandy.enabled", false);
 user_pref("browser.contentblocking.database.enabled", false);
 user_pref("network.trr.mode", 5);
+/* Emoji: font.name-list.emoji is Firefox's bundled fonts/TwemojiMozilla.ttf
+ * (COLR, drawn by Firefox itself), but a release build only registers its
+ * bundled fonts on Nightly and early beta unless this says always.  Without
+ * it emoji are missing-glyph boxes (or DejaVu's monochrome smileys).  The
+ * fontconfig cache for that directory is prebuilt with the others
+ * (ports/firefox/fetch-runtime.sh). */
+user_pref("gfx.bundled-fonts.activate", 1);

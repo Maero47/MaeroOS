@@ -9,11 +9,10 @@
 | 3 | NetSurf framebuffer | Skipped: every rung after links2 went straight at Firefox |
 | 4 | **Dynamic linking (ld.so)** | ✅ Phases 30 + 31: PIEs and external shared libraries load through the real musl `ld.so` |
 | 5 | X11 compatibility layer | ✅ Phases 32b–34: AF_UNIX, the maeroX server, real libX11/libxcb and GTK3 (`make smoke-x`, `make smoke-gtk`) |
-| 6 | **Firefox 115.15.0esr** (official i686 build) | ✅ Paints its window about 5 s after `firefox-bin` starts and loads pages over HTTP and HTTPS (`make smoke-firefox`, `make smoke-firefox-web`, `--sites` for live sites) |
+| 6 | **Firefox 115.15.0esr** (official i686 build) | ✅ Paints its window about 1.7 s after `firefox-bin` starts and loads pages over HTTP and HTTPS (`make smoke-firefox`, `make smoke-firefox-web`, `--sites` for live sites) |
 
 What is still missing on rung 6 is listed under "What does not work" in
-[README.md](README.md): the content sandbox has no namespaces ([docs/sandbox.md](docs/sandbox.md)), scripts DejaVu does not
-cover (CJK, Indic) come out as missing-glyph boxes, and `ff` brings its own
+[README.md](README.md): the content sandbox has no namespaces ([docs/sandbox.md](docs/sandbox.md)), and `ff` brings its own
 profile. The sections below record how each rung was cleared, oldest first.
 
 ## ✅ Phase 30 — the dynamic linker
@@ -139,7 +138,7 @@ extension Cairo composites with. Firefox itself is the official 115.15.0esr
 linux-i686 tarball on a glibc GTK3 runtime from Debian i386 packages
 (`ports/firefox/README.md`). The kernel work that took it from a stall to a
 first paint is in `docs/audit/firefox-first-paint.md`, the startup profile
-that brought first paint down to about 5 s is in `docs/perf/firefox-startup.md`.
+that brought first paint down to about 1.7 s is in `docs/perf/firefox-startup.md`.
 
 ## How to test: does Firefox paint, and load a page?
 
@@ -187,13 +186,17 @@ Every run writes `build/ff-smoke/<timestamp>-<accel>-smpN/` (gitignored):
   possible); on a PASS, `screen-paint.png` is the richest of ten frames
   sampled over `--hold` seconds (25) after the paint line.
 - `summary.txt` — verdict, timeline (graphical session, `ff` start, first
-  `firefox-bin` exec, first Firefox X window, first paint), one line per
+  `firefox-bin` exec, first Firefox X window, first paint; then
+  `launch -> paint marker`, the time `ff` itself measured from launching
+  Firefox to maeroX's paint marker, and Firefox's own startup timeline from
+  `Services.startup.getStartupInfo()`, which `maeros.cfg` prints), one line per
   concluded attempt (stalled / exited status=N / crash-reporter paint), the
   last maeroX trace line with its `putimg=` counter, every
   `[SIG] pid=N killed by signal S` line, the last 40 kernel trace lines and
   the `moz.log` tail that `ff` dumps on a stall.
 - `qemu-cmdline.txt` — the exact QEMU command.
-- `screen-typed.png` (`--type`), `screen-web.png` and `fonts.json` (`--web`),
+- `screen-typed.png` (`--type`), `screen-web.png` and `fonts.json` (`--web`,
+  `--fonts`),
   `site-N-*.png` (`--sites`), described below.
 
 ### Loading a page
@@ -236,9 +239,31 @@ pinned `fonts-dejavu-*` 2.37-8 packages (`ports/firefox/fetch-runtime.sh`
 puts them in `/disk/firefox/share/fonts/dejavu`, 5.3 MB), and
 `testfiles/etc/fonts/fonts.conf` maps the CSS generics, `system-ui` and the
 usual named families (Arial, Helvetica, Segoe UI, Times New Roman, Courier
-New, ...) onto them. They cover Latin, Greek and Cyrillic; CJK, Arabic
-shaping beyond DejaVu's, Indic scripts etc. still come out as boxes (colour
-emoji come from Firefox's own Twemoji).
+New, ...) onto them. They cover Latin, Greek, Cyrillic, Hebrew and basic
+Arabic. Next to them, in `/disk/firefox/share/fonts/noto` (20.6 MB, all SIL
+OFL): Noto Sans CJK Regular, one TTC with the Simplified and Traditional
+Chinese, Hong Kong, Japanese and Korean faces (19.5 MB), and Noto Sans
+Devanagari, Bengali, Tamil, Arabic and Hebrew in regular and bold. Each CSS
+generic lists DejaVu first and these after it, and a page's `lang` picks the
+regional CJK face (`ja` the Japanese one, `zh-TW` the Traditional Chinese
+one, ...). Colour emoji are Firefox's own bundled Twemoji (COLR), which a
+release build registers only when `gfx.bundled-fonts.activate` is 1 (set in
+`testfiles/ffprofile/user.js`).
+
+fontconfig would scan all of that at every Firefox start, since its cache
+directory is on `/tmp`. `fetch-runtime.sh` therefore builds the cache on the
+host with the suite's own i386 `fc-cache --sysroot` into
+`/disk/firefox/share/fontcache`, which `fonts.conf` lists as a second cache
+directory. fontconfig trusts a directory's cache only while the directory's
+mtime is the one recorded in it, so the script sets the font directories'
+mtimes to a fixed value and `make disk` copies every directory's mtime into
+the image.
+
+`--fonts` (implies `--web`) adds rows for those scripts and emoji to the
+page: every character must be a real glyph in both `sans-serif` and `serif`
+(characters past U+FFFF are compared with the box of U+2FA20, since
+Firefox's box for them is wider), and each emoji, drawn on a canvas, must
+leave coloured pixels.
 
 `--net` alone attaches the NIC, so any address can be tried by hand, the
 real network included (QEMU's slirp routes it):

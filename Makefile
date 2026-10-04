@@ -171,7 +171,7 @@ TOYBOX_CFLAGS := -D__linux__ -std=gnu99 -O2 -g \
 TOYBOX_LDFLAGS := -nostdlib -static -T ../../userspace/user.ld \
 	../../userspace/libc/crt0.o ../../userspace/libc/libc.a -lgcc
 
-.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-net-virtio smoke-tcpsrv smoke-net6 smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-gfxmode smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-largefile smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-alpine smoke-alpinex disk-alpinex smoke-alpine-net smoke-audio smoke-procipc disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched bench-bkl smoke-klock stress-smp
+.PHONY: all run run-net run-disk run-iso restart-iso stop-iso debug gdb clean iso limine-iso smoke-uefi initrd userspace toybox disk disk-ff run-firefox smoke smoke-net smoke-net-e1000 smoke-net-virtio smoke-tcpsrv smoke-net6 smoke-fw smoke-disk smoke-ahci smoke-nvme smoke-pkg smoke-toybox smoke-cmds smoke-dyn smoke-dynlib smoke-x smoke-gtk smoke-gui smoke-gfxmode smoke-ext4 smoke-ext2rw smoke-ext4rw smoke-vfat smoke-exfat smoke-largefile smoke-install smoke-hda smoke-acpi smoke-usb smoke-pc check abiprobes smoke-abi smoke-firefox smoke-firefox-web smoke-firefox-fonts smoke-alpine smoke-alpinex disk-alpinex smoke-alpine-net smoke-audio smoke-procipc disk-alpine repo repo-serve start resolutions icons bench-gfx bench-sched bench-bkl smoke-klock stress-smp
 
 all: $(TARGET)
 
@@ -285,6 +285,15 @@ disk: userspace toybox
 	        $(DEBUGFS) -w -R "sif /$$p mode $$m" $(DISK_IMG) 2>/dev/null || true; \
 	    done; \
 	fi
+	@# Every directory keeps its mtime from testfiles/ (debugfs gives it the
+	@# build time): fontconfig only trusts a font directory's prebuilt cache
+	@# (ports/firefox/fetch-runtime.sh) while the directory's mtime matches.
+	@find testfiles \( $(DISK_PRUNE) \) -prune -o -type d -print | while read d; do \
+	    [ "$$d" = "testfiles" ] && continue; \
+	    echo "sif /$${d#testfiles/} mtime @$$(stat -c %Y "$$d")"; \
+	done > $(DISK_IMG).mtimes
+	$(DEBUGFS) -w -f $(DISK_IMG).mtimes $(DISK_IMG) >/dev/null 2>&1 || true
+	@rm -f $(DISK_IMG).mtimes
 	@echo "[DISK]  Done: $(DISK_IMG)"
 
 # Large disk WITH the Firefox + glibc library trees (175 MiB libxul etc.).
@@ -608,6 +617,11 @@ smoke-firefox: $(TARGET) iso disk-ff
 # (HTML, a stylesheet rule, a PNG) must be fetched and its image reach the screen.
 smoke-firefox-web: $(TARGET) iso disk-ff
 	python3 tools/smoke_firefox.py --web $(SMOKE_FF_ARGS)
+
+# The same page with CJK, Devanagari, Bengali, Tamil, Arabic, Hebrew and emoji
+# rows: no missing-glyph boxes in sans-serif or serif, and colour emoji.
+smoke-firefox-fonts: $(TARGET) iso disk-ff
+	python3 tools/smoke_firefox.py --fonts $(SMOKE_FF_ARGS)
 
 # Alpine Linux x86 in a chroot on its own ext2 image (ports/alpine/README.md).
 # disk-alpine fetches the pinned minirootfs and packages once (cached under

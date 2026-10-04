@@ -3875,10 +3875,13 @@ struct vma {
 #define MMAP_FLOOR   0x40000000U
 #define MMAP_TOP     SIGPAGE_VA      /* stack window minus the sigreturn page */
 
-/* Small mappings are populated at mmap time; large ones fault in lazily (8 MiB
- * thread stacks and multi-hundred-MiB libraries mostly go untouched). */
-#define VMA_DEMAND_MIN       (4U * 1024U * 1024U)
-#define VMA_FILE_DEMAND_MIN  (1U * 1024U * 1024U)
+/* Private mappings are never populated at mmap time, whatever their size:
+ * every page faults in on first touch (Linux does the same).  Small ones used
+ * to be filled eagerly, which cost Firefox 0.6 s of its 3 s to first paint:
+ * mozjemalloc's 1 MiB chunks were zeroed whole, and ld.so's reservation of
+ * each library's whole span, read in from the file, was at once replaced by
+ * the MAP_FIXED segment mappings and read in again (docs/perf/firefox-startup.md,
+ * round five). */
 
 static inline uint32_t vma_irq_save(void) {
     uint32_t f; __asm__ volatile("pushf; pop %0; cli" : "=r"(f) :: "memory"); return f;
@@ -4565,14 +4568,6 @@ int vma_handle_fault(uint32_t addr) {
     return vma_populate_page(v, addr);
 }
 
-/* Populate [start,end) of a private VMA now (small mappings).  1 on success. */
-static int vma_populate_range(struct vma *v, uint32_t start, uint32_t end) {
-    if (v->prot == 0) return 1;                 /* nothing to map for PROT_NONE */
-    for (uint32_t a = start; a < end; a += PAGE_SIZE)
-        if (!vma_populate_page(v, a)) return 0;
-    return 1;
-}
-
 /* Unmap every populated page in [start,end) and release the frames.
  *
  * FLUSH-BEFORE-FREE (Linux mmu_gather rule): clear the PTEs first, then
@@ -4891,35 +4886,19 @@ static int sys_mmap2(registers_t *regs) {
     /* ── MAP_PRIVATE anonymous ──
      * Record the VMA; prot is honoured for every page (Linux: PROT_NONE ranges
      * are reservations that fault on any access, read-only ranges fault on
-     * write).  Large regions fault in lazily; small ones are populated now. */
+     * write).  Pages fault in zeroed on first touch. */
     if (anon) {
-        struct vma *v = vma_add(va, end, prot, 0, NULL, 0);
-        if (!v) return -12;
-        if (length < VMA_DEMAND_MIN) {
-            uint64_t kp = kprof_probe_begin();
-            int okp = vma_populate_range(v, va, end);
-            kprof_probe_end(KPP_MMAP_POP, kp);
-            if (!okp) { unmap_range(va, end); return -12; }
-        }
+        if (!vma_add(va, end, prot, 0, NULL, 0)) return -12;
         return (int)va;
     }
 
     /* ── MAP_PRIVATE file-backed ──
      * Pages fault in from the file (copy-on-fault: the frame is private, so
-     * writes never reach the file).  Eagerly copying a big library (libxul.so
-     * is ~175 MiB) would read the whole file through the slow ATA-PIO path even
-     * though startup touches a fraction of it, so large mappings are lazy. */
-    {
-        struct vma *v = vma_add(va, end, prot, 0, fnode, (uint64_t)pgoff * PAGE_SIZE);
-        if (!v) return -12;
-        if (length < VMA_FILE_DEMAND_MIN) {
-            uint64_t kp = kprof_probe_begin();
-            int okp = vma_populate_range(v, va, end);
-            kprof_probe_end(KPP_MMAP_POP, kp);
-            if (!okp) { unmap_range(va, end); return -12; }
-        }
-        return (int)va;
-    }
+     * writes never reach the file).  Startup touches a fraction of a library
+     * (libxul.so is ~175 MiB), and ld.so maps each one twice, so nothing is
+     * read until it is touched. */
+    if (!vma_add(va, end, prot, 0, fnode, (uint64_t)pgoff * PAGE_SIZE)) return -12;
+    return (int)va;
 }
 
 /* ── sys_mmap(struct mmap_arg*) — EAX=90 (old i386 variant) ─────────────── */

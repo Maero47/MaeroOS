@@ -144,6 +144,24 @@ FONT_FAMILIES = [
 ]
 FONT_TEXT = "Latin AaBbGgQq äöüçşğ ÄÖÜÇŞĞİı " \
             "Ελληνικά Кириллица"
+# --fonts adds one row per script beyond Latin/Greek/Cyrillic: key, the lang
+# attribute of its row (which steers fontconfig to the regional CJK face),
+# and the sample.  Every character must come out as a real glyph in both
+# sans-serif and serif, and the emoji in colour.
+FONT_SCRIPTS = [
+    ("zh-Hans", "zh-CN", "简体中文：汉字测试"),
+    ("zh-Hant", "zh-TW", "繁體中文：漢字測試"),
+    ("ja", "ja", "日本語：ひらがな カタカナ 漢字"),
+    ("ko", "ko", "한국어: 한글 테스트"),
+    ("devanagari", "hi", "हिन्दी देवनागरी लिपि"),
+    ("bengali", "bn", "বাংলা লিপি পরীক্ষা"),
+    ("tamil", "ta", "தமிழ் எழுத்துக்கள்"),
+    ("arabic", "ar", "العربية اختبار"),
+    ("hebrew", "he", "עברית בדיקה"),
+    # emoji presentation by default (a text-default one such as U+2764 is
+    # DejaVu's monochrome glyph, as it should be)
+    ("emoji", "", "\U0001F600\U0001F389\U0001F44D\U0001F30D\U0001F680\U0001F355"),
+]
 
 # Runs in the page after load.  For every family and every character of
 # FONT_TEXT it measures the advance and ink box on a canvas and compares them
@@ -157,9 +175,16 @@ FONT_TEXT = "Latin AaBbGgQq äöüçşğ ÄÖÜÇŞĞİı " \
 # serif italic is a real italic face, then POSTs the result to /fontreport and
 # puts the verdict in the title (visible in maeroX's _NET_WM_NAME trace on the
 # serial line).
+#
+# With --fonts, SCRIPTS (FONT_SCRIPTS) are checked the same way in sans-serif
+# and serif.  Firefox's missing-glyph box for a code point past U+FFFF has
+# three hex digits per row instead of two, so those characters are compared
+# with the box of U+2FA20 (unassigned) rather than U+0378.  The emoji are
+# also drawn on a canvas, one at a time, and each must leave coloured pixels:
+# a monochrome fallback glyph has ink but no colour.
 FONT_JS = r"""
 (function () {
-  var FAM = %s, TEXT = %s, SIZE = 37;
+  var FAM = %s, TEXT = %s, SCRIPTS = %s, SIZE = 37;
   var c = document.createElement('canvas').getContext('2d');
   function w(font, s) { c.font = font; return c.measureText(s).width; }
   // advance + ink box; a missing-glyph box matches the reference in all five
@@ -182,6 +207,43 @@ FONT_JS = r"""
     if (boxed.length) r.fails.push(f[0] + ': ' + boxed.length + ' boxed (' + boxed.join('') + ')');
   });
   var sans = SIZE + 'px sans-serif', serif = SIZE + 'px serif', mono = SIZE + 'px monospace';
+  if (SCRIPTS.length) {
+    r.scripts = {};
+    SCRIPTS.forEach(function (sc) {
+      var row = {};
+      ['sans-serif', 'serif'].forEach(function (gen) {
+        var font = SIZE + 'px ' + gen;
+        var box4 = shape(font, '\u0378'), box5 = shape(font, '\u{2FA20}'), boxed = [];
+        Array.from(sc[2]).forEach(function (ch) {
+          if (ch === ' ') return;
+          if (same(shape(font, ch), ch.codePointAt(0) > 0xFFFF ? box5 : box4)) boxed.push(ch);
+        });
+        row[gen] = {boxed: boxed.join(''), text: +w(font, sc[2]).toFixed(2)};
+        if (boxed.length) r.fails.push(sc[0] + ' (' + gen + '): ' + boxed.length + ' boxed (' + boxed.join('') + ')');
+      });
+      r.scripts[sc[0]] = row;
+    });
+    var emoji = SCRIPTS.filter(function (sc) { return sc[0] === 'emoji'; });
+    if (emoji.length) {
+      var cv = document.createElement('canvas'); cv.width = 64; cv.height = 64;
+      var g = cv.getContext('2d'), per = {}, flat = [];
+      Array.from(emoji[0][2]).forEach(function (ch) {
+        g.clearRect(0, 0, 64, 64);
+        g.font = '48px sans-serif'; g.textBaseline = 'top'; g.fillStyle = '#000';
+        g.fillText(ch, 4, 4);
+        var d = g.getImageData(0, 0, 64, 64).data, ink = 0, col = 0;
+        for (var i = 0; i < d.length; i += 4) {
+          if (d[i + 3] < 128) continue;
+          ink++;
+          if (Math.max(d[i], d[i + 1], d[i + 2]) - Math.min(d[i], d[i + 1], d[i + 2]) > 60) col++;
+        }
+        per[ch] = [ink, col];
+        if (col < 100) flat.push(ch);
+      });
+      r.emoji = per;
+      if (flat.length) r.fails.push('emoji not in colour: ' + flat.join(''));
+    }
+  }
   var ck = r.checks;
   // negative control: U+A000 (Yi) is in no installed font, so the detector
   // must call it a box; if it does not, "0 boxed" above proves nothing
@@ -350,6 +412,19 @@ def png_bytes(w, h, rgb):
             chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 
 
+def disk_args(path, how):
+    """QEMU arguments attaching the Firefox disk as an IDE disk (the default),
+    an AHCI port or an NVMe namespace; the kernel mounts the first block
+    device it finds as /disk whichever it is."""
+    if how == "ahci":
+        return ["-drive", "file=%s,format=raw,if=none,id=ffdisk" % path,
+                "-device", "ahci,id=ahci0", "-device", "ide-hd,drive=ffdisk,bus=ahci0.0"]
+    if how == "nvme":
+        return ["-drive", "file=%s,format=raw,if=none,id=ffdisk" % path,
+                "-device", "nvme,drive=ffdisk,serial=ffdisk"]
+    return ["-drive", "file=%s,format=raw,if=ide" % path]
+
+
 class WebServer:
     """The page --web loads, served from a thread; records every request and
     the font report the page POSTs back."""
@@ -365,18 +440,25 @@ class WebServer:
                  b"<p>Fetched by Firefox through the MaeroOS TCP stack.</p>")
 
     @staticmethod
-    def page():
+    def page(fonts=False):
         rows = []
         for key, fam in FONT_FAMILIES:
             style = "font-family:%s" % fam
             rows.append("<tr><td class=k>%s</td><td style=\"%s\">%s</td>"
                         "<td style=\"%s\"><b>Bold</b> <i>Italic</i> <b><i>BoldItalic</i></b></td></tr>"
                         % (key, style, FONT_TEXT, style))
+        scripts = FONT_SCRIPTS if fonts else []
+        for key, lang, text in scripts:
+            rows.append("<tr><td class=k>%s</td><td%s style=\"font-size:22px\">%s</td>"
+                        "<td%s style=\"font-family:serif\">%s <b>%s</b></td></tr>"
+                        % (key, " lang=%s" % lang if lang else "", text,
+                           " lang=%s" % lang if lang else "", text[:4], text[:4]))
         body = ("<img id=mark src=\"mark.png\" width=\"%d\" height=\"%d\" alt=\"mark\">"
                 "<table>%s</table><p style=\"font-size:15px\">missing-glyph control "
                 "(U+A000, no font has it): \ua000</p><script>%s</script></body></html>"
                 % (WEB_MARK_W, WEB_MARK_H, "".join(rows),
-                   FONT_JS % (json.dumps([list(f) for f in FONT_FAMILIES]), json.dumps(FONT_TEXT))))
+                   FONT_JS % (json.dumps([list(f) for f in FONT_FAMILIES]), json.dumps(FONT_TEXT),
+                              json.dumps([list(x) for x in scripts]))))
         return WebServer.PAGE_HEAD + body.encode("utf-8")
 
     @staticmethod
@@ -394,11 +476,11 @@ class WebServer:
         parts.append(b"</body></html>")
         return b"".join(parts)
 
-    def __init__(self, audio=False):
+    def __init__(self, audio=False, fonts=False):
         self.requests = []          # (host time, path, status)
         self.font_report = None     # (host time, parsed JSON) from the page
         self.audio_events = []      # (host time, parsed JSON) from AUDIO_JS
-        page = self.page()
+        page = self.page(fonts)
         if audio:
             page = page.replace(b"</body>", AUDIO_HTML.replace(
                 "REPORT_URL", "'/audioreport'").encode() + b"</body>")
@@ -472,6 +554,8 @@ def red_pixels(frame):
 
 
 SANDBOX_REPORT = "maeros-sandbox: "
+STARTUP_REPORT = "maeros-startup: "     # Services.startup.getStartupInfo(), ms since process start
+PAINT_MS = re.compile(r"ff: paint marker (\d+) ms after launch")
 SANDBOX_WAIT = 45          # s after the verdict to wait for the sandbox report
 
 
@@ -794,6 +878,8 @@ class Run:
         self.key_notes = None
         self.key_ok = None
         self.sandbox = None        # about:support's sandbox section (maeros.cfg)
+        self.startup = None        # Firefox's startup timeline (maeros.cfg)
+        self.paint_ms = None       # launch -> paint marker, measured by ff in the guest
 
     # ── serial intake ────────────────────────────────────────────────────
     def feed(self, chunk):
@@ -864,6 +950,15 @@ class Run:
             interesting = True
         elif self.panic_lines and len(self.panic_lines) < 30:
             self.panic_lines.append(line)
+        elif PAINT_MS.search(line):
+            self.paint_ms = int(PAINT_MS.search(line).group(1))
+            interesting = True
+        elif STARTUP_REPORT in line:
+            try:
+                self.startup = json.loads(line.split(STARTUP_REPORT, 1)[1])
+            except ValueError:
+                self.startup = {"unparsed": line.split(STARTUP_REPORT, 1)[1].strip()}
+            interesting = True
         elif SANDBOX_REPORT in line:
             try:
                 self.sandbox = json.loads(line.split(SANDBOX_REPORT, 1)[1])
@@ -913,6 +1008,12 @@ class Run:
             ("   (%.1fs after the launcher started)" % (self.t_paint - self.t_ff))
             if self.t_paint is not None and self.t_ff is not None else ""))
         L.append("  first Firefox X window    : %s" % fmt_t(self.t_xwindow))
+        L.append("  launch -> paint marker    : %s" % (
+            "%d ms (ff's clock in the guest)" % self.paint_ms if self.paint_ms is not None else "-"))
+        if self.startup:
+            L.append("  firefox startup timeline  : %s" % " ".join(
+                "%s=%s" % (k, self.startup[k]) for k in sorted(self.startup, key=lambda k: (
+                    self.startup[k] if isinstance(self.startup[k], (int, float)) else 1e12, k))))
         if self.desktop_ended is not None:
             L.append("  desktop session ended     : %s" % fmt_t(self.desktop_ended))
         L.append("")
@@ -1212,6 +1313,14 @@ def web_load(qmp, args, run, pump, web):
             "%s=%d" % (k, len(v.get("boxed", ""))) for k, v in fams.items()))
         run.web_notes.append("fonts: checks %s" % " ".join(
             "%s=%s" % (k, "ok" if v else "NO") for k, v in rep.get("checks", {}).items()))
+        if "scripts" in rep:
+            run.web_notes.append("fonts: boxed chars per script (sans/serif): %s" % ", ".join(
+                "%s=%d/%d" % (k, len(v.get("sans-serif", {}).get("boxed", "")),
+                              len(v.get("serif", {}).get("boxed", "")))
+                for k, v in rep["scripts"].items()))
+        if "emoji" in rep:
+            run.web_notes.append("fonts: emoji ink/coloured pixels at 48px: %s" % " ".join(
+                "U+%X=%d/%d" % (ord(k), v[0], v[1]) for k, v in rep["emoji"].items()))
     else:
         run.web_notes.append("font report: never received")
     for n in run.web_notes:
@@ -1228,7 +1337,9 @@ def web_load(qmp, args, run, pump, web):
         run.result, run.reason = "FAIL", "--web: text rendering: %s" % "; ".join(rep["fails"])
     else:
         run.reason += (" Page loaded: image on screen %.1fs after Enter; fonts OK "
-                       "(no missing-glyph boxes in %d families)." % (t_red - t_enter, len(rep.get("families", {}))))
+                       "(no missing-glyph boxes in %d families%s)." % (
+                           t_red - t_enter, len(rep.get("families", {})),
+                           ", %d scripts, emoji in colour" % len(rep["scripts"]) if "scripts" in rep else ""))
 
 
 CPU_LINE = re.compile(r"\[kprof\] cpu window=(\d+)ms idle=(\d+)ms(.*)")
@@ -1549,6 +1660,8 @@ def main():
     ap.add_argument("--out", default=os.path.join("build", "ff-smoke"), help="artifact root")
     ap.add_argument("--tag", default=None, help="suffix for the artifact directory (default: accel-smpN)")
     ap.add_argument("--qemu", default="qemu-system-i386")
+    ap.add_argument("--disk-if", default="ide", choices=["ide", "ahci", "nvme"],
+                    help="how the Firefox disk is attached (default ide)")
     ap.add_argument("--cpu", default=os.environ.get("SMOKE_CPU", "qemu32,+nx") or None,
                     help="QEMU -cpu model (default: $SMOKE_CPU, else qemu32,+nx: QEMU's "
                          "own model plus NX, so the JIT runs under W^X; \"\" = QEMU's own). "
@@ -1582,6 +1695,10 @@ def main():
     ap.add_argument("--web", action="store_true",
                     help="after the paint verdict, load a page served from the host "
                          "(implies --net) and require its image on screen; see above")
+    ap.add_argument("--fonts", action="store_true",
+                    help="--web, with the page also carrying CJK, Devanagari, Bengali, Tamil, "
+                         "Arabic, Hebrew and emoji rows (FONT_SCRIPTS): no missing-glyph boxes "
+                         "in sans-serif or serif, and colour emoji")
     ap.add_argument("--audio", action="store_true",
                     help="after the paint verdict open file:///disk/audio.html, a page that "
                          "plays a 440 Hz WAV through <audio autoplay> (both written into a "
@@ -1607,7 +1724,7 @@ def main():
     args = ap.parse_args()
 
     os.chdir(ROOT)
-    if args.scroll:
+    if args.scroll or args.fonts:
         args.web = True
     if args.audio:
         args.net = True
@@ -1654,8 +1771,7 @@ def main():
     if args.scroll:
         set_gfxstats_marker(args.disk, tmp, True)
     cmd = [qemu,
-           "-cdrom", args.iso,
-           "-drive", "file=%s,format=raw,if=ide" % args.disk,
+           "-cdrom", args.iso] + disk_args(args.disk, args.disk_if) + [
            "-m", args.mem,
            "-smp", str(args.smp),
            "-accel", accel,
@@ -1682,8 +1798,9 @@ def main():
                 "-device", "intel-hda", "-device", "hda-duplex,audiodev=snd0"]
         audio_web = WebServer(audio=True)
         disk = audio_disk(args, audio_web.port)
-        cmd = [("file=%s,format=raw,if=ide" % disk) if c == "file=%s,format=raw,if=ide" % args.disk
-               else c for c in cmd]
+        old = disk_args(args.disk, args.disk_if)
+        i = cmd.index(old[1])
+        cmd[i - 1:i - 1 + len(old)] = disk_args(disk, args.disk_if)
     with open(os.path.join(args.outdir, "qemu-cmdline.txt"), "w") as f:
         f.write(" ".join(cmd) + "\n")
 
@@ -1778,7 +1895,7 @@ def main():
             if args.sites:
                 sites_run(qmp, args, run, pump)
             if args.web:
-                web = WebServer()
+                web = WebServer(fonts=args.fonts)
                 try:
                     web_load(qmp, args, run, pump, web)
                     if args.scroll and run.result == "PASS":

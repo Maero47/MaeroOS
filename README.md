@@ -72,7 +72,7 @@ What is proven by the automated QEMU tests in `tools/`:
 | Display modes (Bochs DISPI, virtio-gpu) | Settings -> Display driven with QMP clicks on `-vga std` and on `virtio-vga`: the mode list comes from the expected driver and holds 1024x768, 1280x800 and 1920x1080; Apply switches (screendump size, colour count, the orb at the new bottom opens the launcher), Revert and the 15 s timeout go back, Keep stays and writes `mode=` to `desktop.conf`, which the next login applies; on virtio the desktop's flushes cover only its damage; the Limine ISO on OVMF with `ramfb` keeps its one fixed GOP mode | `make smoke-gfxmode` |
 | /proc, System V IPC, utmp, inotify | busybox `ps`/`top`/`free`/`uptime` and toybox `ps`/`top`/`free`/`uptime`/`vmstat`/`pgrep`/`killall` read `/proc/stat`, `/proc/loadavg` and `/proc/<pid>`; toybox `who`/`w`/`last` show the console logins from utmp/wtmp; SysV shm/sem/msg between processes with permissions, `IPC_RMID` and `SEM_UNDO` (p46); inotify events on tmpfs and ext2 (p47); another user's `/proc/<pid>` `environ`, `fd/` and links are refused (p48). `SMOKE_PROCIPC_ARGS=--alpine` adds Alpine's procps-ng and htop | `make smoke-procipc` |
 | Linux ABI conformance | 52 musl-built probes (`ports/abiprobes/`), each printing the same `PASS` on Linux, covering findings of the Firefox audit plus later additions: `splice`, `flock`/`fcntl` record locks, `renameat2`, rtnetlink, `/proc/<pid>/fd` link permissions, seccomp filters, System V IPC and inotify among them; any `FAIL`, missing verdict or wedge fails the run | `make smoke-abi` |
-| Firefox 115.15.0esr | `ff: Firefox painted` (the browser window, about 5 s after `firefox-bin` starts); with `--web`, a page served from the host (HTML, a CSS rule, a PNG) requested and its image on screen about 3 s after Enter; both fail unless about:support reports the content sandbox on (level 4 in the test profile, seccomp-bpf with TSYNC) with no syscall refused (`docs/sandbox.md`; needs the Firefox tree, see `ports/firefox/`) | `make smoke-firefox`, `make smoke-firefox-web` |
+| Firefox 115.15.0esr | `ff: Firefox painted` (the browser window, about 1.7 s after `firefox-bin` starts); with `--web`, a page served from the host (HTML, a CSS rule, a PNG) requested and its image on screen about 3 s after Enter, and with `--fonts` the same page also carries CJK, Devanagari, Bengali, Tamil, Arabic, Hebrew and emoji text that must show no missing-glyph box in sans-serif or serif, with the emoji in colour; all fail unless about:support reports the content sandbox on (level 4 in the test profile, seccomp-bpf with TSYNC) with no syscall refused (`docs/sandbox.md`; needs the Firefox tree, see `ports/firefox/`) | `make smoke-firefox`, `make smoke-firefox-web`, `make smoke-firefox-fonts` |
 | Alpine Linux x86 userland (chroot) | Alpine 3.22 (apk-tools 2) and 3.24 (apk-tools 3) roots from pinned, signature-checked packages, run with `chroot /disk/alpine`: `bash -c 'echo ok'`, GNU `ls --version`, `python3 -c 'print(1+1)'`, `vim --version`, `git init/commit/log`, `ssh -V`, `less` on a pipe, `apk add tree` / `apk del tree` from an offline repo on the disk, `apk verify`, and no unimplemented syscall on the way; `--net` also installs from a host-served HTTP mirror (needs network on the build host the first time, see `ports/alpine/`) | `make smoke-alpine` |
 | Alpine networking and sshd (chroot) | In the Alpine chroot on an e1000: busybox `ip addr`/`ip route`/`ip link` (rtnetlink), `ifconfig` and `route -n` (SIOC* ioctls, `/proc/net/route`) show eth0's DHCP address and the default route; `udhcpc -i eth0 -n -q` gets a lease over `AF_PACKET` and its script reconfigures eth0 through rtnetlink; `ping` over a raw ICMP socket; `flock -n` fails while another process holds the lock and a blocking `flock` waits, and `apk` refuses to run while its database lock is held; `openssh-server` installed with `apk` from the offline repo, `ssh-keygen -A`, `sshd` on port 22, and the host logs in through hostfwd with a throwaway key (`ssh ... true`, a command, an interactive `ssh -tt` session on `/dev/pts/0`); no unimplemented syscall. Needs `ssh` on the host | `make smoke-alpine-net` |
 | SMP locking (not in `make check`) | `-smp 4`: a `KLOCK_TEST` kernel's torture threads run a spinlock and a mutex outside the BKL on several CPUs at once without a lost update, and the lock-order checker catches one deliberate inversion; two fork+exec loops, pipelines, mmap/stat loops and `tar \| gzip` run together for 180 s without a hang, panic, kwatch STALL or lockdep report | `make smoke-klock`, `make stress-smp` |
@@ -81,11 +81,12 @@ What is proven by the automated QEMU tests in `tools/`:
 
 - **Firefox 115.15.0esr is usable, not finished.** The prebuilt i686 ESR build paints
   its window and loads pages over HTTP and HTTPS (a real `https://example.com` loads
-  through QEMU's user network, DNS and TLS included), but: text in scripts the disk has
-  no font for (it ships DejaVu Sans, Serif and Sans Mono, which cover Latin, Greek and
-  Cyrillic, and Twemoji; not CJK or Indic) is drawn as missing-glyph boxes; the
+  through QEMU's user network, DNS and TLS included; DejaVu and Noto fonts cover Latin,
+  Greek, Cyrillic, CJK, Devanagari, Bengali, Tamil, Arabic and Hebrew, and emoji are
+  Firefox's colour Twemoji), but: the
   content sandbox runs at level 4 but without user namespaces, so Firefox skips
-  its chroot and network/PID namespaces (`docs/sandbox.md`); startup still takes about 5 s after `firefox-bin` starts; and `ff` has to bring
+  its chroot and network/PID namespaces (`docs/sandbox.md`); scripts outside that
+  set (Thai, Ethiopic, ...) are still missing-glyph boxes; and `ff` has to bring
   its own profile (`testfiles/ffprofile`) that turns off first-run dialogs, telemetry
   and add-on scans. `docs/audit/firefox-first-paint.md` and `docs/perf/firefox-startup.md` record how it
   got here.
@@ -744,6 +745,7 @@ make smoke-install  # maeros-install from the live ISO to an empty disk, then bo
 make smoke-abi      # Linux-ABI probes (ports/abiprobes/README.md), needs i686-linux-musl-gcc and disk.img
 make smoke-firefox  # does Firefox paint? (README-BROWSER.md)
 make smoke-firefox-web  # ...and load a page served from the host over the network
+make smoke-firefox-fonts  # ...a page with CJK, Indic, Arabic, Hebrew and emoji text: no boxes, colour emoji
 make smoke-alpine   # Alpine 3.22/3.24 userland in a chroot, apk from an offline repo (opt-in)
 make smoke-alpine-net  # ip/udhcpc/ping, flock and sshd in that chroot (opt-in, needs ssh on the host)
 make bench-gfx      # compositor/maeroX cost of an animating region (a benchmark, judges nothing)
