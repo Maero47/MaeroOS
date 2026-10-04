@@ -17,8 +17,11 @@
 
 /*
  * The ALSA kernel ABI, as much of it as alsa-lib's "hw" plugin needs for
- * playback: one card (/dev/snd/controlC0) with one PCM playback device
- * (/dev/snd/pcmC0D0p) in RW_INTERLEAVED access, on the HDA or AC'97 driver.
+ * playback: card 0 (/dev/snd/controlC0) with one PCM playback device
+ * (/dev/snd/pcmC0D0p) in RW_INTERLEAVED access, on the HDA or AC'97 driver,
+ * and card 1 (controlC1, pcmC1D0p) for a USB audio device while one is
+ * plugged in (drivers/usb/usb_audio.c registers it through alsa_card_add).
+ * Each card has its own PCM state; the driver behind it is an alsa_out_t.
  *
  * Structure layouts are the i386 ones of the ALSA UAPI (sound/asound.h,
  * PCM protocol 2.0.15, control 2.0.9), written out here from the published
@@ -27,8 +30,9 @@
  * while a 32-bit time_t userland (Debian i386 glibc) uses the older ones,
  * so both are accepted, told apart by that size.
  *
- * Data path.  The hardware runs one fixed stream, 48 kHz S16LE stereo (the
- * stream /dev/dsp carries).  WRITEI frames in any of the advertised formats
+ * Data path.  The hardware runs one fixed stream, S16LE stereo at the
+ * card's rate (48 kHz, the stream /dev/dsp carries; a USB card's may be
+ * 44.1 kHz).  WRITEI frames in any of the advertised formats
  * (S8, U8, S16_LE, S24_LE, S32_LE, FLOAT_LE; 1 or 2 channels; 8-192 kHz) are
  * converted here: decoded to 16-bit stereo (float through its bit pattern:
  * no FPU in the kernel) and resampled to 48 kHz by linear interpolation.
@@ -44,10 +48,17 @@
  * running) is an XRUN as on Linux.  The pointers are frame counts since
  * PREPARE reported modulo the boundary (2^32 frames is 24 h at 48 kHz).
  *
+ * Mixer: "Master Playback Volume" (0..100) and "Master Playback Switch"
+ * elements where the card's driver has them (HDA; a USB Feature Unit),
+ * found by numid or by name; no TLVs, no change events.
+ *
+ * Unplugged (alsa_card_remove): the card's nodes leave /dev/snd, and an open
+ * PCM is DISCONNECTED (ENODEV) until its last close.
+ *
  * Not provided: mmap of the status/control pages (mmap fails, and alsa-lib
  * falls back to SYNC_PTR, as it does on any kernel without it) or of the
- * data buffer (no MMAP access), capture, pause, linked streams, mixer
- * controls.  A second open of the PCM fails (ENOENT here, EBUSY on Linux).
+ * data buffer (no MMAP access), capture, pause, linked streams.  A second
+ * open of the PCM fails (ENOENT here, EBUSY on Linux).
  */
 
 #define EINTR_    4

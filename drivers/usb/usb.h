@@ -2,8 +2,8 @@
 #include <stdint.h>
 
 /* USB core definitions shared by the xHCI host driver (xhci.c) and the class
- * drivers (usb_hid.c).  Written from the USB 2.0 specification (chapter 9)
- * and the HID 1.11 specification. */
+ * drivers (usb_hid.c, usb_msc.c, usb_audio.c).  Written from the USB 2.0
+ * specification (chapter 9) and the HID 1.11 specification. */
 
 /* bmRequestType */
 #define USB_DIR_IN          0x80

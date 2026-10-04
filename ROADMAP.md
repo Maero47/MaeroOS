@@ -66,9 +66,13 @@ What still stands between MaeroOS and daily use on real hardware:
 - **Power.** ACPI sleep states (suspend to RAM); today only S5 power-off,
   reboot and the power button work.
 - **USB.** USB 3 hubs on real hardware (the code is in, but QEMU has no
-  SuperSpeed hub to test it on), isochronous transfers (webcams, USB audio),
-  UAS, a HID keyboard driven in report protocol (today boot protocol, plus a
-  separate media-key interface), the volume keys wired to an ALSA mixer.
+  SuperSpeed hub to test it on), a HID keyboard driven in report protocol
+  (today boot protocol, plus a separate media-key interface).  Isochronous
+  transfers run USB audio playback (UAC1; UAC2 is written but untested, QEMU
+  has no UAC2 device); still missing there: an asynchronous endpoint's
+  feedback (played at the nominal rate), capture, webcams (UVC, isochronous
+  IN), and a headset's HID buttons next to its audio.  UAS uses one command
+  at a time (stream 1) and LUN 0 only.
 - **Firefox.** Startup is about 1.7 s from launch to first paint
   (`docs/perf/firefox-startup.md`); what is left there is Firefox's own code
   and a disk read path that polls with interrupts off. Scripts beyond CJK,
