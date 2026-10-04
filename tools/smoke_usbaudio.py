@@ -114,6 +114,8 @@ def live_perms(proc, sel, log):
     """Card 1's nodes and /dev/dsp1 have no permissions of their own: a
     chown/chmod of card 0's nodes and /dev/dsp applies to them at once, for
     stat and for access (an unprivileged user opening them)."""
+    # the sound nodes' default, root:audio 0660 (alsa_node_perms)
+    c1_perms(proc, sel, log, "660 0 18", "card 1 starts as card 0 (root:audio)")
     run(proc, sel, log, f"busybox chown 1000:18 {C0}; busybox chmod 0600 {C0}")
     c1_perms(proc, sel, log, "600 1000 18", "card 1 follows card 0 (owner)")
     out = run(proc, sel, log, "busybox setuidgid user mixer -c 1")
@@ -129,8 +131,8 @@ def live_perms(proc, sel, log):
     run(proc, sel, log, "busybox chmod 0666 /dev/snd/pcmC1D0p")
     out = run(proc, sel, log, "busybox stat -c 'perm %n %a' /dev/snd/pcmC0D0p")
     expect(out, "perm /dev/snd/pcmC0D0p 666", "chmod of a card-1 node")
-    run(proc, sel, log, f"busybox chmod 0666 {C0}")
-    c1_perms(proc, sel, log, "666 0 0", "card 1 permissions restored")
+    run(proc, sel, log, f"busybox chown 0:18 {C0}; busybox chmod 0660 {C0}")
+    c1_perms(proc, sel, log, "660 0 18", "card 1 permissions restored")
     print("  card 1 + /dev/dsp1 follow card 0 + /dev/dsp live (stat, open)")
 
 
