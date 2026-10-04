@@ -1,5 +1,5 @@
 /*
- * P49 kernel bookkeeping does not drift or grow with use.
+ * P50 kernel bookkeeping does not drift or grow with use.
  *
  * Part 1, /proc nodes: looking up /proc/self/fd/N and /proc/self/fdinfo/N for
  * 400 pipe descriptors, then closing them, must leave the kernel's count of
@@ -20,7 +20,7 @@
  * got a slot uncharged the spill bucket's bytes from that slot, leaving the
  * spill inflated for good.
  */
-#define PROBE_NAME "p49_accounting"
+#define PROBE_NAME "p50_accounting"
 #include "probe.h"
 #include <sys/inotify.h>
 #include <sys/stat.h>
@@ -132,7 +132,7 @@ static void part_inotify(void)
     long slots = read_long(SLOTS);
     if (slots < 0) { probe_info("no acct_slots knob here: accounting not checked"); return; }
     if (geteuid() != 0) { probe_info("not root: accounting not checked"); return; }
-    snprintf(dir, sizeof dir, "/tmp/p49.%d", (int)getpid());
+    snprintf(dir, sizeof dir, "/tmp/p50.%d", (int)getpid());
     if (mkdir(dir, 0777) != 0 || chmod(dir, 0777) != 0) probe_fail("mkdir %s", dir);
     if (write_long(SLOTS, 2) != 0) probe_fail("cannot set %s", SLOTS);
 

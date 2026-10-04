@@ -1,5 +1,5 @@
 /*
- * P51 SIGKILL to a process with an unreaped (zombie) child.
+ * P52 SIGKILL to a process with an unreaped (zombie) child.
  *
  * A process forks a child that exits at once and is never waited for, then
  * sleeps.  kill(pid, SIGKILL) of the parent, and kill(-pgrp, SIGKILL) of a
@@ -11,7 +11,7 @@
  * on every pass, so it spun forever with the big kernel lock held and the
  * whole machine stopped.  Any user could do it to their own processes.
  */
-#define PROBE_NAME "p51_kill_zombie_child"
+#define PROBE_NAME "p52_kill_zombie_child"
 #include "probe.h"
 #include <sys/wait.h>
 

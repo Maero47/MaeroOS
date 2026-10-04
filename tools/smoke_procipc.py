@@ -8,12 +8,12 @@ back), logs in as root and checks:
     free, uptime; toybox ps, top, free, uptime, vmstat, pgrep, killall;
   * utmp/wtmp: toybox who, w and last show the console login;
   * System V shm/sem/msg between processes, with permissions, IPC_RMID and
-    SEM_UNDO on exit (abiprobe p45), and ipcs lists a live segment;
-  * inotify sees each directory operation on tmpfs and on ext2 (p46), and
+    SEM_UNDO on exit (abiprobe p46), and ipcs lists a live segment;
+  * inotify sees each directory operation on tmpfs and on ext2 (p47), and
     on fresh vfat, exFAT and ext4 volumes (build/smoke-procipc/, made with the
     host's mkfs tools when they are there);
   * /proc/<pid> files of another user's process are refused where Linux
-    refuses them, and readable where it does not (p47, and by hand as
+    refuses them, and readable where it does not (p48, and by hand as
     "user").
 
 --alpine (opt-in, like smoke-alpine) also boots disk-alpine.img and runs
@@ -142,20 +142,20 @@ def check_utmp(g):
 
 
 def check_ipc(g):
-    out = g.run("/abiprobes/p45_sysv_ipc", timeout=90)
-    expect(out, r"^PASS p45_sysv_ipc$", "SysV IPC probe")
+    out = g.run("/abiprobes/p46_sysv_ipc", timeout=90)
+    expect(out, r"^PASS p46_sysv_ipc$", "SysV IPC probe")
     # An unprivileged user cannot pin unbounded kernel memory (inotify
     # queues, message queues, shm) and the system stays usable.
-    out = g.run("/abiprobes/p48_ipc_limits", timeout=300)
-    expect(out, r"^PASS p48_ipc_limits$", "IPC/inotify limits probe")
+    out = g.run("/abiprobes/p49_ipc_limits", timeout=300)
+    expect(out, r"^PASS p49_ipc_limits$", "IPC/inotify limits probe")
     # /proc fd/fdinfo nodes go once the fds close; inotify accounting buckets
     # do not drift when a spilled user later gets a slot.
-    out = g.run("/abiprobes/p49_accounting", timeout=150)
-    expect(out, r"^PASS p49_accounting$", "accounting probe")
+    out = g.run("/abiprobes/p50_accounting", timeout=150)
+    expect(out, r"^PASS p50_accounting$", "accounting probe")
     # One user hammering /proc lookups cannot make them fail for root or
     # another user, and the node cache stays bounded.
-    out = g.run("/abiprobes/p50_procfs_fair", timeout=180)
-    expect(out, r"^PASS p50_procfs_fair$", "/proc fairness probe")
+    out = g.run("/abiprobes/p51_procfs_fair", timeout=180)
+    expect(out, r"^PASS p51_procfs_fair$", "/proc fairness probe")
     out = g.run("cat /proc/sys/fs/inotify/queued_bytes")
     expect(out, r"^0$", "no inotify event memory left behind")
     out = g.run("cat /proc/sysvipc/shm | toybox wc -l")
@@ -201,19 +201,19 @@ def make_extra_fs():
 
 def check_inotify(g, extra):
     for d in ("/tmp", "/disk"):
-        out = g.run(f"/abiprobes/p46_inotify {d}", timeout=150)
-        expect(out, r"^PASS p46_inotify$", f"inotify probe on {d}")
+        out = g.run(f"/abiprobes/p47_inotify {d}", timeout=150)
+        expect(out, r"^PASS p47_inotify$", f"inotify probe on {d}")
     for i, (_, fstype) in enumerate(extra):
         dev, mnt = "/dev/hd" + "bcd"[i], "/tmp/" + fstype
         out = g.run(f"busybox mkdir -p {mnt} && busybox mount -t {fstype} {dev} {mnt}; echo rc=$?")
         expect(out, r"rc=0", f"mount {fstype}")
-        out = g.run(f"/abiprobes/p46_inotify {mnt}", timeout=150)
-        expect(out, r"^PASS p46_inotify$", f"inotify probe on {fstype}")
+        out = g.run(f"/abiprobes/p47_inotify {mnt}", timeout=150)
+        expect(out, r"^PASS p47_inotify$", f"inotify probe on {fstype}")
 
 
 def check_proc_perms(g):
-    out = g.run("/abiprobes/p47_proc_pid", timeout=90)
-    expect(out, r"^PASS p47_proc_pid$", "/proc/<pid> probe")
+    out = g.run("/abiprobes/p48_proc_pid", timeout=90)
+    expect(out, r"^PASS p48_proc_pid$", "/proc/<pid> probe")
     # By hand, as the unprivileged account: init (root) is another user.
     g.run("exit", prompt=smokelib.LOGIN_PROMPT, timeout=60)
     g.login("user", "user")

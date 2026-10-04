@@ -1,5 +1,5 @@
 /*
- * P50 one user cannot deny /proc to the others.
+ * P51 one user cannot deny /proc to the others.
  *
  * An unprivileged user (the hammer) keeps looking up ~6000 distinct
  * per-process /proc nodes in tight loops: fd/N, fdinfo/N and their
@@ -26,7 +26,7 @@
  * for 3 s, so the hammer kept the whole cache busy and every new lookup in
  * /proc, /proc/<pid> itself included, failed with ENOENT for everyone.
  */
-#define PROBE_NAME "p50_procfs_fair"
+#define PROBE_NAME "p51_procfs_fair"
 #include "probe.h"
 #include <dirent.h>
 #include <sys/mman.h>

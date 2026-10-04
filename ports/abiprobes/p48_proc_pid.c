@@ -1,5 +1,5 @@
 /*
- * P47 /proc: the system files and /proc/<pid>, and who may read what.
+ * P48 /proc: the system files and /proc/<pid>, and who may read what.
  *
  * Linux: /proc/self is a link to the caller's pid and /proc/thread-self to
  * "<pid>/task/<tid>"; /proc/<pid>/stat, status, cmdline, comm, statm, task/
@@ -12,7 +12,7 @@
  * MaeroOS: /proc/self was a directory, /proc/<pid> held only stat and status,
  * and /proc/stat and /proc/loadavg did not exist.
  */
-#define PROBE_NAME "p47_proc_pid"
+#define PROBE_NAME "p48_proc_pid"
 #include "probe.h"
 #include <dirent.h>
 #include <sys/prctl.h>

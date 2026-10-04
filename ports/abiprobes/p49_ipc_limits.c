@@ -1,5 +1,5 @@
 /*
- * P48 an unprivileged user cannot pin unbounded kernel memory through
+ * P49 an unprivileged user cannot pin unbounded kernel memory through
  * inotify or System V IPC, and the system stays usable when one tries.
  *
  * Run as root it does the work as nobody (65534); as another user, as that
@@ -17,7 +17,7 @@
  * instance (128 instances of 16384 long-named events exhaust the 256 MiB
  * kernel heap).
  */
-#define PROBE_NAME "p48_ipc_limits"
+#define PROBE_NAME "p49_ipc_limits"
 #include "probe.h"
 #include <sys/inotify.h>
 #include <sys/ipc.h>
@@ -65,7 +65,7 @@ static int run(void)
     long maxq = read_long("/proc/sys/fs/inotify/max_queued_events");
     if (maxq <= 0 || maxq > 100000) maxq = 16384;
     char dir[64], path[300];
-    snprintf(dir, sizeof dir, "/tmp/p48.%d", (int)getpid());
+    snprintf(dir, sizeof dir, "/tmp/p49.%d", (int)getpid());
     if (mkdir(dir, 0700) != 0) return 10;
     int in[NINST];
     for (int i = 0; i < NINST; i++) {

@@ -3,7 +3,7 @@
     make smoke-procipc                               # in make check (inotify on
                                                      # tmpfs, ext2, vfat, exFAT, ext4)
     make smoke-procipc SMOKE_PROCIPC_ARGS=--alpine   # + Alpine procps-ng and htop
-    make smoke-abi                                   # p45 (SysV), p46 (inotify), p47 (/proc)
+    make smoke-abi                                   # p46 (SysV), p47 (inotify), p48 (/proc)
 
 ## /proc
 
@@ -100,11 +100,11 @@ count, without letting one user deny `/proc` to the others:
 - Users are tracked in 64 buckets. Users beyond that share a spill bucket
   and its 1024 limit, and root has a bucket of its own.
 
-p50 has one user look up about 6000 distinct nodes in tight loops while
+p51 has one user look up about 6000 distinct nodes in tight loops while
 root and a second user run `ps` and read every `/proc/<pid>/stat` and
 `status`. Before this change, past 4096 nodes only nodes idle for 3 s could
 be evicted, so the hammer kept the whole cache busy and every new lookup
-failed for everyone, `/proc/<pid>` and `/proc/self` included. p50 also has
+failed for everyone, `/proc/<pid>` and `/proc/self` included. p51 also has
 one user try to open and watch 2800 nodes, 400 of which another user
 already holds open. It ends up holding at most 1024 (it held 1414 before
 holders were charged), and per-process directories are refused as bind
@@ -196,7 +196,7 @@ them users share a spill bucket with one 2 MiB budget), and a bucket passes
 to another user only when no instance is bound to it, so bytes are always
 returned to the bucket they were charged to. `acct_slots` (root, 1-64)
 lowers the bucket count for tests and `spill_bytes` shows the spill bucket
-(p49). Past 16384 queued events the queue ends in one `IN_Q_OVERFLOW`
+(p50). Past 16384 queued events the queue ends in one `IN_Q_OVERFLOW`
 (wd -1). `IN_MASK_ADD`, `IN_MASK_CREATE`, `IN_ONLYDIR`, `IN_DONT_FOLLOW` and
 `IN_ONESHOT` are supported.
 

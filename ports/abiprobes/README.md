@@ -1,7 +1,7 @@
 # Linux-ABI probes
 
 Forty-nine small C programs.  P1-P20 are the probes of
-`docs/audit/firefox-first-paint.md` section 8; P21-P49 were added with later
+`docs/audit/firefox-first-paint.md` section 8; P21-P52 were added with later
 kernel fixes.  Each proves or disproves one kernel-semantics gap and prints
 exactly one final line:
 
@@ -63,13 +63,13 @@ regression tests for the fixes in audit section 5.
 | P43 | `p43_lock_close_race.c`     | a descriptor closed while `F_SETLKW`/`flock` waits leaves no lock behind (`F_SETLKW`: `EBADF`) | — |
 | P44 | `p44_proc_fd_link.c`        | `/proc/<pid>/fd/N` links name the open file (`ttyname`); another user's are `EACCES` | — |
 | P45 | `p45_seccomp.c`             | seccomp filters: validation, ALLOW/ERRNO/TRAP (SIGSYS siginfo + ucontext)/KILL_THREAD/KILL_PROCESS/LOG, STRICT, TSYNC, fork/exec inheritance; `no_new_privs` ignores set-uid on exec | — |
-| P45 | `p45_sysv_ipc.c`            | System V shm/sem/msg: sharing across fork, IPC_RMID, SEM_UNDO, blocking, types, keys, permissions | — |
-| P46 | `p46_inotify.c`             | inotify events of each directory operation, poll/epoll/FIONREAD, blocking read, IN_Q_OVERFLOW | — |
-| P47 | `p47_proc_pid.c`            | `/proc/self` link, `/proc/<pid>` files, `/proc/stat`/`loadavg`; another user's `environ`/`fd`/links are `EACCES` | — |
-| P48 | `p48_ipc_limits.c`          | an unprivileged user's inotify queues end in `IN_Q_OVERFLOW`, a full message queue is `EAGAIN`, shm stops at `ENOSPC`; fork and allocation still work | — |
-| P49 | `p49_accounting.c`          | `/proc/self/fd`/`fdinfo` nodes are dropped once the fds close (`procfs_nodes`); inotify's spill bucket returns to 0 after a spilled user gets a slot | — |
-| P50 | `p50_procfs_fair.c`         | an unprivileged user looking up ~6000 distinct `/proc/<pid>/fd`/`fdinfo` nodes in tight loops cannot make root's or another user's `/proc` lookups (or `ps`) fail; `procfs_nodes` stays within `procfs_nodes_max` and falls back once it stops; a user cannot hold (open/inotify-watch) more than its share of nodes; per-pid `/proc` dirs are refused as bind source/target | — |
-| P51 | `p51_kill_zombie_child.c`   | `kill(pid, SIGKILL)` and `kill(-pgrp, SIGKILL)` of a process with an unreaped zombie child return and kill it (the SIGKILL subtree walk used to spin forever under the BKL) | — |
+| P46 | `p46_sysv_ipc.c`            | System V shm/sem/msg: sharing across fork, IPC_RMID, SEM_UNDO, blocking, types, keys, permissions | — |
+| P47 | `p47_inotify.c`             | inotify events of each directory operation, poll/epoll/FIONREAD, blocking read, IN_Q_OVERFLOW | — |
+| P48 | `p48_proc_pid.c`            | `/proc/self` link, `/proc/<pid>` files, `/proc/stat`/`loadavg`; another user's `environ`/`fd`/links are `EACCES` | — |
+| P49 | `p49_ipc_limits.c`          | an unprivileged user's inotify queues end in `IN_Q_OVERFLOW`, a full message queue is `EAGAIN`, shm stops at `ENOSPC`; fork and allocation still work | — |
+| P50 | `p50_accounting.c`          | `/proc/self/fd`/`fdinfo` nodes are dropped once the fds close (`procfs_nodes`); inotify's spill bucket returns to 0 after a spilled user gets a slot | — |
+| P51 | `p51_procfs_fair.c`         | an unprivileged user looking up ~6000 distinct `/proc/<pid>/fd`/`fdinfo` nodes in tight loops cannot make root's or another user's `/proc` lookups (or `ps`) fail; `procfs_nodes` stays within `procfs_nodes_max` and falls back once it stops; a user cannot hold (open/inotify-watch) more than its share of nodes; per-pid `/proc` dirs are refused as bind source/target | — |
+| P52 | `p52_kill_zombie_child.c`   | `kill(pid, SIGKILL)` and `kill(-pgrp, SIGKILL)` of a process with an unreaped zombie child return and kill it (the SIGKILL subtree walk used to spin forever under the BKL) | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the

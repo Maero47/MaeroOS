@@ -1,5 +1,5 @@
 /*
- * P45 System V IPC: shared memory, semaphores, message queues.
+ * P46 System V IPC: shared memory, semaphores, message queues.
  *
  * Linux: shmget/shmat share memory between a parent and a forked child
  * (shm_nattch counts both), a segment removed with IPC_RMID lives until the
@@ -14,7 +14,7 @@
  *
  * MaeroOS: every call was ENOSYS.
  */
-#define PROBE_NAME "p45_sysv_ipc"
+#define PROBE_NAME "p46_sysv_ipc"
 #include "probe.h"
 #include <sys/ipc.h>
 #include <sys/msg.h>

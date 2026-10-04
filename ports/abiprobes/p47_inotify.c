@@ -1,5 +1,5 @@
 /*
- * P46 inotify: the events of each directory operation, on the filesystem of
+ * P47 inotify: the events of each directory operation, on the filesystem of
  * the directory given as argv[1] (default /tmp).
  *
  * Linux: a watch on a directory reports IN_CREATE, IN_MODIFY, IN_CLOSE_WRITE,
@@ -14,7 +14,7 @@
  *
  * MaeroOS: inotify_init was ENOSYS.
  */
-#define PROBE_NAME "p46_inotify"
+#define PROBE_NAME "p47_inotify"
 #include "probe.h"
 #include <poll.h>
 #include <sys/epoll.h>
@@ -66,7 +66,7 @@ int main(int argc, char **argv)
     probe_watchdog(120);
     const char *base = argc > 1 ? argv[1] : "/tmp";
     char dir[256], path[300], path2[300], sub[300];
-    snprintf(dir, sizeof dir, "%s/p46.%d", base, (int)getpid());
+    snprintf(dir, sizeof dir, "%s/p47.%d", base, (int)getpid());
     if (mkdir(dir, 0755) != 0) probe_skip("mkdir %s: %s", dir, strerror(errno));
     snprintf(path, sizeof path, "%s/a", dir);
     snprintf(path2, sizeof path2, "%s/b", dir);
