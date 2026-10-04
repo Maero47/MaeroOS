@@ -55,8 +55,10 @@ void blk_init(void) {
 void blk_set_boot(int disk) {
     if (disk < 0 || disk >= ndisks) return;
     boot = disk;
-    if (disks[boot].kind == BLK_ATA)
+    if (disks[boot].kind == BLK_ATA && disks[boot].unit == 0)
         snprintf(boot_label, sizeof(boot_label), "ata");
+    else if (disks[boot].kind == BLK_ATA)
+        snprintf(boot_label, sizeof(boot_label), "ata%d", disks[boot].unit);
     else
         snprintf(boot_label, sizeof(boot_label), "%s%d",
                  disks[boot].kind == BLK_AHCI ? "ahci" : "nvme", disks[boot].unit);
@@ -104,15 +106,15 @@ const char *blk_boot_devpath(void) {
 
 int blk_read(uint32_t lba, uint8_t count, void *buf) {
     if (boot < 0) return -1;
-    if (disks[boot].kind == BLK_ATA)
-        return ata_read(lba, count, buf);        /* the master's fast path */
+    if (disks[boot].kind == BLK_ATA)            /* any IDE position: root=/dev/hdb3 */
+        return ata_dev_read(disks[boot].unit, lba, count, buf);
     return blk_disk_read(boot, lba, count ? count : 256u, buf);
 }
 
 int blk_write(uint32_t lba, uint8_t count, const void *buf) {
     if (boot < 0) return -1;
     if (disks[boot].kind == BLK_ATA)
-        return ata_write(lba, count, buf);
+        return ata_dev_write(disks[boot].unit, lba, count, buf);
     return blk_disk_write(boot, lba, count ? count : 256u, buf);
 }
 
