@@ -125,13 +125,16 @@ int vfs_access_check_groups(vfs_node_t *node, uint32_t euid, uint32_t egid,
         return 0;
     }
     m = node->mask;
-    /* Many synthetic nodes (devfs, procfs, freshly-created tmpfs dirs) are
-     * built without an explicit mode.  A zero mask should not lock everyone
-     * out: device/pipe/fifo nodes default to world rw (0666); read-only
-     * synthetic files/dirs default to world read + traverse (0555).  Real
-     * on-disk files always carry a non-zero ext2 mode, so this never weakens
-     * an intentionally-restricted file (e.g. /etc/shadow at 0600). */
+    /* Synthetic files and directories (procfs) are built without an explicit
+     * mode and default to world read + traverse (0555); anonymous pipes,
+     * FIFOs and sockets reached through /proc/<pid>/fd to 0666.  A device
+     * node with mode 0 is open to root alone: every devfs and driver node
+     * names its owner and mode, and the old 0666 default made a forgotten
+     * one -- /dev/input/event0 with every keystroke, /dev/fb0 -- world
+     * readable and writable. */
     if (m == 0) {
+        if (node->flags == VFS_FLAG_CHARDEV || node->flags == VFS_FLAG_BLKDEV)
+            return -13;                                       /* -EACCES */
         if (node->flags != VFS_FLAG_FILE && node->flags != VFS_FLAG_DIR)
             m = 0666;
         else
@@ -289,6 +292,14 @@ static vfs_node_t *mnt_cross(vfs_node_t *n, vfs_mnt_t **m) {
     return n;
 }
 
+/* The calling process may search `dir` (root may search any directory). */
+static int walk_may_search(vfs_node_t *dir) {
+    struct proc *p = current_proc;
+    if (!p || p->euid == 0) return 0;
+    return vfs_access_check_groups(dir, p->euid, p->egid, p->groups,
+                                   p->ngroups, VFS_WANT_X);
+}
+
 static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
                     int may_follow, int top_restarts, char *alt,
                     vfs_node_t **out, int *err, vfs_mnt_t **mnt_out) {
@@ -316,6 +327,14 @@ static int vfs_walk(vfs_node_t *root, const char *path, int follow_final,
         const char *after_component = p;
         while (*after_component == '/') after_component++;
         int is_final = (*after_component == '\0');
+
+        /* Search permission on every directory the walk looks a name up in
+         * (Linux may_lookup): a file in another user's 0700 directory is
+         * out of reach whatever its own mode says. */
+        if (cur->flags == VFS_FLAG_DIR && walk_may_search(cur) < 0) {
+            *err = -13;                                       /* -EACCES */
+            return WALK_MISS;
+        }
 
         /* handle "." */
         if (len == 1 && component[0] == '.') continue;
@@ -457,7 +476,9 @@ static vfs_node_t *vfs_lookup_in(vfs_node_t *croot, const char *path,
             if (vfs_root_overlay && vfs_path_uses_root_overlay(pth))
                 r = vfs_walk(vfs_root_overlay, pth, follow_final, may_follow,
                              0, alt, &node, &e, mnt);
-            if (r == WALK_MISS) {
+            /* A directory the caller may not search hides nothing: the
+             * same path on the boot filesystem is not a fallback for it. */
+            if (r == WALK_MISS && e != -13) {
                 r = vfs_walk(vfs_root, pth, follow_final, may_follow,
                              croot != NULL, alt, &node, &e2, mnt);
                 if (e == -2) e = e2;     /* report a loop over a plain miss */

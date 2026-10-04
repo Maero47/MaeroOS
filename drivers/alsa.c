@@ -1279,7 +1279,8 @@ static void chardev(vfs_node_t *n, const char *name, uint32_t ino, uint32_t mino
     strncpy(n->name, name, 255);
     n->flags = VFS_FLAG_CHARDEV;
     n->inode = ino;
-    n->mask = 0666;                          /* like /dev/dsp: no audio group */
+    n->mask = 0660;                          /* root:audio, like /dev/dsp */
+    n->gid = DEV_GID_AUDIO;
     n->rdev = (116U << 8) | minor;          /* ALSA's major */
     n->read_fn = nodata_read;
     n->write_fn = nodata_write;

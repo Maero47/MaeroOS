@@ -71,6 +71,8 @@ regression tests for the fixes in audit section 5.
 | P51 | `p51_procfs_fair.c`         | an unprivileged user looking up ~6000 distinct `/proc/<pid>/fd`/`fdinfo` nodes in tight loops cannot make root's or another user's `/proc` lookups (or `ps`) fail; `procfs_nodes` stays within `procfs_nodes_max` and falls back once it stops; a user cannot hold (open/inotify-watch) more than its share of nodes; per-pid `/proc` dirs are refused as bind source/target | — |
 | P52 | `p52_kill_zombie_child.c`   | `kill(pid, SIGKILL)` and `kill(-pgrp, SIGKILL)` of a process with an unreaped zombie child return and kill it (the SIGKILL subtree walk used to spin forever under the BKL) | — |
 | P53 | `p53_ext2_open_many.c`      | with 160 other files open (each unlinked), a written, open, unlinked ext2 file keeps its data while other files are written (the 128-slot open-inode table let the 129th go untracked and freed) | — |
+| P54 | `p54_dev_perms.c`           | as uid 65534: `/dev/null`, `zero`, `urandom`, `ptmx` open; `/dev/input/event*`, `fb0`, `dsp`, `snd/*` and disks are EACCES; root's `/dev/pts/N` is 0620 root-owned and EACCES, its own pty slave is its own (mode-0 device nodes used to be world read/write) | — |
+| P55 | `p55_path_search.c`         | as uid 65534, in /tmp and /disk: open/stat/readlink/create/chdir under a 0700 directory are EACCES (also two levels down and through a symlink); a 0711 directory is walked through and chdir'd into but not listed (the walk checked no search permission) | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the

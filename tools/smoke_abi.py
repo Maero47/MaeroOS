@@ -124,6 +124,10 @@ PROBES = {
     "p52_kill_zombie_child":   (60, ""),
     # An unlinked file held open keeps its blocks past 128 open inodes (ext2).
     "p53_ext2_open_many":      (120, "/disk"),
+    # Device node owners/modes and devpts slaves; search permission on
+    # every directory of a path (tmpfs and ext2).
+    "p54_dev_perms":           (60, ""),
+    "p55_path_search":         (60, "/disk"),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

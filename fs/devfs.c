@@ -1027,6 +1027,18 @@ static vfs_node_t *pty_alloc_master(void) {
         p->slave.retain_fn = pty_slave_retain;
         p->slave.close_fn = pty_slave_close;
         p->slave.private = p;
+        /* devpts (mounted gid=5,mode=620 as distributions do): the slave
+         * belongs to whoever opened /dev/ptmx, group tty, and nobody else
+         * may open it.  It was mode 0, which let any user read another
+         * user's terminal and type into it. */
+        p->master.mask = 0620;
+        p->slave.mask = 0620;
+        p->slave.gid = DEV_GID_TTY;
+        p->master.gid = DEV_GID_TTY;
+        if (current_proc) {
+            p->slave.uid = current_proc->euid;
+            p->master.uid = current_proc->euid;
+        }
         return &p->master;
     }
     return NULL;
@@ -1222,6 +1234,17 @@ static int inputdir_readdir(vfs_node_t *node, uint32_t idx, vfs_dirent_t *out) {
 
 /* ── Public init ───────────────────────────────────────────────────────────── */
 
+/* Owner, group and mode of a node, like udev's defaults on Linux.  A device
+ * node with mode 0 is closed to everyone but root (vfs_access_check), so
+ * every node here says who may use it.  Console devices (fb0, input, dsp,
+ * snd) belong to root and their group; init hands them to the graphical
+ * session's user while it runs, as logind does. */
+static void dev_perm(vfs_node_t *n, uint32_t mode, uint32_t gid) {
+    n->mask = mode;
+    n->uid  = 0;
+    n->gid  = gid;
+}
+
 vfs_node_t *devfs_mount(void) {
     /* /dev/shm — a real writable tmpfs for POSIX shm_open("/dev/shm/..."). */
     dev_shm_root = tmpfs_mount();
@@ -1236,6 +1259,7 @@ vfs_node_t *devfs_mount(void) {
     dev_null.write_fn = null_write;
     dev_null.read_ready_fn = always_ready;
     dev_null.write_ready_fn = always_ready;
+    dev_perm(&dev_null, 0666, 0);
 
     /* /dev/initrd (Linux: block device 1,250), read-only, root only */
     memset(&dev_initrd, 0, sizeof(dev_initrd));
@@ -1261,6 +1285,7 @@ vfs_node_t *devfs_mount(void) {
     dev_zero.write_fn = null_write;   /* discard writes */
     dev_zero.read_ready_fn = always_ready;
     dev_zero.write_ready_fn = always_ready;
+    dev_perm(&dev_zero, 0666, 0);
 
     /* /dev/tty */
     memset(&dev_tty, 0, sizeof(dev_tty));
@@ -1272,6 +1297,7 @@ vfs_node_t *devfs_mount(void) {
     dev_tty.ioctl_fn = tty_ioctl;
     dev_tty.read_ready_fn = tty_read_ready;
     dev_tty.write_ready_fn = tty_write_ready;
+    dev_perm(&dev_tty, 0666, DEV_GID_TTY);
 
     /* /dev/dsp */
     memset(&dev_dsp, 0, sizeof(dev_dsp));
@@ -1283,6 +1309,7 @@ vfs_node_t *devfs_mount(void) {
     dev_dsp.ioctl_fn = dsp_ioctl;
     dev_dsp.read_ready_fn = always_ready;
     dev_dsp.write_ready_fn = always_ready;
+    dev_perm(&dev_dsp, 0660, DEV_GID_AUDIO);
 
     /* /dev/urandom */
     memset(&dev_urandom, 0, sizeof(dev_urandom));
@@ -1293,6 +1320,7 @@ vfs_node_t *devfs_mount(void) {
     dev_urandom.write_fn = null_write;   /* discard writes */
     dev_urandom.read_ready_fn = always_ready;
     dev_urandom.write_ready_fn = always_ready;
+    dev_perm(&dev_urandom, 0666, 0);
 
     /* /dev/fb0 */
     memset(&dev_fb0, 0, sizeof(dev_fb0));
@@ -1305,6 +1333,7 @@ vfs_node_t *devfs_mount(void) {
     dev_fb0.ioctl_fn = fb0_ioctl;
     dev_fb0.read_ready_fn = always_ready;
     dev_fb0.write_ready_fn = always_ready;
+    dev_perm(&dev_fb0, 0660, DEV_GID_VIDEO);
 
     /* /dev/input/event0 */
     memset(&dev_input_event0, 0, sizeof(dev_input_event0));
@@ -1313,6 +1342,7 @@ vfs_node_t *devfs_mount(void) {
     dev_input_event0.inode   = 6;
     dev_input_event0.read_fn = input_event_read;
     dev_input_event0.read_ready_fn = keyboard_ready;
+    dev_perm(&dev_input_event0, 0660, DEV_GID_INPUT);
 
     /* /dev/input/event1 */
     memset(&dev_input_event1, 0, sizeof(dev_input_event1));
@@ -1321,6 +1351,7 @@ vfs_node_t *devfs_mount(void) {
     dev_input_event1.inode   = 7;
     dev_input_event1.read_fn = input_mouse_read;
     dev_input_event1.read_ready_fn = mouse_ready;
+    dev_perm(&dev_input_event1, 0660, DEV_GID_INPUT);
 
     /* /dev/input */
     memset(&dev_input_dir, 0, sizeof(dev_input_dir));
@@ -1328,6 +1359,7 @@ vfs_node_t *devfs_mount(void) {
     dev_input_dir.flags      = VFS_FLAG_DIR;
     dev_input_dir.finddir_fn = inputdir_finddir;
     dev_input_dir.readdir_fn = inputdir_readdir;
+    dev_perm(&dev_input_dir, 0755, 0);
 
     /* /dev/ptmx */
     memset(&dev_ptmx, 0, sizeof(dev_ptmx));
@@ -1335,6 +1367,7 @@ vfs_node_t *devfs_mount(void) {
     dev_ptmx.flags = VFS_FLAG_CHARDEV;
     dev_ptmx.inode = 20;
     dev_ptmx.open_fn = ptmx_open;
+    dev_perm(&dev_ptmx, 0666, DEV_GID_TTY);
 
     /* /dev/pts */
     memset(&dev_pts_dir, 0, sizeof(dev_pts_dir));
@@ -1342,6 +1375,7 @@ vfs_node_t *devfs_mount(void) {
     dev_pts_dir.flags = VFS_FLAG_DIR;
     dev_pts_dir.finddir_fn = ptsdir_finddir;
     dev_pts_dir.readdir_fn = ptsdir_readdir;
+    dev_perm(&dev_pts_dir, 0755, 0);
 
     /* /dev directory */
     memset(&dev_dir, 0, sizeof(dev_dir));
@@ -1349,6 +1383,7 @@ vfs_node_t *devfs_mount(void) {
     dev_dir.flags       = VFS_FLAG_DIR;
     dev_dir.finddir_fn  = devdir_finddir;
     dev_dir.readdir_fn  = devdir_readdir;
+    dev_perm(&dev_dir, 0755, 0);
 
     return &dev_dir;
 }

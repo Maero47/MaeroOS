@@ -11,6 +11,14 @@
 #define VFS_FLAG_FIFO    0x7   /* named pipe (FIFO) */
 /* AF_UNIX socket inode (S_IFSOCK), made by bind().  Outside the low three
  * bits on purpose: several callers test those bits as a mask. */
+/* Groups that own device nodes: Alpine's /etc/group numbers (the Alpine
+ * chroot and the MaeroOS /etc/group both name them). */
+#define DEV_GID_TTY    5
+#define DEV_GID_DISK   6
+#define DEV_GID_AUDIO 18
+#define DEV_GID_INPUT 23
+#define DEV_GID_VIDEO 27
+
 #define VFS_FLAG_SOCK    0x8
 
 /* Returned by vfs_readdir for each entry */

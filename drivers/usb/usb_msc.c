@@ -403,6 +403,7 @@ static int attach_lun(struct usb_device *d, uint8_t ifnum, uint8_t lun) {
     uint64_t bytes = (uint64_t)k->block_count * bs;
     n->size = bytes;
     n->mask = 0660;
+    n->gid = DEV_GID_DISK;
     n->read_fn = disk_read;
     n->write_fn = disk_write;
     n->read_ready_fn = disk_ready;
