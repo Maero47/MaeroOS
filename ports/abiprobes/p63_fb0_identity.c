@@ -1,5 +1,5 @@
 /*
- * P57 Only /dev/fb0 itself maps the framebuffer.
+ * P63 Only /dev/fb0 itself maps the framebuffer.
  *
  * A regular file that happens to be called fb0 maps its own bytes.  On
  * MaeroOS, /dev/fb0 opened read-only cannot be mapped writable, even
@@ -9,7 +9,7 @@
  * physical framebuffer (bypassing /dev/fb0's mode), and a MAP_PRIVATE|
  * PROT_WRITE view of a read-only /dev/fb0 descriptor wrote the screen.
  */
-#define PROBE_NAME "p57_fb0_identity"
+#define PROBE_NAME "p63_fb0_identity"
 #include "probe.h"
 #include <sys/mman.h>
 #include <sys/utsname.h>

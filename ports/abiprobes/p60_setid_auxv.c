@@ -1,5 +1,5 @@
 /*
- * P54 auxv of a set-uid exec: AT_SECURE=1 and the new effective uid.
+ * P60 auxv of a set-uid exec: AT_SECURE=1 and the new effective uid.
  *
  * As root, the probe copies itself to /tmp as a set-uid-root file, drops to
  * uid/gid 65534 in a child and execs the copy.  The new image reads its
@@ -12,13 +12,13 @@
  * and AT_SECURE 0 while running with euid 0: ld.so would honour LD_PRELOAD
  * from an unprivileged caller (local root).
  */
-#define PROBE_NAME "p54_setid_auxv"
+#define PROBE_NAME "p60_setid_auxv"
 #include "probe.h"
 #include <sys/auxv.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 
-static const char *copy_path = "/tmp/p54_setid";
+static const char *copy_path = "/tmp/p60_setid";
 
 static int child_report(const char *mode)
 {

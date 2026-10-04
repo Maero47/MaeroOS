@@ -1,5 +1,5 @@
 /*
- * P59 Record locks are bounded per user, and one user's locks do not stop
+ * P65 Record locks are bounded per user, and one user's locks do not stop
  * another's.
  *
  * As uid 65534 the probe takes up to 6000 non-adjacent read locks (they
@@ -11,12 +11,12 @@
  * MaeroOS before: one global unbounded list - the kernel heap could be
  * filled with lock records, and every close() in the system walked them all.
  */
-#define PROBE_NAME "p59_lock_limits"
+#define PROBE_NAME "p65_lock_limits"
 #include "probe.h"
 #include <sys/stat.h>
 #include <sys/wait.h>
 
-static const char *path = "/tmp/p59_locks";
+static const char *path = "/tmp/p65_locks";
 
 static int lock_byte(int fd, off_t at)
 {

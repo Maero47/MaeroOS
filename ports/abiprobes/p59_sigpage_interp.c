@@ -1,5 +1,5 @@
 /*
- * P53 An ELF interpreter cannot overwrite the shared sigreturn page.
+ * P59 An ELF interpreter cannot overwrite the shared sigreturn page.
  *
  * The probe writes two tiny ELF files: a program whose PT_INTERP names an
  * interpreter, and that interpreter (ET_DYN), which has a second, writable
@@ -16,14 +16,14 @@
  * frame writable and copied the file bytes into it: every later signal
  * handler in the system returned into int3 (SIGTRAP).
  */
-#define PROBE_NAME "p53_sigpage_interp"
+#define PROBE_NAME "p59_sigpage_interp"
 #include "probe.h"
 #include <elf.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 
-static const char *prog_path = "/tmp/p53_prog";
-static const char *interp_path = "/tmp/p53_interp";
+static const char *prog_path = "/tmp/p59_prog";
+static const char *interp_path = "/tmp/p59_interp";
 
 static void write_file(const char *path, const void *buf, size_t len)
 {

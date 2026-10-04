@@ -1,5 +1,5 @@
 /*
- * P55 Old fstat on any descriptor; nothing maps below 64 KiB.
+ * P61 Old fstat on any descriptor; nothing maps below 64 KiB.
  *
  * The i386 fstat (syscall 108, struct stat with 16-bit ids) works on every
  * kind of descriptor: an eventfd, an epoll instance, a socket, a pipe.  And
@@ -9,7 +9,7 @@
  * MaeroOS before: syscall 108 read the vfs node of descriptors that have
  * none (a kernel panic), and MAP_FIXED at 0 succeeded.
  */
-#define PROBE_NAME "p55_fstat_low_map"
+#define PROBE_NAME "p61_fstat_low_map"
 #include "probe.h"
 #include <sys/epoll.h>
 #include <sys/eventfd.h>

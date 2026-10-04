@@ -1,5 +1,5 @@
 /*
- * P58 MaeroOS syscall 505 (Ctrl+Alt+Backspace kill target) is not a way to
+ * P64 MaeroOS syscall 505 (Ctrl+Alt+Backspace kill target) is not a way to
  * have other users' processes killed.
  *
  * An unprivileged caller cannot register init or a process it could not
@@ -11,7 +11,7 @@
  * MaeroOS before: any pid was accepted from anyone, and the keyboard
  * interrupt sent SIGKILL to it with no credential check.
  */
-#define PROBE_NAME "p58_kill_target"
+#define PROBE_NAME "p64_kill_target"
 #include "probe.h"
 #include <sys/wait.h>
 
