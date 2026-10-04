@@ -38,8 +38,14 @@ int         alsa_ioctl(vfs_node_t *n, uint32_t req, void *uarg, int nonblock);
 /* A hot-plugged card (index 1) comes and goes. */
 void        alsa_card_add(int index, const alsa_out_t *out);
 void        alsa_card_remove(int index);
-/* Is card `index` there (card 1: a USB audio device plugged in)? */
+/* Is card `index` there (card 1: a USB audio device plugged in)?  The
+ * generation counts its arrivals (a new plug-in: devfs refreshes /dev/dsp1's
+ * owner). */
 int         alsa_card_present(int index);
+uint32_t    alsa_card_generation(int index);
+/* The owner, group and mode every sound node starts with (the /dev/snd
+ * nodes, /dev/dsp, /dev/dsp1); see drivers/alsa.c. */
+void        alsa_node_perms(vfs_node_t *n);
 /* /dev/dsp1: raw 48 kHz S16LE stereo straight to card `index`'s driver
  * (bytes taken, or -errno: -ENODEV unplugged, -EINVAL at another rate). */
 int         alsa_raw_write(int index, const uint8_t *data, uint32_t len);

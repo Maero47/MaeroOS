@@ -168,8 +168,10 @@ int  usb_iso_queue(struct usb_device *dev, int i, uint32_t p1, uint32_t l1,
 void usb_iso_kick(struct usb_device *dev, int i);
 /* Take back every queued TD (their `done` runs with ok = 0). */
 void usb_iso_stop(struct usb_device *dev, int i);
-/* Service interval in microseconds, and counters for the trace. */
+/* Service interval in microseconds, the most one TD may carry (the max
+ * ESIT payload as configured), and counters for the trace. */
 uint32_t usb_iso_interval_us(struct usb_device *dev, int i);
+uint32_t usb_iso_esit_bytes(struct usb_device *dev, int i);
 void usb_iso_stats(struct usb_device *dev, int i, uint32_t *tds,
                    uint32_t *missed, uint32_t *underruns);
 

@@ -59,6 +59,7 @@
  */
 #include "xhci.h"
 #include "usb.h"
+#include "xhci_iso.h"
 #include "../pci.h"
 #include "../../arch/i686/cpu/pit.h"
 #include "../../arch/i686/mm/paging.h"
@@ -285,6 +286,7 @@ struct usb_device {
         int stream;          /* bulk on stream 1 (doorbell stream ID) */
         int iso;             /* EP_ISO: index in iso_eps */
         int maxburst;        /* packets per burst - 1 (SS; HS isoch: mult) */
+        int mult;            /* SS isoch: bursts per interval - 1 */
         uint32_t interval;   /* endpoint context Interval (2^n x 125 us) */
     } eps[USB_MAX_EPS];
     int cls;                 /* USB_CLS_* */
@@ -1036,9 +1038,16 @@ int usb_configure_eps_x(struct usb_device *d, const usb_ep_cfg_t *cfgs,
         int in = (ep->bEndpointAddress & 0x80) != 0;
         int dci = (ep->bEndpointAddress & 0x0F) * 2 + in;
         int xfer = ep->bmAttributes & 3;   /* 1 isoch, 2 bulk, 3 interrupt */
-        uint32_t mps = ep->wMaxPacketSize & 0x7FF;
-        if (dci < 2 || mps == 0 || xfer == 0) return -1;
+        uint32_t mps, burst, mult;
         if (d->speed < USB_SPEED_SUPER) comp = 0;
+        if (dci < 2 || xfer == 0 ||
+            xhci_ep_burst(comp != 0, d->speed == USB_SPEED_HIGH, xfer,
+                          ep->wMaxPacketSize, comp, &mps, &burst,
+                          &mult) != 0) {
+            printk("[USB] slot %d: endpoint %02x: bad descriptor values\n",
+                   d->slot, ep->bEndpointAddress);
+            return -1;
+        }
         d->eps[i].dci = dci;
         d->eps[i].addr = ep->bEndpointAddress;
         d->eps[i].mps = (int)mps;
@@ -1050,11 +1059,8 @@ int usb_configure_eps_x(struct usb_device *d, const usb_ep_cfg_t *cfgs,
         d->eps[i].interval = 0;
         /* Max Burst: SuperSpeed from the companion, high-speed periodic
          * endpoints from wMaxPacketSize bits 12:11 (xHCI 6.2.3.4). */
-        uint32_t burst = comp ? comp[2] : 0, mult = 0;
-        if (!comp && d->speed == USB_SPEED_HIGH && xfer != 2)
-            burst = (ep->wMaxPacketSize >> 11) & 3;
-        if (comp && xfer == 1) mult = comp[3] & 3;
         d->eps[i].maxburst = (int)burst;
+        d->eps[i].mult = (int)mult;
         add |= 1U << dci;
         if (dci > max_dci) max_dci = dci;
 
@@ -1271,11 +1277,13 @@ static int iso_queue2(struct usb_device *d, int i, uint32_t p1, uint32_t l1,
     iso_ep_t *q = iso_of(d, i);
     if (!q || d->gone || usb_iso_room(d, i) < 1 || !l1 || l1 + l2 > 0xFFFF)
         return -1;
-    uint32_t mps = (uint32_t)d->eps[i].mps, mb = (uint32_t)d->eps[i].maxburst;
-    uint32_t len = l1 + l2;
-    uint32_t pk = (len + mps - 1) / mps;
-    uint32_t tbc = (pk + mb) / (mb + 1) - 1;
-    uint32_t tlbpc = (pk - 1) % (mb + 1);
+    uint32_t mps = (uint32_t)d->eps[i].mps;
+    uint32_t len = l1 + l2, tbc, tlbpc;
+    /* more than one service interval's packets: refused, never queued with
+     * counts spilling out of their fields */
+    if (xhci_iso_td_fields(len, mps, (uint32_t)d->eps[i].maxburst,
+                           (uint32_t)d->eps[i].mult, &tbc, &tlbpc) != 0)
+        return -1;
     uint32_t ioc = TRB_IOC | (irq ? 0 : TRB_BEI);
     uint32_t left = l2 ? (l2 + mps - 1) / mps : 0;
     if (left > 31) left = 31;
@@ -1355,6 +1363,12 @@ void usb_iso_stop(struct usb_device *d, int i) {
     q->tail = q->head;
     q->trbs = 0;
     q->done = fn;
+}
+
+uint32_t usb_iso_esit_bytes(struct usb_device *d, int i) {
+    if (!iso_of(d, i)) return 0;
+    return (uint32_t)d->eps[i].mps * ((uint32_t)d->eps[i].maxburst + 1) *
+           ((uint32_t)d->eps[i].mult + 1);
 }
 
 uint32_t usb_iso_interval_us(struct usb_device *d, int i) {

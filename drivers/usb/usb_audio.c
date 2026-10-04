@@ -675,7 +675,9 @@ int usb_audio_attach(struct usb_device *d, const uint8_t *cfg, uint32_t len) {
                usb_device_slot(d), best->ifnum, best->alt);
         return -1;
     }
-    usb_ep_cfg_t ec = { best->ep, best->comp, 0 };
+    usb_ep_cfg_t ec = { best->ep,
+                        usb_device_speed(d) >= USB_SPEED_SUPER ? best->comp : 0,
+                        0 };
     if (usb_configure_eps_x(d, &ec, 1) != 0) return -1;
 
     uint8_t *fifo = ua.fifo;
@@ -694,10 +696,10 @@ int usb_audio_attach(struct usb_device *d, const uint8_t *cfg, uint32_t len) {
     ua.interval_us = usb_iso_interval_us(d, 0);
     uint32_t peak = (uint32_t)(((uint64_t)rate * ua.interval_us + 999999U) /
                                1000000U);
+    /* what one TD may carry is what xhci.c configured (the companion
+     * counts only at SuperSpeed), not what the descriptors claim */
     if (!ua.interval_us || peak * ua.frame_bytes > SLOT_SIZE ||
-        peak * ua.frame_bytes > (uint32_t)(best->ep->wMaxPacketSize & 0x7FF) *
-                                ((best->ep->wMaxPacketSize >> 11 & 3) + 1) *
-                                (best->comp ? best->comp[2] + 1U : 1U)) {
+        peak * ua.frame_bytes > usb_iso_esit_bytes(d, 0)) {
         printk("[USB-AUDIO] slot %d: %u-byte packets do not fit\n",
                usb_device_slot(d), (unsigned)(peak * ua.frame_bytes));
         ua.dev = 0;

@@ -19,12 +19,16 @@ audiodev (build/smoke-usbaudio/out.wav).  Then, from the serial shell:
   6. hot-unplug while playing: `tone -c 1 660 6000` in the background,
      QMP device_del of the usb-audio after ~1.5 s: the card leaves /dev/snd,
      tone fails with an error instead of hanging, no panic, the shell works;
-  7. plugged back in (QMP device_add): card 1 again, `tone -c 1 2000 800`
-     plays.
+  7. plugged back in (QMP device_add) after card 0's nodes and /dev/dsp
+     were given to uid 1000:audio 0660: card 1's nodes and /dev/dsp1 come
+     up with that owner and mode; `tone -c 1 2000 800` plays.
 The captured WAV must hold the 440 Hz tone for about 2 s with at most a
 few dropout blocks, the quieter 1 kHz tone, the 1.5 kHz one from /dev/dsp1,
 part of the 660 Hz one, and the
 2 kHz one from the replugged device.
+
+Before booting it runs the host test tools/test_xhci_iso.py (TD burst
+fields on hostile endpoint descriptors).
 
 Usage: python3 tools/smoke_usbaudio.py  (make smoke-usbaudio)
 """
@@ -91,6 +95,11 @@ def expect(out, text, what):
 
 
 def main():
+    # host side first: the isochronous TD fields on hostile descriptors
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "tools",
+                                                     "test_xhci_iso.py")])
+    if r.returncode:
+        raise AssertionError("tools/test_xhci_iso.py failed")
     os.makedirs(OUT_DIR, exist_ok=True)
     for f in (WAV, WAV2, QMP):
         if os.path.exists(f):
@@ -179,6 +188,11 @@ def main():
         if "dsp1" in out:
             raise AssertionError("/dev/dsp1 still listed after unplug")
 
+        # the card's nodes take card 0's (and /dev/dsp's) owner and mode as
+        # it arrives, as init hands the console's sound devices over
+        run(proc, sel, log, "busybox chown 1000:18 /dev/snd/controlC0 "
+            "/dev/snd/pcmC0D0p /dev/dsp; busybox chmod 0660 "
+            "/dev/snd/controlC0 /dev/snd/pcmC0D0p /dev/dsp")
         # plugged back in
         at = smokelib.mark(log)
         qmp.cmd("device_add", driver="usb-audio", id="uaudio2",
@@ -186,6 +200,10 @@ def main():
         smokelib.wait_for(proc, sel, "[ALSA] card 1: USB Audio", log, 30.0,
                           at)
         time.sleep(0.5)
+        out = run(proc, sel, log, "busybox stat -c 'perm %n %a %u %g' "
+                  "/dev/snd/controlC1 /dev/snd/pcmC1D0p /dev/dsp1")
+        for n in ("/dev/snd/controlC1", "/dev/snd/pcmC1D0p", "/dev/dsp1"):
+            expect(out, f"perm {n} 660 1000 18", "card 1 node owner/mode")
         out = run(proc, sel, log, "tone -c 1 2000 800", timeout=40.0)
         expect(out, "tone: done", "2 kHz tone after replug")
         run(proc, sel, log, "sleep 1")
