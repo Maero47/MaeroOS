@@ -257,6 +257,7 @@ int proc_group_empty(struct proc *leader) {
 
 void proc_release(struct proc *p) {
     if (!p || p->state != PROC_ZOMBIE) return;
+    { extern void vma_release(struct proc *p); vma_release(p); }
     if (p->pgdir_phys && !pgdir_release(p->pgdir_phys))
         pgdir_free_user(p->pgdir_phys);
     seccomp_release(p);

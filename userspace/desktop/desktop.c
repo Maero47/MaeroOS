@@ -140,6 +140,7 @@ typedef struct {
 #define SYS_SHM_CREATE 500
 #define SYS_SHM_MAP    501
 #define SYS_SHM_UNMAP  502
+#define SYS_SHM_SIZE   509   /* the object's size in bytes */
 
 #define TERM_LINES 28   /* terminal scrollback (display tail) */
 
@@ -2124,6 +2125,13 @@ static void set_client_pixels(int idx, const char *arg) {
     addr = syscall1(SYS_SHM_MAP, shmid);
     if (addr <= 0) {
         add_log("WMCTL SURFACE MAP FAILED");
+        return;
+    }
+    /* The mapped object's size, not the w and h the client claims, bounds
+     * the reads (w*h*4 <= 2048*2048*4, no overflow). */
+    if (syscall1(SYS_SHM_SIZE, shmid) < w * h * 4) {
+        syscall1(SYS_SHM_UNMAP, shmid);
+        add_log("WMCTL SURFACE TOO SMALL");
         return;
     }
     client_surfaces[idx].surf = (uint32_t *)(uintptr_t)(unsigned)addr;

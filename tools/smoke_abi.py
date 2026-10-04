@@ -130,6 +130,12 @@ PROBES = {
     "p57_fb0_identity":        (60, ""),
     "p58_kill_target":         (60, ""),
     "p59_lock_limits":         (120, ""),
+    # Kernel follow-ups from the userspace review: a leader that exits alone,
+    # brk per process, fstat of a named FIFO, MaeroOS shm_size.
+    "p60_leader_exit":         (60, ""),
+    "p61_thread_brk":          (60, ""),
+    "p62_fifo_fstat":          (60, ""),
+    "p63_shm_size":            (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

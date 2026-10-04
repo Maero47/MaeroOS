@@ -77,6 +77,10 @@ regression tests for the fixes in audit section 5.
 | P57 | `p57_fb0_identity.c`        | a regular file named `fb0` maps its own bytes; read-only `/dev/fb0` gives no writable view (MaeroOS) | — |
 | P58 | `p58_kill_target.c`         | MaeroOS syscall 505: no init, no process the caller could not signal (EPERM); own child allowed | — |
 | P59 | `p59_lock_limits.c`         | record locks bounded per uid (ENOLCK past 4096 here); a second user can still lock; close releases all | — |
+| P60 | `p60_leader_exit.c`         | the main thread `SYS_exit`s while a worker runs: the worker still faults in an earlier mmap and maps new memory; `waitpid(WNOHANG)` does not report the child until the worker's `exit_group(7)`, then status 7 | — |
+| P61 | `p61_thread_brk.c`          | a worker created before the main thread moved the break sees the moved break (`brk(0)`), grows it, and main sees that with its heap intact | — |
+| P62 | `p62_fifo_fstat.c`          | `fstat` of an open named FIFO gives its owner, mode, `st_ino` and `st_dev` (as `stat` of its name); a `pipe(2)` end is still `S_IFIFO` | — |
+| P63 | `p63_shm_size.c`            | MaeroOS syscall 509 `shm_size(id)` = npages*4096; EINVAL for a bad id; another user needs read permission (EACCES at 0600, allowed at 0644) | — |
 
 Every source starts with a comment that names the findings, states the Linux
 behaviour it asserts with a kernel/libc source reference, and quotes the

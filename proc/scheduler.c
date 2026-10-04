@@ -4,7 +4,7 @@
 #include "seccomp.h"
 #include "ktimer.h"
 
-extern void vma_clear(struct proc *p);   /* free demand-paged VMAs (syscall.c) */
+extern void vma_exit(struct proc *p);    /* free the VMAs with the last thread (syscall.c) */
 #include "pipe.h"
 #include "usocket.h"
 #include "shm.h"
@@ -800,7 +800,7 @@ void proc_exit(int status) {
         current_proc->exit_status = status;
     current_proc->state = PROC_ZOMBIE;
 
-    vma_clear(current_proc);   /* free demand-paged anon VMAs (no-op for threads) */
+    vma_exit(current_proc);    /* the VMAs go with the address space's last thread */
 
     if (current_proc->sid == current_proc->pid && current_proc->ctty)
         devfs_session_tty_hangup(current_proc->sid, current_proc->ctty);

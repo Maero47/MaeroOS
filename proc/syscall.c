@@ -706,10 +706,18 @@ static int fd_kstat64(int fd, struct kstat64 *kst) {
         fill_kstat64(kst, f->node);
         return 0;
     case FD_PIPE_R: case FD_PIPE_W:
+        /* An opened named FIFO is its inode (owner, mode, st_ino/st_dev);
+         * only a pipe(2) end, which has no node, is synthetic. */
+        if (f->node) {
+            fill_kstat64(kst, f->node);
+            kst->st_size = 0;
+            kst->st_blocks = 0;
+            return 0;
+        }
         kst->st_mode = 0010666;                 /* S_IFIFO  */
         return 0;
     case FD_SOCKET: case FD_USOCKET:
-        kst->st_mode = 0140777;                 /* S_IFSOCK */
+        kst->st_mode = 0140777;                /* S_IFSOCK */
         return 0;
     case FD_NONE:
         if (fd > 2) return -9;                  /* -EBADF */
@@ -728,6 +736,8 @@ static void epoll_retain(struct epoll *ep);
 static void epoll_release(struct epoll *ep);
 static void vfork_wake_parent(void);                  /* CLONE_VFORK unblock */
 void vma_clear(struct proc *p);                       /* free a proc's VMAs */
+void vma_exit(struct proc *p);
+void vma_release(struct proc *p);
 void vma_clone(struct proc *parent, struct proc *child);
 
 /* ── eventfd ──────────────────────────────────────────────────────────────
@@ -1745,22 +1755,28 @@ static int sys_getpid(registers_t *regs) {
 static void unmap_pages(uint32_t start, uint32_t end);
 
 /* ── sys_brk(void *addr) — EAX=45 ───────────────────────────────────────── */
+static struct proc *mmap_owner(void);
+
+/* The break belongs to the address space (Linux mm->brk), so it lives on the
+ * thread-group leader with the VMA list and the mmap cursor: a worker thread's
+ * brk must see, and move, the break the main thread set. */
 static int sys_brk(registers_t *regs) {
     uint32_t new_brk = (uint32_t)regs->ebx;
+    struct proc *mo = mmap_owner();
 
     /* Query: return current break */
     if (new_brk == 0)
-        return (int)current_proc->heap_end;
+        return (int)mo->heap_end;
 
     /* Clamp: must be in user address space below the stack guard. */
     if (new_brk >= USER_STACK_BASE)
         return -12;  /* -ENOMEM */
     /* Nor into the NULL-page floor (an image with no loadable segment has
      * its break at 0). */
-    if (new_brk < USER_MIN_ADDR || current_proc->heap_end < USER_MIN_ADDR)
+    if (new_brk < USER_MIN_ADDR || mo->heap_end < USER_MIN_ADDR)
         return -12;
 
-    uint32_t old_brk = current_proc->heap_end;
+    uint32_t old_brk = mo->heap_end;
 
     if (new_brk > old_brk) {
         /* Grow heap: map pages from old_brk up to new_brk */
@@ -1800,7 +1816,7 @@ static int sys_brk(registers_t *regs) {
         if (va < end) unmap_pages(va, end);
     }
 
-    current_proc->heap_end = new_brk;
+    mo->heap_end = new_brk;
     return (int)new_brk;
 }
 
@@ -4253,6 +4269,69 @@ void vma_clear(struct proc *p) {
     p->vmas = NULL;
     vma_irq_restore(irq);
     while (v) { struct vma *n = v->next; vma_free_one(v); v = n; }
+}
+
+/* Does anyone other than `p` still run in the address space `mm`? */
+static int mm_has_live_user(uint32_t mm, struct proc *p) {
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (q == p || q->pgdir_phys != mm) continue;
+        if (q->state == PROC_UNUSED || q->state == PROC_ZOMBIE) continue;
+        return 1;
+    }
+    return 0;
+}
+
+/* A thread is exiting (already a zombie).  The VMA list belongs to the address
+ * space, and it lives on the group leader (or on the vm_owner a CLONE_VM child
+ * points at) — which may itself have exited first: the leader of a process
+ * whose other threads run on stays a zombie (waitpid reports it only when the
+ * group is empty) and must keep the VMAs they fault through.  So the list goes
+ * when the LAST thread running in the address space does (Linux mmput when
+ * mm_users drops to 0), from whichever zombie holds it. */
+void vma_exit(struct proc *p) {
+    uint32_t mm = p ? p->pgdir_phys : 0;
+    if (!mm) { vma_clear(p); return; }
+    if (mm_has_live_user(mm, p)) return;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (q->pgdir_phys == mm && q->state == PROC_ZOMBIE && q->vmas)
+            vma_clear(q);
+    }
+}
+
+/* A zombie is being freed.  Its VMAs are normally gone already (vma_exit); the
+ * exception is an address-space owner that a CLONE_VM child (vfork,
+ * posix_spawn, a crash-dumper clone) still runs in after the owner's whole
+ * group has been reaped: hand the list and the cursors to that child so the
+ * slot can be reused without leaving it a dangling vm_owner. */
+void vma_release(struct proc *p) {
+    struct proc *heir = NULL;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (q == p || q->state == PROC_UNUSED || q->vm_owner != p) continue;
+        if (!heir && q->state != PROC_ZOMBIE && q->pgdir_phys == p->pgdir_phys)
+            heir = q;
+        q->vm_owner = NULL;
+    }
+    if (!heir) { vma_clear(p); return; }
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *q = &ptable[i];
+        if (q != heir && q->state != PROC_UNUSED &&
+            q->pgdir_phys == p->pgdir_phys && q->tgid == q->pid &&
+            q->tgid != p->tgid)
+            q->vm_owner = heir;
+    }
+    vma_clear(heir);                    /* its own list was never used */
+    uint32_t irq = vma_irq_save();
+    heir->vmas = p->vmas;
+    p->vmas = NULL;
+    vma_irq_restore(irq);
+    heir->heap_end    = p->heap_end;
+    heir->brk_base    = p->brk_base;
+    heir->mmap_next   = p->mmap_next;
+    heir->image_start = p->image_start;
+    heir->image_end   = p->image_end;
 }
 
 /* Copy parent's VMA list to child (fork), preserving order. */
@@ -10886,6 +10965,7 @@ void syscall_dispatch(registers_t *regs) {
     case 501: ret = shm_sys_map((int)regs->ebx);   break;
     case 502: ret = shm_sys_unmap((int)regs->ebx); break;
     case 506: ret = shm_sys_chmod((int)regs->ebx, regs->ecx); break;
+    case 509: ret = shm_sys_size((int)regs->ebx);  break;
     case 503:  /* kprof: dump the cycle accounting (see include/kernel/kprof.h) */
         kprof_dump("mark");
         ret = 0;
