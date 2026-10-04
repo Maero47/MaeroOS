@@ -19,9 +19,15 @@ etc/desktop.conf        1000  100   0100644
 etc/notes.txt           1000  100   0100644
 etc/pkg-index.txt       1000  100   0100644
 etc/doas.conf           0     0     0100644
+# The only set-uid programs on the image.  Each exists to let a user act as
+# root under its own checks: doas (doas.conf rules + password) and passwd
+# (changes only the caller's own shadow entry unless root).  Test helpers are
+# never set-uid here: credprobe makes a set-uid copy of itself in a fresh
+# root-owned directory for the length of its run and removes it.  The X apps
+# image (ports/alpine/prepare.py) adds /disk/xapp, the set-uid chroot helper.
+# No set-gid programs.
 doas                    0     0     0104755
 passwd                  0     0     0104755
-credprobe               0     0     0104755
 ff                      1000  100   0100755
 ffout                   1000  100   040775
 ffout/README.txt        1000  100   0100644

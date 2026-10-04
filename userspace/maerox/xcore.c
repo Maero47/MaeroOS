@@ -1214,6 +1214,12 @@ static void do_change_property(client_t *c, const uint8_t *q, int qlen) {
     if (24 + bytes > (uint64_t)qlen) { x_error(c, BadLength, 0); return; }
     if (name == 0 || name >= natoms) { x_error(c, BadAtom, name); return; }
     prop_t *p = prop_find(w, name);
+    /* Appends grow a property without bound: cap its size so the byte
+     * counts (p->n * format/8, here and in GetProperty) never wrap. */
+    if (mode != 0 && p && (uint64_t)p->n * (uint32_t)(p->format / 8) + bytes > PROP_MAX) {
+        x_error(c, BadAlloc, 0);
+        return;
+    }
     if (mode == 0 || !p) {
         prop_set(w, name, type, format, q + 24, n, 1);
         return;

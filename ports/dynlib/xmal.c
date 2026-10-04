@@ -253,7 +253,25 @@ static void case_short(int X){
         w8(&s,render_major); w8(&s,20); w16(&s,4); w32(&s,gs); w32(&s,8000); w32(&s,1);
         wr(X,a,16);
         expect_error(X, 16, "AddGlyphs count beyond request");
+        /* An ARGB32 glyph of 54161x19825: 4*w*h is 2^32 + 4, which a 32-bit
+         * size check wraps to 4, matching the 4 data bytes sent. */
+        unsigned gs32 = alloc_id();
+        unsigned char g32[12], *gq=g32;
+        w8(&gq,render_major); w8(&gq,17); w16(&gq,3); w32(&gq,gs32); w32(&gq,0x31);
+        wr(X,g32,12);
+        unsigned char ag[32], *ap=ag;
+        w8(&ap,render_major); w8(&ap,20); w16(&ap,8); w32(&ap,gs32); w32(&ap,1); w32(&ap,1);
+        w16(&ap,54161); w16(&ap,19825); w16(&ap,0); w16(&ap,0); w16(&ap,0); w16(&ap,0);
+        w32(&ap,0xFFFFFFFFu);
+        wr(X,ag,32);
+        expect_error(X, 16, "AddGlyphs ARGB32 size wrapping 2^32");
     }
+    /* CreatePixmap 65535x65535: w*h*4 does not fit in 32 bits. */
+    unsigned char cp[16], *cq=cp;
+    w8(&cq,53); w8(&cq,24); w16(&cq,4); w32(&cq,alloc_id()); w32(&cq,root);
+    w16(&cq,65535); w16(&cq,65535);
+    wr(X,cp,16);
+    expect_error(X, 11, "CreatePixmap 65535x65535");
 }
 
 static void case_putimage(int X, unsigned win, unsigned gc){
