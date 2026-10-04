@@ -118,6 +118,8 @@ PROBES = {
     "p49_accounting":          (120, ""),
     # One user hammering /proc lookups cannot make them fail for others.
     "p50_procfs_fair":         (150, ""),
+    # SIGKILL of a parent with an unreaped child (hung the kernel).
+    "p51_kill_zombie_child":   (60, ""),
 }
 
 # Expected to FAIL today, with the audit findings that the fix must address.

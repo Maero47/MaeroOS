@@ -2601,12 +2601,16 @@ static int sys_kill(registers_t *regs) {
                     changed = 0;
                     for (int j = 0; j < MAX_PROCS; j++) {
                         struct proc *p = &ptable[j];
-                        if (p->state == PROC_UNUSED) continue;
+                        /* A zombie takes no signal (signal_send leaves it
+                         * alone): counting it as progress spun this loop
+                         * forever, under the BKL, whenever a killed parent
+                         * had an unreaped child. */
+                        if (p->state == PROC_UNUSED || p->state == PROC_ZOMBIE) continue;
                         if (p->pending_sigs & (1u << SIGKILL)) continue;  /* already */
                         if (p->parent && (p->parent->pending_sigs & (1u << SIGKILL)) &&
                             kill_permitted(p, SIGKILL)) {
                             signal_send(p, SIGKILL);
-                            changed = 1;
+                            if (p->pending_sigs & (1u << SIGKILL)) changed = 1;
                         }
                     }
                 }
