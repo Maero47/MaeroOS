@@ -154,6 +154,73 @@ def build_images():
     return a_img, a_fs, b_img, c_img, files
 
 
+LONG_NAME = "L" * 255                  # needs 264 bytes in a directory block
+
+
+def build_fix_images():
+    """Disks for the ext2.c review fixes (2026-10-04), next to the others:
+
+    d.img  ext4, metadata_csum, no journal, 1 KiB blocks, 10% reserved:
+           /full is one linear block that a 255-byte name does not fit, in
+           its leaf either once indexed; /spare is one block; /xa and /xb
+           share one extended-attribute block (refcount 2); /pub for uid 1000
+    e.img  ext2, 1 KiB blocks: /many has i_links_count 31999 (EXT2_LINK_MAX
+           is 32000), /other/x is a directory to move into it
+    f.img  ext4 (dir_nlink): /idx is an htree directory with links 64998,
+           /lin a linear one with 64999 (EXT4_LINK_MAX is 65000)
+    """
+    imgs = {}
+    src = os.path.join(OUT, "src-d")
+    os.makedirs(os.path.join(src, "full"))
+    os.makedirs(os.path.join(src, "pub"))
+    for i in range(1, 5):                          # 4 x rec_len 208 = 832 bytes
+        open(os.path.join(src, "full", f"n{i}" + "0" * 198), "wb").close()
+    with open(os.path.join(src, "spare"), "wb") as f:
+        f.write(bytes(1024))
+    for n in ("xa", "xb"):
+        with open(os.path.join(src, n), "wb") as f:
+            f.write(n.encode() + b"\n")
+    d_img = os.path.join(OUT, "d.img")
+    run(MKE2FS, "-q", "-F", "-t", "ext4", "-b", "1024", "-O", "^has_journal", "-m", "10",
+        "-d", src, d_img, "4M")
+    val = os.path.join(OUT, "xattr-val")
+    with open(val, "w") as f:
+        f.write("v" * 600)                         # too big for the inode: a block
+    run(DEBUGFS, "-w", "-R", f"ea_set -f {val} /xa user.big", d_img)
+    acl = re.search(r"File ACL: (\d+)", debugfs(d_img, "stat /xa")).group(1)
+    run(DEBUGFS, "-w", "-R", f"sif /xb file_acl {acl}", d_img)
+    run(DEBUGFS, "-w", "-R", "sif /xb blocks 4", d_img)
+    # e2fsck sets the block's h_refcount to 2 (and its checksum).
+    subprocess.run([E2FSCK, "-fy", d_img], capture_output=True)
+    r = subprocess.run([E2FSCK, "-fn", d_img], capture_output=True, text=True)
+    imgs["d_ok"] = r.returncode == 0 and "user.big" in debugfs(d_img, "ea_list /xb")
+    imgs["d"] = d_img
+
+    src = os.path.join(OUT, "src-e")
+    os.makedirs(os.path.join(src, "many"))
+    os.makedirs(os.path.join(src, "other", "x"))
+    e_img = os.path.join(OUT, "e.img")
+    run(MKE2FS, "-q", "-F", "-t", "ext2", "-b", "1024", "-d", src, e_img, "4M")
+    run(DEBUGFS, "-w", "-R", "sif /many links_count 31999", e_img)
+    imgs["e"] = e_img
+
+    src = os.path.join(OUT, "src-f")
+    os.makedirs(os.path.join(src, "idx"))
+    os.makedirs(os.path.join(src, "lin"))
+    for i in range(150):
+        open(os.path.join(src, "idx", f"entry-{i}-with-a-rather-longer-name"), "wb").close()
+    f_img = os.path.join(OUT, "f.img")
+    run(MKE2FS, "-q", "-F", "-t", "ext4", "-b", "1024", "-O", "^has_journal", "-d", src,
+        f_img, "8M")
+    subprocess.run([E2FSCK, "-fyD", f_img], capture_output=True)
+    m = re.search(r"Flags: (0x[0-9a-f]+)", debugfs(f_img, "stat /idx"))
+    imgs["f_htree"] = m is not None and (int(m.group(1), 16) & 0x1000) != 0
+    run(DEBUGFS, "-w", "-R", "sif /idx links_count 64998", f_img)
+    run(DEBUGFS, "-w", "-R", "sif /lin links_count 64999", f_img)
+    imgs["f"] = f_img
+    return imgs
+
+
 class Guest:
     def __init__(self, proc, sel, log):
         self.proc, self.sel, self.log = proc, sel, log
@@ -316,6 +383,84 @@ def guest_tests(g, files):
           f"sdb1 and nvme0n1 mounted read-write and written, left mounted for poweroff ({out.strip()!r})")
 
 
+def guest_fixes(g):
+    """fs/ext2.c review fixes: 32-bit owners, the shared attribute block's
+    checksum, reserved blocks, a directory converted to an htree on ENOSPC,
+    and directory link counts (EMLINK, dir_nlink)."""
+    g.sh("busybox mkdir -p /mnt/d /mnt/e /mnt/f")
+    rc, out = g.sh("busybox mount -t ext4 /dev/sdd /mnt/d")
+    check(rc == 0, f"mount -t ext4 /dev/sdd /mnt/d ({out.strip()!r})")
+
+    # uid/gid above 65535 survive a remount (the high halves were dropped:
+    # uid 65536 came back as root).
+    rc, out = g.sh("echo o > /mnt/d/owned && busybox chown 65537:65538 /mnt/d/owned && "
+                   "busybox umount /mnt/d && busybox mount -t ext4 /dev/sdd /mnt/d && "
+                   "busybox stat -c owner=%u:%g /mnt/d/owned")
+    check("owner=65537:65538" in out, f"uid/gid 65537:65538 read back after remount ({out.strip()!r})")
+
+    # One user of the shared attribute block goes (refcount 2 -> 1).
+    rc, out = g.sh("busybox rm /mnt/d/xa")
+    check(rc == 0, "rm of one file sharing an xattr block")
+
+    # Reserved blocks: uid 1000 stops short of them, root still writes.
+    rc, out = g.sh("busybox chmod 1777 /mnt/d/pub; "
+                   "busybox setuidgid user busybox dd if=/dev/zero of=/mnt/d/pub/u bs=1k count=8000; "
+                   "echo urc=$?; busybox dd if=/dev/zero of=/mnt/d/r bs=1k count=200; echo rrc=$?",
+                   timeout=180.0)
+    check("urc=0" not in out and "rrc=0" in out,
+          f"uid 1000 cannot use the reserved blocks, root can ({out.strip()[-300:]!r})")
+    g.sh("busybox rm -f /mnt/d/pub/u /mnt/d/r")
+
+    # One free block: the one-block /full is indexed, the name does not fit
+    # its leaf and the split finds no room.  The name fails, the directory
+    # keeps its entries.
+    rc, out = g.sh("busybox dd if=/dev/zero of=/mnt/d/fill bs=1k count=8000; busybox rm /mnt/d/spare; "
+                   f"busybox touch /mnt/d/full/{LONG_NAME}; echo trc=$?; "
+                   "busybox ls /mnt/d/full | busybox wc -l", timeout=180.0)
+    m = re.search(r"trc=(\d+)\s+(\d+)", out)
+    check(m is not None and m.group(1) != "0",
+          f"a 255-byte name in the full directory with one free block: ENOSPC ({out.strip()[-200:]!r})")
+    check(m is not None and m.group(2) == "4",
+          f"the directory still lists its 4 entries after the failed conversion ({out.strip()[-200:]!r})")
+    rc, out = g.sh("busybox rm /mnt/d/fill && busybox umount /mnt/d")
+    check(rc == 0, f"umount /mnt/d ({out.strip()!r})")
+
+    # ext2: no subdirectory past EXT2_LINK_MAX (32000), by mkdir or rename.
+    rc, out = g.sh("busybox mount -t ext2 /dev/sde /mnt/e && busybox mkdir /mnt/e/many/a; echo m1=$?; "
+                   "busybox mkdir /mnt/e/many/b; echo m2=$?; "
+                   "busybox mv /mnt/e/other/x /mnt/e/many/x; echo mv=$?; "
+                   "busybox stat -c links=%h /mnt/e/many; busybox umount /mnt/e")
+    check("m1=0" in out and "m2=0" not in out and "Too many links" in out,
+          f"ext2: mkdir at 32000 links is EMLINK ({out.strip()[-300:]!r})")
+    check("mv=0" not in out and "links=32000" in out,
+          f"ext2: rename of a directory into it is EMLINK, links stay 32000 ({out.strip()[-300:]!r})")
+
+    # ext4: a linear directory stops at 65000; an indexed one goes to 1.
+    rc, out = g.sh("busybox mount -t ext4 /dev/sdf /mnt/f && busybox mkdir /mnt/f/lin/a; echo l1=$?; "
+                   "busybox mkdir /mnt/f/lin/b; echo l2=$?; "
+                   "busybox mkdir /mnt/f/idx/s1 /mnt/f/idx/s2 && busybox stat -c i1=%h /mnt/f/idx; "
+                   "busybox mkdir /mnt/f/idx/s3 && busybox stat -c i2=%h /mnt/f/idx; "
+                   "busybox rmdir /mnt/f/idx/s3 && busybox stat -c i3=%h /mnt/f/idx; "
+                   "busybox umount /mnt/f")
+    check("l1=0" in out and "l2=0" not in out,
+          f"ext4: mkdir in a linear directory at 65000 links is EMLINK ({out.strip()[-300:]!r})")
+    check("i1=1" in out and "i2=1" in out and "i3=1" in out,
+          f"ext4 dir_nlink: an indexed directory past 65000 links counts 1 and stays 1 ({out.strip()[-300:]!r})")
+
+
+def host_fix_checks(imgs):
+    r = subprocess.run([E2FSCK, "-fn", imgs["d"]], capture_output=True, text=True)
+    check(r.returncode == 0, f"host e2fsck -fn sdd clean (xattr checksum, htree on ENOSPC; rc={r.returncode})"
+          + ("" if r.returncode == 0 else "\n" + r.stdout[-1500:]))
+    st = debugfs(imgs["d"], "stat /owned")
+    check(re.search(r"User:\s+65537\s+Group:\s+65538", st) is not None,
+          "debugfs: /owned is uid 65537 gid 65538 on disk")
+    check("user.big" in debugfs(imgs["d"], "ea_list /xb"), "debugfs: /xb keeps its attribute")
+    check(len(live_names(imgs["d"], "/full")) == 4 + 2, "debugfs: /full keeps its 4 entries")
+    st = debugfs(imgs["f"], "stat /idx")
+    check(re.search(r"Links: 1\b", st) is not None, "debugfs: indexed /idx has i_links_count 1")
+
+
 def host_checks(a_img, a_fs, b_img, c_img, files):
     seq_md5 = md5(seq_text(SEQ_N))
     # The partition out of disk a, for the e2fsprogs tools.
@@ -368,6 +513,9 @@ def host_checks(a_img, a_fs, b_img, c_img, files):
 def main():
     a_img, a_fs, b_img, c_img, files = build_images()
     check(files["b_htree"], "host: nvme0n1 /big is an htree directory (e2fsck -D)")
+    imgs = build_fix_images()
+    check(imgs["d_ok"], "host: sdd built clean, /xa and /xb share an attribute block")
+    check(imgs["f_htree"], "host: sdf /idx is an htree directory (e2fsck -D)")
     accel = ["-accel", "kvm"] if os.access("/dev/kvm", os.R_OK | os.W_OK) else ["-accel", "tcg"]
     proc = subprocess.Popen(
         ["qemu-system-i386", *smokelib.QEMU_DISPLAY, *accel, "-M", "q35",
@@ -375,6 +523,9 @@ def main():
          "-drive", "file=disk.img,format=raw,index=0,media=disk,snapshot=on",
          "-drive", f"file={a_img},format=raw,index=1,media=disk",
          "-drive", f"file={c_img},format=raw,index=2,media=disk",
+         "-drive", f"file={imgs['d']},format=raw,index=3,media=disk",
+         "-drive", f"file={imgs['e']},format=raw,index=4,media=disk",
+         "-drive", f"file={imgs['f']},format=raw,index=5,media=disk",
          "-drive", f"file={b_img},format=raw,if=none,id=nv",
          "-device", "nvme,serial=ext2rw,drive=nv",
          "-serial", "stdio", "-m", "256M", "-no-reboot"],
@@ -386,6 +537,7 @@ def main():
     g = Guest(proc, sel, log)
     try:
         smokelib.login(proc, sel, log, timeout=120.0)
+        guest_fixes(g)
         guest_tests(g, files)
 
         # poweroff: ACPI S5, and QEMU (no -no-shutdown) exits.
@@ -413,6 +565,7 @@ def main():
                 proc.wait()
 
     host_checks(a_img, a_fs, b_img, c_img, files)
+    host_fix_checks(imgs)
 
     if failures:
         print(f"\n[SMOKE-EXT2RW] {len(failures)} check(s) failed:")

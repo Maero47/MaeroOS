@@ -103,6 +103,24 @@ typedef struct {
     uint8_t  i_osd2[12];
 } __attribute__((packed)) ext2_inode_t;
 
+/* Owner ids are 32 bits: the high halves live in osd2 (Linux's
+ * l_i_uid_high at byte 4 of it, l_i_gid_high at byte 6).  Storing only the
+ * low half turned a file of uid 65536 into a root-owned one. */
+static inline uint32_t ext2_inode_uid(const ext2_inode_t *in) {
+    return in->i_uid | ((uint32_t)(in->i_osd2[4] | (in->i_osd2[5] << 8)) << 16);
+}
+static inline uint32_t ext2_inode_gid(const ext2_inode_t *in) {
+    return in->i_gid | ((uint32_t)(in->i_osd2[6] | (in->i_osd2[7] << 8)) << 16);
+}
+static inline void ext2_inode_set_owner(ext2_inode_t *in, uint32_t uid, uint32_t gid) {
+    in->i_uid = (uint16_t)uid;
+    in->i_osd2[4] = (uint8_t)(uid >> 16);
+    in->i_osd2[5] = (uint8_t)(uid >> 24);
+    in->i_gid = (uint16_t)gid;
+    in->i_osd2[6] = (uint8_t)(gid >> 16);
+    in->i_osd2[7] = (uint8_t)(gid >> 24);
+}
+
 typedef struct {
     uint32_t inode;
     uint16_t rec_len;
@@ -285,6 +303,9 @@ struct ext2_fs {
     int                 crash_trunc;  /* mount -o x4crashtrunc */
     volatile int        lock;        /* ext2_lock: one changing operation at a time */
     int                 want_reclaim; /* ENOSPC with freed blocks awaiting commit */
+    uint32_t            free_blocks; /* s_free_blocks_count, kept in step */
+    uint32_t            r_blocks;    /* s_r_blocks_count: only root may use */
+    uint32_t            resuid, resgid; /* s_def_resuid/resgid may too */
     int                 no_step;     /* undoing: no step commits (ext2_jnl_due) */
     int                 nozero;      /* the block being allocated is about to be
                                       * written whole: no need to clear it */
@@ -936,6 +957,7 @@ static int ext2_update_super_free_counts(ext2_fs_t *fs, int block_delta, int ino
         sb->s_free_inodes_count -= (uint32_t)(-inode_delta);
     else
         sb->s_free_inodes_count += (uint32_t)inode_delta;
+    fs->free_blocks = sb->s_free_blocks_count;
     /* The superblock's 1024 bytes only: with 1 KiB blocks the next two
      * sectors are the group descriptors, which may have changed meanwhile. */
     return ext2_dev_write(fs, fs->st.lba_offset + 2, 2, sb_buf);
@@ -1161,7 +1183,22 @@ static uint32_t ext2_alloc_inode(ext2_fs_t *fs) {
 /* A free block, searched from `goal` onward (wrapping), so a file's blocks
  * follow each other on the disk.  `zero`: clear it on the disk too. */
 static uint32_t ext2_alloc_block_goal_once(ext2_fs_t *fs, uint32_t goal, int zero);
+
+/* s_r_blocks_count blocks are kept for root (and s_def_resuid/resgid), as
+ * Linux's ext2_has_free_blocks/ext4_has_free_clusters: an ordinary user
+ * cannot fill the disk to the last block, so root's daemons and the
+ * filesystem's own bookkeeping still find room. */
+static int ext2_may_use_reserved(ext2_fs_t *fs) {
+    struct proc *p = current_proc;
+    if (!p || p->euid == 0) return 1;
+    return p->euid == fs->resuid || p->egid == fs->resgid;
+}
+
 static uint32_t ext2_alloc_block_goal(ext2_fs_t *fs, uint32_t goal, int zero) {
+    if (fs->r_blocks) {
+        uint32_t nfree = fs->x4 ? x4_rd32(fs->sb + SB_FREE_BLOCKS) : fs->free_blocks;
+        if (nfree <= fs->r_blocks && !ext2_may_use_reserved(fs)) return 0;
+    }
     uint32_t b = ext2_alloc_block_goal_once(fs, goal, zero);
     /* Full, apart from blocks the running transaction freed: they become
      * free once it commits, which can only happen between operations (a
@@ -2302,6 +2339,7 @@ static uint32_t ext2_write_node_do(vfs_node_t *node, uint64_t offset,
     uint32_t blk_size = fs->st.block_size;
     uint32_t bshift = fs->st.block_shift;
     uint32_t done = 0;
+    int nospace = 0;
     uint8_t *blk_buf = (uint8_t *)kmalloc(blk_size);
     /* Out of kernel memory, not out of disk: say so.  A plain 0 here means
      * "wrote nothing" to a caller that cannot distinguish it from progress,
@@ -2321,7 +2359,7 @@ static uint32_t ext2_write_node_do(vfs_node_t *node, uint64_t offset,
         fs->nozero = whole;
         uint32_t blk_num = ext2_file_blk_alloc(fs, priv->ino, &inode, blk_idx);
         fs->nozero = 0;
-        if (blk_num == 0) break;
+        if (blk_num == 0) { nospace = 1; break; }
 
         if (!whole && ext2_read_block(fs, blk_num, blk_buf) < 0) break;
         memcpy(blk_buf + blk_off, buf + done, to_copy);
@@ -2353,6 +2391,10 @@ static uint32_t ext2_write_node_do(vfs_node_t *node, uint64_t offset,
         node->ctime = inode.i_ctime;
         ext2_write_inode(fs, priv->ino, &inode);
     }
+    /* Nothing written for want of a block: -ENOSPC, not 0, which write(2)
+     * would hand back as "0 bytes written" and a write loop (busybox dd's
+     * full_write) retries forever. */
+    if (!done && nospace) return (uint32_t)-28;
     return done;
 }
 
@@ -3077,6 +3119,7 @@ static int ext2_add_dirent(ext2_fs_t *fs, uint32_t dir_ino, ext2_inode_t *dir_in
                             uint8_t file_type) {
     uint32_t name_len = strlen(name);
     if (name_len == 0 || name_len > 255) return -1;
+    int converted = 0;
     if (fs->x4 && (fs->compat & EXT2_COMPAT_DIR_INDEX) &&
         !(dir_inode->i_flags & EXT2_INDEX_FL) && dir_inode->i_size == fs->st.block_size) {
         /* One block: index it if the name does not fit there any more. */
@@ -3095,12 +3138,18 @@ static int ext2_add_dirent(ext2_fs_t *fs, uint32_t dir_ino, ext2_inode_t *dir_in
             }
         }
         if (b) kfree(b);
-        if (full && x4_make_indexed(fs, dir_ino, dir_inode) < 0) return -1;
+        if (full && (converted = x4_make_indexed(fs, dir_ino, dir_inode)) < 0) return -1;
     }
     if (fs->x4 && (dir_inode->i_flags & EXT2_INDEX_FL)) {
         int r = x4_dx_add(fs, dir_ino, dir_inode, child_ino, name, name_len, file_type);
         if (r == 1) return ext2_write_inode(fs, dir_ino, dir_inode);
-        if (r < 0) return -1;
+        if (r < 0) {
+            /* The conversion is on disk already (block 0 is the index root,
+             * the entries are in the new leaf): the inode must say so even
+             * when the name itself did not fit, or every entry is lost. */
+            if (converted == 1) ext2_write_inode(fs, dir_ino, dir_inode);
+            return -1;
+        }
         printk("[EXT2]  %s: dir %u: htree cannot take '%s'; index dropped\n", fs->name,
                (unsigned)dir_ino, name);
     }
@@ -3408,6 +3457,18 @@ static void ext2_put_xattr_block(ext2_fs_t *fs, uint32_t blk) {
         if (ext2_read_block(fs, blk, buf) == 0) {
             uint32_t refs = hdr[1] - 1;
             memcpy(buf + 4, &refs, 4);
+            /* h_checksum (metadata_csum) covers h_refcount: crc32c of the
+             * block number (le64) and the block with h_checksum zeroed
+             * (Linux ext4_xattr_block_csum).  A stale one makes Linux and
+             * e2fsck drop the block, and the other users' attributes. */
+            if (fs->csum) {
+                uint8_t le[8];
+                x4_wr32(le, blk);
+                x4_wr32(le + 4, 0);
+                x4_wr32(buf + 0x10, 0);
+                uint32_t c = crc32c(fs->csum_seed, le, 8);
+                x4_wr32(buf + 0x10, crc32c(c, buf, fs->st.block_size));
+            }
             ext2_write_block(fs, blk, buf);
         }
         kfree(buf);
@@ -3793,8 +3854,8 @@ typedef struct {
 static void ext2_fill_node(vfs_node_t *node, const ext2_inode_t *inode) {
     node->size  = ext2_isize(inode);
     node->mask  = inode->i_mode & 0xFFF;
-    node->uid   = inode->i_uid;
-    node->gid   = inode->i_gid;
+    node->uid   = ext2_inode_uid(inode);
+    node->gid   = ext2_inode_gid(inode);
     node->atime = inode->i_atime;
     node->mtime = inode->i_mtime;
     node->ctime = inode->i_ctime;
@@ -3925,6 +3986,39 @@ static uint32_t ext2_new_generation(uint32_t ino) {
     return (ext2_now() * 2654435761u) ^ (ino << 8) ^ ++ctr;
 }
 
+/* A directory's link count is 16 bits.  ext2 refuses a subdirectory past
+ * EXT2_LINK_MAX (Linux ext2, -EMLINK); the ext4 rules (x4) refuse one past
+ * EXT4_LINK_MAX in a linear directory, while an indexed one switches to
+ * i_links_count 1, "too many to count" (dir_nlink), and keeps it there
+ * (Linux ext4_inc_count/ext4_dec_count).  Without a cap the count wrapped,
+ * and a directory left at 0 or 1 by a later rmdir reads as deleted. */
+#define EXT2_LINK_MAX 32000u
+#define EXT4_LINK_MAX 65000u
+#define EXT2_RO_COMPAT_DIR_NLINK   0x0020u
+
+static int ext2_dir_link_full(ext2_fs_t *fs, const ext2_inode_t *dir) {
+    if (!fs->x4) return dir->i_links_count >= EXT2_LINK_MAX;
+    return !(dir->i_flags & EXT2_INDEX_FL) && dir->i_links_count >= EXT4_LINK_MAX;
+}
+
+static void ext2_dir_link_inc(ext2_fs_t *fs, ext2_inode_t *dir) {
+    dir->i_links_count++;
+    if (fs->x4 && (dir->i_flags & EXT2_INDEX_FL) &&
+        (dir->i_links_count >= EXT4_LINK_MAX || dir->i_links_count == 2)) {
+        dir->i_links_count = 1;
+        uint32_t ro = x4_rd32(fs->sb + X4_SB_RO_COMPAT);
+        if (!(ro & EXT2_RO_COMPAT_DIR_NLINK)) {
+            x4_wr32(fs->sb + X4_SB_RO_COMPAT, ro | EXT2_RO_COMPAT_DIR_NLINK);
+            fs->ro_compat |= EXT2_RO_COMPAT_DIR_NLINK;
+            fs->sb_dirty = 1;
+        }
+    }
+}
+
+static void ext2_dir_link_dec(ext2_inode_t *dir) {
+    if (dir->i_links_count > 2) dir->i_links_count--;
+}
+
 static int ext2_create_do(vfs_node_t *dir, const char *name, uint32_t flags) {
     if (!dir || !dir->private || !name) return -1;
     ext2_fs_t *fs = ((ext2_priv_t *)dir->private)->fs;
@@ -3938,9 +4032,11 @@ static int ext2_create_do(vfs_node_t *dir, const char *name, uint32_t flags) {
     ext2_inode_t dir_inode;
     if (ext2_read_inode(fs, dpriv->ino, &dir_inode) < 0) return -1;
     if ((dir_inode.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) return -1;
+    if (flags == VFS_FLAG_DIR && ext2_dir_link_full(fs, &dir_inode))
+        return -31;                                                     /* -EMLINK */
 
     uint32_t ino = ext2_alloc_inode(fs);
-    if (!ino) return -1;
+    if (!ino) return -28;                                  /* -ENOSPC */
 
     ext2_inode_t inode;
     memset(&inode, 0, sizeof(inode));
@@ -3957,7 +4053,7 @@ static int ext2_create_do(vfs_node_t *dir, const char *name, uint32_t flags) {
         uint32_t blk = ext2_file_blk_alloc(fs, ino, &inode, 0);
         if (!blk) {
             ext2_free_inode(fs, ino);
-            return -1;
+            return -28;                                     /* -ENOSPC */
         }
         if (ext2_init_dir_block(fs, blk, ino, &inode, dpriv->ino) < 0) {
             ext2_free_inode_blocks(fs, ino, &inode);
@@ -3987,12 +4083,12 @@ static int ext2_create_do(vfs_node_t *dir, const char *name, uint32_t flags) {
         memset(&inode, 0, sizeof(inode));
         ext2_write_inode(fs, ino, &inode);
         ext2_free_inode(fs, ino);
-        return -1;
+        return -28;                                     /* -ENOSPC */
     }
     dir_inode.i_mtime = now;
     dir_inode.i_ctime = now;
     if (flags == VFS_FLAG_DIR) {
-        dir_inode.i_links_count++;
+        ext2_dir_link_inc(fs, &dir_inode);
         ext2_count_dir(fs, ino, 1);
     }
     ext2_write_inode(fs, dpriv->ino, &dir_inode);
@@ -4147,9 +4243,7 @@ static int ext2_unlink_do(vfs_node_t *dir, const char *name) {
 
     dir_inode.i_mtime = now;
     dir_inode.i_ctime = now;
-    if (type == EXT2_S_IFDIR && dir_inode.i_links_count > 0) {
-        dir_inode.i_links_count--;
-    }
+    if (type == EXT2_S_IFDIR) ext2_dir_link_dec(&dir_inode);
     ext2_write_inode(fs, dpriv->ino, &dir_inode);
     return 0;
 }
@@ -4281,6 +4375,10 @@ static int ext2_rename_do(vfs_node_t *old_dir, const char *old_name,
         }
     }
 
+    /* A directory moving in adds a link to its new parent. */
+    if (src_is_dir && !same_dir && !dst_ino && ext2_dir_link_full(fs, ndir))
+        return -31;                                          /* -EMLINK */
+
     /* 1. The new name. */
     if (dst_ino) {
         if (ext2_set_dirent(fs, n_ino, ndir, new_name, src_ino, src_ft) < 0) return -5;
@@ -4299,8 +4397,8 @@ static int ext2_rename_do(vfs_node_t *old_dir, const char *old_name,
     /* 3. A directory that changed parent: its ".." and both link counts. */
     if (src_is_dir && !same_dir) {
         ext2_set_dirent(fs, src_ino, &src, "..", n_ino, 2);
-        if (odir.i_links_count > 0) odir.i_links_count--;
-        ndir->i_links_count++;
+        ext2_dir_link_dec(&odir);
+        ext2_dir_link_inc(fs, ndir);
     }
     src.i_ctime = now;
     ext2_write_inode(fs, src_ino, &src);
@@ -4310,7 +4408,7 @@ static int ext2_rename_do(vfs_node_t *old_dir, const char *old_name,
     if (dst_ino) {
         if (dst_is_dir) {
             dst.i_links_count = 0;
-            if (ndir->i_links_count > 0) ndir->i_links_count--;
+            ext2_dir_link_dec(ndir);
         } else if (dst.i_links_count > 0) {
             dst.i_links_count--;
         }
@@ -4340,8 +4438,7 @@ static int ext2_setattr_do(vfs_node_t *node, uint32_t mode, uint32_t uid,
     ext2_inode_t inode;
     if (ext2_read_inode(fs, priv->ino, &inode) < 0) return -1;
     inode.i_mode = (uint16_t)((inode.i_mode & EXT2_S_IFMT) | (mode & 0xFFF));
-    inode.i_uid  = (uint16_t)uid;
-    inode.i_gid  = (uint16_t)gid;
+    ext2_inode_set_owner(&inode, uid, gid);
     return ext2_write_inode(fs, priv->ino, &inode);
 }
 
@@ -5413,16 +5510,17 @@ static uint32_t ext2_write_node(vfs_node_t *node, uint64_t offset,
         fs->want_reclaim = 0;
     }
     uint32_t r = ext2_write_node_do(node, offset, size, buf);
-    if (fs && fs->want_reclaim && r != VFS_WRITE_ENOMEM && r < size && !fs->ro) {
+    uint32_t got = (int32_t)r < 0 ? 0 : r;      /* -ENOSPC: nothing written */
+    if (fs && fs->want_reclaim && r != VFS_WRITE_ENOMEM && got < size && !fs->ro) {
         /* Out of space but for blocks freed by the open transaction: the
          * write so far is a complete short write, so commit it and go on. */
         fs->want_reclaim = 0;
         ext2_sync_fs(fs);
-        uint32_t r2 = ext2_write_node_do(node, offset + r, size - r, buf + r);
-        if (r2 != VFS_WRITE_ENOMEM && r2 != VFS_WRITE_EFBIG) r += r2;
+        uint32_t r2 = ext2_write_node_do(node, offset + got, size - got, buf + got);
+        if ((int32_t)r2 >= 0) r = got + r2;
     }
     if (fs) {
-        if (fs->crash_test == 1 && r) fs->crash_test = 2;
+        if (fs->crash_test == 1 && (int32_t)r > 0) fs->crash_test = 2;
         ext2_op_end(fs);
         ext2_unlock(fs);
     }
@@ -5721,6 +5819,10 @@ static int ext2_load_super(ext2_fs_t *fs, const uint8_t *sb_buf, uint32_t lba_of
     fs->st.first_data_block  = sb->s_first_data_block;
     fs->st.inodes_count      = sb->s_inodes_count;
     fs->st.blocks_count      = sb->s_blocks_count;
+    fs->free_blocks          = sb->s_free_blocks_count;
+    fs->r_blocks             = sb->s_r_blocks_count;
+    fs->resuid               = sb_buf[0x50] | (sb_buf[0x51] << 8);
+    fs->resgid               = sb_buf[0x52] | (sb_buf[0x53] << 8);
     fs->st.first_ino         = (sb->s_rev_level >= 1) ? sb->s_first_ino : 11;
     fs->st.inode_size        = (sb->s_rev_level >= 1) ? sb->s_inode_size : 128;
     fs->nsect                = nsect;
