@@ -511,6 +511,14 @@ static vfs_node_t dev_dir;   /* the /dev directory itself */
 #define TIOCSPTLCK 0x40045431U
 
 typedef struct {
+    /* Guards the rings' heads and counts, the closed/eof flags and used/gen,
+     * and is the lock of the pair's wait queue (the pair is the channel):
+     * readers and writers test under it and sleep with sleep_locked; closes,
+     * EOF and every ring change wake under it (docs/smp-plan.md stage 2a).
+     * Kept when the slot is cleared (pty_clear), so a sleeper woken in a
+     * freed slot takes the same lock again.  The rest of the line
+     * discipline (termios, canon, pgrp) is still the BKL's. */
+    kspinlock_t lock;
     int used;
     int id;
     uint32_t gen;                /* changes each time the slot is handed out */
@@ -533,8 +541,14 @@ typedef struct {
     vfs_node_t slave;
 } pty_pair_t;
 
-static pty_pair_t ptys[MAX_PTYS];
+static pty_pair_t ptys[MAX_PTYS] = { [0 ... MAX_PTYS - 1] = { .lock = KSPINLOCK_INIT("pty") } };
 static uint32_t pty_gen;
+
+/* Zero a pair except its lock. */
+static void pty_clear(pty_pair_t *p) {
+    size_t keep = __builtin_offsetof(pty_pair_t, used);
+    memset((uint8_t *)p + keep, 0, sizeof(*p) - keep);
+}
 
 /* A read or write that slept may find the pair closed by its last holder,
  * freed and handed to someone else (a thread sharing the descriptor table
@@ -556,21 +570,23 @@ static uint32_t pty_buf_read(pty_pair_t *p, int from_slave,
     uint32_t gen = p->gen;
 
     /* POSIX read semantics: wait until at least one byte is available (or
-     * EOF/signal), then return whatever is buffered, up to len. */
+     * EOF/signal), then return whatever is buffered, up to len.  buf is a
+     * kernel bounce buffer (vfs_read_user), so the copy runs under the lock. */
+    uint32_t fl = kspin_lock_irqsave(&p->lock);
     while (*count == 0) {
         if (!from_slave && p->eof_pending) {
             p->eof_pending = 0;
-            return n;
+            goto out;
         }
         if ((from_slave && p->slave_closed) ||
             (!from_slave && p->master_closed))
-            return n;
+            goto out;
         /* Abort the wait when a deliverable signal is pending so the
          * process can be killed/stopped instead of sleeping forever. */
         if (signal_interrupt_pending(current_proc))
-            return n;
-        sleep_on(p);
-        if (pty_gone(p, gen)) return n;
+            goto out;
+        sleep_locked(p, &p->lock);
+        if (pty_gone(p, gen)) goto out;
     }
     uint32_t take = len;
     if (take > *count) take = *count;
@@ -580,7 +596,11 @@ static uint32_t pty_buf_read(pty_pair_t *p, int from_slave,
     }
     *count -= take;
     wake_up(p);
+    kspin_unlock_irqrestore(&p->lock, fl);
     io_wake_poll();
+    return n;
+out:
+    kspin_unlock_irqrestore(&p->lock, fl);
     return n;
 }
 
@@ -592,29 +612,33 @@ static uint32_t pty_buf_write(pty_pair_t *p, int to_slave,
     uint32_t n = 0;
     uint32_t gen = p->gen;
 
+    uint32_t fl = kspin_lock_irqsave(&p->lock);
     while (n < len) {
         if ((to_slave && p->slave_closed) ||
             (!to_slave && p->master_closed))
-            return n;
+            break;
         while (*count == PTY_BUF_SIZE) {
             if ((to_slave && p->slave_closed) ||
                 (!to_slave && p->master_closed))
-                return n;
+                goto out;
             if (signal_interrupt_pending(current_proc))
-                return n;
-            sleep_on(p);
-            if (pty_gone(p, gen)) return n;
+                goto out;
+            sleep_locked(p, &p->lock);
+            if (pty_gone(p, gen)) goto out;
         }
         uint32_t tail = (*head + *count) % PTY_BUF_SIZE;
         ring[tail] = buf[n++];
         (*count)++;
         /* Wake the reader once the ring is full or the write is done, not
-         * per byte: each wake is a scan of the whole ptable. */
+         * per byte: each wake is a scan of the whole ptable.  Pollers hear
+         * of a full ring before this writer waits for room. */
         if (*count == PTY_BUF_SIZE || n == len) {
             wake_up(p);
             io_wake_poll();
         }
     }
+out:
+    kspin_unlock_irqrestore(&p->lock, fl);
     return n;
 }
 
@@ -685,8 +709,10 @@ static uint32_t pty_master_write_input(pty_pair_t *p,
             if (p->canon_count)
                 pty_commit_canon(p);
             else {
+                uint32_t fl = kspin_lock_irqsave(&p->lock);
                 p->eof_pending = 1;
                 wake_up(p);
+                kspin_unlock_irqrestore(&p->lock, fl);
             }
             continue;
         }
@@ -924,7 +950,10 @@ void devfs_tty_opened(vfs_node_t *n) {
 
 static void pty_maybe_free(pty_pair_t *p) {
     if (!p || p->master_refs > 0 || p->slave_refs > 0) return;
-    memset(p, 0, sizeof(*p));
+    uint32_t fl = kspin_lock_irqsave(&p->lock);
+    pty_clear(p);                 /* used = 0: a woken sleeper sees it gone */
+    wake_up(p);
+    kspin_unlock_irqrestore(&p->lock, fl);
 }
 
 void devfs_session_tty_hangup(int sid, vfs_node_t *tty) {
@@ -962,7 +991,9 @@ static void pty_slave_retain(vfs_node_t *n) {
      * so a bare stat("/dev/pts/N") on a slave nobody had open made the master's
      * read/poll wait instead of reporting hangup, with no holder left to set it
      * back.  pty_slave_close() sets it again when the last holder goes. */
+    uint32_t fl = kspin_lock_irqsave(&p->lock);
     if (p->slave_refs == 0) p->slave_closed = 0;
+    kspin_unlock_irqrestore(&p->lock, fl);
     p->slave_refs++;
 }
 
@@ -975,9 +1006,13 @@ static void pty_master_close(vfs_node_t *n) {
             pty_send_pgrp_signal(p, SIGHUP);
             pty_send_pgrp_signal(p, SIGCONT);
         }
+        uint32_t fl = kspin_lock_irqsave(&p->lock);
         p->master_closed = 1;
+        kspin_unlock_irqrestore(&p->lock, fl);
     }
+    uint32_t fl = kspin_lock_irqsave(&p->lock);
     wake_up(p);
+    kspin_unlock_irqrestore(&p->lock, fl);
     pty_maybe_free(p);
 }
 
@@ -985,8 +1020,10 @@ static void pty_slave_close(vfs_node_t *n) {
     pty_pair_t *p = (pty_pair_t *)n->private;
     if (!p || !p->used) return;
     if (p->slave_refs > 0) p->slave_refs--;
+    uint32_t fl = kspin_lock_irqsave(&p->lock);
     if (p->slave_refs == 0) p->slave_closed = 1;
     wake_up(p);
+    kspin_unlock_irqrestore(&p->lock, fl);
     pty_maybe_free(p);
 }
 
@@ -1014,10 +1051,13 @@ static vfs_node_t *pty_alloc_master(void) {
     for (int i = 0; i < MAX_PTYS; i++) {
         pty_pair_t *p = &ptys[i];
         if (p->used) continue;
-        memset(p, 0, sizeof(*p));
+        uint32_t fl = kspin_lock_irqsave(&p->lock);
+        pty_clear(p);
         p->used = 1;
         p->id = i;
         p->gen = ++pty_gen;
+        p->slave_closed = 1;
+        kspin_unlock_irqrestore(&p->lock, fl);
         /* The descriptor that this open is feeding takes the reference itself
          * (vfs_retain -> pty_master_retain), the same way every other
          * filesystem's nodes are referenced.  Pre-taking it here as well

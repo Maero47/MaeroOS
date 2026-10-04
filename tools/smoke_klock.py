@@ -61,11 +61,11 @@ def main():
         # from every CPU outside the BKL.
         m2 = re.search(r"\[KLOCK-TEST\] stage2 pingpong=(\d+)\+(\d+) sleeps=(\d+) "
                        r"lost_wakeups=(\d+) shootdowns=(\d+) tlb_checks=(\d+) "
-                       r"mem_rounds=(\d+)", text)
+                       r"mem_rounds=(\d+) kstacks=(\d+)", text)
         if not m2:
             raise SystemExit("smoke-klock: no [KLOCK-TEST] stage2 summary line")
-        pp0, pp1, sleeps, lost, sds, checks, mems = map(int, m2.groups())
-        if lost or not sds or not checks or not mems or not sleeps:
+        pp0, pp1, sleeps, lost, sds, checks, mems, kstacks = map(int, m2.groups())
+        if lost or not sds or not checks or not mems or not sleeps or not kstacks:
             raise SystemExit("smoke-klock: stage2 counters wrong: " + m2.group(0))
         if "[KLOCK-TEST] FAIL" in text:
             raise SystemExit("smoke-klock: " + re.search(r"\[KLOCK-TEST\] FAIL[^\n]*", text).group(0))
@@ -91,8 +91,9 @@ def main():
         smokelib.wait_for(proc, sel, "klock-shell-ok\n", log, timeout=30, start=at)
         print("\nsmoke-klock: PASS (threads=%d cpus=%d max_parallel=%d spin_iters=%d "
               "contended=%d mutex_iters=%d; pingpong=%d+%d sleeps=%d shootdowns=%d "
-              "tlb_checks=%d mem_rounds=%d)" % (threads, cpus, par, spins, cont, mutexes,
-                                                pp0, pp1, sleeps, sds, checks, mems))
+              "tlb_checks=%d mem_rounds=%d kstacks=%d)" % (threads, cpus, par, spins, cont,
+                                                           mutexes, pp0, pp1, sleeps, sds,
+                                                           checks, mems, kstacks))
     finally:
         proc.kill()
         proc.wait()

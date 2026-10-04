@@ -445,6 +445,7 @@ static void kt_failf(const char *what, unsigned a, unsigned b) {
 static void kt_finish(void) __attribute__((noreturn));
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
+#include "../mm/kstack.h"
 #include "../arch/i686/mm/paging.h"
 #include "../arch/i686/mm/tlb.h"
 #include "../arch/i686/cpu/pit.h"
@@ -454,7 +455,7 @@ static void kt_finish(void) __attribute__((noreturn));
 #define KT_SD_VA(i) ((uint32_t)KMAP_WINDOW_START + (256U + (uint32_t)(i)) * PAGE_SIZE)
 static uint32_t kt_sd_frame[KT_THREADS][2];
 static volatile uint32_t kt_sd_pub[KT_THREADS];   /* generation every CPU must see */
-static volatile unsigned kt_sd_rounds, kt_sd_checks, kt_mem_rounds;
+static volatile unsigned kt_sd_rounds, kt_sd_checks, kt_mem_rounds, kt_kstacks;
 
 static void kt_frame_fill(uint32_t f, uint32_t v) {
     uint32_t *k = (uint32_t *)paging_temp_map2(f);
@@ -507,6 +508,20 @@ static void kt_mem_round(struct kt_mem *m, unsigned id) {
     m->frame[f] = pmm_alloc_frame();
     m->ftag[f] = kt_rand(&m->seed) ^ (id << 28);
     if (m->frame[f]) kt_frame_fill(m->frame[f], m->ftag[f]);
+
+    /* A kernel stack now and then (kstack_lock; reusing freed slots sends a
+     * shootdown from whichever CPU runs out first). */
+    if ((kt_rand(&m->seed) & 7) == 0) {
+        uint32_t *ks = (uint32_t *)kstack_alloc();
+        if (ks) {
+            uint32_t words = KSTACKSIZE / 4, tag = kt_rand(&m->seed);
+            ks[0] = tag; ks[words / 2] = tag + 1; ks[words - 1] = tag + 2;
+            if (ks[0] != tag || ks[words / 2] != tag + 1 || ks[words - 1] != tag + 2)
+                kt_failf("kernel stack pages shared", ks[0], tag);
+            kstack_free(ks);
+            __sync_add_and_fetch(&kt_kstacks, 1);
+        }
+    }
     __sync_add_and_fetch(&kt_mem_rounds, 1);
 }
 
@@ -621,8 +636,8 @@ static void kt_report(void) {
     if (kt_sd_rounds != (unsigned)KT_THREADS * (KT_ITERS / KT_SD_EVERY) && !kt_fail)
         kt_failf("shootdown rounds missing", kt_sd_rounds, 0);
     printk("[KLOCK-TEST] stage2 pingpong=%u+%u sleeps=%u lost_wakeups=%u shootdowns=%u "
-           "tlb_checks=%u mem_rounds=%u\n", kt_pp_done[0], kt_pp_done[1], kt_pp_sleeps,
-           kt_pp_lost, kt_sd_rounds, kt_sd_checks, kt_mem_rounds);
+           "tlb_checks=%u mem_rounds=%u kstacks=%u\n", kt_pp_done[0], kt_pp_done[1],
+           kt_pp_sleeps, kt_pp_lost, kt_sd_rounds, kt_sd_checks, kt_mem_rounds, kt_kstacks);
     printk("[KLOCK-TEST] threads=%d cpus=%u max_parallel=%d spin_iters=%u contended=%u "
            "mutex_iters=%u lockdep_inversion_caught=%u\n", KT_THREADS, cpus_seen,
            kt_max_running, kt_spins, kt_contended, kt_mutexes, caught);
